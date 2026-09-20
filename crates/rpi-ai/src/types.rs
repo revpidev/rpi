@@ -1409,6 +1409,22 @@ pub enum InputModality {
     Image,
 }
 
+/// `ModelPromptCache` (types.ts:110-112, #9668): best-effort prompt cache
+/// lifetime in seconds per retention tier a request can ask for. A missing
+/// tier means the lifetime is unknown; the warmer (V15-05 scope) does not
+/// warm such caches. Only direct Anthropic carries entries from the catalog
+/// generator (`applyPromptCacheMetadata`, generate-models.ts:939-946 —
+/// proxies are intentionally not annotated).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModelPromptCache {
+    /// `"short"` tier lifetime (Anthropic ephemeral default: 300s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short: Option<u32>,
+    /// `"long"` tier lifetime (`ttl: "1h"`: 3600s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long: Option<u32>,
+}
+
 /// `Model` — unified model system entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1425,6 +1441,12 @@ pub struct Model {
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Vec<InputModality>,
     pub cost: ModelCost,
+    /// Prompt cache lifetimes per retention tier (#9668, c596d09d9).
+    /// Unset when the provider's cache behavior is unknown. Consumed by
+    /// cache warming (V15-05); carried here so catalog data is not
+    /// silently dropped at parse time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<ModelPromptCache>,
     pub context_window: u32,
     pub max_tokens: u32,
     /// Default sampling parameters for this model (v0.84, R2.1.4). See
@@ -1690,9 +1712,26 @@ pub struct ModelCompat {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_fallback_models: Option<Vec<AnthropicAllowedFallbackModel>>,
     /// Whether the provider supports deferred tools loaded by
-    /// `tool_reference` blocks in tool results.
+    /// `tool_reference` blocks in tool results. Post-#9548 catalog data no
+    /// longer carries this key (replaced by the `supportsMidConvo*` faces
+    /// below; the adapter gate converges in V15-06 — T-V15-02-1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_tool_references: Option<bool>,
+    /// Whether the model accepts system messages / Kimi-style tool-bearing
+    /// system messages after the conversation started (#9548, 9e05370b2 —
+    /// replaces the earlier `supportsToolReferences` catalog face). Declared
+    /// in OpenAI-completions/responses and Anthropic-messages compat;
+    /// catalog bake rules are V15-03 data sync, wire semantics V15-06.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_mid_convo_system_messages: Option<bool>,
+    /// Whether tool additions can ride system messages mid-conversation
+    /// (Kimi K3 family: Moonshot, Fireworks, OpenCode; not GitHub Copilot).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_mid_convo_tool_additions: Option<bool>,
+    /// Whether the transport accepts `tool_addition`/`tool_removal` blocks
+    /// (first-party Anthropic only; proxies reject them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_mid_convo_tool_changes: Option<bool>,
 }
 
 /// `AnthropicAllowedFallbackModel` (types.ts:307-311): one server-side

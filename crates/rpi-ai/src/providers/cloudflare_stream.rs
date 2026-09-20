@@ -98,6 +98,7 @@ mod tests {
             thinking_level_map: None,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
+            prompt_cache: None,
             context_window: 1000,
             max_tokens: 100,
             headers: None,

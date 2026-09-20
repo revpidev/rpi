@@ -282,6 +282,7 @@ impl FauxProvider {
                     rates: d.cost.unwrap_or_default(),
                     tiers: None,
                 },
+                prompt_cache: None,
                 context_window: d.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
                 max_tokens: d.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
                 headers: None,

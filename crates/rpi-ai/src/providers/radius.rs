@@ -1,10 +1,13 @@
-//! Port of `packages/ai/src/providers/radius.ts` @ pi 0.82.1 (2efa728) —
-//! Radius gateway provider with a persisted, dynamically refreshed catalog.
+//! Port of `packages/ai/src/providers/radius.ts` @ pi 0.86.1+ (19451accd)
+//! — Radius gateway provider: ships the static public catalog for the
+//! default gateway and overlays the effective gateway catalog after
+//! authentication (4d38031fb "ship Radius model catalog").
 //!
 //! W5 scope notes:
-//! - The static baseline catalog is empty: models come from the OAuth
-//!   credential's cached `gatewayConfig` / `{gateway}/v1/config` refresh
-//!   (`radius_config`).
+//! - Custom gateways do not inherit the public `radius.pi.dev` catalog
+//!   (upstream docs/providers.md#radius): their baseline is empty and
+//!   models come from the OAuth credential's cached `gatewayConfig` /
+//!   `{gateway}/v1/config` refresh (`radius_config`).
 //! - OAuth (`loadRadiusOAuth`: browser PKCE / device code against the
 //!   normalized gateway) landed in T13 W5 as
 //!   [`crate::auth::oauth::radius`], constructed here from the same
@@ -15,10 +18,13 @@
 //!   normalized gateway URL.
 //!
 //! W6-C notes (`refreshModels` overlay, upstream radius.ts:36-63):
-//! - [`RadiusProvider`] holds the `models` cell and `inflightRefresh` dedup
-//!   slot (D-032 item 5 closes here); [`Provider::refresh_models`] restores
-//!   the provider-scoped store, imports legacy `gatewayConfig` catalogs,
-//!   then fetches `{gateway}/v1/config` with the effective credential.
+//! - [`RadiusProvider`] holds the `dynamicModels` cell and `inflightRefresh`
+//!   dedup slot (D-032 item 5 closes here); [`Provider::refresh_models`]
+//!   restores the provider-scoped store, imports legacy `gatewayConfig`
+//!   catalogs, then fetches `{gateway}/v1/config` with the effective
+//!   credential. Only the dynamic overlay is written — the static baseline
+//!   stays put and [`Provider::get_models`] merges the two (dynamic wins by
+//!   id, new ids append; radius.ts:40-49 @ 4d38031fb).
 //! - [`Models::refresh`] (models.ts:276-328) resolves the credential before
 //!   the provider runs, so the Bearer key is the resolved access token.
 
@@ -62,6 +68,16 @@ pub fn radius_provider_with(options: RadiusProviderOptions) -> Arc<RadiusProvide
     let name = options.name.unwrap_or_else(|| "Radius".to_owned());
     let gateway =
         normalize_radius_gateway_url(options.gateway.as_deref().unwrap_or(DEFAULT_RADIUS_GATEWAY));
+    // `baselineModels` (radius.ts:26-29 @ 4d38031fb): the generated public
+    // catalog ships with the default gateway only; custom gateways start
+    // empty. The baseline models keep the catalog's `radius` provider id
+    // upstream via `flattenModelCatalog("radius", …)`; our vendored data
+    // already carries `provider: "radius"` and `baseUrl: …/v1`.
+    let baseline = if gateway == normalize_radius_gateway_url(DEFAULT_RADIUS_GATEWAY) {
+        crate::generated::get_builtin_models("radius").to_vec()
+    } else {
+        Vec::new()
+    };
     let inner = create_provider(CreateProviderOptions {
         id: id.clone(),
         name: Some(name.clone()),
@@ -77,8 +93,9 @@ pub fn radius_provider_with(options: RadiusProviderOptions) -> Arc<RadiusProvide
             // re-normalizes idempotently.
             oauth: Some(Arc::new(RadiusOAuth::new(&name, &gateway))),
         },
-        // `getModels: () => models` starts as `getRadiusModels(id, undefined)`
-        // — empty without an OAuth credential's cached gateway config.
+        // `getModels: () => merged` — the merge of baseline + dynamic
+        // happens in [`RadiusProvider::get_models`] below; the inner core's
+        // list stays the credential-less dynamic start.
         models: get_radius_models(&id, None),
         api: ProviderApi::Single(Arc::new(PiMessages)),
         ..Default::default()
@@ -86,22 +103,29 @@ pub fn radius_provider_with(options: RadiusProviderOptions) -> Arc<RadiusProvide
     Arc::new(RadiusProvider {
         inner,
         gateway,
-        // The `models` closure cell (radius.ts:24): starts from the
+        baseline,
+        // The `dynamicModels` closure cell (radius.ts:25): starts from the
         // credential-less list, replaced by `refresh_models`.
-        models: Arc::new(Mutex::new(get_radius_models(&id, None))),
+        dynamic_models: Arc::new(Mutex::new(get_radius_models(&id, None))),
         id,
         inflight: InflightRefresh::new(),
     })
 }
 
-/// Decorator retaining the normalized gateway URL and the dynamic catalog
-/// overlay (`models` / `inflightRefresh` closure state, radius.ts:24-25);
+/// Decorator retaining the normalized gateway URL, the static public
+/// baseline catalog, and the dynamic overlay (`baselineModels` /
+/// `dynamicModels` / `inflightRefresh` closure state, radius.ts:25-30);
 /// everything else delegates to the [`create_provider`] core.
 pub struct RadiusProvider {
     inner: Arc<dyn Provider>,
     gateway: String,
     id: String,
-    models: Arc<Mutex<Vec<Model>>>,
+    /// `baselineModels` — read-only after construction (the static public
+    /// catalog; empty for custom gateways).
+    baseline: Vec<Model>,
+    /// `dynamicModels` — written by `refresh_models` (stored restore, legacy
+    /// import, gateway fetch).
+    dynamic_models: Arc<Mutex<Vec<Model>>>,
     inflight: InflightRefresh,
 }
 
@@ -136,10 +160,22 @@ impl Provider for RadiusProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        self.models
+        // `getModels()` (radius.ts:40-49 @ 4d38031fb): merge the static
+        // baseline with the dynamic overlay — a dynamic entry replaces the
+        // baseline entry of the same id in place, otherwise appends.
+        let dynamic = self
+            .dynamic_models
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone();
+        let mut merged = self.baseline.clone();
+        for model in dynamic {
+            match merged.iter().position(|entry| entry.id == model.id) {
+                Some(index) => merged[index] = model,
+                None => merged.push(model),
+            }
+        }
+        merged
     }
 
     fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
@@ -156,13 +192,14 @@ impl Provider for RadiusProvider {
     ) -> Option<BoxFuture<'_, Result<(), ModelsError>>> {
         let id = self.id.clone();
         let gateway = self.gateway.clone();
-        let models = self.models.clone();
+        let models = self.dynamic_models.clone();
         let inflight = &self.inflight;
         Some(Box::pin(async move {
             inflight
                 .join_or_run(async move {
                     // Phase 1: restore from the stored snapshot
-                    // (models.ts:375-383 @ 4181f66).
+                    // (models.ts:375-383 @ 4181f66). Only the dynamic
+                    // overlay cell is written; the static baseline stays.
                     let stored = context.stored.clone();
                     let dynamic = if let Some(stored) = &stored {
                         stored
@@ -299,8 +336,18 @@ mod tests {
         let provider = radius_provider();
         assert_eq!(provider.id(), "radius");
         assert_eq!(provider.name(), "Radius");
-        // Purely dynamic: empty until refreshed (providers.test.ts:41).
-        assert!(provider.get_models().is_empty());
+        // Ships the static public catalog for the default gateway
+        // (radius-provider.test.ts "ships a static public catalog…",
+        // 4d38031fb).
+        let models = provider.get_models();
+        assert!(!models.is_empty());
+        assert!(models.iter().any(|model| model.id == "balanced"));
+        let balanced = models
+            .iter()
+            .find(|model| model.id == "balanced")
+            .expect("balanced");
+        assert_eq!(balanced.provider, "radius");
+        assert_eq!(balanced.api.as_str(), "rpi-messages");
     }
 
     #[test]
@@ -313,6 +360,10 @@ mod tests {
         assert_eq!(provider.id(), "radius-eu");
         assert_eq!(provider.name(), "Radius EU");
         assert_eq!(provider.gateway(), "https://radius.eu.example.com");
+        // Custom gateways do not inherit the public `radius.pi.dev` catalog
+        // (radius-provider.test.ts "does not apply the public Radius catalog
+        // to custom gateways").
+        assert!(provider.get_models().is_empty());
     }
 
     // ------------------------------------------------------------------
@@ -488,6 +539,65 @@ mod tests {
             .expect("refresh");
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["stored".to_owned()]);
+    }
+
+    /// "overlays a cached effective catalog without network access"
+    /// (radius-provider.test.ts, 4d38031fb): on the default gateway the
+    /// stored dynamic catalog overlays the static baseline — same-id entries
+    /// are replaced in place, new ids append; baseline-only ids survive.
+    #[tokio::test]
+    async fn overlays_cached_catalog_on_the_static_baseline_without_network() {
+        let stored_models = vec![
+            {
+                let mut model = radius_model("balanced");
+                model.name = "Fresh Balanced".to_owned();
+                model.context_window = 424_242;
+                model.base_url = "https://radius.example/v1".to_owned();
+                model
+            },
+            radius_model("organization-only"),
+        ];
+        let store: Arc<dyn crate::models_store::ModelsStore> =
+            Arc::new(crate::models_store::InMemoryModelsStore::new());
+        store
+            .write(
+                "radius",
+                crate::models_store::ModelsStoreEntry {
+                    models: stored_models,
+                    last_modified: None,
+                    checked_at: Some(now_millis()),
+                    etag: None,
+                },
+                None,
+            )
+            .await
+            .expect("write");
+        let provider = radius_provider();
+        let context =
+            make_context(store, Some(oauth_credential("access-token")), false, false).await;
+        provider
+            .refresh_models(context)
+            .expect("refresh")
+            .await
+            .expect("refresh");
+        let models = provider.get_models();
+        // Baseline (27) + organization-only; `balanced` is replaced, not
+        // duplicated.
+        assert_eq!(models.len(), 27 + 1);
+        assert_eq!(
+            models.iter().filter(|model| model.id == "balanced").count(),
+            1
+        );
+        let balanced = models
+            .iter()
+            .find(|model| model.id == "balanced")
+            .expect("balanced");
+        assert_eq!(balanced.name, "Fresh Balanced");
+        assert_eq!(balanced.base_url, "https://radius.example/v1");
+        assert_eq!(balanced.context_window, 424_242);
+        assert!(models.iter().any(|model| model.id == "organization-only"));
+        // Baseline-only ids survive the overlay.
+        assert!(models.iter().any(|model| model.id == "precise"));
     }
 
     #[tokio::test]

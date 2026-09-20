@@ -1401,11 +1401,35 @@ fn e2e_fixed_child_full_pipeline() {
             wait["details"]["timedOut"].is_null(),
             "wait must observe the terminal transition, not time out: {wait}"
         );
-        let messages = take_sent_messages();
-        let notify = messages
-            .iter()
-            .find(|m| m["customType"] == json!("subagent-notify"))
-            .expect("completion notification arrived as subagent-notify");
+        // Load-tolerant completion poll (pre-existing flake under full-
+        // workspace parallel load, reproduced on a clean tree 2026-09-20 —
+        // V15-03 §7.4): `subagent_wait` can observe the terminal status
+        // transition before the runner's sendMessage host call lands in the
+        // message registry; same fix class as the login-harness sequencing
+        // note in model_runtime.rs (sequence/budget instead of a single
+        // immediate read).
+        let mut notify_legacy_type_seen = false;
+        let notify = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let messages = take_sent_messages();
+                notify_legacy_type_seen |= messages
+                    .iter()
+                    .any(|m| m["customType"] == json!("subagent-async-complete"));
+                if let Some(found) = messages
+                    .iter()
+                    .find(|m| m["customType"] == json!("subagent-notify"))
+                    .cloned()
+                {
+                    break found;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "completion notification never arrived as subagent-notify"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
         // Wire shape (notify.ts sendCompletion): no details field on the
         // message; the renderer re-parses the content text. `display` is
         // false for completed background runs (only non-completed or
@@ -1459,7 +1483,7 @@ fn e2e_fixed_child_full_pipeline() {
         // (host render dispatch).
         let tree = rpi_ext_subagents::render_message_for_test(
             "subagent-notify",
-            notify,
+            &notify,
             &json!({ "expanded": false }),
         );
         let children = tree["children"].as_array().unwrap();
@@ -1483,13 +1507,9 @@ fn e2e_fixed_child_full_pipeline() {
             })
             .expect("run id line rendered in the collapsed notice");
         assert_eq!(run_line["props"]["fg"], json!("muted"));
-        // The old self-made type is gone.
-        assert!(
-            !messages
-                .iter()
-                .any(|m| m["customType"] == json!("subagent-async-complete")),
-            "legacy type no longer injected"
-        );
+        // The old self-made type is gone (the poll drained the registry;
+        // the legacy type would have surfaced in any of those batches).
+        assert!(!notify_legacy_type_seen, "legacy type no longer injected");
     }
 
     // ---- Scenario 12 (TE05): budget rejection paths (FR-P1-04/09) -----

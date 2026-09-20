@@ -1084,10 +1084,12 @@ impl ModelRuntime {
         });
         // Seed the built-in providers (model-runtime.ts:181-190): every
         // static catalog provider is wrapped in the persisted remote-catalog
-        // overlay (`withRemoteCatalog`); radius is a dynamic provider and
-        // passes through unchanged. models.json then composes over these
-        // bases as the overlay layer (provider-composer), so users only
-        // write custom/override config — D-038 registration wave.
+        // overlay (`withRemoteCatalog`); radius carries its own static public
+        // baseline + gateway overlay inside the provider (4d38031fb) and
+        // passes through unwrapped (model-runtime.ts:187). models.json then
+        // composes over these bases as the overlay layer
+        // (provider-composer), so users only write custom/override config —
+        // D-038 registration wave.
         let catalog_base_url = model_catalog_endpoint(options.catalog_base_url.as_deref());
         let builtin_generated_at = rpi_ai::generated::get_builtin_model_data_generated_at();
         for provider in rpi_ai::providers::builtin_providers() {
@@ -2282,6 +2284,7 @@ fn json_model_to_model(
         thinking_level_map: model.thinking_level_map.clone(),
         input: model.input.clone().unwrap_or_else(default_input),
         cost: model.cost.clone().unwrap_or_default(),
+        prompt_cache: None,
         context_window: model.context_window.unwrap_or(128000.0) as u32,
         max_tokens: model.max_tokens.unwrap_or(16384.0) as u32,
         sampling_params: model.sampling_params.clone(),
@@ -2339,6 +2342,7 @@ fn config_model_to_model(
             model.input.clone()
         },
         cost: model.cost.clone().unwrap_or_default(),
+        prompt_cache: None,
         context_window: model.context_window,
         max_tokens: model.max_tokens,
         sampling_params: model.sampling_params.clone(),
@@ -2470,7 +2474,8 @@ mod tests {
         assert!(deepseek.auth().oauth.is_none());
         assert!(deepseek.auth().api_key.is_some());
         assert!(!deepseek.get_models().is_empty());
-        // radius is a dynamic provider, not a catalog entry.
+        // radius ships the static public catalog itself (4d38031fb) and
+        // overlays the gateway catalog at refresh.
         assert!(runtime.get_provider("radius").is_some());
         // No composition errors with an empty models.json.
         assert!(
@@ -2534,7 +2539,8 @@ mod tests {
             deepseek.refresh_models(probe).is_some(),
             "configured base URL: built-in carries the remote-catalog overlay"
         );
-        // radius stays dynamic and passes through unwrapped.
+        // radius passes through unwrapped (its static baseline lives inside
+        // the provider, not in the remote-catalog overlay).
         let radius = runtime.get_provider("radius").expect("radius");
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
         assert!(radius
@@ -3425,6 +3431,7 @@ mod tests {
                 thinking_level_map: None,
                 input: vec![rpi_ai::types::InputModality::Text],
                 cost: rpi_ai::types::ModelCost::default(),
+                prompt_cache: None,
                 context_window: 1000,
                 max_tokens: 100,
                 headers: None,
@@ -3646,6 +3653,7 @@ mod tests {
             thinking_level_map: None,
             input: vec![],
             cost: Default::default(),
+            prompt_cache: None,
             context_window: 1000,
             max_tokens: 100,
             headers: None,
@@ -3732,6 +3740,7 @@ mod tests {
             thinking_level_map: None,
             input: vec![],
             cost: Default::default(),
+            prompt_cache: None,
             context_window: 1000,
             max_tokens: 100,
             headers: Some(headers),
@@ -3763,6 +3772,7 @@ mod tests {
             thinking_level_map: None,
             input: vec![],
             cost: Default::default(),
+            prompt_cache: None,
             context_window: 1000,
             max_tokens: 100,
             headers: None,
@@ -3797,6 +3807,7 @@ mod tests {
                 },
                 tiers: None,
             },
+            prompt_cache: None,
             context_window: 1000,
             max_tokens: 100,
             headers: None,

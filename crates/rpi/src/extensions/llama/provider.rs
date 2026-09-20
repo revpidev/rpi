@@ -162,6 +162,7 @@ fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaE
         thinking_level_map: None,
         input,
         cost: rpi_ai::types::ModelCost::default(),
+        prompt_cache: None,
         context_window,
         max_tokens: context_window,
         headers: None,

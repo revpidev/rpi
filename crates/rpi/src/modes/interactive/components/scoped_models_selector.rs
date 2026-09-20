@@ -700,6 +700,7 @@ mod tests {
             thinking_level_map: None,
             input: Vec::new(),
             cost: Default::default(),
+            prompt_cache: None,
             context_window: 128000,
             max_tokens: 16384,
             headers: None,

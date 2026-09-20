@@ -47,6 +47,7 @@ fn test_model() -> Model {
         thinking_level_map: None,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),
+        prompt_cache: None,
         context_window: 8192,
         max_tokens: 2048,
         headers: None,

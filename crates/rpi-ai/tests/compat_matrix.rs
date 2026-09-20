@@ -12,8 +12,8 @@ use rpi_ai::api::anthropic_messages::get_anthropic_compat;
 use rpi_ai::api::openai_completions::{detect_compat, get_compat, ResolvedOpenAICompletionsCompat};
 use rpi_ai::generated::get_builtin_model;
 use rpi_ai::types::{
-    CacheControlFormat, DeferredToolsMode, MaxTokensField, Model, ModelThinkingLevel,
-    SessionAffinityFormat, ThinkingFormat,
+    CacheControlFormat, MaxTokensField, Model, ModelThinkingLevel, SessionAffinityFormat,
+    ThinkingFormat,
 };
 use serde_json::json;
 
@@ -351,21 +351,33 @@ fn test_catalog_zai_tool_stream_baked() {
 fn test_catalog_kimi_deferred_tools_baked() {
     let k3 = get_builtin_model("moonshotai", "kimi-k3").expect("kimi-k3");
     let compat = k3.compat.as_ref().expect("compat");
-    assert_eq!(compat.deferred_tools_mode, Some(DeferredToolsMode::Kimi));
+    // Post-#9548 catalog shape (9e05370b2): the Kimi deferred-tools face is
+    // carried as mid-conversation system/tool-addition support instead of
+    // `deferredToolsMode` (which left the catalog; the resolved-compat
+    // default stays Kimi-mode for the adapter). Wire-side convergence:
+    // V15-06 (T-V15-02-1).
+    assert_eq!(compat.supports_mid_convo_system_messages, Some(true));
+    assert_eq!(compat.supports_mid_convo_tool_additions, Some(true));
     assert_eq!(
         compat.requires_reasoning_content_on_assistant_messages,
         Some(true)
     );
     assert_eq!(compat.max_tokens_field, Some(MaxTokensField::MaxTokens));
-    assert_eq!(
-        get_compat(k3).deferred_tools_mode,
-        Some(DeferredToolsMode::Kimi)
-    );
 
     let k3_cn = get_builtin_model("moonshotai-cn", "kimi-k3").expect("kimi-k3 cn");
     assert_eq!(
-        k3_cn.compat.as_ref().and_then(|c| c.deferred_tools_mode),
-        Some(DeferredToolsMode::Kimi)
+        k3_cn
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_mid_convo_system_messages),
+        Some(true)
+    );
+    assert_eq!(
+        k3_cn
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_mid_convo_tool_additions),
+        Some(true)
     );
 }
 

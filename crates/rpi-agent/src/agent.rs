@@ -119,6 +119,7 @@ fn default_model() -> Model {
         thinking_level_map: None,
         input: Vec::new(),
         cost: ModelCost::default(),
+        prompt_cache: None,
         context_window: 0,
         max_tokens: 0,
         headers: None,

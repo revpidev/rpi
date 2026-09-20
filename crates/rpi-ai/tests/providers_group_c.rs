@@ -22,7 +22,7 @@ use rpi_ai::providers::{
     ant_ling, kimi_coding, minimax, minimax_cn, moonshotai, moonshotai_cn, qwen_token_plan,
     qwen_token_plan_cn, zai, zai_coding_cn,
 };
-use rpi_ai::types::{ApiKind, DeferredToolsMode};
+use rpi_ai::types::ApiKind;
 
 struct MapAuthContext(HashMap<String, String>);
 
@@ -195,10 +195,21 @@ async fn auth_resolves_the_env_key() {
 /// family has been retired upstream (catalog refresh @ 4181f66).
 #[test]
 fn zai_tool_stream_compat_is_baked_into_the_catalog() {
-    for factory in [
-        zai::zai_provider as fn() -> Arc<dyn Provider>,
-        zai_coding_cn::zai_coding_cn_provider,
-    ] {
+    // zai keeps the GLM-4.7→GLM-5.2 family; zai-coding-cn shrank to the
+    // GLM-5.3 family + glm-4.6v in the 2026-09-20 models.dev snapshot
+    // (rules unchanged — same G2 drift class as the V14-09 xiaomi split).
+    type FactoryIds<'a> = (fn() -> Arc<dyn Provider>, &'a [&'a str]);
+    let cases: Vec<FactoryIds> = vec![
+        (
+            zai::zai_provider as fn() -> Arc<dyn Provider>,
+            &["glm-4.7", "glm-5-turbo", "glm-5.2", "glm-5.2-highspeed"],
+        ),
+        (
+            zai_coding_cn::zai_coding_cn_provider,
+            &["glm-5.3", "glm-5.3-flash", "glm-5.3-highspeed"],
+        ),
+    ];
+    for (factory, ids) in cases {
         let provider = factory();
         let models = provider.get_models();
         let zai_tool_stream = |id: &str| {
@@ -210,7 +221,7 @@ fn zai_tool_stream_compat_is_baked_into_the_catalog() {
                 .as_ref()
                 .and_then(|compat| compat.zai_tool_stream)
         };
-        for id in ["glm-4.7", "glm-5-turbo", "glm-5.2", "glm-5.2-highspeed"] {
+        for id in ids {
             assert_eq!(zai_tool_stream(id), Some(true), "{id}");
         }
     }
@@ -235,12 +246,22 @@ fn moonshotai_kimi_k3_pricing_and_deferred_tools() {
         assert_eq!(model.cost.rates.output, 15.0);
         assert_eq!(model.cost.rates.cache_read, 0.3);
         assert_eq!(model.cost.rates.cache_write, 0.0);
+        // Post-#9548 catalog shape: `deferredToolsMode` was replaced by the
+        // mid-conversation compat faces (9e05370b2; wire convergence V15-06,
+        // T-V15-02-1).
         assert_eq!(
             model
                 .compat
                 .as_ref()
-                .and_then(|compat| compat.deferred_tools_mode),
-            Some(DeferredToolsMode::Kimi)
+                .and_then(|compat| compat.supports_mid_convo_system_messages),
+            Some(true)
+        );
+        assert_eq!(
+            model
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.supports_mid_convo_tool_additions),
+            Some(true)
         );
     }
 }

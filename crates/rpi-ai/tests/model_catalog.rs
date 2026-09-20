@@ -53,7 +53,7 @@ fn test_vendored_files_match_manifest_sha256() {
     )
     .expect("manifest json");
     let files = manifest["files"].as_object().expect("files");
-    assert_eq!(files.len(), 39);
+    assert_eq!(files.len(), 41);
     for (name, hash) in files {
         let bytes = std::fs::read(data_dir().join(name)).expect("vendored file");
         assert_eq!(
@@ -102,6 +102,15 @@ fn normalize_numbers(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Gateway-passthrough keys the Radius public catalog carries on every
+/// entry (`enabled` / `lab` / `providers` routing metadata from
+/// `{gateway}/v1/config`). Upstream TS spreads them into the Model objects
+/// untyped (nothing consumes them); our typed [`Model`] drops them at parse
+/// time — same intentional difference as the dynamic-path sanitize
+/// (D-032, `radius_config.rs` header). Stripped here so the field-by-field
+/// comparison stays exact for every declared field.
+const RADIUS_PASSTHROUGH_KEYS: [&str; 3] = ["enabled", "lab", "providers"];
+
 /// Runtime shape: every model in every vendored provider JSON survives the
 /// typed parse (`builtin_catalog`) and re-serialization field-for-field.
 /// Since V14-09 the comparison source is the vendored JSON itself (the
@@ -146,16 +155,34 @@ fn test_catalog_field_by_field_roundtrip() {
                 "model order diverges for {provider}"
             );
             assert_eq!(model.provider, provider);
+            let mut expected_value = (*expected_value).clone();
+            if provider == "radius" {
+                if let serde_json::Value::Object(map) = &mut expected_value {
+                    for key in RADIUS_PASSTHROUGH_KEYS {
+                        map.remove(key);
+                    }
+                    // `pi-messages` reads back as `rpi-messages` (the de-pi
+                    // brand rename, `normalize_api_kind`; radius is the only
+                    // catalog provider on that API).
+                    if map.get("api") == Some(&serde_json::Value::String("pi-messages".to_owned()))
+                    {
+                        map.insert(
+                            "api".to_owned(),
+                            serde_json::Value::String("rpi-messages".to_owned()),
+                        );
+                    }
+                }
+            }
             let actual = normalize_numbers(&serde_json::to_value(model).expect("serialize model"));
             assert_eq!(
                 &actual,
-                &normalize_numbers(expected_value),
+                &normalize_numbers(&expected_value),
                 "field-level divergence for {provider}:{expected_id}"
             );
             total += 1;
         }
     }
-    assert_eq!(total, 1397);
+    assert_eq!(total, 1443);
 }
 
 /// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
@@ -202,10 +229,10 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-09-14T02:27:28.134Z); update on catalog refresh.
+    // (2026-09-20T13:19:54.379Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_789_352_848_134)
+        Some(1_789_910_394_379)
     );
 }
 
@@ -483,10 +510,13 @@ fn test_correction_fireworks_kimi_k3_compat() {
         compat.requires_reasoning_content_on_assistant_messages,
         Some(true)
     );
-    assert_eq!(
-        compat.deferred_tools_mode,
-        Some(rpi_ai::types::DeferredToolsMode::Kimi)
-    );
+    // Post-#9548 catalog shape: the Kimi deferred-tools face is expressed as
+    // mid-conversation system/tool-addition support (9e05370b2 rework;
+    // deferredToolsMode left the catalog). Wire-side convergence: V15-06
+    // (T-V15-02-1).
+    assert_eq!(compat.supports_mid_convo_system_messages, Some(true));
+    assert_eq!(compat.supports_mid_convo_tool_additions, Some(true));
+    assert_eq!(compat.supports_mid_convo_tool_changes, None);
     assert_eq!(compat.send_session_affinity_headers, Some(true));
 }
 

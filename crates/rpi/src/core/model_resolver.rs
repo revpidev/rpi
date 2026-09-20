@@ -25,7 +25,10 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 38] = [
     ("openai", "gpt-5.5"),
     ("azure-openai-responses", "gpt-5.4"),
     ("openai-codex", "gpt-5.5"),
-    ("radius", "auto"),
+    // `balanced` since 9767ba275 (select Radius models after catalog
+    // discovery); post-login selection falls back to catalog order when the
+    // account catalog lacks it (complete_provider_authentication).
+    ("radius", "balanced"),
     ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
     ("deepseek", "deepseek-v4-pro"),
     ("google", "gemini-3.1-pro-preview"),
@@ -1025,6 +1028,7 @@ mod tests {
             thinking_level_map: None,
             input: vec![InputModality::Text],
             cost: Default::default(),
+            prompt_cache: None,
             context_window: 200000,
             max_tokens: 8192,
             headers: None,

@@ -125,6 +125,7 @@ pub fn get_radius_models_from_config(
             thinking_level_map: model.thinking_level_map.clone(),
             input: model.input.clone(),
             cost: model.cost.clone(),
+            prompt_cache: None,
             context_window: model.context_window,
             max_tokens: model.max_tokens,
             headers: None,

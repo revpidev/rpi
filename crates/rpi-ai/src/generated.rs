@@ -195,17 +195,19 @@ mod tests {
     fn test_catalog_loads_all_vendored_providers() {
         let catalog = builtin_catalog().expect("vendored catalog parses");
         assert_eq!(catalog.providers().len(), CATALOG_PROVIDER_DATA.len());
-        assert_eq!(catalog.providers().len(), 39);
+        assert_eq!(catalog.providers().len(), 41);
         let total: usize = catalog
             .providers()
             .iter()
             .map(|provider| catalog.models(provider).len())
             .sum();
-        // rc.13 catalog-only regen @ 71dca871b rules (models.dev snapshot
-        // 2026-09-14).
-        assert_eq!(total, 1397);
-        // The dynamic radius provider has no catalog entry (upstream all.ts).
-        assert!(!catalog.providers().contains(&"radius"));
+        // Pin-aligned regen @ 19451accd rules (models.dev + Radius public
+        // catalog snapshot 2026-09-20; +radius +meta vs the rc.13 snapshot).
+        assert_eq!(total, 1443);
+        // Radius ships its static public catalog since 4d38031fb; the
+        // gateway overlay lives in `providers::radius`.
+        assert!(catalog.providers().contains(&"radius"));
+        assert!(catalog.providers().contains(&"meta"));
     }
 
     #[test]

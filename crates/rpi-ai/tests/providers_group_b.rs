@@ -457,15 +457,21 @@ async fn test_opencode_go_factory_config_and_auth() {
 // radius
 // ---------------------------------------------------------------------------
 
-/// Upstream (providers.test.ts:41): Radius is purely dynamic — the static
-/// catalog is empty until refreshed.
+/// Upstream (providers.test.ts:41 / radius-provider.test.ts
+/// "ships a static public catalog for the default gateway"): the default
+/// gateway provider carries the vendored public catalog from construction;
+/// only the overlay is dynamic.
 #[tokio::test]
 async fn test_radius_factory_config_and_auth() {
     let provider = radius_provider();
     assert_eq!(provider.id(), "radius");
     assert_eq!(provider.name(), "Radius");
     assert_eq!(provider.base_url(), None);
-    assert!(provider.get_models().is_empty());
+    assert!(!provider.get_models().is_empty());
+    assert!(provider
+        .get_models()
+        .iter()
+        .any(|model| model.id == "balanced"));
 
     let auth = provider.auth();
     let api_key = auth.api_key.as_ref().expect("api key auth");

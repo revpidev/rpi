@@ -4362,9 +4362,14 @@ mod fireworks_deferred_tools_tests {
     use super::*;
     use crate::types::{AssistantContent, ToolResultContent};
     fn fireworks_catalog_model() -> Model {
-        // The vendored catalog entry carries supportsToolReferences +
-        // allowEmptySignature + forceAdaptiveThinking (generator @ 2026-09-14
-        // snapshot ≥ #9323); only the endpoint is overridden for capture.
+        // The V15-02 wire test pins the d92eb8d4b-era catalog face
+        // (supportsToolReferences + allowEmptySignature +
+        // forceAdaptiveThinking). The #9548 rework (9e05370b2) dropped
+        // `supportsToolReferences` from the vendored catalog (replaced by
+        // the supportsMidConvo* faces), so the gate is restored explicitly
+        // here; catalog-data sync landed with V15-03 and the adapter-gate
+        // convergence is V15-06 (T-V15-02-1). Only the endpoint is
+        // overridden for capture.
         let mut model = crate::generated::get_builtin_model(
             "fireworks",
             "accounts/fireworks/models/deepseek-v4-flash-0731",
@@ -4372,6 +4377,9 @@ mod fireworks_deferred_tools_tests {
         .expect("catalog model")
         .clone();
         model.base_url = "http://127.0.0.1:9".to_owned();
+        let mut compat = model.compat.clone().unwrap_or_default();
+        compat.supports_tool_references = Some(true);
+        model.compat = Some(compat);
         model
     }
 

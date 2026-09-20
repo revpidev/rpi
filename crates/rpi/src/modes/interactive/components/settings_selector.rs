@@ -2880,6 +2880,7 @@ mod tests {
                 rates: ModelCostRates::default(),
                 tiers: None,
             },
+            prompt_cache: None,
             context_window: 200_000,
             max_tokens: 8_192,
             headers: None,

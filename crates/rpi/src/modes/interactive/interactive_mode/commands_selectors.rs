@@ -902,12 +902,6 @@ fn show_ambient_auth_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProv
     mount_login_dialog(ui, &dialog);
 }
 
-/// `completeProviderAuthentication` (interactive-mode.ts:5083-5134):
-/// post-login status line, default-model auto-selection when the agent
-/// still runs the "unknown" placeholder, and the footer/editor refresh.
-/// `getAvailable` failures propagate to the caller, which reports them
-/// like any login failure (upstream lets them reject out of
-/// `showApiKeyLoginDialog`'s try).
 /// `llamaCppPostLoginGuidance` (interactive-mode.ts:290-294 @ a1bc0ec79,
 /// #8203): llama.cpp has no default model — direct users to `/llama` first
 /// when nothing is loaded. The provider id matches
@@ -921,20 +915,18 @@ fn llama_cpp_post_login_guidance(action_label: &str, loaded_model_count: usize) 
     }
 }
 
-async fn complete_provider_authentication(
+/// `finishAuthentication` (interactive-mode.ts:5691-5726 @ 9767ba275):
+/// the immediate selection pass — default-model auto-selection when the
+/// agent still runs the "unknown" placeholder, the footer/editor refresh,
+/// and the status line. Extracted from `completeProviderAuthentication` so
+/// the deferred path can re-run it after catalog discovery completes.
+async fn finish_authentication(
     ui: &Arc<InteractiveUi>,
+    runtime: &ModelRuntime,
     provider_id: &str,
-    provider_name: &str,
-    auth_type: AuthType,
+    action_label: &str,
     previous_model: Option<Model>,
 ) -> Result<(), ModelsError> {
-    let runtime = ui.session().model_runtime().clone();
-    let _ = runtime.get_available(None).await?;
-    let action_label = match auth_type {
-        AuthType::Oauth => format!("Logged in to {provider_name}"),
-        AuthType::ApiKey => format!("Saved API key for {provider_name}"),
-    };
-
     let mut selected_model: Option<Model> = None;
     let mut selection_error: Option<String> = None;
     // The agent's "unknown" placeholder maps to `None`
@@ -951,7 +943,7 @@ async fn complete_provider_authentication(
         // the connection; /llama loads a model first.
         if provider_id == "llama.cpp" {
             selection_error = Some(llama_cpp_post_login_guidance(
-                &action_label,
+                action_label,
                 provider_models.len(),
             ));
         } else {
@@ -970,7 +962,15 @@ async fn complete_provider_authentication(
                     let candidate = provider_models
                         .iter()
                         .find(|model| model.id == default_model_id)
-                        .cloned();
+                        .cloned()
+                        // Radius catalogs vary by account; prefer
+                        // `balanced`, then use catalog order
+                        // (9767ba275).
+                        .or_else(|| {
+                            (provider_id == "radius")
+                                .then(|| provider_models.first().cloned())
+                                .flatten()
+                        });
                     match candidate {
                         None => {
                             selection_error = Some(format!(
@@ -1033,6 +1033,122 @@ async fn complete_provider_authentication(
             ui.show_error(&selection_error);
         }
     }
+    Ok(())
+}
+
+/// `completeProviderAuthentication` (interactive-mode.ts:5675-5737 @
+/// 9767ba275): post-login default-model selection, waiting for catalog
+/// discovery when the default model is not in the available snapshot yet
+/// ("select Radius models after catalog discovery"). Dynamic catalogs may
+/// be empty until the first authenticated network refresh, so the
+/// selection defers to after the scoped refresh completes instead of
+/// erroring with "default model not available"; a session/model change
+/// made while the refresh ran cancels the deferred pick.
+/// `deferSelection` (interactive-mode.ts:5681-5685 @ 9767ba275): dynamic
+/// catalogs may be empty until the first authenticated network refresh, so
+/// when the agent still runs the "unknown" placeholder, a default model is
+/// configured for the provider, and that default is not in the available
+/// snapshot yet, the post-login selection waits for catalog discovery
+/// instead of erroring with "default model not available".
+fn post_login_selection_should_defer(
+    previous_model: Option<&Model>,
+    provider_id: &str,
+    available: &[Model],
+) -> bool {
+    previous_model.is_none()
+        && default_model_for_provider(provider_id).is_some()
+        && !available.iter().any(|model| {
+            model.provider == provider_id
+                && Some(model.id.as_str()) == default_model_for_provider(provider_id)
+        })
+}
+
+async fn complete_provider_authentication(
+    ui: &Arc<InteractiveUi>,
+    provider_id: &str,
+    provider_name: &str,
+    auth_type: AuthType,
+    previous_model: Option<Model>,
+) -> Result<(), ModelsError> {
+    let runtime = ui.session().model_runtime().clone();
+    let _ = runtime.get_available(None).await?;
+    let action_label = match auth_type {
+        AuthType::Oauth => format!("Logged in to {provider_name}"),
+        AuthType::ApiKey => format!("Saved API key for {provider_name}"),
+    };
+    let defer_selection = post_login_selection_should_defer(
+        previous_model.as_ref(),
+        provider_id,
+        &runtime.get_available(None).await?,
+    );
+
+    // `getAuthPath()` (config.ts:534-536): `{agentDir}/auth.json`.
+    let auth_path = lock(&ui.session().resource_loader())
+        .agent_dir()
+        .join("auth.json");
+    if defer_selection {
+        ui.show_status(&format!(
+            "{action_label}. Credentials saved to {}. Refreshing model catalog…",
+            auth_path.display()
+        ));
+    } else {
+        finish_authentication(
+            ui,
+            &runtime,
+            provider_id,
+            &action_label,
+            previous_model.clone(),
+        )
+        .await?;
+    }
+
+    // Scoped network refresh with the hard 15s abort (interactive-mode.ts:
+    // 5713-5714) — fire-and-forget upstream (`void … .then(…)`), so the
+    // completion path runs detached here too.
+    let refresh_ui = Arc::clone(ui);
+    let refresh_runtime = runtime.clone();
+    let refresh_provider_id = provider_id.to_owned();
+    let refresh_action_label = action_label.clone();
+    let refresh_previous_model = previous_model.clone();
+    tokio::spawn(async move {
+        let token = CancellationToken::new();
+        let abort = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15_000)).await;
+            abort.cancel();
+        });
+        let result = refresh_runtime
+            .refresh(Some(rpi_ai::models::ModelsRefreshOptions {
+                providers: Some(vec![refresh_provider_id.clone()]),
+                signal: Some(token),
+                ..Default::default()
+            }))
+            .await;
+        if result.aborted {
+            refresh_ui.show_warning(&format!(
+                "{refresh_action_label}, but its model catalog refresh timed out; using cached models."
+            ));
+        } else if !result.errors.is_empty() {
+            refresh_ui.show_warning(&format!(
+                "{refresh_action_label}, but its model catalog could not be refreshed; using cached models."
+            ));
+        }
+        // Do not replace a model or session selected while the refresh was
+        // running (interactive-mode.ts:5720-5722).
+        if defer_selection && refresh_ui.session().model() == refresh_previous_model {
+            let _ = finish_authentication(
+                &refresh_ui,
+                &refresh_runtime,
+                &refresh_provider_id,
+                &refresh_action_label,
+                refresh_previous_model,
+            )
+            .await;
+        }
+        refresh_ui.update_available_provider_count();
+        Component::invalidate(&mut *lock(&refresh_ui.footer));
+        refresh_ui.render_handle.request_render();
+    });
     Ok(())
 }
 
@@ -2967,6 +3083,99 @@ mod tests {
             .await;
     }
 
+    // ---------------------------------------------------------------------
+    // Radius selection immediacy (V15-03 FR-C / R2.3.3, 4d38031fb +
+    // 9767ba275)
+    // ---------------------------------------------------------------------
+
+    /// FR-C: `balanced` resolves from the static public catalog alone — the
+    /// post-login default selection needs no gateway request on the
+    /// selection path (`finish_authentication` performs no refresh; the
+    /// radius provider's baseline comes from the vendored catalog).
+    #[tokio::test]
+    async fn login_completion_selects_radius_balanced_from_static_catalog() {
+        let (mut mode, _terminal, session, _tmp) = mode_harness().await;
+        mode.init().await;
+        // Configure radius with an in-memory API key (no gateway round-trip;
+        // the scoped post-credential refresh is offline by construction).
+        session
+            .model_runtime()
+            .set_runtime_api_key("radius", "radius-test-key")
+            .await
+            .expect("set runtime api key");
+        let ui = Arc::clone(&mode.ui_state);
+        super::finish_authentication(
+            &ui,
+            session.model_runtime(),
+            "radius",
+            "Logged in to Radius",
+            None,
+        )
+        .await
+        .expect("finish authentication");
+        mode.ui_state.ui.tick(Instant::now());
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(
+            chat.contains("Logged in to Radius. Selected balanced"),
+            "chat: {chat}"
+        );
+        assert_eq!(
+            mode.ui_state.session().model().map(|model| model.id),
+            Some("balanced".to_string())
+        );
+        // The selection is a static-catalog model, not a gateway entry.
+        let selected = mode.ui_state.session().model().expect("model");
+        assert_eq!(selected.base_url, "https://radius.pi.dev/v1");
+    }
+
+    /// `deferSelection` (interactive-mode.ts:5681-5685 @ 9767ba275): waits
+    /// for catalog discovery only when the default model is missing from
+    /// the snapshot — with the static Radius catalog `balanced` is present
+    /// from the start, so selection stays immediate.
+    #[test]
+    fn post_login_selection_defer_predicate_matches_upstream() {
+        let radius_model = |id: &str| Model {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            api: rpi_ai::types::ApiKind::from("rpi-messages"),
+            provider: "radius".to_owned(),
+            base_url: "https://radius.pi.dev/v1".to_owned(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: Default::default(),
+            prompt_cache: None,
+            context_window: 1000,
+            max_tokens: 100,
+            headers: None,
+            compat: None,
+            sampling_params: None,
+        };
+        // Unknown placeholder + empty snapshot → defer (the account-catalog
+        // case: "Refreshing model catalog…" until discovery completes).
+        assert!(post_login_selection_should_defer(None, "radius", &[]));
+        // Static catalog already lists `balanced` → immediate.
+        assert!(!post_login_selection_should_defer(
+            None,
+            "radius",
+            &[radius_model("balanced")]
+        ));
+        // A different id does not satisfy the default → defer.
+        assert!(post_login_selection_should_defer(
+            None,
+            "radius",
+            &[radius_model("cheap")]
+        ));
+        // A selected model (no unknown placeholder) never defers.
+        assert!(!post_login_selection_should_defer(
+            Some(&radius_model("cheap")),
+            "radius",
+            &[]
+        ));
+        // Providers without a configured default never defer.
+        assert!(!post_login_selection_should_defer(None, "llama.cpp", &[]));
+    }
+
     fn rendered_chat(ui: &InteractiveUi) -> String {
         lock(&ui.chat_container).render(60).join("\n")
     }
@@ -3550,6 +3759,7 @@ mod tests {
                 thinking_level_map: None,
                 input: Vec::new(),
                 cost: rpi_ai::types::ModelCost::default(),
+                prompt_cache: None,
                 context_window: 200_000,
                 max_tokens: 64_000,
                 headers: None,
@@ -3566,6 +3776,7 @@ mod tests {
                 thinking_level_map: None,
                 input: Vec::new(),
                 cost: rpi_ai::types::ModelCost::default(),
+                prompt_cache: None,
                 context_window: 200_000,
                 max_tokens: 64_000,
                 headers: None,
@@ -3582,6 +3793,7 @@ mod tests {
                 thinking_level_map: None,
                 input: Vec::new(),
                 cost: rpi_ai::types::ModelCost::default(),
+                prompt_cache: None,
                 context_window: 200_000,
                 max_tokens: 64_000,
                 headers: None,

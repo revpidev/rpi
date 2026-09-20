@@ -67,8 +67,9 @@ pub struct BuiltinProviderSpec {
     /// Provider id (upstream `createProvider({ id })`).
     pub id: &'static str,
     /// Whether the provider has a static entry in the vendored catalog
-    /// (`generated.rs`). `false` only for `radius`, the purely dynamic
-    /// gateway provider (upstream `KnownProvider` vs `BuiltinProvider`).
+    /// (`generated.rs`). Every built-in provider qualifies since the
+    /// Radius public catalog shipped (4d38031fb); the `meta` catalog
+    /// entries wait for their provider registration in V15-15.
     pub in_catalog: bool,
     /// Factory, once the provider is ported in a W4 follow-up wave.
     pub factory: Option<ProviderFactory>,
@@ -230,7 +231,9 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
     },
     BuiltinProviderSpec {
         id: "radius",
-        in_catalog: false,
+        // Static public catalog since 4d38031fb (27 models @ 19451accd);
+        // the gateway overlay lives inside the provider itself.
+        in_catalog: true,
         factory: Some(radius::radius_provider),
     },
     BuiltinProviderSpec {
@@ -368,24 +371,22 @@ mod tests {
     fn test_catalog_membership() {
         let catalog = builtin_catalog().expect("catalog");
         for spec in BUILTIN_PROVIDERS {
-            if spec.in_catalog {
-                assert!(
-                    catalog.providers().contains(&spec.id),
-                    "catalog entry missing for {}",
-                    spec.id
-                );
-                assert!(
-                    !get_builtin_models(spec.id).is_empty(),
-                    "no catalog models for {}",
-                    spec.id
-                );
-            } else {
-                assert_eq!(spec.id, "radius");
-                assert!(!catalog.providers().contains(&spec.id));
-            }
+            assert!(
+                catalog.providers().contains(&spec.id),
+                "catalog entry missing for {}",
+                spec.id
+            );
+            assert!(
+                !get_builtin_models(spec.id).is_empty(),
+                "no catalog models for {}",
+                spec.id
+            );
         }
-        // 39 catalog entries = 40 registry entries minus dynamic radius.
-        assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len() - 1);
+        // 41 catalog entries = 40 registry entries + `meta` (catalog shipped
+        // with 4d38031fb-era generation b73412a37; provider registration is
+        // V15-15 scope).
+        assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len() + 1);
+        assert!(catalog.providers().contains(&"meta"));
     }
 
     #[test]
