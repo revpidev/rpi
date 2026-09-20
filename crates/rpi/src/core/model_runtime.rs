@@ -1221,7 +1221,7 @@ impl ModelRuntime {
             // No api of its own: the overlay composes over the base catalog
             // (custom model definitions need an api somewhere and stay
             // unsupported here, as before); `modelOverrides` still apply
-            // below (provider-composer.ts:434-437, #9294).
+            // below (provider-composer.ts:444-461, #9294).
             (None, Some(_)) => base.map(|b| b.get_models()).unwrap_or_default(),
             _ => match extension.and_then(|e| e.models.clone()) {
                 Some(models) => models
@@ -1246,7 +1246,7 @@ impl ModelRuntime {
             },
         };
         // models.json `modelOverrides` are the topmost user-config layer:
-        // applied once, after model construction (provider-composer.ts:434-437).
+        // applied once, after model construction (provider-composer.ts:444-461).
         if let Some(overrides) = config.and_then(|c| c.model_overrides.as_ref()) {
             models = models
                 .into_iter()
@@ -1265,7 +1265,7 @@ impl ModelRuntime {
                 // provider; configured headers/authHeader still wrap auth
                 // resolution (`composeApiKeyAuth`, provider-composer.ts:293),
                 // and `modelOverrides` still compose over the base catalog
-                // (provider-composer.ts:434-437 — upstream builds the model
+                // (provider-composer.ts:444-461 — upstream builds the model
                 // list unconditionally; #9294 configures built-in providers
                 // via modelOverrides alone).
                 let has_model_overrides = config
@@ -2859,6 +2859,31 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&compat.allowed_fallback_models).unwrap(),
             definition_fallbacks
+        );
+
+        // Catalog state (three-state: unset → catalog value): the anthropic
+        // catalog ships claude-fable-5 with server-side fallback metadata
+        // (vendored since V14-09); without an override the composed model
+        // keeps the catalog list verbatim (#9294 review follow-up).
+        let (_tmp, runtime) = runtime_with_models_json(r#"{"providers": {}}"#).await;
+        let model = runtime
+            .get_model("anthropic", "claude-fable-5")
+            .expect("catalog model");
+        let compat = model.compat.as_ref().expect("compat");
+        assert_eq!(
+            serde_json::to_value(&compat.allowed_fallback_models).unwrap(),
+            json!([
+                {
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-8",
+                    "cost": {"input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 6.25}
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-opus-5",
+                    "cost": {"input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 6.25}
+                }
+            ])
         );
     }
 
