@@ -63,13 +63,16 @@ const DEFAULT_PROJECT_TRUST_LABELS: [(DefaultProjectTrust, &str); 3] = [
     (DefaultProjectTrust::Never, "Never trust"),
 ];
 
-/// `HTTP_IDLE_TIMEOUT_CHOICES` (http-dispatcher.ts:6-12).
+/// `HTTP_IDLE_TIMEOUT_CHOICES` (http-dispatcher.ts:6-12). rpi#54 / D-103
+/// (V15-12 FR-B): the `0` entry renders `unlimited` (2026-09-20 user
+/// ruling) instead of upstream's `disabled` — the numeric value stored in
+/// settings is unchanged, so this is display/parse-label only.
 const HTTP_IDLE_TIMEOUT_CHOICES: [(&str, u64); 5] = [
     ("30 sec", 30_000),
     ("1 min", 60_000),
     ("2 min", 120_000),
     ("5 min", 300_000),
-    ("disabled", 0),
+    ("unlimited", 0),
 ];
 
 /// `AUTOMATIC_THEME_VALUE` (settings-selector.ts:230).
@@ -2541,6 +2544,22 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains(&format!("(1/{item_count})"))));
+    }
+
+    /// rpi#54 (V15-12 FR-B): the settings row renders `unlimited` for the
+    /// disabled default; explicit configurations still render a value
+    /// (choice label for known budgets, `N sec` otherwise).
+    #[test]
+    fn http_idle_timeout_row_renders_unlimited_for_default() {
+        assert_eq!(format_http_idle_timeout_ms(0), "unlimited");
+        assert_eq!(format_http_idle_timeout_ms(300_000), "5 min");
+        assert_eq!(format_http_idle_timeout_ms(600_000), "600 sec");
+        // The selector's choice list round-trips the label to the stored
+        // numeric value (`update_value` parses by label; settings persist
+        // the number, so the rename needs no migration).
+        assert!(HTTP_IDLE_TIMEOUT_CHOICES
+            .iter()
+            .any(|(label, ms)| *label == "unlimited" && *ms == 0));
     }
 
     #[test]

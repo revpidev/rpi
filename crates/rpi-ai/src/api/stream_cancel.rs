@@ -4,8 +4,9 @@
 //! interrupts an in-flight body read immediately. The port's byte streams are
 //! decoupled from the request future (`custom_fetch` only races the signal
 //! during send), so an adapter that checks `is_cancelled()` only *after*
-//! `next().await` returns stays blocked until the next chunk arrives or the
-//! idle timeout fires (5 minutes by default — unbounded when disabled).
+//! `next().await` returns stays blocked until the next chunk arrives or
+//! the idle timeout fires (unbounded by default since rpi#54 / D-103;
+//! finite only when the user configures `httpIdleTimeoutMs`).
 //!
 //! [`next_chunk_or_cancelled`] closes that gap for every streaming adapter:
 //! the body read is raced against `CancellationToken::cancelled`, matching the

@@ -276,4 +276,83 @@ mod tests {
             other => panic!("expected headers timeout, got {other:?}"),
         }
     }
+
+    /// rpi#54 (V15-12 FR-A): `idle_timeout()` maps the disabled default
+    /// (`0`) to passthrough (`None`) and explicit budgets verbatim — only
+    /// the *default* flipped, the helper semantics are unchanged.
+    #[test]
+    fn idle_timeout_maps_zero_to_passthrough_and_explicit_verbatim() {
+        assert_eq!(idle_timeout(None), None);
+        assert_eq!(idle_timeout(Some(0)), None);
+        assert_eq!(
+            idle_timeout(Some(600_000)),
+            Some(Duration::from_millis(600_000))
+        );
+    }
+
+    /// rpi#54 (V15-12 FR-A'): with the new disabled-by-default setting the
+    /// SDK layer maps `0` to the "max int32" budget (`sdk.rs`,
+    /// 2_147_483_647 ms — mirrored here; the mapping itself is frozen and
+    /// untested-in-rpi-ai), so a mock SSE body that stays silent far past
+    /// the old 5-minute default must survive and still deliver the
+    /// eventual chunk. Virtual time is compressed via a paused tokio clock
+    /// (`start_paused` auto-advances when every task sleeps), so >6 min of
+    /// silence costs milliseconds of real time — and would instead fire
+    /// `IdleTimeout` promptly if the budget were still the old 300 s
+    /// default, making the assertion discriminating.
+    #[tokio::test(start_paused = true)]
+    async fn default_budget_survives_silence_longer_than_old_default() {
+        const EFFECTIVE_DEFAULT_MS: u64 = 2_147_483_647;
+
+        // Silent SSE body: no chunks for > 5 min, then one chunk.
+        let silent_then_chunk = futures::stream::once(Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(6 * 60)).await;
+            Ok::<&'static str, String>("data")
+        }));
+        let mut wrapped = wrap(silent_then_chunk, Some(EFFECTIVE_DEFAULT_MS));
+
+        let started = std::time::Instant::now();
+        assert!(
+            matches!(wrapped.next().await, Some(Ok("data"))),
+            "silent-but-alive stream must survive on the disabled default"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "virtual-time compression must keep the test fast"
+        );
+    }
+
+    /// rpi#54 (V15-12 FR-A'): user abort stays immediate under the disabled
+    /// default — the cancellation path (`stream_cancel::
+    /// next_chunk_or_cancelled`) races the token against the body read and
+    /// never waits out the (huge) default idle budget.
+    #[tokio::test(start_paused = true)]
+    async fn default_budget_abort_wins_immediately_mid_silence() {
+        const EFFECTIVE_DEFAULT_MS: u64 = 2_147_483_647;
+
+        let mut stalled = wrap(
+            futures::stream::pending::<Result<&'static str, String>>(),
+            Some(EFFECTIVE_DEFAULT_MS),
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        tokio::spawn({
+            let token = token.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                token.cancel();
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let outcome =
+            crate::api::stream_cancel::next_chunk_or_cancelled(&mut stalled, Some(&token)).await;
+        assert!(
+            matches!(outcome, crate::api::stream_cancel::StreamNext::Cancelled),
+            "abort must win mid-silence, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "abort must not wait for the idle budget"
+        );
+    }
 }

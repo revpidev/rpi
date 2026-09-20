@@ -55,8 +55,13 @@ pub use rpi_tui::components::scroll_view::ScrollbarMode;
 pub use rpi_tui::terminal_image::{ImageProtocol, TerminalCapabilityOverrides};
 pub use rpi_tui::tui::TuiMode;
 
-/// `DEFAULT_HTTP_IDLE_TIMEOUT_MS` (http-dispatcher.ts:4).
-pub const DEFAULT_HTTP_IDLE_TIMEOUT_MS: u64 = 300_000;
+/// rpi#54 (D-103): unlike upstream `DEFAULT_HTTP_IDLE_TIMEOUT_MS`
+/// (http-dispatcher.ts:4, 5 min via undici `headersTimeout`/`bodyTimeout`),
+/// rpi defaults to **disabled** (`0` = unlimited; `sdk.rs` maps 0 to the
+/// TS-SDK "max int32" convention) — reasoning-model silences longer than
+/// 5 min must not be client-killed by default. Set `httpIdleTimeoutMs` to
+/// re-enable a finite idle budget.
+pub const DEFAULT_HTTP_IDLE_TIMEOUT_MS: u64 = 0;
 
 // ===========================================================================
 // Settings value model (settings-manager.ts:11-129)
@@ -3032,15 +3037,29 @@ mod tests {
     // describe("httpIdleTimeoutMs")
     // =======================================================================
 
-    // Port of "should default to 5 minutes".
+    // Port of "should default to 5 minutes" — rpi#54 / D-103 (V15-12
+    // FR-C, G2: old expectation `300_000` → new expectation `0`):
+    // upstream still defaults to 5 min (http-dispatcher.ts:4); rpi flips
+    // the default to disabled (unlimited) — see the constant's doc comment.
     #[test]
-    fn test_http_idle_timeout_defaults_to_five_minutes() {
+    fn test_http_idle_timeout_defaults_to_disabled() {
         let dirs = test_dirs();
         let manager = create(&dirs);
         assert_eq!(
             manager.get_http_idle_timeout_ms().unwrap(),
             DEFAULT_HTTP_IDLE_TIMEOUT_MS
         );
+        assert_eq!(DEFAULT_HTTP_IDLE_TIMEOUT_MS, 0);
+    }
+
+    // rpi#54 (V15-12 FR-A): an explicit `httpIdleTimeoutMs` must still apply
+    // verbatim — only the *default* flipped.
+    #[test]
+    fn test_http_idle_timeout_explicit_value_still_applies() {
+        let dirs = test_dirs();
+        write_json(&global_path(&dirs), json!({"httpIdleTimeoutMs": 600000}));
+        let manager = create(&dirs);
+        assert_eq!(manager.get_http_idle_timeout_ms().unwrap(), 600_000);
     }
 
     // Port of "should use merged global and project settings".

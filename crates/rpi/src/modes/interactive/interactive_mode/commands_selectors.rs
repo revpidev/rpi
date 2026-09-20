@@ -164,14 +164,17 @@ fn setting_to_model_thinking(level: ThinkingLevel) -> ModelThinkingLevel {
     }
 }
 
-/// `formatHttpIdleTimeoutMs` (http-dispatcher.ts:27-38).
+/// `formatHttpIdleTimeoutMs` (http-dispatcher.ts:27-38). rpi#54 / D-103
+/// (V15-12 FR-B): the `0` entry renders `unlimited` (2026-09-20 user
+/// ruling) instead of upstream's `disabled`; numbers persist, so this is
+/// display-label only.
 fn format_http_idle_timeout_ms(timeout_ms: u64) -> String {
     const CHOICES: &[(u64, &str)] = &[
         (30_000, "30 sec"),
         (60_000, "1 min"),
         (120_000, "2 min"),
         (300_000, "5 min"),
-        (0, "disabled"),
+        (0, "unlimited"),
     ];
     CHOICES
         .iter()

@@ -33,6 +33,10 @@ zstd.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# rpi#54 (V15-12 FR-A'): `#[tokio::test(start_paused = true)]` for the
+# virtual-clock silence tests (same pattern as the rpi crate V14-22 tick
+# tests and rpi-ext-smart-fetch FR-P2-D).
+tokio = { workspace = true, features = ["test-util"] }
 # Independent sha256/base64url cross-check for PKCE unit tests (challenge == base64url(sha256(verifier))).
 sha2 = "0.10"
 base64 = "0.22"
