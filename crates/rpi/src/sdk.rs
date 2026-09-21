@@ -513,7 +513,7 @@ pub async fn create_agent_session(
                             .get_session_id(),
                     )
                 {
-                    // `cacheContextIsCurrent(model)` (sdk.ts:361-372): keep
+                    // `cacheContextIsCurrent(model)` (sdk.ts:340-352): keep
                     // warming while the transcript still extends this
                     // request's prefix and the model is unchanged. Upstream
                     // compares message identity; Rust translates to value

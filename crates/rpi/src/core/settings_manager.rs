@@ -1714,7 +1714,7 @@ impl SettingsManager {
         CacheWarmingMode::from_setting(self.global_settings.get("cacheWarming"))
     }
 
-    /// `setCacheWarmingMode` (settings-manager.ts:961-966) — persists
+    /// `setCacheWarmingMode` (settings-manager.ts:960-964) — persists
     /// globally.
     pub fn set_cache_warming_mode(&mut self, mode: CacheWarmingMode) {
         self.global_settings

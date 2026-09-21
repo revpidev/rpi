@@ -244,7 +244,7 @@ impl FakeRuntime {
             }),
         };
         // Route append_usage through the real SessionManager but capture the
-        // note argument (appendUsage call assertion, cache-warmer.test.ts:160).
+        // note argument (appendUsage call assertion, cache-warmer.test.ts:168-174).
         let warmer = Arc::new(CacheWarmer::new(CacheWarmerDeps {
             models: models.clone(),
             session,
@@ -272,7 +272,7 @@ impl FakeRuntime {
     }
 
     /// Persisted usage notes (appendUsage `note` assertion surface,
-    /// cache-warmer.test.ts:171-181).
+    /// cache-warmer.test.ts:168-175).
     fn append_notes(&self) -> Vec<Option<String>> {
         self.warmed_entries
             .lock()
@@ -352,7 +352,7 @@ async fn replays_profitable_requests_and_preserves_options() {
     let (called_model, options) = calls.into_iter().next().unwrap();
     assert_eq!(called_model.id, "claude-opus-4-6");
     // One-token cap, zero retries, independent abort signal
-    // (cache-warmer.test.ts:155-162).
+    // (cache-warmer.test.ts:151-158).
     assert_eq!(options.simple.stream.max_tokens, Some(1));
     assert_eq!(options.simple.stream.max_retries, Some(0));
     assert!(options.simple.stream.request.signal.is_some());
@@ -365,7 +365,7 @@ async fn replays_profitable_requests_and_preserves_options() {
     assert_eq!(options.simple.stream.timeout_ms, Some(1234));
 
     // Decision event fired with streaming-phase economics
-    // (cache-warmer.test.ts:163-170).
+    // (cache-warmer.test.ts:159-166).
     let events = runtime.events.lock().unwrap().clone();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].action, CacheWarmingAction::Warm);
@@ -373,7 +373,7 @@ async fn replays_profitable_requests_and_preserves_options() {
     assert!((events[0].warm_cost - 0.050025).abs() < 1e-6);
 
     // Usage persisted with kind cache_warm and surfaced via onWarmed
-    // (cache-warmer.test.ts:171-181).
+    // (cache-warmer.test.ts:167-177).
     let warmed = runtime.warmed_entries.lock().unwrap().clone();
     assert_eq!(warmed.len(), 1);
     assert_eq!(warmed[0].kind, "cache_warm");
@@ -381,7 +381,7 @@ async fn replays_profitable_requests_and_preserves_options() {
     assert_eq!(warmed[0].model, "claude-opus-4-6");
     assert!(runtime.append_notes()[0].is_none());
 
-    // Repeated refreshes keep the options (cache-warmer.test.ts:183-186).
+    // Repeated refreshes keep the options (cache-warmer.test.ts:177-179).
     tokio::time::advance(std::time::Duration::from_millis(270_000)).await;
     tokio::task::yield_now().await;
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
@@ -393,7 +393,7 @@ async fn replays_profitable_requests_and_preserves_options() {
 #[tokio::test(start_paused = true)]
 async fn applies_economic_decisions_and_extension_overrides() {
     // Unprofitable: 5k prompt → savings below threshold → no request
-    // (cache-warmer.test.ts:188-197).
+    // (cache-warmer.test.ts:182-191).
     let unprofitable = FakeRuntime::new(
         CacheWarmingModeArg::Idle,
         branch_with_prompt(5_000),
@@ -414,7 +414,7 @@ async fn applies_economic_decisions_and_extension_overrides() {
     assert!(decision.economics_available);
     assert!(!status.extension_override);
 
-    // Forced warm by extension override (cache-warmer.test.ts:199-204).
+    // Forced warm by extension override (cache-warmer.test.ts:194-199).
     let forced = FakeRuntime::new(
         CacheWarmingModeArg::Idle,
         branch_with_prompt(5_000),
@@ -434,7 +434,7 @@ async fn applies_economic_decisions_and_extension_overrides() {
     );
     forced.warmer.cancel();
 
-    // Vetoed by extension (cache-warmer.test.ts:206-210).
+    // Vetoed by extension (cache-warmer.test.ts:201-205).
     let vetoed = FakeRuntime::new(
         CacheWarmingModeArg::Idle,
         branch_with_prompt(100_000),
@@ -452,7 +452,7 @@ async fn applies_economic_decisions_and_extension_overrides() {
     assert_eq!(status.state, WarmingState::Inactive);
     assert!(status.extension_override);
 
-    // Economics unavailable: zero prompt tokens (cache-warmer.test.ts:212-218).
+    // Economics unavailable: zero prompt tokens (cache-warmer.test.ts:207-214).
     let unavailable = FakeRuntime::new(
         CacheWarmingModeArg::Idle,
         branch_with_prompt(0),
@@ -474,7 +474,7 @@ async fn applies_economic_decisions_and_extension_overrides() {
 
 #[tokio::test(start_paused = true)]
 async fn stops_for_unsupported_requests_context_and_mode_changes() {
-    // mode off (cache-warmer.test.ts:221-225).
+    // mode off (cache-warmer.test.ts:219-222).
     let unsupported = FakeRuntime::new(
         CacheWarmingModeArg::Off,
         branch_with_prompt(100_000),
@@ -488,7 +488,7 @@ async fn stops_for_unsupported_requests_context_and_mode_changes() {
         Some("cache warming disabled")
     );
 
-    // unknown lifetime (cache-warmer.test.ts:226-228).
+    // unknown lifetime (cache-warmer.test.ts:223-225).
     unsupported.mode.store(2, Ordering::SeqCst); // idle
     unsupported
         .warmer
@@ -498,7 +498,7 @@ async fn stops_for_unsupported_requests_context_and_mode_changes() {
         Some("cache lifetime unavailable")
     );
 
-    // budget-thinking Claude with reasoning on (cache-warmer.test.ts:229-231).
+    // budget-thinking Claude with reasoning on (cache-warmer.test.ts:226-227).
     unsupported.warmer.start(
         request(&budget_model(), Some(rpi_ai::types::ThinkingLevel::High)),
         always_current(),
@@ -508,7 +508,7 @@ async fn stops_for_unsupported_requests_context_and_mode_changes() {
         Some("request cannot be replayed safely")
     );
 
-    // Context changed (cache-warmer.test.ts:233-239).
+    // Context changed (cache-warmer.test.ts:229-234).
     let still_current = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let flag = still_current.clone();
     let is_current: IsCurrent = Arc::new(move || flag.load(Ordering::SeqCst));
@@ -524,7 +524,7 @@ async fn stops_for_unsupported_requests_context_and_mode_changes() {
     tokio::task::yield_now().await;
     assert!(unsupported.models.calls.lock().unwrap().is_empty());
 
-    // Mode flipped to off mid-run (cache-warmer.test.ts:240-244).
+    // Mode flipped to off mid-run (cache-warmer.test.ts:236-239).
     unsupported
         .warmer
         .start(request(&adaptive_model(), None), always_current());
@@ -533,7 +533,7 @@ async fn stops_for_unsupported_requests_context_and_mode_changes() {
     tokio::task::yield_now().await;
     assert!(unsupported.models.calls.lock().unwrap().is_empty());
 
-    // Streaming mode stops on settle (cache-warmer.test.ts:246-250).
+    // Streaming mode stops on settle (cache-warmer.test.ts:241-244).
     let streaming = FakeRuntime::new(
         CacheWarmingModeArg::Streaming,
         branch_with_prompt(400_000),
@@ -673,7 +673,7 @@ async fn long_retention_beyond_safety_window_and_none_retention() {
     );
     assert!(runtime.models.calls.lock().unwrap().is_empty());
 
-    // "none" retention never warms (cache-warmer.test.ts:107-109).
+    // "none" retention never warms (cache-warmer.test.ts:131).
     let mut req = request(&adaptive_model(), None);
     req.options.simple.stream.cache_retention = Some(CacheRetention::None);
     runtime.warmer.start(req, always_current());

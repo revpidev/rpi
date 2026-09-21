@@ -1911,7 +1911,7 @@ impl InteractiveUi {
             }
             UiCommand::EntryAppended(entry) => {
                 // entry_appended (interactive-mode.ts:3288-3292; usage arm
-                // at :3276-3279, #9668).
+                // at :3290-3291, #9668).
                 match entry {
                     SessionEntry::Custom(_) => {
                         self.add_custom_entry_to_chat(&entry);
@@ -3258,7 +3258,7 @@ impl InteractiveUi {
     /// 836aee6d3): render billing usage for a compaction or branch summary.
     /// The notice is derived from persisted summary usage and is not stored
     /// as a separate session entry.
-    /// `addCacheWarmingUsage` (interactive-mode.ts:3880-3884, #9668): one
+    /// `addCacheWarmingUsage` (interactive-mode.ts:3892-3896, #9668): one
     /// dim transcript line per successful refresh, behind the same
     /// `showCacheMissNotices` gate as compaction cost notices.
     fn add_cache_warming_usage(&self, entry: &rpi_agent::session::UsageEntry) {

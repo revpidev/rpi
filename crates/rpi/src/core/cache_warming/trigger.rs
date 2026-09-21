@@ -1,5 +1,5 @@
 //! 触发器 — the cache-warmer lifecycle state machine
-//! (cache-warmer.ts:141-345 @ c596d09d9, #9668).
+//! (cache-warmer.ts:141-385 @ c596d09d9, #9668).
 //!
 //! `start` replaces any previous run (aborting its in-flight refresh); the
 //! scheduling deadline re-arms after each refresh. Warm requests never
@@ -133,7 +133,7 @@ impl CacheWarmerDeps {
 /// `onWarmed?: (entry: UsageEntry) => void` (cache-warmer.ts:168).
 pub type OnWarmed = Arc<dyn Fn(&UsageEntry) + Send + Sync>;
 
-/// `CacheWarmer` (cache-warmer.ts:159-345).
+/// `CacheWarmer` (cache-warmer.ts:159-385).
 pub struct CacheWarmer {
     pub(super) deps: CacheWarmerDeps,
     pub(super) state: Mutex<WarmerState>,

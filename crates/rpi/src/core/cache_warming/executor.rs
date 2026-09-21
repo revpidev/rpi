@@ -25,7 +25,7 @@ fn wall_epoch_ms() -> u64 {
 }
 
 impl CacheWarmer {
-    /// `schedule` (cache-warmer.ts:310-317). `self: &Arc<Self>` because the
+    /// `schedule` (cache-warmer.ts:279-289). `self: &Arc<Self>` because the
     /// timer task outlives the caller.
     pub(super) fn schedule(self: &Arc<Self>, generation: u64) {
         let (beyond_deadline, sleep_until, phase_now) = {

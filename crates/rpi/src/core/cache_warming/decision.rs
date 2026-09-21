@@ -1,5 +1,5 @@
 //! 决策器 — cost-aware pure functions of the cache warmer
-//! (cache-warmer.ts:16-107, 320-337, 373-437 @ c596d09d9, #9668).
+//! (cache-warmer.ts:16-107, 362-383, 387-437 @ c596d09d9, #9668).
 //!
 //! All functions are pure (time/state passed in) so the eligibility matrix
 //! and economics are table-testable without a runtime.
@@ -100,7 +100,7 @@ pub fn last_prompt_tokens(branch: &[SessionEntry]) -> u64 {
         .unwrap_or(0)
 }
 
-/// `price` (cache-warmer.ts:72-85): cost of a partial usage record.
+/// `price` (cache-warmer.ts:72-86): cost of a partial usage record.
 fn price(model: &Model, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
     let mut usage = Usage {
         input,
@@ -330,7 +330,7 @@ mod tests {
         openai.api = ApiKind(ApiKind::OPENAI_RESPONSES.to_owned());
         let unknown = anthropic_model(None);
 
-        // TTL resolution (upstream cache-warmer.test.ts:131-141).
+        // TTL resolution (upstream cache-warmer.test.ts:128-135).
         assert_eq!(
             get_prompt_cache_ttl_ms(&adaptive, None, None),
             Some(300_000)

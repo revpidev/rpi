@@ -81,7 +81,7 @@ pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
 
 /// All 37 event names, in the upstream `ExtensionAPI.on()` overload order
-/// (types.ts:1259-1303 + #9668 `cache_warming_decision` at :1291-1293,
+/// (types.ts:1259-1303 + #9668 `cache_warming_decision` at :1294-1297,
 /// c596d09d9 — inserted between `context` and `before_provider_request`).
 pub const ALL_EVENTS: [&str; 37] = [
     EVENT_PROJECT_TRUST,
