@@ -1446,6 +1446,31 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
+    /// `appendUsage` (#9668, c596d09d9; session-manager.ts:1133-1149):
+    /// append model-attributed usage that does not participate in LLM
+    /// context. Returns the appended entry.
+    pub fn append_usage(
+        &mut self,
+        kind: &str,
+        provider: &str,
+        model: &str,
+        usage: Usage,
+        note: Option<&str>,
+    ) -> Result<rpi_agent::session::UsageEntry, RpiError> {
+        let entry = rpi_agent::session::UsageEntry {
+            id: self.next_entry_id(),
+            parent_id: self.leaf_id.clone(),
+            timestamp: now_iso8601(),
+            kind: kind.to_owned(),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            usage,
+            note: note.map(str::to_owned),
+        };
+        self.append_entry(FileEntry::Usage(entry.clone()))?;
+        Ok(entry)
+    }
+
     /// `appendSessionInfo` (session-manager.ts:1136-1147): `\r\n` runs are
     /// replaced with a space and the result trimmed.
     pub fn append_session_info(&mut self, name: &str) -> Result<String, RpiError> {

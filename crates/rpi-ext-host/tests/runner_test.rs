@@ -1509,3 +1509,84 @@ async fn runner_invalidate_unsubscribes_extension_event_bus_subscription() {
         "no delivery after invalidate — subscription was auto-unsubscribed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// emitCacheWarmingDecision (#9668, c596d09d9; runner.ts:920-941)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cache_warming_decision_uses_the_last_extension_override() {
+    // Port of "uses the last extension override"
+    // (cache-warmer.test.ts:254-275): two handlers both return an action —
+    // the last one wins.
+    let host = host_with(vec![
+        inline_ext("warmer", |api| {
+            api.on(
+                ext::EVENT_CACHE_WARMING_DECISION,
+                json_handler(|_| Ok(json!({"action": "warm"}))),
+            )
+            .unwrap();
+        }),
+        inline_ext("stopper", |api| {
+            api.on(
+                ext::EVENT_CACHE_WARMING_DECISION,
+                json_handler(|_| Ok(json!({"action": "stop"}))),
+            )
+            .unwrap();
+        }),
+    ])
+    .await;
+
+    let action = host
+        .emit_cache_warming_decision(ext::CacheWarmingDecisionEvent {
+            warm_cost: 0.05,
+            miss_cost: 0.5,
+            continuation_probability: 0.15,
+            action: ext::CacheWarmingAction::Warm,
+        })
+        .await;
+    assert_eq!(action, ext::CacheWarmingAction::Stop);
+}
+
+#[tokio::test]
+async fn cache_warming_decision_falls_back_to_own_action() {
+    // No handlers → the event's own action; a handler without an action
+    // field keeps it too; a failing handler is reported and skipped
+    // (cache-warmer.ts:267-270 "Extension failures fall back to pi's own
+    // decision").
+    let host = host_with(vec![inline_ext("noop", |api| {
+        api.on(
+            ext::EVENT_CACHE_WARMING_DECISION,
+            json_handler(|_| Ok(Value::Null)),
+        )
+        .unwrap();
+    })])
+    .await;
+    let action = host
+        .emit_cache_warming_decision(ext::CacheWarmingDecisionEvent {
+            warm_cost: 0.05,
+            miss_cost: 0.5,
+            continuation_probability: 1.0,
+            action: ext::CacheWarmingAction::Warm,
+        })
+        .await;
+    assert_eq!(action, ext::CacheWarmingAction::Warm);
+
+    let host = host_with(vec![inline_ext("broken", |api| {
+        api.on(
+            ext::EVENT_CACHE_WARMING_DECISION,
+            json_handler(|_| Err("boom".to_owned())),
+        )
+        .unwrap();
+    })])
+    .await;
+    let action = host
+        .emit_cache_warming_decision(ext::CacheWarmingDecisionEvent {
+            warm_cost: 0.05,
+            miss_cost: 0.5,
+            continuation_probability: 1.0,
+            action: ext::CacheWarmingAction::Warm,
+        })
+        .await;
+    assert_eq!(action, ext::CacheWarmingAction::Warm);
+}

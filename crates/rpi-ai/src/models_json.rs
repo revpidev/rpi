@@ -202,6 +202,17 @@ pub struct ModelsJsonModelOverrideCost {
     pub tiers: Option<Vec<ModelCostTier>>,
 }
 
+/// `ModelPromptCacheSchema` (#9668, c596d09d9; model-config.ts:139-142):
+/// best-effort prompt cache lifetime in seconds per retention tier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsJsonPromptCache {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long: Option<u32>,
+}
+
 /// `ModelOverrideSchema`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,6 +222,9 @@ pub struct ModelsJsonModelOverride {
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Option<Vec<InputModality>>,
     pub cost: Option<ModelsJsonModelOverrideCost>,
+    /// `ModelOverrideSchema.promptCache` (#9668): merged per tier with the
+    /// catalog value.
+    pub prompt_cache: Option<ModelsJsonPromptCache>,
     pub context_window: Option<f64>,
     pub max_tokens: Option<f64>,
     /// 25a2c8dcf (#7568): default sampling parameters for this model.
@@ -231,6 +245,9 @@ pub struct ModelsJsonModel {
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Option<Vec<InputModality>>,
     pub cost: Option<ModelCost>,
+    /// `ModelDefinitionSchema.promptCache` (#9668): unset disables cache
+    /// warming for the model.
+    pub prompt_cache: Option<ModelsJsonPromptCache>,
     pub context_window: Option<f64>,
     pub max_tokens: Option<f64>,
     /// 25a2c8dcf (#7568): default sampling parameters for this model.

@@ -193,6 +193,9 @@ pub struct AgentSessionConfig {
     /// Runner slot shared with the Agent's stream hooks.
     pub extension_runner_ref: ExtensionRunnerRef,
     pub session_start_event: SessionStartEvent,
+    /// Keeps the prompt cache entry of the last session request warm
+    /// (#9668; agent-session.ts:222-223 `cacheWarmer`).
+    pub cache_warmer: Option<Arc<crate::core::cache_warming::CacheWarmer>>,
 }
 
 /// `ExtensionBindings` (agent-session.ts:228-235), T10 subset.
@@ -389,6 +392,8 @@ struct AgentSessionInner {
     extension_runner_ref: ExtensionRunnerRef,
     cwd: String,
     session_start_event: SessionStartEvent,
+    /// `_cacheWarmer` (#9668, c596d09d9; agent-session.ts:380).
+    cache_warmer: Option<Arc<crate::core::cache_warming::CacheWarmer>>,
 
     compaction: tokio::sync::Mutex<CompactionRunner>,
     /// Shared manual-compaction abort handle: works while the runner mutex is
@@ -543,6 +548,7 @@ impl AgentSession {
             extension_runner_ref: config.extension_runner_ref,
             cwd: config.cwd,
             session_start_event: config.session_start_event,
+            cache_warmer: config.cache_warmer.clone(),
             compaction: tokio::sync::Mutex::new(compaction),
             compaction_abort,
             auto_compaction_abort,
@@ -602,6 +608,21 @@ impl AgentSession {
         // Subscribe to agent events for internal handling (persistence,
         // auto-compaction, retry logic) (agent-session.ts:393).
         let session = AgentSession { inner };
+        // `_cacheWarmer.onWarmed` (agent-session.ts:401-403): re-emit each
+        // persisted cache-warming usage entry as `entry_appended` so the
+        // transcript notice renders (#9668).
+        if let Some(cache_warmer) = session.inner.cache_warmer.clone() {
+            let weak = Arc::downgrade(&session.inner);
+            cache_warmer.set_on_warmed(Some(Arc::new(move |entry| {
+                if let Some(inner) = weak.upgrade() {
+                    AgentSession { inner }.emit(AgentSessionEvent::Session(
+                        SessionEvent::EntryAppended {
+                            entry: Box::new(SessionEntry::Usage(entry.clone())),
+                        },
+                    ));
+                }
+            })));
+        }
         let weak = Arc::downgrade(&session.inner);
         let unsubscribe = session
             .inner
@@ -759,6 +780,11 @@ impl AgentSession {
         self.inner
             .is_agent_run_active
             .store(false, Ordering::SeqCst);
+        // `this._cacheWarmer?.onAgentSettled()` (agent-session.ts:663,
+        // #9668): streaming mode stops warming; idle mode switches phase.
+        if let Some(cache_warmer) = &self.inner.cache_warmer {
+            cache_warmer.on_agent_settled();
+        }
         self.runner().emit("agent_settled").await;
         self.emit(AgentSessionEvent::Session(SessionEvent::AgentSettled));
         self.resolve_idle_wait_if_idle();
@@ -1066,6 +1092,12 @@ impl AgentSession {
 
     /// `dispose` (agent-session.ts:837-854).
     pub fn dispose(&self) {
+        // `this._cacheWarmer.onWarmed = undefined; this._cacheWarmer.cancel()`
+        // (agent-session.ts:933-935, #9668).
+        if let Some(cache_warmer) = &self.inner.cache_warmer {
+            cache_warmer.set_on_warmed(None);
+            cache_warmer.cancel();
+        }
         self.abort_retry();
         self.abort_compaction();
         self.abort_branch_summary();
@@ -3338,6 +3370,24 @@ impl AgentSession {
     // Statistics
     // ==================================================================
 
+    /// `cacheWarmingStatus` getter (agent-session.ts:949-951, #9668):
+    /// current cache-warming state and the policy inputs that produced it.
+    pub fn cache_warming_status(&self) -> Option<crate::core::cache_warming::CacheWarmingStatus> {
+        self.inner
+            .cache_warmer
+            .as_ref()
+            .map(|warmer| warmer.status())
+    }
+
+    /// `setCacheWarmingMode` (agent-session.ts:953-957, #9668): persist the
+    /// mode globally and immediately reconcile active warming.
+    pub fn set_cache_warming_mode(&self, mode: crate::core::settings_manager::CacheWarmingMode) {
+        self.settings_manager(|settings| settings.set_cache_warming_mode(mode));
+        if let Some(cache_warmer) = &self.inner.cache_warmer {
+            cache_warmer.on_mode_changed();
+        }
+    }
+
     /// `getSessionStats` (agent-session.ts:3107-3157).
     pub fn get_session_stats(&self) -> SessionStats {
         let mut user_messages = 0u64;
@@ -3358,6 +3408,12 @@ impl AgentSession {
                     if let Some(usage) = &compaction.usage {
                         add_usage_to_totals(&mut totals, usage);
                     }
+                }
+                // `entry.type === "usage"` → session totals
+                // (agent-session.ts:3488-3493, #9668): counted exactly once,
+                // never adds messages.
+                Some(SessionEntry::Usage(usage_entry)) => {
+                    add_usage_to_totals(&mut totals, &usage_entry.usage);
                 }
                 Some(SessionEntry::Message(message_entry)) => {
                     total_messages += 1;

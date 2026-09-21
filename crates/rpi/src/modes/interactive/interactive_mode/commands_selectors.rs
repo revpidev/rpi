@@ -364,6 +364,12 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
                 format_http_idle_timeout_ms(timeout_ms)
             ));
         }
+        SettingsChange::CacheWarmingMode(mode) => {
+            // `onCacheWarmingModeChange` (interactive-mode.ts:4755-4758,
+            // #9668): persist + reconcile, then surface the new mode.
+            session.set_cache_warming_mode(mode);
+            ui.show_status(&format!("Cache warming: {}", mode.as_str()));
+        }
         SettingsChange::ModelThinkingLevelChange {
             provider,
             model_id,
@@ -1269,6 +1275,7 @@ impl InteractiveUi {
             http_idle_timeout_ms: session
                 .settings_manager(|s| s.get_http_idle_timeout_ms())
                 .unwrap_or(crate::core::settings_manager::DEFAULT_HTTP_IDLE_TIMEOUT_MS),
+            cache_warming_mode: session.settings_manager(|s| s.get_cache_warming_mode()),
             // `thinkingLevel` here is the global DEFAULT (not the session
             // level) — interactive-mode.ts:4577.
             thinking_level: model_thinking_to_setting(

@@ -55,6 +55,7 @@ pub const EVENT_SESSION_SHUTDOWN: &str = "session_shutdown";
 pub const EVENT_SESSION_BEFORE_TREE: &str = "session_before_tree";
 pub const EVENT_SESSION_TREE: &str = "session_tree";
 pub const EVENT_CONTEXT: &str = "context";
+pub const EVENT_CACHE_WARMING_DECISION: &str = "cache_warming_decision";
 pub const EVENT_BEFORE_PROVIDER_REQUEST: &str = "before_provider_request";
 pub const EVENT_BEFORE_PROVIDER_HEADERS: &str = "before_provider_headers";
 pub const EVENT_AFTER_PROVIDER_RESPONSE: &str = "after_provider_response";
@@ -79,10 +80,10 @@ pub const EVENT_INPUT: &str = "input";
 pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
 
-/// All 36 event names, in the upstream `ExtensionAPI.on()` overload order
-/// (types.ts:1257-1301; `ui_prompt_start` / `ui_prompt_end` at :1286-1287,
-/// ccfe79ed2 / V14-11 FR-C).
-pub const ALL_EVENTS: [&str; 36] = [
+/// All 37 event names, in the upstream `ExtensionAPI.on()` overload order
+/// (types.ts:1257-1301 + #9668 `cache_warming_decision` at :1291-1293,
+/// c596d09d9 — inserted between `context` and `before_provider_request`).
+pub const ALL_EVENTS: [&str; 37] = [
     EVENT_PROJECT_TRUST,
     EVENT_RESOURCES_DISCOVER,
     EVENT_SESSION_START,
@@ -96,6 +97,7 @@ pub const ALL_EVENTS: [&str; 36] = [
     EVENT_SESSION_BEFORE_TREE,
     EVENT_SESSION_TREE,
     EVENT_CONTEXT,
+    EVENT_CACHE_WARMING_DECISION,
     EVENT_BEFORE_PROVIDER_REQUEST,
     EVENT_BEFORE_PROVIDER_HEADERS,
     EVENT_AFTER_PROVIDER_RESPONSE,
@@ -488,6 +490,44 @@ pub struct ContextEvent {
 pub struct ContextEventResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<AgentMessage>>,
+}
+
+/// `CacheWarmingAction` (cache-warmer.ts:97, #9668/c596d09d9): pi's
+/// warm-or-stop decision; extensions may override it per refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheWarmingAction {
+    #[serde(rename = "warm")]
+    Warm,
+    #[serde(rename = "stop")]
+    Stop,
+}
+
+/// `CacheWarmingDecisionEvent` (cache-warmer.ts:117-123, #9668): fired
+/// before each prompt-cache refresh with pi's decision filled in. The event
+/// carries only the cost estimates; everything else an extension might want
+/// (model, idle state, context size) is on the context (extensions.md
+/// `cache_warming_decision`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheWarmingDecisionEvent {
+    /// Price of this refresh: a cache read of the prompt plus one output token.
+    pub warm_cost: f64,
+    /// Extra price of the next real request if the cache entry is lost.
+    pub miss_cost: f64,
+    /// Estimated chance that a real request arrives before the entry expires.
+    pub continuation_probability: f64,
+    /// Pi's decision: `"warm"` when expected savings reach the threshold.
+    pub action: CacheWarmingAction,
+}
+
+/// `CacheWarmingDecisionEventResult` (cache-warmer.ts:125-127): override
+/// whether this refresh is sent; `"stop"` ends warming until the next real
+/// request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheWarmingDecisionEventResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<CacheWarmingAction>,
 }
 
 /// `BeforeProviderRequestEvent` (types.ts:670-673). The handler *result* is

@@ -408,6 +408,15 @@ impl NativeExtensionHost {
         self.core().emit_context(messages).await
     }
 
+    /// `cache_warming_decision` (#9668, c596d09d9): typed passthrough to the
+    /// runner's override aggregation.
+    pub async fn emit_cache_warming_decision(
+        &self,
+        event: crate::types::CacheWarmingDecisionEvent,
+    ) -> crate::types::CacheWarmingAction {
+        self.core().emit_cache_warming_decision(event).await
+    }
+
     pub async fn emit_before_provider_request(&self, payload: Value) -> Value {
         self.core().emit_before_provider_request(payload).await
     }

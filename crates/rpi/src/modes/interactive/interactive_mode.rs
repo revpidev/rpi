@@ -1910,10 +1910,18 @@ impl InteractiveUi {
                 self.render_handle.request_render();
             }
             UiCommand::EntryAppended(entry) => {
-                // entry_appended (interactive-mode.ts:2887-2892).
-                if matches!(entry, SessionEntry::Custom(_)) {
-                    self.add_custom_entry_to_chat(&entry);
-                    self.render_handle.request_render();
+                // entry_appended (interactive-mode.ts:2887-2892; usage arm
+                // at :3276-3279, #9668).
+                match entry {
+                    SessionEntry::Custom(_) => {
+                        self.add_custom_entry_to_chat(&entry);
+                        self.render_handle.request_render();
+                    }
+                    SessionEntry::Usage(usage_entry) if usage_entry.kind == "cache_warm" => {
+                        self.add_cache_warming_usage(&usage_entry);
+                        self.render_handle.request_render();
+                    }
+                    _ => {}
                 }
             }
             UiCommand::SessionInfoChanged { name } => {
@@ -3250,6 +3258,28 @@ impl InteractiveUi {
     /// 836aee6d3): render billing usage for a compaction or branch summary.
     /// The notice is derived from persisted summary usage and is not stored
     /// as a separate session entry.
+    /// `addCacheWarmingUsage` (interactive-mode.ts:3880-3884, #9668): one
+    /// dim transcript line per successful refresh, behind the same
+    /// `showCacheMissNotices` gate as compaction cost notices.
+    fn add_cache_warming_usage(&self, entry: &rpi_agent::session::UsageEntry) {
+        if !self
+            .session()
+            .settings_manager(|settings| settings.get_show_cache_miss_notices())
+        {
+            return;
+        }
+        self.add_chat_child(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
+        self.add_chat_child(Box::new(Text::new(
+            lock(&self.theme).fg(
+                "dim",
+                &crate::core::cache_warming::format_cache_warming_usage(entry),
+            ),
+            1,
+            0,
+            None,
+        )));
+    }
+
     fn add_compaction_cost_notice(&self, kind: CompactionCostKind, usage: &rpi_ai::types::Usage) {
         if !self
             .session()
@@ -3728,6 +3758,14 @@ impl InteractiveUi {
             };
             if matches!(entry, SessionEntry::Custom(_)) {
                 self.add_custom_entry_to_chat(entry);
+                continue;
+            }
+            // `isUsageSessionEntry` (interactive-mode.ts:3783-3786, #9668):
+            // successful cache-warming usage renders as a transcript notice.
+            if let SessionEntry::Usage(usage_entry) = entry {
+                if usage_entry.kind == "cache_warm" {
+                    self.add_cache_warming_usage(usage_entry);
+                }
                 continue;
             }
             let messages = session_entry_to_context_messages(entry);

@@ -223,6 +223,47 @@ impl InteractiveUi {
             to_locale_string(stats.tokens.total)
         ));
 
+        // Cache Warming section (interactive-mode.ts:6382-6391, #9668).
+        let cache_warming_status = self.session().cache_warming_status();
+        info.push_str(&format!("\n{}\n", Theme::bold("Cache Warming")));
+        info.push_str(&format!(
+            "{} {}\n",
+            lock(&self.theme).fg("dim", "Mode:"),
+            self.session()
+                .settings_manager(|settings| settings.get_cache_warming_mode())
+                .as_str()
+        ));
+        info.push_str(&format!(
+            "{} {}\n",
+            lock(&self.theme).fg("dim", "Status:"),
+            match &cache_warming_status {
+                Some(status) => crate::core::cache_warming::format_cache_warming_status(
+                    status,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                ),
+                None => "Inactive (cache warming unavailable)".to_owned(),
+            }
+        ));
+        if let Some(decision) = cache_warming_status
+            .as_ref()
+            .and_then(|status| status.decision.as_ref())
+            .filter(|decision| decision.economics_available)
+        {
+            info.push_str(&format!(
+                "{} ${:.3}\n",
+                lock(&self.theme).fg("dim", "Cache miss penalty:"),
+                decision.miss_cost
+            ));
+            info.push_str(&format!(
+                "{} ${:.3}\n",
+                lock(&self.theme).fg("dim", "Refresh cost:"),
+                decision.warm_cost
+            ));
+        }
+
         if stats.cost > 0.0 {
             info.push_str(&format!("\n{}\n", Theme::bold("Cost")));
             info.push_str(&format!(
@@ -853,6 +894,27 @@ mod tests {
             "in-memory session file label: {rendered}"
         );
         assert!(rendered.contains("User: 1"), "user count: {rendered}");
+    }
+
+    /// #9668 (V15-05 FR-D): the `/session` diagnostics include the Cache
+    /// Warming section (interactive-mode.ts:6382-6391) — mode line, status
+    /// line, and the cost estimates when economics are available.
+    #[tokio::test]
+    async fn session_command_renders_cache_warming_section() {
+        let (mode, _terminal) = mode_harness().await;
+        let ui = &mode.ui_state;
+        seed_user_message(&ui.session(), "first question");
+        ui.handle_session_command();
+        let rendered = strip_ansi(&chat_render(ui));
+        assert!(rendered.contains("Cache Warming"), "rendered: {rendered}");
+        assert!(rendered.contains("Mode: streaming"), "rendered: {rendered}");
+        // The test session goes through sdk assembly, so a warmer exists;
+        // before any request it reports "waiting for first request"
+        // (cache-warmer.ts:290).
+        assert!(
+            rendered.contains("Inactive (waiting for first request)"),
+            "rendered: {rendered}"
+        );
     }
 
     // ---------------------------------------------------------------------

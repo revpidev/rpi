@@ -106,6 +106,8 @@ pub struct SettingsSelectorOptions {
     pub follow_up_mode: QueueMode,
     pub transport: TransportSetting,
     pub http_idle_timeout_ms: u64,
+    /// `SettingsConfig.cacheWarmingMode` (settings-selector.ts:65, #9668).
+    pub cache_warming_mode: crate::core::settings_manager::CacheWarmingMode,
     /// Global default thinking level (the per-model "(clear override)"
     /// description; the plain "Default thinking level" entry was removed
     /// upstream, 5b3caaf4c).
@@ -160,6 +162,8 @@ pub enum SettingsChange {
     FollowUpMode(QueueMode),
     Transport(TransportSetting),
     HttpIdleTimeoutMs(u64),
+    /// `onCacheWarmingModeChange` (settings-selector.ts:105, #9668).
+    CacheWarmingMode(crate::core::settings_manager::CacheWarmingMode),
     /// `onModelThinkingLevelChange` (settings-selector.ts:102).
     ModelThinkingLevelChange {
         provider: String,
@@ -1736,6 +1740,20 @@ impl SettingsSelectorComponent {
                 submenu: None,
             },
             SettingItem {
+                id: "cache-warming-mode".to_string(),
+                label: "Cache warming".to_string(),
+                description: Some(
+                    "off; streaming while the agent runs; idle also between runs while continuation stays profitable".to_string(),
+                ),
+                current_value: options.cache_warming_mode.as_str().to_string(),
+                values: Some(vec![
+                    "off".to_string(),
+                    "streaming".to_string(),
+                    "idle".to_string(),
+                ]),
+                submenu: None,
+            },
+            SettingItem {
                 id: "hide-thinking".to_string(),
                 label: "Hide thinking".to_string(),
                 description: Some("Hide thinking blocks in assistant responses".to_string()),
@@ -2297,6 +2315,15 @@ impl SettingsSelectorComponent {
                         None => return,
                     }
                 }
+                "cache-warming-mode" => {
+                    let mode = match new_value {
+                        "off" => crate::core::settings_manager::CacheWarmingMode::Off,
+                        "streaming" => crate::core::settings_manager::CacheWarmingMode::Streaming,
+                        "idle" => crate::core::settings_manager::CacheWarmingMode::Idle,
+                        _ => return,
+                    };
+                    SettingsChange::CacheWarmingMode(mode)
+                }
                 "hide-thinking" => SettingsChange::HideThinkingBlock(new_value == "true"),
                 "mermaid-rendering" => {
                     SettingsChange::MermaidRenderingMode(parse_mermaid_rendering_mode(new_value))
@@ -2420,6 +2447,7 @@ mod tests {
             follow_up_mode: QueueMode::All,
             transport: Transport::Auto,
             http_idle_timeout_ms: 300_000,
+            cache_warming_mode: crate::core::settings_manager::CacheWarmingMode::Streaming,
             thinking_level: ThinkingLevel::High,
             model_thinking_levels: Default::default(),
             available_default_models: Vec::new(),
@@ -2536,11 +2564,11 @@ mod tests {
         assert!(joined.contains("false"));
         assert!(joined.contains("Autocomplete max items"));
         assert!(joined.contains("Enter/Space to change · Esc to cancel"));
-        // Scroll hint shows the item count (30 items without image rows, 32
-        // with them; +fullscreen-copy-on-select, 4e4949299; the 10-row
-        // window always scrolls).
+        // Scroll hint shows the item count (31 items without image rows, 33
+        // with them; +fullscreen-copy-on-select, 4e4949299; +cache warming
+        // row #9668/V15-05; the 10-row window always scrolls).
         let supports_images = get_capabilities().images.is_some();
-        let item_count = if supports_images { 32 } else { 30 };
+        let item_count = if supports_images { 33 } else { 31 };
         assert!(lines
             .iter()
             .any(|l| l.contains(&format!("(1/{item_count})"))));
@@ -2696,13 +2724,14 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Move down to the Warnings item (index 25 with image rows, 23
+        // Move down to the Warnings item (index 26 with image rows, 24
         // without: the nine always-present rows inserted after autocompact /
-        // auto-resize push the base items down).
+        // auto-resize push the base items down; +1 cache-warming row
+        // #9668/V15-05).
         let target = if get_capabilities().images.is_some() {
-            25
+            26
         } else {
-            23
+            24
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2745,11 +2774,12 @@ mod tests {
         opts.current_model = Some(test_model("beta", "b1", true));
         let mut component = SettingsSelectorComponent::new(opts, theme(), on_change, on_cancel);
         // Move to the model-thinking item (same index the old thinking
-        // entry occupied: 26 with image rows, 24 without).
+        // entry occupied: 26 with image rows, 24 without; +1 cache-warming
+        // row #9668/V15-05 → 27/25).
         let target = if get_capabilities().images.is_some() {
-            26
+            27
         } else {
-            24
+            25
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2821,9 +2851,9 @@ mod tests {
         opts.available_default_models = vec![test_model("alpha", "a1", true)];
         let mut component = SettingsSelectorComponent::new(opts, theme(), on_change, on_cancel);
         let target = if get_capabilities().images.is_some() {
-            26
+            27
         } else {
-            24
+            25
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2851,9 +2881,9 @@ mod tests {
         opts.available_default_models = vec![test_model("alpha", "a1", false)];
         let mut component = SettingsSelectorComponent::new(opts, theme(), on_change, on_cancel);
         let target = if get_capabilities().images.is_some() {
-            26
+            27
         } else {
-            24
+            25
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2899,9 +2929,9 @@ mod tests {
         // Theme item index: 30 with image rows, 28 without (3 T32 items
         // added before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar).
         let target = if get_capabilities().images.is_some() {
-            31
+            32
         } else {
-            29
+            30
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2950,9 +2980,9 @@ mod tests {
         // Theme item index: 30 with image rows, 28 without (3 T32 items
         // added before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar).
         let target = if get_capabilities().images.is_some() {
-            31
+            32
         } else {
-            29
+            30
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2994,10 +3024,11 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let component = SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
 
-        // The full item count is now 30 (no images) or 32 (with images):
-        // 26 base + 3 T32 items + fullscreen-copy-on-select (4e4949299).
+        // The full item count is now 31 (no images) or 33 (with images):
+        // 26 base + 3 T32 items + fullscreen-copy-on-select (4e4949299) +
+        // cache warming (#9668/V15-05).
         let supports_images = get_capabilities().images.is_some();
-        let expected = if supports_images { 32 } else { 30 };
+        let expected = if supports_images { 33 } else { 31 };
         let lines = render_plain(&component, 100);
         let joined = lines.join("\n");
         // The scroll indicator shows the total count.

@@ -524,6 +524,11 @@ impl TreeList {
             .iter()
             .filter(|flat_node| {
                 let entry = &flat_node.node.entry;
+                // Usage entries never appear in the tree (tree-selector.ts:341,
+                // #9668).
+                if matches!(entry.known(), Some(SessionEntry::Usage(_))) {
+                    return false;
+                }
                 let is_current_leaf = current_leaf_id
                     .as_deref()
                     .is_some_and(|lid| entry.id() == lid);
@@ -4022,5 +4027,51 @@ mod tests {
             .unwrap();
         assert_eq!(flat.node.label, None);
         assert_eq!(flat.node.label_timestamp, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // #9668 (V15-05): usage entries never appear in the tree
+    // (tree-selector.ts:341)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn usage_entries_are_hidden_in_every_filter_mode() {
+        fn usage_entry(id: &str, parent_id: Option<&str>) -> StoredEntry {
+            known(SessionEntry::Usage(rpi_agent::session::UsageEntry {
+                id: id.to_owned(),
+                parent_id: parent_id.map(str::to_owned),
+                timestamp: TS.to_owned(),
+                kind: "cache_warm".to_owned(),
+                provider: "anthropic".to_owned(),
+                model: "claude-opus-4-6".to_owned(),
+                usage: rpi_ai::types::Usage::default(),
+                note: None,
+            }))
+        }
+
+        let tree = vec![node(
+            user_msg("u1", None, "hello"),
+            vec![node(
+                assistant_msg("a1", Some("u1"), "hi", StopReason::Stop, None),
+                vec![node(usage_entry("w1", Some("a1")), Vec::new(), None)],
+                None,
+            )],
+            None,
+        )];
+        for filter_mode in [
+            TreeFilterMode::Default,
+            TreeFilterMode::UserOnly,
+            TreeFilterMode::NoTools,
+            TreeFilterMode::LabeledOnly,
+            TreeFilterMode::All,
+        ] {
+            let list = tree_list(tree.clone(), Some("w1"), 20, None, filter_mode);
+            assert!(
+                list.filtered_nodes
+                    .iter()
+                    .all(|n| n.node.entry.type_tag() != "usage"),
+                "usage entry hidden in {filter_mode:?}"
+            );
+        }
     }
 }

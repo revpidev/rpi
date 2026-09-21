@@ -530,6 +530,51 @@ impl ExtensionRunnerCore {
         result
     }
 
+    /// `emitCacheWarmingDecision` (#9668, c596d09d9; runner.ts:920-941):
+    /// returns the event's own action unless a handler overrides it; the
+    /// last override wins. Handler errors are emitted via `emitError` and
+    /// dispatch continues (failures fall back to pi's decision at the
+    /// caller — a handler that both errors and never returns loses its
+    /// override).
+    pub async fn emit_cache_warming_decision(
+        &self,
+        event: crate::types::CacheWarmingDecisionEvent,
+    ) -> crate::types::CacheWarmingAction {
+        use crate::types::{CacheWarmingDecisionEventResult, EVENT_CACHE_WARMING_DECISION};
+
+        let mut action = event.action;
+        let payload = match serde_json::to_value(&event) {
+            Ok(mut payload) => {
+                crate::types::stamp_event_type(&mut payload, EVENT_CACHE_WARMING_DECISION);
+                payload
+            }
+            Err(_) => return action,
+        };
+
+        for (path, handler) in self.handlers_for(EVENT_CACHE_WARMING_DECISION) {
+            let ctx = self.create_context();
+            match handler(payload.clone(), ctx).await {
+                Ok(handler_result) => {
+                    if let Ok(Some(result)) = serde_json::from_value::<
+                        Option<CacheWarmingDecisionEventResult>,
+                    >(handler_result)
+                    {
+                        if let Some(override_action) = result.action {
+                            action = override_action;
+                        }
+                    }
+                }
+                Err(error) => self.emit_error(ExtensionError::new(
+                    &path,
+                    EVENT_CACHE_WARMING_DECISION,
+                    error,
+                )),
+            }
+        }
+
+        action
+    }
+
     /// `emitMessageEnd` (runner.ts:822-862): chained message replacement;
     /// a replacement must keep the original role, otherwise an error is
     /// emitted and the replacement is skipped.

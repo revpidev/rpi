@@ -186,6 +186,45 @@ impl MermaidRenderingMode {
     }
 }
 
+/// `CacheWarmingMode = "off" | "streaming" | "idle"` (#9668,
+/// c596d09d9; settings-manager.ts:76-77) — default `"streaming"`. Global
+/// setting only because each refresh costs money (settings-manager.ts:954).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CacheWarmingMode {
+    #[serde(rename = "off")]
+    Off,
+    #[default]
+    #[serde(rename = "streaming")]
+    Streaming,
+    #[serde(rename = "idle")]
+    Idle,
+}
+
+impl CacheWarmingMode {
+    /// The on-disk string form (settings-manager.ts:76-77).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheWarmingMode::Off => "off",
+            CacheWarmingMode::Streaming => "streaming",
+            CacheWarmingMode::Idle => "idle",
+        }
+    }
+
+    /// `CACHE_WARMING_MODES.includes(mode)` — invalid stored values fall
+    /// back to the default (settings-manager.test.ts:413-415).
+    fn from_setting(value: Option<&Value>) -> Self {
+        value
+            .and_then(Value::as_str)
+            .and_then(|mode| match mode {
+                "off" => Some(CacheWarmingMode::Off),
+                "streaming" => Some(CacheWarmingMode::Streaming),
+                "idle" => Some(CacheWarmingMode::Idle),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// `WarningSettings` (settings-manager.ts:58-60) — file shape.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1667,6 +1706,23 @@ impl SettingsManager {
         }
     }
 
+    /// `getCacheWarmingMode` (#9668, c596d09d9; settings-manager.ts:954-958):
+    /// read from global settings only because warming costs money —
+    /// project `cacheWarming` is ignored; invalid values fall back to
+    /// `"streaming"`.
+    pub fn get_cache_warming_mode(&self) -> CacheWarmingMode {
+        CacheWarmingMode::from_setting(self.global_settings.get("cacheWarming"))
+    }
+
+    /// `setCacheWarmingMode` (settings-manager.ts:960-965) — persists
+    /// globally.
+    pub fn set_cache_warming_mode(&mut self, mode: CacheWarmingMode) {
+        self.global_settings
+            .set("cacheWarming", Value::String(mode.as_str().to_owned()));
+        self.mark_modified("cacheWarming", None);
+        self.save();
+    }
+
     /// `getWebSocketConnectTimeoutMs` (settings-manager.ts:842-844) — no
     /// default at this layer (docs/settings.md:172 documents 15000, applied
     /// by the SDK transport layer); a present-but-invalid value is an error.
@@ -3058,6 +3114,60 @@ mod tests {
 
         assert!(dirs.project_dir.join(".rpi").exists());
         assert!(project_path(&dirs).exists());
+    }
+
+    // =======================================================================
+    // describe("cacheWarming") — #9668 (V15-05 FR-A)
+    // =======================================================================
+
+    // Port of "defaults to streaming and ignores project settings"
+    // (settings-manager.test.ts:396-414): global-only because each refresh
+    // costs money.
+    #[test]
+    fn test_cache_warming_defaults_to_streaming_and_ignores_project() {
+        let dirs = test_dirs();
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Streaming
+        );
+
+        write_json(&project_path(&dirs), json!({"cacheWarming": "idle"}));
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Streaming
+        );
+
+        write_json(&global_path(&dirs), json!({"cacheWarming": "idle"}));
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Idle
+        );
+
+        write_json(&global_path(&dirs), json!({"cacheWarming": "bogus"}));
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Streaming
+        );
+    }
+
+    // Port of "persists the mode globally" (settings-manager.test.ts:416-423).
+    #[test]
+    fn test_cache_warming_persists_globally() {
+        let dirs = test_dirs();
+        let mut manager = create(&dirs);
+        manager.set_cache_warming_mode(CacheWarmingMode::Off);
+
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Off
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(global_path(&dirs)).unwrap()
+            )
+            .unwrap(),
+            json!({"cacheWarming": "off"})
+        );
     }
 
     // =======================================================================

@@ -291,6 +291,11 @@ impl Component for FooterComponent {
                         add_usage_to_totals(&mut usage_totals, usage);
                     }
                 }
+                // `entry.type === "usage"` → session totals (footer.ts:92-93,
+                // #9668).
+                Some(SessionEntry::Usage(usage_entry)) => {
+                    add_usage_to_totals(&mut usage_totals, &usage_entry.usage);
+                }
                 _ => {}
             }
         }

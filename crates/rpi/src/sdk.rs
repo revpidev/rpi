@@ -369,10 +369,45 @@ pub async fn create_agent_session(
             None => NoopExtensionRunner::shared(),
         };
     let extension_runner_ref = new_extension_runner_ref(extension_runner);
+    // Cache warmer (#9668, c596d09d9; sdk.ts:304-309): created before the
+    // stream function so session requests can arm it. Mode is re-read per
+    // decision; the decide hook routes through the extension runner
+    // (sdk.ts:308: `emitCacheWarmingDecision(event) ?? event.action`).
+    let cache_warmer = std::sync::Arc::new(crate::core::cache_warming::CacheWarmer::new(
+        crate::core::cache_warming::CacheWarmerDeps {
+            models: model_runtime.clone(),
+            session: session_manager.clone(),
+            get_mode: {
+                let loader = resource_loader.clone();
+                Arc::new(move || {
+                    let loader = loader.lock().unwrap_or_else(|e| e.into_inner());
+                    loader.settings_manager().get_cache_warming_mode()
+                })
+            },
+            decide: {
+                let runner_ref = extension_runner_ref.clone();
+                Arc::new(move |event| {
+                    let runner_ref = runner_ref.clone();
+                    Box::pin(async move {
+                        let runner = crate::core::extensions::read_runner(&runner_ref);
+                        runner.emit_cache_warming_decision(event).await
+                    }) as crate::core::cache_warming::DecideFuture
+                })
+            },
+        },
+    ));
+    // `agent` is created after the stream function that references it;
+    // the OnceLock cell breaks the cycle (upstream assigns the hoisted
+    // `let agent` binding, sdk.ts:368-376). Unset → warming never starts
+    // (no requests exist before the agent does).
+    let agent_cell: Arc<std::sync::OnceLock<Arc<Agent>>> = Arc::new(std::sync::OnceLock::new());
     let stream_fn = {
         let model_runtime = model_runtime.clone();
         let loader = resource_loader.clone();
         let runner_ref = extension_runner_ref.clone();
+        let cache_warmer = cache_warmer.clone();
+        let agent_cell = agent_cell.clone();
+        let session_manager_for_warming = session_manager.clone();
         Arc::new(
             move |model: Model, context: rpi_ai::types::Context, options: StreamOptions| {
                 let model_runtime = model_runtime.clone();
@@ -462,6 +497,57 @@ pub async fn create_agent_session(
                             as BoxFuture<'static, rpi_ai::types::ProviderHeaders>
                     })),
                 };
+                // Arm the cache warmer from session requests only
+                // (sdk.ts:387-391, #9668): compaction and summaries carry
+                // their own routing ids (`session_id` differs), so only the
+                // conversation request replaces the cache entry.
+                if stream_options_with_headers
+                    .simple
+                    .stream
+                    .session_id
+                    .as_deref()
+                    == Some(
+                        session_manager_for_warming
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_session_id(),
+                    )
+                {
+                    // `cacheContextIsCurrent(model)` (sdk.ts:361-372): keep
+                    // warming while the transcript still extends this
+                    // request's prefix and the model is unchanged. Upstream
+                    // compares message identity; Rust translates to value
+                    // equality (equivalent content at the same indices is
+                    // the same conversation prefix for cache purposes —
+                    // identity does not exist for value types).
+                    if let Some(agent) = agent_cell.get() {
+                        let request_model = (model.provider.clone(), model.id.clone());
+                        let request_messages = agent.state().messages;
+                        let cell = agent_cell.clone();
+                        let is_current: crate::core::cache_warming::IsCurrent =
+                            Arc::new(move || {
+                                let Some(agent) = cell.get() else {
+                                    return false;
+                                };
+                                let state = agent.state();
+                                state.model.provider == request_model.0
+                                    && state.model.id == request_model.1
+                                    && request_messages.len() <= state.messages.len()
+                                    && request_messages
+                                        .iter()
+                                        .zip(state.messages.iter())
+                                        .all(|(requested, current)| requested == current)
+                            });
+                        cache_warmer.start(
+                            crate::core::cache_warming::CacheWarmRequest {
+                                model: model.clone(),
+                                context: context.clone(),
+                                options: stream_options_with_headers.clone(),
+                            },
+                            is_current,
+                        );
+                    }
+                }
                 Box::pin(model_runtime.stream_simple(
                     &model,
                     &context,
@@ -540,6 +626,10 @@ pub async fn create_agent_session(
     ));
 
     let agent = Arc::new(Agent::new(agent_options));
+    // Complete the cache-warmer cycle: the stream function can now observe
+    // agent state for `isCurrent` checks (#9668; sdk.ts:368-376 hoisted
+    // assignment).
+    let _ = agent_cell.set(agent.clone());
 
     // Restore messages / save initial entries (sdk.ts:362-374).
     if has_existing_session {
@@ -588,6 +678,7 @@ pub async fn create_agent_session(
             reason: crate::core::extensions::SessionStartReason::Startup,
             previous_session_file: None,
         }),
+        cache_warmer: Some(cache_warmer),
     });
 
     Ok(CreateAgentSessionResult {
@@ -764,6 +855,19 @@ pub(crate) fn sanitize_default_tool_names(names: Vec<String>) -> Vec<String> {
             known
         })
         .collect()
+}
+
+/// `ModelRuntime` satisfies the warmer's `streamSimple` view (#9668;
+/// cache-warmer.ts:269 `Pick<ModelRuntime, "streamSimple">`).
+impl crate::core::cache_warming::WarmingModels for ModelRuntime {
+    fn warming_stream_simple(
+        &self,
+        model: &Model,
+        context: &rpi_ai::types::Context,
+        options: Option<rpi_ai::models::ModelsSimpleStreamOptions>,
+    ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+        self.stream_simple(model, context, options)
+    }
 }
 
 #[cfg(test)]

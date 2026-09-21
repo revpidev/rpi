@@ -2591,6 +2591,59 @@ fn migration_rewrite_preserves_extra_fields_on_known_entries() {
 
 /// session_info sanitize: `\r\n` → space (T07 self-check).
 #[test]
+fn append_usage_persists_without_context_participation() {
+    // #9668 (V15-05): `appendUsage` — model-attributed usage that does not
+    // participate in LLM context (session-format.md §UsageEntry;
+    // agent-session-stats.test.ts:211-241 intent).
+    let mut session = in_memory();
+    let usage = usage_sample();
+    let entry = session
+        .append_usage(
+            "cache_warm",
+            "anthropic",
+            "claude-opus-4-6",
+            usage.clone(),
+            Some("extension override"),
+        )
+        .expect("append");
+    assert_eq!(entry.kind, "cache_warm");
+    assert_eq!(entry.note.as_deref(), Some("extension override"));
+    assert_eq!(entry.provider, "anthropic");
+    assert_eq!(entry.model, "claude-opus-4-6");
+
+    // Typed view round-trips: the entry is Known(Usage) with tag "usage".
+    let entries = session.get_entries();
+    let stored = entries
+        .iter()
+        .find(|e| e.type_tag() == "usage")
+        .expect("usage entry persisted");
+    match stored.known() {
+        Some(SessionEntry::Usage(u)) => {
+            assert_eq!(u.id, entry.id);
+            assert_eq!(u.usage.total_tokens, usage.total_tokens);
+        }
+        other => panic!("expected usage, got {other:?}"),
+    }
+
+    // No context message: usage entries never enter the LLM context
+    // (agent-session-stats.test.ts:234).
+    let context = session.build_session_context();
+    assert!(context.messages.is_empty());
+
+    // Usage totals group by provider/model (usage-totals.ts:46-48, #9668).
+    let known: Vec<SessionEntry> = entries.iter().filter_map(|e| e.known()).cloned().collect();
+    let breakdown = crate::core::usage_totals::get_usage_cost_breakdown(&known);
+    assert_eq!(
+        breakdown,
+        vec![crate::core::usage_totals::UsageCostBreakdownEntry {
+            key: "anthropic/claude-opus-4-6".to_owned(),
+            cost: usage.cost.total,
+            tokens: usage.total_tokens,
+        }]
+    );
+}
+
+#[test]
 fn append_session_info_sanitizes_newlines() {
     let mut session = in_memory();
     session.append_message(user_msg("hello")).expect("append");

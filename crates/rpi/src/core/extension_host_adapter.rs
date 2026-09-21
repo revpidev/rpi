@@ -615,6 +615,13 @@ impl ExtensionRunner for ExtensionHostAdapter {
         serde_json::from_value(result).unwrap_or(messages)
     }
 
+    async fn emit_cache_warming_decision(
+        &self,
+        event: rpi_ext_host::types::CacheWarmingDecisionEvent,
+    ) -> rpi_ext_host::types::CacheWarmingAction {
+        self.host.emit_cache_warming_decision(event).await
+    }
+
     async fn emit_before_provider_request(&self, payload: Value) -> Value {
         self.host.emit_before_provider_request(payload).await
     }

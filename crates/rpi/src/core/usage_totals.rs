@@ -68,6 +68,10 @@ pub fn get_usage_cost_breakdown(entries: &[SessionEntry]) -> Vec<UsageCostBreakd
                 Some(usage) => (Some("Tools/summaries".to_owned()), Some(usage)),
                 None => (None, None),
             },
+            SessionEntry::Usage(usage_entry) => (
+                Some(format!("{}/{}", usage_entry.provider, usage_entry.model)),
+                Some(&usage_entry.usage),
+            ),
             SessionEntry::Compaction(compaction) => match &compaction.usage {
                 Some(usage) => (Some("Tools/summaries".to_owned()), Some(usage)),
                 None => (None, None),

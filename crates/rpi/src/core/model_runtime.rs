@@ -950,6 +950,23 @@ fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -
             tiers: cost.tiers.clone().or_else(|| model.cost.tiers.take()),
         };
     }
+    // `promptCache: override.promptCache ? {...model.promptCache,
+    // ...override.promptCache} : model.promptCache` (provider-composer.ts:
+    // 126-127, #9668) — per-tier override, absent tier keeps the model
+    // value.
+    if let Some(override_prompt_cache) = &override_.prompt_cache {
+        model.prompt_cache = Some(match model.prompt_cache.take() {
+            Some(mut base) => {
+                base.short = override_prompt_cache.short.or(base.short);
+                base.long = override_prompt_cache.long.or(base.long);
+                base
+            }
+            None => rpi_ai::types::ModelPromptCache {
+                short: override_prompt_cache.short,
+                long: override_prompt_cache.long,
+            },
+        });
+    }
     if let Some(context_window) = override_.context_window {
         model.context_window = context_window as u32;
     }
@@ -2284,7 +2301,12 @@ fn json_model_to_model(
         thinking_level_map: model.thinking_level_map.clone(),
         input: model.input.clone().unwrap_or_else(default_input),
         cost: model.cost.clone().unwrap_or_default(),
-        prompt_cache: None,
+        prompt_cache: model
+            .prompt_cache
+            .map(|cache| rpi_ai::types::ModelPromptCache {
+                short: cache.short,
+                long: cache.long,
+            }),
         context_window: model.context_window.unwrap_or(128000.0) as u32,
         max_tokens: model.max_tokens.unwrap_or(16384.0) as u32,
         sampling_params: model.sampling_params.clone(),
@@ -2766,6 +2788,79 @@ mod tests {
         assert!(model.reasoning);
         assert_eq!(model.context_window, 64000);
         assert_eq!(model.max_tokens, 4096);
+    }
+
+    /// #9668 (model-registry.test.ts:790-816, @ c596d09d9): "custom model
+    /// and model override carry prompt cache lifetimes" — definitions
+    /// pass through; overrides merge per tier with the built-in catalog.
+    #[tokio::test]
+    async fn custom_model_and_override_carry_prompt_cache_lifetimes() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {
+                "openrouter": {
+                    "baseUrl": "https://my-proxy.example.com/v1",
+                    "api": "openai-completions",
+                    "models": [{"id": "custom/cached-model", "promptCache": {"short": 120}}],
+                    "modelOverrides": {
+                        "custom/cached-model": {"promptCache": {"long": 240}}
+                    }
+                },
+                "anthropic": {
+                    "modelOverrides": {
+                        "claude-sonnet-4-6": {"promptCache": {"long": 1800}}
+                    }
+                }
+            }}"#,
+        )
+        .await;
+        assert!(runtime.get_error().is_none(), "no composition error");
+
+        // Definition passthrough + per-tier override merge on the custom
+        // model: the override adds the long tier, the definition's short
+        // tier is kept (upstream asserts this merge on its openrouter
+        // catalog entry; rpi's custom provider has no catalog, so the merge
+        // runs over the definition value — same provider-composer.ts:126-127
+        // code path).
+        let custom = runtime
+            .get_model("openrouter", "custom/cached-model")
+            .expect("custom model");
+        assert_eq!(
+            custom.prompt_cache,
+            Some(rpi_ai::types::ModelPromptCache {
+                short: Some(120),
+                long: Some(240)
+            })
+        );
+
+        // Catalog merge: direct Anthropic carries {300, 3600} from the
+        // generated catalog (V15-03); the long-tier override wins, short
+        // keeps the catalog value (model-registry.test.ts:813-814).
+        let merged = runtime
+            .get_model("anthropic", "claude-sonnet-4-6")
+            .expect("catalog model");
+        assert_eq!(
+            merged.prompt_cache,
+            Some(rpi_ai::types::ModelPromptCache {
+                short: Some(300),
+                long: Some(1800)
+            })
+        );
+
+        // Non-overridden catalog model keeps its catalog value: the long
+        // tier is 3600, not the override's 1800 (upstream asserts
+        // `claude-opus-4` stays undefined; rpi's regenerated catalog
+        // annotates every direct Anthropic model, so the equivalent
+        // negative is "override did not leak across models").
+        let untouched = runtime
+            .get_model("anthropic", "claude-opus-4-8")
+            .expect("catalog model without override");
+        assert_eq!(
+            untouched.prompt_cache,
+            Some(rpi_ai::types::ModelPromptCache {
+                short: Some(300),
+                long: Some(3600)
+            })
+        );
     }
 
     /// model-registry.test.ts (b03a367a4 @ d1230ea20, #9294): "Anthropic

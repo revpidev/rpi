@@ -213,6 +213,7 @@ fn get_message_from_entry(entry: &SessionEntry) -> Option<AgentMessage> {
         SessionEntry::ThinkingLevelChange(_)
         | SessionEntry::ModelChange(_)
         | SessionEntry::ActiveToolsChange(_)
+        | SessionEntry::Usage(_)
         | SessionEntry::Custom(_)
         | SessionEntry::Label(_)
         | SessionEntry::SessionInfo(_)

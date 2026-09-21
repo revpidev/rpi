@@ -77,6 +77,27 @@ pub struct ActiveToolsChangeEntry {
     pub active_tool_names: Vec<String>,
 }
 
+/// `UsageEntry` (#9668, c596d09d9): model-attributed usage that is not an
+/// assistant message and does not participate in LLM context. `kind` is an
+/// arbitrary string identifying the operation; cache warming uses
+/// `"cache_warm"`. Contributes to session token/cost totals; hidden from
+/// the conversation tree (session-format.md §UsageEntry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageEntry {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp: String,
+    /// Arbitrary usage category, such as `"cache_warm"`.
+    pub kind: String,
+    pub provider: String,
+    pub model: String,
+    pub usage: Usage,
+    /// Optional human-readable qualifier for usage notices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// `CompactionEntry` — both persisted forms (see file header note).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -225,6 +246,7 @@ pub enum SessionEntry {
     ThinkingLevelChange(ThinkingLevelChangeEntry),
     ModelChange(ModelChangeEntry),
     ActiveToolsChange(ActiveToolsChangeEntry),
+    Usage(UsageEntry),
     Compaction(CompactionEntry),
     BranchSummary(BranchSummaryEntry),
     Custom(CustomEntry),
@@ -273,6 +295,7 @@ pub enum FileEntry {
     Label(LabelEntry),
     SessionInfo(SessionInfoEntry),
     Leaf(LeafEntry),
+    Usage(UsageEntry),
 }
 
 impl FileEntry {
@@ -285,6 +308,7 @@ impl FileEntry {
             FileEntry::ThinkingLevelChange(e) => Some(SessionEntry::ThinkingLevelChange(e)),
             FileEntry::ModelChange(e) => Some(SessionEntry::ModelChange(e)),
             FileEntry::ActiveToolsChange(e) => Some(SessionEntry::ActiveToolsChange(e)),
+            FileEntry::Usage(e) => Some(SessionEntry::Usage(e)),
             FileEntry::Compaction(e) => Some(SessionEntry::Compaction(e)),
             FileEntry::BranchSummary(e) => Some(SessionEntry::BranchSummary(e)),
             FileEntry::Custom(e) => Some(SessionEntry::Custom(e)),
@@ -304,6 +328,7 @@ impl SessionEntry {
             SessionEntry::ThinkingLevelChange(_) => "thinking_level_change",
             SessionEntry::ModelChange(_) => "model_change",
             SessionEntry::ActiveToolsChange(_) => "active_tools_change",
+            SessionEntry::Usage(_) => "usage",
             SessionEntry::Compaction(_) => "compaction",
             SessionEntry::BranchSummary(_) => "branch_summary",
             SessionEntry::Custom(_) => "custom",
@@ -321,6 +346,7 @@ impl SessionEntry {
             SessionEntry::ThinkingLevelChange(e) => &e.id,
             SessionEntry::ModelChange(e) => &e.id,
             SessionEntry::ActiveToolsChange(e) => &e.id,
+            SessionEntry::Usage(e) => &e.id,
             SessionEntry::Compaction(e) => &e.id,
             SessionEntry::BranchSummary(e) => &e.id,
             SessionEntry::Custom(e) => &e.id,
@@ -338,6 +364,7 @@ impl SessionEntry {
             SessionEntry::ThinkingLevelChange(e) => e.parent_id.as_deref(),
             SessionEntry::ModelChange(e) => e.parent_id.as_deref(),
             SessionEntry::ActiveToolsChange(e) => e.parent_id.as_deref(),
+            SessionEntry::Usage(e) => e.parent_id.as_deref(),
             SessionEntry::Compaction(e) => e.parent_id.as_deref(),
             SessionEntry::BranchSummary(e) => e.parent_id.as_deref(),
             SessionEntry::Custom(e) => e.parent_id.as_deref(),
@@ -355,6 +382,7 @@ impl SessionEntry {
             SessionEntry::ThinkingLevelChange(e) => &e.timestamp,
             SessionEntry::ModelChange(e) => &e.timestamp,
             SessionEntry::ActiveToolsChange(e) => &e.timestamp,
+            SessionEntry::Usage(e) => &e.timestamp,
             SessionEntry::Compaction(e) => &e.timestamp,
             SessionEntry::BranchSummary(e) => &e.timestamp,
             SessionEntry::Custom(e) => &e.timestamp,
