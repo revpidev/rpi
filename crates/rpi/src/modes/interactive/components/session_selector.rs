@@ -611,7 +611,7 @@ impl SessionList {
         self.filter_sessions(&query);
     }
 
-    /// `setSessions` (session-selector.ts:361-371 @ 19451accd,
+    /// `setSessions` (session-selector.ts:362-372 @ 19451accd,
     /// dfbf793b7): preserve the selected path across refreshes once the
     /// user has moved the selection; untouched lists follow the newest
     /// entry (index 0).
@@ -1284,7 +1284,7 @@ impl SessionSelectorComponent {
         changed
     }
 
-    /// `loadScope` (session-selector.ts:937-996 @ 19451accd, dfbf793b7):
+    /// `loadScope` (session-selector.ts:941-1005 @ 19451accd, dfbf793b7):
     /// spawn the progressive loader thread. No-op when the scope already
     /// has a load in flight. Load failures are impossible: the local list
     /// APIs return `Vec<SessionInfo>` and never error (upstream's rejection
@@ -1368,7 +1368,7 @@ impl SessionSelectorComponent {
         self.tui.request_render(false);
     }
 
-    /// `toggleScope` (session-selector.ts:1021-1033 @ 19451accd,
+    /// `toggleScope` (session-selector.ts:1031-1040 @ 19451accd,
     /// dfbf793b7): switch the displayed scope to its slot (or an empty list
     /// while the first load is pending) and kick off the load only when the
     /// slot is empty and idle.

@@ -2521,7 +2521,7 @@ pub fn build_session_info(file_path: &Path) -> Option<SessionInfo> {
     })
 }
 
-/// `SessionListProgress` (session-manager.ts:793-798 @ 19451accd,
+/// `SessionListProgress` (session-manager.ts:795-800 @ 19451accd,
 /// dfbf793b7): `(loaded, total)` plus the activity-sorted partial list on
 /// periodic publishes (`partial_sessions` is `Some` exactly on the upstream
 /// publish points: first file, every publish interval, and the final one).
