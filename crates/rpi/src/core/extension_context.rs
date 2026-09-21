@@ -171,6 +171,78 @@ impl ContextActions for SessionContextActions {
         entries
     }
 
+    /// `ctx.sessionToolResults` (rpi additive, ADR-0030): the active
+    /// branch (root→leaf) `type:"message"` entries of the bound session
+    /// whose `message.role == "toolResult"` and whose `message.toolName`
+    /// matches `tool_name` exactly — the cross-ABI equivalent of upstream
+    /// `ctx.sessionManager.getBranch()` replay reads (rpiv-todo
+    /// `state/replay.ts` @ 338b264, same filter chain).
+    /// Like `get_session_entries`, the projection walks the RAW stored
+    /// entry so malformed-but-navigable results round-trip verbatim.
+    /// Filter order per ADR-0030: `type:"message"` → `role:"toolResult"`
+    /// → exact `toolName` → tail `limit`. The projection is exactly the
+    /// six ADR-0030 fields — `message.content` blocks never cross the
+    /// boundary. Fail-closed `[]` when the session is gone or no branch
+    /// is active.
+    fn get_session_tool_results(
+        &self,
+        tool_name: &str,
+        limit: Option<u64>,
+    ) -> Vec<rpi_ext_host::types::SessionToolResultInfo> {
+        let Some(session) = self.session() else {
+            return Vec::new();
+        };
+        let manager = session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<rpi_ext_host::types::SessionToolResultInfo> = manager
+            .get_branch(None)
+            .iter()
+            .filter(|entry| entry.type_tag() == "message")
+            .filter_map(|entry| {
+                let raw = entry.raw_value();
+                let message = raw.get("message")?;
+                if message.get("role").and_then(Value::as_str) != Some("toolResult") {
+                    return None;
+                }
+                if message.get("toolName").and_then(Value::as_str) != Some(tool_name) {
+                    return None;
+                }
+                Some(rpi_ext_host::types::SessionToolResultInfo {
+                    id: raw
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    parent_id: raw
+                        .get("parentId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    timestamp: raw
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    tool_name: tool_name.to_owned(),
+                    // Malformed-but-navigable results default the flag to
+                    // false (ToolResultMessage always serializes `isError`).
+                    is_error: message
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    // `details` is the structured payload verbatim (null
+                    // when the result carries none — the raw record omits
+                    // the key rather than storing null).
+                    details: message.get("details").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        if let Some(limit) = limit {
+            let keep = (limit as usize).min(results.len());
+            results.drain(..results.len() - keep);
+        }
+        results
+    }
+
     /// `compact` — fire-and-forget with the callback pair
     /// (agent-session.ts:2423-2433).
     fn compact(&self, options: CompactOptions) {

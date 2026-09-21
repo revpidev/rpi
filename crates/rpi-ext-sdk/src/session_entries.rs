@@ -90,6 +90,80 @@ pub fn supports_session_entries<H: HostCall + ?Sized>(
     }
 }
 
+/// `ctx.sessionToolResults` — the additive host-call of ADR-0030
+/// (exercising ADR-0027's wider-read revision clause).
+pub const METHOD_SESSION_TOOL_RESULTS: &str = "ctx.sessionToolResults";
+
+/// One filtered toolResult of the active branch (ADR-0030 frozen shape):
+/// `{id, parentId, timestamp, toolName, isError, details}`. `details` is
+/// the tool's structured payload verbatim (`null` when the result carries
+/// none); `content` text blocks are never on the wire.
+///
+/// The native mirror is `rpi_ext_host::types::SessionToolResultInfo`; the
+/// two serialize byte-identically (asserted by
+/// `rpi-ext-host/tests/session_tool_results_parity.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionToolResult {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp: String,
+    pub tool_name: String,
+    pub is_error: bool,
+    pub details: Value,
+}
+
+/// Read the active branch's filtered toolResults (ADR-0030).
+///
+/// - `tool_name`: REQUIRED exact-match filter (no wildcard/prefix — the
+///   host rejects a missing/non-string value with `invalidRequest`).
+/// - `limit`: keep the filtered **tail** N results (path order kept);
+///   `None` = unlimited. The host caps explicit limits at
+///   `SESSION_ENTRIES_MAX_LIMIT` (10_000); invalid values are treated as
+///   absent by the dispatch layer.
+///
+/// Errors: `unknownMethod` on hosts without the method (pre-V15-14);
+/// `invalidRequest` when the host-side `toolName` arg is missing/non-string
+/// (the SDK wrapper always sends one, so this only surfaces on hand-rolled
+/// calls); `capabilityDenied` without capability `session`.
+pub fn session_tool_results<H: HostCall + ?Sized>(
+    host: &H,
+    tool_name: &str,
+    limit: Option<u64>,
+) -> Result<Vec<SessionToolResult>, InteractiveUiError> {
+    let mut args = serde_json::Map::new();
+    args.insert("toolName".to_owned(), Value::String(tool_name.to_owned()));
+    if let Some(limit) = limit {
+        args.insert("limit".to_owned(), Value::from(limit));
+    }
+    let response = host.call(METHOD_SESSION_TOOL_RESULTS, Value::Object(args))?;
+    serde_json::from_value(response)
+        .map_err(|error| InteractiveUiError::protocol(format!("sessionToolResults reply: {error}")))
+}
+
+/// Probe whether the host implements `ctx.sessionToolResults` (ADR-0030
+/// consumer migration, TE34): `Ok(true)` = readable; `Ok(false)` = old
+/// host answering `unknownMethod` (pre-V15-14 — replay falls back to a
+/// cleared list, fail-closed); `Err` = transport failure. The probe call
+/// carries a syntactically valid (non-matching) `toolName` so new hosts
+/// answer a successful `[]` without touching the branch.
+pub fn supports_session_tool_results<H: HostCall + ?Sized>(
+    host: &H,
+) -> Result<bool, InteractiveUiError> {
+    match host.call(
+        METHOD_SESSION_TOOL_RESULTS,
+        serde_json::json!({"toolName": "rpi-abi-probe"}),
+    ) {
+        // Read-only with no side effects; a successful call (including
+        // `[]`) proves support.
+        Ok(_) => Ok(true),
+        Err(error) => match error.kind {
+            crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(false),
+            _ => Err(error),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +291,125 @@ mod tests {
         assert_eq!(
             supports_session_entries(&host).expect_err("denied").kind,
             InteractiveUiErrorKind::CapabilityDenied
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ctx.sessionToolResults (ADR-0030, V15-14)
+    // -----------------------------------------------------------------------
+
+    fn tool_result(
+        id: &str,
+        parent: Option<&str>,
+        is_error: bool,
+        details: Value,
+    ) -> SessionToolResult {
+        let timestamp = match id {
+            "e2" => "2026-09-20T00:00:01.000Z",
+            _ => "2026-09-20T00:00:00.000Z",
+        };
+        SessionToolResult {
+            id: id.to_owned(),
+            parent_id: parent.map(str::to_owned),
+            timestamp: timestamp.to_owned(),
+            tool_name: "todo".to_owned(),
+            is_error,
+            details,
+        }
+    }
+
+    #[test]
+    fn tool_results_wrap_the_frozen_request_shape() {
+        // toolName is always sent (required); limit only when present.
+        let host = FakeHost::new(vec![Ok(json!([])), Ok(json!([]))]);
+        session_tool_results(&host, "todo", Some(50)).expect("call 1");
+        session_tool_results(&host, "todo", None).expect("call 2");
+        assert_eq!(
+            host.calls.borrow().as_slice(),
+            &[
+                (
+                    METHOD_SESSION_TOOL_RESULTS.to_owned(),
+                    json!({"toolName": "todo", "limit": 50})
+                ),
+                (
+                    METHOD_SESSION_TOOL_RESULTS.to_owned(),
+                    json!({"toolName": "todo"})
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_results_parse_the_reply_array() {
+        let host = FakeHost::new(vec![Ok(json!([
+            {
+                "id": "e1",
+                "parentId": null,
+                "timestamp": "2026-09-20T00:00:00.000Z",
+                "toolName": "todo",
+                "isError": false,
+                "details": {"tasks": [], "nextId": 1}
+            },
+            {
+                "id": "e2",
+                "parentId": "e1",
+                "timestamp": "2026-09-20T00:00:01.000Z",
+                "toolName": "todo",
+                "isError": true,
+                "details": null
+            }
+        ]))]);
+        let results = session_tool_results(&host, "todo", None).expect("results");
+        assert_eq!(
+            results,
+            vec![
+                tool_result("e1", None, false, json!({"tasks": [], "nextId": 1})),
+                tool_result("e2", Some("e1"), true, Value::Null),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_results_probe_and_old_host_error() {
+        // Old host: unknownMethod → surfaced error + Ok(false) probe.
+        let host = FakeHost::new(vec![
+            Err(InteractiveUiError::new(
+                InteractiveUiErrorKind::UnknownMethod,
+                "unknown host call: ctx.sessionToolResults",
+            )),
+            Err(InteractiveUiError::new(
+                InteractiveUiErrorKind::UnknownMethod,
+                "unknown host call: ctx.sessionToolResults",
+            )),
+        ]);
+        let error = session_tool_results(&host, "todo", None).expect_err("old host");
+        assert_eq!(error.kind, InteractiveUiErrorKind::UnknownMethod);
+        assert!(!supports_session_tool_results(&host).expect("probe"));
+
+        // New host: the probe's non-matching toolName answers a successful
+        // `[]`, which proves support.
+        let host = FakeHost::new(vec![Ok(json!([]))]);
+        let probed = supports_session_tool_results(&host).expect("probe");
+        assert!(probed);
+        assert_eq!(
+            host.calls.borrow().as_slice(),
+            &[(
+                METHOD_SESSION_TOOL_RESULTS.to_owned(),
+                json!({"toolName": "rpi-abi-probe"})
+            )]
+        );
+
+        // Hosts that reject the required arg answer invalidRequest (not
+        // unknownMethod) — still a support signal via the error kind table.
+        let host = FakeHost::new(vec![Err(InteractiveUiError::new(
+            InteractiveUiErrorKind::InvalidRequest,
+            "ctx.sessionToolResults: required string arg `toolName`",
+        ))]);
+        assert_eq!(
+            supports_session_tool_results(&host)
+                .expect_err("invalid request")
+                .kind,
+            InteractiveUiErrorKind::InvalidRequest
         );
     }
 }

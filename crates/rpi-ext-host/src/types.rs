@@ -636,7 +636,30 @@ pub struct SessionEntryInfo {
 /// ≥ the suggested 1000 while bounding per-call response size). Applies
 /// to explicit limits only; the unfiltered result set is the branch's
 /// custom entries, which are already bounded by the session itself.
+/// ADR-0030 reuses this cap verbatim for `ctx.sessionToolResults`
+/// (V15-14): same semantics, same constant — one cap for the session
+/// read family.
 pub const SESSION_ENTRIES_MAX_LIMIT: u64 = 10_000;
+
+/// `ctx.sessionToolResults` item (rpi additive host-call, ADR-0030):
+/// one `type:"message"` entry of the active branch whose
+/// `message.role == "toolResult"` and whose `toolName` matched the
+/// request exactly — `{id, parentId, timestamp, toolName, isError,
+/// details}`. `details` is the tool's structured payload verbatim
+/// (`null` when the result carries none); the `content` text blocks are
+/// NEVER projected across the boundary (ADR-0030 decision 3 — the
+/// guest-visible face is the named tool's details snapshot plus the
+/// judging metadata only, not conversation text).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionToolResultInfo {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp: String,
+    pub tool_name: String,
+    pub is_error: bool,
+    pub details: Value,
+}
 
 /// `MessageEndEventResult` (types.ts:1086-1089). The replacement must keep
 /// the original role (enforced in runner.rs, runner.ts:837-844).

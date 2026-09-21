@@ -1056,6 +1056,22 @@ pub trait ContextActions: Send + Sync {
     ) -> Vec<crate::types::SessionEntryInfo> {
         Vec::new()
     }
+
+    /// `ctx.sessionToolResults` (rpi additive, ADR-0030): read-only
+    /// `role:"toolResult"` entries of the active branch (root→leaf)
+    /// filtered by exact `tool_name`. `limit` (already validated positive
+    /// and capped by the dispatch layer at
+    /// [`crate::types::SESSION_ENTRIES_MAX_LIMIT`]) keeps the filtered
+    /// tail. The projection carries the six ADR-0030 fields only — `content`
+    /// blocks never cross the boundary. Default empty — unbound hosts fail
+    /// closed (`[]`).
+    fn get_session_tool_results(
+        &self,
+        _tool_name: &str,
+        _limit: Option<u64>,
+    ) -> Vec<crate::types::SessionToolResultInfo> {
+        Vec::new()
+    }
 }
 
 /// `withSession` callback (types.ts:358): receives the
@@ -1663,6 +1679,22 @@ impl ExtensionContext {
         Ok(self
             .context_actions()?
             .map(|actions| actions.get_session_entries(custom_type, limit))
+            .unwrap_or_default())
+    }
+
+    /// `ctx.sessionToolResults` (rpi additive, ADR-0030) — read-only
+    /// `role:"toolResult"` entries of the active branch (root→leaf
+    /// order), filtered by exact `toolName` and tail-limited by `limit`;
+    /// the six-field projection never carries `content` blocks. Default
+    /// empty when unbound (fail-closed `[]`).
+    pub fn session_tool_results(
+        &self,
+        tool_name: &str,
+        limit: Option<u64>,
+    ) -> Result<Vec<crate::types::SessionToolResultInfo>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .map(|actions| actions.get_session_tool_results(tool_name, limit))
             .unwrap_or_default())
     }
 }

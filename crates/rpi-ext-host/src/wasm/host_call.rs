@@ -107,7 +107,8 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "ctx.setRuntimeApiKey"
         | "ctx.removeRuntimeApiKey"
         | "ctx.sessionFile"
-        | "ctx.sessionEntries" => Requires(Capability::Session),
+        | "ctx.sessionEntries"
+        | "ctx.sessionToolResults" => Requires(Capability::Session),
         _ => UnknownMethod,
     }
 }
@@ -891,6 +892,33 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(serde_json::to_value(entries).unwrap_or(Value::Array(Vec::new())))
         }
+        "ctx.sessionToolResults" => {
+            // rpi additive (ADR-0030): read-only `role:"toolResult"`
+            // entries of the active branch, filtered by exact `toolName`.
+            // `toolName` is REQUIRED (missing/non-string → `invalidRequest`,
+            // unlike sessionEntries' optional `customType` — the wider
+            // read face must never degenerate into "all tools"); `limit`
+            // follows the ADR-0027 contract (invalid values treated as
+            // absent, explicit limits capped at SESSION_ENTRIES_MAX_LIMIT).
+            // Unbound hosts fail closed with [].
+            let Some(tool_name) = str_arg(&args, "toolName") else {
+                return err(
+                    "invalidRequest",
+                    "ctx.sessionToolResults: required string arg `toolName`",
+                );
+            };
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.min(ext::SESSION_ENTRIES_MAX_LIMIT));
+            let results = state
+                .api
+                .context()
+                .session_tool_results(tool_name, limit)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(serde_json::to_value(results).unwrap_or(Value::Array(Vec::new())))
+        }
         "ctx.getSystemPrompt" => Ok(json!(state
             .api
             .context()
@@ -1237,6 +1265,11 @@ mod tests {
             required_capability("ctx.sessionEntries"),
             Requires(Capability::Session)
         ));
+        // ADR-0030 addition is Session-gated too (same family as ctx.*).
+        assert!(matches!(
+            required_capability("ctx.sessionToolResults"),
+            Requires(Capability::Session)
+        ));
         // v0.1.4 C0 interactive UI additions are all `ui`-gated, additive.
         for method in crate::interactive_ui::INTERACTIVE_UI_METHODS {
             assert!(
@@ -1449,6 +1482,241 @@ mod session_entries_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+}
+
+/// V15-14 (ADR-0030): `ctx.sessionToolResults` dispatch-level behavior —
+/// required `toolName`, limit validation/clamping at the ABI boundary,
+/// fail-closed `[]` for unbound hosts, and the capability gate.
+/// Branch/filter/order semantics against a real `SessionManager` live in
+/// `rpi/tests/extension_ctx_session_tool_results_test.rs`.
+#[cfg(test)]
+mod session_tool_results_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    use super::dispatch;
+    use crate::api::{
+        CompactOptions, ContextActions, ContextUsage, ExtensionApi, ExtensionRuntime,
+        LoadedExtension,
+    };
+    use crate::types::SessionToolResultInfo;
+    use crate::wasm::{Capability, DispatchTarget, HostState, WasmForward};
+
+    /// ContextActions recorder: captures the (toolName, limit) pair the
+    /// dispatch layer hands to the trait boundary.
+    struct RecordingActions {
+        calls: std::sync::Mutex<Vec<(String, Option<u64>)>>,
+    }
+
+    #[async_trait]
+    impl ContextActions for RecordingActions {
+        fn get_model(&self) -> Option<Value> {
+            None
+        }
+        fn is_idle(&self) -> bool {
+            true
+        }
+        fn is_project_trusted(&self) -> bool {
+            true
+        }
+        fn get_signal(&self) -> Option<tokio_util::sync::CancellationToken> {
+            None
+        }
+        fn abort(&self) {}
+        fn has_pending_messages(&self) -> bool {
+            false
+        }
+        fn shutdown(&self) {}
+        fn get_context_usage(&self) -> Option<ContextUsage> {
+            None
+        }
+        fn compact(&self, _options: CompactOptions) {}
+        fn get_system_prompt(&self) -> String {
+            String::new()
+        }
+        fn get_system_prompt_options(&self) -> Value {
+            Value::Null
+        }
+        fn get_session_tool_results(
+            &self,
+            tool_name: &str,
+            limit: Option<u64>,
+        ) -> Vec<SessionToolResultInfo> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((tool_name.to_owned(), limit));
+            vec![SessionToolResultInfo {
+                id: "stub".to_owned(),
+                parent_id: None,
+                timestamp: String::new(),
+                tool_name: tool_name.to_owned(),
+                is_error: false,
+                details: Value::Null,
+            }]
+        }
+    }
+
+    fn host_state(capabilities: HashSet<Capability>) -> HostState {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:v15-14>", "<inline:v15-14>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        }
+    }
+
+    fn calls(actions: &RecordingActions) -> Vec<(String, Option<u64>)> {
+        actions
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Fail-closed: a host with no bound ContextActions answers `[]`, not
+    /// an error.
+    #[test]
+    fn ctx_session_tool_results_unbound_answers_empty_array() {
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        let value = dispatch(
+            &mut state,
+            "ctx.sessionToolResults",
+            json!({"toolName": "todo"}),
+        )
+        .expect("unbound host answers []");
+        assert_eq!(value, json!([]));
+    }
+
+    /// Arg contract at the trait boundary: `toolName` REQUIRED (missing /
+    /// non-string → `invalidRequest` — the wider read face must never
+    /// degenerate into "all tools"); `limit` follows ADR-0027 (invalid
+    /// values absent, explicit limits clamped to SESSION_ENTRIES_MAX_LIMIT).
+    #[test]
+    fn ctx_session_tool_results_arg_contract() {
+        let actions = Arc::new(RecordingActions {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        state
+            .api
+            .runtime()
+            .set_context_actions(Some(actions.clone() as Arc<dyn ContextActions>));
+
+        dispatch(
+            &mut state,
+            "ctx.sessionToolResults",
+            json!({"toolName": "todo", "limit": 100}),
+        )
+        .expect("filtered call");
+        dispatch(
+            &mut state,
+            "ctx.sessionToolResults",
+            json!({"toolName": "todo"}),
+        )
+        .expect("limit is optional");
+        dispatch(
+            &mut state,
+            "ctx.sessionToolResults",
+            json!({"toolName": "todo", "limit": 0}),
+        )
+        .expect("invalid limit treated as absent");
+        dispatch(
+            &mut state,
+            "ctx.sessionToolResults",
+            json!({"toolName": "todo", "limit": u64::MAX}),
+        )
+        .expect("oversized limit is clamped, not rejected");
+
+        assert_eq!(
+            calls(&actions),
+            vec![
+                ("todo".to_owned(), Some(100)),
+                ("todo".to_owned(), None),
+                ("todo".to_owned(), None),
+                (
+                    "todo".to_owned(),
+                    Some(crate::types::SESSION_ENTRIES_MAX_LIMIT)
+                ),
+            ],
+            "limit 0 absent; limit clamps at the host cap"
+        );
+
+        // toolName missing / non-string → invalidRequest, nothing read.
+        for bad_args in [json!({}), json!({"toolName": 42}), json!({"limit": 5})] {
+            let error = dispatch(&mut state, "ctx.sessionToolResults", bad_args.clone())
+                .expect_err("required toolName");
+            assert_eq!(error.0, "invalidRequest", "args: {bad_args}");
+        }
+        assert_eq!(
+            calls(&actions).len(),
+            4,
+            "rejected calls never reach the trait boundary"
+        );
+    }
+
+    /// The reply serializes the six-field ADR-0030 shape (camelCase,
+    /// `details` always present, no content key).
+    #[test]
+    fn ctx_session_tool_results_serializes_the_frozen_shape() {
+        let actions = Arc::new(RecordingActions {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        state
+            .api
+            .runtime()
+            .set_context_actions(Some(actions.clone() as Arc<dyn ContextActions>));
+        let value = dispatch(
+            &mut state,
+            "ctx.sessionToolResults",
+            json!({"toolName": "todo"}),
+        )
+        .expect("call");
+        assert_eq!(
+            value,
+            json!([{
+                "id": "stub",
+                "parentId": null,
+                "timestamp": "",
+                "toolName": "todo",
+                "isError": false,
+                "details": null,
+            }]),
+            "camelCase six-field wire shape with details: null when absent"
+        );
+    }
+
+    /// Without capability `session` the guest-call gate (checked in
+    /// `handle_host_call` before dispatch) rejects with `capabilityDenied`.
+    #[test]
+    fn ctx_session_tool_results_requires_session_capability() {
+        let mut state = host_state(HashSet::from([Capability::Tools]));
+        let response = crate::wasm::handle_host_call(
+            &mut state,
+            b"{\"call\": \"ctx.sessionToolResults\", \"args\": {\"toolName\": \"todo\"}}",
+        );
+        let response: Value = serde_json::from_slice(&response).expect("envelope JSON");
+        assert_eq!(
+            response["error"]["kind"],
+            json!("capabilityDenied"),
+            "full envelope: {response}"
+        );
     }
 }
 
