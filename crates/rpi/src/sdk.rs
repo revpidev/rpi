@@ -369,10 +369,10 @@ pub async fn create_agent_session(
             None => NoopExtensionRunner::shared(),
         };
     let extension_runner_ref = new_extension_runner_ref(extension_runner);
-    // Cache warmer (#9668, c596d09d9; sdk.ts:304-309): created before the
+    // Cache warmer (#9668, c596d09d9; sdk.ts:307-312): created before the
     // stream function so session requests can arm it. Mode is re-read per
     // decision; the decide hook routes through the extension runner
-    // (sdk.ts:308: `emitCacheWarmingDecision(event) ?? event.action`).
+    // (sdk.ts:311: `emitCacheWarmingDecision(event) ?? event.action`).
     let cache_warmer = std::sync::Arc::new(crate::core::cache_warming::CacheWarmer::new(
         crate::core::cache_warming::CacheWarmerDeps {
             models: model_runtime.clone(),
@@ -498,7 +498,7 @@ pub async fn create_agent_session(
                     })),
                 };
                 // Arm the cache warmer from session requests only
-                // (sdk.ts:387-391, #9668): compaction and summaries carry
+                // (sdk.ts:383-384, #9668): compaction and summaries carry
                 // their own routing ids (`session_id` differs), so only the
                 // conversation request replaces the cache entry.
                 if stream_options_with_headers
@@ -858,7 +858,7 @@ pub(crate) fn sanitize_default_tool_names(names: Vec<String>) -> Vec<String> {
 }
 
 /// `ModelRuntime` satisfies the warmer's `streamSimple` view (#9668;
-/// cache-warmer.ts:269 `Pick<ModelRuntime, "streamSimple">`).
+/// cache-warmer.ts:162 `Pick<ModelRuntime, "streamSimple">`).
 impl crate::core::cache_warming::WarmingModels for ModelRuntime {
     fn warming_stream_simple(
         &self,

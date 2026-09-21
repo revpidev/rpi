@@ -463,7 +463,7 @@ pub trait ExtensionRunner: Send + Sync {
     /// `cache_warming_decision` (#9668, c596d09d9): returns the effective
     /// action — the event's own unless an extension overrides (last
     /// override wins). Default = pi's own decision (no-extension behavior,
-    /// cache-warmer.ts:275-278).
+    /// cache-warmer.ts:166-168).
     async fn emit_cache_warming_decision(
         &self,
         event: rpi_ext_host::types::CacheWarmingDecisionEvent,

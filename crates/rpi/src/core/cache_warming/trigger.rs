@@ -1,5 +1,5 @@
 //! 触发器 — the cache-warmer lifecycle state machine
-//! (cache-warmer.ts:139-318 @ c596d09d9, #9668).
+//! (cache-warmer.ts:141-345 @ c596d09d9, #9668).
 //!
 //! `start` replaces any previous run (aborting its in-flight refresh); the
 //! scheduling deadline re-arms after each refresh. Warm requests never
@@ -24,7 +24,7 @@ use super::decision::{
 };
 use super::{CacheWarmingStatus, WarmingState};
 
-/// `Pick<ModelRuntime, "streamSimple">` (cache-warmer.ts:269) — the warmer's
+/// `Pick<ModelRuntime, "streamSimple">` (cache-warmer.ts:162) — the warmer's
 /// entire view of the model runtime. `ModelRuntime` implements this at the
 /// `sdk.rs` wiring; tests inject fakes.
 pub trait WarmingModels: Send + Sync {
@@ -43,7 +43,7 @@ pub type DecideFuture = std::pin::Pin<
 
 /// `CacheWarmer`'s decision hook: receives the pending decision event,
 /// returns the effective action (extension overrides land inside the
-/// closure; failures fall back to pi's own action — cache-warmer.ts:275-278,
+/// closure; failures fall back to pi's own action — cache-warmer.ts:166-168,
 /// runner errors already reported by the runner).
 pub type CacheWarmingDecide =
     Arc<dyn Fn(rpi_ext_host::types::CacheWarmingDecisionEvent) -> DecideFuture + Send + Sync>;
@@ -63,7 +63,7 @@ pub struct CacheWarmRequest {
     pub options: ModelsSimpleStreamOptions,
 }
 
-/// `phase` (cache-warmer.ts:107).
+/// `phase` (cache-warmer.ts:147).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// While the agent run that sent the request is still active.
@@ -81,7 +81,7 @@ impl Phase {
     }
 }
 
-/// `ActiveRun` (cache-warmer.ts:141-154). Guarded by the state mutex;
+/// `ActiveRun` (cache-warmer.ts:141-157). Guarded by the state mutex;
 /// `generation` identifies the run across spawned refresh tasks (the
 /// upstream object-identity check `this.run === run`).
 pub(super) struct ActiveRun {
@@ -104,7 +104,7 @@ pub(super) struct ActiveRun {
 
 impl ActiveRun {
     /// `run.startedAt + (idle ? MAX_IDLE_WARMING_AGE_MS : MAX_WARMING_AGE_MS)`
-    /// (cache-warmer.ts:241-242).
+    /// (cache-warmer.ts:282).
     pub(super) fn deadline(&self) -> tokio::time::Instant {
         self.started_at + std::time::Duration::from_millis(self.phase.safety_window_ms())
     }
@@ -115,7 +115,7 @@ pub(super) struct WarmerState {
     pub(super) inactive: CacheWarmingStatus,
 }
 
-/// Constructor dependencies (cache-warmer.ts:266-279).
+/// Constructor dependencies (cache-warmer.ts:162-168).
 pub struct CacheWarmerDeps {
     pub models: Arc<dyn WarmingModels>,
     pub session: Arc<Mutex<crate::core::session_manager::SessionManager>>,
@@ -124,16 +124,16 @@ pub struct CacheWarmerDeps {
 }
 
 impl CacheWarmerDeps {
-    /// The default decide hook (cache-warmer.ts:278-279): pi's own action.
+    /// The default decide hook (cache-warmer.ts:174-176): pi's own action.
     pub fn default_decide() -> CacheWarmingDecide {
         Arc::new(|event| Box::pin(async move { event.action }) as DecideFuture)
     }
 }
 
-/// `onWarmed?: (entry: UsageEntry) => void` (cache-warmer.ts:277).
+/// `onWarmed?: (entry: UsageEntry) => void` (cache-warmer.ts:168).
 pub type OnWarmed = Arc<dyn Fn(&UsageEntry) + Send + Sync>;
 
-/// `CacheWarmer` (cache-warmer.ts:161-318).
+/// `CacheWarmer` (cache-warmer.ts:159-345).
 pub struct CacheWarmer {
     pub(super) deps: CacheWarmerDeps,
     pub(super) state: Mutex<WarmerState>,
@@ -142,7 +142,7 @@ pub struct CacheWarmer {
 }
 
 impl CacheWarmer {
-    /// Constructor (cache-warmer.ts:280-290).
+    /// Constructor (cache-warmer.ts:170-181).
     pub fn new(deps: CacheWarmerDeps) -> Self {
         CacheWarmer {
             deps,
@@ -155,9 +155,9 @@ impl CacheWarmer {
         }
     }
 
-    /// `onWarmed` callback (cache-warmer.ts:277): called with the persisted
+    /// `onWarmed` callback (cache-warmer.ts:168): called with the persisted
     /// usage entry after each successful refresh; wired by `AgentSession`
-    /// to re-emit `entry_appended` (agent-session.ts:401-403).
+    /// to re-emit `entry_appended` (agent-session.ts:403).
     pub fn set_on_warmed(&self, callback: Option<OnWarmed>) {
         *lock_write(&self.on_warmed) = callback;
     }
@@ -172,7 +172,7 @@ impl CacheWarmer {
         }
     }
 
-    /// `status` getter (cache-warmer.ts:292-307).
+    /// `status` getter (cache-warmer.ts:183-200).
     pub fn status(&self) -> CacheWarmingStatus {
         if (self.deps.get_mode)() == CacheWarmingMode::Off {
             return CacheWarmingStatus::inactive("cache warming disabled");
@@ -201,7 +201,7 @@ impl CacheWarmer {
         }
     }
 
-    /// `start` (cache-warmer.ts:309-337): keep the prompt cache entry
+    /// `start` (cache-warmer.ts:202-238): keep the prompt cache entry
     /// written by `request` warm while `is_current` holds. Replaces any
     /// previous run. `self: &Arc<Self>` because scheduling spawns the
     /// refresh task.
@@ -262,7 +262,7 @@ impl CacheWarmer {
         self.schedule(generation);
     }
 
-    /// `onAgentSettled` (cache-warmer.ts:339-351): the agent run that sent
+    /// `onAgentSettled` (cache-warmer.ts:240-253): the agent run that sent
     /// the request finished. Streaming mode stops; idle mode continues
     /// under the shorter 30-minute horizon.
     pub fn on_agent_settled(&self) {
@@ -287,7 +287,7 @@ impl CacheWarmer {
         }
     }
 
-    /// `onModeChanged` (cache-warmer.ts:353-359): reconcile an active run
+    /// `onModeChanged` (cache-warmer.ts:255-260): reconcile an active run
     /// after the persisted warming mode changes.
     pub fn on_mode_changed(&self) {
         let reason = {
@@ -303,14 +303,14 @@ impl CacheWarmer {
         }
     }
 
-    /// `cancel` (cache-warmer.ts:361-363).
+    /// `cancel` (cache-warmer.ts:262-264).
     pub fn cancel(&self) {
         self.stop("inactive", None);
     }
 
     // -- internals ----------------------------------------------------------
 
-    /// `evaluate` (cache-warmer.ts:320-337) over a locked run.
+    /// `evaluate` (cache-warmer.ts:362-379) over a locked run.
     pub(super) fn evaluate_locked(&self, run: &ActiveRun) -> CacheWarmingDecision {
         let prompt_tokens = self.branch_prompt_tokens();
         evaluate_decision(&run.request.model, prompt_tokens, run.phase)
@@ -332,7 +332,7 @@ impl CacheWarmer {
         }
     }
 
-    /// `stop` (cache-warmer.ts:375-378).
+    /// `stop` (cache-warmer.ts:274-277).
     pub(super) fn stop(&self, reason: &str, stopped: Option<(CacheWarmingDecision, bool)>) {
         self.clear_run();
         let mut state = lock(&self.state);
@@ -345,7 +345,7 @@ impl CacheWarmer {
         };
     }
 
-    /// `getModeStopReason` (cache-warmer.ts:310-316).
+    /// `getModeStopReason` (cache-warmer.ts:355-360).
     pub(super) fn mode_stop_reason(&self, mode: CacheWarmingMode, phase: Phase) -> Option<String> {
         if mode == CacheWarmingMode::Off {
             Some("cache warming disabled".to_owned())
@@ -356,7 +356,7 @@ impl CacheWarmer {
         }
     }
 
-    /// `validateRun` (cache-warmer.ts:300-306): true when `generation` is
+    /// `validateRun` (cache-warmer.ts:347-353): true when `generation` is
     /// still the active run and nothing disqualifies it; a disqualifying
     /// run is stopped and reported as invalid.
     pub(super) fn validate_run(&self, generation: u64) -> bool {

@@ -365,7 +365,7 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
             ));
         }
         SettingsChange::CacheWarmingMode(mode) => {
-            // `onCacheWarmingModeChange` (interactive-mode.ts:4755-4758,
+            // `onCacheWarmingModeChange` (interactive-mode.ts:4767-4770,
             // #9668): persist + reconcile, then surface the new mode.
             session.set_cache_warming_mode(mode);
             ui.show_status(&format!("Cache warming: {}", mode.as_str()));

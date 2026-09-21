@@ -194,7 +194,7 @@ pub struct AgentSessionConfig {
     pub extension_runner_ref: ExtensionRunnerRef,
     pub session_start_event: SessionStartEvent,
     /// Keeps the prompt cache entry of the last session request warm
-    /// (#9668; agent-session.ts:222-223 `cacheWarmer`).
+    /// (#9668; agent-session.ts:223 `cacheWarmer`).
     pub cache_warmer: Option<Arc<crate::core::cache_warming::CacheWarmer>>,
 }
 
@@ -608,7 +608,7 @@ impl AgentSession {
         // Subscribe to agent events for internal handling (persistence,
         // auto-compaction, retry logic) (agent-session.ts:393).
         let session = AgentSession { inner };
-        // `_cacheWarmer.onWarmed` (agent-session.ts:401-403): re-emit each
+        // `_cacheWarmer.onWarmed` (agent-session.ts:403): re-emit each
         // persisted cache-warming usage entry as `entry_appended` so the
         // transcript notice renders (#9668).
         if let Some(cache_warmer) = session.inner.cache_warmer.clone() {
@@ -1093,7 +1093,7 @@ impl AgentSession {
     /// `dispose` (agent-session.ts:837-854).
     pub fn dispose(&self) {
         // `this._cacheWarmer.onWarmed = undefined; this._cacheWarmer.cancel()`
-        // (agent-session.ts:933-935, #9668).
+        // (agent-session.ts:933-934, #9668).
         if let Some(cache_warmer) = &self.inner.cache_warmer {
             cache_warmer.set_on_warmed(None);
             cache_warmer.cancel();
@@ -3370,7 +3370,7 @@ impl AgentSession {
     // Statistics
     // ==================================================================
 
-    /// `cacheWarmingStatus` getter (agent-session.ts:949-951, #9668):
+    /// `cacheWarmingStatus` getter (agent-session.ts:950-952, #9668):
     /// current cache-warming state and the policy inputs that produced it.
     pub fn cache_warming_status(&self) -> Option<crate::core::cache_warming::CacheWarmingStatus> {
         self.inner

@@ -1910,7 +1910,7 @@ impl InteractiveUi {
                 self.render_handle.request_render();
             }
             UiCommand::EntryAppended(entry) => {
-                // entry_appended (interactive-mode.ts:2887-2892; usage arm
+                // entry_appended (interactive-mode.ts:3288-3292; usage arm
                 // at :3276-3279, #9668).
                 match entry {
                     SessionEntry::Custom(_) => {
@@ -3760,7 +3760,7 @@ impl InteractiveUi {
                 self.add_custom_entry_to_chat(entry);
                 continue;
             }
-            // `isUsageSessionEntry` (interactive-mode.ts:3783-3786, #9668):
+            // `isUsageSessionEntry` (interactive-mode.ts:3799, #9668):
             // successful cache-warming usage renders as a transcript notice.
             if let SessionEntry::Usage(usage_entry) = entry {
                 if usage_entry.kind == "cache_warm" {

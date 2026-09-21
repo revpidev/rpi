@@ -2630,7 +2630,7 @@ fn append_usage_persists_without_context_participation() {
     let context = session.build_session_context();
     assert!(context.messages.is_empty());
 
-    // Usage totals group by provider/model (usage-totals.ts:46-48, #9668).
+    // Usage totals group by provider/model (usage-totals.ts:44-46, #9668).
     let known: Vec<SessionEntry> = entries.iter().filter_map(|e| e.known()).cloned().collect();
     let breakdown = crate::core::usage_totals::get_usage_cost_breakdown(&known);
     assert_eq!(

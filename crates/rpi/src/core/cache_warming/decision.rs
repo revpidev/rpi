@@ -1,5 +1,5 @@
 //! 决策器 — cost-aware pure functions of the cache warmer
-//! (cache-warmer.ts:12-102, 320-337, 373-437 @ c596d09d9, #9668).
+//! (cache-warmer.ts:16-107, 320-337, 373-437 @ c596d09d9, #9668).
 //!
 //! All functions are pure (time/state passed in) so the eligibility matrix
 //! and economics are table-testable without a runtime.
@@ -16,21 +16,21 @@ use super::{CacheWarmingStatus, Phase};
 use crate::core::cache_warming::WarmingState;
 
 /// Streaming warming never continues past this long after the real request
-/// that started it (cache-warmer.ts:13).
+/// that started it (cache-warmer.ts:16).
 pub const MAX_WARMING_AGE_MS: u64 = 60 * 60_000;
 /// Idle warming uses a shorter horizon because continuation estimates become
-/// less reliable with age (cache-warmer.ts:15).
+/// less reliable with age (cache-warmer.ts:18).
 pub const MAX_IDLE_WARMING_AGE_MS: u64 = 30 * 60_000;
 /// A refresh is sent only when it is expected to save at least this many
-/// dollars (cache-warmer.ts:17).
+/// dollars (cache-warmer.ts:20).
 pub const CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS: f64 = 0.05;
 /// Chance that a real request arrives before the cache entry expires while
 /// the agent sits idle. Measured from upstream usage; per-session estimates
-/// were not better than this constant (cache-warmer.ts:21).
+/// were not better than this constant (cache-warmer.ts:26).
 pub const IDLE_CONTINUATION_PROBABILITY: f64 = 0.15;
 
 /// Refresh at 90% of the TTL while preserving at least ten seconds of
-/// margin (cache-warmer.ts:24-28). `None` when the TTL is too short to
+/// margin (cache-warmer.ts:29-32). `None` when the TTL is too short to
 /// schedule anything.
 pub fn get_cache_warming_delay_ms(ttl_ms: u64) -> Option<u64> {
     if ttl_ms <= 10_000 {
@@ -62,7 +62,7 @@ pub fn get_prompt_cache_ttl_ms(
 }
 
 /// Whether replaying the request with a one-token output cap leaves its
-/// cache entry untouched (cache-warmer.ts:48-53). Anthropic's budget-based
+/// cache entry untouched (cache-warmer.ts:55-58). Anthropic's budget-based
 /// thinking (Claude models without adaptive thinking) derives
 /// `budget_tokens` from `max_tokens`; the replay would get a different
 /// budget, which Anthropic keys the message cache on, and the model could
@@ -80,7 +80,7 @@ pub fn is_replayable(model: &Model, reasoning: Option<&ThinkingLevel>) -> bool {
 }
 
 /// Prompt size of the most recent real request on the branch, as reported
-/// by the provider (cache-warmer.ts:57-66): the last assistant message's
+/// by the provider (cache-warmer.ts:61-70): the last assistant message's
 /// `input + cacheRead + cacheWrite`.
 pub fn last_prompt_tokens(branch: &[SessionEntry]) -> u64 {
     branch
@@ -100,7 +100,7 @@ pub fn last_prompt_tokens(branch: &[SessionEntry]) -> u64 {
         .unwrap_or(0)
 }
 
-/// `price` (cache-warmer.ts:68-84): cost of a partial usage record.
+/// `price` (cache-warmer.ts:72-85): cost of a partial usage record.
 fn price(model: &Model, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
     let mut usage = Usage {
         input,
@@ -115,7 +115,7 @@ fn price(model: &Model, input: u64, output: u64, cache_read: u64, cache_write: u
 }
 
 /// Inputs and outcome of one warm-or-stop decision, as shown by `/session`
-/// (cache-warmer.ts:86-96).
+/// (cache-warmer.ts:91-107).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CacheWarmingDecision {
     /// `"streaming"` while the agent run that sent the request is active.
@@ -134,7 +134,7 @@ pub struct CacheWarmingDecision {
     pub action: CacheWarmingAction,
 }
 
-/// `evaluate` (cache-warmer.ts:320-337): the cost model. A refresh is a
+/// `evaluate` (cache-warmer.ts:362-379): the cost model. A refresh is a
 /// cache read of the whole prompt plus one output token; the avoided miss
 /// is the cache-write (or uncached input) price of the prompt minus its
 /// cache-read price. Idle continuation uses the fixed 15% estimate;
@@ -222,7 +222,7 @@ fn format_cache_warming_decision_time(next_warm_at: Option<u64>, now: u64) -> St
     format!("Decision in {}", parts.join(" "))
 }
 
-/// One-line status for `/session` (cache-warmer.ts:399-411).
+/// One-line status for `/session` (cache-warmer.ts:417-431).
 pub fn format_cache_warming_status(status: &CacheWarmingStatus, now: u64) -> String {
     let Some(decision) = &status.decision else {
         return format!(
@@ -269,7 +269,7 @@ pub fn format_cache_warming_status(status: &CacheWarmingStatus, now: u64) -> Str
 }
 
 /// One-line transcript text for persisted cache-warming usage
-/// (cache-warmer.ts:434-437).
+/// (cache-warmer.ts:433-437).
 pub fn format_cache_warming_usage(entry: &UsageEntry) -> String {
     let note = entry
         .note
@@ -277,7 +277,7 @@ pub fn format_cache_warming_usage(entry: &UsageEntry) -> String {
         .map(|note| format!(" ({note})"))
         .unwrap_or_default();
     // `toFixed(6)` then strip trailing zeros beyond three decimals
-    // (cache-warmer.ts:436 regex `/(\.\d{3}\d*?)0+$/`).
+    // (cache-warmer.ts:435 regex `/(\.\d{3}\d*?)0+$/`).
     let formatted = format!("{:.6}", entry.usage.cost.total);
     let cost = match formatted.split_once('.') {
         Some((int_part, decimals)) => {
@@ -330,7 +330,7 @@ mod tests {
         openai.api = ApiKind(ApiKind::OPENAI_RESPONSES.to_owned());
         let unknown = anthropic_model(None);
 
-        // TTL resolution (upstream cache-warmer.test.ts:104-115).
+        // TTL resolution (upstream cache-warmer.test.ts:131-141).
         assert_eq!(
             get_prompt_cache_ttl_ms(&adaptive, None, None),
             Some(300_000)
@@ -354,7 +354,7 @@ mod tests {
         );
         assert_eq!(get_prompt_cache_ttl_ms(&unknown, None, None), None);
 
-        // Delay (90% of TTL with a 10s margin; cache-warmer.test.ts:116-119).
+        // Delay (90% of TTL with a 10s margin; cache-warmer.test.ts:136-138).
         assert_eq!(get_cache_warming_delay_ms(300_000), Some(270_000));
         assert_eq!(get_cache_warming_delay_ms(60_000), Some(50_000));
         assert_eq!(get_cache_warming_delay_ms(10_000), None);

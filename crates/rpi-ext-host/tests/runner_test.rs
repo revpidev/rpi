@@ -1511,13 +1511,13 @@ async fn runner_invalidate_unsubscribes_extension_event_bus_subscription() {
 }
 
 // ---------------------------------------------------------------------------
-// emitCacheWarmingDecision (#9668, c596d09d9; runner.ts:920-941)
+// emitCacheWarmingDecision (#9668, c596d09d9; runner.ts:921-941)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn cache_warming_decision_uses_the_last_extension_override() {
     // Port of "uses the last extension override"
-    // (cache-warmer.test.ts:254-275): two handlers both return an action —
+    // (cache-warmer.test.ts:301-320): two handlers both return an action —
     // the last one wins.
     let host = host_with(vec![
         inline_ext("warmer", |api| {
@@ -1552,7 +1552,7 @@ async fn cache_warming_decision_uses_the_last_extension_override() {
 async fn cache_warming_decision_falls_back_to_own_action() {
     // No handlers → the event's own action; a handler without an action
     // field keeps it too; a failing handler is reported and skipped
-    // (cache-warmer.ts:267-270 "Extension failures fall back to pi's own
+    // (cache-warmer.ts:296-301 "Extension failures fall back to pi's own
     // decision").
     let host = host_with(vec![inline_ext("noop", |api| {
         api.on(

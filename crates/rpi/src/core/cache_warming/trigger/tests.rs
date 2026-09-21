@@ -23,7 +23,7 @@ use super::{
 };
 
 // ---------------------------------------------------------------------------
-// Fixtures (cache-warmer.test.ts:53-69)
+// Fixtures (cache-warmer.test.ts:33-69)
 // ---------------------------------------------------------------------------
 
 fn test_model(id: &str) -> Model {
@@ -148,7 +148,7 @@ fn branch_with_prompt(prompt_tokens: u64) -> Vec<rpi_agent::session::FileEntry> 
 }
 
 // ---------------------------------------------------------------------------
-// Fake runtime (cache-warmer.test.ts:98-130)
+// Fake runtime (cache-warmer.test.ts:84-125)
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -325,7 +325,7 @@ fn always_current() -> IsCurrent {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (cache-warmer.test.ts:140-251)
+// Tests (cache-warmer.test.ts:127-320)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -524,7 +524,7 @@ async fn stops_for_unsupported_requests_context_and_mode_changes() {
     tokio::task::yield_now().await;
     assert!(unsupported.models.calls.lock().unwrap().is_empty());
 
-    // Mode flipped to off mid-run (cache-warmer.test.ts:241-245).
+    // Mode flipped to off mid-run (cache-warmer.test.ts:240-244).
     unsupported
         .warmer
         .start(request(&adaptive_model(), None), always_current());
@@ -623,7 +623,7 @@ async fn default_off_mode_never_spawns_or_sends() {
 
 #[tokio::test(start_paused = true)]
 async fn idle_safety_window_stops_warming() {
-    // 30-minute idle horizon (cache-warmer.ts:15): with a 300s TTL the
+    // 30-minute idle horizon (cache-warmer.ts:18): with a 300s TTL the
     // 5-minute refresh cadence would exceed the window after the run
     // started ≥ ~29 min ago; assert the stop reason after settling late.
     let runtime = FakeRuntime::new(
@@ -662,7 +662,7 @@ async fn long_retention_beyond_safety_window_and_none_retention() {
     req.options.simple.stream.cache_retention = Some(CacheRetention::Long);
     // 86400s * 0.9 = 77760s until the first refresh — beyond both safety
     // windows (60 min streaming / 30 min idle), so `schedule` stops
-    // immediately without sending anything (cache-warmer.ts:241-246: warm
+    // immediately without sending anything (cache-warmer.ts:282-284: warm
     // requests never extend the fixed safety windows).
     runtime.warmer.start(req, always_current());
     let status = runtime.warmer.status();

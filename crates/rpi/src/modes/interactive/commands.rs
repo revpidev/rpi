@@ -223,7 +223,7 @@ impl InteractiveUi {
             to_locale_string(stats.tokens.total)
         ));
 
-        // Cache Warming section (interactive-mode.ts:6382-6391, #9668).
+        // Cache Warming section (interactive-mode.ts:6400-6409, #9668).
         let cache_warming_status = self.session().cache_warming_status();
         info.push_str(&format!("\n{}\n", Theme::bold("Cache Warming")));
         info.push_str(&format!(
@@ -897,7 +897,7 @@ mod tests {
     }
 
     /// #9668 (V15-05 FR-D): the `/session` diagnostics include the Cache
-    /// Warming section (interactive-mode.ts:6382-6391) — mode line, status
+    /// Warming section (interactive-mode.ts:6400-6409) — mode line, status
     /// line, and the cost estimates when economics are available.
     #[tokio::test]
     async fn session_command_renders_cache_warming_section() {
@@ -910,7 +910,7 @@ mod tests {
         assert!(rendered.contains("Mode: streaming"), "rendered: {rendered}");
         // The test session goes through sdk assembly, so a warmer exists;
         // before any request it reports "waiting for first request"
-        // (cache-warmer.ts:290).
+        // (cache-warmer.ts:180).
         assert!(
             rendered.contains("Inactive (waiting for first request)"),
             "rendered: {rendered}"

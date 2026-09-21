@@ -1446,7 +1446,7 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
-    /// `appendUsage` (#9668, c596d09d9; session-manager.ts:1133-1149):
+    /// `appendUsage` (#9668, c596d09d9; session-manager.ts:1153-1171):
     /// append model-attributed usage that does not participate in LLM
     /// context. Returns the appended entry.
     pub fn append_usage(

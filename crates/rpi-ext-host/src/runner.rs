@@ -530,7 +530,7 @@ impl ExtensionRunnerCore {
         result
     }
 
-    /// `emitCacheWarmingDecision` (#9668, c596d09d9; runner.ts:920-941):
+    /// `emitCacheWarmingDecision` (#9668, c596d09d9; runner.ts:921-941):
     /// returns the event's own action unless a handler overrides it; the
     /// last override wins. Handler errors are emitted via `emitError` and
     /// dispatch continues (failures fall back to pi's decision at the

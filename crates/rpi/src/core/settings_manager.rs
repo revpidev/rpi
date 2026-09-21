@@ -187,8 +187,8 @@ impl MermaidRenderingMode {
 }
 
 /// `CacheWarmingMode = "off" | "streaming" | "idle"` (#9668,
-/// c596d09d9; settings-manager.ts:76-77) — default `"streaming"`. Global
-/// setting only because each refresh costs money (settings-manager.ts:954).
+/// c596d09d9; settings-manager.ts:77-78) — default `"streaming"`. Global
+/// setting only because each refresh costs money (settings-manager.ts:955).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CacheWarmingMode {
     #[serde(rename = "off")]
@@ -201,7 +201,7 @@ pub enum CacheWarmingMode {
 }
 
 impl CacheWarmingMode {
-    /// The on-disk string form (settings-manager.ts:76-77).
+    /// The on-disk string form (settings-manager.ts:77-78).
     pub fn as_str(self) -> &'static str {
         match self {
             CacheWarmingMode::Off => "off",
@@ -211,7 +211,7 @@ impl CacheWarmingMode {
     }
 
     /// `CACHE_WARMING_MODES.includes(mode)` — invalid stored values fall
-    /// back to the default (settings-manager.test.ts:413-415).
+    /// back to the default (settings-manager.test.ts:406-408).
     fn from_setting(value: Option<&Value>) -> Self {
         value
             .and_then(Value::as_str)
@@ -1706,7 +1706,7 @@ impl SettingsManager {
         }
     }
 
-    /// `getCacheWarmingMode` (#9668, c596d09d9; settings-manager.ts:954-958):
+    /// `getCacheWarmingMode` (#9668, c596d09d9; settings-manager.ts:955-959):
     /// read from global settings only because warming costs money —
     /// project `cacheWarming` is ignored; invalid values fall back to
     /// `"streaming"`.
@@ -1714,7 +1714,7 @@ impl SettingsManager {
         CacheWarmingMode::from_setting(self.global_settings.get("cacheWarming"))
     }
 
-    /// `setCacheWarmingMode` (settings-manager.ts:960-965) — persists
+    /// `setCacheWarmingMode` (settings-manager.ts:961-966) — persists
     /// globally.
     pub fn set_cache_warming_mode(&mut self, mode: CacheWarmingMode) {
         self.global_settings
@@ -3121,7 +3121,7 @@ mod tests {
     // =======================================================================
 
     // Port of "defaults to streaming and ignores project settings"
-    // (settings-manager.test.ts:396-414): global-only because each refresh
+    // (settings-manager.test.ts:397-408): global-only because each refresh
     // costs money.
     #[test]
     fn test_cache_warming_defaults_to_streaming_and_ignores_project() {
@@ -3150,7 +3150,7 @@ mod tests {
         );
     }
 
-    // Port of "persists the mode globally" (settings-manager.test.ts:416-423).
+    // Port of "persists the mode globally" (settings-manager.test.ts:410-421).
     #[test]
     fn test_cache_warming_persists_globally() {
         let dirs = test_dirs();

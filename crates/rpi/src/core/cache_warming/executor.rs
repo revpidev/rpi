@@ -1,5 +1,5 @@
 //! 执行器 — one refresh cycle of the cache warmer
-//! (cache-warmer.ts:239-298 @ c596d09d9, #9668).
+//! (cache-warmer.ts:279-345 @ c596d09d9, #9668).
 //!
 //! `schedule` arms the next refresh (aborting runs whose next refresh would
 //! land beyond the phase safety window); `refresh` re-evaluates the
@@ -25,7 +25,7 @@ fn wall_epoch_ms() -> u64 {
 }
 
 impl CacheWarmer {
-    /// `schedule` (cache-warmer.ts:239-255). `self: &Arc<Self>` because the
+    /// `schedule` (cache-warmer.ts:310-317). `self: &Arc<Self>` because the
     /// timer task outlives the caller.
     pub(super) fn schedule(self: &Arc<Self>, generation: u64) {
         let (beyond_deadline, sleep_until, phase_now) = {
@@ -47,7 +47,7 @@ impl CacheWarmer {
         };
         if beyond_deadline {
             // Warm requests never extend the fixed safety windows
-            // (cache-warmer.ts:243-246).
+            // (cache-warmer.ts:282-284).
             let reason = match phase_now {
                 Phase::Idle => "30-minute idle safety limit reached",
                 Phase::Streaming => "one-hour safety limit reached",
@@ -62,10 +62,10 @@ impl CacheWarmer {
         });
     }
 
-    /// `refresh` (cache-warmer.ts:257-298). Best-effort: every failure path
+    /// `refresh` (cache-warmer.ts:291-345). Best-effort: every failure path
     /// either stops the run (recorded in `/session`) or re-arms the timer.
     pub(super) async fn refresh(self: &Arc<Self>, generation: u64) {
-        // `run.timer = undefined` — the armed timer fired (cache-warmer.ts:258).
+        // `run.timer = undefined` — the armed timer fired (cache-warmer.ts:292).
         {
             let mut state = lock(&self.state);
             let Some(run) = &mut state.run else {
@@ -100,14 +100,14 @@ impl CacheWarmer {
             action: decision.action,
         };
         // Extension failures fall back to pi's own decision
-        // (cache-warmer.ts:267-270).
+        // (cache-warmer.ts:296-301).
         let action = ((self.deps.decide)(event)).await;
         if !self.validate_run(generation) {
             return;
         }
         let extension_override = action != decision.action;
         if action == CacheWarmingAction::Stop {
-            // cache-warmer.ts:279-289.
+            // cache-warmer.ts:310-317.
             let reason = if extension_override {
                 "stopped by extension"
             } else if decision.economics_available {
@@ -128,7 +128,7 @@ impl CacheWarmer {
             }
         }
         // Execute: replay the request with a one-token output cap
-        // (cache-warmer.ts:291-295). Everything else about the request —
+        // (cache-warmer.ts:322-328). Everything else about the request —
         // reasoning, session affinity headers, timeouts, env — is preserved
         // exactly as it was sent.
         let mut options = request.options;
@@ -144,7 +144,7 @@ impl CacheWarmer {
             return;
         }
         if let Some(message) = message {
-            // Failed refreshes are not recorded (cache-warmer.ts:296-302).
+            // Failed refreshes are not recorded (cache-warmer.ts:329-336).
             if message.stop_reason != StopReason::Error
                 && message.stop_reason != StopReason::Aborted
             {
@@ -168,7 +168,7 @@ impl CacheWarmer {
                 }
             }
         }
-        // `if (this.run === run) this.schedule(run)` (cache-warmer.ts:304).
+        // `if (this.run === run) this.schedule(run)` (cache-warmer.ts:344).
         let still_active = {
             let state = lock(&self.state);
             state

@@ -22,7 +22,7 @@
 //! run active); "idle" mode continues after settle under a 30-minute
 //! horizon. Compaction/summary requests never start warming (they carry
 //! their own routing ids — `session_id` differs from the session manager
-//! id; `sdk.ts:387-391`).
+//! id; `sdk.ts:383-384`).
 //!
 //! Time: scheduling and safety windows use `tokio::time::Instant` so the
 //! state machine is testable under `start_paused`; the `next_warm_at`
@@ -45,7 +45,7 @@ pub use trigger::{
 
 pub use rpi_ext_host::types::CacheWarmingAction;
 
-/// `CacheWarmingStatus.state` (cache-warmer.ts:100).
+/// `CacheWarmingStatus.state` (cache-warmer.ts:124).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WarmingState {
     /// Nothing scheduled (with `reason`).
@@ -56,7 +56,7 @@ pub enum WarmingState {
     Refreshing,
 }
 
-/// `CacheWarmingStatus` (cache-warmer.ts:98-106) — `/session` view.
+/// `CacheWarmingStatus` (cache-warmer.ts:122-134) — `/session` view.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CacheWarmingStatus {
     pub state: WarmingState,

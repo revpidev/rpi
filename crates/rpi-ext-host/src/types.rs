@@ -81,7 +81,7 @@ pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
 
 /// All 37 event names, in the upstream `ExtensionAPI.on()` overload order
-/// (types.ts:1257-1301 + #9668 `cache_warming_decision` at :1291-1293,
+/// (types.ts:1259-1303 + #9668 `cache_warming_decision` at :1291-1293,
 /// c596d09d9 — inserted between `context` and `before_provider_request`).
 pub const ALL_EVENTS: [&str; 37] = [
     EVENT_PROJECT_TRUST,
@@ -492,7 +492,7 @@ pub struct ContextEventResult {
     pub messages: Option<Vec<AgentMessage>>,
 }
 
-/// `CacheWarmingAction` (cache-warmer.ts:97, #9668/c596d09d9): pi's
+/// `CacheWarmingAction` (cache-warmer.ts:88, #9668/c596d09d9): pi's
 /// warm-or-stop decision; extensions may override it per refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheWarmingAction {
@@ -502,7 +502,7 @@ pub enum CacheWarmingAction {
     Stop,
 }
 
-/// `CacheWarmingDecisionEvent` (cache-warmer.ts:117-123, #9668): fired
+/// `CacheWarmingDecisionEvent` (cache-warmer.ts:112-116, #9668): fired
 /// before each prompt-cache refresh with pi's decision filled in. The event
 /// carries only the cost estimates; everything else an extension might want
 /// (model, idle state, context size) is on the context (extensions.md
@@ -520,7 +520,7 @@ pub struct CacheWarmingDecisionEvent {
     pub action: CacheWarmingAction,
 }
 
-/// `CacheWarmingDecisionEventResult` (cache-warmer.ts:125-127): override
+/// `CacheWarmingDecisionEventResult` (cache-warmer.ts:117-119): override
 /// whether this refresh is sent; `"stop"` ends warming until the next real
 /// request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
