@@ -106,6 +106,7 @@ use crate::core::themes::{load_theme, TerminalTheme, Theme};
 use crate::core::trust_manager::has_trust_requiring_project_resources;
 use crate::error::RpiError;
 use crate::modes::interactive::components::keybinding_hints::key_display_text;
+use crate::modes::interactive::components::session_selector::SessionSelectorComponent;
 use crate::modes::interactive::components::settings_selector::SettingsSelectorComponent;
 use crate::modes::interactive::components::status_indicator::{
     BranchSummaryStatusIndicator, CompactionStatusIndicator, CompactionStatusReason,
@@ -477,6 +478,12 @@ pub(crate) enum UiCommand {
     /// Mode-internal: clipboard paste (deferred — insertion touches the
     /// editor and clipboard reads block).
     PasteImage,
+    /// Mode-internal: a progressive session-list loader published events
+    /// (dfbf793b7 @ 19451accd, V15-04 FR-A). The drain applies them to the
+    /// mounted session selector via its typed slot; the loader threads
+    /// never lock the component themselves (lock contract — the same
+    /// discipline as the git branch watcher).
+    SessionListEvent,
 }
 
 impl From<AgentSessionEvent> for UiCommand {
@@ -1405,6 +1412,12 @@ pub(crate) struct InteractiveUi {
     /// path (interactive-mode.ts:4561). Set when the selector mounts, cleared
     /// when it unmounts.
     pub(crate) settings_selector_weak: Mutex<Option<Weak<Mutex<SettingsSelectorComponent>>>>,
+    /// Typed handle to a mounted session selector (the drain target for
+    /// [`UiCommand::SessionListEvent`]; `SharedComponent` is type-erased so
+    /// the drain cannot downcast). Cleared wherever the settings selector
+    /// weak ref is cleared (any selector mount/unmount makes a stale entry
+    /// unreachable).
+    pub(crate) session_selector: Mutex<Option<Arc<Mutex<SessionSelectorComponent>>>>,
     /// Extension terminal input listeners registered via the UI bridge
     /// (interactive-mode.ts:2303-2312). Each entry is `(listener_id, handler)`.
     /// On `switch_tui_mode`, all handlers are re-registered on the new
@@ -2371,6 +2384,22 @@ impl InteractiveUi {
                 // from the drain (insertion touches the editor).
                 self.handle_paste_image_impl();
             }
+            UiCommand::SessionListEvent => {
+                // Progressive session-list publish (dfbf793b7 @ 19451accd,
+                // V15-04 FR-A): apply pending loader events to the mounted
+                // session selector. Ignored when no selector is mounted —
+                // the component cancelled its loads on select/cancel and
+                // the slot was cleared with the selector.
+                let Some(selector) = lock(&self.session_selector).clone() else {
+                    return;
+                };
+                let mut selector = lock(&selector);
+                // Fast path: a settled selector has an empty channel (its
+                // load slot was consumed with the final event).
+                if selector.loads_pending() {
+                    selector.drain_load_events();
+                }
+            }
             UiCommand::ThemeChanged => {
                 // Theme watcher reload (theme.ts:921-932): reload the custom
                 // theme file, keeping the last successfully loaded theme when
@@ -2566,6 +2595,9 @@ impl InteractiveUi {
         }
         // Clear the settings selector weak ref (selector changed / reinstated).
         *lock(&self.settings_selector_weak) = None;
+        // Clear the typed session-selector slot (same supersede semantics —
+        // a stale drain target must not outlive its selector).
+        *lock(&self.session_selector) = None;
     }
 
     /// The `done()` callback (interactive-mode.ts:4123-4127): restore the
@@ -2586,6 +2618,7 @@ impl InteractiveUi {
         }
         // Clear the settings selector weak ref (selector is no longer mounted).
         *lock(&self.settings_selector_weak) = None;
+        *lock(&self.session_selector) = None;
     }
 
     /// Guarded close for extension dialogs (M3, upstream's
@@ -2610,6 +2643,7 @@ impl InteractiveUi {
         drop(active);
         // Clear the settings selector weak ref (selector is no longer mounted).
         *lock(&self.settings_selector_weak) = None;
+        *lock(&self.session_selector) = None;
     }
 
     /// Whether `entry` still owns the editor region (ADR-0024 C1): the
@@ -4551,6 +4585,7 @@ impl InteractiveMode {
             agent_dir: Mutex::new(agent_dir),
             scrollbar_theme: theme_handle,
             settings_selector_weak: Mutex::new(None),
+            session_selector: Mutex::new(None),
             extension_input_listeners: Mutex::new(Vec::new()),
         });
         *lock(&ui_state.self_arc) = Some(Arc::downgrade(&ui_state));
@@ -5926,6 +5961,7 @@ mod tests {
             UiCommand::Dequeue => "dequeue",
             UiCommand::CopyMessage { .. } => "copy_message",
             UiCommand::PasteImage => "paste_image",
+            UiCommand::SessionListEvent => "session_list_event",
         }
     }
 

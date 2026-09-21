@@ -3,9 +3,11 @@
 //! manager is created (main.ts:321-333).
 //!
 //! Intentional differences:
-//! - The component loads session lists synchronously from `cwd` /
-//!   `session_dir` (see the `SessionSelectorComponent` port notes), so the
-//!   loader callbacks of `selectSession` collapse into plain path arguments.
+//! - The component loads session lists progressively from `cwd` /
+//!   `session_dir` on loader threads (dfbf793b7 @ 19451accd, V15-04 FR-A;
+//!   see the `SessionSelectorComponent` port notes): the driver loop below
+//!   drains the published events between `TuiHandle::pump` calls, replacing
+//!   upstream's promise continuations on the JS event loop.
 //! - The terminal is injectable for tests (the `with_terminal` variant);
 //!   production uses a `ProcessTerminal`.
 //! - `onExit` is a no-op: the component port never fires it (the field is
@@ -135,9 +137,13 @@ pub(crate) async fn select_session_with_terminal(
         None,
         // No running session yet — nothing to protect from deletion.
         None,
+        // No `load_wake` hook: this driver loop drains the loader channel
+        // between pumps (the interactive mode routes through its
+        // `UiCommand` drain instead).
+        None,
     )));
 
-    let entry = shared_component_from_boxed(Box::new(PickerRegion(selector)));
+    let entry = shared_component_from_boxed(Box::new(PickerRegion(Arc::clone(&selector))));
     ui.add_child(entry.clone());
     ui.set_focus(Some(entry));
     ui.request_render(false);
@@ -150,10 +156,14 @@ pub(crate) async fn select_session_with_terminal(
     let stop = Arc::new(AtomicBool::new(false));
     let driver_ui = ui.clone();
     let driver_stop = Arc::clone(&stop);
+    let driver_selector = Arc::clone(&selector);
     let driver = std::thread::Builder::new()
         .name("rpi-picker-driver".to_string())
         .spawn(move || {
             while !driver_stop.load(Ordering::Relaxed) {
+                // Progressive loads (dfbf793b7): apply published session-list
+                // events before each pump so renders observe fresh state.
+                lock(&driver_selector).drain_load_events();
                 driver_ui.pump(Some(Duration::from_millis(50)));
             }
         })
@@ -230,6 +240,25 @@ mod tests {
         terminal.feed(data);
     }
 
+    /// Feed `data` once the picker has rendered `needle` — progressive
+    /// loading (dfbf793b7) means the first publish lands asynchronously, so
+    /// selection keys must wait for the list to appear (upstream tests
+    /// await the render the same way).
+    async fn feed_when_rendered(terminal: &TestTerminal, needle: &str, data: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never rendered {needle}"
+            );
+            if terminal.is_started() && terminal.writes().contains(needle) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        terminal.feed(data);
+    }
+
     #[tokio::test]
     async fn escape_cancels_picker() {
         let (_tmp, cwd, session_dir, settings, _file) = picker_fixture();
@@ -259,7 +288,9 @@ mod tests {
             &settings,
             Box::new(terminal.clone()),
         );
-        let feeder = feed_when_started(&terminal, "\r");
+        // The session's first message must be on screen before Enter can
+        // select it (progressive publish race — see helper docs).
+        let feeder = feed_when_rendered(&terminal, "hello", "\r");
         let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
             tokio::join!(picker, feeder)
         })

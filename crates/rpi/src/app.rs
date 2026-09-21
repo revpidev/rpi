@@ -181,19 +181,18 @@ enum ResolvedSession {
     NotFound(String),
 }
 
-/// `findLocalSessionByExactId` (main.ts:153-161).
+/// `findLocalSessionByExactId` (main.ts:241-249 @ 19451accd,
+/// 9b791a4cc / #9601): header-only exact-ID lookup via
+/// [`SessionManager::find_by_id`] — no transcript scan, no full listing.
 fn find_local_session_by_exact_id(
     session_id: &str,
     cwd: &Path,
     session_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    SessionManager::list(cwd, session_dir)
-        .into_iter()
-        .find(|s| s.id == session_id)
-        .map(|s| s.path)
+    SessionManager::find_by_id(cwd, session_id, session_dir)
 }
 
-/// `resolveSessionPath` (main.ts:163-189).
+/// `resolveSessionPath` (main.ts:251-283 @ 19451accd).
 fn resolve_session_path(
     session_arg: &str,
     cwd: &Path,
@@ -204,16 +203,17 @@ fn resolve_session_path(
         return ResolvedSession::Path(resolve_path(session_arg, cwd));
     }
 
-    // Current project: exact id, then id prefix.
+    // Exact IDs only require reading session headers. Fall back to the full
+    // metadata listing for prefix matches (main.ts:262-266).
+    if let Some(path) = find_local_session_by_exact_id(session_arg, cwd, session_dir) {
+        return ResolvedSession::Local(path);
+    }
+
+    // Current project: id prefix.
     let local_sessions = SessionManager::list(cwd, session_dir);
     let local_match = local_sessions
         .iter()
-        .find(|s| s.id == session_arg)
-        .or_else(|| {
-            local_sessions
-                .iter()
-                .find(|s| s.id.starts_with(session_arg))
-        });
+        .find(|s| s.id.starts_with(session_arg));
     if let Some(local_match) = local_match {
         return ResolvedSession::Local(local_match.path.clone());
     }

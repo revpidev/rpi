@@ -738,30 +738,49 @@ fn session_cwd_matches(cwd: Option<&str>, resolved_cwd: &Path) -> bool {
     }
 }
 
-/// `findMostRecentSession` (session-manager.ts:635-656).
+/// `findMostRecentSession` (session-manager.ts:660-677 @ 19451accd,
+/// dd01f5b24 "speed up recent session discovery"): stat every candidate
+/// first, sort by mtime (desc), then read headers in recency order and stop
+/// at the first cwd match — the newest matching session is found without
+/// scanning headers of the whole directory (the pre-dd01f5b24 port read
+/// every header up front). Equal-mtime ties resolve to the first candidate
+/// in read_dir order (upstream stable descending sort + `files[0]`).
 pub fn find_most_recent_session(session_dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     let resolved_dir = PathBuf::from(normalize_path(&session_dir.to_string_lossy()));
     let resolved_cwd = cwd.map(|c| resolve_path(&c.to_string_lossy(), &process_cwd()));
 
     let read_dir = std::fs::read_dir(&resolved_dir).ok()?;
-    let mut files: Vec<(PathBuf, std::time::SystemTime)> = read_dir
+    let mut files: Vec<(PathBuf, i64)> = read_dir
         .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .filter(|p| match read_session_header_for_discovery(p) {
-            Some(header) => match (&resolved_cwd, session_header_cwd(&header)) {
-                (Some(rcwd), hcwd) => session_cwd_matches(hcwd, rcwd),
-                (None, _) => true,
-            },
-            None => false,
-        })
         .filter_map(|p| {
-            let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
-            Some((p, mtime))
+            let mtime_ms = std::fs::metadata(&p)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some((p, mtime_ms.as_millis() as i64))
         })
         .collect();
-    files.sort_by_key(|(_, mtime)| *mtime);
-    files.pop().map(|(p, _)| p)
+    // Stable descending by mtime (upstream `.sort((a, b) => b.mtime -
+    // a.mtime)` — stable in V8, and `sort_by_key` is stable by contract).
+    files.sort_by_key(|&(_, mtime_ms)| std::cmp::Reverse(mtime_ms));
+
+    for (path, _) in files {
+        let header = read_session_header_for_discovery(&path);
+        if let Some(header) = header {
+            let cwd_matches = match &resolved_cwd {
+                Some(rcwd) => session_cwd_matches(session_header_cwd(&header), rcwd),
+                None => true,
+            };
+            if cwd_matches {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2330,8 +2349,9 @@ pub fn path_to_root_or_compaction(
 //
 // Assigned to T12 in the T07 landing note (D-012) but pulled forward: T10's
 // `--session` / `--fork` / `--session-id` resolution needs it. Sequential
-// reads replace upstream's 10-way concurrency limit and progress callbacks
-// (ordering is identical after the `modified` sort; only latency differs).
+// reads replace upstream's 10-way concurrency limit (ordering is identical
+// after the `modified` sort; only latency differs); progressive publishing
+// and cancellation landed with V15-04 (dfbf793b7) below.
 
 /// `SessionInfo` (session-manager.ts:174-186). Timestamps are epoch ms
 /// (upstream `Date`).
@@ -2501,27 +2521,137 @@ pub fn build_session_info(file_path: &Path) -> Option<SessionInfo> {
     })
 }
 
-/// `listSessionsFromDir` (session-manager.ts:1589-1625).
-fn list_sessions_from_dir(dir: &Path) -> Vec<SessionInfo> {
+/// `SessionListProgress` (session-manager.ts:793-798 @ 19451accd,
+/// dfbf793b7): `(loaded, total)` plus the activity-sorted partial list on
+/// periodic publishes (`partial_sessions` is `Some` exactly on the upstream
+/// publish points: first file, every publish interval, and the final one).
+pub type SessionListProgress<'a> = &'a mut dyn FnMut(usize, usize, Option<&[SessionInfo]>);
+
+/// Cancellation flag for progressive listings (the upstream `AbortSignal`).
+/// Checked between files — a cancelled listing stops publishing and returns
+/// early (upstream rejects with `AbortError`; the sync Rust port has no
+/// rejection channel, and callers that cancel discard the return value the
+/// same way upstream selectors drop aborted results via `isActive()`).
+pub type SessionListCancel<'a> = &'a std::sync::atomic::AtomicBool;
+
+/// `CURRENT_SESSION_LIST_PUBLISH_INTERVAL` (session-manager.ts:804).
+const CURRENT_SESSION_LIST_PUBLISH_INTERVAL: usize = 10;
+/// `ALL_SESSION_LIST_PUBLISH_INTERVAL` (session-manager.ts:805).
+const ALL_SESSION_LIST_PUBLISH_INTERVAL: usize = 100;
+
+fn listing_cancelled(cancel: Option<SessionListCancel<'_>>) -> bool {
+    cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `sortSessionInfos` (session-manager.ts:838-840): descending by activity
+/// time (`modified`), stable.
+fn sort_session_infos(sessions: &mut [SessionInfo]) {
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
+}
+
+/// `listSessionsFromDir` (session-manager.ts:844-882 @ 19451accd,
+/// dfbf793b7): candidates sorted by file name descending (session file
+/// names are timestamp-prefixed, so name order approximates recency
+/// upstream), read in order, with partial publishes at `loaded == 1`, every
+/// [`CURRENT_SESSION_LIST_PUBLISH_INTERVAL`] files and the final file.
+fn list_sessions_from_dir_with_progress(
+    dir: &Path,
+    mut on_progress: Option<SessionListProgress<'_>>,
+    cancel: Option<SessionListCancel<'_>>,
+) -> Vec<SessionInfo> {
+    // `signal?.throwIfAborted()` at entry.
+    if listing_cancelled(cancel) {
+        return Vec::new();
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
-    let mut sessions = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "jsonl") {
-            if let Some(info) = build_session_info(&path) {
-                sessions.push(info);
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    // Upstream sorts the directory entry names with `b.localeCompare(a)`
+    // (descending); session file names are ASCII timestamp-prefixed, so
+    // byte order matches the locale collation for them.
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+    let total = files.len();
+    let mut partial: Vec<SessionInfo> = Vec::new();
+    let mut loaded = 0usize;
+    for path in files {
+        if listing_cancelled(cancel) {
+            return Vec::new();
+        }
+        let info = build_session_info(&path);
+        loaded += 1;
+        if let Some(info) = info {
+            partial.push(info);
+        }
+        let publish_partial = loaded == 1
+            || loaded.is_multiple_of(CURRENT_SESSION_LIST_PUBLISH_INTERVAL)
+            || loaded == total;
+        if publish_partial {
+            if let Some(progress) = on_progress.as_mut() {
+                // `sortSessionInfos([...partialSessions])` — the snapshot is
+                // sorted; the accumulator keeps completion order.
+                let mut snapshot = partial.clone();
+                sort_session_infos(&mut snapshot);
+                progress(loaded, total, Some(&snapshot));
             }
         }
     }
-    sessions
+    partial
 }
 
 impl SessionManager {
-    /// `SessionManager.list` (session-manager.ts:1638-1651).
-    pub fn list(cwd: &Path, session_dir: Option<&Path>) -> Vec<SessionInfo> {
+    /// `SessionManager.findById` (session-manager.ts:1732-1757 @ 19451accd,
+    /// 9b791a4cc / #9601): exact-ID lookup that reads session headers only —
+    /// no transcript bodies, no full listing. Directory iteration order is
+    /// the raw `read_dir` order (upstream `readdirSync`), first header match
+    /// wins.
+    pub fn find_by_id(cwd: &Path, id: &str, session_dir: Option<&Path>) -> Option<PathBuf> {
+        let dir = match session_dir {
+            Some(dir) => PathBuf::from(normalize_path(&dir.to_string_lossy())),
+            None => get_default_session_dir(cwd).ok()?,
+        };
+        let filter_cwd = session_dir.is_some() && dir != get_default_session_dir_path(cwd, None);
+        let resolved_cwd = resolve_path(
+            &cwd.to_string_lossy(),
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        );
+
+        let read_dir = std::fs::read_dir(&dir).ok()?;
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(header) = read_session_header_for_discovery(&path) else {
+                continue;
+            };
+            if header.id != id {
+                continue;
+            }
+            if filter_cwd && !session_cwd_matches(session_header_cwd(&header), &resolved_cwd) {
+                continue;
+            }
+            return Some(path);
+        }
+        None
+    }
+
+    /// `SessionManager.list` (session-manager.ts:1757-1773 @ 19451accd,
+    /// dfbf793b7) with progressive publishing and cancellation.
+    /// Partial snapshots are filtered through the cwd include filter before
+    /// reaching `on_progress` (upstream wraps the progress callback).
+    pub fn list_with_progress(
+        cwd: &Path,
+        session_dir: Option<&Path>,
+        mut on_progress: Option<SessionListProgress<'_>>,
+        cancel: Option<SessionListCancel<'_>>,
+    ) -> Vec<SessionInfo> {
         let dir = match session_dir {
             Some(dir) => PathBuf::from(normalize_path(&dir.to_string_lossy())),
             None => match get_default_session_dir(cwd) {
@@ -2534,31 +2664,67 @@ impl SessionManager {
             &cwd.to_string_lossy(),
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
         );
-        let mut sessions: Vec<SessionInfo> = list_sessions_from_dir(&dir)
-            .into_iter()
-            .filter(|session| {
-                !filter_cwd || session_cwd_matches(Some(session.cwd.as_str()), &resolved_cwd)
-            })
-            .collect();
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
+        let include_session = move |session: &SessionInfo| {
+            !filter_cwd || session_cwd_matches(Some(session.cwd.as_str()), &resolved_cwd)
+        };
+
+        let mut filtered_progress =
+            |loaded: usize, total: usize, partial: Option<&[SessionInfo]>| {
+                if let Some(progress) = on_progress.as_mut() {
+                    let filtered: Option<Vec<SessionInfo>> = partial.map(|sessions| {
+                        sessions
+                            .iter()
+                            .filter(|s| include_session(s))
+                            .cloned()
+                            .collect()
+                    });
+                    progress(loaded, total, filtered.as_deref());
+                }
+            };
+        let mut sessions: Vec<SessionInfo> =
+            list_sessions_from_dir_with_progress(&dir, Some(&mut filtered_progress), cancel)
+                .into_iter()
+                .filter(|session| include_session(session))
+                .collect();
+        sort_session_infos(&mut sessions);
         sessions
     }
 
-    /// `SessionManager.listAll` (session-manager.ts:1653-1711).
-    pub fn list_all(session_dir: Option<&Path>) -> Vec<SessionInfo> {
+    /// `SessionManager.list` (session-manager.ts:1757-1773): the eager
+    /// variant — no progress, no cancellation.
+    pub fn list(cwd: &Path, session_dir: Option<&Path>) -> Vec<SessionInfo> {
+        Self::list_with_progress(cwd, session_dir, None, None)
+    }
+
+    /// `SessionManager.listAll` (session-manager.ts:1775-1871 @ 19451accd,
+    /// dfbf793b7) with progressive publishing and cancellation. Custom
+    /// directories use the single-directory cadence; the all-projects scan
+    /// stats every candidate first, sorts by mtime (desc, file-name desc
+    /// tiebreak) and publishes at the first candidate, every
+    /// [`ALL_SESSION_LIST_PUBLISH_INTERVAL`] files and the final one — so
+    /// the most recent sessions surface first.
+    pub fn list_all_with_progress(
+        session_dir: Option<&Path>,
+        mut on_progress: Option<SessionListProgress<'_>>,
+        cancel: Option<SessionListCancel<'_>>,
+    ) -> Vec<SessionInfo> {
         if let Some(custom_dir) = session_dir {
             let dir = PathBuf::from(normalize_path(&custom_dir.to_string_lossy()));
-            let mut sessions = list_sessions_from_dir(&dir);
-            sessions.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
+            let mut sessions = list_sessions_from_dir_with_progress(&dir, on_progress, cancel);
+            sort_session_infos(&mut sessions);
             return sessions;
         }
 
+        // `signal?.throwIfAborted()` at entry.
+        if listing_cancelled(cancel) {
+            return Vec::new();
+        }
         let sessions_dir = crate::config::get_sessions_dir();
         let entries = match std::fs::read_dir(&sessions_dir) {
             Ok(entries) => entries,
             Err(_) => return Vec::new(),
         };
-        let mut sessions = Vec::new();
+        let mut candidates: Vec<(PathBuf, Option<i64>)> = Vec::new();
         for entry in entries.flatten() {
             // da66636cc (#7552): follow symlinked session directories as well
             // as real ones — session dirs may be symlinks to external storage.
@@ -2566,10 +2732,71 @@ impl SessionManager {
                 .file_type()
                 .is_ok_and(|t| t.is_dir() || t.is_symlink())
             {
-                sessions.extend(list_sessions_from_dir(&entry.path()));
+                let dir = entry.path();
+                let Ok(files) = std::fs::read_dir(&dir) else {
+                    // Upstream `mapWithConcurrency` maps failed readdirs to
+                    // empty candidate lists.
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    // Best-effort stat (upstream `catch { return { path } }`).
+                    let mtime_ms = std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64);
+                    candidates.push((path, mtime_ms));
+                }
             }
         }
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
-        sessions
+        // `(b.mtimeMs ?? -Infinity) - (a.mtimeMs ?? -Infinity) ||
+        //  basename(b).localeCompare(basename(a))` — mtime desc, name desc
+        // tiebreak, missing stats last.
+        candidates.sort_by(|(a_path, a_mtime), (b_path, b_mtime)| {
+            let a_ms = a_mtime.unwrap_or(i64::MIN);
+            let b_ms = b_mtime.unwrap_or(i64::MIN);
+            b_ms.cmp(&a_ms)
+                .then_with(|| b_path.file_name().cmp(&a_path.file_name()))
+        });
+
+        let total = candidates.len();
+        let mut partial: Vec<SessionInfo> = Vec::new();
+        let mut loaded = 0usize;
+        for (index, (path, _)) in candidates.iter().enumerate() {
+            if listing_cancelled(cancel) {
+                return Vec::new();
+            }
+            let info = build_session_info(path);
+            loaded += 1;
+            if let Some(info) = info {
+                partial.push(info);
+            }
+            // `firstCandidateLoaded && (index === 0 || loaded % 100 === 0 ||
+            // loaded === totalFiles)` — sequential reads load candidate 0
+            // first, so the `firstCandidateLoaded` flag folds into
+            // `index == 0`.
+            let publish_partial = index == 0
+                || loaded.is_multiple_of(ALL_SESSION_LIST_PUBLISH_INTERVAL)
+                || loaded == total;
+            if publish_partial {
+                if let Some(progress) = on_progress.as_mut() {
+                    let mut snapshot = partial.clone();
+                    sort_session_infos(&mut snapshot);
+                    progress(loaded, total, Some(&snapshot));
+                }
+            }
+        }
+        sort_session_infos(&mut partial);
+        partial
+    }
+
+    /// `SessionManager.listAll` (session-manager.ts:1775-1871): the eager
+    /// variant — no progress, no cancellation.
+    pub fn list_all(session_dir: Option<&Path>) -> Vec<SessionInfo> {
+        Self::list_all_with_progress(session_dir, None, None)
     }
 }

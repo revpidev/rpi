@@ -1706,6 +1706,7 @@ impl InteractiveUi {
         };
 
         let select_ui = Arc::clone(ui);
+        let load_wake_ui = Arc::clone(ui);
         let selector = Arc::new(Mutex::new(SessionSelectorComponent::new(
             cwd,
             session_dir,
@@ -1775,10 +1776,20 @@ impl InteractiveUi {
                 }
             })),
             current_session_file,
+            // dfbf793b7: loader threads wake the run loop's UiCommand drain
+            // after every publish (the component itself also requests a
+            // render through its `TuiHandle`).
+            Some(Arc::new(move || {
+                load_wake_ui.push(UiCommand::SessionListEvent);
+            })),
         )));
-
-        let entry = shared_component_from_boxed(Box::new(FocusableRegion(selector)));
+        let entry = shared_component_from_boxed(Box::new(FocusableRegion(Arc::clone(&selector))));
         ui.show_selector(entry);
+        // Typed drain target for `UiCommand::SessionListEvent` (the entry
+        // above is type-erased as a `SharedComponent`). Registered AFTER
+        // `show_selector` — it clears the slot when superseding a previous
+        // selector.
+        *lock(&ui.session_selector) = Some(selector);
     }
 
     /// `showTrustSelector` (interactive-mode.ts:4429-4452): the value strings
@@ -3184,6 +3195,41 @@ mod tests {
 
     fn selector_mounted(ui: &InteractiveUi) -> bool {
         lock(&ui.active_selector).is_some()
+    }
+
+    #[tokio::test]
+    async fn session_selector_progressive_load_routes_through_drain() {
+        // V15-04 FR-A (dfbf793b7): the session selector loads progressively
+        // on loader threads and its publishes wake the run loop's
+        // `UiCommand` drain, which applies them to the mounted component
+        // through the typed slot.
+        let (mode, _terminal, _session, _tmp) = mode_harness().await;
+        InteractiveUi::show_session_selector(&mode.ui_state);
+        assert!(selector_mounted(&mode.ui_state), "session selector mounted");
+
+        // The typed slot is registered and draining settles the load.
+        let selector = lock(&mode.ui_state.session_selector)
+            .clone()
+            .expect("typed session selector slot");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            mode.ui_state.drain_events();
+            if !lock(&selector).loads_pending() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "loads never settled through the drain"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Hiding the selector clears the slot (stale drains become no-ops).
+        mode.ui_state.hide_selector();
+        assert!(lock(&mode.ui_state.session_selector).is_none());
+        mode.ui_state
+            .push(crate::modes::interactive::interactive_mode::UiCommand::SessionListEvent);
+        mode.ui_state.drain_events();
     }
 
     // ---------------------------------------------------------------------

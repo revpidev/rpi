@@ -5,14 +5,19 @@
 //!   of the upstream global `theme` getter and `requestRender` callback
 //!   (theme.ts:799-816). Render requests use [`Tui::request_render`]
 //!   (non-forced, matching the upstream `requestRender()` calls).
-//! - Loading is synchronous: upstream loads current/all sessions
-//!   asynchronously with `(loaded, total)` progress callbacks
-//!   (session-selector.ts:922-982); the port calls the synchronous
-//!   [`SessionManager::list`] / [`SessionManager::list_all`] once and reports
-//!   the completed progress (`total/total`) before clearing the loading
-//!   state. The `allLoadSeq` staleness guard and the `scope !== this.scope`
-//!   post-load checks become unnecessary (a scope toggle cannot interleave
-//!   with a synchronous load).
+//! - Loading is progressive (dfbf793b7 @ 19451accd, V15-04 FR-A): scope
+//!   loads run on a background thread and publish
+//!   `(loaded, total, partial)` snapshots through an mpsc channel; the
+//!   component applies them in [`SessionSelectorComponent::drain_load_events`]
+//!   (driven by the `UiCommand::SessionListEvent` drain in the interactive
+//!   mode, or the picker driver loop between `TuiHandle::pump` calls).
+//!   Selection/cancel aborts in-flight loads (`cancel_loads`, the upstream
+//!   `AbortController` pair) and drops the receivers so late publishes are
+//!   ignored (the upstream `isActive()` guard). Upstream's promise rejection
+//!   path for failed loads has no Rust counterpart — the local list APIs
+//!   never error — and the upstream 10-way read concurrency is a plain
+//!   sequential read order here (candidates are pre-sorted, so partial
+//!   orderings match).
 //! - The header status-message auto-hide timer (`setTimeout`, 116-126) is not
 //!   ported: messages persist until the next status change (unassigned — no
 //!   v0.1 task claims the timer).
@@ -59,7 +64,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rpi_tui::components::input::Input;
@@ -69,7 +75,7 @@ use rpi_tui::tui::{Component, Focusable};
 use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::utils::{truncate_to_width, visible_width};
 
-use crate::core::session_manager::{SessionInfo, SessionManager};
+use crate::core::session_manager::{SessionInfo, SessionListProgress, SessionManager};
 use crate::core::themes::Theme;
 
 use super::dynamic_border::DynamicBorder;
@@ -83,6 +89,34 @@ use super::session_selector_search::{
 enum SessionScope {
     Current,
     All,
+}
+
+/// One published step of a progressive scope load — the wire form of the
+/// upstream `onProgress(loaded, total, partialSessions?)` callbacks plus the
+/// resolving promise result (`Done`), sent from the loader thread to
+/// [`SessionSelectorComponent::drain_load_events`].
+#[derive(Debug)]
+enum SessionLoadEvent {
+    Progress {
+        loaded: usize,
+        total: usize,
+        /// Activity-sorted snapshot; `None` on non-publishing progress
+        /// ticks (never produced by the current core — kept for shape
+        /// parity with the upstream callback signature).
+        partial: Option<Vec<SessionInfo>>,
+    },
+    /// The load resolved with its final session list.
+    Done(Vec<SessionInfo>),
+}
+
+/// In-flight scope load (the upstream `AbortController` pair,
+/// session-selector.ts:872-873 @ 19451accd): the cancel flag stops the
+/// loader thread between files, and dropping the receiver discards late
+/// publishes (the upstream `isActive()` identity guard — a stale event can
+/// never reach a slot that no longer holds its channel).
+struct ScopeLoad {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<SessionLoadEvent>,
 }
 
 /// `StatusMessage.type` (session-selector.ts:65).
@@ -517,6 +551,12 @@ pub struct SessionList {
     all_sessions: Vec<SessionInfo>,
     filtered_sessions: Vec<FlatSessionNode>,
     selected_index: usize,
+    /// dfbf793b7: once the user has interacted with the list, later
+    /// `set_sessions` calls preserve the selected PATH across the refreshed
+    /// filter (progressive publishes reorder the list around the newest
+    /// session floating to the top); untouched lists re-select index 0
+    /// (session-selector.ts:291, 360-371).
+    selection_touched: bool,
     search_input: Input,
     show_cwd: bool,
     sort_mode: SortMode,
@@ -542,6 +582,7 @@ impl SessionList {
             all_sessions: sessions,
             filtered_sessions: Vec::new(),
             selected_index: 0,
+            selection_touched: false,
             search_input: Input::new(),
             show_cwd,
             sort_mode,
@@ -570,12 +611,31 @@ impl SessionList {
         self.filter_sessions(&query);
     }
 
-    /// `setSessions` (session-selector.ts:361-365).
+    /// `setSessions` (session-selector.ts:361-371 @ 19451accd,
+    /// dfbf793b7): preserve the selected path across refreshes once the
+    /// user has moved the selection; untouched lists follow the newest
+    /// entry (index 0).
     pub(crate) fn set_sessions(&mut self, sessions: Vec<SessionInfo>, show_cwd: bool) {
+        let selected_path = if self.selection_touched {
+            self.get_selected_session_path()
+        } else {
+            None
+        };
         self.all_sessions = sessions;
         self.show_cwd = show_cwd;
         let query = self.search_input.get_value().to_string();
         self.filter_sessions(&query);
+        if !self.selection_touched {
+            self.selected_index = 0;
+        } else if let Some(selected_path) = selected_path {
+            let selected_index = self
+                .filtered_sessions
+                .iter()
+                .position(|node| node.session.path.to_string_lossy() == selected_path);
+            if let Some(selected_index) = selected_index {
+                self.selected_index = selected_index;
+            }
+        }
     }
 
     /// `getSelectedSessionPath` (session-selector.ts:284-287).
@@ -716,6 +776,10 @@ impl SessionList {
             return self.start_delete_confirmation_for_selected_session();
         }
 
+        // dfbf793b7 (session-selector.ts:611): every non-command key marks
+        // the selection as user-touched (selection keys AND keys forwarded
+        // to the search input below).
+        self.selection_touched = true;
         // Up arrow (session-selector.ts:604-610).
         if kb.matches_id(data, "tui.select.up") {
             self.selected_index = self.selected_index.saturating_sub(1);
@@ -978,10 +1042,20 @@ pub struct SessionSelectorComponent {
     scope: SessionScope,
     sort_mode: SortMode,
     name_filter: NameFilter,
-    current_sessions: Vec<SessionInfo>,
+    /// `currentSessions` (session-selector.ts:716 @ 19451accd):
+    /// `Option` — `None` until the first partial publish lands (upstream
+    /// `SessionInfo[] | null`).
+    current_sessions: Option<Vec<SessionInfo>>,
+    /// `allSessions` (session-selector.ts:717).
     all_sessions: Option<Vec<SessionInfo>>,
-    current_loading: bool,
-    all_loading: bool,
+    /// `currentLoad` / `allLoad` (session-selector.ts:872-873).
+    current_load: Option<ScopeLoad>,
+    all_load: Option<ScopeLoad>,
+    /// Wake hook invoked by the loader threads after every publish — routes
+    /// the event into the host's UI drain (`UiCommand::SessionListEvent` in
+    /// the interactive mode; `None` for the startup picker, whose driver
+    /// loop drains between pumps).
+    load_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     mode: SelectorMode,
     rename_input: Input,
     rename_target_path: Option<String>,
@@ -1002,13 +1076,16 @@ pub struct SessionSelectorComponent {
 }
 
 impl SessionSelectorComponent {
-    /// `constructor` (session-selector.ts:749-860). Upstream takes two async
-    /// loaders (`SessionsLoader`) and a `requestRender` callback; the port
-    /// takes the `cwd` / optional `session_dir` used by
-    /// [`SessionManager::list`] / [`SessionManager::list_all`] and loads
-    /// synchronously. `current_session_file_path` is the running session's
-    /// file, whose deletion is prevented (upstream
-    /// `currentSessionFilePath`, session-selector.ts:777-781).
+    /// `constructor` (session-selector.ts:749-860 @ 19451accd). Upstream
+    /// takes two async `SessionsLoader` callbacks plus a `requestRender`
+    /// callback; the port takes the `cwd` / optional `session_dir` used by
+    /// [`SessionManager::list_with_progress`] /
+    /// [`SessionManager::list_all_with_progress`] (spawned on loader
+    /// threads by [`SessionSelectorComponent::load_scope`]) and an optional
+    /// `load_wake` hook the threads call after publishing (see the field
+    /// docs). `current_session_file_path` is the running session's file,
+    /// whose deletion is prevented (upstream `currentSessionFilePath`,
+    /// session-selector.ts:777-781).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)] // mirrors the upstream callback type
     pub fn new(
@@ -1023,6 +1100,7 @@ impl SessionSelectorComponent {
         on_delete: Option<Box<dyn FnMut(&str) + Send>>,
         on_rename: Option<Box<dyn FnMut(&str, &str) + Send>>,
         current_session_file_path: Option<String>,
+        load_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         let can_rename = on_rename.is_some();
 
@@ -1062,10 +1140,11 @@ impl SessionSelectorComponent {
             scope: SessionScope::Current,
             sort_mode: SortMode::Threaded,
             name_filter: NameFilter::All,
-            current_sessions: Vec::new(),
+            current_sessions: None,
             all_sessions: None,
-            current_loading: false,
-            all_loading: false,
+            current_load: None,
+            all_load: None,
+            load_wake,
             mode: SelectorMode::List,
             rename_input: Input::new(),
             rename_target_path: None,
@@ -1091,69 +1170,229 @@ impl SessionSelectorComponent {
         &self.session_list
     }
 
-    /// `loadScope` (session-selector.ts:922-982), synchronous — see module
-    /// header. Load failures are impossible: the local list APIs return
-    /// `Vec<SessionInfo>` and never error.
-    fn load_scope(&mut self, scope: SessionScope) {
-        let show_cwd = scope == SessionScope::All;
-
-        // Mark loading (session-selector.ts:926-935).
-        if scope == SessionScope::Current {
-            self.current_loading = true;
-        } else {
-            self.all_loading = true;
-        }
-        self.header.set_scope(scope);
-        self.header.set_loading(true);
-
-        let (sessions, total) = if scope == SessionScope::Current {
-            let sessions = SessionManager::list(&self.cwd, self.session_dir.as_deref());
-            let total = sessions.len();
-            self.current_sessions = sessions.clone();
-            self.current_loading = false;
-            (sessions, total)
-        } else {
-            let sessions = SessionManager::list_all(self.session_dir.as_deref());
-            let total = sessions.len();
-            self.all_sessions = Some(sessions.clone());
-            self.all_loading = false;
-            (sessions, total)
-        };
-
-        // Upstream fires onProgress(loaded, total) during the async load
-        // (session-selector.ts:937-942); the sync port reports the completed
-        // count once before clearing the loading state.
-        self.header.set_progress(total, total);
-        self.header.set_loading(false);
-        self.session_list.set_sessions(sessions, show_cwd);
-        self.tui.request_render(false);
+    /// Whether either scope still has a load in flight (test/drain probe;
+    /// mirrors the upstream `currentLoad/allLoad` null checks).
+    pub(crate) fn loads_pending(&self) -> bool {
+        self.current_load.is_some() || self.all_load.is_some()
     }
 
-    /// `toggleScope` (session-selector.ts:1003-1026).
-    fn toggle_scope(&mut self) {
-        if self.scope == SessionScope::Current {
-            self.scope = SessionScope::All;
-            self.header.set_scope(self.scope);
+    fn load_slot(&mut self, scope: SessionScope) -> &mut Option<ScopeLoad> {
+        match scope {
+            SessionScope::Current => &mut self.current_load,
+            SessionScope::All => &mut self.all_load,
+        }
+    }
 
-            if let Some(all_sessions) = &self.all_sessions {
-                self.header.set_loading(false);
-                self.session_list.set_sessions(all_sessions.clone(), true);
-                self.tui.request_render(false);
-                return;
-            }
+    fn load_active(&self, scope: SessionScope) -> bool {
+        match scope {
+            SessionScope::Current => self.current_load.is_some(),
+            SessionScope::All => self.all_load.is_some(),
+        }
+    }
 
-            if !self.all_loading {
-                self.load_scope(SessionScope::All);
+    fn sessions_slot(&mut self, scope: SessionScope) -> &mut Option<Vec<SessionInfo>> {
+        match scope {
+            SessionScope::Current => &mut self.current_sessions,
+            SessionScope::All => &mut self.all_sessions,
+        }
+    }
+
+    /// `cancelLoads` (session-selector.ts:872-883 @ 19451accd): abort both
+    /// in-flight loads and drop their session slots (late publishes find a
+    /// dropped receiver and vanish — the `isActive()` guard).
+    fn cancel_loads(&mut self) {
+        if self.current_load.is_some() {
+            if let Some(load) = self.current_load.take() {
+                load.cancel.store(true, Ordering::Relaxed);
             }
+            self.current_sessions = None;
+        }
+        if self.all_load.is_some() {
+            if let Some(load) = self.all_load.take() {
+                load.cancel.store(true, Ordering::Relaxed);
+            }
+            self.all_sessions = None;
+        }
+    }
+
+    /// Apply pending loader events for both scopes — the drain side of the
+    /// progressive loads. Runs on the UI thread (the interactive-mode
+    /// `UiCommand` drain or the picker driver loop between pumps).
+    /// `loadScope`'s `onProgress` / promise-continuation application
+    /// (session-selector.ts:955-983 @ 19451accd).
+    pub fn drain_load_events(&mut self) {
+        let mut changed = false;
+        for scope in [SessionScope::Current, SessionScope::All] {
+            changed |= self.drain_scope(scope);
+        }
+        if changed {
+            self.tui.request_render(false);
+        }
+    }
+
+    /// Drain one scope's channel. Progress snapshots land in the scope's
+    /// session slot (list/progress UI updates only when the scope is
+    /// displayed); `Done` settles the slot and clears the load.
+    fn drain_scope(&mut self, scope: SessionScope) -> bool {
+        let Some(load) = self.load_slot(scope).take() else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match load.rx.try_recv() {
+                Ok(SessionLoadEvent::Progress {
+                    loaded,
+                    total,
+                    partial,
+                }) => {
+                    let Some(partial) = partial else { continue };
+                    *self.sessions_slot(scope) = Some(partial.clone());
+                    if self.scope == scope {
+                        self.session_list
+                            .set_sessions(partial, scope == SessionScope::All);
+                        self.header.set_progress(loaded, total);
+                        changed = true;
+                    }
+                }
+                Ok(SessionLoadEvent::Done(sessions)) => {
+                    *self.sessions_slot(scope) = Some(sessions.clone());
+                    if self.scope == scope {
+                        self.header.set_loading(false);
+                        self.session_list
+                            .set_sessions(sessions, scope == SessionScope::All);
+                        changed = true;
+                    }
+                    // Load finished — do not restore the slot.
+                    return changed;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Loader thread exited without `Done` (cancelled with the
+                    // slot still mounted — e.g. an abort raced the drain).
+                    // Clear the displayed loading state; the slot stays
+                    // empty, matching the dropped receiver.
+                    if self.scope == scope {
+                        self.header.set_loading(false);
+                        changed = true;
+                    }
+                    return changed;
+                }
+            }
+        }
+        // Still in flight — restore the slot.
+        *self.load_slot(scope) = Some(load);
+        changed
+    }
+
+    /// `loadScope` (session-selector.ts:937-996 @ 19451accd, dfbf793b7):
+    /// spawn the progressive loader thread. No-op when the scope already
+    /// has a load in flight. Load failures are impossible: the local list
+    /// APIs return `Vec<SessionInfo>` and never error (upstream's rejection
+    /// branch has no Rust counterpart).
+    fn load_scope(&mut self, scope: SessionScope) {
+        if self.load_active(scope) {
             return;
         }
 
-        self.scope = SessionScope::Current;
-        self.header.set_scope(self.scope);
-        self.header.set_loading(self.current_loading);
-        self.session_list
-            .set_sessions(self.current_sessions.clone(), false);
+        let (tx, rx) = mpsc::channel::<SessionLoadEvent>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = Arc::clone(&cancel);
+        let tui = self.tui.clone();
+        let wake = self.load_wake.clone();
+        let cwd = self.cwd.clone();
+        let session_dir = self.session_dir.clone();
+
+        *self.load_slot(scope) = Some(ScopeLoad { cancel, rx });
+        // Upstream marks the header (scope + loading) synchronously before
+        // awaiting the loader.
+        self.header.set_scope(scope);
+        self.header.set_loading(true);
+
+        let progress_tx = tx.clone();
+        let progress_tui = tui.clone();
+        let progress_wake = wake.clone();
+        let loader = move || {
+            let mut publish =
+                move |loaded: usize, total: usize, partial: Option<&[SessionInfo]>| {
+                    let _ = progress_tx.send(SessionLoadEvent::Progress {
+                        loaded,
+                        total,
+                        partial: partial.map(<[SessionInfo]>::to_vec),
+                    });
+                    progress_tui.request_render(false);
+                    if let Some(wake) = progress_wake.as_ref() {
+                        wake();
+                    }
+                };
+            let progress: SessionListProgress = &mut publish;
+            let sessions = if scope == SessionScope::Current {
+                SessionManager::list_with_progress(
+                    &cwd,
+                    session_dir.as_deref(),
+                    Some(progress),
+                    Some(&thread_cancel),
+                )
+            } else {
+                SessionManager::list_all_with_progress(
+                    session_dir.as_deref(),
+                    Some(progress),
+                    Some(&thread_cancel),
+                )
+            };
+            let _ = tx.send(SessionLoadEvent::Done(sessions));
+            tui.request_render(false);
+            if let Some(wake) = wake.as_ref() {
+                wake();
+            }
+        };
+        match std::thread::Builder::new()
+            .name("rpi-session-list".to_owned())
+            .spawn(loader)
+        {
+            Ok(_) => {}
+            // Thread-spawn failure (resource exhaustion) mirrors the
+            // upstream load-failure branch: clear the load and surface the
+            // error (session-selector.ts:985-996).
+            Err(_) => {
+                *self.load_slot(scope) = None;
+                if self.scope == scope {
+                    self.header.set_loading(false);
+                    self.header.set_status_message(Some((
+                        StatusKind::Error,
+                        "Failed to load sessions: could not spawn loader thread".to_owned(),
+                    )));
+                }
+                return;
+            }
+        }
         self.tui.request_render(false);
+    }
+
+    /// `toggleScope` (session-selector.ts:1021-1033 @ 19451accd,
+    /// dfbf793b7): switch the displayed scope to its slot (or an empty list
+    /// while the first load is pending) and kick off the load only when the
+    /// slot is empty and idle.
+    fn toggle_scope(&mut self) {
+        self.scope = if self.scope == SessionScope::Current {
+            SessionScope::All
+        } else {
+            SessionScope::Current
+        };
+        let sessions = match self.scope {
+            SessionScope::Current => self.current_sessions.clone(),
+            SessionScope::All => self.all_sessions.clone(),
+        };
+        let loading = self.load_active(self.scope);
+        self.header.set_scope(self.scope);
+        self.header.set_loading(loading);
+        self.session_list.set_sessions(
+            sessions.clone().unwrap_or_default(),
+            self.scope == SessionScope::All,
+        );
+        self.tui.request_render(false);
+        if sessions.is_none() && !loading {
+            self.load_scope(self.scope);
+        }
     }
 
     /// `toggleSortMode` (session-selector.ts:984-990): cycle threaded →
@@ -1195,16 +1434,16 @@ impl SessionSelectorComponent {
         };
         on_delete(path);
 
-        self.current_sessions
-            .retain(|s| s.path.to_string_lossy() != path);
+        if let Some(current_sessions) = self.current_sessions.as_mut() {
+            current_sessions.retain(|s| s.path.to_string_lossy() != path);
+        }
         if let Some(all_sessions) = self.all_sessions.as_mut() {
             all_sessions.retain(|s| s.path.to_string_lossy() != path);
         }
 
-        let sessions = if self.scope == SessionScope::All {
-            self.all_sessions.clone().unwrap_or_default()
-        } else {
-            self.current_sessions.clone()
+        let sessions = match self.scope {
+            SessionScope::All => self.all_sessions.clone().unwrap_or_default(),
+            SessionScope::Current => self.current_sessions.clone().unwrap_or_default(),
         };
         let show_cwd = self.scope == SessionScope::All;
         self.session_list.set_sessions(sessions, show_cwd);
@@ -1215,8 +1454,13 @@ impl SessionSelectorComponent {
         self.tui.request_render(false);
     }
 
-    /// `refreshSessionsAfterMutation` (session-selector.ts:999-1001).
+    /// `refreshSessionsAfterMutation` (session-selector.ts:999-1001 @
+    /// 19451accd): cancel both loads, empty the slots, reload the displayed
+    /// scope.
     fn refresh_sessions_after_mutation(&mut self) {
+        self.cancel_loads();
+        self.current_sessions = None;
+        self.all_sessions = None;
         self.load_scope(self.scope);
     }
 
@@ -1226,17 +1470,15 @@ impl SessionSelectorComponent {
         if !self.can_rename {
             return;
         }
-        if self.scope == SessionScope::Current && self.current_loading {
-            return;
-        }
-        if self.scope == SessionScope::All && self.all_loading {
+        // Loading guard (session-selector.ts:823-824 @ 19451accd): no
+        // renaming while the displayed scope's load is in flight.
+        if self.load_active(self.scope) {
             return;
         }
 
-        let sessions = if self.scope == SessionScope::All {
-            self.all_sessions.clone().unwrap_or_default()
-        } else {
-            self.current_sessions.clone()
+        let sessions = match self.scope {
+            SessionScope::All => self.all_sessions.clone().unwrap_or_default(),
+            SessionScope::Current => self.current_sessions.clone().unwrap_or_default(),
         };
         let name = sessions
             .iter()
@@ -1287,10 +1529,17 @@ impl SessionSelectorComponent {
         match event {
             SessionListEvent::Select(path) => {
                 self.header.set_status_message(None);
+                // `sessionList.onSelect` (session-selector.ts:801-805 @
+                // 19451accd): cancel in-flight loads before handing control
+                // back — selected, the picker closes and the remaining
+                // transcript reads are aborted.
+                self.cancel_loads();
                 (self.on_select)(&path);
             }
             SessionListEvent::Cancel => {
                 self.header.set_status_message(None);
+                // `sessionList.onCancel` (session-selector.ts:806-810).
+                self.cancel_loads();
                 (self.on_cancel)();
             }
             SessionListEvent::ToggleScope => self.toggle_scope(),
@@ -1623,7 +1872,7 @@ mod tests {
         on_rename: bool,
         current_session_file: Option<&Path>,
     ) -> SessionSelectorComponent {
-        SessionSelectorComponent::new(
+        let component = SessionSelectorComponent::new(
             harness.cwd.clone(),
             Some(harness.session_dir.clone()),
             theme(),
@@ -1634,7 +1883,23 @@ mod tests {
             on_delete.then(|| callbacks.on_delete()),
             on_rename.then(|| callbacks.on_rename()),
             current_session_file.map(|p| p.to_string_lossy().to_string()),
-        )
+            None,
+        );
+        pump_until_loaded(component)
+    }
+
+    /// Drive a freshly built component to a settled state: drain loader
+    /// events until the current-scope load finishes (progressive loads,
+    /// dfbf793b7 — upstream tests `await flushPromises()`).
+    fn pump_until_loaded(mut component: SessionSelectorComponent) -> SessionSelectorComponent {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while component.current_load.is_some() || component.all_load.is_some() {
+            assert!(std::time::Instant::now() < deadline, "loads never settled");
+            component.drain_load_events();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        component.drain_load_events();
+        component
     }
 
     /// Session file body strings stripped of ANSI codes, one entry per
@@ -1737,7 +2002,10 @@ mod tests {
         assert!(lines.join("\n").contains("◉ Current Folder"));
 
         // Tab → all scope: both sessions, header flips to ◉ All.
+        // (Progressive loads, dfbf793b7: the toggle starts the all-scope
+        // load — drain it to settle, upstream `await flushPromises()`.)
         component.handle_input("\t");
+        component = pump_until_loaded(component);
         let lines = body_lines(&component, 80);
         let joined = lines.join("\n");
         assert!(joined.contains("in cwd"));
@@ -1981,7 +2249,7 @@ mod tests {
         let deleted: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let target_arc = Arc::new(target.clone());
-        let mut component = SessionSelectorComponent::new(
+        let component = SessionSelectorComponent::new(
             harness.cwd.clone(),
             Some(harness.session_dir.clone()),
             theme(),
@@ -2004,7 +2272,9 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
+        let mut component = pump_until_loaded(component);
 
         // Ctrl+D enters the confirmation state: header shows the confirm hint.
         component.handle_input("\x04");
@@ -2470,5 +2740,249 @@ mod tests {
         );
         assert!(strip_ansi(&list.render(80).join("\n")).contains("alpha"));
         assert!(!strip_ansi(&list.render(80).join("\n")).contains("beta"));
+    }
+
+    // -----------------------------------------------------------------------
+    // V15-04 FR-A (dfbf793b7): progressive load application. The events are
+    // injected through a fake `ScopeLoad` channel (the real loads run on
+    // loader threads over real files — covered by `build` +
+    // `pump_until_loaded` above and the picker e2e).
+    // -----------------------------------------------------------------------
+
+    /// Install a controllable all-scope load: returns the sender end.
+    fn install_fake_all_load(
+        component: &mut SessionSelectorComponent,
+    ) -> mpsc::Sender<SessionLoadEvent> {
+        let (tx, rx) = mpsc::channel();
+        component.all_load = Some(ScopeLoad {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        tx
+    }
+
+    fn info(path: &str, id: &str, modified_ms: i64) -> SessionInfo {
+        SessionInfo {
+            path: PathBuf::from(path),
+            id: id.to_owned(),
+            cwd: String::new(),
+            name: None,
+            parent_session_path: None,
+            created_ms: modified_ms,
+            modified_ms,
+            message_count: 1,
+            first_message: format!("msg {id}"),
+            all_messages_text: format!("msg {id}"),
+        }
+    }
+
+    #[test]
+    fn progressive_partial_updates_list_and_done_settles() {
+        install_global_keybindings();
+        let harness = Harness::new();
+        let callbacks = Callbacks::new();
+        let mut component = build(&harness, &callbacks, false, false, None);
+
+        // Switch to the all scope with the fake load in flight.
+        component.scope = SessionScope::All;
+        component.header.set_scope(SessionScope::All);
+        component.header.set_loading(true);
+        let tx = install_fake_all_load(&mut component);
+
+        // Partial publish: the newest session surfaces immediately and the
+        // header shows the progress counter.
+        tx.send(SessionLoadEvent::Progress {
+            loaded: 1,
+            total: 2,
+            partial: Some(vec![info("/sessions/a.jsonl", "a", 2_000)]),
+        })
+        .unwrap();
+        component.drain_load_events();
+        let joined = body_lines(&component, 200).join("\n");
+        assert!(joined.contains("msg a"));
+        assert!(joined.contains("Loading 1/2"));
+
+        // A later partial replaces the snapshot (grew + re-sorted).
+        tx.send(SessionLoadEvent::Progress {
+            loaded: 2,
+            total: 2,
+            partial: Some(vec![
+                info("/sessions/a.jsonl", "a", 2_000),
+                info("/sessions/b.jsonl", "b", 1_000),
+            ]),
+        })
+        .unwrap();
+        component.drain_load_events();
+        let joined = body_lines(&component, 200).join("\n");
+        assert!(joined.contains("msg a"));
+        assert!(joined.contains("msg b"));
+
+        // Done settles the slot and clears the loading state.
+        tx.send(SessionLoadEvent::Done(vec![
+            info("/sessions/a.jsonl", "a", 2_000),
+            info("/sessions/b.jsonl", "b", 1_000),
+        ]))
+        .unwrap();
+        component.drain_load_events();
+        assert!(component.all_load.is_none());
+        assert!(component.all_sessions.is_some());
+        let joined = body_lines(&component, 200).join("\n");
+        assert!(!joined.contains("Loading"), "done clears the loading state");
+    }
+
+    #[test]
+    fn selection_follows_newest_until_touched_then_preserves_path() {
+        install_global_keybindings();
+        let mut list = SessionList::new(
+            Vec::new(),
+            false,
+            SortMode::Recent,
+            NameFilter::All,
+            None,
+            theme(),
+        );
+        // Recent mode keeps the incoming order (the listing API delivers
+        // activity-descending), so the fixtures are pre-sorted.
+        list.set_sessions(
+            vec![
+                info("/sessions/new.jsonl", "new", 2_000),
+                info("/sessions/old.jsonl", "old", 1_000),
+            ],
+            false,
+        );
+        // Untouched: the selection follows index 0 (the newest entry).
+        assert_eq!(
+            list.get_selected_session_path().as_deref(),
+            Some("/sessions/new.jsonl")
+        );
+
+        // A newer publish arrives: untouched selection still tracks index 0.
+        list.set_sessions(
+            vec![
+                info("/sessions/newest.jsonl", "newest", 3_000),
+                info("/sessions/new.jsonl", "new", 2_000),
+            ],
+            false,
+        );
+        assert_eq!(
+            list.get_selected_session_path().as_deref(),
+            Some("/sessions/newest.jsonl")
+        );
+
+        // User moves the selection: the chosen PATH survives later publishes
+        // even as newer sessions reorder the list head.
+        list.process_input("\x1b[B"); // Down → "new" (index 1)
+        assert_eq!(
+            list.get_selected_session_path().as_deref(),
+            Some("/sessions/new.jsonl")
+        );
+        list.set_sessions(
+            vec![
+                info("/sessions/newest.jsonl", "newest", 3_000),
+                info("/sessions/new.jsonl", "new", 2_000),
+                info("/sessions/old.jsonl", "old", 1_000),
+            ],
+            false,
+        );
+        assert_eq!(
+            list.get_selected_session_path().as_deref(),
+            Some("/sessions/new.jsonl"),
+            "touched selection preserves the selected path"
+        );
+    }
+
+    #[test]
+    fn select_cancels_in_flight_loads_and_ignores_late_publishes() {
+        install_global_keybindings();
+        let harness = Harness::new();
+        let cwd = harness.cwd_str();
+        write_session(
+            &harness.session_dir,
+            "s1",
+            &cwd,
+            None,
+            None,
+            Some("pick me"),
+            1_000,
+        );
+        let callbacks = Callbacks::new();
+        let mut component = build(&harness, &callbacks, false, false, None);
+        let selected = callbacks.selected.clone();
+
+        // Fake in-flight all load while the current scope is displayed.
+        let tx = install_fake_all_load(&mut component);
+        // Give the list something selectable.
+        component.current_sessions = Some(vec![info(
+            &harness.session_dir.join("s1.jsonl").to_string_lossy(),
+            "s1",
+            1_000,
+        )]);
+        component
+            .session_list
+            .set_sessions(component.current_sessions.clone().unwrap(), false);
+
+        // Enter selects → in-flight loads are cancelled before the callback.
+        component.handle_input("\r");
+        assert_eq!(selected.lock().unwrap()[0], {
+            let path = harness.session_dir.join("s1.jsonl");
+            path.to_string_lossy().to_string()
+        });
+        assert!(component.all_load.is_none(), "select cancels the all load");
+        assert!(
+            component.all_sessions.is_none(),
+            "cancelled slot is emptied"
+        );
+
+        // A late publish from the aborted load finds a dropped receiver: the
+        // drain applies nothing and does not panic.
+        tx.send(SessionLoadEvent::Done(vec![info("/x.jsonl", "x", 1)]))
+            .ok();
+        component.drain_load_events();
+        assert!(component.all_sessions.is_none());
+    }
+
+    #[test]
+    fn toggle_scope_while_all_loading_does_not_duplicate_load() {
+        // Upstream session-selector-path-delete.test.ts "does not start
+        // redundant All loads when toggling scopes while All is already
+        // loading": the in-flight all load keeps ownership, its partial is
+        // displayed and "Loading" stays up.
+        install_global_keybindings();
+        let harness = Harness::new();
+        let callbacks = Callbacks::new();
+        let mut component = build(&harness, &callbacks, false, false, None);
+
+        let tx = install_fake_all_load(&mut component);
+        component.handle_input("\t"); // current → all: load already active
+        let first_load = component.all_load.as_ref().map(|_| ());
+        assert!(first_load.is_some());
+
+        tx.send(SessionLoadEvent::Progress {
+            loaded: 1,
+            total: 2,
+            partial: Some(vec![info("/sessions/all.jsonl", "all", 5_000)]),
+        })
+        .unwrap();
+        component.drain_load_events();
+        let joined = body_lines(&component, 200).join("\n");
+        assert!(joined.contains("msg all"));
+        assert!(joined.contains("Loading"), "load still in flight");
+
+        // Round-trip current → all again: the SAME load must still own the
+        // slot (a duplicate spawn would have dropped the receiver).
+        component.handle_input("\t"); // all → current
+        component.handle_input("\t"); // current → all
+        tx.send(SessionLoadEvent::Progress {
+            loaded: 2,
+            total: 2,
+            partial: Some(vec![
+                info("/sessions/all.jsonl", "all", 5_000),
+                info("/sessions/other.jsonl", "other", 1_000),
+            ]),
+        })
+        .unwrap();
+        component.drain_load_events();
+        let joined = body_lines(&component, 200).join("\n");
+        assert!(joined.contains("msg other"), "original load still delivers");
     }
 }

@@ -915,6 +915,295 @@ fn find_most_recent_session_filters_by_cwd() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// V15-04 (dfbf793b7 / dd01f5b24 / 9b791a4cc): progressive discovery —
+// upstream file-operations.test.ts "rejects a cancelled session listing" +
+// the cadence/ordering contracts behind `load session picker
+// progressively`.
+// ---------------------------------------------------------------------------
+
+/// A complete session file (header + user message) whose `modified_ms` is
+/// the message activity timestamp `activity_ms`.
+fn write_active_session(dir: &Path, id: &str, cwd: &str, activity_ms: i64) -> PathBuf {
+    let path = dir.join(format!("{id}.jsonl"));
+    let message_line = format!(
+        "{{\"type\":\"message\",\"id\":\"m-{id}\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"msg {id}\",\"timestamp\":{activity_ms}}}}}"
+    );
+    std::fs::write(&path, format!("{}\n{message_line}\n", header_line(id, cwd)))
+        .expect("write session");
+    path
+}
+
+#[test]
+fn list_with_progress_publishes_first_interval_and_final_snapshots() {
+    let tmp = TempDir::new();
+    let dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&dir).expect("dir");
+    // Custom-dir listings filter by the caller's cwd (list()'s
+    // `filterCwd`), so the fixtures carry it.
+    let cwd = tmp.path().to_string_lossy().to_string();
+    for i in 0..25 {
+        write_active_session(&dir, &format!("s{i:02}"), &cwd, 1_000 + i);
+    }
+
+    let mut publishes: Vec<(usize, usize, Option<usize>)> = Vec::new();
+    let mut progress = |loaded: usize, total: usize, partial: Option<&[SessionInfo]>| {
+        // Every publish carries a snapshot sorted by activity (modified)
+        // desc — s24 (the highest activity) always leads.
+        if let Some(partial) = partial {
+            assert_eq!(partial[0].id, "s24");
+        }
+        publishes.push((loaded, total, partial.map(<[SessionInfo]>::len)));
+    };
+    let sessions =
+        SessionManager::list_with_progress(tmp.path(), Some(&dir), Some(&mut progress), None);
+
+    // dfbf793b7 cadence (session-manager.ts:875): loaded == 1, every 10,
+    // final — 1, 10, 20, 25 for 25 files.
+    let loaded_at: Vec<usize> = publishes.iter().map(|(l, _, _)| *l).collect();
+    assert_eq!(loaded_at, vec![1, 10, 20, 25]);
+    assert!(publishes.iter().all(|(_, total, _)| *total == 25));
+    // Snapshots grow monotonically.
+    let lens: Vec<usize> = publishes.iter().filter_map(|(_, _, l)| *l).collect();
+    assert_eq!(lens, vec![1, 10, 20, 25]);
+
+    // Final result: activity-descending, identical to the eager listing
+    // (the「逐字节同选」red line — only ordering/timing of loading changed).
+    assert_eq!(
+        sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        (0..25)
+            .rev()
+            .map(|i| format!("s{i:02}"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(sessions, SessionManager::list(tmp.path(), Some(&dir)));
+}
+
+#[test]
+fn cancelled_listing_stops_publishing_and_returns_early() {
+    // Upstream file-operations.test.ts "rejects a cancelled session listing"
+    // (dfbf793b7): aborting mid-listing surfaces as an AbortError rejection
+    // upstream; the sync Rust port stops publishing and returns early —
+    // callers that cancel discard the value (the selector drops its
+    // receiver).
+    let tmp = TempDir::new();
+    let dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let cwd = tmp.path().to_string_lossy().to_string();
+    for i in 0..25 {
+        write_active_session(&dir, &format!("s{i:02}"), &cwd, 1_000 + i);
+    }
+
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut publish_count = 0usize;
+    let mut progress = |_loaded: usize, _total: usize, _partial: Option<&[SessionInfo]>| {
+        publish_count += 1;
+        if publish_count == 1 {
+            // Abort the moment the first partial lands.
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    let sessions = SessionManager::list_with_progress(
+        tmp.path(),
+        Some(&dir),
+        Some(&mut progress),
+        Some(&cancel),
+    );
+    assert!(sessions.is_empty(), "cancelled listing returns early");
+    assert_eq!(publish_count, 1, "no publishes after cancellation");
+
+    // Pre-cancelled listings (upstream `throwIfAborted` at entry) publish
+    // nothing at all.
+    let pre = std::sync::atomic::AtomicBool::new(true);
+    let mut seen = 0usize;
+    let mut progress2 = |_loaded: usize, _total: usize, _partial: Option<&[SessionInfo]>| {
+        seen += 1;
+    };
+    let sessions2 =
+        SessionManager::list_all_with_progress(Some(&dir), Some(&mut progress2), Some(&pre));
+    assert!(sessions2.is_empty());
+    assert_eq!(seen, 0);
+}
+
+#[test]
+fn list_all_with_progress_surfaces_newest_sessions_first_across_dirs() {
+    let tmp = TempDir::new();
+    let agent_dir = tmp.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    let dir_a = sessions_dir.join("aaa");
+    let dir_b = sessions_dir.join("bbb");
+    std::fs::create_dir_all(&dir_a).expect("dir a");
+    std::fs::create_dir_all(&dir_b).expect("dir b");
+
+    // Interleaved mtimes across the two project dirs: the candidate sort
+    // (mtime desc) is global, so partials lead with the newest regardless
+    // of which directory holds it.
+    let newest = write_active_session(&dir_b, "newest", "/tmp", 9_000);
+    let middle = write_active_session(&dir_a, "middle", "/tmp", 5_000);
+    let oldest = write_active_session(&dir_b, "oldest", "/tmp", 1_000);
+    // Distinct file mtimes so the candidate order is deterministic
+    // (activity times drive the snapshot sort; mtimes drive read order).
+    std::fs::write(&oldest, std::fs::read_to_string(&oldest).unwrap() + "").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    std::fs::write(&middle, std::fs::read_to_string(&middle).unwrap() + "").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    std::fs::write(&newest, std::fs::read_to_string(&newest).unwrap() + "").unwrap();
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var_os(crate::config::ENV_AGENT_DIR);
+    std::env::set_var(crate::config::ENV_AGENT_DIR, &agent_dir);
+
+    let mut first_partial: Option<Vec<String>> = None;
+    let mut final_order: Option<Vec<String>> = None;
+    let result = {
+        let mut progress = |_loaded: usize, _total: usize, partial: Option<&[SessionInfo]>| {
+            if partial.is_some() && first_partial.is_none() {
+                first_partial = partial
+                    .map(|sessions| sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>());
+            }
+            if let Some(partial) = partial {
+                final_order = Some(partial.iter().map(|s| s.id.clone()).collect::<Vec<_>>());
+            }
+        };
+        let sessions = SessionManager::list_all_with_progress(None, Some(&mut progress), None);
+        match prev {
+            Some(v) => std::env::set_var(crate::config::ENV_AGENT_DIR, v),
+            None => std::env::remove_var(crate::config::ENV_AGENT_DIR),
+        }
+        sessions
+    };
+
+    // First publish: the newest candidate only (dfbf793b7's
+    // `firstCandidateLoaded` — session-manager.ts:1857-1862).
+    assert_eq!(first_partial.expect("partial"), vec!["newest".to_owned()]);
+    // Final: activity-descending across both dirs, equal to the eager API.
+    assert_eq!(
+        result.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        vec!["newest", "middle", "oldest"]
+    );
+    assert_eq!(
+        final_order.expect("final snapshot"),
+        vec![
+            "newest".to_owned(),
+            "middle".to_owned(),
+            "oldest".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn find_most_recent_session_reads_headers_only_in_recency_order() {
+    // dd01f5b24: stat first, then read headers newest-first and stop at the
+    // first cwd match — a newest candidate with a huge (unparseable)
+    // transcript body still wins because only its header is read; a newer
+    // foreign-cwd header is skipped without touching the body.
+    let tmp = TempDir::new();
+    let project_a = tmp.path().join("project-a");
+    let old_match = tmp.path().join("old-match.jsonl");
+    std::fs::write(
+        &old_match,
+        format!(
+            "{}\n{}\n",
+            header_line("old", &project_a.to_string_lossy()),
+            "x".repeat(1024)
+        ),
+    )
+    .expect("write");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let foreign = tmp.path().join("foreign.jsonl");
+    std::fs::write(
+        &foreign,
+        format!("{}\n", header_line("foreign", "/somewhere/else")),
+    )
+    .expect("write");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    // Newest: header matches project-a but the body is garbage that would
+    // break `buildSessionInfo` — header-only discovery still selects it.
+    let newest_match = tmp.path().join("newest-match.jsonl");
+    std::fs::write(
+        &newest_match,
+        format!(
+            "{}\n{}\n",
+            header_line("newest", &project_a.to_string_lossy()),
+            "{ broken json !!!"
+        ),
+    )
+    .expect("write");
+
+    assert_eq!(
+        find_most_recent_session(tmp.path(), Some(&project_a)),
+        Some(newest_match.clone())
+    );
+    // No cwd filter: the newest file wins outright.
+    assert_eq!(
+        find_most_recent_session(tmp.path(), None),
+        Some(newest_match)
+    );
+    // A cwd nothing matches yields None even with files present.
+    assert_eq!(
+        find_most_recent_session(tmp.path(), Some(&tmp.path().join("nobody"))),
+        None
+    );
+}
+
+#[test]
+fn find_by_id_matches_header_identity_without_reading_bodies() {
+    // 9b791a4cc (#9601, regression #9440): exact IDs resolve from session
+    // headers alone — a file whose body would fail `buildSessionInfo` is
+    // still found, renamed files keep working, and custom dirs filter by
+    // cwd (upstream session-id-readonly.test.ts).
+    let tmp = TempDir::new();
+    let dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let project_a = tmp.path().join("project-a");
+    let project_b = tmp.path().join("project-b");
+
+    // Body garbage — unparseable lines are skipped by the entry parser, so
+    // the session still lists; the exact-ID path never touches the body at
+    // all (read_session_header only — the #9440 fix's property).
+    let renamed = dir.join("imported-session.jsonl");
+    std::fs::write(
+        &renamed,
+        format!(
+            "{}\n{}\n",
+            header_line("renamed-id", &project_a.to_string_lossy()),
+            "not json at all"
+        ),
+    )
+    .expect("write");
+
+    assert_eq!(
+        SessionManager::find_by_id(&project_a, "renamed-id", Some(&dir)),
+        Some(renamed.clone())
+    );
+    assert_eq!(
+        SessionManager::find_by_id(&project_a, "missing-id", Some(&dir)),
+        None
+    );
+
+    // Custom session dir + foreign cwd header: filtered out (upstream
+    // "filters exact IDs by cwd in a custom session directory").
+    let foreign = dir.join("foreign.jsonl");
+    std::fs::write(
+        &foreign,
+        format!(
+            "{}\n",
+            header_line("foreign-id", &project_b.to_string_lossy())
+        ),
+    )
+    .expect("write");
+    assert_eq!(
+        SessionManager::find_by_id(&project_a, "foreign-id", Some(&dir)),
+        None,
+        "foreign-cwd session must not match in a custom dir"
+    );
+    assert_eq!(
+        SessionManager::find_by_id(&project_b, "foreign-id", Some(&dir)),
+        Some(foreign)
+    );
+}
+
 #[test]
 fn set_session_file_truncates_and_rewrites_empty_file_with_valid_header() {
     let tmp = TempDir::new();

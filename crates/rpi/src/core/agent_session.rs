@@ -3077,6 +3077,25 @@ impl AgentSession {
         target_id: &str,
         options: NavigateTreeOptions,
     ) -> Result<NavigateTreeResult, RpiError> {
+        // e687434a6 (#9179): reject navigation while a response streams or a
+        // compaction/branch-summary holds the runner — the tree selector
+        // would otherwise swap the leaf out from under the progress UI
+        // (agent-session.ts:3261-3268 @ 19451accd; the wrapper's abort-cell
+        // clear + idle resolve still run on this early return, mirroring
+        // the upstream `finally`).
+        if self.is_streaming() {
+            return Err(RpiError::Session(
+                "Wait for the current response to finish before navigating the session tree."
+                    .to_owned(),
+            ));
+        }
+        if self.is_compacting() {
+            return Err(RpiError::Session(
+                "Wait for the current compaction or tree navigation to finish before navigating the session tree."
+                    .to_owned(),
+            ));
+        }
+
         let old_leaf_id = lock(&self.inner.session_manager)
             .get_leaf_id()
             .map(str::to_owned);

@@ -1614,3 +1614,292 @@ mod session_scoped_mutations {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// V15-04 FR-D (e687434a6 / #9179): tree navigation is rejected while a
+// compaction or a prior navigation holds the runner. Upstream:
+// test/suite/regressions/9178-tree-during-compaction.test.ts.
+// ---------------------------------------------------------------------------
+
+/// Seed helper: a four-entry conversation returning (target assistant id,
+/// original leaf id).
+fn seed_navigation_conversation(fixture: &SessionFixture) -> (String, String) {
+    fn user_msg(text: &str) -> AgentMessage {
+        AgentMessage::User(rpi_ai::types::UserMessage {
+            role: rpi_ai::types::UserRole::User,
+            content: rpi_ai::types::UserContent::Text(text.to_owned()),
+            timestamp: 1,
+        })
+    }
+    let manager = fixture.session.session_manager();
+    let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+    manager
+        .append_message(user_msg("first user"))
+        .expect("append");
+    let target = manager
+        .append_message(AgentMessage::Assistant(faux_assistant_message(
+            "first assistant",
+            FauxAssistantOptions::default(),
+        )))
+        .expect("append");
+    manager
+        .append_message(user_msg("second user"))
+        .expect("append");
+    let original_leaf = manager
+        .append_message(AgentMessage::Assistant(faux_assistant_message(
+            "second assistant",
+            FauxAssistantOptions::default(),
+        )))
+        .expect("append");
+    (target, original_leaf)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn navigate_tree_during_manual_compaction_is_rejected_9179() {
+    use rpi::core::compaction_runner::CompactionEvent;
+
+    // A slow summary stream holds the compaction runner open after
+    // CompactionStart (the same window the upstream deferred compaction
+    // creates — deterministic race). The seeded conversation can also need
+    // a turn-prefix summarization before the main summary, so the queue
+    // carries several slow responses.
+    let slow_summary = || {
+        faux_assistant_message(
+            format!("SUMMARY {}", "detail ".repeat(40)).as_str(),
+            FauxAssistantOptions::default(),
+        )
+        .into()
+    };
+    let settings = r#"{"compaction": {"reserveTokens": 100, "keepRecentTokens": 10}}"#;
+    let fixture = session_fixture(
+        vec![slow_summary(), slow_summary(), slow_summary()],
+        FauxProviderOptions {
+            tokens_per_second: Some(60.0),
+            ..Default::default()
+        },
+        Some(settings),
+    )
+    .await;
+    {
+        let manager = fixture.session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        for text in ["q one", "a one", "q two"] {
+            let message = if text.starts_with('q') {
+                AgentMessage::User(rpi_ai::types::UserMessage {
+                    role: rpi_ai::types::UserRole::User,
+                    content: rpi_ai::types::UserContent::Text("x".repeat(200)),
+                    timestamp: 1,
+                })
+            } else {
+                AgentMessage::Assistant(faux_assistant_message(
+                    "y".repeat(200),
+                    FauxAssistantOptions::default(),
+                ))
+            };
+            manager.append_message(message).expect("append");
+        }
+    }
+    let (target, original_leaf) = seed_navigation_conversation(&fixture);
+
+    // Navigate the moment the compaction is observably in flight. The
+    // leaf observation happens inside the spawn — still during the
+    // compaction drip (the compact() await below settles it).
+    type NavOutcome = Option<(
+        Result<rpi::core::agent_session::NavigateTreeResult, rpi::RpiError>,
+        Option<String>,
+    )>;
+    let navigation_outcome: Arc<Mutex<NavOutcome>> = Arc::new(Mutex::new(None));
+    let nav_session = fixture.session.clone();
+    let nav_target = target.clone();
+    let outcome_slot = navigation_outcome.clone();
+    let unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
+        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event {
+            if matches!(*inner, CompactionEvent::CompactionStart { .. }) {
+                assert!(
+                    !nav_session.is_idle(),
+                    "compaction must be in flight at CompactionStart"
+                );
+                let session = nav_session.clone();
+                let target = nav_target.clone();
+                let slot = outcome_slot.clone();
+                tokio::spawn(async move {
+                    let outcome = session
+                        .navigate_tree(
+                            &target,
+                            rpi::core::agent_session::NavigateTreeOptions {
+                                summarize: false,
+                                custom_instructions: None,
+                                replace_instructions: false,
+                                label: None,
+                            },
+                        )
+                        .await;
+                    let leaf_after_reject = {
+                        let manager = session.session_manager();
+                        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+                        manager.get_leaf_id().map(str::to_owned)
+                    };
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((outcome, leaf_after_reject));
+                });
+            }
+        }
+    }));
+
+    fixture.session.compact(None).await.expect("compact ok");
+
+    // The navigation was rejected with the upstream message and never moved
+    // the leaf (observed inside the compaction window, above).
+    let (outcome, leaf_after_reject) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(outcome) = navigation_outcome
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return outcome;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("navigation outcome reported");
+    let error = outcome.expect_err("navigation during compaction must be rejected");
+    assert_eq!(
+        error.raw_message(),
+        "Wait for the current compaction or tree navigation to finish before navigating the session tree."
+    );
+    assert_eq!(leaf_after_reject.as_deref(), Some(original_leaf.as_str()));
+    // The compaction appended to the original leaf (#9178 assertions).
+    {
+        let manager = fixture.session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = manager.get_entries();
+        let last = entries.last().expect("entries");
+        match last.known() {
+            Some(rpi_agent::session::SessionEntry::Compaction(compaction)) => {
+                assert_eq!(
+                    compaction.parent_id.as_deref(),
+                    Some(original_leaf.as_str())
+                );
+            }
+            other => panic!("expected trailing compaction entry, got {other:?}"),
+        }
+    }
+    let messages: Vec<String> = fixture
+        .session
+        .messages()
+        .into_iter()
+        .map(|m| match m {
+            AgentMessage::Assistant(assistant) => {
+                rpi_ai::utils::text::content_text_assistant(&assistant.content, "")
+            }
+            _ => String::new(),
+        })
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|text| text.contains("second assistant")),
+        "compacted context still contains the latest assistant message"
+    );
+    let _ = unsubscribe;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_navigation_while_first_pending_is_rejected_9179() {
+    // Upstream "rejects a second navigation while the first is waiting":
+    // the first navigation's branch summarization holds
+    // `branch_summary_abort` (isCompacting), so a concurrent navigation is
+    // rejected. The faux provider's first call IS the branch summary —
+    // call_count >= 1 proves the abort cell was set.
+    let fixture = session_fixture(
+        vec![faux_assistant_message(
+            format!("BRANCH SUMMARY {}", "detail ".repeat(40)).as_str(),
+            FauxAssistantOptions::default(),
+        )
+        .into()],
+        FauxProviderOptions {
+            tokens_per_second: Some(60.0),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let (target, original_leaf) = seed_navigation_conversation(&fixture);
+
+    let first_session = fixture.session.clone();
+    let first_target = target.clone();
+    let first_navigation = tokio::spawn(async move {
+        first_session
+            .navigate_tree(
+                &first_target,
+                rpi::core::agent_session::NavigateTreeOptions {
+                    summarize: true,
+                    custom_instructions: None,
+                    replace_instructions: false,
+                    label: None,
+                },
+            )
+            .await
+    });
+
+    // Wait until the first navigation reached its model stream.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fixture.provider.call_count() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "summary never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        fixture.session.is_compacting(),
+        "branch summary in flight must hold isCompacting"
+    );
+
+    let second = fixture
+        .session
+        .navigate_tree(
+            &target,
+            rpi::core::agent_session::NavigateTreeOptions {
+                summarize: false,
+                custom_instructions: None,
+                replace_instructions: false,
+                label: None,
+            },
+        )
+        .await;
+    let error = second.expect_err("second navigation must be rejected");
+    assert_eq!(
+        error.raw_message(),
+        "Wait for the current compaction or tree navigation to finish before navigating the session tree."
+    );
+    {
+        let manager = fixture.session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(manager.get_leaf_id(), Some(original_leaf.as_str()));
+    }
+
+    // The first navigation completes: the abandoned branch was summarized
+    // (`summarize: true`), so the new leaf is the branch-summary entry
+    // attached to the navigation target — off the original leaf either way.
+    let first = tokio::time::timeout(Duration::from_secs(30), first_navigation)
+        .await
+        .expect("first navigation finished")
+        .expect("join ok")
+        .expect("first navigation ok");
+    assert!(!first.cancelled);
+    {
+        let manager = fixture.session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let leaf_id = manager.get_leaf_id().expect("leaf").to_owned();
+        assert_ne!(leaf_id, original_leaf);
+        match manager.get_entry(&leaf_id).as_ref().and_then(|e| e.known()) {
+            Some(rpi_agent::session::SessionEntry::BranchSummary(summary)) => {
+                assert_eq!(summary.parent_id.as_deref(), Some(target.as_str()));
+            }
+            other => panic!("expected branch-summary leaf, got {other:?}"),
+        }
+    }
+}
