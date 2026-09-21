@@ -410,6 +410,11 @@ struct AgentSessionInner {
     next_listener_id: AtomicU64,
     unsubscribe_agent: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     is_agent_run_active: AtomicBool,
+    /// `_agentRunAbortRequested` (agent-session.ts @ de2de549b, #9340/#9777):
+    /// set when `abort()` lands while a run is active; gates retry/compaction
+    /// continuation decisions in `handle_post_agent_run` and stale-retry
+    /// cleanup (`finish_cancelled_retry`).
+    agent_run_abort_requested: AtomicBool,
     idle_notify: Notify,
 
     steering_messages: Mutex<Vec<String>>,
@@ -546,6 +551,7 @@ impl AgentSession {
             next_listener_id: AtomicU64::new(0),
             unsubscribe_agent: Mutex::new(None),
             is_agent_run_active: AtomicBool::new(false),
+            agent_run_abort_requested: AtomicBool::new(false),
             idle_notify: Notify::new(),
             steering_messages: Mutex::new(Vec::new()),
             follow_up_messages: Mutex::new(Vec::new()),
@@ -866,8 +872,12 @@ impl AgentSession {
         }
     }
 
-    /// `_willRetryAfterAgentEnd` (agent-session.ts:668-681).
+    /// `_willRetryAfterAgentEnd` (agent-session.ts:668-681 @ de2de549b: an
+    /// abort request suppresses the will-retry signal, #9340).
     fn will_retry_after_agent_end(&self, messages: &[AgentMessage]) -> bool {
+        if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
+            return false;
+        }
         let settings = lock(&self.inner.resource_loader)
             .settings_manager_mut()
             .get_retry_settings();
@@ -1632,8 +1642,13 @@ impl AgentSession {
     // Prompting
     // ==================================================================
 
-    /// `_runAgentPrompt` (agent-session.ts:1061-1073).
+    /// `_runAgentPrompt` (agent-session.ts:1061-1073 @ de2de549b: resets
+    /// `_agentRunAbortRequested` at entry and finalizes cancelled retries in
+    /// the `finally` block).
     async fn run_agent_prompt(&self, messages: Vec<AgentMessage>) -> Result<(), RpiError> {
+        self.inner
+            .agent_run_abort_requested
+            .store(false, Ordering::SeqCst);
         self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
         let result = async {
             self.inner
@@ -1652,6 +1667,9 @@ impl AgentSession {
         }
         .await;
         // finally (agent-session.ts:1068-1072).
+        if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
+            self.finish_cancelled_retry();
+        }
         *lock(&self.inner.system_prompt_override) = None;
         self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
@@ -1659,15 +1677,41 @@ impl AgentSession {
         result
     }
 
-    /// `_handlePostAgentRun` (agent-session.ts:1075-1103).
+    /// `_finishCancelledRetry` (agent-session.ts @ de2de549b, #9777): clears
+    /// stale retry state after an abort so the UI observes the final
+    /// `auto_retry_end` instead of a hanging attempt counter.
+    fn finish_cancelled_retry(&self) {
+        let attempt = self.retry_attempt();
+        if attempt == 0 {
+            return;
+        }
+        self.set_retry_attempt(0);
+        self.emit(AgentSessionEvent::Session(SessionEvent::AutoRetryEnd {
+            success: false,
+            attempt,
+            final_error: Some("Retry cancelled".to_owned()),
+        }));
+    }
+
+    /// `_handlePostAgentRun` (agent-session.ts:1075-1103 @ de2de549b: every
+    /// continuation decision is gated on `_agentRunAbortRequested`).
     async fn handle_post_agent_run(&self) -> bool {
         let msg = lock(&self.inner.last_assistant_message).take();
+        if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
+            self.finish_cancelled_retry();
+            return false;
+        }
         let Some(msg) = msg else {
             return false;
         };
 
         if self.is_retryable_error(&msg) && self.prepare_retry(&msg).await {
-            return true;
+            // A retry was scheduled, but an abort landed meanwhile: clean up
+            // the stale attempt state and stop the continuation loop.
+            if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
+                self.finish_cancelled_retry();
+            }
+            return !self.inner.agent_run_abort_requested.load(Ordering::SeqCst);
         }
 
         if msg.stop_reason == StopReason::Error && self.retry_attempt() > 0 {
@@ -1681,11 +1725,12 @@ impl AgentSession {
         }
 
         if self.check_compaction(&msg, true).await {
-            return true;
+            return !self.inner.agent_run_abort_requested.load(Ordering::SeqCst);
         }
 
         // Messages queued by agent_end handlers need a continuation.
-        self.inner.agent.has_queued_messages()
+        !self.inner.agent_run_abort_requested.load(Ordering::SeqCst)
+            && self.inner.agent.has_queued_messages()
     }
 
     /// `prompt` (agent-session.ts:1114-1265).
@@ -2169,13 +2214,27 @@ impl AgentSession {
         lock(&self.inner.follow_up_messages).clone()
     }
 
-    /// `abort` (agent-session.ts:1616-1623 @ 9841914, bea67d90d/#8920):
-    /// retry → compaction → branch summary → agent.abort → waitForIdle.
-    pub async fn abort(&self) {
+    /// Sync prefix of `abort` (agent-session.ts:1616-1623 @ 9841914,
+    /// bea67d90d/#8920, de2de549b/#9340): sets `_agentRunAbortRequested`
+    /// when a run is active, cancels retry/compaction/branch-summary and
+    /// aborts the agent — everything before the `waitForIdle` await. Sync so
+    /// event listeners can request an abort that lands before the next
+    /// `_handlePostAgentRun` decision.
+    pub fn request_abort(&self) {
+        if self.inner.is_agent_run_active.load(Ordering::SeqCst) {
+            self.inner
+                .agent_run_abort_requested
+                .store(true, Ordering::SeqCst);
+        }
         self.abort_retry();
         self.abort_compaction();
         self.abort_branch_summary();
         self.inner.agent.abort();
+    }
+
+    /// `abort` (agent-session.ts:1616-1623): request_abort → waitForIdle.
+    pub async fn abort(&self) {
+        self.request_abort();
         self.wait_for_idle().await;
     }
 
@@ -2758,9 +2817,13 @@ impl AgentSession {
         }
         self.set_retry_attempt(attempt);
 
-        let delay_ms = settings
-            .base_delay_ms
-            .saturating_mul(1u64 << (attempt - 1).min(31));
+        // #8826 (c37b0e03b): backoff is capped by `retry.maxAgentDelayMs`
+        // (default 60s) — `retryDelayMs(settings, attempt)` upstream.
+        let delay_ms = rpi_ai::utils::retry::retry_delay_ms(
+            settings.base_delay_ms,
+            Some(settings.max_agent_delay_ms),
+            attempt,
+        );
 
         self.emit(AgentSessionEvent::Session(SessionEvent::AutoRetryStart {
             attempt,
@@ -2788,13 +2851,10 @@ impl AgentSession {
         *lock(&self.inner.retry_abort) = None;
 
         if cancelled {
-            let attempt = self.retry_attempt();
-            self.set_retry_attempt(0);
-            self.emit(AgentSessionEvent::Session(SessionEvent::AutoRetryEnd {
-                success: false,
-                attempt,
-                final_error: Some("Retry cancelled".to_owned()),
-            }));
+            // Aborted during the backoff sleep — emit end event so UI can
+            // clean up (agent-session.ts @ de2de549b deduplicated this into
+            // `_finishCancelledRetry`).
+            self.finish_cancelled_retry();
             return false;
         }
         true
@@ -3765,6 +3825,9 @@ fn retry_config_to_policy(config: RetryConfig) -> Option<RetryPolicy> {
         enabled: config.enabled,
         max_retries: config.max_retries as u32,
         base_delay_ms: config.base_delay_ms,
+        // #8826: the agent-level cap rides the shared policy so
+        // compaction/branch-summary summarization retries are capped too.
+        max_agent_delay_ms: Some(config.max_agent_delay_ms),
     })
 }
 

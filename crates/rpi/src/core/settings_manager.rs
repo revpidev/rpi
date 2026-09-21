@@ -1620,13 +1620,16 @@ impl SettingsManager {
         self.save();
     }
 
-    /// `getRetrySettings` (settings-manager.ts:813-819) — resolved values
-    /// with defaults applied.
+    /// `getRetrySettings` (settings-manager.ts:813-819 @ c37b0e03b) —
+    /// resolved values with defaults applied; `maxAgentDelayMs` defaults
+    /// to 60s (#8826).
     pub fn get_retry_settings(&self) -> RetryConfig {
         RetryConfig {
             enabled: self.get_retry_enabled(),
             max_retries: value_u64(self.settings.nested("retry", "maxRetries")).unwrap_or(3),
             base_delay_ms: value_u64(self.settings.nested("retry", "baseDelayMs")).unwrap_or(2000),
+            max_agent_delay_ms: value_u64(self.settings.nested("retry", "maxAgentDelayMs"))
+                .unwrap_or(rpi_ai::utils::retry::DEFAULT_MAX_AGENT_RETRY_DELAY_MS),
         }
     }
 
@@ -2468,12 +2471,15 @@ pub struct BranchSummaryConfig {
 }
 
 /// Resolved return type of [`SettingsManager::get_retry_settings`]
-/// (settings-manager.ts:813-819).
+/// (settings-manager.ts:813-819 @ c37b0e03b — adds `maxAgentDelayMs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryConfig {
     pub enabled: bool,
     pub max_retries: u64,
     pub base_delay_ms: u64,
+    /// Max agent-level retry delay (`retry.maxAgentDelayMs`, default
+    /// 60s — #8826).
+    pub max_agent_delay_ms: u64,
 }
 
 /// Resolved return type of [`SettingsManager::get_provider_retry_settings`]
@@ -2627,6 +2633,27 @@ mod tests {
 
     fn settings(value: Value) -> Settings {
         Settings::from_map(value.as_object().unwrap().clone())
+    }
+
+    /// `retry.maxAgentDelayMs` (#8826): explicit value overrides the 60s
+    /// default; the key rides the existing `retry` object untouched.
+    #[test]
+    fn test_get_retry_settings_max_agent_delay_ms_override() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"retry": {"enabled": true, "maxRetries": 5, "baseDelayMs": 30000, "maxAgentDelayMs": 90000}}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_retry_settings(),
+            RetryConfig {
+                enabled: true,
+                max_retries: 5,
+                base_delay_ms: 30000,
+                max_agent_delay_ms: 90_000,
+            }
+        );
     }
 
     // `defaultTools` (settings-manager.ts:128 @ 4d9aa837c; docs/settings.md
@@ -3896,6 +3923,7 @@ mod tests {
                 enabled: true,
                 max_retries: 3,
                 base_delay_ms: 2000,
+                max_agent_delay_ms: 60_000,
             }
         );
         assert_eq!(

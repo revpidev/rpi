@@ -1778,6 +1778,7 @@ async fn test_compaction_retries_transient_errors_and_emits_events_body() {
                 enabled: true,
                 max_retries: 1,
                 base_delay_ms: 0,
+                max_agent_delay_ms: None,
             }),
             ..base_options(
                 &models,
@@ -1825,6 +1826,7 @@ async fn test_compaction_does_not_retry_non_retryable_errors_body() {
                 enabled: true,
                 max_retries: 1,
                 base_delay_ms: 0,
+                max_agent_delay_ms: None,
             }),
             ..base_options(
                 &models,
@@ -1865,6 +1867,7 @@ async fn test_compaction_exhausts_transient_retries_body() {
                 enabled: true,
                 max_retries: 3,
                 base_delay_ms: 0,
+                max_agent_delay_ms: None,
             }),
             ..base_options(
                 &models,
@@ -1942,6 +1945,7 @@ async fn test_branch_summary_retries_transient_errors_and_emits_events_body() {
                 enabled: true,
                 max_retries: 1,
                 base_delay_ms: 0,
+                max_agent_delay_ms: None,
             }),
             ..base_options(
                 &models,

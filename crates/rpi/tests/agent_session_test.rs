@@ -540,6 +540,127 @@ async fn auto_retry_exhausted_reports_final_error() {
     assert_eq!(fixture.provider.call_count(), 4);
 }
 
+/// #9777 (de2de549b "finalizes retry state when abort is requested after a
+/// retry attempt fails"): an abort landing at the second failed attempt
+/// must reset the stale retry counter, suppress `willRetry` on `agent_end`,
+/// and emit a terminal `auto_retry_end { "Retry cancelled" }`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_after_retry_attempt_finalizes_retry_state_9777() {
+    let fixture = session_fixture(
+        vec![
+            error_step("overloaded_error"),
+            error_step("overloaded_error"),
+        ],
+        FauxProviderOptions::default(),
+        Some(r#"{"retry": {"enabled": true, "maxRetries": 3, "baseDelayMs": 0}}"#),
+    )
+    .await;
+
+    let session = fixture.session.clone();
+    let error_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter = error_count.clone();
+    let _unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
+        if let AgentSessionEvent::Agent(agent_event) = &event {
+            if let rpi_agent::types::AgentEvent::MessageEnd { message } = agent_event.as_ref() {
+                match message {
+                    AgentMessage::Assistant(a)
+                        if a.stop_reason == rpi_ai::types::StopReason::Error
+                            && counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+                                == 2 =>
+                    {
+                        // Sync prefix of `abort()` so the flag lands before
+                        // the next `handle_post_agent_run` decision.
+                        session.request_abort();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }));
+
+    fixture
+        .session
+        .prompt("test", PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    assert_eq!(
+        fixture.session.retry_attempt(),
+        0,
+        "stale retry state cleared"
+    );
+    let agent_ends = fixture.events_of_type("agent_end");
+    let last_end = serde_json::to_value(agent_ends.last().expect("agent_end")).expect("serialize");
+    assert_eq!(last_end["willRetry"], false, "abort suppresses willRetry");
+
+    let retry_end = fixture.events_of_type("auto_retry_end");
+    let end = serde_json::to_value(retry_end.last().expect("auto_retry_end")).expect("serialize");
+    assert_eq!(end["success"], false);
+    assert_eq!(end["attempt"], 1);
+    assert_eq!(end["finalError"], "Retry cancelled");
+    assert_eq!(fixture.provider.call_count(), 2);
+}
+
+/// #9340 (de2de549b "does not start post-run auto-compaction after abort"):
+/// an abort requested at the assistant `message_end` must stop the post-run
+/// continuation before `_checkCompaction` — no `compaction_start` at all,
+/// even though the threshold would otherwise fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_prevents_post_run_auto_compaction_9340() {
+    let settings = r#"{
+        "compaction": { "enabled": true, "reserveTokens": 7000, "keepRecentTokens": 16 },
+        "retry": { "enabled": false }
+    }"#;
+    let provider_options = FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(8192),
+            max_tokens: Some(8192),
+        }]),
+        ..Default::default()
+    };
+    let fixture = session_fixture(
+        vec![error_step("Synthetic network failure")],
+        provider_options,
+        Some(settings),
+    )
+    .await;
+
+    let session = fixture.session.clone();
+    let _unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
+        if let AgentSessionEvent::Agent(agent_event) = &event {
+            if let rpi_agent::types::AgentEvent::MessageEnd { message } = agent_event.as_ref() {
+                match message {
+                    AgentMessage::Assistant(a)
+                        if a.stop_reason == rpi_ai::types::StopReason::Error =>
+                    {
+                        session.request_abort();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }));
+
+    fixture
+        .session
+        .prompt(&"z".repeat(1000), PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    let types = flattened_event_types(&fixture);
+    assert!(
+        !types.iter().any(|t| t == "compaction:compaction_start"),
+        "no compaction may start after an abort-requested run end: {types:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // bash: staged as pending during streaming, flushed before the next prompt
 // (agent-session.ts:2851)

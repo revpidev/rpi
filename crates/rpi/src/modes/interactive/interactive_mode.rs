@@ -4019,14 +4019,20 @@ impl InteractiveUi {
 
     /// `restoreQueuedMessagesToEditor` (interactive-mode.ts:3987-4007):
     /// merges all queues (session steering + follow-up + compaction queue)
-    /// into the editor, optionally aborting the run.
+    /// into the editor, optionally aborting the run. The abort routes
+    /// through `session.abort()` (de2de549b/#9340), not `agent.abort()`, so
+    /// the abort-requested flag, retry/compaction/branch-summary aborts and
+    /// `waitForIdle` all run.
     fn restore_queued_messages_to_editor(&self, abort: bool) -> usize {
         let (steering, follow_up) = self.clear_all_queues();
         let all_queued: Vec<String> = steering.into_iter().chain(follow_up).collect();
         if all_queued.is_empty() {
             self.update_pending_messages_display();
             if abort {
-                self.session().agent().abort();
+                let session = self.session();
+                tokio::spawn(async move {
+                    session.abort().await;
+                });
             }
             return 0;
         }
@@ -4040,7 +4046,10 @@ impl InteractiveUi {
         lock(&self.editor).set_text(&combined);
         self.update_pending_messages_display();
         if abort {
-            self.session().agent().abort();
+            let session = self.session();
+            tokio::spawn(async move {
+                session.abort().await;
+            });
         }
         all_queued.len()
     }
@@ -7499,6 +7508,8 @@ mod tests {
         ui.queue_compaction_message("compaction q".to_string(), StreamingBehavior::Steer);
         let _ = ui.session().steer("session q", None).await;
         lock(&ui.editor).set_text("draft");
+        // de2de549b/#9340: the abort now routes through `session.abort()`
+        // (spawned); on this idle harness session it must settle cleanly.
         let restored = ui.restore_queued_messages_to_editor(true);
         assert_eq!(restored, 2);
         let text = lock(&ui.editor).get_text();

@@ -656,6 +656,33 @@ async fn stream_final_message(
     }
 }
 
+/// Synthesize the aborted summarization result for a cancelled request
+/// (#9340/#9777, upstream `throwIfAborted` during the auth wait): the lazy
+/// stream's first poll resolves auth, so racing the consumption against the
+/// signal here is the rpi shape of "cancellation during authentication is
+/// not lost". Aborted messages carry no error message (retry.rs abort
+/// normalization shape).
+fn aborted_summary_message(model: &Model) -> AssistantMessage {
+    AssistantMessage {
+        role: AssistantRole::Assistant,
+        content: Vec::new(),
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        provider_thinking_level: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Aborted,
+        error_message: None,
+        timestamp: now_millis(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
+    }
+}
+
 /// `completeSummarization` (compaction.ts:562-581): shared choke point for
 /// every compaction/branch-summary summarization call. Summaries are
 /// standalone requests: `cacheRetention: "none"` + a fresh uuidv7 routing
@@ -680,7 +707,16 @@ pub async fn complete_summarization(
     };
     let produce = || async {
         let stream = stream_fn(model.clone(), context.clone(), request_options.clone());
-        stream_final_message(stream, model).await
+        match request_options.signal.clone() {
+            Some(signal) => tokio::select! {
+                // `biased` + stream first: a terminal event that already
+                // arrived (adapter-aborted request) wins over a token that
+                // fired in the same wakeup.
+                message = stream_final_message(stream, model) => message,
+                () = signal.cancelled() => aborted_summary_message(model),
+            },
+            None => stream_final_message(stream, model).await,
+        }
     };
     retry_assistant_call(produce, retry, request_options.signal.as_ref(), callbacks).await
 }

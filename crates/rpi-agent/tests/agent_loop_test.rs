@@ -2751,3 +2751,86 @@ async fn sequential_task_panic_is_contained_as_error_tool_result() {
     );
     assert_eq!(call_count(&state), 2, "loop converged to the next turn");
 }
+
+// ---------------------------------------------------------------------------
+// #9055 (b2602be77 "optimize EventStream queue") — AgentEventStream mirror.
+//
+// Upstream replaced the O(n) `Array.shift()` queue with a two-stack FifoQueue.
+// The rpi `AgentEventStream` (agent_loop.rs) is mpsc-channel-backed (O(1)
+// dequeue), so the quadratic blowup cannot occur; these tests port the
+// upstream regression semantics (buffered drain order, post-terminal push,
+// end-wakes-waiters) plus the linearity assertion on the drain path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn event_stream_drains_buffered_events_in_order_9055() {
+    let stream = AgentEventStream::new();
+    stream.push(AgentEvent::AgentStart);
+    stream.push(AgentEvent::TurnStart);
+    stream.push(AgentEvent::AgentEnd { messages: vec![] });
+    // AgentEnd flips `done`: later pushes are dropped.
+    stream.push(AgentEvent::TurnStart);
+    stream.end(vec![]);
+
+    let result = stream.clone().result().await;
+    assert!(result.is_empty());
+
+    let types = stream
+        .clone()
+        .map(|e| event_type(&e))
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(types, vec!["agent_start", "turn_start", "agent_end"]);
+}
+
+#[tokio::test]
+async fn event_stream_end_wakes_waiting_consumers_9055() {
+    let stream = AgentEventStream::new();
+
+    let mut first = stream.clone();
+    let mut second = stream.clone();
+    let producer = stream.clone();
+
+    let mut f1 = Box::pin(first.next());
+    let mut f2 = Box::pin(second.next());
+    assert!(futures::poll!(&mut f1).is_pending());
+    assert!(futures::poll!(&mut f2).is_pending());
+
+    producer.end(vec![]);
+    assert!(f1.await.is_none());
+    assert!(f2.await.is_none());
+}
+
+/// Linearity assertion: draining 10⁴ vs 10⁵ buffered events stays in the
+/// linear regime (O(1) dequeues → ratio ≈ 10×; a shift-style O(n) dequeue
+/// would approach 100×). Generous bounds only fail on quadratic blowups.
+#[tokio::test]
+async fn event_stream_buffered_drain_is_linear_9055() {
+    async fn drain_round(n: u32) -> (u32, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let stream = AgentEventStream::new();
+        for _ in 0..n {
+            stream.push(AgentEvent::AgentStart);
+        }
+        stream.end(vec![]);
+        let mut iter = stream.clone();
+        let mut drained = 0u32;
+        while iter.next().await.is_some() {
+            drained += 1;
+        }
+        (drained, start.elapsed())
+    }
+
+    let (small_count, small) = drain_round(10_000).await;
+    let (large_count, large) = drain_round(100_000).await;
+    assert_eq!((small_count, large_count), (10_000, 100_000));
+    assert!(
+        large.as_secs() < 5,
+        "100k drain took {large:?} (quadratic?)"
+    );
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+    assert!(
+        ratio < 50.0,
+        "drain time ratio 100k/10k = {ratio:.1}x (linear ≈ 10x, quadratic ≈ 100x)"
+    );
+}

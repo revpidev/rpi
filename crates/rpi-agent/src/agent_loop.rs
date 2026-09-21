@@ -299,6 +299,11 @@ struct Inner {
 /// (upstream `EventStream<AgentEvent, AgentMessage[]>` from
 /// `createAgentStream`, agent-loop.ts:145-150).
 ///
+/// #9055 (`b2602be77`): upstream swapped the O(n) `Array.shift()` queue for
+/// a two-stack FifoQueue; this port is mpsc-channel-backed (`poll_recv` is
+/// O(1)), so the buffered-drain path was never quadratic. Regression
+/// semantics + linearity tests live in `tests/agent_loop_test.rs`.
+///
 /// - [`push`](Self::push) is ignored after an `agent_end` event or
 ///   [`end`](Self::end).
 /// - [`result`](Self::result) resolves with the `agent_end` messages (or the

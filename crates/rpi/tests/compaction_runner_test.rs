@@ -1130,3 +1130,225 @@ async fn auto_compact_marks_only_the_auto_abort_cell() {
     assert!(!cell_is_some(&auto_cell), "auto cell cleared afterwards");
     assert!(!cell_is_some(&manual_cell), "manual cell still untouched");
 }
+
+// ---------------------------------------------------------------------------
+// #9340/#9777 (de2de549b "close compaction cancellation races") — upstream
+// test/suite/regressions/9340-9777-auto-compaction-cancellation.test.ts.
+// ---------------------------------------------------------------------------
+
+/// #9777 "cancels synchronously from compaction_start": an abort landing in
+/// a `compaction_start` listener must not reach the summarization request.
+#[tokio::test]
+async fn auto_compaction_cancelled_from_compaction_start_skips_summarization_9777() {
+    let provider = faux_provider_window_8192();
+    provider.set_responses(vec![scripted("SUMMARY")]);
+    let model = provider.get_model(None).expect("faux-1");
+    let mut agent_opts = AgentOptions::new(provider.stream_fn());
+    agent_opts.initial_state = InitialAgentState {
+        model: Some(model.clone()),
+        thinking_level: Some(ThinkingLevel::Off),
+        ..Default::default()
+    };
+    let agent = Arc::new(Agent::new(agent_opts));
+    let session = SessionManager::in_memory(None, NewSessionOptions::default()).expect("session");
+    let events: Arc<Mutex<Vec<CompactionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_sink = events.clone();
+    let mut runner = CompactionRunner::new(
+        agent.clone(),
+        Arc::new(Mutex::new(session)),
+        Some(model),
+        settings(),
+        None,
+        provider.stream_fn(),
+        ThinkingLevel::Off,
+        Arc::new(move |event| {
+            events_sink.lock().expect("events").push(event);
+        }),
+    );
+
+    // Cancel the auto token the moment compaction_start is emitted (the
+    // upstream test's `session.abortCompaction()` subscription).
+    let cell = runner.auto_abort_token_cell();
+    let record = events.clone();
+    runner.set_emit_sink(Arc::new(move |event| {
+        let is_start = matches!(event, CompactionEvent::CompactionStart { .. });
+        record.lock().expect("events").push(event);
+        if is_start {
+            if let Some(token) = cell.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                token.cancel();
+            }
+        }
+    }));
+
+    // Pure estimate over the threshold (4 × ~6k tokens > 8192-4096).
+    let mut messages = Vec::new();
+    for i in 0..4 {
+        let message = user(&format!("q{i} {}", "x".repeat(6000)));
+        runner
+            .session_mut()
+            .append_message(message.clone())
+            .expect("append user");
+        messages.push(message);
+    }
+    agent.set_messages(messages);
+    let mut error = assistant("", StopReason::Error, 0, now_ms());
+    error.error_message = Some("boom".to_owned());
+
+    runner.check_compaction(&error, true).await;
+
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "no summarization request may be issued after a synchronous cancel"
+    );
+    let events = events.lock().expect("events").clone();
+    assert_eq!(
+        event_types(&events),
+        vec!["compaction_start", "compaction_end"]
+    );
+    match events.last() {
+        Some(CompactionEvent::CompactionEnd { aborted, .. }) => {
+            assert!(*aborted, "cancel from compaction_start is aborted");
+        }
+        other => panic!("expected compaction_end, got {other:?}"),
+    }
+}
+
+/// #9777 "cancels summarization authentication": the rpi auth wait is the
+/// lazy stream's first poll (upstream mocks `getAuth` to hang); a gated
+/// stream that never resolves stands in for it. Cancelling the abort token
+/// must resolve the compaction with `aborted: true` without the gate ever
+/// releasing.
+#[tokio::test]
+async fn auto_compaction_cancelled_during_summarization_wait_9777() {
+    let provider = faux_provider_window_8192();
+    provider.set_responses(vec![scripted("SUMMARY")]);
+    let model = provider.get_model(None).expect("faux-1");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gated = gated_stream_fn(&provider, entered.clone(), release.clone());
+    let mut agent_opts = AgentOptions::new(gated.clone());
+    agent_opts.initial_state = InitialAgentState {
+        model: Some(model.clone()),
+        thinking_level: Some(ThinkingLevel::Off),
+        ..Default::default()
+    };
+    let agent = Arc::new(Agent::new(agent_opts));
+    let session = SessionManager::in_memory(None, NewSessionOptions::default()).expect("session");
+    let events: Arc<Mutex<Vec<CompactionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_sink = events.clone();
+    let mut runner = CompactionRunner::new(
+        agent.clone(),
+        Arc::new(Mutex::new(session)),
+        Some(model),
+        settings(),
+        None,
+        gated,
+        ThinkingLevel::Off,
+        Arc::new(move |event| {
+            events_sink.lock().expect("events").push(event);
+        }),
+    );
+
+    let mut messages = Vec::new();
+    for i in 0..4 {
+        let message = user(&format!("q{i} {}", "x".repeat(6000)));
+        runner
+            .session_mut()
+            .append_message(message.clone())
+            .expect("append user");
+        messages.push(message);
+    }
+    agent.set_messages(messages);
+    let mut error = assistant("", StopReason::Error, 0, now_ms());
+    error.error_message = Some("boom".to_owned());
+
+    let cell = runner.auto_abort_token_cell();
+    let check = runner.check_compaction(&error, true);
+    tokio::pin!(check);
+
+    // Drive the compaction future until the summarization request parks at
+    // the gate (the auth wait), then cancel — without the signal race the
+    // future would never settle and the timeout below would fire.
+    tokio::select! {
+        outcome = &mut check => panic!(
+            "compaction settled before the gate was entered (outcome: {outcome})"
+        ),
+        _ = entered.notified() => {}
+    }
+    if let Some(token) = cell.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        token.cancel();
+    }
+
+    let done = tokio::time::timeout(std::time::Duration::from_secs(10), check.as_mut()).await;
+    let continued = done.expect("compaction settles after cancel during auth wait");
+    assert!(!continued);
+
+    let events = events.lock().expect("events").clone();
+    match events.last() {
+        Some(CompactionEvent::CompactionEnd {
+            aborted: true,
+            error_message: None,
+            ..
+        }) => {}
+        other => panic!("expected aborted compaction_end, got {other:?}"),
+    }
+}
+
+/// Upstream "reports X as a failure": an unrelated summarization error (auth
+/// failure text) is NOT classified as aborted — `compaction_end` carries
+/// `aborted: false` and the error message.
+#[tokio::test]
+async fn auto_compaction_unrelated_summarization_error_is_a_failure() {
+    let mut error_response = faux_assistant_message(
+        "",
+        FauxAssistantOptions {
+            stop_reason: Some(StopReason::Error),
+            error_message: Some("auth failed".to_owned()),
+            ..Default::default()
+        },
+    );
+    error_response.timestamp = now_ms();
+    let mut fixture = fixture(settings(), vec![error_response.into()]);
+
+    let mut messages = Vec::new();
+    for i in 0..4 {
+        let message = user(&format!("q{i} {}", "x".repeat(6000)));
+        fixture
+            .runner
+            .session_mut()
+            .append_message(message.clone())
+            .expect("append user");
+        messages.push(message);
+    }
+    fixture.agent.set_messages(messages);
+    let mut error = assistant("", StopReason::Error, 0, now_ms());
+    error.error_message = Some("boom".to_owned());
+
+    fixture.runner.check_compaction(&error, true).await;
+
+    let events = fixture.events();
+    match events.last() {
+        Some(CompactionEvent::CompactionEnd {
+            aborted: false,
+            error_message: Some(message),
+            ..
+        }) => assert!(message.contains("auth failed"), "got {message}"),
+        other => panic!("expected failed compaction_end, got {other:?}"),
+    }
+}
+
+fn faux_provider_window_8192() -> Arc<FauxProvider> {
+    FauxProvider::new(FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(8192),
+            max_tokens: Some(65536),
+        }]),
+        ..Default::default()
+    })
+}

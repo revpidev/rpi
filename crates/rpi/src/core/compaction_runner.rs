@@ -759,6 +759,25 @@ impl CompactionRunner {
         self.agent.state().messages
     }
 
+    /// #9340/#9777 (`de2de549b`): fail-fast once the abort token fired —
+    /// mirrors upstream's `throwIfAborted` checkpoints followed by the
+    /// catch's `aborted = signal.aborted || cancelledByExtension`
+    /// classification: clear the idle-blocking cell first (3852cb2b8), then
+    /// emit the aborted `compaction_end` pair.
+    async fn abort_auto_outcome(&self, reason: CompactionReason, from_extension: bool) -> bool {
+        *lock_abort(&self.auto_active_token) = None;
+        self.emit(CompactionEvent::CompactionEnd {
+            reason,
+            result: None,
+            aborted: true,
+            will_retry: false,
+            error_message: None,
+        });
+        self.emit_session_compact_failed(reason, None, true, false, from_extension)
+            .await;
+        false
+    }
+
     /// `_runAutoCompaction` (agent-session.ts:2047-2215). Never fails
     /// outward: errors are reported via `compaction_end` and yield `false`.
     async fn run_auto_compaction(&mut self, reason: CompactionReason, will_retry: bool) -> bool {
@@ -778,9 +797,16 @@ impl CompactionRunner {
                 return Ok(false);
             };
 
-            self.emit(CompactionEvent::CompactionStart { reason });
+            // de2de549b order: the abort controller is stored BEFORE the
+            // start emit, so a `compaction_start` listener cancelling via
+            // `abort_compaction()` is caught by the checkpoint below
+            // (upstream #9777 "cancels synchronously from compaction_start").
             *lock_abort(&self.auto_active_token) = Some(token.clone());
             started = true;
+            self.emit(CompactionEvent::CompactionStart { reason });
+            if token.is_cancelled() {
+                return Ok(self.abort_auto_outcome(reason, false).await);
+            }
 
             // Extension-provided compaction (agent-session.ts:2079-2105).
             let extension_compaction = match self
@@ -795,24 +821,20 @@ impl CompactionRunner {
             {
                 Ok(compaction) => compaction,
                 Err(error) if raw_error_message(&error) == "Compaction cancelled" => {
-                    // Extension cancel (agent-session.ts:2085-2092).
-                    // Clear idle state before compaction_end so listeners can
-                    // submit queued prompts (agent-session.ts:1907-1908 @ 3852cb2b8).
-                    *lock_abort(&self.auto_active_token) = None;
-                    self.emit(CompactionEvent::CompactionEnd {
-                        reason,
-                        result: None,
-                        aborted: true,
-                        will_retry: false,
-                        error_message: None,
-                    });
-                    self.emit_session_compact_failed(reason, None, true, false, false)
-                        .await;
-                    return Ok(false);
+                    // Extension cancel (agent-session.ts:2085-2092): the
+                    // upstream `de2de549b` catch classifies it as aborted
+                    // (`cancelledByExtension`); same emission as the token
+                    // checkpoints above.
+                    return Ok(self.abort_auto_outcome(reason, false).await);
                 }
                 Err(error) => return Err(error),
             };
             from_extension = extension_compaction.is_some();
+            // #9777: same gate after the extension await (upstream
+            // `throwIfAborted` after `session_before_compact`).
+            if token.is_cancelled() {
+                return Ok(self.abort_auto_outcome(reason, from_extension).await);
+            }
 
             let result = match extension_compaction {
                 Some(compaction) => compaction,
@@ -832,18 +854,7 @@ impl CompactionRunner {
             };
 
             if token.is_cancelled() {
-                // Clear idle state before compaction_end (3852cb2b8).
-                *lock_abort(&self.auto_active_token) = None;
-                self.emit(CompactionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                });
-                self.emit_session_compact_failed(reason, None, true, false, from_extension)
-                    .await;
-                return Ok(false);
+                return Ok(self.abort_auto_outcome(reason, from_extension).await);
             }
 
             let result = self

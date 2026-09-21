@@ -94,6 +94,10 @@ fn retryable_provider_error_pattern() -> &'static Regex {
 }
 
 /// `RetryPolicy` — matches `settings.retry` in coding-agent.
+///
+/// #8826 (`c37b0e03b` "cap agent retry backoff"): [`max_agent_delay_ms`]
+/// caps each computed delay; `None` defaults to
+/// [`DEFAULT_MAX_AGENT_RETRY_DELAY_MS`] (60s).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub enabled: bool,
@@ -101,6 +105,21 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     /// Base delay in ms. Per-attempt delay is `baseDelayMs * 2^(attempt-1)`.
     pub base_delay_ms: u64,
+    /// Optional cap for agent-level retry delays in ms (`maxAgentDelayMs`).
+    /// `None` → [`DEFAULT_MAX_AGENT_RETRY_DELAY_MS`].
+    pub max_agent_delay_ms: Option<u64>,
+}
+
+/// `DEFAULT_MAX_AGENT_RETRY_DELAY_MS` (retry.ts @ c37b0e03b, #8826).
+pub const DEFAULT_MAX_AGENT_RETRY_DELAY_MS: u64 = 60_000;
+
+/// `retryDelayMs` (retry.ts @ c37b0e03b, #8826): exponential backoff with a
+/// cap — `min(baseDelayMs * 2^(attempt-1), maxAgentDelayMs ?? 60s)`.
+/// `u64` arithmetic saturates, so upstream's `Number.isSafeInteger`
+/// guard is covered by `saturating_mul`/`saturating_pow`.
+pub fn retry_delay_ms(base_delay_ms: u64, max_agent_delay_ms: Option<u64>, attempt: u32) -> u64 {
+    let delay = base_delay_ms.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
+    delay.min(max_agent_delay_ms.unwrap_or(DEFAULT_MAX_AGENT_RETRY_DELAY_MS))
 }
 
 type RetryCallback<Args> = dyn Fn(Args) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
@@ -181,8 +200,9 @@ where
             .clone()
             .unwrap_or_else(|| "Unknown error".to_owned());
         last_retry = Some((attempt, error_message.clone()));
-        let base_delay_ms = policy.map(|p| p.base_delay_ms).unwrap_or(0);
-        let delay_ms = base_delay_ms * 2u64.saturating_pow(attempt - 1);
+        let policy_base = policy.map(|p| p.base_delay_ms).unwrap_or(0);
+        let policy_cap = policy.and_then(|p| p.max_agent_delay_ms);
+        let delay_ms = retry_delay_ms(policy_base, policy_cap, attempt);
         if let Some(cb) = callbacks.and_then(|c| c.on_retry_scheduled.as_ref()) {
             cb((attempt, max_attempts, delay_ms, error_message.clone())).await;
         }
@@ -326,6 +346,7 @@ mod tests {
             enabled: true,
             max_retries: 3,
             base_delay_ms: 1,
+            max_agent_delay_ms: None,
         };
         let response = retry_assistant_call(
             || async { assistant(StopReason::Stop, None) },
@@ -343,6 +364,7 @@ mod tests {
             enabled: true,
             max_retries: 2,
             base_delay_ms: 1,
+            max_agent_delay_ms: None,
         };
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let calls2 = calls.clone();
@@ -373,6 +395,7 @@ mod tests {
             enabled: true,
             max_retries: 3,
             base_delay_ms: 1,
+            max_agent_delay_ms: None,
         };
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let calls2 = calls.clone();
@@ -399,6 +422,7 @@ mod tests {
             enabled: true,
             max_retries: 3,
             base_delay_ms: 10_000,
+            max_agent_delay_ms: None,
         };
         let token = CancellationToken::new();
         let token2 = token.clone();
@@ -432,6 +456,7 @@ mod tests {
             enabled: true,
             max_retries: 3,
             base_delay_ms: 1,
+            max_agent_delay_ms: None,
         };
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let calls2 = calls.clone();
@@ -450,5 +475,78 @@ mod tests {
         .await;
         assert_eq!(response.stop_reason, StopReason::Aborted);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // #8826 (c37b0e03b "cap agent retry backoff") — upstream retry.test.ts
+    // -----------------------------------------------------------------------
+
+    /// `retryDelayMs caps agent retry delay` (upstream table).
+    #[test]
+    fn test_retry_delay_ms_caps_agent_delay_8826() {
+        // Default cap (60s): base 2s, attempt 6 → 64s uncapped → 60s.
+        assert_eq!(retry_delay_ms(2_000, None, 6), 60_000);
+        // Explicit cap 5s: attempt 5 → 32s uncapped → 5s.
+        assert_eq!(retry_delay_ms(2_000, Some(5_000), 5), 5_000);
+        // Cap 0 disables waiting entirely.
+        assert_eq!(retry_delay_ms(2_000, Some(0), 5), 0);
+        // Below the cap the exponential value passes through unchanged.
+        assert_eq!(retry_delay_ms(2_000, None, 3), 8_000);
+        // attempt 0/1 clamp to the first power (2^(max(0, attempt-1))).
+        assert_eq!(retry_delay_ms(2_000, None, 0), 2_000);
+    }
+
+    /// `reports capped retry delays` (upstream): onRetryScheduled observes
+    /// the capped schedule [10, 15, 15, 15] for base 10 / cap 15 / 4 retries.
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_assistant_call_reports_capped_retry_delays_8826() {
+        let policy = RetryPolicy {
+            enabled: true,
+            max_retries: 4,
+            base_delay_ms: 10,
+            max_agent_delay_ms: Some(15),
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let scheduled: std::sync::Arc<std::sync::Mutex<Vec<u64>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scheduled2 = scheduled.clone();
+        let callbacks = RetryCallbacks {
+            on_retry_scheduled: Some(Box::new(
+                move |(_, _, delay_ms, _): (u32, u32, u64, String)| {
+                    let scheduled = scheduled2.clone();
+                    Box::pin(async move {
+                        scheduled
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(delay_ms);
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                },
+            )),
+            ..Default::default()
+        };
+        let response = retry_assistant_call(
+            move || {
+                let calls = calls2.clone();
+                async move {
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n < 5 {
+                        assistant(StopReason::Error, Some("terminated"))
+                    } else {
+                        assistant(StopReason::Stop, None)
+                    }
+                }
+            },
+            Some(&policy),
+            None,
+            Some(&callbacks),
+        )
+        .await;
+        assert_eq!(response.stop_reason, StopReason::Stop);
+        assert_eq!(
+            *scheduled.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![10, 15, 15, 15]
+        );
     }
 }

@@ -5,6 +5,14 @@
 //! final result. Backed by an unbounded mpsc channel (the upstream queue is
 //! unbounded; consumers see the same ordering and buffering semantics).
 //!
+//! #9055 (`b2602be77`, "optimize EventStream queue"): upstream replaced the
+//! `Array.shift()` queue (O(n) per dequeue, O(n²) when draining buffered
+//! events) with a two-stack FifoQueue. This port is exempt by construction:
+//! `mpsc::UnboundedReceiver::poll_recv` is O(1), so the drain path was never
+//! quadratic. The upstream regression suite is ported below (drain order,
+//! post-terminal push, interleaved arrival, waiting-consumer order, drain
+//! after end) plus the linearity assertion the task requires.
+//!
 //! The stream is `Clone`: clones share the same underlying queue, mirroring
 //! the single upstream object passed between producers and consumers.
 
@@ -237,5 +245,174 @@ mod tests {
         producer.end(None);
         let events: Vec<StreamEvent> = stream.collect().await;
         assert_eq!(events.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // #9055 regression suite (upstream event-stream.test.ts @ b2602be77).
+    // The rpi queue is channel-backed (O(1) dequeue), so these pin the
+    // ordering semantics the upstream FifoQueue swap had to preserve.
+    // -----------------------------------------------------------------------
+
+    fn kind(event: &StreamEvent) -> &'static str {
+        match event {
+            StreamEvent::Start { .. } => "start",
+            StreamEvent::TextStart { .. } => "text_start",
+            StreamEvent::TextDelta { .. } => "text_delta",
+            StreamEvent::TextEnd { .. } => "text_end",
+            StreamEvent::ThinkingStart { .. } => "thinking_start",
+            StreamEvent::Done { .. } => "done",
+            StreamEvent::Error { .. } => "error",
+            _ => "other",
+        }
+    }
+
+    fn text_event(kind_index: usize, partial: &AssistantMessage) -> StreamEvent {
+        match kind_index {
+            0 => StreamEvent::Start {
+                partial: partial.clone(),
+            },
+            1 => StreamEvent::TextStart {
+                content_index: 0,
+                partial: partial.clone(),
+            },
+            _ => StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "x".to_owned(),
+                partial: partial.clone(),
+            },
+        }
+    }
+
+    /// "drains buffered events in order and ignores events pushed after
+    /// completion" + "drains buffered events after end and resolves the
+    /// explicit result" (both upstream cases share the buffered-drain shape;
+    /// `end(Some(..))` is the explicit-result arm).
+    #[tokio::test]
+    async fn test_9055_drains_buffered_events_in_order() {
+        let partial = message(StopReason::Pending);
+        let stream = AssistantMessageEventStream::new();
+        stream.push(text_event(0, &partial));
+        stream.push(text_event(1, &partial));
+        stream.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: message(StopReason::Stop),
+        });
+        // Terminal event flips `done`: later pushes are dropped.
+        stream.push(text_event(2, &partial));
+        stream.end(Some(message(StopReason::Stop)));
+
+        let result = stream.result().await.expect("resolved");
+        assert_eq!(result.stop_reason, StopReason::Stop);
+
+        let kinds: Vec<&str> = stream.clone().map(|event| kind(&event)).collect().await;
+        assert_eq!(kinds, vec!["start", "text_start", "done"]);
+    }
+
+    /// "preserves order when events arrive after buffered draining starts".
+    #[tokio::test]
+    async fn test_9055_order_preserved_when_events_arrive_mid_drain() {
+        let partial = message(StopReason::Pending);
+        let stream = AssistantMessageEventStream::new();
+        stream.push(text_event(0, &partial));
+        stream.push(text_event(1, &partial));
+
+        let mut iter = stream.clone();
+        let first = iter.next().await;
+        assert_eq!(kind(&first.expect("event")), "start");
+
+        // Arrives after draining started: must land behind the buffered event.
+        stream.push(text_event(2, &partial));
+        assert_eq!(kind(&iter.next().await.expect("event")), "text_start");
+        assert_eq!(kind(&iter.next().await.expect("event")), "text_delta");
+        stream.end(None);
+        assert!(iter.next().await.is_none());
+    }
+
+    /// "delivers events to waiting consumers in registration order".
+    /// Both consumers' `next()` futures are polled once (registering their
+    /// waiters on the shared receiver) before any event is pushed; the
+    /// channel dequeues FIFO, and the first-registered consumer is the first
+    /// to resume.
+    #[tokio::test]
+    async fn test_9055_waiting_consumers_served_in_registration_order() {
+        let stream = AssistantMessageEventStream::new();
+        let partial = message(StopReason::Pending);
+
+        let mut first = stream.clone();
+        let mut second = stream.clone();
+        let producer = stream.clone();
+
+        let mut f1 = Box::pin(first.next());
+        let mut f2 = Box::pin(second.next());
+        // Deterministic registration: both waiters park before the pushes.
+        assert!(futures::poll!(&mut f1).is_pending());
+        assert!(futures::poll!(&mut f2).is_pending());
+
+        producer.push(text_event(0, &partial));
+        producer.push(text_event(1, &partial));
+
+        let e1 = f1.await.expect("event for first");
+        let e2 = f2.await.expect("event for second");
+        assert_eq!(kind(&e1), "start");
+        assert_eq!(kind(&e2), "text_start");
+    }
+
+    /// "wakes all waiting consumers when ended without a result".
+    #[tokio::test]
+    async fn test_9055_end_wakes_all_waiting_consumers() {
+        let stream = AssistantMessageEventStream::new();
+
+        let mut first = stream.clone();
+        let mut second = stream.clone();
+        let producer = stream.clone();
+
+        let mut f1 = Box::pin(first.next());
+        let mut f2 = Box::pin(second.next());
+        assert!(futures::poll!(&mut f1).is_pending());
+        assert!(futures::poll!(&mut f2).is_pending());
+
+        producer.end(None);
+        assert!(f1.await.is_none());
+        assert!(f2.await.is_none());
+    }
+
+    /// Linearity assertion (task §4 FR-A): draining 10⁴ and 10⁵ buffered
+    /// events must stay in the linear regime. A `shift`-style O(n) dequeue
+    /// would make the 10⁵ round ~100× the 10⁴ round; O(1) dequeues keep the
+    /// ratio near 10×. Both rounds run in milliseconds, so the generous
+    /// bounds below only fail on quadratic blowups (50× ratio / 5s absolute).
+    #[tokio::test]
+    async fn test_9055_buffered_drain_is_linear() {
+        async fn drain_round(n: u32) -> (u32, std::time::Duration) {
+            let start = std::time::Instant::now();
+            let stream = AssistantMessageEventStream::new();
+            let partial = message(StopReason::Pending);
+            for _ in 0..n {
+                stream.push(StreamEvent::Start {
+                    partial: partial.clone(),
+                });
+            }
+            stream.end(None);
+            let mut iter = stream.clone();
+            let mut drained = 0u32;
+            while iter.next().await.is_some() {
+                drained += 1;
+            }
+            (drained, start.elapsed())
+        }
+
+        let (small_count, small) = drain_round(10_000).await;
+        let (large_count, large) = drain_round(100_000).await;
+        assert_eq!(small_count, 10_000);
+        assert_eq!(large_count, 100_000);
+        assert!(
+            large.as_secs() < 5,
+            "100k drain took {large:?} (quadratic?)"
+        );
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 50.0,
+            "drain time ratio 100k/10k = {ratio:.1}x (linear ≈ 10x, quadratic ≈ 100x)"
+        );
     }
 }
