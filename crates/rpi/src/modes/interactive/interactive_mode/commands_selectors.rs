@@ -1165,8 +1165,8 @@ fn show_login_auth_type_selector(
     // rpi collapses `method.loginLabel` (helpers.ts `lazyOAuth`) for every
     // provider — the uniform "Sign in with an account" row (upstream
     // swaps in the provider's own label, e.g. meta's "Sign in with Meta",
-    // oauthLoginLabel interactive-mode.ts:4937-4939; the kimi/xai/
-    // openrouter collapse precedent predates meta).
+    // oauthLoginLabel interactive-mode.ts:5648-5650 @ 19451accd; the
+    // kimi/xai/openrouter collapse precedent predates meta).
     let subscription_label = "Sign in with an account";
     let api_key_label = "Sign in with an API key";
     let mut options: Vec<&str> = Vec::new();
