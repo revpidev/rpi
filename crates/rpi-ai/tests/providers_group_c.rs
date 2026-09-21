@@ -6,8 +6,9 @@
 //! `zai` compat assertions of `openai-completions-tool-choice.test.ts`
 //! (`zaiToolStream`) against the Rust factories in
 //! `rpi_ai::providers::{zai, zai_coding_cn, moonshotai, moonshotai_cn,
-//! kimi_coding, minimax, minimax_cn, ant_ling, qwen_token_plan,
-//! qwen_token_plan_cn}` @ pi 0.82.1 (2efa728).
+//! kimi_coding, meta, minimax, minimax_cn, ant_ling, qwen_token_plan,
+//! qwen_token_plan_cn}` @ pi 0.82.1 (2efa728) + meta @ 0.86.1
+//! (b73412a37, V15-15).
 //!
 //! The OAuth part of `kimi-coding-oauth.test.ts` is ported in T13 W5 (see
 //! `auth/oauth/kimi_coding.rs` and `tests/oauth_kimi_xai.rs`); the factory
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use rpi_ai::auth::AuthContext;
 use rpi_ai::models::Provider;
 use rpi_ai::providers::{
-    ant_ling, kimi_coding, minimax, minimax_cn, moonshotai, moonshotai_cn, qwen_token_plan,
+    ant_ling, kimi_coding, meta, minimax, minimax_cn, moonshotai, moonshotai_cn, qwen_token_plan,
     qwen_token_plan_cn, zai, zai_coding_cn,
 };
 use rpi_ai::types::ApiKind;
@@ -96,6 +97,15 @@ const SPECS: &[FactorySpec] = &[
         factory: kimi_coding::kimi_coding_provider,
     },
     FactorySpec {
+        id: "meta",
+        name: "Meta",
+        base_url: "https://api.meta.ai/v1",
+        auth_name: "Meta Model API key",
+        env_key: "META_API_KEY",
+        api: ApiKind::OPENAI_RESPONSES,
+        factory: meta::meta_provider,
+    },
+    FactorySpec {
         id: "minimax",
         name: "MiniMax",
         base_url: "https://api.minimax.io/anthropic",
@@ -144,7 +154,7 @@ const SPECS: &[FactorySpec] = &[
 
 #[test]
 fn factory_shape_matches_upstream() {
-    assert_eq!(SPECS.len(), 10);
+    assert_eq!(SPECS.len(), 11);
     for spec in SPECS {
         let provider = (spec.factory)();
         assert_eq!(provider.id(), spec.id);

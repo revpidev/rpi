@@ -80,6 +80,20 @@ const GOOGLE_GENERATIVE_AI: LiveTarget = LiveTarget {
     provider: "google",
 };
 
+/// Meta Model API (`META_API_KEY`; the OAuth-minted key works the same
+/// way — upstream's `stream.test.ts`/`tokens.test.ts`/
+/// `cross-provider-handoff.test.ts` Meta additions are all gated on this
+/// env, V15-15 port note in the task file §7).
+const META: LiveTarget = LiveTarget {
+    key_env: "META_API_KEY",
+    model_env: "RPI_LIVE_META_MODEL",
+    base_url_env: "RPI_LIVE_META_BASE_URL",
+    default_model: "muse-spark-1.3",
+    default_base_url: "https://api.meta.ai/v1",
+    api: "openai-responses",
+    provider: "meta",
+};
+
 /// Azure gate: `AZURE_OPENAI_API_KEY` plus `AZURE_OPENAI_RESOURCE_NAME` (the
 /// base URL is derived from the resource name unless overridden).
 fn gate_azure() -> Option<(Model, StreamOptions)> {
@@ -272,6 +286,18 @@ async fn test_live_google_generative_ai() {
         .collect()
         .await;
     smoke(events, "google-generative-ai").await;
+}
+
+#[tokio::test]
+async fn test_live_meta_openai_responses() {
+    let Some((model, options)) = gate(&META) else {
+        return;
+    };
+    let events = OpenAiResponses
+        .stream(&model, &context(), Some(options))
+        .collect()
+        .await;
+    smoke(events, "meta").await;
 }
 
 #[tokio::test]

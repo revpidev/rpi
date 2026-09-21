@@ -627,6 +627,7 @@ Extensions can register additional flags (e.g., --plan from plan-mode extension)
   MOONSHOT_API_KEY                 - Moonshot AI API key
   OPENCODE_API_KEY                 - OpenCode Zen/OpenCode Go API key
   KIMI_API_KEY                     - Kimi For Coding API key
+  META_API_KEY                     - Meta Model API key
   CLOUDFLARE_API_KEY               - Cloudflare API token (Workers AI and AI Gateway)
   CLOUDFLARE_ACCOUNT_ID            - Cloudflare account id (required for both)
   CLOUDFLARE_GATEWAY_ID            - Cloudflare AI Gateway slug (required for AI Gateway)
@@ -1314,6 +1315,16 @@ mod tests {
                 "--tui-mode <mode>              TUI mode: regular (default) or fullscreen"
             ),
             "help text must contain --tui-mode line"
+        );
+    }
+
+    #[test]
+    fn test_help_contains_meta_api_key_line() {
+        // `META_API_KEY` env line (cli/args.ts @ b73412a37, V15-15).
+        let help = print_help(&[], false);
+        assert!(
+            help.contains("META_API_KEY                     - Meta Model API key"),
+            "help text must contain META_API_KEY line"
         );
     }
 

@@ -1,12 +1,12 @@
 //! Port of `packages/ai/src/providers/all.ts` @ pi 0.84.1 (`4181f66`) — T13 W4
-//! phase 1: the built-in provider registry (40 factory ids, upstream
+//! phase 1: the built-in provider registry (41 factory ids, upstream
 //! registration order) and the catalog data path.
 //!
 //! Factory implementations (`xxxProvider()` per upstream `providers/xxx.ts`)
 //! landed in the follow-up W4 waves as `src/providers/<id>.rs` files.
 //!
 //! Intentional differences:
-//! - Upstream `builtinProviders()` constructs all 40 providers; the Rust
+//! - Upstream `builtinProviders()` constructs all 41 providers; the Rust
 //!   `builtin_providers()` does the same now that every W4 wave has landed
 //!   (while waves were in flight it yielded only the ported subset).
 //! - The `openrouter-images` image-generation provider is part of the images
@@ -33,6 +33,7 @@ pub mod google_vertex;
 pub mod groq;
 pub mod huggingface;
 pub mod kimi_coding;
+pub mod meta;
 pub mod minimax;
 pub mod minimax_cn;
 pub mod mistral;
@@ -68,14 +69,14 @@ pub struct BuiltinProviderSpec {
     pub id: &'static str,
     /// Whether the provider has a static entry in the vendored catalog
     /// (`generated.rs`). Every built-in provider qualifies since the
-    /// Radius public catalog shipped (4d38031fb); the `meta` catalog
-    /// entries wait for their provider registration in V15-15.
+    /// Radius public catalog shipped (4d38031fb); `meta` registered with
+    /// its catalog in V15-15 (b73412a37).
     pub in_catalog: bool,
     /// Factory, once the provider is ported in a W4 follow-up wave.
     pub factory: Option<ProviderFactory>,
 }
 
-/// All 38 built-in providers in upstream `builtinProviders()` registration
+/// All 41 built-in providers in upstream `builtinProviders()` registration
 /// order. Registration order is observable (insertion-ordered `Models`:
 /// initial-model fallback, available-model listings) — do not reorder.
 pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
@@ -158,6 +159,11 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
         id: "kimi-coding",
         in_catalog: true,
         factory: Some(kimi_coding::kimi_coding_provider),
+    },
+    BuiltinProviderSpec {
+        id: "meta",
+        in_catalog: true,
+        factory: Some(meta::meta_provider),
     },
     BuiltinProviderSpec {
         id: "minimax",
@@ -318,7 +324,7 @@ mod tests {
     use crate::generated::{builtin_catalog, get_builtin_models};
 
     /// Upstream `builtinProviders()` order, transcribed from `all.ts` @ 4181f66.
-    const UPSTREAM_ORDER: [&str; 40] = [
+    const UPSTREAM_ORDER: [&str; 41] = [
         "amazon-bedrock",
         "ant-ling",
         "anthropic",
@@ -335,6 +341,7 @@ mod tests {
         "groq",
         "huggingface",
         "kimi-coding",
+        "meta",
         "minimax",
         "minimax-cn",
         "mistral",
@@ -382,10 +389,10 @@ mod tests {
                 spec.id
             );
         }
-        // 41 catalog entries = 40 registry entries + `meta` (catalog shipped
-        // with 4d38031fb-era generation b73412a37; provider registration is
-        // V15-15 scope).
-        assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len() + 1);
+        // Since V15-15 every catalog provider is registered (the last
+        // gap — `meta`, catalog shipped with the 4d38031fb-era generation
+        // — registered with b73412a37).
+        assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len());
         assert!(catalog.providers().contains(&"meta"));
     }
 
@@ -403,7 +410,7 @@ mod tests {
         // Group C wave: 10 factories; group D wave: 12 more; group A wave:
         // 8 more; group B wave (this): 8 more. Other waves add their own ids
         // here as they land.
-        const PORTED: [&str; 40] = [
+        const PORTED: [&str; 41] = [
             "amazon-bedrock",
             "ant-ling",
             "anthropic",
@@ -420,6 +427,7 @@ mod tests {
             "groq",
             "huggingface",
             "kimi-coding",
+            "meta",
             "minimax",
             "minimax-cn",
             "mistral",

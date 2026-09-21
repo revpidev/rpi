@@ -67,6 +67,7 @@ fn get_api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "opencode" => Some(&["OPENCODE_API_KEY"]),
         "opencode-go" => Some(&["OPENCODE_API_KEY"]),
         "kimi-coding" => Some(&["KIMI_API_KEY"]),
+        "meta" => Some(&["META_API_KEY"]),
         "cloudflare-workers-ai" => Some(&["CLOUDFLARE_API_KEY"]),
         "cloudflare-ai-gateway" => Some(&["CLOUDFLARE_API_KEY"]),
         "xiaomi" => Some(&["XIAOMI_API_KEY"]),
@@ -191,6 +192,8 @@ mod tests {
             get_api_key_env_vars("cloudflare-ai-gateway"),
             Some(&["CLOUDFLARE_API_KEY"][..])
         );
+        // `meta: "META_API_KEY"` (env-api-keys.ts @ b73412a37, V15-15).
+        assert_eq!(get_api_key_env_vars("meta"), Some(&["META_API_KEY"][..]));
         assert_eq!(get_api_key_env_vars("huggingface"), Some(&["HF_TOKEN"][..]));
         // Providers without a known env var (ambient-only).
         assert_eq!(get_api_key_env_vars("amazon-bedrock"), None);

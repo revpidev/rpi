@@ -16,8 +16,8 @@ use std::sync::Arc;
 use super::super::types::OAuthAuth;
 use super::{
     anthropic::anthropic_oauth, github_copilot::github_copilot_oauth,
-    kimi_coding::kimi_coding_oauth, openai_codex::openai_codex_oauth, openrouter::openrouter_oauth,
-    xai::xai_oauth,
+    kimi_coding::kimi_coding_oauth, meta::meta_oauth, openai_codex::openai_codex_oauth,
+    openrouter::openrouter_oauth, xai::xai_oauth,
 };
 
 /// `OAuthFlowLoaders` — a statically-bundled flow loader (upstream
@@ -49,6 +49,11 @@ pub fn load_kimi_coding_oauth() -> Arc<dyn OAuthAuth> {
     kimi_coding_oauth()
 }
 
+/// `loadMetaOAuth` (b73412a37, #9096).
+pub fn load_meta_oauth() -> Arc<dyn OAuthAuth> {
+    meta_oauth()
+}
+
 /// `loadXaiOAuth`.
 pub fn load_xai_oauth() -> Arc<dyn OAuthAuth> {
     xai_oauth()
@@ -63,6 +68,7 @@ pub fn oauth_flow_loaders() -> &'static [(&'static str, OAuthFlowLoader)] {
         ("github-copilot", load_github_copilot_oauth),
         ("openrouter", load_openrouter_oauth),
         ("kimi-coding", load_kimi_coding_oauth),
+        ("meta", load_meta_oauth),
         ("xai", load_xai_oauth),
     ]
 }
@@ -91,6 +97,7 @@ mod tests {
             ("github-copilot", "GitHub Copilot"),
             ("openrouter", "OpenRouter OAuth"),
             ("kimi-coding", "Kimi Code (subscription)"),
+            ("meta", "Meta (Muse subscription)"),
             ("xai", "xAI (Grok/X subscription)"),
         ];
         assert_eq!(oauth_flow_loaders().len(), expected.len());

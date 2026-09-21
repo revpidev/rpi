@@ -18,7 +18,7 @@ pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 
 /// `defaultModelPerProvider` (model-resolver.ts:14-53) — ids pinned to the
 /// upstream commit; unknown providers fall through to "first available".
-pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 38] = [
+pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 39] = [
     ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
     ("ant-ling", "Ring-2.6-1T"),
     ("anthropic", "claude-opus-4-8"),
@@ -52,6 +52,7 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 38] = [
     ("opencode", "kimi-k2.6"),
     ("opencode-go", "kimi-k2.6"),
     ("kimi-coding", "kimi-for-coding"),
+    ("meta", "muse-spark-1.3"),
     ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
     (
         "cloudflare-ai-gateway",
@@ -1293,6 +1294,18 @@ mod tests {
         assert!(minimatch_nocase("a/b", "a/**/b"));
         assert!(minimatch_nocase("a/x/b", "a/**/b"));
         assert!(minimatch_nocase("a/x/y/b", "a/**/b"));
+    }
+
+    #[test]
+    fn test_default_model_per_provider_covers_meta() {
+        // `meta: "muse-spark-1.3"` (model-resolver.ts @ b73412a37, V15-15)
+        // — the post-login auto-selection default for the Meta provider.
+        assert_eq!(default_model_for_provider("meta"), Some("muse-spark-1.3"));
+        assert_eq!(
+            default_model_for_provider("kimi-coding"),
+            Some("kimi-for-coding")
+        );
+        assert_eq!(default_model_for_provider("does-not-exist"), None);
     }
 
     // ------------------------------------------------------------------

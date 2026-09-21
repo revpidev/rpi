@@ -67,8 +67,8 @@ pub struct BuiltinCatalog {
 impl BuiltinCatalog {
     /// `all.ts` `getBuiltinProviders()` — catalog provider ids.
     /// (Since 4d38031fb every built-in provider ships a static catalog
-    /// entry, radius included; the `meta` entries wait for their provider
-    /// registration — see `providers.rs`.)
+    /// entry, radius included; `meta`'s provider registration landed with
+    /// V15-15 — see `providers.rs`.)
     pub fn providers(&self) -> &[&'static str] {
         &self.providers
     }

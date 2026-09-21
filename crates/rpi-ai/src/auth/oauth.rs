@@ -11,6 +11,7 @@ pub mod device_code;
 pub mod github_copilot;
 pub mod kimi_coding;
 pub mod load;
+pub mod meta;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod pkce;
@@ -24,7 +25,8 @@ pub use callback_page::{
 pub use device_code::{poll_oauth_device_code_flow, DeviceCodePollOptions, DeviceCodePollResult};
 pub use github_copilot::github_copilot_oauth;
 pub use kimi_coding::kimi_coding_oauth;
-pub use load::{load_oauth_flow, load_xai_oauth, OAuthFlowLoader};
+pub use load::{load_meta_oauth, load_oauth_flow, load_xai_oauth, OAuthFlowLoader};
+pub use meta::meta_oauth;
 pub use openai_codex::openai_codex_oauth;
 pub use openrouter::openrouter_oauth;
 pub use pkce::{generate_pkce, Pkce};
