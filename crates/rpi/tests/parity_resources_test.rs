@@ -433,7 +433,7 @@ fn parity_settings_deep_merge() {
         };
         let manager =
             SettingsManager::from_storage(storage, SettingsManagerCreateOptions::default());
-        let compaction = manager.get_compaction_settings();
+        let compaction = manager.get_compaction_settings(None);
         let branch_summary = manager.get_branch_summary_settings();
         let retry = manager.get_retry_settings();
         let provider_retry = manager.get_provider_retry_settings();

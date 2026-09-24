@@ -1324,3 +1324,139 @@ async fn complete_summarization_preserves_caller_session_id() {
         "summaries stay cache-skip regardless of caller options"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #9740: oversized trailing tool results fall back to the latest valid cut
+// point (8bdcd4498, test/compaction.test.ts "should fall back to the latest
+// valid cut point before oversized trailing tool results")
+// ---------------------------------------------------------------------------
+
+fn oversized_trailing_tool_result_entries() -> Vec<SessionEntry> {
+    let big = "x".repeat(8000);
+    let entries = json!([
+        {
+            "type": "message",
+            "id": "e-old-user",
+            "parentId": null,
+            "timestamp": "2026-09-18T00:00:00.000Z",
+            "message": {"role": "user", "content": "old history", "timestamp": 1}
+        },
+        {
+            "type": "message",
+            "id": "e-old-assistant",
+            "parentId": "e-old-user",
+            "timestamp": "2026-09-18T00:00:01.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "old answer"}],
+                "api": "faux",
+                "provider": "faux",
+                "model": "faux-1",
+                "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                           "totalTokens": 0,
+                           "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+                "stopReason": "stop",
+                "timestamp": 2
+            }
+        },
+        {
+            "type": "message",
+            "id": "e-current-user",
+            "parentId": "e-old-assistant",
+            "timestamp": "2026-09-18T00:00:02.000Z",
+            "message": {"role": "user", "content": "read the large file", "timestamp": 3}
+        },
+        {
+            "type": "message",
+            "id": "e-tool-call",
+            "parentId": "e-current-user",
+            "timestamp": "2026-09-18T00:00:03.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "toolCall", "id": "call-1", "name": "read",
+                     "arguments": {"path": "big.txt"}}
+                ],
+                "api": "faux",
+                "provider": "faux",
+                "model": "faux-1",
+                "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                           "totalTokens": 0,
+                           "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+                "stopReason": "toolUse",
+                "timestamp": 4
+            }
+        },
+        {
+            "type": "message",
+            "id": "e-tool-result",
+            "parentId": "e-tool-call",
+            "timestamp": "2026-09-18T00:00:04.000Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call-1",
+                "toolName": "read",
+                "content": [{"type": "text", "text": big}],
+                "isError": false,
+                "timestamp": 5
+            }
+        }
+    ]);
+    session_entries(&entries)
+}
+
+/// The trailing tool result alone exceeds `keepRecentTokens` (8000 chars ≈
+/// 2000 estimated tokens vs. the 1000 budget), so no valid cut point exists
+/// at or after the crossing index — the fallback keeps the preceding
+/// assistant tool call (latest cut point, index 3) instead of resetting to
+/// the first message.
+#[test]
+fn oversized_trailing_tool_results_fall_back_to_latest_cut_point() {
+    let entries = oversized_trailing_tool_result_entries();
+    let cut = find_cut_point(&entries, 0, entries.len(), 1000);
+    assert_eq!(cut.first_kept_entry_index, 3);
+    assert_eq!(cut.turn_start_index, Some(2));
+    assert!(cut.is_split_turn);
+}
+
+/// The end-to-end preparation keeps the tool-call pair together: the turn
+/// prefix is the current user message and only the old history summarizes.
+#[test]
+fn oversized_trailing_tool_results_prepare_compaction_keeps_pair() {
+    let entries = oversized_trailing_tool_result_entries();
+    let settings = CompactionSettings {
+        keep_recent_tokens: 1000,
+        ..rpi_agent::compaction::DEFAULT_COMPACTION_SETTINGS
+    };
+    let preparation =
+        prepare_compaction(&entries, &settings).unwrap_or_else(|| panic!("preparation expected"));
+    assert_eq!(preparation.first_kept_entry_id, "e-tool-call");
+    let summarize_texts: Vec<String> = preparation
+        .messages_to_summarize
+        .iter()
+        .map(|message| match message {
+            AgentMessage::User(user) => match &user.content {
+                rpi_ai::types::UserContent::Text(text) => text.clone(),
+                other => panic!("unexpected user content: {other:?}"),
+            },
+            AgentMessage::Assistant(assistant) => match &assistant.content[0] {
+                rpi_ai::types::AssistantContent::Text(text) => text.text.clone(),
+                other => panic!("unexpected assistant content: {other:?}"),
+            },
+            other => panic!("unexpected message: {other:?}"),
+        })
+        .collect();
+    assert_eq!(summarize_texts, ["old history", "old answer"]);
+    let prefix_texts: Vec<String> = preparation
+        .turn_prefix_messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::User(user) => match &user.content {
+                rpi_ai::types::UserContent::Text(text) => text.clone(),
+                other => panic!("unexpected user content: {other:?}"),
+            },
+            other => panic!("unexpected message: {other:?}"),
+        })
+        .collect();
+    assert_eq!(prefix_texts, ["read the large file"]);
+}

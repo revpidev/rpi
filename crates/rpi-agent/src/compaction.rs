@@ -426,9 +426,11 @@ pub struct CutPointResult {
     pub is_split_turn: bool,
 }
 
-/// `findCutPoint` (compaction.ts:403-461): walk backwards from newest,
-/// accumulating estimated message sizes; stop at `keepRecentTokens`, snap to
-/// the closest valid cut point, then absorb adjacent metadata entries.
+/// `findCutPoint` (compaction.ts:403-461 @ 8bdcd4498): walk backwards from
+/// newest, accumulating estimated message sizes; stop at
+/// `keepRecentTokens`, snap to the closest valid cut point (falling back to
+/// the latest one when trailing tool results alone exceed the budget,
+/// #9740), then absorb adjacent metadata entries.
 pub fn find_cut_point(
     entries: &[SessionEntry],
     start_index: usize,
@@ -459,13 +461,16 @@ pub fn find_cut_point(
         accumulated_tokens += message_tokens;
 
         if accumulated_tokens >= keep_recent_tokens {
-            // Find the closest valid cut point at or after this entry.
-            for &c in &cut_points {
-                if c >= i {
-                    cut_index = c;
-                    break;
-                }
-            }
+            // Prefer the closest valid cut point at or after this entry. If
+            // trailing tool results exceed the budget by themselves, keep
+            // their preceding assistant tool call instead of falling back to
+            // the first message (#9740, compaction.ts:445-451 @ 8bdcd4498).
+            let fallback = cut_points[cut_points.len() - 1]; // non-empty per early return
+            cut_index = cut_points
+                .iter()
+                .copied()
+                .find(|&candidate| candidate >= i)
+                .unwrap_or(fallback);
             break;
         }
     }

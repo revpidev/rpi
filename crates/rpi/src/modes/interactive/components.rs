@@ -56,7 +56,8 @@ pub use keybinding_hints::{key_display_text, key_hint, key_text, raw_key_hint};
 pub use skill_invocation_message::SkillInvocationMessageComponent;
 pub use status_indicator::{
     BranchSummaryStatusIndicator, CompactionStatusIndicator, CompactionStatusReason, IdleStatus,
-    RetryStatusIndicator, StatusIndicator, StatusIndicatorKind, WorkingStatusIndicator,
+    RetryStatusIndicator, SharedStatusIndicator, StatusIndicator, StatusIndicatorKind,
+    WorkingStatusIndicator,
 };
 pub use tool_execution::{
     ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, ToolResultState,

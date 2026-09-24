@@ -92,6 +92,16 @@ pub fn model_or_none(model: &Model) -> Option<Model> {
     }
 }
 
+/// `&Model` → the per-model settings key ref for
+/// [`SettingsManager::get_compaction_settings`] (settings-manager.ts:858 @
+/// 46bde88a1, #8133).
+fn compaction_model_ref(model: &Model) -> crate::core::settings_manager::CompactionModelRef<'_> {
+    crate::core::settings_manager::CompactionModelRef {
+        provider: &model.provider,
+        id: &model.id,
+    }
+}
+
 // ============================================================================
 // AgentSessionEvent (agent-session.ts:139-181)
 // ============================================================================
@@ -514,8 +524,12 @@ impl AgentSession {
             let loader = lock(&config.resource_loader);
             let settings = loader.settings_manager();
             let retry_config = settings.get_retry_settings();
+            // `getCompactionSettings(model)` (agent-session.ts:540 @
+            // 46bde88a1): the constructor resolves per-model token budgets
+            // (#8133); the other upstream read points map to
+            // `sync_compaction_model` (see there).
             (
-                settings.get_compaction_settings(),
+                settings.get_compaction_settings(model.as_ref().map(compaction_model_ref)),
                 retry_config_to_policy(retry_config),
                 config.agent.state().thinking_level,
                 config.agent.stream_function.clone(),
@@ -2674,8 +2688,12 @@ impl AgentSession {
         let (compaction, retry) = {
             let mut loader = lock(&self.inner.resource_loader);
             let settings = loader.settings_manager_mut();
+            // Per-model token budgets resolve here (agent-session.ts:540 /
+            // :1974-1975 / :2155 / :2271-2274 @ 46bde88a1 — the constructor
+            // covers the first; `compact` / `check_compaction` sync before
+            // every trigger, covering the rest). #8133.
             (
-                settings.get_compaction_settings(),
+                settings.get_compaction_settings(model.as_ref().map(compaction_model_ref)),
                 retry_config_to_policy(settings.get_retry_settings()),
             )
         };

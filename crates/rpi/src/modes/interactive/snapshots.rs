@@ -33,10 +33,13 @@ use crate::core::agent_session::ParsedSkillBlock;
 use crate::core::themes::{load_theme, Theme};
 use crate::modes::interactive::components::{
     render_diff, AssistantMessageComponent, BashExecutionComponent, BranchSummaryMessageComponent,
+    BranchSummaryStatusIndicator, CompactionStatusIndicator, CompactionStatusReason,
     CompactionSummaryMessageComponent, CustomMessageComponent, RenderDiffOptions,
-    SkillInvocationMessageComponent, ToolExecutionComponent, ToolExecutionOptions,
-    ToolResultContentLoose, ToolResultState, UserMessageComponent,
+    RetryStatusIndicator, SharedStatusIndicator, SkillInvocationMessageComponent,
+    ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, ToolResultState,
+    UserMessageComponent,
 };
+use crate::modes::interactive::custom_editor::CustomEditor;
 use crate::modes::interactive::theme::markdown_theme;
 
 fn snapshot_dir() -> PathBuf {
@@ -325,4 +328,130 @@ fn diff_render_hunk() {
     );
     let lines: Vec<String> = rendered.split('\n').map(|s| s.to_string()).collect();
     assert_snapshot("diff_render_hunk", &lines);
+}
+
+// --- editor-border status spinners (c1d4c8011, V15-07 FR-C) ----------------
+//
+// Golden frames for the three spinner states now embedded in the editor's
+// top border (compaction / branch summary / retry) plus the custom-editor
+// opt-out fallback (plain border; the standalone row hosts the indicator
+// instead — rendered as its own frame below).
+
+fn border_editor(embed: bool) -> std::sync::Arc<std::sync::Mutex<CustomEditor>> {
+    use rpi_tui::components::editor::{EditorOptions, EditorTheme};
+    use rpi_tui::tui_handle::TuiHandle;
+    use rpi_tui::tui_main_screen::TuiMainScreen;
+
+    let theme = dark_theme();
+    let tui = TuiHandle::from_main(TuiMainScreen::new(Box::new(
+        crate::modes::interactive::test_support::TestTerminal::new(),
+    )));
+    let editor_theme = EditorTheme {
+        border_color: Box::new({
+            let theme = Arc::clone(&theme);
+            move |text: &str| theme.fg("borderMuted", text)
+        }),
+        select_list: Arc::new(rpi_tui::components::select_list::SelectListTheme::identity()),
+    };
+    std::sync::Arc::new(std::sync::Mutex::new(CustomEditor::new(
+        tui,
+        editor_theme,
+        EditorOptions::default(),
+        embed,
+    )))
+}
+
+fn with_embedded_spinner(shared: SharedStatusIndicator, dispose: impl FnOnce()) -> Vec<String> {
+    use rpi_tui::tui::Component as _;
+
+    let editor = border_editor(true);
+    lock_snapshot_editor(&editor).set_working_status_indicator(Some(shared));
+    let region = crate::modes::interactive::custom_editor::CustomEditorRegion::new(editor);
+    let lines = region.render(60);
+    dispose();
+    lines
+}
+
+fn lock_indicator<T>(indicator: &Arc<std::sync::Mutex<T>>) -> std::sync::MutexGuard<'_, T> {
+    indicator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_snapshot_editor(
+    editor: &std::sync::Arc<std::sync::Mutex<CustomEditor>>,
+) -> std::sync::MutexGuard<'_, CustomEditor> {
+    editor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn editor_border_compaction_threshold_spinner() {
+    let indicator = Arc::new(std::sync::Mutex::new(CompactionStatusIndicator::new(
+        noop_render_handle(),
+        CompactionStatusReason::Threshold,
+        dark_theme(),
+    )));
+    let lines = with_embedded_spinner(
+        SharedStatusIndicator::Compaction(Arc::clone(&indicator)),
+        || lock_indicator(&indicator).dispose(),
+    );
+    assert_snapshot("editor_border_compaction_threshold_spinner", &lines);
+}
+
+#[test]
+fn editor_border_branch_summary_spinner() {
+    let indicator = Arc::new(std::sync::Mutex::new(BranchSummaryStatusIndicator::new(
+        noop_render_handle(),
+        dark_theme(),
+    )));
+    let lines = with_embedded_spinner(
+        SharedStatusIndicator::BranchSummary(Arc::clone(&indicator)),
+        || lock_indicator(&indicator).dispose(),
+    );
+    assert_snapshot("editor_border_branch_summary_spinner", &lines);
+}
+
+#[test]
+fn editor_border_retry_spinner() {
+    // 10s delay: the countdown message is deterministic at construction
+    // ("Retrying (1/3) in 10s...").
+    let indicator = Arc::new(std::sync::Mutex::new(RetryStatusIndicator::new(
+        noop_render_handle(),
+        1,
+        3,
+        10_000,
+        dark_theme(),
+    )));
+    let lines = with_embedded_spinner(SharedStatusIndicator::Retry(Arc::clone(&indicator)), || {
+        lock_indicator(&indicator).dispose()
+    });
+    assert_snapshot("editor_border_retry_spinner", &lines);
+}
+
+#[test]
+fn editor_border_opt_out_keeps_plain_border_and_standalone_row() {
+    use rpi_tui::tui::Component as _;
+
+    // A custom editor that did not opt in keeps the plain top border…
+    let editor = border_editor(false);
+    let indicator = Arc::new(std::sync::Mutex::new(CompactionStatusIndicator::new(
+        noop_render_handle(),
+        CompactionStatusReason::Threshold,
+        dark_theme(),
+    )));
+    lock_snapshot_editor(&editor).set_working_status_indicator(Some(
+        SharedStatusIndicator::Compaction(Arc::clone(&indicator)),
+    ));
+    let region = crate::modes::interactive::custom_editor::CustomEditorRegion::new(editor);
+    let mut lines = region.render(60);
+    // …and the status row hosts the standalone indicator instead
+    // (the mode's `ActiveStatus` render).
+    lines.extend(lock_indicator(&indicator).render(60));
+    lock_indicator(&indicator).dispose();
+    assert_snapshot(
+        "editor_border_opt_out_keeps_plain_border_and_standalone_row",
+        &lines,
+    );
 }

@@ -31,7 +31,10 @@
 //!   cryptographically secure; collision resistance is what matters here.
 //! - Wrongly-typed values in settings.json (e.g. `steeringMode: 5`) fall back
 //!   to defaults in the typed getters instead of passing through raw as in
-//!   JS; valid files behave identically.
+//!   JS; valid files behave identically. The per-model compaction token
+//!   overrides (#8133) follow the same convention: upstream's safe-integer
+//!   and object checks throw on invalid values; here wrongly-typed override
+//!   fields/entries fall through to the next resolution tier.
 //! - `parseHttpIdleTimeoutMs` number parsing uses Rust `f64` parsing; JS
 //!   `Number()` exotica (`"0x10"`, `"Infinity"`) parse differently. All
 //!   realistic values (decimal integers, `"disabled"`, `""`) match.
@@ -67,8 +70,20 @@ pub const DEFAULT_HTTP_IDLE_TIMEOUT_MS: u64 = 0;
 // Settings value model (settings-manager.ts:11-129)
 // ===========================================================================
 
-/// `CompactionSettings` (settings-manager.ts:11-15) — file shape; all fields
-/// optional, defaults live in the getters.
+/// `CompactionModelOverride` (settings-manager.ts:13-16 @ 46bde88a1) —
+/// file shape; per-model token budgets keyed by exact `"provider/modelId"`
+/// strings under `compaction.modelOverrides` (#8133).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CompactionModelOverride {
+    /// default: falls through to the ordinary `compaction.reserveTokens`
+    pub reserve_tokens: Option<u64>,
+    /// default: falls through to the ordinary `compaction.keepRecentTokens`
+    pub keep_recent_tokens: Option<u64>,
+}
+
+/// `CompactionSettings` (settings-manager.ts:18-21 @ 46bde88a1) — file
+/// shape; all fields optional, defaults live in the getters.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompactionSettings {
@@ -78,6 +93,10 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u64>,
     /// default: 20000
     pub keep_recent_tokens: Option<u64>,
+    /// `modelOverrides` (46bde88a1): exact `"provider/modelId"` keys —
+    /// the same per-model key convention as the models.json `modelOverrides`
+    /// face (V15-01 FR-E seam).
+    pub model_overrides: Option<HashMap<String, CompactionModelOverride>>,
 }
 
 /// `BranchSummarySettings` (settings-manager.ts:17-20) — file shape.
@@ -1604,25 +1623,60 @@ impl SettingsManager {
         self.save();
     }
 
-    /// `getCompactionReserveTokens` (settings-manager.ts:773-775) —
-    /// default 16384.
-    pub fn get_compaction_reserve_tokens(&self) -> u64 {
-        value_u64(self.settings.nested("compaction", "reserveTokens")).unwrap_or(16384)
+    /// `getCompactionReserveTokens(model?)` (settings-manager.ts:773-775 +
+    /// 46bde88a1) — default 16384.
+    pub fn get_compaction_reserve_tokens(&self, model: Option<CompactionModelRef<'_>>) -> u64 {
+        self.get_compaction_token_setting("reserveTokens", model)
     }
 
-    /// `getCompactionKeepRecentTokens` (settings-manager.ts:777-779) —
-    /// default 20000.
-    pub fn get_compaction_keep_recent_tokens(&self) -> u64 {
-        value_u64(self.settings.nested("compaction", "keepRecentTokens")).unwrap_or(20000)
+    /// `getCompactionKeepRecentTokens(model?)` (settings-manager.ts:777-779
+    /// + 46bde88a1) — default 20000.
+    pub fn get_compaction_keep_recent_tokens(&self, model: Option<CompactionModelRef<'_>>) -> u64 {
+        self.get_compaction_token_setting("keepRecentTokens", model)
     }
 
-    /// `getCompactionSettings` (settings-manager.ts:781-787) — resolved
-    /// values with defaults applied.
-    pub fn get_compaction_settings(&self) -> CompactionConfig {
+    /// `getCompactionTokenSetting` (settings-manager.ts:854-885 @ 46bde88a1):
+    /// resolve each token setting through the model override, the ordinary
+    /// setting, then the built-in default. Upstream throws on wrongly-typed
+    /// values (safe-integer/object checks); the port follows the module's
+    /// documented wrong-type deviation — malformed ordinary/override values
+    /// fall back to the next tier instead of surfacing an error, valid files
+    /// behave identically.
+    fn get_compaction_token_setting(
+        &self,
+        field: &str,
+        model: Option<CompactionModelRef<'_>>,
+    ) -> u64 {
+        let ordinary = value_u64(self.settings.nested("compaction", field));
+        let model_override = model.map(CompactionModelRef::settings_key).and_then(|key| {
+            self.settings
+                .nested("compaction", "modelOverrides")
+                .and_then(|overrides| overrides.as_object())
+                .and_then(|entries| entries.get(&key))
+                .and_then(|entry| entry.as_object())
+                .and_then(|entry| entry.get(field))
+        });
+        value_u64(model_override)
+            .or(ordinary)
+            .unwrap_or(match field {
+                "reserveTokens" => 16384,
+                "keepRecentTokens" => 20000,
+                // Invariant: both compaction token fields are covered above.
+                _ => 16384,
+            })
+    }
+
+    /// `getCompactionSettings(model?)` (settings-manager.ts:781-787 +
+    /// 46bde88a1) — resolved values with defaults applied; the token
+    /// settings resolve through the per-model override chain.
+    pub fn get_compaction_settings(
+        &self,
+        model: Option<CompactionModelRef<'_>>,
+    ) -> CompactionConfig {
         CompactionConfig {
             enabled: self.get_compaction_enabled(),
-            reserve_tokens: self.get_compaction_reserve_tokens(),
-            keep_recent_tokens: self.get_compaction_keep_recent_tokens(),
+            reserve_tokens: self.get_compaction_reserve_tokens(model),
+            keep_recent_tokens: self.get_compaction_keep_recent_tokens(model),
         }
     }
 
@@ -2506,6 +2560,24 @@ impl SettingsManager {
         self.global_settings.set("warnings", json_value(warnings));
         self.mark_modified("warnings", None);
         self.save();
+    }
+}
+
+/// `Pick<Model, "provider" | "id">` (settings-manager.ts:858 @ 46bde88a1):
+/// the model identity the per-model compaction overrides key on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionModelRef<'a> {
+    pub provider: &'a str,
+    pub id: &'a str,
+}
+
+impl CompactionModelRef<'_> {
+    /// `${provider}/${id}` settings key (settings-manager.ts:866-867 @
+    /// 46bde88a1) — the per-model key convention shared with the models.json
+    /// `modelOverrides` face (V15-01 FR-E seam, design baseline §1.3
+    /// ruling 3).
+    pub fn settings_key(self) -> String {
+        format!("{}/{}", self.provider, self.id)
     }
 }
 
@@ -4018,8 +4090,8 @@ mod tests {
         assert_eq!(manager.get_follow_up_mode(), QueueMode::OneAtATime);
         assert_eq!(manager.get_transport(), Transport::Auto);
         assert!(manager.get_compaction_enabled());
-        assert_eq!(manager.get_compaction_reserve_tokens(), 16384);
-        assert_eq!(manager.get_compaction_keep_recent_tokens(), 20000);
+        assert_eq!(manager.get_compaction_reserve_tokens(None), 16384);
+        assert_eq!(manager.get_compaction_keep_recent_tokens(None), 20000);
         assert_eq!(
             manager.get_branch_summary_settings(),
             BranchSummaryConfig {
@@ -4072,6 +4144,262 @@ mod tests {
             MermaidRenderingMode::Streaming
         );
         assert_eq!(manager.get_websocket_connect_timeout_ms().unwrap(), None);
+    }
+
+    // =======================================================================
+    // Per-model compaction token budgets (#8133, 46bde88a1 —
+    // settings-manager-compaction.test.ts)
+    // =======================================================================
+
+    fn model_ref<'a>(provider: &'a str, id: &'a str) -> super::CompactionModelRef<'a> {
+        super::CompactionModelRef { provider, id }
+    }
+
+    const MODEL_KEY: &str = "provider/family/model";
+
+    /// "uses defaults without compaction settings" — both with and
+    /// without a model reference.
+    #[test]
+    fn test_compaction_model_overrides_default_without_settings() {
+        let dirs = test_dirs();
+        let manager = create(&dirs);
+        let expected = CompactionConfig {
+            enabled: true,
+            reserve_tokens: 16384,
+            keep_recent_tokens: 20000,
+        };
+        assert_eq!(manager.get_compaction_settings(None), expected);
+        assert_eq!(
+            manager.get_compaction_settings(Some(model_ref("provider", "family/model"))),
+            expected
+        );
+    }
+
+    /// "resolves each field independently and keeps individual getters
+    /// consistent" — the override wins for its field only; a later
+    /// project-tier override replaces that field per deep-merge while the
+    /// global override keeps the other.
+    #[test]
+    fn test_compaction_model_overrides_resolve_each_field_independently() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"compaction": {
+                "reserveTokens": 8192,
+                "keepRecentTokens": 10000,
+                "modelOverrides": {MODEL_KEY: {"reserveTokens": 400000}},
+            }}),
+        );
+        let manager = create(&dirs);
+        let model = model_ref("provider", "family/model");
+        assert_eq!(
+            manager.get_compaction_settings(Some(model)),
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 400000,
+                keep_recent_tokens: 10000
+            }
+        );
+        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 400000);
+        assert_eq!(
+            manager.get_compaction_keep_recent_tokens(Some(model)),
+            10000
+        );
+        // No model reference: the ordinary settings apply.
+        assert_eq!(
+            manager.get_compaction_settings(None),
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 8192,
+                keep_recent_tokens: 10000
+            }
+        );
+
+        // Project-tier entry replaces `keepRecentTokens` only; the global
+        // override's `reserveTokens` survives the per-field deep merge
+        // ("merges project model overrides per field").
+        write_json(
+            &project_path(&dirs),
+            json!({"compaction": {"modelOverrides": {MODEL_KEY: {"keepRecentTokens": 2000}}}}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(manager.get_compaction_keep_recent_tokens(Some(model)), 2000);
+        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 400000);
+    }
+
+    /// "falls back to built-in defaults for missing fields" — an override
+    /// object with one field leaves the other at the built-in default.
+    #[test]
+    fn test_compaction_model_overrides_fall_back_for_missing_fields() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"compaction": {"modelOverrides": {MODEL_KEY: {"keepRecentTokens": 1024}}}}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_compaction_settings(Some(model_ref("provider", "family/model"))),
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 16384,
+                keep_recent_tokens: 1024
+            }
+        );
+    }
+
+    /// "matches exact provider/model IDs, including IDs containing
+    /// slashes" — near-miss keys (`provider/*`, bare model id, other
+    /// provider/id, case change) never match.
+    #[test]
+    fn test_compaction_model_overrides_match_exact_model_ids() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"compaction": {"modelOverrides": {
+                MODEL_KEY: {"reserveTokens": 400000},
+                "provider/*": {"reserveTokens": 1},
+                "family/model": {"reserveTokens": 2},
+            }}}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_compaction_reserve_tokens(Some(model_ref("provider", "family/model"))),
+            400000
+        );
+        let defaults = CompactionConfig {
+            enabled: true,
+            reserve_tokens: 16384,
+            keep_recent_tokens: 20000,
+        };
+        for (provider, id) in [
+            ("other", "family/model"),
+            ("provider", "other"),
+            ("provider", "family/Model"),
+        ] {
+            assert_eq!(
+                manager.get_compaction_settings(Some(model_ref(provider, id))),
+                defaults,
+                "{provider}/{id} must not match"
+            );
+        }
+    }
+
+    /// "keeps enabled global and preserves overrides when saving the
+    /// toggle" — `enabled` inside an override entry is ignored, and
+    /// `setCompactionEnabled` writes only `compaction.enabled` (the
+    /// `modelOverrides` object rides along untouched).
+    #[test]
+    fn test_compaction_model_overrides_enabled_stays_global() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"compaction": {"modelOverrides": {
+                MODEL_KEY: {"enabled": false, "reserveTokens": 400000},
+            }}}),
+        );
+        let mut manager = create(&dirs);
+        let model = model_ref("provider", "family/model");
+        assert!(manager.get_compaction_settings(Some(model)).enabled);
+        manager.set_compaction_enabled(false);
+        manager.reload();
+        assert_eq!(
+            manager.get_compaction_settings(Some(model)),
+            CompactionConfig {
+                enabled: false,
+                reserve_tokens: 400000,
+                keep_recent_tokens: 20000
+            }
+        );
+    }
+
+    /// "accepts zero in ordinary settings and model overrides".
+    #[test]
+    fn test_compaction_model_overrides_accept_zero() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"compaction": {"reserveTokens": 0, "keepRecentTokens": 0}}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_compaction_settings(Some(model_ref("provider", "family/model"))),
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 0,
+                keep_recent_tokens: 0
+            }
+        );
+        write_json(
+            &project_path(&dirs),
+            json!({"compaction": {
+                "reserveTokens": 1000,
+                "keepRecentTokens": 1000,
+                "modelOverrides": {MODEL_KEY: {"reserveTokens": 0, "keepRecentTokens": 0}},
+            }}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_compaction_settings(Some(model_ref("provider", "family/model"))),
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 0,
+                keep_recent_tokens: 0
+            }
+        );
+    }
+
+    /// Invalid token values / malformed entries: upstream's #8133
+    /// safe-integer and object checks throw (settings-manager-compaction.
+    /// test.ts "reports invalid token values"); the port keeps the
+    /// module-level wrong-type deviation — wrongly-typed values fall
+    /// through to the next tier (override → ordinary → default) instead of
+    /// erroring, and malformed entries are ignored. Valid files behave
+    /// identically. Numbers keep the established `value_u64` coercion
+    /// (Math.floor semantics; negatives saturate to 0) — the same handling
+    /// the ordinary compaction settings had before #8133.
+    #[test]
+    fn test_compaction_model_overrides_invalid_values_fall_back() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"compaction": {
+                "reserveTokens": 8192,
+                "modelOverrides": {MODEL_KEY: {
+                    "reserveTokens": "400000",
+                    "keepRecentTokens": -5,
+                }},
+            }}),
+        );
+        let manager = create(&dirs);
+        let model = model_ref("provider", "family/model");
+        // String override falls through to ordinary (8192); the negative
+        // number clamps to 0 (saturating cast, same as ordinary settings).
+        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 8192);
+        assert_eq!(manager.get_compaction_keep_recent_tokens(Some(model)), 0);
+
+        // Malformed entry (not an object) ignored entirely.
+        write_json(
+            &global_path(&dirs),
+            json!({"compaction": {
+                "reserveTokens": 8192,
+                "modelOverrides": {MODEL_KEY: 42},
+            }}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 8192);
+
+        // Invalid ordinary value + valid override → the override wins
+        // (upstream throws; the port's tiered fallback resolves forward).
+        write_json(
+            &global_path(&dirs),
+            json!({"compaction": {
+                "reserveTokens": "oops",
+                "modelOverrides": {MODEL_KEY: {"reserveTokens": 4096}},
+            }}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 4096);
+        assert_eq!(manager.get_compaction_reserve_tokens(None), 16384);
     }
 
     // =======================================================================

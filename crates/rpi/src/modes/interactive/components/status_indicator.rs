@@ -1,6 +1,8 @@
 //! Status indicators — port of
 //! `packages/coding-agent/src/modes/interactive/components/status-indicator.ts`
-//! @ pi 0.82.1 (2efa728).
+//! @ pi 0.82.1 (2efa728), with the border-slice methods on the base struct
+//! per c1d4c8011 (working/compaction/summarization/retry all embed in the
+//! editor border).
 //!
 //! Intentional differences:
 //! - The theme is passed explicitly (`Arc<Theme>`) instead of read from the
@@ -13,9 +15,13 @@
 //! - `WorkingIndicatorOptions` (the extension-provided spinner options,
 //!   status-indicator.ts:18) maps to `LoaderIndicatorOptions`; the
 //!   constructor here keeps upstream's default (default frames).
+//! - The editor border hosts indicators through [`SharedStatusIndicator`]
+//!   (upstream shares the `StatusIndicator` base object itself,
+//!   custom-editor.ts:24-26 @ c1d4c8011).
 
 use std::sync::{Arc, Mutex};
 
+use rpi_tui::components::editor::BorderStatusProvider;
 use rpi_tui::components::loader::{Loader, LoaderIndicatorOptions};
 use rpi_tui::tui::{Component, RenderHandle};
 use rpi_tui::utils::truncate_to_width;
@@ -74,7 +80,22 @@ impl StatusIndicator {
         self.loader.get_rendered_indicator()
     }
 
-    /// `dispose` (status-indicator.ts:24-26).
+    /// `renderInBorder` (status-indicator.ts:24-27 @ c1d4c8011, lifted from
+    /// `WorkingStatusIndicator`): the loader's text line (leading margin
+    /// stripped, trailing padding trimmed), truncated to `width`.
+    pub fn render_in_border(&self, width: usize) -> String {
+        let line = self.render(width + 2).get(1).cloned().unwrap_or_default();
+        let trimmed = line.strip_prefix(' ').unwrap_or(&line);
+        truncate_to_width(trimmed.trim_end(), width, "", false)
+    }
+
+    /// `renderSpinnerInBorder` (status-indicator.ts:29-31 @ c1d4c8011):
+    /// spinner only.
+    pub fn render_spinner_in_border(&self, width: usize) -> String {
+        truncate_to_width(&self.get_rendered_indicator(), width, "", false)
+    }
+
+    /// `dispose` (status-indicator.ts:33-35).
     pub fn dispose(&mut self) {
         self.loader.stop();
     }
@@ -178,23 +199,16 @@ impl WorkingStatusIndicator {
         }
     }
 
-    /// `renderInBorder` (status-indicator.ts:44-47 @ 9841914): the loader's
-    /// text line (leading margin stripped, trailing padding trimmed),
-    /// truncated to `width`.
+    /// `renderInBorder` (inherited from the base `StatusIndicator` since
+    /// c1d4c8011; previously status-indicator.ts:44-47 @ 9841914).
     pub fn render_in_border(&self, width: usize) -> String {
-        let line = self
-            .inner
-            .render(width + 2)
-            .get(1)
-            .cloned()
-            .unwrap_or_default();
-        let trimmed = line.strip_prefix(' ').unwrap_or(&line);
-        truncate_to_width(trimmed.trim_end(), width, "", false)
+        self.inner.render_in_border(width)
     }
 
-    /// `renderSpinnerInBorder` (status-indicator.ts:49-51): spinner only.
+    /// `renderSpinnerInBorder` (inherited from the base `StatusIndicator`
+    /// since c1d4c8011).
     pub fn render_spinner_in_border(&self, width: usize) -> String {
-        truncate_to_width(&self.inner.get_rendered_indicator(), width, "", false)
+        self.inner.render_spinner_in_border(width)
     }
 
     pub fn dispose(&mut self) {
@@ -203,8 +217,7 @@ impl WorkingStatusIndicator {
 }
 // No direct `BorderStatusProvider` impl: `Loader`'s render cache is a
 // `RefCell` (`Send` but not `Sync`); the shared form used by the editor
-// border is the `Arc<Mutex<WorkingStatusIndicator>>` adapter in
-// custom_editor.rs.
+// border is [`SharedStatusIndicator`] below.
 
 impl Component for WorkingStatusIndicator {
     fn render(&self, width: usize) -> Vec<String> {
@@ -213,6 +226,73 @@ impl Component for WorkingStatusIndicator {
 
     fn invalidate(&mut self) {
         self.inner.invalidate();
+    }
+}
+
+/// `SharedStatusIndicator` (custom-editor.ts:24-26 @ c1d4c8011): the shared
+/// form every status-indicator kind hands to the editor border — upstream
+/// passes the `StatusIndicator` base object itself; the port wraps the
+/// mode-owned `Arc<Mutex<…>>` handles (render/invalidate lock through
+/// them, same contract as the former `SharedWorkingStatus` adapter).
+pub enum SharedStatusIndicator {
+    Working(Arc<Mutex<WorkingStatusIndicator>>),
+    Retry(Arc<Mutex<RetryStatusIndicator>>),
+    Compaction(Arc<Mutex<CompactionStatusIndicator>>),
+    BranchSummary(Arc<Mutex<BranchSummaryStatusIndicator>>),
+}
+
+impl Clone for SharedStatusIndicator {
+    fn clone(&self) -> Self {
+        match self {
+            SharedStatusIndicator::Working(indicator) => {
+                SharedStatusIndicator::Working(Arc::clone(indicator))
+            }
+            SharedStatusIndicator::Retry(indicator) => {
+                SharedStatusIndicator::Retry(Arc::clone(indicator))
+            }
+            SharedStatusIndicator::Compaction(indicator) => {
+                SharedStatusIndicator::Compaction(Arc::clone(indicator))
+            }
+            SharedStatusIndicator::BranchSummary(indicator) => {
+                SharedStatusIndicator::BranchSummary(Arc::clone(indicator))
+            }
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl BorderStatusProvider for SharedStatusIndicator {
+    fn render_in_border(&self, width: usize) -> String {
+        match self {
+            SharedStatusIndicator::Working(indicator) => lock(indicator).render_in_border(width),
+            SharedStatusIndicator::Retry(indicator) => lock(indicator).render_in_border(width),
+            SharedStatusIndicator::Compaction(indicator) => lock(indicator).render_in_border(width),
+            SharedStatusIndicator::BranchSummary(indicator) => {
+                lock(indicator).render_in_border(width)
+            }
+        }
+    }
+
+    fn render_spinner_in_border(&self, width: usize) -> String {
+        match self {
+            SharedStatusIndicator::Working(indicator) => {
+                lock(indicator).render_spinner_in_border(width)
+            }
+            SharedStatusIndicator::Retry(indicator) => {
+                lock(indicator).render_spinner_in_border(width)
+            }
+            SharedStatusIndicator::Compaction(indicator) => {
+                lock(indicator).render_spinner_in_border(width)
+            }
+            SharedStatusIndicator::BranchSummary(indicator) => {
+                lock(indicator).render_spinner_in_border(width)
+            }
+        }
     }
 }
 
@@ -271,6 +351,22 @@ impl RetryStatusIndicator {
             loader,
             countdown: Some(countdown),
         }
+    }
+
+    /// `renderInBorder` (base-class inheritance, c1d4c8011): the loader's
+    /// text line via the shared loader lock.
+    pub fn render_in_border(&self, width: usize) -> String {
+        let line = self.render(width + 2).get(1).cloned().unwrap_or_default();
+        let trimmed = line.strip_prefix(' ').unwrap_or(&line);
+        truncate_to_width(trimmed.trim_end(), width, "", false)
+    }
+
+    /// `renderSpinnerInBorder` (base-class inheritance, c1d4c8011).
+    pub fn render_spinner_in_border(&self, width: usize) -> String {
+        let Ok(loader) = self.loader.lock() else {
+            return String::new();
+        };
+        truncate_to_width(&loader.get_rendered_indicator(), width, "", false)
     }
 
     /// `dispose` (status-indicator.ts:67-71).
@@ -344,6 +440,16 @@ impl CompactionStatusIndicator {
         }
     }
 
+    /// `renderInBorder` / `renderSpinnerInBorder` (base-class
+    /// inheritance, c1d4c8011).
+    pub fn render_in_border(&self, width: usize) -> String {
+        self.inner.render_in_border(width)
+    }
+
+    pub fn render_spinner_in_border(&self, width: usize) -> String {
+        self.inner.render_spinner_in_border(width)
+    }
+
     pub fn dispose(&mut self) {
         self.inner.dispose();
     }
@@ -386,6 +492,16 @@ impl BranchSummaryStatusIndicator {
                 None,
             ),
         }
+    }
+
+    /// `renderInBorder` / `renderSpinnerInBorder` (base-class
+    /// inheritance, c1d4c8011).
+    pub fn render_in_border(&self, width: usize) -> String {
+        self.inner.render_in_border(width)
+    }
+
+    pub fn render_spinner_in_border(&self, width: usize) -> String {
+        self.inner.render_spinner_in_border(width)
     }
 
     pub fn dispose(&mut self) {

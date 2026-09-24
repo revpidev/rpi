@@ -25,7 +25,7 @@ use rpi_tui::keybindings::get_keybindings;
 use rpi_tui::tui::{Component, Focusable, TuiMouseEvent, TuiMouseHandlerResult};
 use rpi_tui::tui_handle::TuiHandle;
 
-use crate::modes::interactive::components::WorkingStatusIndicator;
+use crate::modes::interactive::components::SharedStatusIndicator;
 
 /// App-action handler (upstream `() => void`).
 pub type ActionHandler = Box<dyn FnMut() + Send>;
@@ -38,10 +38,11 @@ pub type ExtensionShortcutHandler = Box<dyn FnMut(&str) -> bool + Send>;
 /// `CustomEditor` (custom-editor.ts:7-79 @ 9841914).
 pub struct CustomEditor {
     editor: Editor,
-    /// `embedWorkingStatus` (custom-editor.ts:16-18, 1d9787c11): render the
-    /// streaming working status in the editor's top border. Opt-in; the
-    /// default editor passes `true`, custom editors keep the standalone
-    /// status row (interactive-mode.ts:561).
+    /// `embedWorkingStatus` (custom-editor.ts:16-18, 1d9787c11): render
+    /// working, compaction, summarization, and retry status in the editor's
+    /// top border (c1d4c8011). Opt-in; the default editor passes `true`,
+    /// custom editors keep the standalone status row
+    /// (interactive-mode.ts:561).
     embed_working_status: bool,
     /// App action handlers, keyed by `app.*` keybinding id
     /// (`actionHandlers`, custom-editor.ts:9).
@@ -82,15 +83,13 @@ impl CustomEditor {
         self.embed_working_status
     }
 
-    /// `setWorkingStatusIndicator` (custom-editor.ts:24-26 @ 9841914):
-    /// install/clear the working status rendered in the top border. Editors
-    /// that did not opt in never host it (upstream gates at render time on
-    /// `embedWorkingStatus`; the port gates at set time — equivalent since
-    /// the flag never changes after construction).
-    pub fn set_working_status_indicator(
-        &mut self,
-        indicator: Option<Arc<Mutex<WorkingStatusIndicator>>>,
-    ) {
+    /// `setWorkingStatusIndicator` (custom-editor.ts:26-28 @ c1d4c8011):
+    /// install/clear the status spinner rendered in the top border — any
+    /// indicator kind (working/compaction/summarization/retry) may host
+    /// here. Editors that did not opt in never host it (upstream gates at
+    /// render time on `embedWorkingStatus`; the port gates at set time —
+    /// equivalent since the flag never changes after construction).
+    pub fn set_working_status_indicator(&mut self, indicator: Option<SharedStatusIndicator>) {
         if !self.embed_working_status {
             // Not opted in: never host the indicator (plain border), the
             // set-time equivalent of upstream's render-time
@@ -98,8 +97,7 @@ impl CustomEditor {
             self.editor.set_border_status(None);
             return;
         }
-        let provider = indicator.map(SharedWorkingStatus);
-        self.editor.set_border_status(provider.map(|shared| {
+        self.editor.set_border_status(indicator.map(|shared| {
             let provider: Arc<dyn BorderStatusProvider> = Arc::new(shared);
             provider
         }));
@@ -277,27 +275,10 @@ impl CustomEditor {
     }
 }
 
-/// `CustomEditorRegion` adapter: shares the working status with the inner
-/// editor's border rendering ([`BorderStatusProvider`] for the mode-owned
-/// `Arc<Mutex<WorkingStatusIndicator>>`; upstream shares the indicator
-/// object itself, custom-editor.ts:24-26).
-struct SharedWorkingStatus(Arc<Mutex<WorkingStatusIndicator>>);
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-impl BorderStatusProvider for SharedWorkingStatus {
-    fn render_in_border(&self, width: usize) -> String {
-        lock(&self.0).render_in_border(width)
-    }
-
-    fn render_spinner_in_border(&self, width: usize) -> String {
-        lock(&self.0).render_spinner_in_border(width)
-    }
-}
+// The editor border's [`BorderStatusProvider`] for the mode-owned
+// indicator handles is [`SharedStatusIndicator`] (status_indicator.rs,
+// custom-editor.ts:24-26 @ c1d4c8011 — upstream shares the `StatusIndicator`
+// base object with the editor).
 
 /// Tree entry for a shared [`CustomEditor`]: the TUI owns this wrapper while
 /// the interactive mode keeps the concrete `Arc<Mutex<CustomEditor>>` for
@@ -480,13 +461,22 @@ mod tests {
                 Arc::clone(&theme),
             ),
         ));
-        lock_editor(&editor).set_working_status_indicator(Some(Arc::clone(&indicator)));
+        lock_editor(&editor).set_working_status_indicator(Some(
+            crate::modes::interactive::components::SharedStatusIndicator::Working(Arc::clone(
+                &indicator,
+            )),
+        ));
         let region = CustomEditorRegion::new(Arc::clone(&editor));
         let lines = Component::render(&region, 20);
         assert_eq!(strip_ansi(&lines[0]), "─".repeat(20), "plain border");
         // The standalone row still renders with the default accent/muted
         // colors (upstream asserts the accent and muted fg codes).
-        let standalone = Component::render(&*lock(&indicator), 20);
+        let standalone = Component::render(
+            &*indicator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            20,
+        );
         let joined = standalone.join("\n");
         assert!(
             joined.contains(theme.get_fg_ansi("accent")),
@@ -532,7 +522,9 @@ mod tests {
                 }),
             ),
         ));
-        lock_editor(&editor).set_working_status_indicator(Some(indicator));
+        lock_editor(&editor).set_working_status_indicator(Some(
+            crate::modes::interactive::components::SharedStatusIndicator::Working(indicator),
+        ));
 
         let region = CustomEditorRegion::new(Arc::clone(&editor));
         let lines = Component::render(&region, 20);
@@ -547,6 +539,118 @@ mod tests {
             4,
             "border runs + spinner + label"
         );
+    }
+
+    /// Port of "embeds compaction, summary, and retry labels within the
+    /// border width" (status-indicator.test.ts @ c1d4c8011): every
+    /// indicator kind embeds in the opted-in editor's top border, the
+    /// border width is preserved at every clamp width, and clearing the
+    /// slot restores the plain border.
+    #[test]
+    fn embeds_compaction_summary_and_retry_labels_within_border_width() {
+        let _guard = KEYBINDINGS_LOCK.lock().unwrap();
+        install_keybindings();
+        let tui = TuiHandle::from_main(TuiMainScreen::new(Box::new(
+            super::super::test_support::TestTerminal::new(),
+        )));
+        let theme = dark_theme();
+        let editor = Arc::new(Mutex::new(CustomEditor::new(
+            tui.clone(),
+            editor_theme_with(&theme),
+            EditorOptions::default(),
+            true,
+        )));
+        let render_handle = rpi_tui::tui::RenderHandle::new(|| {});
+        // Labels per the indicator constructors (cancel hints resolved by
+        // the default keybinding table); the border prefix includes the
+        // frame-0 spinner (⠋), as in the upstream `── ${label} ` slice.
+        let indicators: Vec<(
+            &str,
+            crate::modes::interactive::components::SharedStatusIndicator,
+        )> = vec![
+            (
+                "Compacting context... (escape to cancel)",
+                crate::modes::interactive::components::SharedStatusIndicator::Compaction(
+                    Arc::new(Mutex::new(
+                        crate::modes::interactive::components::CompactionStatusIndicator::new(
+                            render_handle.clone(),
+                            crate::modes::interactive::components::CompactionStatusReason::Manual,
+                            Arc::clone(&theme),
+                        ),
+                    )),
+                ),
+            ),
+            (
+                "Auto-compacting... (escape to cancel)",
+                crate::modes::interactive::components::SharedStatusIndicator::Compaction(
+                    Arc::new(Mutex::new(
+                        crate::modes::interactive::components::CompactionStatusIndicator::new(
+                            render_handle.clone(),
+                            crate::modes::interactive::components::CompactionStatusReason::Threshold,
+                            Arc::clone(&theme),
+                        ),
+                    )),
+                ),
+            ),
+            (
+                "Context overflow detected, Auto-compacting... (escape to cancel)",
+                crate::modes::interactive::components::SharedStatusIndicator::Compaction(
+                    Arc::new(Mutex::new(
+                        crate::modes::interactive::components::CompactionStatusIndicator::new(
+                            render_handle.clone(),
+                            crate::modes::interactive::components::CompactionStatusReason::Overflow,
+                            Arc::clone(&theme),
+                        ),
+                    )),
+                ),
+            ),
+            (
+                "Summarizing branch... (escape to cancel)",
+                crate::modes::interactive::components::SharedStatusIndicator::BranchSummary(
+                    Arc::new(Mutex::new(
+                        crate::modes::interactive::components::BranchSummaryStatusIndicator::new(
+                            render_handle.clone(),
+                            Arc::clone(&theme),
+                        ),
+                    )),
+                ),
+            ),
+            (
+                "Retrying (1/3) in 10s... (escape to cancel)",
+                crate::modes::interactive::components::SharedStatusIndicator::Retry(Arc::new(
+                    Mutex::new(crate::modes::interactive::components::RetryStatusIndicator::new(
+                        render_handle.clone(),
+                        1,
+                        3,
+                        10_000,
+                        Arc::clone(&theme),
+                    )),
+                )),
+            ),
+        ];
+
+        let region = CustomEditorRegion::new(Arc::clone(&editor));
+        for (label, shared) in &indicators {
+            lock_editor(&editor).set_working_status_indicator(Some(shared.clone()));
+            let lines = Component::render(&region, 120);
+            assert!(
+                strip_ansi(&lines[0]).contains(&format!("── ⠋ {label} ")),
+                "{label}: {}",
+                strip_ansi(&lines[0])
+            );
+            for width in [1, 4, 10, 20, 80, 120] {
+                let top = &Component::render(&region, width)[0];
+                assert_eq!(
+                    rpi_tui::utils::visible_width(top),
+                    width,
+                    "{label} @{width}"
+                );
+            }
+        }
+
+        lock_editor(&editor).set_working_status_indicator(None);
+        let plain = &Component::render(&region, 120)[0];
+        assert_eq!(strip_ansi(plain), "─".repeat(120));
     }
 
     #[test]

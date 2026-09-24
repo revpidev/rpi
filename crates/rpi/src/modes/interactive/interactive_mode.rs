@@ -117,8 +117,8 @@ use crate::modes::interactive::components::user_message_selector::UserMessageSel
 use crate::modes::interactive::components::{
     dynamic_border::DynamicBorder, tool_execution::ToolResultState, BashExecutionComponent,
     BranchSummaryMessageComponent, CompactionSummaryMessageComponent, CustomEntryComponent,
-    CustomMessageComponent, SkillInvocationMessageComponent, ToolExecutionComponent,
-    ToolExecutionOptions, ToolResultContentLoose, UserMessageComponent,
+    CustomMessageComponent, SharedStatusIndicator, SkillInvocationMessageComponent,
+    ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, UserMessageComponent,
 };
 use crate::modes::interactive::custom_editor::{CustomEditor, CustomEditorRegion, EscapeHandler};
 use crate::modes::interactive::footer::{FooterComponent, FooterDataProvider};
@@ -802,19 +802,29 @@ struct StreamingTrack {
 }
 
 /// The status container's active indicator (upstream `activeStatusIndicator`
-/// and `idleStatus`; `Idle` renders nothing). The working variant tracks
-/// whether it is embedded in the editor border
-/// (`activeWorkingIndicatorEmbedded`, interactive-mode.ts:407 @ 9841914,
-/// 1d9787c11): embedded indicators render nothing in the status row.
+/// and `idleStatus`; `Idle` renders nothing). Since c1d4c8011 every kind
+/// tracks whether it is embedded in the editor border (upstream
+/// `activeWorkingIndicatorEmbedded`, interactive-mode.ts:407 — the name
+/// predates the all-kinds embedding): embedded indicators render nothing in
+/// the status row, and the editor border hosts the shared handle.
 enum ActiveStatus {
     Idle,
     Working {
         indicator: Arc<Mutex<WorkingStatusIndicator>>,
         embedded: bool,
     },
-    Retry(RetryStatusIndicator),
-    Compaction(CompactionStatusIndicator),
-    BranchSummary(BranchSummaryStatusIndicator),
+    Retry {
+        indicator: Arc<Mutex<RetryStatusIndicator>>,
+        embedded: bool,
+    },
+    Compaction {
+        indicator: Arc<Mutex<CompactionStatusIndicator>>,
+        embedded: bool,
+    },
+    BranchSummary {
+        indicator: Arc<Mutex<BranchSummaryStatusIndicator>>,
+        embedded: bool,
+    },
 }
 
 impl ActiveStatus {
@@ -822,9 +832,29 @@ impl ActiveStatus {
         match self {
             ActiveStatus::Idle => None,
             ActiveStatus::Working { .. } => Some(StatusIndicatorKind::Working),
-            ActiveStatus::Retry(_) => Some(StatusIndicatorKind::Retry),
-            ActiveStatus::Compaction(_) => Some(StatusIndicatorKind::Compaction),
-            ActiveStatus::BranchSummary(_) => Some(StatusIndicatorKind::BranchSummary),
+            ActiveStatus::Retry { .. } => Some(StatusIndicatorKind::Retry),
+            ActiveStatus::Compaction { .. } => Some(StatusIndicatorKind::Compaction),
+            ActiveStatus::BranchSummary { .. } => Some(StatusIndicatorKind::BranchSummary),
+        }
+    }
+
+    /// The shared handle for the editor border slot (upstream passes the
+    /// `StatusIndicator` object itself; `Idle` has none).
+    fn shared(&self) -> Option<SharedStatusIndicator> {
+        match self {
+            ActiveStatus::Idle => None,
+            ActiveStatus::Working { indicator, .. } => {
+                Some(SharedStatusIndicator::Working(Arc::clone(indicator)))
+            }
+            ActiveStatus::Retry { indicator, .. } => {
+                Some(SharedStatusIndicator::Retry(Arc::clone(indicator)))
+            }
+            ActiveStatus::Compaction { indicator, .. } => {
+                Some(SharedStatusIndicator::Compaction(Arc::clone(indicator)))
+            }
+            ActiveStatus::BranchSummary { indicator, .. } => {
+                Some(SharedStatusIndicator::BranchSummary(Arc::clone(indicator)))
+            }
         }
     }
 
@@ -832,9 +862,9 @@ impl ActiveStatus {
         match self {
             ActiveStatus::Idle => {}
             ActiveStatus::Working { indicator, .. } => lock(indicator).dispose(),
-            ActiveStatus::Retry(indicator) => indicator.dispose(),
-            ActiveStatus::Compaction(indicator) => indicator.dispose(),
-            ActiveStatus::BranchSummary(indicator) => indicator.dispose(),
+            ActiveStatus::Retry { indicator, .. } => lock(indicator).dispose(),
+            ActiveStatus::Compaction { indicator, .. } => lock(indicator).dispose(),
+            ActiveStatus::BranchSummary { indicator, .. } => lock(indicator).dispose(),
         }
     }
 }
@@ -845,15 +875,27 @@ impl Component for ActiveStatus {
             ActiveStatus::Idle => Vec::new(),
             // The embedded indicator lives in the editor's top border; the
             // status row stays empty (showStatusIndicator,
-            // interactive-mode.ts:2101-2106).
-            ActiveStatus::Working { embedded: true, .. } => Vec::new(),
+            // interactive-mode.ts:2180-2188).
             ActiveStatus::Working {
                 indicator,
                 embedded: false,
             } => lock(indicator).render(width),
-            ActiveStatus::Retry(indicator) => indicator.render(width),
-            ActiveStatus::Compaction(indicator) => indicator.render(width),
-            ActiveStatus::BranchSummary(indicator) => indicator.render(width),
+            ActiveStatus::Retry {
+                indicator,
+                embedded: false,
+            } => lock(indicator).render(width),
+            ActiveStatus::Compaction {
+                indicator,
+                embedded: false,
+            } => lock(indicator).render(width),
+            ActiveStatus::BranchSummary {
+                indicator,
+                embedded: false,
+            } => lock(indicator).render(width),
+            ActiveStatus::Working { embedded: true, .. }
+            | ActiveStatus::Retry { embedded: true, .. }
+            | ActiveStatus::Compaction { embedded: true, .. }
+            | ActiveStatus::BranchSummary { embedded: true, .. } => Vec::new(),
         }
     }
 
@@ -861,10 +903,23 @@ impl Component for ActiveStatus {
         match self {
             ActiveStatus::Idle => {}
             ActiveStatus::Working { indicator, .. } => lock(indicator).invalidate(),
-            ActiveStatus::Retry(indicator) => indicator.invalidate(),
-            ActiveStatus::Compaction(indicator) => indicator.invalidate(),
-            ActiveStatus::BranchSummary(indicator) => indicator.invalidate(),
+            ActiveStatus::Retry { indicator, .. } => lock(indicator).invalidate(),
+            ActiveStatus::Compaction { indicator, .. } => lock(indicator).invalidate(),
+            ActiveStatus::BranchSummary { indicator, .. } => lock(indicator).invalidate(),
         }
+    }
+}
+
+/// Write the `embedded` flag on any indicator variant (`showStatusIndicator`
+/// decides it after the editor opt-in probe; upstream mutates
+/// `activeWorkingIndicatorEmbedded` instead, interactive-mode.ts:2183).
+fn set_embedded(status: &mut ActiveStatus, embedded: bool) {
+    match status {
+        ActiveStatus::Idle => {}
+        ActiveStatus::Working { embedded: slot, .. }
+        | ActiveStatus::Retry { embedded: slot, .. }
+        | ActiveStatus::Compaction { embedded: slot, .. }
+        | ActiveStatus::BranchSummary { embedded: slot, .. } => *slot = embedded,
     }
 }
 
@@ -1933,16 +1988,14 @@ impl InteractiveUi {
             }
             UiCommand::ThinkingLevelChanged(level) => {
                 // thinking_level_changed (interactive-mode.ts:2900-2903 @
-                // 9841914, 1d9787c11): refresh the footer, re-tint the editor
-                // border and invalidate the working indicator so its
-                // spinner/label re-render in the new border color.
+                // 9841914, 1d9787c11; c1d4c8011 widened the invalidation to
+                // every active indicator): refresh the footer, re-tint the
+                // editor border and invalidate the active spinner so it
+                // re-renders in the new border color.
                 let _ = level;
                 Component::invalidate(&mut *lock(&self.footer));
                 self.update_editor_border_color();
-                let mut status = lock(&self.status);
-                if status.kind() == Some(StatusIndicatorKind::Working) {
-                    status.invalidate();
-                }
+                lock(&self.status).invalidate();
             }
             UiCommand::MessageStart(message) => {
                 // message_start (interactive-mode.ts:2905-2926).
@@ -2171,13 +2224,15 @@ impl InteractiveUi {
                     session.abort_compaction();
                 }));
                 drop(editor);
-                self.show_status_indicator(ActiveStatus::Compaction(
-                    CompactionStatusIndicator::new(
+                self.show_status_indicator(ActiveStatus::Compaction {
+                    indicator: Arc::new(Mutex::new(CompactionStatusIndicator::new(
                         self.render_handle.clone(),
                         compaction_status_reason(reason),
                         Arc::clone(&lock(&self.theme)),
-                    ),
-                ));
+                    ))),
+                    // `showStatusIndicator` decides the final embed state.
+                    embedded: false,
+                });
                 self.render_handle.request_render();
             }
             UiCommand::CompactionEnd {
@@ -2271,13 +2326,17 @@ impl InteractiveUi {
                     session.abort_retry();
                 }));
                 drop(editor);
-                self.show_status_indicator(ActiveStatus::Retry(RetryStatusIndicator::new(
-                    self.render_handle.clone(),
-                    attempt,
-                    max_attempts,
-                    delay_ms,
-                    Arc::clone(&lock(&self.theme)),
-                )));
+                self.show_status_indicator(ActiveStatus::Retry {
+                    indicator: Arc::new(Mutex::new(RetryStatusIndicator::new(
+                        self.render_handle.clone(),
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        Arc::clone(&lock(&self.theme)),
+                    ))),
+                    // `showStatusIndicator` decides the final embed state.
+                    embedded: false,
+                });
                 self.render_handle.request_render();
             }
             UiCommand::AutoRetryEnd {
@@ -2308,13 +2367,17 @@ impl InteractiveUi {
             } => {
                 // summarization_retry_scheduled (interactive-mode.ts:3150-3157).
                 self.show_error(&error_message);
-                self.show_status_indicator(ActiveStatus::Retry(RetryStatusIndicator::new(
-                    self.render_handle.clone(),
-                    attempt,
-                    max_attempts,
-                    delay_ms,
-                    Arc::clone(&lock(&self.theme)),
-                )));
+                self.show_status_indicator(ActiveStatus::Retry {
+                    indicator: Arc::new(Mutex::new(RetryStatusIndicator::new(
+                        self.render_handle.clone(),
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        Arc::clone(&lock(&self.theme)),
+                    ))),
+                    // `showStatusIndicator` decides the final embed state.
+                    embedded: false,
+                });
                 self.render_handle.request_render();
             }
             UiCommand::SummarizationRetryAttemptStart(source) => {
@@ -2322,21 +2385,27 @@ impl InteractiveUi {
                 self.clear_status_indicator(Some(StatusIndicatorKind::Retry));
                 match source {
                     RetrySource::BranchSummary => {
-                        self.show_status_indicator(ActiveStatus::BranchSummary(
-                            BranchSummaryStatusIndicator::new(
+                        self.show_status_indicator(ActiveStatus::BranchSummary {
+                            indicator: Arc::new(Mutex::new(BranchSummaryStatusIndicator::new(
                                 self.render_handle.clone(),
                                 Arc::clone(&lock(&self.theme)),
-                            ),
-                        ));
+                            ))),
+                            // `showStatusIndicator` decides the final embed
+                            // state.
+                            embedded: false,
+                        });
                     }
                     RetrySource::Compaction { reason } => {
-                        self.show_status_indicator(ActiveStatus::Compaction(
-                            CompactionStatusIndicator::new(
+                        self.show_status_indicator(ActiveStatus::Compaction {
+                            indicator: Arc::new(Mutex::new(CompactionStatusIndicator::new(
                                 self.render_handle.clone(),
                                 compaction_status_reason(reason),
                                 Arc::clone(&lock(&self.theme)),
-                            ),
-                        ));
+                            ))),
+                            // `showStatusIndicator` decides the final embed
+                            // state.
+                            embedded: false,
+                        });
                     }
                 }
                 self.render_handle.request_render();
@@ -2823,47 +2892,37 @@ impl InteractiveUi {
         ui.show_selector(entry);
     }
 
-    /// `setEditorWorkingStatusIndicator` (interactive-mode.ts:2094-2099
-    /// @ 9841914): clear the default editor's slot, then install on the
-    /// active editor if it embeds the working status. The port's only
+    /// `setEditorWorkingStatusIndicator` (interactive-mode.ts:2173-2178 @
+    /// c1d4c8011): clear the default editor's slot, then install on the
+    /// active editor if it embeds the status spinners. The port's only
     /// `CustomEditor` is the default editor (extension editor trees replace
     /// the container content but are declarative, never `CustomEditor`
     /// subclasses), so the embed decision is its `embed_working_status`
     /// flag — mirrors upstream's `isWorkingStatusEditor(this.editor)`.
     fn set_editor_working_status_indicator(
         &self,
-        indicator: Option<&Arc<Mutex<WorkingStatusIndicator>>>,
+        indicator: Option<SharedStatusIndicator>,
     ) -> bool {
-        lock(&self.editor).set_working_status_indicator(indicator.cloned());
+        lock(&self.editor).set_working_status_indicator(indicator);
         lock(&self.editor).embed_working_status()
     }
 
-    /// `showStatusIndicator` (interactive-mode.ts:2092-2107 @ 9841914): the
-    /// working indicator embeds into the editor border when possible; the
-    /// status row only hosts what is not embedded.
-    fn show_status_indicator(&self, indicator: ActiveStatus) {
-        let indicator = match indicator {
-            ActiveStatus::Working { indicator, .. } => {
-                let embedded = self.set_editor_working_status_indicator(Some(&indicator));
-                ActiveStatus::Working {
-                    indicator,
-                    embedded,
-                }
-            }
-            other => {
-                self.set_editor_working_status_indicator(None);
-                other
-            }
-        };
+    /// `showStatusIndicator` (interactive-mode.ts:2180-2190 @ c1d4c8011):
+    /// every indicator kind first tries the editor border; the status row
+    /// only hosts what is not embedded.
+    fn show_status_indicator(&self, mut indicator: ActiveStatus) {
+        let embedded = self.set_editor_working_status_indicator(indicator.shared());
+        set_embedded(&mut indicator, embedded);
         let mut status = lock(&self.status);
         status.dispose();
         *status = indicator;
     }
 
-    /// `clearStatusIndicator` (interactive-mode.ts:2109-2126 @ 9841914):
-    /// dispose, clear the editor slot too (embedded or not), and — the
-    /// idle-status re-add branch is a no-op here because `Idle` renders
-    /// nothing (rpi reserves no status-row height; see the v0.1 baseline).
+    /// `clearStatusIndicator` (interactive-mode.ts:2192-2210 @ c1d4c8011):
+    /// dispose, clear the editor slot too (embedded or not — every kind may
+    /// be embedded since c1d4c8011), and — the idle-status re-add branch is
+    /// a no-op here because `Idle` renders nothing (rpi reserves no
+    /// status-row height; see the v0.1 baseline).
     fn clear_status_indicator(&self, kind: Option<StatusIndicatorKind>) {
         let mut status = lock(&self.status);
         if let Some(kind) = kind {
@@ -6640,6 +6699,116 @@ mod tests {
         let _ = terminal;
     }
 
+    /// Port of "routes every status through the editor opt-in" + "does not
+    /// reserve separate status height for an embedded <kind> indicator"
+    /// (interactive-tui.test.ts @ c1d4c8011): every indicator kind —
+    /// working, compaction (manual/threshold/overflow), branch summary,
+    /// retry — embeds into the default editor's top border (the mode's only
+    /// editor always opts in) and renders nothing in the standalone status
+    /// row; clearing any kind also clears the editor slot.
+    #[tokio::test]
+    async fn routes_every_status_kind_through_the_editor_border() {
+        fn strip_ansi(input: &str) -> String {
+            let mut out = String::with_capacity(input.len());
+            let mut chars = input.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let theme = Arc::clone(&lock(&ui.theme));
+        let render_handle = ui.render_handle.clone();
+
+        let compaction = |reason: CompactionStatusReason| ActiveStatus::Compaction {
+            indicator: Arc::new(Mutex::new(CompactionStatusIndicator::new(
+                render_handle.clone(),
+                reason,
+                Arc::clone(&theme),
+            ))),
+            embedded: false,
+        };
+        let indicators = || {
+            vec![
+                (
+                    StatusIndicatorKind::Compaction,
+                    "Auto-compacting...",
+                    compaction(CompactionStatusReason::Threshold),
+                ),
+                (
+                    StatusIndicatorKind::Compaction,
+                    "Compacting context...",
+                    compaction(CompactionStatusReason::Manual),
+                ),
+                (
+                    StatusIndicatorKind::Compaction,
+                    "Context overflow detected, Auto-compacting...",
+                    compaction(CompactionStatusReason::Overflow),
+                ),
+                (
+                    StatusIndicatorKind::BranchSummary,
+                    "Summarizing branch...",
+                    ActiveStatus::BranchSummary {
+                        indicator: Arc::new(Mutex::new(BranchSummaryStatusIndicator::new(
+                            render_handle.clone(),
+                            Arc::clone(&theme),
+                        ))),
+                        embedded: false,
+                    },
+                ),
+                (
+                    StatusIndicatorKind::Retry,
+                    "Retrying (1/3) in 10s...",
+                    ActiveStatus::Retry {
+                        indicator: Arc::new(Mutex::new(RetryStatusIndicator::new(
+                            render_handle.clone(),
+                            1,
+                            3,
+                            10_000,
+                            Arc::clone(&theme),
+                        ))),
+                        embedded: false,
+                    },
+                ),
+            ]
+        };
+
+        for (kind, label, indicator) in indicators() {
+            ui.show_status_indicator(indicator);
+            // Embedded: the mode's only editor opts in, so every kind lands
+            // in the border and the status row renders nothing.
+            let embedded = match &*lock(&ui.status) {
+                ActiveStatus::Working { embedded, .. }
+                | ActiveStatus::Retry { embedded, .. }
+                | ActiveStatus::Compaction { embedded, .. }
+                | ActiveStatus::BranchSummary { embedded, .. } => *embedded,
+                ActiveStatus::Idle => panic!("indicator not shown"),
+            };
+            assert!(embedded, "{kind:?} must embed in the editor border");
+            assert!(Component::render(&*lock(&ui.status), 60).is_empty());
+            let region = CustomEditorRegion::new(Arc::clone(&ui.editor));
+            let border = strip_ansi(&Component::render(&region, 100)[0]);
+            assert!(border.contains(label), "{kind:?} border: {border:?}");
+
+            // Clearing the kind disposes it and restores the plain border.
+            ui.clear_status_indicator(Some(kind));
+            assert!(matches!(*lock(&ui.status), ActiveStatus::Idle));
+            let plain = strip_ansi(&Component::render(&region, 100)[0]);
+            assert_eq!(plain, "─".repeat(100), "border must reset for {kind:?}");
+        }
+    }
+
     /// 1d9787c11 port: the working indicator embeds in the default editor's
     /// top border ("Working" label, thinking-level border color) and the
     /// status row renders nothing while embedded.
@@ -6749,7 +6918,7 @@ mod tests {
         ui.push(UiCommand::CompactionStart(CompactionReason::Threshold));
         ui.drain_events();
         assert!(
-            matches!(*lock(&ui.status), ActiveStatus::Compaction(_)),
+            matches!(*lock(&ui.status), ActiveStatus::Compaction { .. }),
             "compaction status shown"
         );
         assert!(lock(&ui.auto_compaction_escape_handler).is_some());
@@ -7033,7 +7202,7 @@ mod tests {
             error_message: "boom".to_string(),
         });
         ui.drain_events();
-        assert!(matches!(*lock(&ui.status), ActiveStatus::Retry(_)));
+        assert!(matches!(*lock(&ui.status), ActiveStatus::Retry { .. }));
         assert!(lock(&ui.retry_escape_handler).is_some());
 
         ui.push(UiCommand::AutoRetryEnd {
@@ -7068,13 +7237,13 @@ mod tests {
             error_message: "summarize failed".to_string(),
         });
         ui.drain_events();
-        assert!(matches!(*lock(&ui.status), ActiveStatus::Retry(_)));
+        assert!(matches!(*lock(&ui.status), ActiveStatus::Retry { .. }));
         ui.push(UiCommand::SummarizationRetryAttemptStart(
             RetrySource::BranchSummary,
         ));
         ui.drain_events();
         assert!(
-            matches!(*lock(&ui.status), ActiveStatus::BranchSummary(_)),
+            matches!(*lock(&ui.status), ActiveStatus::BranchSummary { .. }),
             "branch summary indicator"
         );
         ui.push(UiCommand::SummarizationRetryFinished);
@@ -7084,7 +7253,7 @@ mod tests {
         // interactive-mode.ts:1858-1861) — the indicator stays until the
         // next status event.
         assert!(
-            matches!(*lock(&ui.status), ActiveStatus::BranchSummary(_)),
+            matches!(*lock(&ui.status), ActiveStatus::BranchSummary { .. }),
             "branch summary indicator remains (upstream kind-mismatch quirk)"
         );
     }
