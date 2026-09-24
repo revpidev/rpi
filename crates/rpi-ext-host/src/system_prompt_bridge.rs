@@ -11,11 +11,12 @@
 //!
 //! The algorithm mirrors upstream `buildSystemPrompt` +
 //! `buildSystemPromptSections` section-for-section (preamble + tagged
-//! sections joined by blank lines, custom sections replaced by name); two
-//! documented gaps remain versus the host builder: the `docs` section (rpi
-//! bundled-doc paths live only in the host crate) and per-tool guideline
-//! merging (the host pre-merges `toolGuidelines` into `promptGuidelines`).
-//! Both only affect the chained visibility render, never the request.
+//! sections joined by blank lines, custom sections replaced by name); one
+//! documented gap remains versus the host builder: the `docs` section (rpi
+//! bundled-doc paths live only in the host crate). Per-tool guideline
+//! merging is NOT a gap — `build_rules` below consumes `toolGuidelines`
+//! per selected tool, mirroring the host builder (#9548).
+//! The gap only affects the chained visibility render, never the request.
 //!
 //! Merge note (runner boundary): handler-returned options merge key-level;
 //! the three map fields (`sections`/`toolSnippets`/`toolGuidelines`) merge

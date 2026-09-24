@@ -350,14 +350,14 @@ fn test_catalog_zai_tool_stream_baked() {
 }
 
 #[test]
-fn test_catalog_kimi_deferred_tools_baked() {
+fn test_catalog_kimi_mid_convo_tool_additions() {
     let k3 = get_builtin_model("moonshotai", "kimi-k3").expect("kimi-k3");
     let compat = k3.compat.as_ref().expect("compat");
     // Post-#9548 catalog shape (9e05370b2): the Kimi deferred-tools face is
     // carried as mid-conversation system/tool-addition support instead of
-    // `deferredToolsMode` (which left the catalog; the resolved-compat
-    // default stays Kimi-mode for the adapter). Wire-side convergence:
-    // V15-06 (T-V15-02-1).
+    // `deferredToolsMode` (which left the catalog AND the resolved compat —
+    // detection defaults to false; the catalog carries the flags
+    // explicitly). Wire-side convergence: V15-06 (T-V15-02-1).
     assert_eq!(compat.supports_mid_convo_system_messages, Some(true));
     assert_eq!(compat.supports_mid_convo_tool_additions, Some(true));
     assert_eq!(

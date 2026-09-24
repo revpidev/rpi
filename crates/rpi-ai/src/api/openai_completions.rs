@@ -158,8 +158,9 @@ pub fn get_tools_by_name(tools: Option<&[Tool]>, names: &[String]) -> Vec<Tool> 
 // Compat detection and resolution
 // ---------------------------------------------------------------------------
 
-/// `Required<OpenAICompletionsCompat>` with `cacheControlFormat` and
-/// `deferredToolsMode` kept optional (upstream `ResolvedOpenAICompletionsCompat`).
+/// `Required<OpenAICompletionsCompat>` with `cacheControlFormat` kept
+/// optional (upstream `ResolvedOpenAICompletionsCompat`; the old
+/// `deferredToolsMode` optional left with #9548).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedOpenAICompletionsCompat {
     pub supports_store: bool,

@@ -828,6 +828,57 @@ async fn throws_when_continue_called_while_streaming() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn continue_run_rejects_system_only_transcript() {
+    // Upstream e2e.test.ts:270-281 (agent.ts:382-384): a transcript holding
+    // only the leading system declaration has nothing to continue from —
+    // the Agent layer rejects before a run starts, so no error turn is
+    // synthesized and the transcript is left untouched.
+    let provider = faux_provider();
+    let mut options = AgentOptions::new(provider.stream_fn());
+    options.initial_state = InitialAgentState {
+        system_prompt: Some("Test".to_owned()),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+
+    let error = agent
+        .continue_run()
+        .await
+        .expect_err("system-only transcript must be rejected");
+    assert_eq!(error.to_string(), "No messages to continue from");
+
+    let state = agent.state();
+    assert_eq!(state.messages.len(), 1, "no error turn synthesized");
+    assert!(matches!(state.messages[0], AgentMessage::System(_)));
+    assert_eq!(provider.call_count(), 0, "no request was made");
+
+    // The reset() shape hits the same guard: the transcript restarts from
+    // the replayed prompt baseline ([system]) — nothing to continue from.
+    agent.set_messages(vec![
+        AgentMessage::System(rpi_ai::types::SystemMessage {
+            role: Default::default(),
+            content: rpi_ai::types::SystemContent::Text("Test".to_owned()),
+            sections: None,
+            tools_added: None,
+            tools_removed: None,
+            timestamp: 0,
+        }),
+        user_message("Initial"),
+        AgentMessage::Assistant(assistant_text("Initial response")),
+    ]);
+    agent.reset().expect("reset with idle agent");
+    let error = agent
+        .continue_run()
+        .await
+        .expect_err("reset baseline must be rejected");
+    assert_eq!(error.to_string(), "No messages to continue from");
+    let state = agent.state();
+    assert_eq!(state.messages.len(), 1, "still only the system baseline");
+    assert!(matches!(state.messages[0], AgentMessage::System(_)));
+    assert_eq!(provider.call_count(), 0, "no request was made");
+}
+
+#[tokio::test]
 async fn continue_processes_queued_follow_up_after_assistant_turn() {
     let provider = faux_provider();
     provider.set_responses(vec![text_response("Processed")]);

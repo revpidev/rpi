@@ -1650,7 +1650,7 @@ impl AgentSession {
         self.rebuild_system_prompt(&valid_names);
     }
 
-    /// `_rebuildSystemPrompt` (agent-session.ts:1108-1141 @ #9548): rebuild
+    /// `_rebuildSystemPrompt` (agent-session.ts:1113-1137 @ #9548): rebuild
     /// the **base** prompt options from the resource loader + tool registry.
     /// Returns the built prompt text (rendered exactly as the transcript's
     /// system message replays it) for callers that display it.
@@ -1664,13 +1664,17 @@ impl AgentSession {
                 .collect();
             // Snippets/guidelines ride the (possibly extension-overridden)
             // definitions — overrides do NOT inherit the built-in text
-            // (agent-session.ts:2489-2503). Guidelines stay keyed per tool
-            // (#9548 `toolGuidelines`): the rules section re-derives them
-            // for the CURRENT selected set on every build.
+            // (agent-session.ts:2489-2503). Both maps cover EVERY registered
+            // definition (agent-session.ts:1116 iterates the full registry,
+            // :1135 takes the entire guideline map): a handler that injects
+            // a registered-but-inactive tool into `selectedTools` must still
+            // get its `<tools>` line / `<rules>` bullets rendered from the
+            // base options. `selectedTools` stays filtered to the valid set;
+            // `build_rules` re-derives lines for the CURRENT selected set on
+            // every build (#9548 `toolGuidelines`).
             let mut tool_snippets: HashMap<String, String> = HashMap::new();
             let mut tool_guidelines: HashMap<String, Vec<String>> = HashMap::new();
-            for name in &valid {
-                let entry = definitions.get(name).expect("filtered above");
+            for (name, entry) in definitions.iter() {
                 if let Some(snippet) = &entry.prompt_snippet {
                     tool_snippets.insert(name.clone(), snippet.clone());
                 }

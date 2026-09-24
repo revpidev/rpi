@@ -689,9 +689,11 @@ impl Agent {
         .await
     }
 
-    /// Continue from the current transcript (agent.ts:349-377, upstream
-    /// `continue()`). The last message must be a user or tool-result message;
-    /// with an assistant tail the steering queue is drained first (skipping
+    /// Continue from the current transcript (agent.ts:377-404, upstream
+    /// `continue()`). The last message must be a user or tool-result message
+    /// (a system-only transcript — e.g. right after `reset()` — is rejected
+    /// with `"No messages to continue from"`, agent.ts:382-384); with an
+    /// assistant tail the steering queue is drained first (skipping
     /// the initial steering poll), then the follow-up queue.
     pub async fn continue_run(&self) -> Result<(), AgentError> {
         if lock(&self.active_run).is_some() {
@@ -700,7 +702,25 @@ impl Agent {
             ));
         }
 
-        let last_message = lock(&self.state).messages.last().cloned();
+        let last_message = {
+            let messages = &lock(&self.state).messages;
+            // #9548 (agent.ts:382-384): a transcript holding only system
+            // messages (e.g. right after `reset()`) has nothing to continue
+            // from either — rejected here, before a run starts, so no error
+            // turn is synthesized. `all` is vacuously true on an empty
+            // transcript, mirroring upstream's `every`.
+            if messages
+                .iter()
+                .all(|message| matches!(message, AgentMessage::System(_)))
+            {
+                return Err(AgentError::Message(
+                    "No messages to continue from".to_owned(),
+                ));
+            }
+            messages.last().cloned()
+        };
+        // Unreachable in practice (the guard above rejects empty); kept to
+        // satisfy exhaustiveness — upstream's redundant `!lastMessage`.
         let Some(last_message) = last_message else {
             return Err(AgentError::Message(
                 "No messages to continue from".to_owned(),

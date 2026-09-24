@@ -169,6 +169,25 @@ async fn session_fixture(
     host: Arc<NativeExtensionHost>,
     custom_tools: Vec<Arc<dyn AgentTool>>,
 ) -> SessionFixture {
+    // Default shape: the custom tools are the strict allowlist AND the
+    // active set.
+    let active_tools: Vec<String> = custom_tools
+        .iter()
+        .map(|tool| tool.name().to_owned())
+        .collect();
+    session_fixture_with_tools(responses, host, custom_tools, Some(active_tools)).await
+}
+
+/// `session_fixture` with an explicit tool config: `tools: None` leaves the
+/// allowlist open (every built-in registers) with the default active set
+/// (read/bash/edit/write) — registered-but-inactive built-ins (grep, …)
+/// stay available for handler injection.
+async fn session_fixture_with_tools(
+    responses: Vec<FauxResponseStep>,
+    host: Arc<NativeExtensionHost>,
+    custom_tools: Vec<Arc<dyn AgentTool>>,
+    tools: Option<Vec<String>>,
+) -> SessionFixture {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
@@ -227,16 +246,12 @@ async fn session_fixture(
         .expect("in-memory session"),
     ));
 
-    let active_tools: Vec<String> = custom_tools
-        .iter()
-        .map(|tool| tool.name().to_owned())
-        .collect();
     let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
         cwd: Some(cwd),
         agent_dir: Some(agent_dir),
         model_runtime: Some(model_runtime),
         model: Some(model),
-        tools: Some(active_tools),
+        tools,
         custom_tools,
         services: Some(services.clone()),
         session_manager: Some(session_manager),
@@ -1086,5 +1101,85 @@ async fn w2_before_agent_start_partial_options_replacement_keeps_tools() {
     assert!(
         cwd_section.contains("/tmp/"),
         "cwd section keeps the real path through the merge: {cwd_section}"
+    );
+}
+
+/// Review V15-06 P2-2 (agent-session.ts:1116/:1136): the base options'
+/// `toolSnippets`/`toolGuidelines` maps must cover EVERY registered
+/// definition, not just the active set — a handler that injects a
+/// registered-but-inactive tool (`grep`) into `selectedTools` gets its
+/// `<tools>` line rendered from the base maps. Negative control: with
+/// active-set-only maps the grep line is missing and this test fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w2_selected_tools_edit_renders_registered_inactive_tool_snippet() {
+    let host = host_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_BEFORE_AGENT_START, |_event| {
+            Ok(json!({
+                "systemPromptOptions": {"selectedTools": ["read", "grep"]}
+            }))
+        });
+    })])
+    .await;
+
+    // Capture the tool names the request declares.
+    let request_tools: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = request_tools.clone();
+    let tools_step = FauxResponseStep::Factory(Box::new(
+        move |context: &rpi_ai::types::TranscriptContext, _options, _state, _model| {
+            let names = rpi_ai::utils::transcript::get_current_tools(&context.messages)
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(names);
+            faux_assistant_message("done", FauxAssistantOptions::default())
+        },
+    ));
+    // `tools: None` — every built-in registers (allowlist open), the
+    // default active set is read/bash/edit/write; grep stays registered
+    // but inactive until the handler injects it.
+    let fixture = session_fixture_with_tools(vec![tools_step], Arc::new(host), vec![], None).await;
+    fixture
+        .session
+        .prompt("hello", rpi::core::agent_session::PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    // The handler-edited loadout won (edit ≠ base [read,bash,edit,write]).
+    let captured = request_tools
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].as_slice(),
+        ["read", "grep"],
+        "handler-edited selectedTools drive the request loadout"
+    );
+
+    // The declared prompt renders the injected tool's snippet line — the
+    // base maps carry every registered definition's snippet.
+    let declared_tools = fixture
+        .session
+        .messages()
+        .into_iter()
+        .filter_map(|message| match message {
+            rpi_agent::messages::AgentMessage::System(system) => {
+                system.section("tools").flatten().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        declared_tools.contains("- grep: Search file contents for patterns"),
+        "<tools> section renders the injected tool's line: {declared_tools}"
+    );
+    assert!(
+        declared_tools.contains("- read: "),
+        "active read tool still rendered: {declared_tools}"
     );
 }

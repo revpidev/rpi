@@ -103,11 +103,12 @@ fn convert_source_info(info: &ext::ExtSourceInfo) -> SourceInfo {
     }
 }
 
-/// `wrapRegisteredTool` (wrapper.ts:17-37): adapt a host-registered tool
+/// `wrapRegisteredTool` (wrapper.ts:17-23): adapt a host-registered tool
 /// into an `AgentTool` — execution runs the extension's `execute` with the
-/// host context, and tools activated during execution surface via
-/// `addedToolNames` (pure additions only; a removal falls back to the full
-/// next-turn set upstream computes elsewhere).
+/// host context (runner's `createContext`, consistent across tools and
+/// event handlers). #9548 removed the old `addedToolNames` attachment —
+/// tool-loadout changes now ride transcript system messages declared by
+/// the agent loop's next `declare_tool_changes`.
 pub struct HostToolAdapter {
     host: Arc<NativeExtensionHost>,
     definition: ext::ToolDefinition,

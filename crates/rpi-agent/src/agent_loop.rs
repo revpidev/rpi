@@ -454,14 +454,10 @@ pub fn agent_loop_continue(
 }
 
 fn validate_continuation(context: &AgentContext) -> Result<(), AgentError> {
-    // #9548 (agent.ts:382-384): a transcript holding only system messages
-    // has nothing to continue from either.
-    let only_system = !context.messages.is_empty()
-        && context
-            .messages
-            .iter()
-            .all(|message| matches!(message, AgentMessage::System(_)));
-    if context.messages.is_empty() || only_system {
+    // The all-system guard lives in `Agent::continue_run`
+    // (agent.ts:382-384), not here — the loop layer only checks the
+    // empty/assistant-tail shape (agent-loop.ts:71-78/:131-139).
+    if context.messages.is_empty() {
         return Err(AgentError::Message(
             "Cannot continue: no messages in context".to_owned(),
         ));

@@ -1123,6 +1123,71 @@ mod tests {
             .all(|item| item["type"] != json!("tool_search_output")));
     }
 
+    /// #9548 (transcript-tool-changes.test.ts:262, payload level): with a
+    /// removal in the history, an addition-anchoring transport cannot
+    /// replay — the request `tools` field carries the complete CURRENT
+    /// state, no `additional_tools` item is emitted, and the update folds
+    /// into a second developer message (full section replay).
+    #[test]
+    fn test_build_params_removal_history_falls_back_to_complete_tool_state() {
+        // Upstream shared `context` fixture: base prompt with sections +
+        // toolsAdded; later update removes base_tool and adds late_tool.
+        let ctx = crate::utils::transcript::normalize_context(&crate::types::Context {
+            system_prompt: None,
+            messages: vec![
+                crate::types::Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("base prompt".to_owned()),
+                    sections: Some(serde_json::Map::from_iter([
+                        ("rules".to_owned(), json!("<rules>\nold rules\n</rules>")),
+                        ("docs".to_owned(), json!("<docs>\nread docs\n</docs>")),
+                    ])),
+                    tools_added: Some(vec![common::tool("base_tool")]),
+                    tools_removed: None,
+                    timestamp: 0,
+                }),
+                common::user_text("before"),
+                crate::types::Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("updated guidance".to_owned()),
+                    sections: Some(serde_json::Map::from_iter([
+                        ("rules".to_owned(), json!("<rules>\nnew rules\n</rules>")),
+                        ("docs".to_owned(), serde_json::Value::Null),
+                    ])),
+                    tools_added: Some(vec![common::tool("late_tool")]),
+                    tools_removed: Some(vec![crate::types::ToolReference {
+                        name: "base_tool".to_owned(),
+                    }]),
+                    timestamp: 2,
+                }),
+            ],
+            tools: None,
+        });
+
+        // Both capabilities present (:262 model): mid-convo system messages
+        // + additional_tools — the removal still forces the fallback.
+        let m = model(
+            json!({"compat": {"supportsMidConvoSystemMessages": true, "supportsAdditionalTools": true}}),
+        );
+        let params = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
+        // Complete current state in the request field.
+        assert_eq!(top_level_tool_names(&params), vec!["late_tool"]);
+        let input = params["input"].as_array().expect("input");
+        // No anchored additions.
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("additional_tools")));
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("tool_search_call")));
+        // Leading prompt + folded update = exactly two developer messages.
+        let developer_count = input
+            .iter()
+            .filter(|item| item["role"] == json!("developer") && item.get("type").is_none())
+            .count();
+        assert_eq!(developer_count, 2, "input: {input:?}");
+    }
+
     // -- client headers ---------------------------------------------------------
 
     #[test]
