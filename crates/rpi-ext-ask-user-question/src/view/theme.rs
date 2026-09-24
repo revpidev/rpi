@@ -192,12 +192,9 @@ mod tests {
     #[test]
     fn paint_helpers_emit_sgr_and_plain_passthrough() {
         let theme = Theme::dark();
-        assert_eq!(theme.accent("x"), format!("\u{1b}[38;5;109mx\u{1b}[0m"));
-        assert_eq!(
-            theme.accent_bold("x"),
-            format!("\u{1b}[1;38;5;109mx\u{1b}[0m")
-        );
-        assert_eq!(theme.bold("x"), format!("\u{1b}[1;38;5;252mx\u{1b}[0m"));
+        assert_eq!(theme.accent("x"), "\u{1b}[38;5;109mx\u{1b}[0m");
+        assert_eq!(theme.accent_bold("x"), "\u{1b}[1;38;5;109mx\u{1b}[0m");
+        assert_eq!(theme.bold("x"), "\u{1b}[1;38;5;252mx\u{1b}[0m");
         assert!(theme.selected("x").starts_with("\u{1b}[38;5;252;48;5;237m"));
     }
 }

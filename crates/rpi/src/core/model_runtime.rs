@@ -276,7 +276,10 @@ impl CredentialSynchronizationOperation {
 
 /// `CredentialSynchronizationError` (model-runtime.ts:94-111): the
 /// credential mutation committed successfully but the local model/auth
-/// snapshot could not be synchronized.
+/// snapshot could not be synchronized. Larger than clippy's 128-byte
+/// `result_large_err` threshold because it carries the full
+/// [`Credential`] for error reporting — a rare path, so the affected
+/// functions `#[allow]` the lint instead of boxing.
 #[derive(Debug)]
 pub struct CredentialSynchronizationError {
     pub provider_id: String,
@@ -1790,6 +1793,7 @@ impl ModelRuntime {
     /// same provider run strictly in arrival order without dropping updates.
     /// Upstream chains JS Promises; Rust uses `tokio::sync::Mutex` which
     /// provides the same guarantee.
+    #[allow(clippy::result_large_err)]
     async fn enqueue_credential_operation(
         self: &Arc<Self>,
         provider_id: &str,
@@ -1803,6 +1807,7 @@ impl ModelRuntime {
     /// `synchronizeCredentialState` (model-runtime.ts:514-534): recompose the
     /// provider, run a scoped refresh, update the snapshot, and refresh
     /// availability. Any failure is wrapped in `CredentialSynchronizationError`.
+    #[allow(clippy::result_large_err)]
     async fn synchronize_credential_state(
         &self,
         provider_id: &str,
@@ -1817,6 +1822,7 @@ impl ModelRuntime {
     /// (model-runtime.ts:514-534): the interaction's cancellation token
     /// (from login) is combined with the refresh timeout to produce a bounded
     /// refresh signal.
+    #[allow(clippy::result_large_err)]
     async fn synchronize_credential_state_with_signal(
         &self,
         provider_id: &str,
@@ -1875,6 +1881,7 @@ impl ModelRuntime {
     /// `setRuntimeApiKey` (model-runtime.ts:536-547, commit d2be68dbe et al.):
     /// non-persistent runtime override (the `--api-key` CLI path), serialized
     /// per-provider and followed by credential synchronization.
+    #[allow(clippy::result_large_err)]
     pub async fn set_runtime_api_key(
         self: &Arc<Self>,
         provider_id: &str,
@@ -1908,6 +1915,7 @@ impl ModelRuntime {
     }
 
     /// `removeRuntimeApiKey` (model-runtime.ts:549-555).
+    #[allow(clippy::result_large_err)]
     pub async fn remove_runtime_api_key(
         self: &Arc<Self>,
         provider_id: &str,
@@ -1997,6 +2005,7 @@ impl ModelRuntime {
 
     /// `logout` (model-runtime.ts:682-688): remove the stored credential,
     /// serialized per-provider, followed by credential synchronization.
+    #[allow(clippy::result_large_err)]
     pub async fn logout(
         self: &Arc<Self>,
         provider_id: &str,

@@ -1332,8 +1332,7 @@ pub fn execute_search(
         tool: ToolMetadata,
         score: i64,
     }
-    let matches: Vec<MatchItem>;
-    if regex_mode {
+    let matches: Vec<MatchItem> = if regex_mode {
         // JS `query.length` counts UTF-16 units.
         if query.encode_utf16().count() > MAX_REGEX_SEARCH_QUERY_LENGTH {
             return text_result(
@@ -1399,7 +1398,7 @@ pub fn execute_search(
                 }
             }
         }
-        matches = found;
+        found
     } else if query.trim().is_empty() {
         let Some(server) = server else {
             return text_result(
@@ -1422,17 +1421,17 @@ pub fn execute_search(
             })
             .collect();
         found.sort_by(|a, b| a.tool.name.cmp(&b.tool.name));
-        matches = found;
+        found
     } else {
-        matches = rank_tool_matches(&search_state, query, server, true)
+        rank_tool_matches(&search_state, query, server, true)
             .into_iter()
             .map(|m| MatchItem {
                 server: m.server,
                 tool: m.tool,
                 score: m.score,
             })
-            .collect();
-    }
+            .collect()
+    };
 
     let page = paginate(&matches, offset.unwrap_or(0), limit.unwrap_or(12));
     if page.total == 0 {

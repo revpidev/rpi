@@ -688,7 +688,7 @@ mod tests {
             &outputs,
             &chain_dir,
         );
-        assert_eq!(text, format!("CONTEXT | T | P | /tmp/chain"));
+        assert_eq!(text, "CONTEXT | T | P | /tmp/chain");
     }
 
     #[test]

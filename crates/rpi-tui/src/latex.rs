@@ -2074,44 +2074,43 @@ impl<'a> LatexParser<'a> {
             })
             .collect();
 
-        let lines: Vec<String>;
-        if environment == "array" || environment == "matrix" || environment == "smallmatrix" {
-            lines = rows;
-        } else {
-            let delimiter: Option<[&str; 6]> = match environment {
-                "pmatrix" => Some(["⎛", "⎞", "⎜", "⎟", "⎝", "⎠"]),
-                "bmatrix" => Some(["⎡", "⎤", "⎢", "⎥", "⎣", "⎦"]),
-                "Bmatrix" => Some(["⎧", "⎫", "⎨", "⎬", "⎩", "⎭"]),
-                "vmatrix" => Some(["│", "│", "│", "│", "│", "│"]),
-                "Vmatrix" => Some(["║", "║", "║", "║", "║", "║"]),
-                _ => None,
+        let lines: Vec<String> =
+            if environment == "array" || environment == "matrix" || environment == "smallmatrix" {
+                rows
+            } else {
+                let delimiter: Option<[&str; 6]> = match environment {
+                    "pmatrix" => Some(["⎛", "⎞", "⎜", "⎟", "⎝", "⎠"]),
+                    "bmatrix" => Some(["⎡", "⎤", "⎢", "⎥", "⎣", "⎦"]),
+                    "Bmatrix" => Some(["⎧", "⎫", "⎨", "⎬", "⎩", "⎭"]),
+                    "vmatrix" => Some(["│", "│", "│", "│", "│", "│"]),
+                    "Vmatrix" => Some(["║", "║", "║", "║", "║", "║"]),
+                    _ => None,
+                };
+                let Some(delimiter) = delimiter else {
+                    self.supported = false;
+                    return rows.join("\n");
+                };
+                rows.iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let left = if index == 0 {
+                            delimiter[0]
+                        } else if index == rows.len() - 1 {
+                            delimiter[4]
+                        } else {
+                            delimiter[2]
+                        };
+                        let right = if index == 0 {
+                            delimiter[1]
+                        } else if index == rows.len() - 1 {
+                            delimiter[5]
+                        } else {
+                            delimiter[3]
+                        };
+                        format!("{left} {row} {right}")
+                    })
+                    .collect()
             };
-            let Some(delimiter) = delimiter else {
-                self.supported = false;
-                return rows.join("\n");
-            };
-            lines = rows
-                .iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    let left = if index == 0 {
-                        delimiter[0]
-                    } else if index == rows.len() - 1 {
-                        delimiter[4]
-                    } else {
-                        delimiter[2]
-                    };
-                    let right = if index == 0 {
-                        delimiter[1]
-                    } else if index == rows.len() - 1 {
-                        delimiter[5]
-                    } else {
-                        delimiter[3]
-                    };
-                    format!("{left} {row} {right}")
-                })
-                .collect();
-        }
 
         if lines.len() <= 1 {
             return lines.first().cloned().unwrap_or_default();

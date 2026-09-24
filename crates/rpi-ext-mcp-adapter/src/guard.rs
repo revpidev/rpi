@@ -1085,7 +1085,7 @@ mod tests {
         // The 4 KiB total budget: many 100-B fields stop being preserved.
         let mut many = serde_json::Map::new();
         for i in 0..80 {
-            many.insert(format!("k{i:02}"), json!(format!("{}", "v".repeat(90))));
+            many.insert(format!("k{i:02}"), json!("v".repeat(90)));
         }
         let summarized = summarize_structured_content(&Value::Object(many));
         let preserved = summarized["preservedFields"].as_object().expect("object");

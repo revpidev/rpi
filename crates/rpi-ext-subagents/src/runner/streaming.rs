@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(bounded.len(), MAX_STREAMED_RECENT_TOOLS);
         assert_eq!(bounded[0]["tool"], json!("tool8"));
 
-        state.recent_output = vec![format!("{}", "x".repeat(2500))];
+        state.recent_output = vec!["x".repeat(2500)];
         let bounded = bound_streamed_recent_output(&state);
         assert!(bounded[0]
             .as_str()
