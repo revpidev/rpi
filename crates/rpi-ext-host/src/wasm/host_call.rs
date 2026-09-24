@@ -214,7 +214,11 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     parameters: definition
                         .get("parameters")
                         .cloned()
-                        .unwrap_or_else(|| json!({"type": "object"})),
+                        // Missing/non-object schemas are rejected by
+                        // `register_tool` (loader.ts:289-293, `acaa253cc` /
+                        // #9300) instead of silently defaulting — pass the
+                        // raw value (Null when absent) through.
+                        .unwrap_or(Value::Null),
                     constrained_sampling: definition.get("constrainedSampling").cloned(),
                     render_shell: str_arg(&definition, "renderShell").map(str::to_owned),
                     prepare_arguments: None,
@@ -356,7 +360,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     },
                     name,
                 })
-                .map_err(|e| ("stale", e.to_string()))?;
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
         }
 

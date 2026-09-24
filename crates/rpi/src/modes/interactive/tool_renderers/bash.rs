@@ -15,7 +15,8 @@
 //!   `request_render`; the elapsed line is recomputed from the shared timing
 //!   state at `render()` time, so the timer never touches the component.
 //! - `Date.now()` milliseconds become `Instant` durations; `formatDuration`
-//!   is `(ms/1000).toFixed(1)` in both.
+//!   matches the upstream renderer (toFixed(1) under a minute, minutes /
+//!   seconds / hours above, `fe219d7f8`).
 
 use std::cell::RefCell;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -96,15 +97,28 @@ impl Drop for TickerGuard {
     }
 }
 
-/// `formatDuration` (bash.ts:227-229): `(ms/1000).toFixed(1)`. Mirrors JS
-/// exactly: the duration is truncated to whole milliseconds first
-/// (`Date.now()` deltas are integers), and the tenths digit rounds half away
+/// `formatDuration` (renderers/bash.ts:33-41, `fe219d7f8` / #9628): under a
+/// minute stays `(ms/1000).toFixed(1)` — the tenths digit rounds half away
 /// from zero (`toFixed` picks the larger n on ties, e.g. 1250ms → `1.3s`;
-/// Rust's `{:.1}` would round ties to even).
+/// Rust's `{:.1}` would round ties to even) — while ≥1min durations render
+/// as minutes+seconds, adding hours past 59m. Mirrors JS: the duration is
+/// truncated to whole milliseconds first (`Date.now()` deltas are integers).
 fn format_duration(duration: Duration) -> String {
     let ms = duration.as_millis() as f64;
-    let tenths = (ms / 100.0).round();
-    format!("{:.1}s", tenths / 10.0)
+    let seconds = ms / 1000.0;
+    if seconds < 60.0 {
+        let tenths = (ms / 100.0).round();
+        return format!("{:.1}s", tenths / 10.0);
+    }
+
+    let total_seconds = seconds.floor() as u64;
+    let minutes = total_seconds / 60;
+    let remainder = total_seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {remainder}s");
+    }
+
+    format!("{}h {}m {remainder}s", minutes / 60, minutes % 60)
 }
 
 /// `formatBashCall` (bash.ts:231-237).
@@ -476,6 +490,33 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(50)), "0.1s");
         assert_eq!(format_duration(Duration::from_millis(0)), "0.0s");
         assert_eq!(format_duration(Duration::from_millis(999)), "1.0s");
+    }
+
+    /// #9628 (`fe219d7f8`, tool-execution-component.test.ts `test.each`):
+    /// keep short durations precise and make long shell durations readable —
+    /// minutes+seconds at ≥1min (note 59_999ms still renders the <60s
+    /// branch, where toFixed(1) lands on "60.0s"), hours past 59m.
+    #[test]
+    fn format_duration_supports_hours_minutes_seconds() {
+        let cases: &[(u128, &str)] = &[
+            (0, "0.0s"),
+            (4_200, "4.2s"),
+            (59_900, "59.9s"),
+            (59_999, "60.0s"),
+            (60_000, "1m 0s"),
+            (90_900, "1m 30s"),
+            (1_592_200, "26m 32s"),
+            (3_599_999, "59m 59s"),
+            (3_600_000, "1h 0m 0s"),
+            (7_384_900, "2h 3m 4s"),
+        ];
+        for (ms, formatted) in cases {
+            assert_eq!(
+                format_duration(Duration::from_millis(*ms as u64)),
+                *formatted,
+                "{ms}ms"
+            );
+        }
     }
 
     #[test]

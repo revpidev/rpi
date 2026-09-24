@@ -400,7 +400,7 @@ impl NativeExtensionHost {
         self.core().emit_tool_call(payload).await
     }
 
-    pub async fn emit_user_bash(&self, payload: Value) -> Option<Value> {
+    pub async fn emit_user_bash(&self, payload: Value) -> Result<Option<Value>, ExtensionError> {
         self.core().emit_user_bash(payload).await
     }
 

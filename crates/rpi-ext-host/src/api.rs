@@ -2245,12 +2245,21 @@ impl ExtensionApi {
 
     // -- registration (loader.ts:245-294) ------------------------------------
 
-    /// `pi.registerTool(tool)` (loader.ts:245-252). Same-extension
-    /// re-registration overwrites in place (JS `Map.set`); cross-extension
-    /// conflicts resolve at query time (runner.ts:447-457).
+    /// `pi.registerTool(tool)` (loader.ts:245-252, `acaa253cc` / #9300):
+    /// same-extension re-registration overwrites in place (JS `Map.set`);
+    /// cross-extension conflicts resolve at query time (runner.ts:447-457).
+    /// Tools without an object parameter schema are rejected at
+    /// registration instead of breaking provider request serialization
+    /// later.
     pub fn register_tool(&self, tool: ToolDefinition) -> Result<(), ExtError> {
         self.assert_api_active()?;
         self.runtime.assert_active()?;
+        if !tool.parameters.is_object() {
+            return Err(ExtError::Call(format!(
+                "Tool \"{}\" registered by extension \"{}\" must define an object parameter schema.",
+                tool.name, self.extension.path
+            )));
+        }
         self.extension.insert_tool(RegisteredTool {
             definition: tool,
             source_info: self.extension.source_info.clone(),

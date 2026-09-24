@@ -132,6 +132,27 @@ impl rpi_agent::types::AgentTool for HostToolAdapter {
         &self.definition.parameters
     }
 
+    fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
+        // `wrapToolDefinition` passes the definition's `constrainedSampling`
+        // through untouched (builtin-tool-strict-mode.test.ts, `fcff255b0`):
+        // re-registering a built-in name with `constrainedSampling: false`
+        // overrides the built-in strict-prefer default. `false | config`
+        // deserializes via the untagged `ConstrainedSampling` enum; values
+        // that fit neither shape fall back to the provider default (None)
+        // with a warning instead of failing tool registration.
+        let value = self.definition.constrained_sampling.clone()?;
+        match serde_json::from_value::<rpi_ai::types::ConstrainedSampling>(value) {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                tracing::warn!(
+                    "extension tool {} has an invalid constrainedSampling value: {error}",
+                    self.definition.name
+                );
+                None
+            }
+        }
+    }
+
     fn execution_mode(&self) -> Option<rpi_agent::types::ToolExecutionMode> {
         self.definition.execution_mode
     }
@@ -420,23 +441,32 @@ impl ExtensionRunner for ExtensionHostAdapter {
         command: &str,
         exclude_from_context: bool,
         cwd: &str,
-    ) -> Option<crate::tools::bash_executor::BashResult> {
+    ) -> Result<Option<crate::tools::bash_executor::BashResult>, String> {
         let payload = serde_json::json!({
             "type": ext::EVENT_USER_BASH,
             "command": command,
             "excludeFromContext": exclude_from_context,
             "cwd": cwd,
         });
-        let result = self.host.emit_user_bash(payload).await?;
-        if result.get("operations").is_some_and(|o| !o.is_null()) {
-            // Custom BashOperations are closure bundles upstream; they cannot
-            // cross the JSON dispatch boundary (candidate deviation, T15 W2).
-            tracing::warn!(
-                "user_bash extension returned custom operations; not supported by the rpi host, ignoring"
-            );
-        }
-        let replacement = result.get("result").cloned().filter(|r| !r.is_null())?;
-        Some(crate::tools::bash_executor::BashResult {
+        // Fail-closed (#9068): a handler error or invalid defined result
+        // surfaces as Err — the caller aborts without local execution; the
+        // runner already reported the error via onError.
+        let result = self
+            .host
+            .emit_user_bash(payload)
+            .await
+            .map_err(|error| error.error)?;
+        // Runner validation guarantees a defined result is the `result`
+        // branch: the `operations` closure bundle can never be valid over
+        // the JSON boundary (ADR-0007 gap 1), so the old drop-with-warning
+        // fallback is unreachable — such results now fail closed upstream
+        // of here.
+        let replacement =
+            result.and_then(|value| value.get("result").cloned().filter(|r| !r.is_null()));
+        let Some(replacement) = replacement else {
+            return Ok(None);
+        };
+        Ok(Some(crate::tools::bash_executor::BashResult {
             output: replacement
                 .get("output")
                 .and_then(Value::as_str)
@@ -458,7 +488,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
                 .get("fullOutputPath")
                 .and_then(Value::as_str)
                 .map(std::path::PathBuf::from),
-        })
+        }))
     }
 
     async fn emit_session_before_tree(&self) -> Option<SessionBeforeTreeResult> {

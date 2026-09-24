@@ -117,6 +117,11 @@ impl AgentTool for WriteTool {
         WRITE_PARAMS.get_or_init(write_parameters)
     }
 
+    fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
+        // write.ts:57 (`fcff255b0`): strict-prefer by default, no gate.
+        crate::tools::builtin_strict_prefer_sampling()
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,

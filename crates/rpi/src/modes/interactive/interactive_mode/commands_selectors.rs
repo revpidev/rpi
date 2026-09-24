@@ -2236,46 +2236,64 @@ impl InteractiveUi {
         let ui = self.upgrade_self();
         let render_handle = self.render_handle.clone();
         spawn_async(async move {
-            // `user_bash` extension interception (interactive-mode.ts:5931-5940):
-            // the first non-empty handler result wins; a full `result`
-            // replacement skips local execution entirely (:5942-5966).
+            // `user_bash` extension interception (interactive-mode.ts:6509-6524):
+            // a full `result` replacement skips local execution entirely;
+            // handler errors or invalid defined results **fail closed**
+            // (#9068, `509ee2bd0`) — no later handlers, no local execution
+            // (the runner already reported the error; upstream returns
+            // silently from the catch arm). Only `Ok(None)` falls through.
             let runner = session.extension_runner();
             if runner.has_handlers("user_bash") {
                 let cwd = session.cwd().to_owned();
-                if let Some(result) = runner
+                match runner
                     .emit_user_bash(&command, exclude_from_context, &cwd)
                     .await
                 {
-                    if !result.output.is_empty() {
-                        lock(&component).append_output(&result.output);
+                    Ok(Some(result)) => {
+                        if !result.output.is_empty() {
+                            lock(&component).append_output(&result.output);
+                        }
+                        lock(&component).set_complete(
+                            result.exit_code,
+                            result.cancelled,
+                            result.truncated.then(|| TruncationResult {
+                                content: result.output.clone(),
+                                truncated: true,
+                                truncated_by: None,
+                                total_lines: 0,
+                                total_bytes: 0,
+                                output_lines: 0,
+                                output_bytes: 0,
+                                last_line_partial: false,
+                                first_line_exceeds_limit: false,
+                                max_lines: 0,
+                                max_bytes: 0,
+                            }),
+                            result
+                                .full_output_path
+                                .as_ref()
+                                .map(|path| path.to_string_lossy().into_owned()),
+                        );
+                        session.record_bash_result(&command, &result, exclude_from_context);
+                        if let Some(ui) = &ui {
+                            *lock(&ui.bash_component) = None;
+                            ui.render_handle.request_render();
+                        }
+                        return;
                     }
-                    lock(&component).set_complete(
-                        result.exit_code,
-                        result.cancelled,
-                        result.truncated.then(|| TruncationResult {
-                            content: result.output.clone(),
-                            truncated: true,
-                            truncated_by: None,
-                            total_lines: 0,
-                            total_bytes: 0,
-                            output_lines: 0,
-                            output_bytes: 0,
-                            last_line_partial: false,
-                            first_line_exceeds_limit: false,
-                            max_lines: 0,
-                            max_bytes: 0,
-                        }),
-                        result
-                            .full_output_path
-                            .as_ref()
-                            .map(|path| path.to_string_lossy().into_owned()),
-                    );
-                    session.record_bash_result(&command, &result, exclude_from_context);
-                    if let Some(ui) = &ui {
-                        *lock(&ui.bash_component) = None;
-                        ui.render_handle.request_render();
+                    Ok(None) => {}
+                    Err(_) => {
+                        // Fail-closed: complete the mounted component with no
+                        // result and stop — never execute locally. The error
+                        // already surfaced through the runner's onError
+                        // listeners (extension error surface).
+                        lock(&component).set_complete(None, false, None, None);
+                        if let Some(ui) = &ui {
+                            *lock(&ui.bash_component) = None;
+                            ui.render_handle.request_render();
+                        }
+                        return;
                     }
-                    return;
                 }
             }
 

@@ -888,25 +888,146 @@ async fn runner_tool_call_handler_errors_propagate() {
 }
 
 // ---------------------------------------------------------------------------
-// user_bash (runner.ts:942-969)
+// user_bash (runner.ts:1042-1068, `509ee2bd0` / #9068 — fail-closed)
 // ---------------------------------------------------------------------------
 
+fn user_bash_event() -> Value {
+    json!({"type": ext::EVENT_USER_BASH, "command": "ls", "excludeFromContext": false, "cwd": "/x"})
+}
+
+/// Upstream "fails closed when a user_bash handler throws": the error is
+/// reported through onError and returned — later handlers never run and the
+/// caller must not fall back to local execution.
 #[tokio::test]
-async fn runner_user_bash_first_non_null_result_wins() {
+async fn runner_user_bash_handler_error_fails_closed() {
+    let later_ran = Arc::new(Mutex::new(false));
+    let later_ran_ext = Arc::clone(&later_ran);
     let host = host_with(vec![
         inline_ext("ext-a", |api| {
             api.on(
                 ext::EVENT_USER_BASH,
-                json_handler(|_| Err("ignored".to_owned())),
+                json_handler(|_| Err("Routing failed".to_owned())),
             )
             .unwrap();
+        }),
+        inline_ext("ext-b", move |api| {
+            let later_ran = Arc::clone(&later_ran_ext);
+            api.on(
+                ext::EVENT_USER_BASH,
+                json_handler(move |_| {
+                    *later_ran.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    Ok(Value::Null)
+                }),
+            )
+            .unwrap();
+        }),
+    ])
+    .await;
+    let errors = collect_errors(&host);
+
+    let error = host.emit_user_bash(user_bash_event()).await.unwrap_err();
+    assert_eq!(error.extension_path, "<inline:ext-a>");
+    assert_eq!(error.event, ext::EVENT_USER_BASH);
+    assert_eq!(error.error, "Routing failed");
+    // Later handlers were not invoked (fail-closed) and the error was
+    // reported through onError.
+    assert!(!*later_ran.lock().unwrap_or_else(|e| e.into_inner()));
+    let errors = errors.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].event, ext::EVENT_USER_BASH);
+    assert_eq!(errors[0].error, "Routing failed");
+}
+
+/// Upstream `fails closed when a user_bash handler returns %s` matrix:
+/// empty object / null operations / operations without exec / null result /
+/// incomplete result / operations-and-result — all defined-but-invalid
+/// results abort with the shared message. `operations` can never be valid
+/// over the JSON boundary (exec would have to be a function).
+#[tokio::test]
+async fn runner_user_bash_invalid_results_fail_closed() {
+    let later_ran = Arc::new(Mutex::new(false));
+    let invalid_results: Vec<(&str, Value)> = vec![
+        ("empty object", json!({})),
+        ("null operations", json!({"operations": null})),
+        ("operations without exec", json!({"operations": {}})),
+        (
+            "operations as data",
+            json!({"operations": {"exec": "not a function"}}),
+        ),
+        ("null result", json!({"result": null})),
+        (
+            "incomplete result",
+            json!({"result": {"output": "handled"}}),
+        ),
+        (
+            "operations and a result",
+            json!({
+                "operations": {"exec": null},
+                "result": {"output": "handled", "exitCode": 0, "cancelled": false, "truncated": false}
+            }),
+        ),
+    ];
+    for (description, handler_result) in invalid_results {
+        let ran_flag = Arc::clone(&later_ran);
+        let host = host_with(vec![
+            inline_ext("ext-a", move |api| {
+                let handler_result = handler_result.clone();
+                api.on(
+                    ext::EVENT_USER_BASH,
+                    json_handler(move |_| Ok(handler_result.clone())),
+                )
+                .unwrap();
+            }),
+            inline_ext("ext-b", move |api| {
+                let ran_flag = Arc::clone(&ran_flag);
+                api.on(
+                    ext::EVENT_USER_BASH,
+                    json_handler(move |_| {
+                        *ran_flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                        Ok(Value::Null)
+                    }),
+                )
+                .unwrap();
+            }),
+        ])
+        .await;
+        let errors = collect_errors(&host);
+
+        let error = host.emit_user_bash(user_bash_event()).await.unwrap_err();
+        assert_eq!(
+            error.error,
+            "Invalid user_bash handler result: return undefined for local execution or exactly one valid { operations } or { result } object",
+            "case: {description}"
+        );
+        assert_eq!(error.event, ext::EVENT_USER_BASH);
+        assert!(
+            !*later_ran.lock().unwrap_or_else(|e| e.into_inner()),
+            "case: {description}"
+        );
+        let errors = errors.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(errors.len(), 1, "case: {description}");
+        assert!(errors[0]
+            .error
+            .starts_with("Invalid user_bash handler result"));
+    }
+}
+
+/// Upstream `accepts valid user_bash … result overrides` + the old
+/// first-defined-result-wins semantics: `undefined` (JSON null) continues
+/// to the next handler, a valid `{ result }` stops propagation.
+#[tokio::test]
+async fn runner_user_bash_undefined_continues_then_valid_result_wins() {
+    let host = host_with(vec![
+        inline_ext("ext-a", |api| {
             api.on(ext::EVENT_USER_BASH, json_handler(|_| Ok(Value::Null)))
                 .unwrap();
         }),
         inline_ext("ext-b", |api| {
             api.on(
                 ext::EVENT_USER_BASH,
-                json_handler(|_| Ok(json!({"result": {"output": "done"}}))),
+                json_handler(|_| {
+                    Ok(json!({"result": {"output": "done", "exitCode": 0, "cancelled": false, "truncated": false}}))
+                }),
             )
             .unwrap();
         }),
@@ -922,12 +1043,20 @@ async fn runner_user_bash_first_non_null_result_wins() {
     let errors = collect_errors(&host);
 
     let result = host
-        .emit_user_bash(json!({"type": ext::EVENT_USER_BASH, "command": "ls", "excludeFromContext": false, "cwd": "/x"}))
+        .emit_user_bash(user_bash_event())
         .await
-        .unwrap();
+        .unwrap()
+        .expect("defined result");
     assert_eq!(result["result"]["output"], "done");
-    // ext-a's throw was isolated and reported.
-    assert_eq!(errors.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+    // No handler errors on the happy path.
+    assert!(errors.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+}
+
+/// No handlers → `Ok(None)` (the caller runs default bash execution).
+#[tokio::test]
+async fn runner_user_bash_no_handlers_continues() {
+    let host = host_with(Vec::new()).await;
+    assert_eq!(host.emit_user_bash(user_bash_event()).await, Ok(None));
 }
 
 // ---------------------------------------------------------------------------

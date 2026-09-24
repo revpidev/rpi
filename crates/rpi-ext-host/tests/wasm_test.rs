@@ -134,6 +134,37 @@ const NO_DISPATCH_GUEST_WAT: &str = r#"
 )
 "#;
 
+/// #9300 (`acaa253cc`): schemaless registerTool guest — init calls
+/// registerTool WITHOUT `parameters` and returns the host response verbatim
+/// as the init receipt; the host rejection (error envelope) fails the load.
+const SCHEMALESS_GUEST_WAT: &str = r#"
+(module
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "rpi_alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $ptr))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
+  (func (export "rpi_extension_init") (result i64)
+    ;; forwards the host_call response directly as the init receipt.
+    (return (call $host_call (i32.const 16) (call $strlen (i32.const 16)))))
+  (func (export "rpi_dispatch") (param i32 i32) (result i64)
+    (return (i64.const 0)))
+  (func $strlen (param $ptr i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $scan
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $ptr) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $scan)))
+    (local.get $n))
+  (data (i32.const 16) "{\"call\":\"registerTool\",\"args\":{\"name\":\"schemaless\",\"description\":\"s\"}}\00")
+)
+"#;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir(PathBuf);
@@ -250,6 +281,25 @@ async fn wasm_capability_denied_for_bare_guest_and_allowed_by_manifest() {
     let (host, errors) = host_loading(&[granted]).await;
     assert!(errors.is_empty(), "{errors:?}");
     assert!(host.get_tool_definition("probe_tool").is_some());
+}
+
+/// #9300: a wasm guest registering a tool without a parameter schema is
+/// rejected during load (no silent `{"type":"object"}` default anymore).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_register_tool_without_parameters_fails_load() {
+    let tmp = TempDir::new("schemaless");
+    let wasm = tmp.write_guest(
+        "schemaless",
+        SCHEMALESS_GUEST_WAT,
+        Some(r#"{"name":"schemaless","version":"0.1.0","wasm":"dist/guest.wasm","capabilities":["tools"],"rpiAbi":1}"#),
+    );
+    let (host, errors) = host_loading(&[wasm]).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("must define an object parameter schema"),
+        "got: {errors:?}"
+    );
+    assert!(host.get_tool_definition("schemaless").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

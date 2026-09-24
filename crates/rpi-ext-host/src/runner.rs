@@ -89,6 +89,52 @@ struct BuiltinKeybinding {
     restrict_override: bool,
 }
 
+/// `isUserBashEventResult` (runner.ts:121-146, `509ee2bd0` / #9068): a
+/// valid defined result carries **exactly one** of `operations` / `result`.
+/// - `operations` must be an object whose `exec` is a function — functions
+///   cannot cross the JSON dispatch boundary, so no JSON value satisfies
+///   this arm and any `operations`-shaped result is invalid here (ADR-0007
+///   gap 1: custom execution backends are not supported; since #9068 they
+///   fail closed instead of falling back to the local shell).
+/// - `result` must be the full [`BashResult`] shape: string `output`, a
+///   present `exitCode` (number or null-as-undefined), boolean
+///   `cancelled`/`truncated`, and optional string `fullOutputPath`.
+///
+/// Presence follows upstream's `!== undefined` semantics: a JSON `null`
+/// counts as defined (and then fails the shape check).
+fn is_user_bash_event_result(value: &Value) -> bool {
+    let Some(candidate) = value.as_object() else {
+        return false;
+    };
+    let has_operations = candidate.contains_key("operations");
+    let has_result = candidate.contains_key("result");
+    if has_operations == has_result {
+        return false;
+    }
+    if has_operations {
+        // `typeof operations.exec === "function"` — unrepresentable as
+        // JSON; over this boundary the arm always rejects.
+        return false;
+    }
+
+    let Some(result) = candidate.get("result") else {
+        return false;
+    };
+    let Some(result) = result.as_object() else {
+        return false;
+    };
+    result.get("output").is_some_and(Value::is_string)
+        && result.contains_key("exitCode")
+        && result
+            .get("exitCode")
+            .is_some_and(|code| code.is_number() || code.is_null())
+        && result.get("cancelled").is_some_and(Value::is_boolean)
+        && result.get("truncated").is_some_and(Value::is_boolean)
+        && result
+            .get("fullOutputPath")
+            .is_none_or(|path| path.is_string() || path.is_null())
+}
+
 /// Registration registry + emit dispatch over a loaded extension set.
 ///
 /// The upstream `ExtensionRunner` also owns context factories and bound
@@ -761,23 +807,41 @@ impl ExtensionRunnerCore {
         Ok(result)
     }
 
-    /// `emitUserBash` (runner.ts:942-969): first non-null result wins;
-    /// errors are isolated per handler.
-    pub async fn emit_user_bash(&self, payload: Value) -> Option<Value> {
+    /// `emitUserBash` (runner.ts:1042-1068, `509ee2bd0` / #9068):
+    /// first defined result wins; `undefined` (JSON null) continues to the
+    /// next handler. **Fail-closed**: a handler error or an invalid defined
+    /// result aborts the command — reported through `onError` and returned
+    /// as `Err` so the caller neither invokes later handlers nor falls
+    /// back to local execution. A defined result must be exactly one of
+    /// `{ operations }` (an `exec`-backed closure bundle — which can never
+    /// cross the JSON dispatch boundary, so over this boundary it is always
+    /// invalid) or `{ result }`.
+    pub async fn emit_user_bash(&self, payload: Value) -> Result<Option<Value>, ExtensionError> {
         for (path, handler) in self.handlers_for(EVENT_USER_BASH) {
             let ctx = self.create_context();
-            match handler(payload.clone(), ctx).await {
-                Ok(handler_result) => {
-                    if !handler_result.is_null() {
-                        return Some(handler_result);
-                    }
-                }
+            let handler_result = match handler(payload.clone(), ctx).await {
+                Ok(result) => result,
                 Err(error) => {
-                    self.emit_error(ExtensionError::new(&path, EVENT_USER_BASH, error));
+                    let error = ExtensionError::new(&path, EVENT_USER_BASH, error);
+                    self.emit_error(error.clone());
+                    return Err(error);
                 }
+            };
+            if handler_result.is_null() {
+                continue;
             }
+            if !is_user_bash_event_result(&handler_result) {
+                let error = ExtensionError::new(
+                    &path,
+                    EVENT_USER_BASH,
+                    "Invalid user_bash handler result: return undefined for local execution or exactly one valid { operations } or { result } object".to_owned(),
+                );
+                self.emit_error(error.clone());
+                return Err(error);
+            }
+            return Ok(Some(handler_result));
         }
-        None
+        Ok(None)
     }
 
     /// `emitContext` (runner.ts:971-1001): chained `messages` replacement.

@@ -407,18 +407,21 @@ pub trait ExtensionRunner: Send + Sync {
         None
     }
 
-    /// `user_bash` interception (interactive-mode.ts:5931-5940): the first
-    /// non-empty handler result wins. Only the full-replacement `result`
-    /// branch crosses the JSON boundary; a handler returning custom
-    /// `operations` (a closure bundle upstream) cannot be honored by the
-    /// host and is dropped with a warning (candidate deviation, T15 W2).
+    /// `user_bash` interception (interactive-mode.ts:6509-6524):
+    /// `Ok(Some(result))` is the full-replacement result (skips local
+    /// execution); `Ok(None)` continues to local execution. **Fail-closed**
+    /// (`509ee2bd0` / #9068): `Err` aborts the command — the caller must
+    /// not fall back to the local shell; the runner already reported the
+    /// error through the extension error surface. A handler's custom
+    /// `operations` backend cannot cross the JSON dispatch boundary
+    /// (ADR-0007 gap 1) and is rejected by the runner as an invalid result.
     async fn emit_user_bash(
         &self,
         _command: &str,
         _exclude_from_context: bool,
         _cwd: &str,
-    ) -> Option<crate::tools::bash_executor::BashResult> {
-        None
+    ) -> Result<Option<crate::tools::bash_executor::BashResult>, String> {
+        Ok(None)
     }
 
     async fn emit_session_before_tree(&self) -> Option<SessionBeforeTreeResult> {

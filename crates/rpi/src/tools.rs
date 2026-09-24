@@ -103,6 +103,27 @@ pub fn resolve_active_tool_names(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Strict-prefer JSON-schema sampling (fcff255b0, #9300-adjacent)
+// ---------------------------------------------------------------------------
+
+/// `constrainedSampling: { type: "json_schema", strict: "prefer" }` for the
+/// built-in `read`/`bash`/`edit`/`write` tools — strict-prefer by default,
+/// without any experimental gate (upstream removed the `PI_EXPERIMENTAL`
+/// toggle in `fcff255b0`; rpi never carried the gate). Upstream's list also
+/// has `powershell`, which rpi does not port ([N/A], V14-13 FR-G / ADR-0003).
+/// Strictness is a provider-side conversion (`resolve_json_schema_strict_sampling`),
+/// not a change to the execution schema; extensions re-registering a
+/// same-named tool with `constrainedSampling: false` override this
+/// (HostToolAdapter passes the definition value through).
+pub(crate) fn builtin_strict_prefer_sampling() -> Option<rpi_ai::types::ConstrainedSampling> {
+    Some(rpi_ai::types::ConstrainedSampling::Config(
+        rpi_ai::types::ConstrainedSamplingConfig::JsonSchema {
+            strict: rpi_ai::types::ConstrainedSamplingStrict::Prefer,
+        },
+    ))
+}
+
 /// Settings-derived options for the built-in tools (`_buildRuntime`,
 /// agent-session.ts:2552-2564). `None` keeps each tool's own default.
 #[derive(Default)]

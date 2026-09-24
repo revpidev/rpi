@@ -331,6 +331,71 @@ async fn api_register_tool_refreshes_only_when_bound() {
     );
 }
 
+/// #9300 (`acaa253cc`, loader.ts:289-293): tools whose `parameters` is not
+/// a JSON object are rejected at registration with the upstream message,
+/// instead of breaking provider request serialization later. Arrays and
+/// scalars are objects in JS `typeof` terms but explicitly rejected
+/// upstream (`Array.isArray` / `null` checks); here `Value::is_object`
+/// covers all three.
+#[tokio::test]
+async fn api_register_tool_rejects_non_object_parameter_schemas() {
+    let host = host_with(vec![inline_ext("ext-a", |_api| {})]).await;
+    let api = api_of(&host);
+    let bad_parameters = [
+        ("missing (null)", serde_json::Value::Null),
+        ("array", serde_json::json!([{"type": "object"}])),
+        ("string", serde_json::json!("object")),
+        ("number", serde_json::json!(0)),
+    ];
+    for (description, parameters) in bad_parameters {
+        let mut tool = minimal_tool("bad_tool");
+        tool.parameters = parameters;
+        let error = api.register_tool(tool).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "extension call failed: Tool \"bad_tool\" registered by extension \"<inline:ext-a>\" must define an object parameter schema.",
+            "case: {description}"
+        );
+    }
+    // An object schema (the TypeBox-normal `type: "object"` and even an
+    // empty object) is accepted.
+    api.register_tool(minimal_tool("good_tool")).unwrap();
+    let mut empty = minimal_tool("empty_object");
+    empty.parameters = serde_json::json!({});
+    api.register_tool(empty).unwrap();
+    assert_eq!(host.get_all_registered_tools().len(), 2);
+}
+
+/// #9300: a factory failing `registerTool` surfaces as a load error — the
+/// extension is not loaded (upstream: `Failed to load extension: Tool …
+/// must define an object parameter schema.`).
+#[tokio::test]
+async fn api_register_tool_schema_error_fails_extension_load() {
+    let host = NativeExtensionHost::new("/test-cwd");
+    let factory: ExtensionFactory = Arc::new(|api| {
+        let mut tool = minimal_tool("noop");
+        tool.parameters = serde_json::Value::Null;
+        let result = api.register_tool(tool);
+        Box::pin(async move { result.map_err(|error| error.to_string()) })
+    });
+    let errors = host
+        .load_inline(&[InlineExtension::Named {
+            name: "schemaless".to_owned(),
+            factory,
+            hidden: false,
+        }])
+        .await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0]
+            .error
+            .contains("Tool \"noop\" registered by extension \"<inline:schemaless>\" must define an object parameter schema."),
+        "got: {:?}",
+        errors[0].error
+    );
+    assert!(host.get_all_registered_tools().is_empty());
+}
+
 fn minimal_tool(name: &str) -> ext::ToolDefinition {
     ext::ToolDefinition {
         name: name.to_owned(),

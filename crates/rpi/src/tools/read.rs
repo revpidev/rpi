@@ -193,6 +193,11 @@ impl AgentTool for ReadTool {
         })
     }
 
+    fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
+        // read.ts:77 (`fcff255b0`): strict-prefer by default, no gate.
+        crate::tools::builtin_strict_prefer_sampling()
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,

@@ -477,6 +477,89 @@ mod bash_tool_tests {
         let output = String::from_utf8_lossy(&binding);
         assert!(output.contains("hello"));
     }
+
+    /// #9577 (`a8b3dd199`, tools.test.ts): signal-killed shells map to the
+    /// conventional `128 + signal` exit codes instead of `None` (which the
+    /// tool previously reported as success).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_signal_killed_commands_map_to_128_plus_signal() {
+        let ops = create_local_bash_operations(None);
+        for (signal, exit_code) in [("KILL", 137), ("TERM", 143)] {
+            let result = ops
+                .exec(
+                    &format!("kill -{signal} $$"),
+                    std::path::Path::new("."),
+                    BashExecOptions {
+                        signal: CancellationToken::new(),
+                        timeout: None,
+                        env: None,
+                    },
+                    &|_data: Vec<u8>| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, Some(exit_code), "signal {signal}");
+        }
+    }
+
+    /// #9577: signal-terminated commands fail with the partial output
+    /// preserved (no more silent success).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_signal_killed_commands_rejected_with_partial_output() {
+        let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
+        for (signal, exit_code) in [("KILL", 137), ("TERM", 143)] {
+            let err = run_bash(
+                &tool,
+                &format!("printf 'before-kill\\n'; kill -{signal} $$"),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("before-kill"), "partial output lost: {err}");
+            assert!(
+                err.contains(&format!("Command exited with code {exit_code}")),
+                "signal {signal}: {err}"
+            );
+        }
+    }
+
+    /// #9577: a custom operations backend resolving to a null exit code
+    /// fails the command ("terminated without an exit code") with the
+    /// partial output preserved.
+    struct NullExitOperations;
+
+    #[async_trait::async_trait]
+    impl rpi::tools::bash::BashOperations for NullExitOperations {
+        async fn exec(
+            &self,
+            _command: &str,
+            _cwd: &std::path::Path,
+            _options: BashExecOptions,
+            on_data: &(dyn Fn(Vec<u8>) + Send + Sync),
+        ) -> Result<Option<i32>, rpi::tools::bash::BashExecError> {
+            on_data(b"partial\n".to_vec());
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_null_exit_code_from_custom_operations_rejected() {
+        let tool = create_bash_tool(
+            &test_ctx(),
+            BashToolOptions {
+                operations: Some(Arc::new(NullExitOperations)),
+                ..Default::default()
+            },
+        );
+        let err = run_bash(&tool, "remote", None).await.unwrap_err();
+        assert!(err.contains("partial"), "partial output lost: {err}");
+        assert!(
+            err.contains("Command terminated without an exit code"),
+            "got: {err}"
+        );
+    }
 }
 
 mod bash_executor_tests {

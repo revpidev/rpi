@@ -181,6 +181,11 @@ impl AgentTool for EditTool {
         EDIT_PARAMS.get_or_init(edit_parameters)
     }
 
+    fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
+        // edit.ts:156 (`fcff255b0`): strict-prefer by default, no gate.
+        crate::tools::builtin_strict_prefer_sampling()
+    }
+
     /// Legacy shim + JSON string parse (edit.ts:94-118).
     ///
     /// 1. If `edits` is a JSON string, try to parse it as an array or a

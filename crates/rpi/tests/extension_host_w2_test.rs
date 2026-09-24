@@ -751,7 +751,7 @@ async fn w2_after_provider_response_skipped_without_handlers() {
 }
 
 // ---------------------------------------------------------------------------
-// user_bash（interactive-mode.ts:5931-5940）
+// user_bash（interactive-mode.ts:6509-6524；#9068 fail-closed）
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -775,28 +775,55 @@ async fn w2_user_bash_full_result_replacement() {
     let result = runner
         .emit_user_bash("ls -la", true, "/w2-cwd")
         .await
-        .expect("replacement");
+        .expect("replacement")
+        .expect("full result");
     assert_eq!(result.output, "extension output");
     assert_eq!(result.exit_code, Some(0));
     assert!(!result.cancelled);
     assert!(!result.truncated);
 }
 
+/// #9068（`509ee2bd0`）：handler 报错 → `Err`（中止命令，不回退本地执行）；
+/// 上游 operations（闭包束）跨 JSON 边界必然无效 → 同样 fail-closed
+/// （ADR-0007 缺口 1 的「丢弃并回退」随之退场）；无 handler → `Ok(None)`
+/// （调用方走默认本地执行）。
 #[tokio::test]
-async fn w2_user_bash_operations_only_and_no_handler_fall_back() {
-    // operations (closure bundle) cannot cross the JSON boundary → dropped fallback
-    // (candidate divergence); no handler → None (the caller runs default bash
-    // execution).
+async fn w2_user_bash_fail_closed_and_no_handler_fall_back() {
+    let runner = runner_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_USER_BASH, |_| {
+            Err("Routing failed".to_owned())
+        });
+    })])
+    .await;
+    let error = match runner.emit_user_bash("x", false, "/w2-cwd").await {
+        Err(error) => error,
+        Ok(_) => panic!("a handler error must abort the command"),
+    };
+    assert_eq!(error, "Routing failed");
+
+    // operations closure bundle — invalid over the JSON boundary, aborts.
     let runner = runner_with(vec![inline_ext(|api| {
         on_json(api, ext::EVENT_USER_BASH, |_| {
             Ok(json!({"operations": {"note": "custom backend"}}))
         });
     })])
     .await;
-    assert!(runner.emit_user_bash("x", false, "/w2-cwd").await.is_none());
+    let error = match runner.emit_user_bash("x", false, "/w2-cwd").await {
+        Err(error) => error,
+        Ok(_) => panic!("an operations-only result must abort the command"),
+    };
+    assert!(
+        error.starts_with("Invalid user_bash handler result"),
+        "got: {error}"
+    );
 
+    // No handler → Ok(None): the caller runs default bash execution.
     let empty = runner_with(Vec::new()).await;
-    assert!(empty.emit_user_bash("x", false, "/w2-cwd").await.is_none());
+    assert!(empty
+        .emit_user_bash("x", false, "/w2-cwd")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 // ---------------------------------------------------------------------------

@@ -50,6 +50,9 @@ pub struct BashExecOptions {
 
 #[async_trait]
 pub trait BashOperations: Send + Sync {
+    /// Resolves to the exit code. Signal terminations should be reported as
+    /// `128 + signal` (bash.ts:64-66, `a8b3dd199`); a `None` exit code is
+    /// treated by the bash tool as a failed command.
     async fn exec(
         &self,
         command: &str,
@@ -258,6 +261,25 @@ fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<u64>, BashExecError
     Ok(Some(ms as u64))
 }
 
+/// Map a child exit status to the conventional exit code (bash.ts:139-142,
+/// `a8b3dd199` / #9577): a signal-killed shell has no exit code, so report
+/// `128 + signal` (the standard shell convention — callers must not mistake
+/// the termination for success); an exit without a usable code or signal
+/// reports `1`.
+fn exit_status_to_code(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
+}
+
 enum IoMsg {
     Data(Vec<u8>),
     StdoutEof,
@@ -395,7 +417,7 @@ impl BashOperations for LocalBashOperations {
                 _ = options.signal.cancelled(), if !aborted && !timed_out => { aborted = true; if let Some(p) = pid { kill_process_tree(p); } killed_at = Some(tokio::time::Instant::now()); }
                 _ = &mut timeout_fut, if !timed_out && !aborted => { timed_out = true; if let Some(p) = pid { kill_process_tree(p); } killed_at = Some(tokio::time::Instant::now()); }
                 _ = &mut kill_grace_fut, if killed_at.is_some() && !exited => { tracing::warn!(grace_ms = KILL_GRACE_MS, "killed child did not exit within grace; abandoning wait"); break; }
-                result = child.wait(), if !exited => { exited = true; exit_code = result.ok().and_then(|s| s.code()); }
+                result = child.wait(), if !exited => { exited = true; exit_code = result.ok().map(|s| exit_status_to_code(&s)); }
                 msg = rx.recv() => { match msg { Some(IoMsg::Data(b)) => { pending_data = Some(b); } Some(IoMsg::StdoutEof) => { stdout_ended = true; } Some(IoMsg::StderrEof) => { stderr_ended = true; } None => { stdout_ended = true; stderr_ended = true; } } }
             }
             if let Some(b) = pending_data.take() {
@@ -575,6 +597,11 @@ impl AgentTool for BashTool {
         &self.parameters_value
     }
 
+    fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
+        // bash.ts:238 (`fcff255b0`): strict-prefer by default, no gate.
+        crate::tools::builtin_strict_prefer_sampling()
+    }
+
     async fn execute(
         &self,
         _id: &str,
@@ -680,13 +707,21 @@ impl AgentTool for BashTool {
         match exec_result {
             Ok(exit_code) => {
                 let (text, _) = format_output(&snapshot, last_lb, "(no output)");
-                if let Some(code) = exit_code {
-                    if code != 0 {
-                        return Err(AgentError::Message(append_status(
-                            &text,
-                            &format!("Command exited with code {code}"),
-                        )));
-                    }
+                // bash.ts:368-373 (`a8b3dd199` / #9577): a missing exit code
+                // (signal-terminated custom operations, exotic wait
+                // failures) fails the command with the partial output
+                // instead of reporting success.
+                let Some(code) = exit_code else {
+                    return Err(AgentError::Message(append_status(
+                        &text,
+                        "Command terminated without an exit code",
+                    )));
+                };
+                if code != 0 {
+                    return Err(AgentError::Message(append_status(
+                        &text,
+                        &format!("Command exited with code {code}"),
+                    )));
                 }
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
