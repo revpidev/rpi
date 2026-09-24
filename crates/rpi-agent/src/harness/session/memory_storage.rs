@@ -484,6 +484,7 @@ mod tests {
             details: None,
             usage: Some(usage(1, 2, 3, 4, 10, 0.1)),
             from_hook: None,
+            system_message: None,
         });
         let branch_summary = SessionEntry::BranchSummary(BranchSummaryEntry {
             id: "branch-summary".to_owned(),
@@ -537,6 +538,7 @@ mod tests {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         });
         let after = message_entry(
             "after-compaction",

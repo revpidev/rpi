@@ -44,9 +44,9 @@ use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
-    AssistantContent, AssistantMessage, Context, DoneReason, ErrorReason, Model, ProviderResponse,
+    AssistantContent, AssistantMessage, DoneReason, ErrorReason, Model, ProviderResponse,
     SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets, ThinkingLevel,
-    Tool, ToolCall, Usage,
+    Tool, ToolCall, TranscriptContext, Usage,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -149,9 +149,12 @@ fn get_google_budget(
 /// [`params_to_wire`] after the `on_payload` hook, mirroring the SDK pipeline.
 fn build_params(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &GoogleOptions,
 ) -> Result<Value, String> {
+    // Collapse at entry (#9548, google-generative-ai.ts:65): the leading
+    // prompt becomes `systemInstruction`, tools resolve from the transcript.
+    let context = &crate::utils::transcript::collapse_system_messages(context);
     let contents = convert_messages(model, context);
 
     let mut config = Map::new();
@@ -161,13 +164,18 @@ fn build_params(
     if let Some(max_tokens) = options.stream.max_tokens {
         config.insert("maxOutputTokens".to_owned(), json!(max_tokens));
     }
-    if let Some(system_prompt) = &context.system_prompt {
+    let initial_system_text =
+        crate::utils::transcript::get_initial_system_message(&context.messages)
+            .map(crate::utils::text::get_system_message_text)
+            .unwrap_or_default();
+    if !initial_system_text.is_empty() {
         config.insert(
             "systemInstruction".to_owned(),
-            json!(sanitize_surrogates(system_prompt)),
+            json!(sanitize_surrogates(&initial_system_text)),
         );
     }
-    let tools: &[Tool] = context.tools.as_deref().unwrap_or(&[]);
+    let current_tools = crate::utils::transcript::get_current_tools(&context.messages);
+    let tools: &[Tool] = &current_tools;
     if !tools.is_empty() {
         if let Some(converted) = convert_tools(
             tools,
@@ -660,7 +668,7 @@ fn check_raw_chunk_error(bytes: &[u8]) -> Result<(), String> {
 /// message either way.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &GoogleOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
@@ -866,7 +874,7 @@ fn finish_processor(
 /// `stream` (google-generative-ai).
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: GoogleOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
@@ -910,7 +918,7 @@ pub fn stream(
 /// `streamSimple` (google-generative-ai).
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     // Auth check at the entry, before any stream is constructed
@@ -1016,7 +1024,7 @@ impl ProviderStreams for GoogleGenerativeAi {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -1032,7 +1040,7 @@ impl ProviderStreams for GoogleGenerativeAi {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)

@@ -176,12 +176,12 @@ fn model(base_url: &str) -> Model {
     model_with_id("gemini-2.5-flash", base_url, json!({}))
 }
 
-fn context(messages: Vec<Message>) -> Context {
-    Context {
+fn context(messages: Vec<Message>) -> rpi_ai::types::TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages,
         tools: None,
-    }
+    })
 }
 
 fn user_text(text: &str) -> Message {
@@ -777,8 +777,11 @@ async fn test_tool_call_flow() {
         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
     }))
     .expect("tool");
-    let mut ctx = context(vec![user_text("weather?")]);
-    ctx.tools = Some(vec![tool]);
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
+        messages: vec![user_text("weather?")],
+        tools: Some(vec![tool]),
+    });
     let events = collect(stream(
         &model(&base_url),
         &ctx,

@@ -108,7 +108,11 @@ mod tests {
             ..Default::default()
         };
         options.request.api_key = Some("test-key".to_owned());
-        let stream = streams.stream(&model, &crate::types::Context::default(), Some(options));
+        let stream = streams.stream(
+            &model,
+            &crate::utils::transcript::normalize_context(&crate::types::Context::default()),
+            Some(options),
+        );
         let _ = stream.result().await;
         let raw = tokio::time::timeout(std::time::Duration::from_secs(5), raw_rx)
             .await

@@ -409,7 +409,9 @@ pub async fn create_agent_session(
         let agent_cell = agent_cell.clone();
         let session_manager_for_warming = session_manager.clone();
         Arc::new(
-            move |model: Model, context: rpi_ai::types::Context, options: StreamOptions| {
+            move |model: Model,
+                  context: rpi_ai::types::TranscriptContext,
+                  options: StreamOptions| {
                 let model_runtime = model_runtime.clone();
                 let loader = loader.clone();
                 let runner_ref = runner_ref.clone();
@@ -538,19 +540,31 @@ pub async fn create_agent_session(
                                         .zip(state.messages.iter())
                                         .all(|(requested, current)| requested == current)
                             });
+                        // #9548: the request context is the normalized
+                        // transcript; the facade re-normalizes (no-op).
+                        let facade_context = rpi_ai::types::Context {
+                            system_prompt: None,
+                            messages: context.messages.clone(),
+                            tools: None,
+                        };
                         cache_warmer.start(
                             crate::core::cache_warming::CacheWarmRequest {
                                 model: model.clone(),
-                                context: context.clone(),
+                                context: facade_context,
                                 options: stream_options_with_headers.clone(),
                             },
                             is_current,
                         );
                     }
                 }
+                let facade_context = rpi_ai::types::Context {
+                    system_prompt: None,
+                    messages: context.messages,
+                    tools: None,
+                };
                 Box::pin(model_runtime.stream_simple(
                     &model,
-                    &context,
+                    &facade_context,
                     Some(stream_options_with_headers),
                 )) as rpi_agent::BoxStream<'static, rpi_ai::types::StreamEvent>
             },

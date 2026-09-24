@@ -914,7 +914,15 @@ pub fn build_context_entries(entries: &[StoredEntry], leaf_id: Option<&str>) -> 
         if Some(entry.id()) == first_kept_entry_id.as_deref() {
             found_first_kept = true;
         }
-        if found_first_kept {
+        // #9548 (session-manager.ts:459): pre-compaction system messages
+        // are folded into the compaction entry's `systemMessage` checkpoint,
+        // never replayed from the retained range.
+        let is_system_message = matches!(
+            entry.known(),
+            Some(SessionEntry::Message(message_entry))
+                if matches!(message_entry.message, AgentMessage::System(_))
+        );
+        if found_first_kept && !is_system_message {
             context_entries.push((*entry).clone());
         }
     }
@@ -1404,8 +1412,10 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
-    /// `appendCompaction` (session-manager.ts:1097-1119). The main path
-    /// writes only the `firstKeptEntryId` form (ADR-0003 §1).
+    /// `appendCompaction` (session-manager.ts:1112-1142 @ #9548). The main
+    /// path writes only the `firstKeptEntryId` form (ADR-0003 §1) and
+    /// snapshots the current prompt/tool state (`systemMessage`) at the
+    /// compaction boundary.
     pub fn append_compaction(
         &mut self,
         summary: &str,
@@ -1415,10 +1425,28 @@ impl SessionManager {
         from_hook: Option<bool>,
         usage: Option<Usage>,
     ) -> Result<String, RpiError> {
+        let timestamp = now_iso8601();
+        // `getCurrentSystemMessage(buildSessionContext().messages)` — the
+        // replayed checkpoint becomes the leading system message of the
+        // compacted context.
+        let system_message = {
+            let context = self.build_session_context();
+            let llm_messages: Vec<rpi_ai::types::Message> = context
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    AgentMessage::System(system) => {
+                        Some(rpi_ai::types::Message::System(system.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            rpi_ai::utils::transcript::get_current_system_message(&llm_messages)
+        };
         let entry = FileEntry::Compaction(CompactionEntry {
             id: self.next_entry_id(),
             parent_id: self.leaf_id.clone(),
-            timestamp: now_iso8601(),
+            timestamp: timestamp.clone(),
             summary: summary.to_owned(),
             first_kept_entry_id: Some(first_kept_entry_id.to_owned()),
             tokens_before,
@@ -1426,6 +1454,10 @@ impl SessionManager {
             details,
             usage,
             from_hook,
+            system_message: system_message.map(|mut message| {
+                message.timestamp = parse_iso8601_ms(&timestamp).unwrap_or(0);
+                message
+            }),
         });
         self.append_entry(entry)
     }

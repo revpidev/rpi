@@ -24,6 +24,7 @@ pub mod interactive_ui;
 pub mod loader;
 pub mod native;
 pub mod runner;
+pub mod system_prompt_bridge;
 pub mod types;
 pub mod wasm;
 

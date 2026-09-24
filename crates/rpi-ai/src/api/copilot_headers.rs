@@ -23,6 +23,8 @@ pub fn infer_copilot_initiator(messages: &[Message]) -> &'static str {
 /// header when sending images.
 pub fn has_copilot_vision_input(messages: &[Message]) -> bool {
     messages.iter().any(|message| match message {
+        // System messages carry no image content (#9548).
+        Message::System(_) => false,
         Message::User(user) => match &user.content {
             UserContent::Blocks(blocks) => blocks
                 .iter()

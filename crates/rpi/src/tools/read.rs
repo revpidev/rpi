@@ -287,7 +287,6 @@ impl AgentTool for ReadTool {
                 content,
                 details: Value::Null,
                 usage: None,
-                added_tool_names: None,
                 terminate: None,
             });
         }
@@ -413,7 +412,6 @@ impl AgentTool for ReadTool {
             })],
             details,
             usage: None,
-            added_tool_names: None,
             terminate: None,
         })
     }

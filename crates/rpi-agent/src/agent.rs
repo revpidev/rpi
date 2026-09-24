@@ -313,7 +313,9 @@ impl PromptInput {
     }
 }
 
-/// `defaultConvertToLlm` (agent.ts:32-36): keep only user/assistant/toolResult.
+/// `defaultConvertToLlm` (agent.ts:34-42 @ #9548): keep
+/// system/user/assistant/toolResult — the transcript's system messages pass
+/// through so the prompt and tool declarations ride the LLM context.
 fn default_convert_to_llm() -> ConvertToLlmFn {
     Arc::new(|messages: Vec<AgentMessage>| {
         Box::pin(async move {
@@ -323,6 +325,7 @@ fn default_convert_to_llm() -> ConvertToLlmFn {
                     AgentMessage::User(u) => Some(rpi_ai::types::Message::User(u)),
                     AgentMessage::Assistant(a) => Some(rpi_ai::types::Message::Assistant(a)),
                     AgentMessage::ToolResult(t) => Some(rpi_ai::types::Message::ToolResult(t)),
+                    AgentMessage::System(s) => Some(rpi_ai::types::Message::System(s)),
                     _ => None,
                 })
                 .collect()
@@ -349,7 +352,9 @@ pub struct Agent {
     active_run: Arc<Mutex<Option<ActiveRun>>>,
 
     pub convert_to_llm: ConvertToLlmFn,
-    pub transform_context: Option<TransformContextFn>,
+    /// `transformContext` — interior-mutable so the session can wrap it
+    /// post-construction (#9548 `_installAgentForcedPromptProjection`).
+    transform_context: std::sync::RwLock<Option<TransformContextFn>>,
     pub stream_function: StreamFn,
     pub get_api_key: Option<GetApiKeyFn>,
     pub on_payload: Option<rpi_ai::types::OnPayloadCallback>,
@@ -380,13 +385,35 @@ pub struct Agent {
 impl Agent {
     pub fn new(options: AgentOptions) -> Self {
         let initial = options.initial_state;
+        // #9548 (agent.ts:76-85): `systemPrompt` and `tools` become the
+        // leading system message unless `messages` already starts with one.
+        let tools = initial.tools.unwrap_or_default();
+        let mut messages = initial.messages.unwrap_or_default();
+        let declared_tools: Vec<rpi_ai::types::Tool> = tools
+            .iter()
+            .map(|tool| rpi_ai::types::Tool {
+                name: tool.name().to_owned(),
+                description: tool.description().to_owned(),
+                parameters: tool.parameters().clone(),
+                constrained_sampling: tool.constrained_sampling(),
+            })
+            .collect();
+        let initial_message = rpi_ai::utils::transcript::create_initial_system_message(
+            initial.system_prompt.as_deref(),
+            Some(&declared_tools),
+        );
+        if !matches!(messages.first(), Some(AgentMessage::System(_))) {
+            if let Some(initial_message) = initial_message {
+                messages.insert(0, AgentMessage::System(initial_message));
+            }
+        }
         Self {
             state: Arc::new(Mutex::new(AgentState {
-                system_prompt: initial.system_prompt.unwrap_or_default(),
-                model: initial.model.unwrap_or_else(default_model),
+                system_prompt: String::new(),
+                model: initial.model.clone().unwrap_or_else(default_model),
                 thinking_level: initial.thinking_level.unwrap_or(ThinkingLevel::Off),
-                tools: initial.tools.unwrap_or_default(),
-                messages: initial.messages.unwrap_or_default(),
+                tools,
+                messages,
                 is_streaming: false,
                 streaming_message: None,
                 pending_tool_calls: HashSet::new(),
@@ -404,7 +431,7 @@ impl Agent {
             convert_to_llm: options
                 .convert_to_llm
                 .unwrap_or_else(default_convert_to_llm),
-            transform_context: options.transform_context,
+            transform_context: std::sync::RwLock::new(options.transform_context),
             stream_function: options.stream_fn,
             get_api_key: options.get_api_key,
             on_payload: options.on_payload,
@@ -466,13 +493,41 @@ impl Agent {
             .clone()
     }
 
-    /// Current agent state (snapshot copy).
-    pub fn state(&self) -> AgentState {
-        lock(&self.state).clone()
+    /// The currently installed `transformContext` hook.
+    pub fn transform_context(&self) -> Option<TransformContextFn> {
+        self.transform_context
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
-    pub fn set_system_prompt(&self, system_prompt: String) {
-        lock(&self.state).system_prompt = system_prompt;
+    /// Replace the `transformContext` hook (session-level wrapping, #9548).
+    pub fn set_transform_context(&self, transform: Option<TransformContextFn>) {
+        *self
+            .transform_context
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = transform;
+    }
+
+    /// Current agent state (snapshot copy). `system_prompt` is derived at
+    /// snapshot time from the transcript's system messages (#9548 getter
+    /// semantics, agent.ts:88-90); writing it directly is not possible —
+    /// prompt changes travel as system messages in `messages`.
+    pub fn state(&self) -> AgentState {
+        let mut snapshot = lock(&self.state).clone();
+        let llm_messages: Vec<rpi_ai::types::Message> = snapshot
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::System(system) => {
+                    Some(rpi_ai::types::Message::System(system.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        snapshot.system_prompt =
+            rpi_ai::utils::transcript::get_current_system_prompt(&llm_messages);
+        snapshot
     }
 
     pub fn set_model(&self, model: Model) {
@@ -583,8 +638,21 @@ impl Agent {
             ));
         }
         {
+            // #9548 (agent.ts:353-354): keep the replayed prompt/tool
+            // baseline — the transcript restarts from the current prompt.
             let mut state = lock(&self.state);
-            state.messages = Vec::new();
+            let llm_messages: Vec<rpi_ai::types::Message> = state
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    AgentMessage::System(system) => {
+                        Some(rpi_ai::types::Message::System(system.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let baseline = rpi_ai::utils::transcript::get_current_system_message(&llm_messages);
+            state.messages = baseline.map(AgentMessage::System).into_iter().collect();
             state.is_streaming = false;
             state.streaming_message = None;
             state.pending_tool_calls = HashSet::new();
@@ -700,7 +768,6 @@ impl Agent {
     fn create_context_snapshot(&self) -> AgentContext {
         let state = lock(&self.state);
         AgentContext {
-            system_prompt: state.system_prompt.clone(),
             messages: state.messages.clone(),
             tools: Some(state.tools.clone()),
         }
@@ -812,7 +879,11 @@ impl Agent {
             },
             tool_execution: self.tool_execution,
             convert_to_llm: self.convert_to_llm.clone(),
-            transform_context: self.transform_context.clone(),
+            transform_context: self
+                .transform_context
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             get_api_key: self.get_api_key.clone(),
             should_stop_after_turn,
             prepare_next_turn,

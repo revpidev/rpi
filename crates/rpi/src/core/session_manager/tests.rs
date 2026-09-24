@@ -96,6 +96,7 @@ fn compaction(id: &str, parent_id: Option<&str>, summary: &str, first_kept: &str
         details: None,
         usage: None,
         from_hook: None,
+        system_message: None,
     }))
 }
 
@@ -530,6 +531,7 @@ fn retained_tail_compaction_form_is_self_contained_checkpoint() {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         })),
         msg("4", Some("3"), user_msg("after compaction")),
     ];
@@ -1981,7 +1983,6 @@ fn preserves_tool_and_summary_usage_across_a_file_backed_reload() {
             })],
             details: None,
             usage: Some(usage.clone()),
-            added_tool_names: None,
             is_error: false,
             timestamp: 1,
         }))
@@ -2832,6 +2833,7 @@ fn path_to_root_or_compaction_stops_at_compaction_checkpoint() {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         })),
         msg("3", Some("2"), user_msg("new")),
     ];

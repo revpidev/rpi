@@ -70,6 +70,14 @@ fn strip_keys(value: &mut Value) {
 
 /// Filter session-layer event types and strip non-Agent-layer keys, then
 /// re-render as JSONL (one compact JSON object per line).
+///
+/// #9548: the fixtures carry the AgentSession layer's leading system
+/// declaration (`message_start`/`message_end` for the prompt/tool state,
+/// plus its entry in `agent_end.messages`); this test drives the bare
+/// `Agent`, where that message is a session-layer prompt contribution that
+/// never enters the initial state — drop it from both sides, exactly like
+/// `crates/rpi/tests/parity_tools_test.rs` (the declaration's parity is
+/// covered session-level by `parity_headless_test` / `parity_session_test`).
 fn prepare_lines(text: &str) -> String {
     let mut out = String::new();
     for line in text.lines() {
@@ -82,7 +90,19 @@ fn prepare_lines(text: &str) -> String {
                 continue;
             }
         }
+        if matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("message_start" | "message_end")
+        ) && value["message"]["role"] == serde_json::json!("system")
+        {
+            continue;
+        }
         strip_keys(&mut value);
+        if value.get("type").and_then(Value::as_str) == Some("agent_end") {
+            if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+                messages.retain(|message| message["role"] != serde_json::json!("system"));
+            }
+        }
         out.push_str(&serde_json::to_string(&value).expect("render"));
         out.push('\n');
     }

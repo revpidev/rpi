@@ -5,7 +5,8 @@
 
 pub mod cost;
 pub mod custom_fetch;
-pub mod deferred_tools;
+/// (removed #9548): deferred tool loading via `deferred_tools` was replaced
+/// by transcript system-message tool declarations; see `utils/transcript.rs`.
 pub mod error_body;
 pub mod estimate;
 pub mod event_stream;
@@ -20,6 +21,7 @@ pub mod retry;
 pub mod rpi_user_agent;
 pub mod sanitize_unicode;
 pub mod text;
+pub mod transcript;
 pub mod transform_messages;
 pub mod uuid;
 pub mod validation;

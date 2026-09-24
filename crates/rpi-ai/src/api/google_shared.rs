@@ -23,8 +23,8 @@ use crate::api::constrained_sampling::{
     get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use crate::types::{
-    AssistantContent, Context, InputModality, Message, Model, StopReason, StreamOptions, Tool,
-    ToolResultContent, UserContent, UserContentBlock,
+    AssistantContent, InputModality, Message, Model, StopReason, StreamOptions, Tool,
+    ToolResultContent, TranscriptContext, UserContent, UserContentBlock,
 };
 use crate::utils::provider_retry::{
     retry_provider_request, ProviderErrorInfo, ProviderRetryOptions, RetryError,
@@ -263,7 +263,12 @@ fn supports_multimodal_function_response(model_id: &str) -> bool {
 }
 
 /// `convertMessages`: internal messages to Gemini `Content[]` format.
-pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
+/// Gemini has no mid-conversation system messages; the leading prompt is
+/// sent as `systemInstruction` (#9548, google-shared.ts:191-193).
+pub fn convert_messages(model: &Model, context: &TranscriptContext) -> Vec<Value> {
+    let collapsed = crate::utils::transcript::collapse_system_messages(context);
+    let conversation: Vec<Message> =
+        crate::utils::transcript::without_initial_system_message(&collapsed.messages).to_vec();
     let mut contents: Vec<Value> = Vec::new();
     let requires_id = requires_tool_call_id(&model.id);
     let mut normalize_tool_call_id =
@@ -285,10 +290,13 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
                 .collect()
         };
     let transformed_messages =
-        transform_messages(&context.messages, model, Some(&mut normalize_tool_call_id));
+        transform_messages(&conversation, model, Some(&mut normalize_tool_call_id));
 
     for msg in &transformed_messages {
         match msg {
+            // Unreachable post-collapse (the leading system message was
+            // removed and later ones folded into it); skip defensively.
+            Message::System(_) => {}
             Message::User(user) => match &user.content {
                 UserContent::Text(text) => {
                     contents.push(json!({

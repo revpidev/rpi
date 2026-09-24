@@ -139,8 +139,9 @@ pub fn transform_messages(
         .into_iter()
         .map(|msg| {
             match msg {
-                // User messages pass through unchanged.
-                Message::User(_) => msg,
+                // System and user messages pass through unchanged (#9548:
+                // transform-messages.ts:78-80).
+                Message::System(_) | Message::User(_) => msg,
 
                 // ToolResult: normalize toolCallId if we have a mapping.
                 Message::ToolResult(mut result) => {
@@ -246,6 +247,12 @@ pub fn transform_messages(
     let mut result: Vec<Message> = Vec::new();
     let mut pending_tool_calls: Vec<crate::types::ToolCall> = Vec::new();
     let mut existing_tool_result_ids: HashSet<String> = HashSet::new();
+    // System messages are transparent to tool-call accounting: one that
+    // lands between a tool call and its results is held back and emitted
+    // after the results (synthetic ones included), so it never causes a
+    // duplicate result for a call that is answered later (#9548,
+    // transform-messages.ts:163-186).
+    let mut held_system_messages: Vec<Message> = Vec::new();
 
     macro_rules! insert_synthetic_tool_results {
         () => {
@@ -262,7 +269,6 @@ pub fn transform_messages(
                             })],
                             details: None,
                             usage: None,
-                            added_tool_names: None,
                             is_error: true,
                             timestamp: now_ms(),
                         }));
@@ -270,6 +276,12 @@ pub fn transform_messages(
                 }
                 existing_tool_result_ids = HashSet::new();
             }
+            // System messages are transparent to tool-call accounting: one
+            // that lands between a tool call and its results is held back
+            // and emitted after the results (synthetic ones included), so it
+            // never causes a duplicate result for a call that is answered
+            // later (#9548, transform-messages.ts:163-186).
+            result.append(&mut held_system_messages);
         };
     }
 
@@ -308,9 +320,16 @@ pub fn transform_messages(
                 existing_tool_result_ids.insert(result_msg.tool_call_id.clone());
                 result.push(msg);
             }
+            Message::System(_) => {
+                if !pending_tool_calls.is_empty() {
+                    held_system_messages.push(msg);
+                } else {
+                    result.push(msg);
+                }
+            }
             Message::User(_) => {
-                // User message interrupts tool flow: insert synthetic results
-                // for orphaned calls.
+                // A new user turn interrupts tool flow: insert synthetic
+                // results for orphaned calls.
                 insert_synthetic_tool_results!();
                 result.push(msg);
             }
@@ -391,7 +410,6 @@ mod tests {
             })],
             details: None,
             usage: None,
-            added_tool_names: None,
             is_error: false,
             timestamp: 2,
         })

@@ -69,14 +69,14 @@ pub(crate) fn thinking_level_from_model_level(level: ModelThinkingLevel) -> Opti
 // AgentContext (types.ts)
 // ---------------------------------------------------------------------------
 
-/// `AgentContext` — context snapshot passed into the low-level agent loop.
+/// `AgentContext` — context snapshot passed into the low-level agent loop
+/// (#9548: the system prompt and tool declarations ride the transcript's
+/// system messages; no standalone `system_prompt` field anymore).
 #[derive(Clone, Default)]
 pub struct AgentContext {
-    /// System prompt included with the request.
-    pub system_prompt: String,
     /// Transcript visible to the model.
     pub messages: Vec<AgentMessage>,
-    /// Tools available for this run.
+    /// Tools available for execution in this run.
     pub tools: Option<Vec<Arc<dyn AgentTool>>>,
 }
 
@@ -175,6 +175,9 @@ pub type PrepareNextTurnContext = ShouldStopAfterTurnContext;
 pub struct AgentLoopTurnUpdate {
     /// Context for the next provider request.
     pub context: Option<AgentContext>,
+    /// Messages to append before the next provider request, with normal
+    /// lifecycle events (#9548, agent-loop.ts:146).
+    pub messages: Option<Vec<AgentMessage>>,
     /// Model for the next provider request.
     pub model: Option<Model>,
     /// Thinking level for the next provider request (`"off"` clears
@@ -451,7 +454,14 @@ pub fn agent_loop_continue(
 }
 
 fn validate_continuation(context: &AgentContext) -> Result<(), AgentError> {
-    if context.messages.is_empty() {
+    // #9548 (agent.ts:382-384): a transcript holding only system messages
+    // has nothing to continue from either.
+    let only_system = !context.messages.is_empty()
+        && context
+            .messages
+            .iter()
+            .all(|message| matches!(message, AgentMessage::System(_)));
+    if context.messages.is_empty() || only_system {
         return Err(AgentError::Message(
             "Cannot continue: no messages in context".to_owned(),
         ));
@@ -474,27 +484,30 @@ pub async fn run_agent_loop(
     signal: Option<CancellationToken>,
     stream_fn: StreamFn,
 ) -> Vec<AgentMessage> {
-    let mut new_messages: Vec<AgentMessage> = prompts.clone();
+    // #9548 (agent-loop.ts:106-116): declare tool loadout changes to the
+    // model before the run — the difference between the committed transcript
+    // and the executable set becomes a system message.
+    let initial_messages = declare_tool_changes(&context, &prompts.clone());
+    let mut new_messages: Vec<AgentMessage> = initial_messages.clone();
     let mut current_context = AgentContext {
-        system_prompt: context.system_prompt,
         messages: context
             .messages
             .iter()
             .cloned()
-            .chain(prompts.iter().cloned())
+            .chain(initial_messages.iter().cloned())
             .collect(),
-        tools: context.tools,
+        tools: context.tools.clone(),
     };
 
     emit(AgentEvent::AgentStart).await;
     emit(AgentEvent::TurnStart).await;
-    for prompt in &prompts {
+    for message in &initial_messages {
         emit(AgentEvent::MessageStart {
-            message: prompt.clone(),
+            message: message.clone(),
         })
         .await;
         emit(AgentEvent::MessageEnd {
-            message: prompt.clone(),
+            message: message.clone(),
         })
         .await;
     }
@@ -580,6 +593,7 @@ async fn run_loop(
             // results or queued messages keep the loop going. Terminal
             // turns never trigger prepare, so compaction and other
             // prepare-time side effects vanish from them.
+            let mut prepared_messages: Vec<AgentMessage> = Vec::new();
             if let Some((message, tool_results)) = last_completed_turn.as_ref() {
                 if let Some(prepare_next_turn) = &config.prepare_next_turn {
                     let next_turn_context = PrepareNextTurnContext {
@@ -598,6 +612,9 @@ async fn run_loop(
                         if let Some(thinking_level) = update.thinking_level {
                             config.reasoning = thinking_level_from_model_level(thinking_level);
                         }
+                        // #9548 (agent-loop.ts:196): messages returned by the
+                        // hook are appended before the next provider request.
+                        prepared_messages = update.messages.unwrap_or_default();
                     }
                 }
                 // Preparation can be long-running (for example, compaction).
@@ -614,20 +631,23 @@ async fn run_loop(
                 emit(AgentEvent::TurnStart).await;
             }
 
-            // Process pending messages (inject before next assistant response).
-            if !pending_messages.is_empty() {
-                for message in std::mem::take(&mut pending_messages) {
-                    emit(AgentEvent::MessageStart {
-                        message: message.clone(),
-                    })
-                    .await;
-                    emit(AgentEvent::MessageEnd {
-                        message: message.clone(),
-                    })
-                    .await;
-                    current_context.messages.push(message.clone());
-                    new_messages.push(message);
-                }
+            // Process prepared and queued messages before the next assistant
+            // response, declaring tool loadout changes first (#9548,
+            // agent-loop.ts:208-215).
+            pending_messages.splice(0..0, prepared_messages.drain(..));
+            let messages_to_inject = declare_tool_changes(current_context, &pending_messages);
+            pending_messages.clear();
+            for message in messages_to_inject {
+                emit(AgentEvent::MessageStart {
+                    message: message.clone(),
+                })
+                .await;
+                emit(AgentEvent::MessageEnd {
+                    message: message.clone(),
+                })
+                .await;
+                current_context.messages.push(message.clone());
+                new_messages.push(message);
             }
 
             // Stream assistant response.
@@ -799,6 +819,159 @@ async fn finalize_streamed_message(
     final_message
 }
 
+/// `declareToolChanges` (agent-loop.ts:281-325 @ #9548): declare tool
+/// loadout changes to the model.
+///
+/// `context.tools` is what the runtime can execute; the transcript's system
+/// messages declare what the model may call. Before each request the
+/// difference becomes `toolsAdded` and `toolsRemoved` on a system message.
+/// When a pending system message exists, its tool fields are treated as
+/// intent and replaced with the delta between the committed transcript and
+/// the executable set, so replay always yields exactly `context.tools`.
+/// Otherwise a new system message is inserted before the first non-system
+/// pending message.
+fn declare_tool_changes(
+    context: &AgentContext,
+    pending_messages: &[AgentMessage],
+) -> Vec<AgentMessage> {
+    let system_index = pending_messages
+        .iter()
+        .rposition(|message| matches!(message, AgentMessage::System(_)));
+    let baseline: Vec<AgentMessage> = match system_index {
+        Some(index) => pending_messages
+            .iter()
+            .enumerate()
+            .map(|(i, message)| {
+                if i == index {
+                    match message {
+                        AgentMessage::System(system) => {
+                            AgentMessage::System(with_tool_changes(system, &NO_CHANGES))
+                        }
+                        _ => unreachable!("rposition matched a system message"),
+                    }
+                } else {
+                    message.clone()
+                }
+            })
+            .collect(),
+        None => pending_messages.to_vec(),
+    };
+    let declared_tools: Vec<Tool> = context
+        .tools
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|tool| {
+            rpi_ai::utils::transcript::to_tool_declaration(&Tool {
+                name: tool.name().to_owned(),
+                description: tool.description().to_owned(),
+                parameters: tool.parameters().clone(),
+                constrained_sampling: tool.constrained_sampling(),
+            })
+        })
+        .collect();
+    let mut replay_messages: Vec<Message> = context
+        .messages
+        .iter()
+        .filter_map(agent_message_to_llm_ref)
+        .collect();
+    replay_messages.extend(
+        baseline
+            .iter()
+            .filter_map(agent_message_to_llm_ref)
+            .collect::<Vec<_>>(),
+    );
+    let changes = rpi_ai::utils::transcript::get_tool_state_changes(
+        &rpi_ai::utils::transcript::get_current_tools(&replay_messages),
+        &declared_tools,
+    );
+    let unchanged = changes.tools_added.is_empty() && changes.tools_removed.is_empty();
+
+    if let Some(index) = system_index {
+        // Keep the caller's message object when it already declares no tool
+        // changes.
+        let pending = match &pending_messages[index] {
+            AgentMessage::System(system) => system,
+            _ => unreachable!("rposition matched a system message"),
+        };
+        if unchanged
+            && pending.tools_added.as_ref().is_none_or(|t| t.is_empty())
+            && pending.tools_removed.as_ref().is_none_or(|t| t.is_empty())
+        {
+            return pending_messages.to_vec();
+        }
+        return baseline
+            .into_iter()
+            .enumerate()
+            .map(|(i, message)| match (i == index, message) {
+                (true, AgentMessage::System(system)) => {
+                    AgentMessage::System(with_tool_changes(&system, &changes))
+                }
+                (_, message) => message,
+            })
+            .collect();
+    }
+    if unchanged {
+        return pending_messages.to_vec();
+    }
+    let update = AgentMessage::System(with_tool_changes(
+        &rpi_ai::types::SystemMessage {
+            role: Default::default(),
+            content: Default::default(),
+            sections: None,
+            tools_added: None,
+            tools_removed: None,
+            timestamp: now_millis(),
+        },
+        &changes,
+    ));
+    let insert_index = pending_messages
+        .iter()
+        .position(|message| !matches!(message, AgentMessage::System(_)))
+        .unwrap_or(pending_messages.len());
+    let mut result = Vec::with_capacity(pending_messages.len() + 1);
+    result.extend(pending_messages[..insert_index].iter().cloned());
+    result.push(update);
+    result.extend(pending_messages[insert_index..].iter().cloned());
+    result
+}
+
+/// `NO_CHANGES` (agent-loop.ts:327).
+const NO_CHANGES: rpi_ai::utils::transcript::ToolStateChanges =
+    rpi_ai::utils::transcript::ToolStateChanges {
+        tools_added: Vec::new(),
+        tools_removed: Vec::new(),
+    };
+
+/// `withToolChanges` (agent-loop.ts:329-337): copy a system message with its
+/// tool fields replaced by `changes`; empty lists omit the field.
+fn with_tool_changes(
+    message: &rpi_ai::types::SystemMessage,
+    changes: &rpi_ai::utils::transcript::ToolStateChanges,
+) -> rpi_ai::types::SystemMessage {
+    rpi_ai::types::SystemMessage {
+        role: message.role,
+        content: message.content.clone(),
+        sections: message.sections.clone(),
+        tools_added: (!changes.tools_added.is_empty()).then(|| changes.tools_added.clone()),
+        tools_removed: (!changes.tools_removed.is_empty()).then(|| changes.tools_removed.clone()),
+        timestamp: message.timestamp,
+    }
+}
+
+/// Reference projection of an [`AgentMessage`] onto the LLM [`Message`] union
+/// (system/user/assistant/toolResult only — the replay helpers read no
+/// others).
+fn agent_message_to_llm_ref(message: &AgentMessage) -> Option<Message> {
+    match message {
+        AgentMessage::System(system) => Some(Message::System(system.clone())),
+        AgentMessage::User(user) => Some(Message::User(user.clone())),
+        AgentMessage::Assistant(assistant) => Some(Message::Assistant(assistant.clone())),
+        AgentMessage::ToolResult(result) => Some(Message::ToolResult(result.clone())),
+        _ => None,
+    }
+}
+
 /// `streamAssistantResponse` — stream one assistant response from the LLM.
 /// This is where `AgentMessage[]` gets transformed to `Message[]`.
 async fn stream_assistant_response(
@@ -819,22 +992,14 @@ async fn stream_assistant_response(
     // Convert to LLM-compatible messages (AgentMessage[] → Message[]).
     let llm_messages = (config.convert_to_llm)(messages).await;
 
-    // Build LLM context.
-    let llm_context = Context {
-        system_prompt: Some(context.system_prompt.clone()),
+    // Build LLM context (#9548, agent-loop.ts:355): the prompt and tool
+    // declarations already ride the transcript's system messages; the
+    // request is normalized without a standalone system prompt or tool list.
+    let llm_context = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
         messages: llm_messages,
-        tools: context.tools.as_ref().map(|tools| {
-            tools
-                .iter()
-                .map(|tool| Tool {
-                    name: tool.name().to_owned(),
-                    description: tool.description().to_owned(),
-                    parameters: tool.parameters().clone(),
-                    constrained_sampling: tool.constrained_sampling(),
-                })
-                .collect()
-        }),
-    };
+        tools: None,
+    });
 
     // Resolve API key (important for expiring tokens). Upstream `||` treats an
     // empty string as missing, hence the non-empty filter.
@@ -1572,11 +1737,6 @@ fn create_tool_result_message(finalized: &FinalizedToolCallOutcome) -> ToolResul
             Some(finalized.result.details.clone())
         },
         usage: finalized.result.usage.clone(),
-        added_tool_names: finalized
-            .result
-            .added_tool_names
-            .clone()
-            .filter(|names| !names.is_empty()),
         is_error: finalized.is_error,
         timestamp: now_millis(),
     }

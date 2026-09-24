@@ -25,11 +25,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use futures::StreamExt;
 use rpi_agent::stream_fn::StreamFn;
 use rpi_ai::types::{
-    ApiKind, AssistantContent, AssistantMessage, AssistantRole, CacheRetention, Context,
-    DoneReason, ErrorReason, ImageContent, InputModality, Message, Model, ModelCost,
-    ModelCostRates, ProviderResponse, StopReason, StreamEvent, StreamOptions, TextContent,
-    ThinkingContent, ToolCall, ToolResultContent, ToolResultMessage, Usage, UsageCost,
-    UserContentBlock,
+    ApiKind, AssistantContent, AssistantMessage, AssistantRole, CacheRetention, DoneReason,
+    ErrorReason, ImageContent, InputModality, Message, Model, ModelCost, ModelCostRates,
+    ProviderResponse, StopReason, StreamEvent, StreamOptions, TextContent, ThinkingContent,
+    ToolCall, ToolResultContent, ToolResultMessage, Usage, UsageCost, UserContentBlock,
 };
 
 pub const DEFAULT_API: &str = "faux";
@@ -172,7 +171,14 @@ pub struct FauxState {
 /// Factory response step: computes the assistant message from the actual
 /// request context/options (upstream `FauxResponseFactory`, synchronous).
 pub type FauxResponseFactory = Box<
-    dyn Fn(&Context, Option<&StreamOptions>, FauxState, &Model) -> AssistantMessage + Send + Sync,
+    dyn Fn(
+            &rpi_ai::types::TranscriptContext,
+            Option<&StreamOptions>,
+            FauxState,
+            &Model,
+        ) -> AssistantMessage
+        + Send
+        + Sync,
 >;
 
 /// One scripted step: a fixed message or a factory. The message variant is
@@ -353,7 +359,9 @@ impl FauxProvider {
     pub fn stream_fn(self: &Arc<Self>) -> StreamFn {
         let this = Arc::clone(self);
         Arc::new(
-            move |model: Model, context: Context, options: StreamOptions| {
+            move |model: Model,
+                  context: rpi_ai::types::TranscriptContext,
+                  options: StreamOptions| {
                 let this = Arc::clone(&this);
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
                 tokio::spawn(async move {
@@ -368,7 +376,7 @@ impl FauxProvider {
         &self,
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
         model: Model,
-        context: Context,
+        context: rpi_ai::types::TranscriptContext,
         options: StreamOptions,
     ) {
         if let Some(on_response) = &options.on_response {
@@ -428,7 +436,7 @@ impl FauxProvider {
     fn usage_estimate(
         &self,
         message: &AssistantMessage,
-        context: &Context,
+        context: &rpi_ai::types::TranscriptContext,
         options: &StreamOptions,
     ) -> Usage {
         let prompt_text = serialize_context(context);
@@ -522,32 +530,50 @@ fn tool_result_to_text(message: &ToolResultMessage) -> String {
 
 /// Port of upstream `serializeContext` (parity-sensitive: cache usage
 /// estimates in session JSONL derive from this exact string shape).
-fn serialize_context(context: &Context) -> String {
+/// #9548: the system prompt and tools ride the transcript's system messages
+/// (`system:<text>` + `tool±:<json>` markers, faux.ts:197-217).
+fn serialize_context(context: &rpi_ai::types::TranscriptContext) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(system) = &context.system_prompt {
-        parts.push(format!("system:{system}"));
-    }
     for message in &context.messages {
-        let text = match message {
-            Message::User(u) => match &u.content {
-                rpi_ai::types::UserContent::Text(t) => t.clone(),
-                rpi_ai::types::UserContent::Blocks(blocks) => content_to_text(blocks),
-            },
-            Message::Assistant(a) => assistant_content_to_text(&a.content),
-            Message::ToolResult(tr) => tool_result_to_text(tr),
-        };
-        let role = match message.role() {
-            rpi_ai::types::Role::User => "user",
-            rpi_ai::types::Role::Assistant => "assistant",
-            rpi_ai::types::Role::ToolResult => "toolResult",
+        let (role, text) = match message {
+            Message::System(system) => {
+                let mut pieces = vec![rpi_ai::utils::text::get_system_message_text(system)];
+                if let Some(removed) = &system.tools_removed {
+                    pieces.extend(removed.iter().map(|tool| {
+                        format!(
+                            "tool-:{}",
+                            serde_json::to_string(tool).unwrap_or_else(|_| "null".to_owned())
+                        )
+                    }));
+                }
+                if let Some(added) = &system.tools_added {
+                    pieces.extend(added.iter().map(|tool| {
+                        format!(
+                            "tool+:{}",
+                            serde_json::to_string(tool).unwrap_or_else(|_| "null".to_owned())
+                        )
+                    }));
+                }
+                (
+                    "system",
+                    pieces
+                        .into_iter()
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+            Message::User(u) => (
+                "user",
+                match &u.content {
+                    rpi_ai::types::UserContent::Text(t) => t.clone(),
+                    rpi_ai::types::UserContent::Blocks(blocks) => content_to_text(blocks),
+                },
+            ),
+            Message::Assistant(a) => ("assistant", assistant_content_to_text(&a.content)),
+            Message::ToolResult(tr) => ("toolResult", tool_result_to_text(tr)),
         };
         parts.push(format!("{role}:{text}"));
-    }
-    if let Some(tools) = &context.tools {
-        if !tools.is_empty() {
-            let json = serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_owned());
-            parts.push(format!("tools:{json}"));
-        }
     }
     parts.join("\n\n")
 }
@@ -918,7 +944,7 @@ impl rpi_ai::models::Provider for FauxAiProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &rpi_ai::types::TranscriptContext,
         options: Option<StreamOptions>,
     ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
         let stream = rpi_ai::utils::event_stream::AssistantMessageEventStream::new();
@@ -940,7 +966,7 @@ impl rpi_ai::models::Provider for FauxAiProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &rpi_ai::types::TranscriptContext,
         options: Option<rpi_ai::types::SimpleStreamOptions>,
     ) -> Result<rpi_ai::utils::event_stream::AssistantMessageEventStream, String> {
         self.reasoning_seen
@@ -955,8 +981,8 @@ impl rpi_ai::models::Provider for FauxAiProvider {
 mod tests {
     use super::*;
 
-    fn user_context(text: &str) -> Context {
-        Context {
+    fn user_context(text: &str) -> rpi_ai::types::TranscriptContext {
+        rpi_ai::utils::transcript::normalize_context(&rpi_ai::types::Context {
             system_prompt: None,
             messages: vec![Message::User(rpi_ai::types::UserMessage {
                 role: rpi_ai::types::UserRole::User,
@@ -964,7 +990,7 @@ mod tests {
                 timestamp: 0,
             })],
             tools: None,
-        }
+        })
     }
 
     async fn collect(

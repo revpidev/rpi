@@ -158,10 +158,9 @@ impl rpi_agent::types::AgentTool for HostToolAdapter {
         signal: tokio_util::sync::CancellationToken,
         on_update: Option<rpi_agent::types::AgentToolUpdateCallback>,
     ) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::AgentError> {
-        // wrapper.ts:23-34 — snapshot active tools around execution; only a
-        // pure addition set is attached as `addedToolNames`.
-        let actions = self.host.runtime().actions();
-        let active_before = actions.as_ref().map(|a| a.get_active_tools());
+        // #9548 (wrapper.ts): plain `wrapToolDefinition` execution — the
+        // addedToolNames attachment went with the deferred-tool mechanism
+        // (tool changes ride transcript system messages now).
         let request = ext::ToolExecuteRequest {
             tool_call_id: tool_call_id.to_owned(),
             params,
@@ -169,32 +168,9 @@ impl rpi_agent::types::AgentTool for HostToolAdapter {
             on_update,
         };
         let ctx = self.host.core().create_context();
-        let mut result = (self.definition.execute)(request, ctx)
+        (self.definition.execute)(request, ctx)
             .await
-            .map_err(rpi_agent::AgentError::Tool)?;
-        let (Some(actions), Some(before)) = (actions, active_before) else {
-            return Ok(result);
-        };
-        let after = actions.get_active_tools();
-        if !before.iter().all(|name| after.contains(name)) {
-            return Ok(result);
-        }
-        let mut added: Vec<String> = after
-            .into_iter()
-            .filter(|name| !before.contains(name))
-            .collect();
-        if added.is_empty() {
-            return Ok(result);
-        }
-        // `[...new Set([...(result.addedToolNames ?? []), ...added])]`.
-        let mut merged: Vec<String> = result.added_tool_names.take().unwrap_or_default();
-        for name in added.drain(..) {
-            if !merged.contains(&name) {
-                merged.push(name);
-            }
-        }
-        result.added_tool_names = Some(merged);
-        Ok(result)
+            .map_err(rpi_agent::AgentError::Tool)
     }
 }
 
@@ -561,15 +537,19 @@ impl ExtensionRunner for ExtensionHostAdapter {
         &self,
         text: &str,
         images: Option<&[ImageContent]>,
-        system_prompt: &str,
-        system_prompt_options: Value,
+        system_prompt_options: &crate::core::system_prompt::BuildSystemPromptOptions,
     ) -> Option<BeforeAgentStartResult> {
+        // #9548: the event carries the structured options; the rendered
+        // prompt is recomputed per handler inside the runner (chained), so
+        // the session no longer pre-renders it.
+        let options_json = serde_json::to_value(system_prompt_options).unwrap_or(Value::Null);
+        let base_prompt = crate::core::system_prompt::build_system_prompt(system_prompt_options);
         let payload = serde_json::json!({
             "type": ext::EVENT_BEFORE_AGENT_START,
             "prompt": text,
             "images": images,
-            "systemPrompt": system_prompt,
-            "systemPromptOptions": system_prompt_options,
+            "systemPrompt": base_prompt,
+            "systemPromptOptions": options_json,
         });
         let result = self.host.emit_before_agent_start(payload).await?;
         let messages = result
@@ -588,13 +568,29 @@ impl ExtensionRunner for ExtensionHostAdapter {
                     .collect()
             })
             .unwrap_or_default();
-        let system_prompt = result
-            .get("systemPrompt")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        // The combined result carries the mutated options (runner threads
+        // in-place mutations and chained `systemPrompt` as force). A parse
+        // failure falls back to the base options and drops the handler's
+        // mutations — log it (a malformed `toolGuidelines` shape would
+        // otherwise vanish silently).
+        let system_prompt_options = match result.get("systemPromptOptions").cloned() {
+            Some(value) => match serde_json::from_value::<
+                crate::core::system_prompt::BuildSystemPromptOptions,
+            >(value.clone())
+            {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    tracing::warn!(
+                        "before_agent_start systemPromptOptions parse failed, using base: {error}"
+                    );
+                    system_prompt_options.clone()
+                }
+            },
+            None => system_prompt_options.clone(),
+        };
         Some(BeforeAgentStartResult {
             messages,
-            system_prompt,
+            system_prompt_options,
         })
     }
 

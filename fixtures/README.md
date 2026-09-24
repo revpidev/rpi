@@ -1,6 +1,6 @@
 # Rpi Parity Fixtures
 
-> Landing directory and runbook for the parity/contract test baseline data (golden fixtures).Upstream reference: the committed goldens are recorded against `external/pi` @ `9841914c71a74d81abe07f751aefd271fd924e63` (v0.85.0+) — re-recorded in v0.1.4 M5 (previously `4181f66` / v0.11 T18, `2efa728` / v0.1). The current pin always lives in `UPSTREAM.md`; regenerating fixtures that match the committed data requires the submodule checked out at the recording pin.The v0.1.4 re-record accompanied the eb3e9feed theme-validation split (rpi `themes.rs`: lenient library cast + app-installed validator; the `themes` golden dropped its `pendingSplitCases` meta and every case is compared — the `resource-loader-e2e` theme diagnostics now pin the lenient path's raw TypeError wording). Diff-time canonicalization: the normalizer moves an `errorMessage` key that shares an object with `timestamp` to the object end — upstream's key order is construction-path dependent (fresh literals vs spread-appended abort messages) and not part of the session-format contract.Note: `events.jsonl` holds the **internal** AgentSession event transcript (with cumulative `message`/`partial` on `message_update`); the delta-only wire shape (`toJsonEvent`, json-event.ts @ 9841914) applies only at the print/json + RPC stdout boundary and is covered by the print/RPC tests, not by these fixtures.
+> Landing directory and runbook for the parity/contract test baseline data (golden fixtures).Upstream reference: the five scenario goldens under `generated/` (`single-turn`/`tool-calls`/`abort`/`length-truncation`/`steering-followup`) are recorded against `external/pi` @ **`19451accdeec671c1f4da9eafac8fc270f510ef4`** (v0.86.1+1) — re-recorded in v0.1.5 V15-06 (#9548: the leading system declaration entry joins the transcript; usage numbers shift with the new faux `serializeContext` shape; diff-time `normalize_system_declaration` in `parity_headless_test.rs` absorbs the documented rpi packaging deltas: brand wording, no bundled `docs` section, tool declarations compared as a name set). **All other committed goldens** (resources/themes/mcp/subagents tracks) **remain recorded against their previously documented pins** — for the v0.1.4-era baselines that is `9841914c71a74d81abe07f751aefd271fd924e63` (v0.85.0+, v0.1.4 M5; previously `4181f66` / v0.11 T18, `2efa728` / v0.1). The current pin always lives in `UPSTREAM.md`; regenerating fixtures that match the committed data requires the submodule checked out at the recording pin.The v0.1.4 re-record accompanied the eb3e9feed theme-validation split (rpi `themes.rs`: lenient library cast + app-installed validator; the `themes` golden dropped its `pendingSplitCases` meta and every case is compared — the `resource-loader-e2e` theme diagnostics now pin the lenient path's raw TypeError wording). Diff-time canonicalization: the normalizer moves an `errorMessage` key that shares an object with `timestamp` to the object end — upstream's key order is construction-path dependent (fresh literals vs spread-appended abort messages) and not part of the session-format contract.Note: `events.jsonl` holds the **internal** AgentSession event transcript (with cumulative `message`/`partial` on `message_update`); the delta-only wire shape (`toJsonEvent`, json-event.ts @ 9841914) applies only at the print/json + RPC stdout boundary and is covered by the print/RPC tests, not by these fixtures.
 >
 > The **shared normalization and diff implementation** lives in `rpi-test-support` (`normalize.rs` / `diff.rs`). In addition, each parity test strips numeric keys (`usage`/`details` etc., see the `STRIPPED_KEYS` list at the top of each test file — currently a local implementation in three test files) before diffing.Fixtures store **raw bytes**; timestamp / uuid / session id / cwd stripping happens at diff time, not at generation time.
 
@@ -23,7 +23,8 @@ fixtures/
 > `external/pi-subagents` @ `0fc0eebb` (v0.66.0) until TE39, `external/pi-mcp-adapter` @ `10a45367`
 > (v2.32.1) until TE40, `external/rpiv-mono` @ `338b264` until TE41; `external/agent-smart-fetch` @
 > `b0111612` unchanged (upstream HEAD, zero-diff re-verified). The committed goldens above remain
-> recorded against `9841914` until the v0.1.5 host re-record tasks (V15-xx) land; the pi submodule
+> recorded against `9841914` except the five `generated/` scenarios, re-recorded @ `19451accd`
+> with V15-06 (#9548); the pi submodule
 > at `d1230ea` is the read source for those tasks. New **target tracks** (expectation source = new
 > pins, read-only snapshots): `fixtures/generated/subagents-parity-v070/` (v0.70.0 @ `b72714de`)
 > and the mcp v2.34.0+9 snapshot via `scripts/mcp-parity/TARGET-TRACK.md` — both start as skeleton
@@ -49,8 +50,8 @@ Prerequisites (one-time; `node_modules/` and `dist/` are both in `.gitignore`, s
 
 ```bash
 cd external/pi
-git rev-parse HEAD   # must match the recording pin (9841914c71a74d81abe07f751aefd271fd924e63,
-                     # see the note at the top of this file)
+git rev-parse HEAD   # must match the recording pin (19451accdeec671c1f4da9eafac8fc270f510ef4
+                     # for the five generated/ scenarios; see the note at the top of this file)
 npm ci --ignore-scripts
 # Build order matters (workspace deps); pi-ai uses build:offline so the
 # network-fetching generate-models step does not rewrite pinned sources.

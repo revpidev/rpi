@@ -60,8 +60,9 @@ use crate::api::sse::SseDecoder;
 use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
-    AssistantMessage, Context, DoneReason, ErrorReason, Model, ModelThinkingLevel, ProviderHeaders,
-    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, Usage,
+    AssistantMessage, DoneReason, ErrorReason, Model, ModelThinkingLevel, ProviderHeaders,
+    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
+    TranscriptContext, Usage,
 };
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
@@ -312,17 +313,40 @@ pub fn build_client_headers(
 /// payload snapshots compare byte-for-byte with the JS payloads.
 pub fn build_params(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &AzureOpenAIResponsesOptions,
     deployment_name: &str,
     grammar_tool_input_properties: &HashMap<String, String>,
 ) -> Result<Value, String> {
+    // #9548 (azure-openai-responses.ts:282-299).
+    let supports_additional_tools = model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.supports_additional_tools)
+        .unwrap_or(false);
+    let supports_tool_search = model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.supports_tool_search)
+        .unwrap_or(false);
+    let supports_mid_convo_system_messages = model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.supports_mid_convo_system_messages)
+        .unwrap_or(false);
+    let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
+        &context.messages,
+        supports_additional_tools || supports_tool_search,
+    );
     let messages = convert_responses_messages(
         model,
         context,
         &AZURE_TOOL_CALL_PROVIDERS,
         &ConvertResponsesMessagesOptions {
             grammar_tool_input_properties: Some(grammar_tool_input_properties),
+            supports_mid_convo_system_messages,
+            supports_additional_tools,
+            supports_tool_search,
             ..ConvertResponsesMessagesOptions::default()
         },
     )?;
@@ -345,7 +369,9 @@ pub fn build_params(
     if let Some(temperature) = options.stream.temperature {
         params["temperature"] = json!(temperature);
     }
-    if let Some(tools) = context.tools.as_deref().filter(|tools| !tools.is_empty()) {
+    let request_tools = transcript_tools.request_tools;
+    if !request_tools.is_empty() {
+        let tools: &[crate::types::Tool] = &request_tools;
         // Unlike openai-responses (default false), the Azure adapter defaults
         // `supportsStrictMode` to true.
         params["tools"] = json!(convert_responses_tools(
@@ -448,7 +474,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
 /// message either way.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &AzureOpenAIResponsesOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
@@ -465,7 +491,7 @@ async fn run(
         .ok_or_else(|| format!("No API key for provider: {}", model.provider))?;
     let config = resolve_azure_config(model, Some(options))?;
     let grammar_tool_input_properties = create_grammar_tool_input_properties(
-        context.tools.as_deref(),
+        Some(crate::utils::transcript::get_declared_tools(&context.messages).as_slice()),
         model
             .compat
             .as_ref()
@@ -656,13 +682,21 @@ async fn run(
 /// `stream` (azure-openai-responses).
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: AzureOpenAIResponsesOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
     let task_stream = event_stream.clone();
     let model = model.clone();
-    let context = context.clone();
+    // #9548 (azure-openai-responses.ts:77).
+    let context = crate::utils::transcript::resolve_transcript(
+        context,
+        model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.supports_mid_convo_system_messages)
+            .unwrap_or(false),
+    );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let mut output = initial_output(&model);
@@ -701,7 +735,7 @@ pub fn stream(
 /// `clampThinkingLevel`; a clamped "off" omits `reasoning_effort`.
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     // Auth check at the entry, before any stream is constructed
@@ -756,7 +790,7 @@ impl ProviderStreams for AzureOpenAiResponses {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -772,7 +806,7 @@ impl ProviderStreams for AzureOpenAiResponses {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
@@ -805,7 +839,11 @@ mod tests {
         HashMap::new()
     }
 
-    fn params_for(model: &Model, ctx: &Context, options: &AzureOpenAIResponsesOptions) -> Value {
+    fn params_for(
+        model: &Model,
+        ctx: &crate::types::TranscriptContext,
+        options: &AzureOpenAIResponsesOptions,
+    ) -> Value {
         build_params(model, ctx, options, "deployment-x", &no_grammar()).expect("params")
     }
 

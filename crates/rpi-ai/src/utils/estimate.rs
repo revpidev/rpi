@@ -9,8 +9,8 @@
 //! the D-003 faux-provider decision (chars/4, BMP-equivalent).
 
 use crate::types::{
-    AssistantContent, Context, ImageContent, Message, TextContent, Tool, ToolResultContent, Usage,
-    UserContent, UserContentBlock,
+    AssistantContent, ImageContent, Message, TextContent, Tool, ToolResultContent,
+    TranscriptContext, Usage, UserContent, UserContentBlock,
 };
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -63,7 +63,17 @@ pub fn estimate_text_tokens(text: &str) -> u64 {
 }
 
 pub fn estimate_message_tokens(message: &Message) -> u64 {
+    // System messages count their rendered text plus both tool lists
+    // (#9548, estimate.ts:49-56).
+    if let Message::System(system) = message {
+        let mut tokens = estimate_text_tokens(&crate::utils::text::get_system_message_text(system));
+        tokens += estimate_tools_tokens(system.tools_added.as_deref());
+        tokens += estimate_tool_reference_tokens(system.tools_removed.as_deref());
+        return tokens;
+    }
     let chars: usize = match message {
+        // Handled by the early return above.
+        Message::System(_) => 0,
         Message::User(user) => match &user.content {
             UserContent::Text(text) => estimate_text_and_image_chars_text(text),
             UserContent::Blocks(blocks) => blocks
@@ -123,6 +133,7 @@ fn last_assistant_usage_info(messages: &[Message]) -> Option<(&Usage, usize)> {
 
 fn message_timestamp(message: &Message) -> i64 {
     match message {
+        Message::System(m) => m.timestamp,
         Message::User(m) => m.timestamp,
         Message::Assistant(m) => m.timestamp,
         Message::ToolResult(m) => m.timestamp,
@@ -160,53 +171,22 @@ fn estimate_tools_tokens(tools: Option<&[Tool]>) -> u64 {
     }
 }
 
+fn estimate_tool_reference_tokens(tools: Option<&[crate::types::ToolReference]>) -> u64 {
+    match tools {
+        Some(tools) if !tools.is_empty() => estimate_text_tokens(&safe_json_stringify(&tools)),
+        _ => 0,
+    }
+}
+
 /// `estimateContextTokens` for a bare message slice (upstream array overload).
 pub fn estimate_messages_tokens(messages: &[Message]) -> ContextUsageEstimate {
     estimate_messages(messages)
 }
 
-/// `estimateContextTokens` for a full [`Context`].
-pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
-    let estimate = estimate_messages(&context.messages);
-
-    if let Some(last_usage_index) = estimate.last_usage_index {
-        let added_names: std::collections::HashSet<&str> = context.messages[last_usage_index + 1..]
-            .iter()
-            .filter_map(|message| match message {
-                Message::ToolResult(result) => result.added_tool_names.as_deref(),
-                _ => None,
-            })
-            .flatten()
-            .map(String::as_str)
-            .collect();
-        let added_tools: Vec<Tool> = context
-            .tools
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|tool| added_names.contains(tool.name.as_str()))
-            .cloned()
-            .collect();
-        let added_tool_tokens = estimate_tools_tokens(Some(&added_tools));
-        return ContextUsageEstimate {
-            tokens: estimate.tokens + added_tool_tokens,
-            usage_tokens: estimate.usage_tokens,
-            trailing_tokens: estimate.trailing_tokens + added_tool_tokens,
-            last_usage_index: Some(last_usage_index),
-        };
-    }
-
-    let prefix_tokens = context
-        .system_prompt
-        .as_deref()
-        .map(estimate_text_tokens)
-        .unwrap_or(0)
-        + estimate_tools_tokens(context.tools.as_deref());
-
-    ContextUsageEstimate {
-        tokens: estimate.tokens + prefix_tokens,
-        usage_tokens: estimate.usage_tokens,
-        trailing_tokens: estimate.trailing_tokens + prefix_tokens,
-        last_usage_index: None,
-    }
+/// `estimateContextTokens` for a normalized [`TranscriptContext`]
+/// (post-#9548: the prompt and tools ride the system messages, so the
+/// message-only estimate already covers them; the old `Context` prefix /
+/// `addedToolNames` adjustments are gone with the fields themselves).
+pub fn estimate_context_tokens(context: &TranscriptContext) -> ContextUsageEstimate {
+    estimate_messages(&context.messages)
 }

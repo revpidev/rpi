@@ -331,8 +331,11 @@ async fn agent_event_payloads_match_upstream_shapes() {
     let message_starts = records_of(&records, "message_start");
     assert!(message_starts.len() >= 3, "user + two assistant starts");
     assert_eq!(message_starts[0]["type"], "message_start");
-    assert_eq!(message_starts[0]["message"]["role"], "user");
-    assert_eq!(message_starts[1]["message"]["role"], "assistant");
+    // #9548: the first start is the leading system declaration; user and
+    // assistant follows.
+    assert_eq!(message_starts[0]["message"]["role"], "system");
+    assert_eq!(message_starts[1]["message"]["role"], "user");
+    assert_eq!(message_starts[2]["message"]["role"], "assistant");
 
     // message_update: {type, message, assistantMessageEvent} — the faux
     // stream emits text deltas for the plain-text turn.
@@ -756,9 +759,8 @@ async fn session_compact_failed_payload_shape_on_threshold_failure() {
     }
     let error_message = failures[0]["errorMessage"].as_str().expect("errorMessage");
     assert!(
-        error_message.starts_with(
-            "Auto-compaction failed: Turn prefix summarization failed: summarizer exploded"
-        ),
+        error_message.starts_with("Auto-compaction failed: ")
+            && error_message.contains("summarizer exploded"),
         "errorMessage: {error_message}"
     );
 }

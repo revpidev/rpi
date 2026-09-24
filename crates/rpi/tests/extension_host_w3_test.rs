@@ -4,7 +4,7 @@
 //!
 //! Upstream anchors: agent-session.ts:1429-1503 (sendMessage/
 //! sendUserMessage), :2356-2443 (bindCore mapping), :2454-2545
-//! (_refreshToolRegistry), wrapper.ts:17-37 (addedToolNames),
+//! (_refreshToolRegistry), wrapper.ts (wrapRegisteredTools 上下文适配),
 //! agent-session-services.ts:81-127 (flag application), exec.ts:34-106
 //! (exec).
 
@@ -491,6 +491,14 @@ async fn w3_set_active_tools_ignores_unknown_and_rebuilds_prompt() {
         !after.contains("Execute bash commands"),
         "bash snippet must leave the prompt"
     );
+    // #9548 (P2b): guidelines re-derive for the CURRENT tool set — read's
+    // guideline line is present, bash's is gone (contributions → definitions
+    // → tool_guidelines map → build_rules end-to-end).
+    assert!(after.contains("- Use read to examine files instead of cat or sed."));
+    assert!(
+        !after.contains("- You can inspect RPI_*"),
+        "bash guidelines must leave with the tool"
+    );
 
     // getAllTools: all registered tools (including inactive ones), with sourceInfo.
     let all = api.get_all_tools().unwrap();
@@ -500,7 +508,8 @@ async fn w3_set_active_tools_ignores_unknown_and_rebuilds_prompt() {
 }
 
 // ---------------------------------------------------------------------------
-// addedToolNames（wrapper.ts:17-37）
+// Runtime tool activation declares via transcript system messages (#9548;
+// the pre-#9548 `addedToolNames` tool-result attachment is gone)
 // ---------------------------------------------------------------------------
 
 fn register_tool(api: &ExtensionApi, name: &str, execute: ext::ToolExecuteFn) {
@@ -540,7 +549,7 @@ fn tool_result_json(session: &AgentSession) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn w3_added_tool_names_pure_addition_branch() {
+async fn w3_runtime_tool_addition_declared_via_system_message() {
     let (host, slot) = host_with_api(Vec::new()).await;
     // The activator registers extra during execution: registerTool's refresh adds the
     // new name to the active set (the new-names branch of agent-session.ts:2536-2541),
@@ -599,17 +608,32 @@ async fn w3_added_tool_names_pure_addition_branch() {
         .expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // Purely additive: addedToolNames carries extra (wrapper.ts:28-34).
+    // #9548: addedToolNames is gone — the runtime-added tool is declared by
+    // a transcript system message (declare_tool_changes before the next
+    // request) and the active set keeps it.
     let result = tool_result_json(&fixture.session);
-    assert_eq!(result["addedToolNames"], json!(["extra"]));
+    assert!(result.get("addedToolNames").is_none() || result["addedToolNames"].is_null());
     assert!(fixture
         .session
         .get_active_tool_names()
         .contains(&"extra".to_owned()));
+    // The declaration rode a system message with toolsAdded: [extra].
+    let declared_extra = fixture
+        .session
+        .messages()
+        .iter()
+        .any(|message| match message {
+            rpi_agent::messages::AgentMessage::System(system) => system
+                .tools_added
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool.name == "extra")),
+            _ => false,
+        });
+    assert!(declared_extra, "extra declared via system message");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn w3_added_tool_names_suppressed_when_tools_removed() {
+async fn w3_tool_declaration_replaced_when_tools_removed() {
     let (host, slot) = host_with_api(Vec::new()).await;
     let host = host;
     let slot2 = slot.clone();
@@ -627,8 +651,8 @@ async fn w3_added_tool_names_suppressed_when_tools_removed() {
                             .unwrap_or_else(|e| e.into_inner())
                             .clone()
                             .expect("api");
-                        // A set change that removes (read dropped) → do not attach addedToolNames
-                        //（wrapper.ts:26-27）。
+                        // A set change that removes (read dropped); the
+                        // delta rides a transcript system message (#9548).
                         api.set_active_tools(vec!["swapper".to_owned(), "other".to_owned()])
                             .expect("set_active_tools");
                         Ok(rpi_agent::types::AgentToolResult::default())
@@ -666,6 +690,28 @@ async fn w3_added_tool_names_suppressed_when_tools_removed() {
         result.get("addedToolNames").is_none() || result["addedToolNames"].is_null(),
         "no addedToolNames when the active set lost tools: {result}"
     );
+    // #9548: the removal+addition delta rode a system message — the new
+    // tools are declared and the dropped built-ins are removed.
+    let session_messages = fixture.session.messages();
+    let declared = session_messages
+        .iter()
+        .filter_map(|message| match message {
+            rpi_agent::messages::AgentMessage::System(system) => Some(system),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(declared.iter().any(|system| {
+        system
+            .tools_added
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool.name == "swapper"))
+    }));
+    assert!(declared.iter().any(|system| {
+        system
+            .tools_removed
+            .as_ref()
+            .is_some_and(|removed| removed.iter().any(|tool| tool.name == "read"))
+    }));
 }
 
 // ---------------------------------------------------------------------------

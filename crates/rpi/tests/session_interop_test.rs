@@ -334,13 +334,14 @@ async fn d1_upstream_to_rpi_prompt_continue_multiple_fixtures() {
             .await
             .expect("prompt");
 
-        // File: exactly 2 new lines appended (user + assistant message).
+        // File: exactly 3 new lines appended — #9548 old-session backfill
+        // (leading system declaration) + user + assistant.
         let on_disk = std::fs::read_to_string(&staged).expect("read continued session");
         let continued_lines = non_empty_lines(&on_disk);
         assert_eq!(
             continued_lines.len(),
-            before_lines.len() + 2,
-            "{scenario}: file appended exactly user+assistant"
+            before_lines.len() + 3,
+            "{scenario}: file appended exactly system+user+assistant"
         );
 
         // Prefix untouched (byte-identical original lines).
@@ -350,26 +351,39 @@ async fn d1_upstream_to_rpi_prompt_continue_multiple_fixtures() {
             "{scenario}: original fixture lines untouched"
         );
 
-        // The two new lines are message entries: user then assistant.
-        let user_line: Value =
-            serde_json::from_str(continued_lines[before_lines.len()]).expect("user line parses");
+        // The backfilled declaration is a system message entry.
+        let system_line: Value =
+            serde_json::from_str(continued_lines[before_lines.len()]).expect("system line parses");
         assert_eq!(
-            user_line.get("type").and_then(Value::as_str),
+            system_line.get("type").and_then(Value::as_str),
             Some("message"),
             "{scenario}: new line 1 is a message"
         );
         assert_eq!(
-            user_line["message"]["role"].as_str(),
-            Some("user"),
-            "{scenario}: new line 1 is user role"
+            system_line["message"]["role"].as_str(),
+            Some("system"),
+            "{scenario}: new line 1 is the backfilled system declaration"
         );
 
-        let assistant_line: Value = serde_json::from_str(continued_lines[before_lines.len() + 1])
+        let user_line: Value = serde_json::from_str(continued_lines[before_lines.len() + 1])
+            .expect("user line parses");
+        assert_eq!(
+            user_line.get("type").and_then(Value::as_str),
+            Some("message"),
+            "{scenario}: new line 2 is a message"
+        );
+        assert_eq!(
+            user_line["message"]["role"].as_str(),
+            Some("user"),
+            "{scenario}: new line 2 is user role"
+        );
+
+        let assistant_line: Value = serde_json::from_str(continued_lines[before_lines.len() + 2])
             .expect("assistant line parses");
         assert_eq!(
             assistant_line.get("type").and_then(Value::as_str),
             Some("message"),
-            "{scenario}: new line 2 is a message"
+            "{scenario}: new line 3 is a message"
         );
         assert_eq!(
             assistant_line["message"]["role"].as_str(),

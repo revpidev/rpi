@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use rpi_ai::types::{Context, Model, StreamEvent, StreamOptions};
+use rpi_ai::types::{Model, StreamEvent, StreamOptions, TranscriptContext};
 
 /// Boxed, sendable stream of [`StreamEvent`]s.
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
@@ -25,5 +25,8 @@ pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
 /// `Models::stream_simple` (adapted to this shape by the assembly layer)
 /// satisfies it in production; tests inject faux streams (coding-standards
 /// §4.2).
-pub type StreamFn =
-    Arc<dyn Fn(Model, Context, StreamOptions) -> BoxStream<'static, StreamEvent> + Send + Sync>;
+pub type StreamFn = Arc<
+    dyn Fn(Model, TranscriptContext, StreamOptions) -> BoxStream<'static, StreamEvent>
+        + Send
+        + Sync,
+>;

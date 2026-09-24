@@ -444,9 +444,10 @@ struct AgentSessionInner {
     pending_bash_messages: Mutex<Vec<BashExecutionMessage>>,
 
     scoped_models: Mutex<Vec<ScopedModel>>,
-    base_system_prompt: Mutex<String>,
+    /// Prompt options after before_agent_start mutations for the active
+    /// run (#9548, agent-session.ts:390); `None` outside a run.
+    run_system_prompt_options: Mutex<Option<BuildSystemPromptOptions>>,
     base_system_prompt_options: Mutex<BuildSystemPromptOptions>,
-    system_prompt_override: Mutex<Option<String>>,
     tool_registry: Mutex<OrderedMap<Arc<dyn AgentTool>>>,
     /// `ToolDefinitionEntry` registry (agent-session.ts:2460 `_toolDefinitions`).
     tool_definitions: Mutex<OrderedMap<ToolDefinitionEntry>>,
@@ -570,19 +571,21 @@ impl AgentSession {
             bash_tokens: Mutex::new(Vec::new()),
             pending_bash_messages: Mutex::new(Vec::new()),
             scoped_models: Mutex::new(config.scoped_models),
-            base_system_prompt: Mutex::new(String::new()),
+            run_system_prompt_options: Mutex::new(None),
             base_system_prompt_options: Mutex::new(BuildSystemPromptOptions {
                 custom_prompt: None,
+                force_system_prompt: None,
                 selected_tools: None,
                 tool_snippets: None,
+                tool_guidelines: None,
                 prompt_guidelines: Vec::new(),
                 append_system_prompt: None,
+                sections: None,
                 cwd: PathBuf::new(),
                 context_files: Vec::new(),
                 skills_xml: None,
                 doc_paths: None,
             }),
-            system_prompt_override: Mutex::new(None),
             tool_registry: Mutex::new(OrderedMap::default()),
             tool_definitions: Mutex::new(OrderedMap::default()),
             custom_tools: config.custom_tools.clone(),
@@ -651,11 +654,25 @@ impl AgentSession {
             }
         }
 
-        session.build_tool_runtime(config.initial_active_tool_names);
         // `_installAgentNextTurnRefresh()` (agent-session.ts:397, 563-580):
         // wrap the (optional) previous prepare chain with the threshold
         // compaction + state refresh (V14-01 FR-D).
         session.install_agent_next_turn_refresh();
+        // `_installAgentForcedPromptProjection()` (agent-session.ts:417 @
+        // #9548).
+        session.install_agent_forced_prompt_projection();
+        // Upstream constructor order (agent-session.ts:415-423): installs →
+        // `_buildRuntime` → restore. `config.initialActiveToolNames ===
+        // undefined` decides the restore — capture before the move.
+        let restore_from_transcript = config.initial_active_tool_names.is_none();
+        session.build_tool_runtime(config.initial_active_tool_names);
+        // `_restoreToolsFromTranscript` (agent-session.ts:421-424 @ #9548):
+        // with no explicit initial loadout, the transcript-declared tool set
+        // is authoritative (resume restores `setActiveTools` state); a fresh
+        // transcript declares nothing and this is a no-op.
+        if restore_from_transcript {
+            session.restore_tools_from_transcript();
+        }
         session
     }
 
@@ -714,23 +731,60 @@ impl AgentSession {
                     } else {
                         None
                     };
+                    let mut prepared_messages: Vec<AgentMessage> = Vec::new();
                     if let Some(update) = previous_snapshot {
                         if let Some(next_context) = update.context {
                             context = next_context;
                         }
+                        prepared_messages = update.messages.unwrap_or_default();
                     }
 
-                    // 3. Refresh from live state (agent-session.ts:568-578).
-                    let state = session.inner.agent.state();
-                    let system_prompt = lock(&session.inner.system_prompt_override)
+                    // 3. Refresh prompt/tool loadout from live state
+                    //    (agent-session.ts:591-613 @ #9548).
+                    let run_options = lock(&session.inner.run_system_prompt_options)
                         .clone()
-                        .unwrap_or_else(|| lock(&session.inner.base_system_prompt).clone());
+                        .unwrap_or_else(|| lock(&session.inner.base_system_prompt_options).clone());
+                    let mut options = run_options.clone();
+                    options.selected_tools = Some(session.get_active_tool_names());
+                    // toolSnippets / toolGuidelines merge base+run key-wise
+                    // with the run winning (agent-session.ts:587-588); the
+                    // rpi builder reads both maps per selected tool.
+                    let mut merged_snippets = lock(&session.inner.base_system_prompt_options)
+                        .tool_snippets
+                        .clone()
+                        .unwrap_or_default();
+                    if let Some(run_snippets) = &run_options.tool_snippets {
+                        for (name, snippet) in run_snippets {
+                            merged_snippets.insert(name.clone(), snippet.clone());
+                        }
+                    }
+                    options.tool_snippets = Some(merged_snippets);
+                    let mut merged_guidelines = lock(&session.inner.base_system_prompt_options)
+                        .tool_guidelines
+                        .clone()
+                        .unwrap_or_default();
+                    if let Some(run_guidelines) = &run_options.tool_guidelines {
+                        for (name, guidelines) in run_guidelines {
+                            merged_guidelines.insert(name.clone(), guidelines.clone());
+                        }
+                    }
+                    options.tool_guidelines = Some(merged_guidelines);
+                    let update_message = session
+                        .prepare_prompt_and_tool_loadout(&mut options, Some(&context.messages));
+                    // Keep session.systemPrompt and ctx.getSystemPrompt() in
+                    // step with what the provider sees.
+                    *lock(&session.inner.run_system_prompt_options) = Some(options);
+                    if let Some(update) = update_message {
+                        prepared_messages.push(AgentMessage::System(update));
+                    }
+
+                    let state = session.inner.agent.state();
                     Some(AgentLoopTurnUpdate {
                         context: Some(AgentContext {
-                            system_prompt,
-                            tools: Some(state.tools),
+                            tools: Some(state.tools.clone()),
                             messages: context.messages,
                         }),
+                        messages: Some(prepared_messages),
                         model: Some(state.model),
                         thinking_level: Some(state.thinking_level),
                     })
@@ -853,7 +907,10 @@ impl AgentSession {
                 }
                 AgentMessage::User(_)
                 | AgentMessage::Assistant(_)
-                | AgentMessage::ToolResult(_) => {
+                | AgentMessage::ToolResult(_)
+                | AgentMessage::System(_) => {
+                    // #9548: system messages (prompt/tool patches) persist
+                    // through the same message-entry path.
                     let result = lock(&self.inner.session_manager).append_message(message.clone());
                     if let Err(error) = result {
                         tracing::warn!("session append failed: {error}");
@@ -1179,9 +1236,13 @@ impl AgentSession {
         !self.is_streaming() && !self.is_compacting()
     }
 
-    /// `get systemPrompt` (agent-session.ts:886-888).
+    /// `get systemPrompt` (agent-session.ts:980-983 @ #9548): the current
+    /// effective system prompt, including changes not yet sent to the model
+    /// (`run` options when set, else base).
     pub fn system_prompt(&self) -> String {
-        self.inner.agent.state().system_prompt
+        let run = lock(&self.inner.run_system_prompt_options).clone();
+        let base = lock(&self.inner.base_system_prompt_options).clone();
+        build_system_prompt(&run.unwrap_or(base))
     }
 
     /// `get retryAttempt` (agent-session.ts:891-893).
@@ -1584,17 +1645,17 @@ impl AgentSession {
         drop(registry);
         self.inner.agent.set_tools(tools);
 
-        let base = self.rebuild_system_prompt(&valid_names);
-        *lock(&self.inner.base_system_prompt) = base.clone();
-        let override_ = lock(&self.inner.system_prompt_override).clone();
-        self.inner
-            .agent
-            .set_system_prompt(override_.unwrap_or(base));
+        // #9548: rebuilding only refreshes the base options — the live
+        // prompt rides the transcript's system messages.
+        self.rebuild_system_prompt(&valid_names);
     }
 
-    /// `_rebuildSystemPrompt` (agent-session.ts:1021-1055).
+    /// `_rebuildSystemPrompt` (agent-session.ts:1108-1141 @ #9548): rebuild
+    /// the **base** prompt options from the resource loader + tool registry.
+    /// Returns the built prompt text (rendered exactly as the transcript's
+    /// system message replays it) for callers that display it.
     fn rebuild_system_prompt(&self, tool_names: &[String]) -> String {
-        let (valid, tool_snippets, prompt_guidelines) = {
+        let (valid, tool_snippets, tool_guidelines) = {
             let definitions = lock(&self.inner.tool_definitions);
             let valid: Vec<String> = tool_names
                 .iter()
@@ -1603,21 +1664,21 @@ impl AgentSession {
                 .collect();
             // Snippets/guidelines ride the (possibly extension-overridden)
             // definitions — overrides do NOT inherit the built-in text
-            // (agent-session.ts:2489-2503).
+            // (agent-session.ts:2489-2503). Guidelines stay keyed per tool
+            // (#9548 `toolGuidelines`): the rules section re-derives them
+            // for the CURRENT selected set on every build.
             let mut tool_snippets: HashMap<String, String> = HashMap::new();
-            let mut prompt_guidelines: Vec<String> = Vec::new();
+            let mut tool_guidelines: HashMap<String, Vec<String>> = HashMap::new();
             for name in &valid {
                 let entry = definitions.get(name).expect("filtered above");
                 if let Some(snippet) = &entry.prompt_snippet {
                     tool_snippets.insert(name.clone(), snippet.clone());
                 }
-                for guideline in &entry.prompt_guidelines {
-                    if !prompt_guidelines.iter().any(|g| g == guideline) {
-                        prompt_guidelines.push(guideline.clone());
-                    }
+                if !entry.prompt_guidelines.is_empty() {
+                    tool_guidelines.insert(name.clone(), entry.prompt_guidelines.clone());
                 }
             }
-            (valid, tool_snippets, prompt_guidelines)
+            (valid, tool_snippets, tool_guidelines)
         };
 
         let loader = lock(&self.inner.resource_loader);
@@ -1656,10 +1717,13 @@ impl AgentSession {
 
         let options = BuildSystemPromptOptions {
             custom_prompt,
-            selected_tools: Some(valid),
+            force_system_prompt: None,
+            selected_tools: Some(valid.clone()),
             tool_snippets: Some(tool_snippets),
-            prompt_guidelines,
+            tool_guidelines: Some(tool_guidelines),
+            prompt_guidelines: Vec::new(),
             append_system_prompt,
+            sections: None,
             cwd: PathBuf::from(&self.inner.cwd),
             context_files,
             skills_xml,
@@ -1668,6 +1732,183 @@ impl AgentSession {
         let prompt = build_system_prompt(&options);
         *lock(&self.inner.base_system_prompt_options) = options;
         prompt
+    }
+
+    /// `_preparePromptAndToolLoadout` (agent-session.ts:1145-1165 @ #9548):
+    /// apply a prompt and tool loadout for the next request. Sets the
+    /// executable tools and returns a system message patching the prompt
+    /// sections the model currently has (replayed from `messages`), or
+    /// `None` when the prompt is unchanged. Tool changes are declared by
+    /// the agent loop before the request.
+    ///
+    /// A forced prompt does not affect the transcript: the structured
+    /// sections are still diffed and persisted, and the forced text is
+    /// projected onto the request by
+    /// [`Self::install_agent_forced_prompt_projection`].
+    fn prepare_prompt_and_tool_loadout(
+        &self,
+        options: &mut BuildSystemPromptOptions,
+        messages: Option<&[AgentMessage]>,
+    ) -> Option<rpi_ai::types::SystemMessage> {
+        // `selectedTools` filtered to the registry and deduplicated, tools
+        // set on the agent. Upstream mutates `options.selectedTools` in place
+        // (agent-session.ts:1150-1152), so the rendered sections AND the
+        // caller's stored run options carry exactly the executable loadout.
+        let registry = lock(&self.inner.tool_registry);
+        let mut valid_tool_names: Vec<String> = Vec::new();
+        let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
+        if let Some(selected) = &options.selected_tools {
+            let mut seen = std::collections::HashSet::new();
+            for name in selected {
+                if seen.insert(name.clone()) {
+                    if let Some(tool) = registry.get(name) {
+                        valid_tool_names.push(name.clone());
+                        tools.push(tool.clone());
+                    }
+                }
+            }
+        }
+        drop(registry);
+        self.inner.agent.set_tools(tools);
+        if options.selected_tools.is_some() {
+            options.selected_tools = Some(valid_tool_names);
+        }
+
+        let replay_messages: Vec<rpi_ai::types::Message> = messages
+            .unwrap_or(&self.inner.agent.state().messages)
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::System(system) => {
+                    Some(rpi_ai::types::Message::System(system.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let current = rpi_ai::utils::transcript::get_current_system_message(&replay_messages);
+        let previous_sections: crate::core::system_prompt::SystemPromptSections = current
+            .as_ref()
+            .map(|current| {
+                current
+                    .iter_sections()
+                    .filter_map(|(name, value)| {
+                        value.map(|value| (name.to_owned(), value.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let desired = crate::core::system_prompt::build_system_prompt_sections(options);
+        crate::core::system_prompt::diff_system_prompt_sections(&previous_sections, &desired).map(
+            |sections| rpi_ai::types::SystemMessage {
+                role: Default::default(),
+                content: Default::default(),
+                sections: Some(sections),
+                tools_added: None,
+                tools_removed: None,
+                timestamp: now_millis(),
+            },
+        )
+    }
+
+    /// `_installAgentForcedPromptProjection` (agent-session.ts:1175-1192 @
+    /// #9548): send a forced prompt as the provider's leading system prompt
+    /// without recording it. A `before_agent_start` handler that returns
+    /// `systemPrompt` needs that exact text at the head of the request; a
+    /// mid-conversation system message would leave the original prompt in
+    /// place. The forced text is a rendering of the current prompt, so the
+    /// transcript keeps its structured sections and the request is
+    /// projected instead: the system messages collapse into one head
+    /// holding the forced text and the current tools. Runs after the
+    /// `context` extension handlers.
+    fn install_agent_forced_prompt_projection(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let agent = self.inner.agent.clone();
+        let previous = agent.transform_context();
+        agent.set_transform_context(Some(Arc::new(
+            move |messages: Vec<AgentMessage>, signal: CancellationToken| {
+                let weak = weak.clone();
+                let previous = previous.clone();
+                Box::pin(async move {
+                    let transformed = match previous {
+                        Some(previous) => previous(messages, signal).await,
+                        None => messages,
+                    };
+                    let Some(inner) = weak.upgrade() else {
+                        return transformed;
+                    };
+                    let session = AgentSession { inner };
+                    let forced = lock(&session.inner.run_system_prompt_options)
+                        .as_ref()
+                        .and_then(|options| options.force_system_prompt.clone());
+                    let Some(forced) = forced else {
+                        return transformed;
+                    };
+                    let llm_messages: Vec<rpi_ai::types::Message> = transformed
+                        .iter()
+                        .filter_map(|message| match message {
+                            AgentMessage::System(system) => {
+                                Some(rpi_ai::types::Message::System(system.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let current =
+                        rpi_ai::utils::transcript::get_current_system_message(&llm_messages);
+                    let head = rpi_ai::types::SystemMessage {
+                        role: Default::default(),
+                        content: rpi_ai::types::SystemContent::Text(forced),
+                        sections: None,
+                        tools_added: current
+                            .as_ref()
+                            .and_then(|current| current.tools_added.clone()),
+                        tools_removed: None,
+                        timestamp: current.as_ref().map_or_else(now_millis, |c| c.timestamp),
+                    };
+                    let mut result = Vec::with_capacity(transformed.len() + 1);
+                    result.push(AgentMessage::System(head));
+                    result.extend(
+                        transformed
+                            .into_iter()
+                            .filter(|message| !matches!(message, AgentMessage::System(_))),
+                    );
+                    result
+                })
+            },
+        )));
+    }
+
+    /// `_restoreToolsFromTranscript` (agent-session.ts:1194-1204 @ #9548):
+    /// restore the active tool loadout declared by the session transcript,
+    /// if it declares one.
+    fn restore_tools_from_transcript(&self) {
+        let context = lock(&self.inner.session_manager).build_session_context();
+        let llm_messages: Vec<rpi_ai::types::Message> = context
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::System(system) => {
+                    Some(rpi_ai::types::Message::System(system.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let Some(current) = rpi_ai::utils::transcript::get_current_system_message(&llm_messages)
+        else {
+            return;
+        };
+        let registry = lock(&self.inner.tool_registry);
+        let mut tool_names: Vec<String> = Vec::new();
+        let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
+        if let Some(added) = &current.tools_added {
+            for tool in added {
+                if let Some(registered) = registry.get(&tool.name) {
+                    tool_names.push(tool.name.clone());
+                    tools.push(registered.clone());
+                }
+            }
+        }
+        drop(registry);
+        self.inner.agent.set_tools(tools);
+        self.rebuild_system_prompt(&tool_names);
     }
 
     // ==================================================================
@@ -1702,7 +1943,9 @@ impl AgentSession {
         if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
             self.finish_cancelled_retry();
         }
-        *lock(&self.inner.system_prompt_override) = None;
+        // #9548 (agent-session.ts:1233): the run's prompt options (including
+        // any forced prompt) end with the run.
+        *lock(&self.inner.run_system_prompt_options) = None;
         self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
         self.emit_agent_settled().await;
@@ -1905,46 +2148,72 @@ impl AgentSession {
             // Pending "nextTurn" asides.
             messages.extend(lock(&self.inner.pending_next_turn_messages).drain(..));
 
-            // before_agent_start extension event (agent-session.ts:1224-1253).
-            // The event carries the fully assembled base system prompt and
-            // the build options; the runner chains `systemPrompt`
-            // replacements across handlers (runner.ts:1068-1132).
-            let (base_prompt, prompt_options_json) = {
-                let base = lock(&self.inner.base_system_prompt).clone();
-                (base, self.system_prompt_options_json())
-            };
-            if let Some(result) = self
+            // before_agent_start extension event (agent-session.ts:1398-1436
+            // @ #9548). Handlers may edit `systemPromptOptions` (collections
+            // mutable) or return `systemPrompt` — the runner chains the
+            // latter as `forceSystemPrompt` on the options and threads the
+            // mutated options back in the combined result.
+            // Baseline for the edit check: upstream's normalized options
+            // always carry a selectedTools array (absent → default four,
+            // system-prompt.ts:58) — mirror that when the base is unset.
+            let selected_tools_before = lock(&self.inner.base_system_prompt_options)
+                .selected_tools
+                .clone()
+                .unwrap_or_else(|| {
+                    ["read", "bash", "edit", "write"]
+                        .map(str::to_owned)
+                        .to_vec()
+                });
+            let base_options = lock(&self.inner.base_system_prompt_options).clone();
+            let result = self
                 .runner()
-                .emit_before_agent_start(
-                    &expanded_text,
-                    images.as_deref(),
-                    &base_prompt,
-                    prompt_options_json,
-                )
-                .await
-            {
-                for msg in result.messages {
-                    messages.push(AgentMessage::Custom(CustomMessage {
-                        role: CustomRole::Custom,
-                        custom_type: msg.custom_type,
-                        content: msg.content.unwrap_or_default(),
-                        display: msg.display,
-                        details: msg.details,
-                        timestamp: now_millis(),
-                    }));
-                }
-                if let Some(system_prompt) = result.system_prompt {
-                    *lock(&self.inner.system_prompt_override) = Some(system_prompt.clone());
-                    self.inner.agent.set_system_prompt(system_prompt);
-                } else {
-                    *lock(&self.inner.system_prompt_override) = None;
-                    let base = lock(&self.inner.base_system_prompt).clone();
-                    self.inner.agent.set_system_prompt(base);
-                }
-            } else {
-                *lock(&self.inner.system_prompt_override) = None;
-                let base = lock(&self.inner.base_system_prompt).clone();
-                self.inner.agent.set_system_prompt(base);
+                .emit_before_agent_start(&expanded_text, images.as_deref(), &base_options)
+                .await;
+            let (mut options, result_messages) = match result {
+                Some(combined) => (combined.system_prompt_options, combined.messages),
+                None => (
+                    lock(&self.inner.base_system_prompt_options).clone(),
+                    Vec::new(),
+                ),
+            };
+            // Handlers may edit `event.systemPromptOptions.selectedTools` or
+            // call `setActiveTools()`, which updates the live loadout
+            // instead. An explicit edit wins; otherwise the live loadout is
+            // authoritative, so a `setActiveTools()` call is not undone here
+            // (agent-session.ts:1407-1413). A missing key (`None`) is NOT an
+            // edit — the rpi replacement-style ABI lets a handler return a
+            // partial options object, and `normalizeBuildSystemPromptOptions`
+            // upstream (system-prompt.ts:58) can never produce "absent";
+            // treating it as unedited keeps the current loadout instead of
+            // clearing every tool.
+            let handler_edited_tools = options.selected_tools.as_ref().is_some_and(|tools| {
+                tools.len() != selected_tools_before.len()
+                    || tools
+                        .iter()
+                        .zip(selected_tools_before.iter())
+                        .any(|(name, before)| name != before)
+            });
+            if !handler_edited_tools {
+                options.selected_tools = Some(self.get_active_tool_names());
+            }
+            for msg in result_messages {
+                messages.push(AgentMessage::Custom(CustomMessage {
+                    role: CustomRole::Custom,
+                    custom_type: msg.custom_type,
+                    content: msg.content.unwrap_or_default(),
+                    display: msg.display,
+                    details: msg.details,
+                    timestamp: now_millis(),
+                }));
+            }
+            // #9548: diff the desired sections against what the model
+            // currently has (replayed from the transcript) — the patch rides
+            // a system message placed before the user turn; tool changes are
+            // declared by the agent loop before the request.
+            let update_message = self.prepare_prompt_and_tool_loadout(&mut options, None);
+            *lock(&self.inner.run_system_prompt_options) = Some(options);
+            if let Some(update) = update_message {
+                messages.insert(0, AgentMessage::System(update));
             }
 
             Ok(Some(messages))
@@ -3312,9 +3581,11 @@ impl AgentSession {
             }
         }
 
-        // Update agent state.
+        // Update agent state; restore the tool loadout the transcript
+        // declares (agent-session.ts:3431-3434 @ #9548).
         let session_context = lock(&self.inner.session_manager).build_session_context();
         self.inner.agent.set_messages(session_context.messages);
+        self.restore_tools_from_transcript();
 
         // `session_tree` payload (agent-session.ts:3288-3295 @ 9841914): the
         // post-navigation leaf, the pre-navigation leaf, and — only when a
@@ -3709,9 +3980,7 @@ impl AgentSession {
         }
         lock(&self.inner.resource_loader).extend_resources(&paths);
         let tool_names = self.get_active_tool_names();
-        let base = self.rebuild_system_prompt(&tool_names);
-        *lock(&self.inner.base_system_prompt) = base.clone();
-        self.inner.agent.set_system_prompt(base);
+        self.rebuild_system_prompt(&tool_names);
     }
 
     /// Invoke the mode-provided extension shutdown handler (T15 W5; no-op
@@ -3740,6 +4009,27 @@ impl AgentSession {
             }
             if let Some(append) = &options.append_system_prompt {
                 map.insert("appendSystemPrompt".to_owned(), append.clone().into());
+            }
+            // #9548: the upstream getter exposes the FULL options object
+            // (agent-session.ts:2789) — include the per-tool maps and custom
+            // sections when present.
+            if let Some(snippets) = &options.tool_snippets {
+                map.insert(
+                    "toolSnippets".to_owned(),
+                    serde_json::to_value(snippets).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if let Some(guidelines) = &options.tool_guidelines {
+                map.insert(
+                    "toolGuidelines".to_owned(),
+                    serde_json::to_value(guidelines).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if let Some(sections) = &options.sections {
+                map.insert(
+                    "sections".to_owned(),
+                    serde_json::to_value(sections).unwrap_or(serde_json::Value::Null),
+                );
             }
         }
         json

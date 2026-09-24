@@ -40,7 +40,7 @@ use crate::models::{
     Provider, ProviderApi, RefreshModelsContext,
 };
 use crate::models_store::ModelsStoreEntry;
-use crate::types::{Context, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions};
+use crate::types::{Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext};
 use crate::utils::event_stream::AssistantMessageEventStream;
 
 use super::radius_config::{
@@ -311,7 +311,7 @@ impl Provider for RadiusProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         self.inner.stream(model, context, options)
@@ -320,7 +320,7 @@ impl Provider for RadiusProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         self.inner.stream_simple(model, context, options)

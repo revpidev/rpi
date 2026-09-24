@@ -965,7 +965,21 @@ async fn w2_before_agent_start_chains_system_prompt_and_injects_messages() {
     ])
     .await;
 
-    let fixture = session_fixture(vec![text_step("done")], Arc::new(host), Vec::new()).await;
+    // #9548: the forced prompt rides the request head (projection), not the
+    // transcript — capture the LLM request's leading system content.
+    let request_prompt: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = request_prompt.clone();
+    let forced_step = FauxResponseStep::Factory(Box::new(
+        move |context: &rpi_ai::types::TranscriptContext, _options, _state, _model| {
+            let prompt = rpi_ai::utils::transcript::get_current_system_prompt(&context.messages);
+            capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(prompt);
+            faux_assistant_message("done", FauxAssistantOptions::default())
+        },
+    ));
+    let fixture = session_fixture(vec![forced_step], Arc::new(host), Vec::new()).await;
     fixture
         .session
         .prompt("hello", rpi::core::agent_session::PromptOptions::default())
@@ -973,7 +987,9 @@ async fn w2_before_agent_start_chains_system_prompt_and_injects_messages() {
         .expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // Chained: ext-b sees ext-a's replaced prompt; the effective prompt is prompt-B.
+    // Chained: ext-b sees ext-a's replaced prompt; the forced prompt-B rides
+    // the request head; run options end with the run (post-idle the getter
+    // renders the base sections again).
     assert_eq!(
         observed
             .lock()
@@ -981,7 +997,14 @@ async fn w2_before_agent_start_chains_system_prompt_and_injects_messages() {
             .as_slice(),
         ["prompt-A"]
     );
-    assert_eq!(fixture.session.system_prompt(), "prompt-B");
+    assert_eq!(
+        request_prompt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_slice(),
+        ["prompt-B"]
+    );
+    assert!(fixture.session.system_prompt().contains("<cwd>"));
     // The injected custom message is queued (role:"custom").
     let has_injected = fixture.session.messages().into_iter().any(|message| {
         let value = serde_json::to_value(&message).expect("json");
@@ -989,4 +1012,79 @@ async fn w2_before_agent_start_chains_system_prompt_and_injects_messages() {
             && value.get("customType").and_then(Value::as_str) == Some("injected-note")
     });
     assert!(has_injected, "injected custom message present");
+}
+
+/// #9548 + review M1: a handler returning a PARTIAL `systemPromptOptions`
+/// object (the rpi replacement-style ABI) must not clear the tool loadout —
+/// a missing `selectedTools` key is "not an edit", the live tools stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w2_before_agent_start_partial_options_replacement_keeps_tools() {
+    let host = host_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_BEFORE_AGENT_START, |_event| {
+            Ok(json!({
+                "systemPromptOptions": {"customPrompt": "custom preamble"}
+            }))
+        });
+    })])
+    .await;
+
+    // Capture the tool names the request declares.
+    let request_tools: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = request_tools.clone();
+    let tools_step = FauxResponseStep::Factory(Box::new(
+        move |context: &rpi_ai::types::TranscriptContext, _options, _state, _model| {
+            let names = rpi_ai::utils::transcript::get_current_tools(&context.messages)
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(names);
+            faux_assistant_message("done", FauxAssistantOptions::default())
+        },
+    ));
+    let tool = Arc::new(RecorderTool {
+        parameters: json!({"type": "object", "properties": {}}),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    });
+    let fixture = session_fixture(vec![tools_step], Arc::new(host), vec![tool]).await;
+    fixture
+        .session
+        .prompt("hello", rpi::core::agent_session::PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    let captured = request_tools
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(captured.len(), 1);
+    // The fixture activates exactly the custom tool; a partial options
+    // replacement must not clear it.
+    assert_eq!(
+        captured[0].as_slice(),
+        ["recorder"],
+        "tools survive a partial options replacement"
+    );
+
+    // The custom preamble applied (transcript head carries it), and the
+    // untouched base fields (cwd) survived the merge.
+    let head = fixture
+        .session
+        .messages()
+        .into_iter()
+        .find_map(|message| match message {
+            rpi_agent::messages::AgentMessage::System(system) => Some(system),
+            _ => None,
+        })
+        .expect("system declaration");
+    let preamble = head.section("preamble").flatten().expect("preamble");
+    assert_eq!(preamble, "custom preamble");
+    let cwd_section = head.section("cwd").flatten().expect("cwd section");
+    assert!(
+        cwd_section.contains("/tmp/"),
+        "cwd section keeps the real path through the merge: {cwd_section}"
+    );
 }

@@ -68,7 +68,7 @@ use rpi_ai::models_json::{
 use rpi_ai::models_store::{InMemoryModelsStore, JsonFileModelsStore, ModelsStore};
 use rpi_ai::types::{
     ApiKind, AssistantMessage, Context, Model, ModelCompat, ModelCost, ModelCostRates, ProviderEnv,
-    ProviderHeaders, SimpleStreamOptions, StreamOptions,
+    ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 
@@ -797,7 +797,7 @@ impl Provider for ModelOverridingProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         self.base.stream(model, context, options)
@@ -806,7 +806,7 @@ impl Provider for ModelOverridingProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         self.base.stream_simple(model, context, options)
@@ -863,7 +863,7 @@ impl Provider for RefreshDelegatingProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         self.inner.stream(model, context, options)
@@ -872,7 +872,7 @@ impl Provider for RefreshDelegatingProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         self.inner.stream_simple(model, context, options)
@@ -2038,6 +2038,8 @@ impl ModelRuntime {
 
     /// `stream` — delegates to [`Models::stream`], which performs the same
     /// lazy auth resolution + header merge as upstream `prepareRequest`.
+    /// `stream` — the facade keeps the caller's [`Context`] and normalizes
+    /// inside `Models` (upstream model-runtime.ts:638-648, #9548).
     pub fn stream(
         &self,
         model: &Model,
@@ -4065,7 +4067,7 @@ mod tests {
         use futures::future::BoxFuture;
         use rpi_ai::auth::{ModelsError, ProviderAuth};
         use rpi_ai::models::{Provider, RefreshModelsContext};
-        use rpi_ai::types::{Context, ProviderHeaders, SimpleStreamOptions, StreamOptions};
+        use rpi_ai::types::{ProviderHeaders, SimpleStreamOptions, StreamOptions};
         use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 
         /// Minimal dynamic provider: records each `refresh_models` call's
@@ -4112,7 +4114,7 @@ mod tests {
             fn stream(
                 &self,
                 _model: &rpi_ai::types::Model,
-                _context: &Context,
+                _context: &TranscriptContext,
                 _options: Option<StreamOptions>,
             ) -> AssistantMessageEventStream {
                 unreachable!("not used in refresh tests")
@@ -4120,7 +4122,7 @@ mod tests {
             fn stream_simple(
                 &self,
                 _model: &rpi_ai::types::Model,
-                _context: &Context,
+                _context: &TranscriptContext,
                 _options: Option<SimpleStreamOptions>,
             ) -> Result<AssistantMessageEventStream, String> {
                 unreachable!("not used in refresh tests")

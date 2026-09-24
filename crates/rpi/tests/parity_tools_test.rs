@@ -74,7 +74,25 @@ fn prepare_lines(text: &str) -> String {
                 continue;
             }
         }
+        // #9548: the SDK-recorded fixture carries the AgentSession layer's
+        // leading system declaration (message_start/end for the prompt/tool
+        // state); this test drives the low-level agent directly, where that
+        // message never enters the prompts — drop it from both sides.
+        if matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("message_start" | "message_end")
+        ) && value["message"]["role"] == serde_json::json!("system")
+        {
+            continue;
+        }
         strip_keys(&mut value);
+        // agent_end.messages: drop the session-layer system declaration the
+        // same way (this test drives the bare agent).
+        if value.get("type").and_then(Value::as_str) == Some("agent_end") {
+            if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+                messages.retain(|message| message["role"] != serde_json::json!("system"));
+            }
+        }
         out.push_str(&serde_json::to_string(&value).expect("render"));
         out.push('\n');
     }

@@ -523,7 +523,6 @@ async fn l0_load_capability_denied_and_full_surface() {
                 "url": "https://example.com/x", "spinnerTick": 1,
             }),
             usage: None,
-            added_tool_names: None,
             terminate: None,
         },
         rpi_ext_host::types::ToolRenderResultOptions {
@@ -561,7 +560,6 @@ async fn l0_load_capability_denied_and_full_surface() {
                 }
             }),
             usage: None,
-            added_tool_names: None,
             terminate: None,
         },
         rpi_ext_host::types::ToolRenderResultOptions {
@@ -609,7 +607,6 @@ async fn l0_load_capability_denied_and_full_surface() {
                 "spinnerTick": 0,
             }),
             usage: None,
-            added_tool_names: None,
             terminate: None,
         },
         rpi_ext_host::types::ToolRenderResultOptions {

@@ -324,7 +324,6 @@ fn convert_to_llm_passes_through_base_message_kinds() {
         })],
         details: None,
         usage: None,
-        added_tool_names: None,
         is_error: false,
         timestamp: 3,
     });

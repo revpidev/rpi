@@ -43,20 +43,18 @@ use crate::api::openai_completions::{
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
 use crate::api::openai_responses_shared::{
     convert_responses_messages, convert_responses_tools, ConvertResponsesMessagesOptions,
-    ConvertResponsesToolsOptions, ResponsesDeferredToolsMode, ResponsesStreamOptions,
-    ResponsesStreamProcessor,
+    ConvertResponsesToolsOptions, ResponsesStreamOptions, ResponsesStreamProcessor,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
 use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
-    AssistantMessage, CacheRetention, Context, DoneReason, ErrorReason, Model, ModelThinkingLevel,
+    AssistantMessage, CacheRetention, DoneReason, ErrorReason, Model, ModelThinkingLevel,
     ProviderHeaders, ProviderResponse, SessionAffinityFormat, SimpleStreamOptions, StopReason,
-    StreamEvent, StreamOptions, Usage,
+    StreamEvent, StreamOptions, TranscriptContext, Usage,
 };
 use crate::utils::custom_fetch::send_provider_request;
-use crate::utils::deferred_tools::split_deferred_tools_identity;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
@@ -124,6 +122,8 @@ pub struct ResolvedOpenAIResponsesCompat {
     /// e47b8e37a (#7709): message-anchored `additional_tools` input items.
     pub supports_additional_tools: bool,
     pub supports_tool_search: bool,
+    /// #9548: later system messages sent in place.
+    pub supports_mid_convo_system_messages: bool,
     pub supports_explicit_prompt_cache_mode: bool,
     /// b8b873b98 (#8941): whether `max_output_tokens` is accepted. Default:
     /// true; some Codex-protocol gateways reject the field.
@@ -154,6 +154,9 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAIResponsesCompat {
             .unwrap_or(false),
         supports_tool_search: compat
             .and_then(|compat| compat.supports_tool_search)
+            .unwrap_or(false),
+        supports_mid_convo_system_messages: compat
+            .and_then(|compat| compat.supports_mid_convo_system_messages)
             .unwrap_or(false),
         supports_explicit_prompt_cache_mode: compat
             .and_then(|compat| compat.supports_explicit_prompt_cache_mode)
@@ -208,7 +211,7 @@ fn get_prompt_cache_options(
 /// `x-client-request-id`, plus `session_id` for the openai format.
 pub fn build_client_headers(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     api_key: &str,
     options_headers: Option<&ProviderHeaders>,
     session_id: Option<&str>,
@@ -274,21 +277,16 @@ pub fn build_client_headers(
 /// snapshots compare byte-for-byte with the JS payloads.
 pub fn build_params(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &OpenAIResponsesOptions,
     compat: &ResolvedOpenAIResponsesCompat,
     grammar_tool_input_properties: &HashMap<String, String>,
 ) -> Result<Value, String> {
-    // e47b8e37a (#7709): additional_tools-capable models (GPT-5.6 family)
-    // prefer message-anchored input items over client tool search.
-    let deferred_tools_mode = if compat.supports_additional_tools {
-        Some(ResponsesDeferredToolsMode::AdditionalTools)
-    } else if compat.supports_tool_search {
-        Some(ResponsesDeferredToolsMode::ToolSearch)
-    } else {
-        None
-    };
-    let tool_placement = split_deferred_tools_identity(context, deferred_tools_mode.is_some());
+    // #9548: tools split between the request field and in-place additions.
+    let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
+        &context.messages,
+        compat.supports_additional_tools || compat.supports_tool_search,
+    );
     let tool_options = ConvertResponsesToolsOptions {
         supports_strict_mode: Some(compat.supports_strict_mode),
         supports_open_ai_grammar_tools: Some(compat.supports_open_ai_grammar_tools),
@@ -300,8 +298,9 @@ pub fn build_params(
         &OPENAI_TOOL_CALL_PROVIDERS,
         &ConvertResponsesMessagesOptions {
             grammar_tool_input_properties: Some(grammar_tool_input_properties),
-            deferred_tools: Some(&tool_placement.deferred),
-            deferred_tools_mode,
+            supports_mid_convo_system_messages: compat.supports_mid_convo_system_messages,
+            supports_additional_tools: compat.supports_additional_tools,
+            supports_tool_search: compat.supports_tool_search,
             tool_options: tool_options.clone(),
             ..ConvertResponsesMessagesOptions::default()
         },
@@ -342,9 +341,9 @@ pub fn build_params(
     if let Some(service_tier) = &options.service_tier {
         params["service_tier"] = json!(service_tier);
     }
-    if !tool_placement.immediate.is_empty() {
+    if !transcript_tools.request_tools.is_empty() {
         params["tools"] = json!(convert_responses_tools(
-            &tool_placement.immediate,
+            &transcript_tools.request_tools,
             &tool_options,
         )?);
     }
@@ -462,7 +461,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
 /// message either way.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &OpenAIResponsesOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
@@ -481,7 +480,7 @@ async fn run(
     };
     let compat = get_compat(model);
     let grammar_tool_input_properties = create_grammar_tool_input_properties(
-        context.tools.as_deref(),
+        Some(crate::utils::transcript::get_declared_tools(&context.messages).as_slice()),
         compat.supports_open_ai_grammar_tools,
     )?;
     let headers = build_client_headers(
@@ -683,13 +682,18 @@ async fn run(
 /// `stream` (openai-responses).
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: OpenAIResponsesOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
     let task_stream = event_stream.clone();
     let model = model.clone();
-    let context = context.clone();
+    // #9548 (openai-responses.ts:119): resolve the mid-conversation policy
+    // per model compat before anything else consumes the transcript.
+    let context = crate::utils::transcript::resolve_transcript(
+        context,
+        get_compat(&model).supports_mid_convo_system_messages,
+    );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let mut output = initial_output(&model);
@@ -728,7 +732,7 @@ pub fn stream(
 /// `clampThinkingLevel`; a clamped "off" omits `reasoning_effort`.
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     // Auth check at the entry, before any stream is constructed
@@ -781,7 +785,7 @@ impl ProviderStreams for OpenAiResponses {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -797,7 +801,7 @@ impl ProviderStreams for OpenAiResponses {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
@@ -829,7 +833,11 @@ mod tests {
         HashMap::new()
     }
 
-    fn params_for(model: &Model, ctx: &Context, options: &OpenAIResponsesOptions) -> Value {
+    fn params_for(
+        model: &Model,
+        ctx: &crate::types::TranscriptContext,
+        options: &OpenAIResponsesOptions,
+    ) -> Value {
         build_params(model, ctx, options, &get_compat(model), &no_grammar()).expect("params")
     }
 
@@ -1002,24 +1010,36 @@ mod tests {
         assert!(plain.get("temperature").is_none());
     }
 
-    // -- deferred tools mode (e47b8e37a @ 4181f66, #7709) ----------------------
+    // -- transcript tool additions (#9548; replaces the e47b8e37a-era
+    // addedToolNames mechanism) ---------------------------------------------
 
-    /// One base_tool call whose result marks late_tool as transcript-loaded;
-    /// both tools are in `Context.tools`.
-    fn deferred_tools_context() -> Context {
-        common::context(
-            vec![
-                common::same_model_assistant(json!([
-                    {"type": "toolCall", "id": "call_1|fc_1", "name": "base_tool", "arguments": {}}
-                ])),
-                common::tool_result(
-                    "call_1|fc_1",
-                    json!([{"type": "text", "text": "ok"}]),
-                    json!({"addedToolNames": ["late_tool"]}),
-                ),
+    /// One base_tool in the leading system message; a later system message
+    /// adds late_tool (upstream transcript-tool-changes.test.ts
+    /// `additionContext`).
+    fn deferred_tools_context() -> crate::types::TranscriptContext {
+        crate::utils::transcript::normalize_context(&crate::types::Context {
+            system_prompt: None,
+            messages: vec![
+                crate::types::Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("base prompt".to_owned()),
+                    sections: None,
+                    tools_added: Some(vec![common::tool("base_tool")]),
+                    tools_removed: None,
+                    timestamp: 0,
+                }),
+                common::user_text("before"),
+                crate::types::Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("updated guidance".to_owned()),
+                    sections: None,
+                    tools_added: Some(vec![common::tool("late_tool")]),
+                    tools_removed: None,
+                    timestamp: 2,
+                }),
             ],
-            Some(vec![common::tool("base_tool"), common::tool("late_tool")]),
-        )
+            tools: None,
+        })
     }
 
     fn top_level_tool_names(params: &Value) -> Vec<&str> {
@@ -1031,17 +1051,19 @@ mod tests {
             .collect()
     }
 
-    /// Upstream deferred-tools.test.ts: "loads an OpenAI Responses tool
-    /// through additional_tools" + "falls back to client tool search when
-    /// additional_tools is unsupported" + "leaves providers without deferred
-    /// loading unchanged" (adapter-level mode selection).
+    /// #9548 (transcript-tool-changes shape): tool additions ride a later
+    /// system message; `supportsAdditionalTools` anchors them as
+    /// `additional_tools` items, `supportsToolSearch` maps them to the
+    /// client search pair, otherwise every declared tool stays top-level.
     #[test]
-    fn test_build_params_deferred_tools_mode_selection() {
+    fn test_build_params_system_tool_additions_mode_selection() {
         let ctx = deferred_tools_context();
 
         // supportsAdditionalTools: the deferred tool rides a message-anchored
         // additional_tools item (no defer_loading, no tool-search pair).
-        let m = model(json!({"compat": {"supportsAdditionalTools": true}}));
+        let m = model(
+            json!({"compat": {"supportsMidConvoSystemMessages": true, "supportsAdditionalTools": true}}),
+        );
         let params = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
         assert_eq!(top_level_tool_names(&params), vec!["base_tool"]);
         let input = params["input"].as_array().expect("input");
@@ -1063,7 +1085,7 @@ mod tests {
         // additional_tools unsupported + tool search supported: client
         // tool-search fallback.
         let m = model(
-            json!({"compat": {"supportsAdditionalTools": false, "supportsToolSearch": true}}),
+            json!({"compat": {"supportsMidConvoSystemMessages": true, "supportsAdditionalTools": false, "supportsToolSearch": true}}),
         );
         let params = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
         assert_eq!(top_level_tool_names(&params), vec!["base_tool"]);

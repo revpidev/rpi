@@ -42,7 +42,7 @@ use rpi_agent::session::{MessageEntry, SessionEntry};
 use rpi_agent::types::{AgentEvent, AgentToolResult, AgentToolUpdateCallback, QueueMode};
 use rpi_ai::models::Models;
 use rpi_ai::types::{
-    ApiKind, AssistantContent, AssistantMessage, AssistantRole, Context, Model, ModelThinkingLevel,
+    ApiKind, AssistantContent, AssistantMessage, AssistantRole, Model, ModelThinkingLevel,
     StopReason, TextContent, ToolResultContent, Usage, UsageCost, UserContent, UserContentBlock,
     UserMessage, UserRole,
 };
@@ -174,7 +174,7 @@ fn user_message_text(user: &UserMessage) -> String {
 }
 
 /// `textFromUserMessages` (agent-harness.test.ts:39-49) over the LLM context.
-fn text_from_user_messages(context: &Context) -> Vec<String> {
+fn text_from_user_messages(context: &rpi_ai::types::TranscriptContext) -> Vec<String> {
     context
         .messages
         .iter()
@@ -317,7 +317,6 @@ impl AgentHarnessTool<()> for CalculateTool {
             })],
             details: Value::Null,
             usage: self.usage.clone(),
-            added_tool_names: None,
             terminate: None,
         })
     }
@@ -378,7 +377,6 @@ impl AgentHarnessTool<()> for GetCurrentTimeTool {
             })],
             details: json!({ "utcTimestamp": 0 }),
             usage: None,
-            added_tool_names: None,
             terminate: None,
         })
     }
@@ -436,7 +434,6 @@ impl AgentHarnessTool<()> for NamedTool {
             })],
             details: Value::Null,
             usage: None,
-            added_tool_names: None,
             terminate: None,
         })
     }
@@ -954,15 +951,20 @@ async fn test_save_point_refreshes_config_body() {
         FauxResponseStep::Factory({
             let captured = Arc::clone(&captured);
             Box::new(move |context, options, _state, model| {
+                // #9548: the prompt and tools are views over the
+                // transcript's system messages.
+                let llm_prompt =
+                    rpi_ai::utils::transcript::get_current_system_prompt(&context.messages);
+                let tool_names: Vec<String> =
+                    rpi_ai::utils::transcript::get_current_tools(&context.messages)
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect();
                 captured.lock().expect("captured").push((
                     model.id.clone(),
                     options.and_then(|options| options.reasoning),
-                    context.system_prompt.clone().unwrap_or_default(),
-                    context
-                        .tools
-                        .as_ref()
-                        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
-                        .unwrap_or_default(),
+                    llm_prompt,
+                    tool_names,
                 ));
                 faux_assistant_message(
                     vec![faux_tool_call(
@@ -983,15 +985,20 @@ async fn test_save_point_refreshes_config_body() {
         FauxResponseStep::Factory({
             let captured = Arc::clone(&captured);
             Box::new(move |context, options, _state, model| {
+                // #9548: the prompt and tools are views over the
+                // transcript's system messages.
+                let llm_prompt =
+                    rpi_ai::utils::transcript::get_current_system_prompt(&context.messages);
+                let tool_names: Vec<String> =
+                    rpi_ai::utils::transcript::get_current_tools(&context.messages)
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect();
                 captured.lock().expect("captured").push((
                     model.id.clone(),
                     options.and_then(|options| options.reasoning),
-                    context.system_prompt.clone().unwrap_or_default(),
-                    context
-                        .tools
-                        .as_ref()
-                        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
-                        .unwrap_or_default(),
+                    llm_prompt,
+                    tool_names,
                 ));
                 faux_assistant_message("done", FauxAssistantOptions::default())
             })
@@ -1414,7 +1421,6 @@ impl AgentHarnessTool<TestContext> for ContextTool {
             })],
             details: Value::Null,
             usage: None,
-            added_tool_names: None,
             terminate: None,
         })
     }

@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::api::{
     EventHandler, ExtensionContext, ExtensionRuntime, HostActions, InsertionMap, LoadedExtension,
@@ -102,6 +102,49 @@ pub struct ExtensionRunnerCore {
     next_listener_id: AtomicU64,
     shortcut_diagnostics: RwLock<Vec<HostDiagnostic>>,
     command_diagnostics: RwLock<Vec<HostDiagnostic>>,
+}
+
+/// Merge a handler-returned `systemPromptOptions` object onto the current
+/// options (rpi by-value ABI bridge for upstream's in-place mutation,
+/// runner.ts:1200-1210). Top-level keys replace; `null` clears the key;
+/// the map-valued `sections`/`toolSnippets`/`toolGuidelines` merge per-key
+/// (null removes one entry) so chained handlers accumulate custom sections
+/// and snippets like upstream's shared object.
+fn merge_system_prompt_options(current: &mut Value, update: &Value) {
+    let (Some(current_map), Some(update_map)) = (current.as_object_mut(), update.as_object())
+    else {
+        return;
+    };
+    const MAP_FIELDS: [&str; 3] = ["sections", "toolSnippets", "toolGuidelines"];
+    for (key, value) in update_map {
+        if MAP_FIELDS.contains(&key.as_str()) {
+            if let Some(update_entries) = value.as_object() {
+                let current_entries = current_map
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(current_entries) = current_entries.as_object_mut() {
+                    for (entry_key, entry_value) in update_entries {
+                        if entry_value.is_null() {
+                            current_entries.remove(entry_key);
+                        } else {
+                            current_entries.insert(entry_key.clone(), entry_value.clone());
+                        }
+                    }
+                    // A map field left empty reads as absent upstream
+                    // (the builders treat `{}` like `undefined`).
+                    if current_entries.is_empty() {
+                        current_map.remove(key);
+                    }
+                    continue;
+                }
+            }
+        }
+        if value.is_null() {
+            current_map.remove(key);
+        } else {
+            current_map.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 impl ExtensionRunnerCore {
@@ -819,24 +862,58 @@ impl ExtensionRunnerCore {
         current_headers
     }
 
-    /// `emitBeforeAgentStart` (runner.ts:1068-1132): collects injected
-    /// messages; `systemPrompt` replacements chain so each handler observes
-    /// the previous handler's prompt.
+    /// `emitBeforeAgentStart` (runner.ts:1174-1236 @ #9548): collects
+    /// injected messages; handlers may mutate `systemPromptOptions`
+    /// (collections) and returning `systemPrompt` replaces the whole prompt
+    /// for the run — chained across handlers as `forceSystemPrompt` on the
+    /// options, and each handler observes the previous handler's render.
+    ///
+    /// Bridge note (rpi-specific): JS handlers mutate the event's options
+    /// object in place; the rpi ABI boundary is by-value JSON, so an
+    /// in-place mutation cannot cross it. Handlers may instead return
+    /// `systemPromptOptions` (rpi extension of the result shape) whose keys
+    /// MERGE onto the current options — the key-level equivalent of upstream
+    /// in-place mutation (a partial object keeps untouched fields; `null`
+    /// clears a key; the map fields `sections`/`toolSnippets`/
+    /// `toolGuidelines` merge per-key so chained handlers accumulate). The
+    /// chained `systemPrompt` is applied onto them by this runner, matching
+    /// the upstream runner semantics (runner.ts:1208-1210).
     pub async fn emit_before_agent_start(&self, payload: Value) -> Option<Value> {
-        // `ctx.getSystemPrompt()` returns the current (chained) prompt
-        // during this emit (runner.ts:1075-1082).
-        let current_prompt_cell = Arc::new(RwLock::new(
-            payload
-                .get("systemPrompt")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        ));
-        let mut current_system_prompt = payload.get("systemPrompt").cloned().unwrap_or(Value::Null);
+        // Normalized mutable options, threaded through every handler.
+        // `normalizeBuildSystemPromptOptions` always yields a full object
+        // (upstream normalizes `undefined` to defaults), so a missing or
+        // non-object payload field becomes `{}` — otherwise a chained
+        // `systemPrompt` could not land as `forceSystemPrompt` and would be
+        // lost from the combined result (runner.ts:1175-1177).
+        let mut current_options = match payload.get("systemPromptOptions") {
+            Some(options) if options.is_object() => options.clone(),
+            _ => Value::Object(Map::new()),
+        };
+        // The host pre-rendered `systemPrompt` with its authoritative
+        // builder over the same options (extension-host-adapter), which is
+        // exactly what upstream's `renderCurrentSystemPrompt()` returns for
+        // the first handler (`buildSystemPrompt(currentOptions)`). Seed the
+        // chain with it; after an options replacement the bridge render is
+        // the best available approximation (no docs section, see
+        // system_prompt_bridge.rs).
+        let base_render = payload
+            .get("systemPrompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut current_render = if base_render.is_empty() {
+            crate::system_prompt_bridge::build_system_prompt(&current_options)
+        } else {
+            base_render
+        };
+        let current_prompt_cell = Arc::new(RwLock::new(current_render.clone()));
         let mut messages: Vec<Value> = Vec::new();
-        let mut system_prompt_modified = false;
+        let mut modified = false;
 
         for (path, handler) in self.handlers_for(EVENT_BEFORE_AGENT_START) {
+            // `ctx.getSystemPrompt()` returns the current (chained) prompt
+            // during this emit (runner.ts:1180-1188).
+            *write(&current_prompt_cell) = current_render.clone();
             let ctx = ExtensionContext::with_system_prompt_override(
                 self.runtime.clone(),
                 self.cwd.clone(),
@@ -844,7 +921,8 @@ impl ExtensionRunnerCore {
             );
             let mut event = payload.clone();
             if let Value::Object(map) = &mut event {
-                map.insert("systemPrompt".to_owned(), current_system_prompt.clone());
+                map.insert("systemPromptOptions".to_owned(), current_options.clone());
+                map.insert("systemPrompt".to_owned(), json!(current_render));
             }
             match handler(event, ctx).await {
                 Ok(handler_result) => {
@@ -856,13 +934,35 @@ impl ExtensionRunnerCore {
                             messages.push(message.clone());
                         }
                     }
+                    // rpi bridge: the handler's returned options MERGE onto
+                    // the current ones (key-level, like upstream in-place
+                    // mutation — a partial object no longer drops untouched
+                    // fields; `null` clears a key). Map-valued fields
+                    // (`sections`/`toolSnippets`/`toolGuidelines`) merge
+                    // per-key so chained handlers accumulate custom sections.
+                    if let Some(options) = handler_result.get("systemPromptOptions") {
+                        if options.is_object() {
+                            merge_system_prompt_options(&mut current_options, options);
+                            current_render =
+                                crate::system_prompt_bridge::build_system_prompt(&current_options);
+                            modified = true;
+                        }
+                    }
                     if let Some(system_prompt) = handler_result.get("systemPrompt") {
+                        // rpi 口径（V15-06 裁决 12）：`null` 视为未提供并跳过；
+                        // 上游 `!== undefined` 会把越约的 null 写成
+                        // `forceSystemPrompt = null`——不追随该越约行为。
                         if !system_prompt.is_null() {
-                            current_system_prompt = system_prompt.clone();
-                            if let Some(text) = system_prompt.as_str() {
-                                *write(&current_prompt_cell) = text.to_owned();
+                            // Chained as `forceSystemPrompt` on the options
+                            // (runner.ts:1208-1210 @ #9548); the render is
+                            // the forced text (`buildSystemPromptState`).
+                            if let Value::Object(map) = &mut current_options {
+                                map.insert("forceSystemPrompt".to_owned(), system_prompt.clone());
                             }
-                            system_prompt_modified = true;
+                            if let Some(text) = system_prompt.as_str() {
+                                current_render = text.to_owned();
+                            }
+                            modified = true;
                         }
                     }
                 }
@@ -872,7 +972,7 @@ impl ExtensionRunnerCore {
             }
         }
 
-        if messages.is_empty() && !system_prompt_modified {
+        if messages.is_empty() && !modified {
             return None;
         }
 
@@ -880,8 +980,8 @@ impl ExtensionRunnerCore {
         if !messages.is_empty() {
             out.insert("messages".to_owned(), Value::Array(messages));
         }
-        if system_prompt_modified {
-            out.insert("systemPrompt".to_owned(), current_system_prompt);
+        if modified {
+            out.insert("systemPromptOptions".to_owned(), current_options);
         }
         Some(Value::Object(out))
     }

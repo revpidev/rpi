@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use crate::models::ProviderStreams;
 use crate::types::{
-    Context, Model, ProviderHeaders, SessionAffinityFormat, SimpleStreamOptions, StreamOptions,
+    Model, ProviderHeaders, SessionAffinityFormat, SimpleStreamOptions, StreamOptions,
+    TranscriptContext,
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 
@@ -93,7 +94,7 @@ impl ProviderStreams for WithSessionHeader {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         let options = options.map(|mut options| {
@@ -106,7 +107,7 @@ impl ProviderStreams for WithSessionHeader {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         let options = options.map(|mut options| {
@@ -267,7 +268,11 @@ pub(crate) mod tests {
         let options = stream_options(Some("opencode-sess-1"), None);
         let mut options = options;
         options.request.api_key = Some("test-key".to_owned());
-        let stream = wrapped.stream(&model, &context, Some(options));
+        let stream = wrapped.stream(
+            &model,
+            &crate::utils::transcript::normalize_context(&context),
+            Some(options),
+        );
         let _ = stream.result().await;
         let raw = tokio::time::timeout(std::time::Duration::from_secs(5), raw_rx)
             .await

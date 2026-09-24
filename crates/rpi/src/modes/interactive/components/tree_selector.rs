@@ -833,6 +833,11 @@ impl TreeList {
 
         match entry.known() {
             Some(SessionEntry::Message(message_entry)) => match &message_entry.message {
+                // #9548: prompt/tool state entries fall through to the
+                // generic role fallback (upstream `else` branch).
+                AgentMessage::System(_) => {
+                    parts.push("system".to_string());
+                }
                 AgentMessage::User(user_message) => {
                     parts.push("user".to_string());
                     parts.push(extract_content_user(&user_message.content));
@@ -965,6 +970,8 @@ impl TreeList {
 
         let result: String = match entry.known() {
             Some(SessionEntry::Message(message_entry)) => match &message_entry.message {
+                // #9548: the generic role fallback (upstream `else` branch).
+                AgentMessage::System(_) => self.theme.fg("dim", "[system]"),
                 AgentMessage::User(user_message) => format!(
                     "{}{}",
                     self.theme.fg("accent", "user: "),
@@ -2693,7 +2700,6 @@ mod tests {
                 })],
                 details: None,
                 usage: None,
-                added_tool_names: None,
                 is_error: false,
                 timestamp: 1,
             }),
@@ -3043,6 +3049,7 @@ mod tests {
                 details: None,
                 usage: None,
                 from_hook: None,
+                system_message: None,
             })),
             vec![],
             None,

@@ -1204,6 +1204,7 @@ mod tests {
                 details: None,
                 usage: Some(usage(1, 2, 3, 4, 10, 0.1)),
                 from_hook: None,
+                system_message: None,
             }))
             .await
             .expect("append");

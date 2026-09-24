@@ -25,9 +25,9 @@ use rpi_agent::types::{
 };
 use rpi_agent::AgentError;
 use rpi_ai::types::{
-    ApiKind, AssistantContent, AssistantMessage, Context, DoneReason, ErrorReason, InputModality,
-    Message, Model, ModelCost, StopReason, StreamEvent, StreamOptions, TextContent,
-    ToolResultContent, Usage, UserContent, UserMessage, UserRole,
+    ApiKind, AssistantContent, AssistantMessage, DoneReason, ErrorReason, InputModality, Message,
+    Model, ModelCost, StopReason, StreamEvent, StreamOptions, TextContent, ToolResultContent,
+    Usage, UserContent, UserMessage, UserRole,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -132,7 +132,7 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> AssistantContent {
 
 /// Recorded LLM call (the context/options the stream fn was invoked with).
 struct RecordedCall {
-    context: Context,
+    context: rpi_ai::types::TranscriptContext,
     options: StreamOptions,
 }
 
@@ -189,7 +189,10 @@ fn call_count(state: &Arc<Mutex<MockScript>>) -> usize {
     state.lock().unwrap().calls.len()
 }
 
-fn recorded_context(state: &Arc<Mutex<MockScript>>, index: usize) -> Context {
+fn recorded_context(
+    state: &Arc<Mutex<MockScript>>,
+    index: usize,
+) -> rpi_ai::types::TranscriptContext {
     state.lock().unwrap().calls[index].context.clone()
 }
 
@@ -341,6 +344,7 @@ fn message_roles(messages: &[AgentMessage]) -> Vec<&'static str> {
             AgentMessage::Custom(_) => "custom",
             AgentMessage::BranchSummary(_) => "branchSummary",
             AgentMessage::CompactionSummary(_) => "compactionSummary",
+            AgentMessage::System(_) => "system",
         })
         .collect()
 }
@@ -373,7 +377,6 @@ fn message_start_markers(events: &[AgentEvent]) -> Vec<String> {
 #[tokio::test]
 async fn emits_events_with_agent_message_types() {
     let context = AgentContext {
-        system_prompt: "You are helpful.".to_owned(),
         messages: Vec::new(),
         tools: None,
     };
@@ -415,7 +418,6 @@ async fn handles_custom_message_types_via_convert_to_llm() {
         timestamp: 5,
     });
     let context = AgentContext {
-        system_prompt: "You are helpful.".to_owned(),
         messages: vec![notification],
         tools: None,
     };
@@ -461,7 +463,6 @@ async fn handles_custom_message_types_via_convert_to_llm() {
 #[tokio::test]
 async fn applies_transform_context_before_convert_to_llm() {
     let context = AgentContext {
-        system_prompt: "You are helpful.".to_owned(),
         messages: vec![
             user_message("old message 1"),
             AgentMessage::Assistant(text_assistant("old response 1")),
@@ -562,7 +563,6 @@ async fn handles_tool_calls_and_results() {
     );
 
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -670,7 +670,6 @@ async fn partial_update_reaches_stream_before_execute_returns() {
     );
 
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(streaming_tool)]),
     };
@@ -725,7 +724,6 @@ async fn does_not_execute_tool_calls_from_length_truncated_message() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -782,7 +780,6 @@ async fn executes_mutated_before_tool_call_args_without_revalidation() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -882,7 +879,6 @@ async fn prepares_tool_arguments_for_validation() {
     });
 
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1007,7 +1003,6 @@ async fn emits_tool_execution_end_in_completion_order_results_in_source_order() 
     });
     let tool = gated_echo_tool("echo", gate.clone(), gate_state.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1044,7 +1039,6 @@ async fn injects_queued_messages_after_all_tool_calls_complete() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1122,7 +1116,6 @@ async fn forces_sequential_when_tool_has_execution_mode_sequential() {
     let tool = gated_echo_tool("slow", gate.clone(), gate_state.clone())
         .with_mode(ToolExecutionMode::Sequential);
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1205,7 +1198,6 @@ async fn forces_sequential_when_one_of_multiple_tools_is_sequential() {
     );
 
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(slow_tool), Arc::new(fast_tool)]),
     };
@@ -1253,7 +1245,6 @@ async fn allows_parallel_when_all_tools_have_execution_mode_parallel() {
     let tool = gated_echo_tool("echo", gate.clone(), gate_state.clone())
         .with_mode(ToolExecutionMode::Parallel);
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1287,7 +1278,6 @@ async fn uses_prepare_next_turn_snapshot_before_continuing() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed);
     let context = AgentContext {
-        system_prompt: "first prompt".to_owned(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1304,10 +1294,17 @@ async fn uses_prepare_next_turn_snapshot_before_continuing() {
                 }
                 Some(AgentLoopTurnUpdate {
                     context: Some(AgentContext {
-                        system_prompt: "second prompt".to_owned(),
                         messages: hook_context.context.messages.clone(),
                         tools: hook_context.context.tools.clone(),
                     }),
+                    messages: Some(vec![AgentMessage::System(rpi_ai::types::SystemMessage {
+                        role: Default::default(),
+                        content: rpi_ai::types::SystemContent::Text("second prompt".to_owned()),
+                        sections: None,
+                        tools_added: None,
+                        tools_removed: None,
+                        timestamp: 0,
+                    })]),
                     model: None,
                     thinking_level: None,
                 })
@@ -1332,10 +1329,21 @@ async fn uses_prepare_next_turn_snapshot_before_continuing() {
     let (_events, _messages) = collect(stream).await;
 
     assert_eq!(call_count(&state), 2);
-    assert_eq!(
-        recorded_context(&state, 1).system_prompt.as_deref(),
-        Some("second prompt")
-    );
+    // #9548: the prompt change rides a system message in the transcript.
+    let second = recorded_context(&state, 1);
+    let prompt = second
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            rpi_ai::types::Message::System(system) => Some(
+                rpi_ai::utils::text::content_text_system(&system.content, "\n"),
+            ),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assert_eq!(prompt, "second prompt");
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,7 +1359,6 @@ async fn prepare_next_turn_skipped_on_stop_terminal_turn() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1389,7 +1396,6 @@ async fn prepare_next_turn_skipped_on_stop_terminal_turn() {
 #[tokio::test]
 async fn prepare_next_turn_skipped_on_aborted_turn() {
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: None,
     };
@@ -1451,7 +1457,6 @@ async fn prepare_next_turn_runs_between_turn_end_and_turn_start() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed);
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1517,7 +1522,6 @@ async fn steering_queued_during_prepare_is_picked_up() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed);
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1600,7 +1604,6 @@ async fn parallel_preflight_abort_skips_prepared_tools() {
         }),
     );
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1699,7 +1702,6 @@ async fn stops_after_turn_when_should_stop_after_turn_returns_true() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1779,17 +1781,19 @@ async fn stops_after_turn_when_should_stop_after_turn_returns_true() {
     );
     assert_eq!(
         *callback_context_roles.lock().unwrap(),
-        vec!["user", "assistant", "toolResult"]
+        vec!["system", "user", "assistant", "toolResult"]
     );
     assert_eq!(
         message_roles(&messages),
-        ["user", "assistant", "toolResult"]
+        ["system", "user", "assistant", "toolResult"]
     );
     assert_eq!(
         event_types(&events),
         [
             "agent_start",
             "turn_start",
+            "message_start",
+            "message_end",
             "message_start",
             "message_end",
             "message_start",
@@ -1824,7 +1828,6 @@ async fn stops_after_tool_batch_when_every_tool_result_terminates() {
         }),
     );
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1845,7 +1848,7 @@ async fn stops_after_tool_batch_when_every_tool_result_terminates() {
     assert_eq!(call_count(&state), 1);
     assert_eq!(
         message_roles(&messages),
-        ["user", "assistant", "toolResult"]
+        ["system", "user", "assistant", "toolResult"]
     );
     assert_eq!(
         events
@@ -1880,7 +1883,6 @@ async fn continues_after_parallel_tool_calls_when_not_all_terminate() {
         }),
     );
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1900,7 +1902,14 @@ async fn continues_after_parallel_tool_calls_when_not_all_terminate() {
     assert_eq!(call_count(&state), 2);
     assert_eq!(
         message_roles(&messages),
-        ["user", "assistant", "toolResult", "toolResult", "assistant"]
+        [
+            "system",
+            "user",
+            "assistant",
+            "toolResult",
+            "toolResult",
+            "assistant"
+        ]
     );
 }
 
@@ -1909,7 +1918,6 @@ async fn allows_after_tool_call_to_mark_batch_as_terminating() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed);
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -1949,7 +1957,6 @@ async fn stops_after_blocked_tool_call_when_before_tool_call_sets_terminate_true
     let executed = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -2003,7 +2010,6 @@ async fn continues_after_mixed_batch_with_one_terminating_blocked_call() {
     let executed = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -2052,7 +2058,6 @@ async fn continues_after_mixed_batch_with_one_terminating_blocked_call() {
 #[tokio::test]
 async fn agent_loop_continue_throws_when_context_has_no_messages() {
     let context = AgentContext {
-        system_prompt: "You are helpful.".to_owned(),
         messages: Vec::new(),
         tools: None,
     };
@@ -2068,7 +2073,6 @@ async fn agent_loop_continue_throws_when_context_has_no_messages() {
 #[tokio::test]
 async fn agent_loop_continue_throws_when_last_message_is_assistant() {
     let context = AgentContext {
-        system_prompt: "You are helpful.".to_owned(),
         messages: vec![
             user_message("Hello"),
             AgentMessage::Assistant(text_assistant("Hi")),
@@ -2090,7 +2094,6 @@ async fn agent_loop_continue_throws_when_last_message_is_assistant() {
 #[tokio::test]
 async fn agent_loop_continue_from_existing_context_without_user_message_events() {
     let context = AgentContext {
-        system_prompt: "You are helpful.".to_owned(),
         messages: vec![user_message("Hello")],
         tools: None,
     };
@@ -2130,7 +2133,6 @@ async fn agent_loop_continue_allows_custom_message_as_last_message() {
         timestamp: 5,
     });
     let context = AgentContext {
-        system_prompt: "You are helpful.".to_owned(),
         messages: vec![custom],
         tools: None,
     };
@@ -2166,7 +2168,6 @@ async fn resolves_api_key_dynamically_before_each_llm_call() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed);
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -2221,7 +2222,6 @@ async fn resolves_api_key_dynamically_before_each_llm_call() {
 
         let (stream_fn, state) = mock_stream_fn(vec![text_assistant("done")]);
         let context = AgentContext {
-            system_prompt: String::new(),
             messages: Vec::new(),
             tools: None,
         };
@@ -2249,7 +2249,6 @@ async fn abort_in_before_tool_call_yields_operation_aborted_error_result() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -2397,7 +2396,6 @@ async fn before_tool_call_block_yields_error_result_without_executing() {
         let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let tool = echo_tool(executed.clone());
         let context = AgentContext {
-            system_prompt: String::new(),
             messages: Vec::new(),
             tools: Some(vec![Arc::new(tool)]),
         };
@@ -2450,7 +2448,6 @@ async fn tool_not_found_yields_error_result_without_executing() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -2493,7 +2490,6 @@ async fn validation_failure_yields_error_result_without_executing() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -2542,7 +2538,6 @@ async fn after_tool_call_hook_error_degrades_to_error_result() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(tool)]),
     };
@@ -2629,7 +2624,6 @@ async fn parallel_task_panic_still_emits_tool_execution_end_for_missing_slot() {
         }),
     );
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(ok_tool), Arc::new(boom_tool)]),
     };
@@ -2703,7 +2697,6 @@ async fn sequential_task_panic_is_contained_as_error_tool_result() {
         }),
     );
     let context = AgentContext {
-        system_prompt: String::new(),
         messages: Vec::new(),
         tools: Some(vec![Arc::new(boom_tool)]),
     };

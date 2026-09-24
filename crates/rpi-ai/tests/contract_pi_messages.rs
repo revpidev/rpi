@@ -206,15 +206,15 @@ fn create_model(base_url: &str) -> Model {
 }
 
 /// Upstream `context` fixture (fixed timestamp for determinism).
-fn context() -> Context {
-    Context {
+fn context() -> rpi_ai::types::TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages: vec![serde_json::from_value(
             json!({"role": "user", "content": "Hello", "timestamp": 0}),
         )
         .expect("user message")],
         tools: None,
-    }
+    })
 }
 
 /// Upstream `usage` fixture.

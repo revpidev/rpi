@@ -431,13 +431,15 @@ async fn prompt_lifecycle_messages_state_stats() {
     assert_eq!(response["success"], true);
     assert_eq!(response["data"]["text"], "Hello from faux!");
 
-    // get_messages: user + assistant
+    // get_messages: system + user + assistant (#9548: the leading system
+    // declaration is part of the session transcript).
     rpc.send(&json!({"id": "m1", "type": "get_messages"})).await;
     let response = rpc.next_response(Some("m1")).await;
     let messages = response["data"]["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0]["role"], "user");
-    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[2]["role"], "assistant");
 
     // get_state: full RpcSessionState shape (rpc.md §get_state).
     rpc.send(&json!({"id": "s1", "type": "get_state"})).await;
@@ -452,7 +454,8 @@ async fn prompt_lifecycle_messages_state_stats() {
     assert_eq!(data["followUpMode"], "one-at-a-time");
     assert!(data["sessionId"].as_str().is_some());
     assert_eq!(data["autoCompactionEnabled"], true);
-    assert_eq!(data["messageCount"], 2);
+    // #9548: messageCount includes the leading system declaration.
+    assert_eq!(data["messageCount"], 3);
     assert_eq!(data["pendingMessageCount"], 0);
     // in-memory session: no sessionFile / sessionName keys.
     assert!(data.get("sessionFile").is_none());
@@ -465,7 +468,8 @@ async fn prompt_lifecycle_messages_state_stats() {
     let data = &response["data"];
     assert_eq!(data["userMessages"], 1);
     assert_eq!(data["assistantMessages"], 1);
-    assert_eq!(data["totalMessages"], 2);
+    // #9548: totalMessages counts the leading system declaration too.
+    assert_eq!(data["totalMessages"], 3);
     assert!(data["tokens"]["input"].as_u64().is_some());
     assert!(data["cost"].as_f64().is_some());
     assert!(data["contextUsage"]["contextWindow"].as_u64().is_some());
@@ -990,6 +994,14 @@ async fn clear_queue_returns_and_purges_queues() {
         .await;
     rpc.next_response(Some("p1")).await;
     rpc.next_event("agent_start").await;
+    // #9548 race hardening: the loop runs one initial steering poll before
+    // the first LLM call (agent_start → prompt/tool declaration events →
+    // poll). A steer sent right after agent_start can slip in ahead of that
+    // poll and be delivered immediately, so wait for the first
+    // `message_update` (streaming started ⇒ the poll has long passed)
+    // before queueing — same shape as the fixture generator's
+    // `waitForEvent("message_update")`.
+    rpc.next_event("message_update").await;
 
     // Queue one steering and one follow-up while the stream is in flight.
     rpc.send(&json!({"id": "st1", "type": "steer", "message": "steer note"}))

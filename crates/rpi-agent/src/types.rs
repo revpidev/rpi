@@ -95,10 +95,6 @@ pub struct AgentToolResult {
     /// main LLM context accounting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    /// Names of tools introduced by this result and available from this
-    /// transcript point onward.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub added_tool_names: Option<Vec<String>>,
     /// Hint that the agent should stop after the current tool batch. Early
     /// termination only happens when every finalized tool result in the batch
     /// sets this to true. Runtime-only; never written to the transcript.
@@ -269,7 +265,6 @@ mod tests {
             })],
             details: None,
             usage: None,
-            added_tool_names: None,
             is_error: false,
             timestamp: 3,
         }
@@ -406,7 +401,6 @@ mod tests {
             })],
             details: json!({"lines": 1}),
             usage: None,
-            added_tool_names: None,
             terminate: Some(false),
         };
         assert_eq!(

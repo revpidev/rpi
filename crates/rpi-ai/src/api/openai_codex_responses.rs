@@ -42,8 +42,7 @@ use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
 use crate::api::openai_responses::{apply_service_tier_pricing, OPENAI_TOOL_CALL_PROVIDERS};
 use crate::api::openai_responses_shared::{
     convert_responses_messages, convert_responses_tools, ConvertResponsesMessagesOptions,
-    ConvertResponsesToolsOptions, ResponsesDeferredToolsMode, ResponsesStreamOptions,
-    ResponsesStreamProcessor,
+    ConvertResponsesToolsOptions, ResponsesStreamOptions, ResponsesStreamProcessor,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
@@ -52,11 +51,10 @@ use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
     AssistantMessage, AssistantMessageDiagnostic, CacheRetention, Context, DiagnosticErrorInfo,
     DoneReason, ErrorReason, Message, Model, ModelThinkingLevel, NumberOrString, ProviderHeaders,
-    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, Transport,
-    Usage,
+    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
+    TranscriptContext, Transport, Usage,
 };
 use crate::utils::custom_fetch::{send_provider_request, SendFailure};
-use crate::utils::deferred_tools::split_deferred_tools_identity;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::headers_to_record;
 use crate::utils::uuid::uuidv7;
@@ -390,7 +388,7 @@ fn header_record_to_map(record: &HeaderRecord) -> Result<reqwest::header::Header
 /// plus conditional assignments (serde_json `preserve_order`).
 pub fn build_request_body(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &OpenAiCodexResponsesOptions,
     cache_session_id: Option<&str>,
     grammar_tool_input_properties: &HashMap<String, String>,
@@ -402,27 +400,26 @@ pub fn build_request_body(
     let supports_open_ai_grammar_tools = compat
         .and_then(|compat| compat.supports_open_ai_grammar_tools)
         .unwrap_or(false);
-    // e47b8e37a (#7709): `supportsAdditionalTools` wins over
-    // `supportsToolSearch`; neither means deferred tools are not split out.
-    let deferred_tools_mode = if compat
+    // #9548 (openai-codex-responses.ts:539-553): tools split between the
+    // request field and in-place additions.
+    let supports_additional_tools = compat
         .and_then(|compat| compat.supports_additional_tools)
-        .unwrap_or(false)
-    {
-        Some(ResponsesDeferredToolsMode::AdditionalTools)
-    } else if compat
+        .unwrap_or(false);
+    let supports_tool_search = compat
         .and_then(|compat| compat.supports_tool_search)
-        .unwrap_or(false)
-    {
-        Some(ResponsesDeferredToolsMode::ToolSearch)
-    } else {
-        None
-    };
-    let tool_placement = split_deferred_tools_identity(context, deferred_tools_mode.is_some());
+        .unwrap_or(false);
+    let supports_mid_convo_system_messages = compat
+        .and_then(|compat| compat.supports_mid_convo_system_messages)
+        .unwrap_or(false);
+    let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
+        &context.messages,
+        supports_additional_tools || supports_tool_search,
+    );
     let tool_options = ConvertResponsesToolsOptions {
         strict: None,
         supports_strict_mode: Some(supports_strict_mode),
         supports_open_ai_grammar_tools: Some(supports_open_ai_grammar_tools),
-        defer_loading: false,
+        tool_search_result: false,
     };
     let messages = convert_responses_messages(
         model,
@@ -431,18 +428,19 @@ pub fn build_request_body(
         &ConvertResponsesMessagesOptions {
             include_system_prompt: false,
             grammar_tool_input_properties: Some(grammar_tool_input_properties),
-            deferred_tools: Some(&tool_placement.deferred),
-            deferred_tools_mode,
+            supports_mid_convo_system_messages,
+            supports_additional_tools,
+            supports_tool_search,
             tool_options: tool_options.clone(),
         },
     )?;
 
-    // JS `context.systemPrompt || "You are a helpful assistant."`.
-    let instructions = context
-        .system_prompt
-        .as_deref()
-        .filter(|prompt| !prompt.is_empty())
-        .unwrap_or("You are a helpful assistant.");
+    // JS `instructions || "You are a helpful assistant."` — the leading
+    // system message renders the instruction text (#9548).
+    let instructions = crate::utils::transcript::get_initial_system_message(&context.messages)
+        .map(crate::utils::text::get_system_message_text)
+        .filter(|instructions| !instructions.is_empty())
+        .unwrap_or_else(|| "You are a helpful assistant.".to_owned());
     // JS `options?.textVerbosity || "low"`.
     let verbosity = options
         .text_verbosity
@@ -474,9 +472,9 @@ pub fn build_request_body(
     if let Some(service_tier) = &options.service_tier {
         body["service_tier"] = json!(service_tier);
     }
-    if !tool_placement.immediate.is_empty() {
+    if !transcript_tools.request_tools.is_empty() {
         body["tools"] = json!(convert_responses_tools(
-            &tool_placement.immediate,
+            &transcript_tools.request_tools,
             &tool_options,
         )?);
     }
@@ -1112,11 +1110,12 @@ async fn process_websocket_stream(
         } else if use_cached_context && cache_key.is_some() && output.response_id.is_some() {
             // invariant: checked is_some() above
             let (session_id, account_id) = cache_key.clone().unwrap();
-            let response_context = Context {
+            // #9548: `normalizeContext({ messages: [output] })`.
+            let response_context = crate::utils::transcript::normalize_context(&Context {
                 system_prompt: None,
                 messages: vec![Message::Assistant(output.clone())],
                 tools: None,
-            };
+            });
             let response_items = convert_responses_messages(
                 model,
                 &response_context,
@@ -1168,7 +1167,7 @@ async fn process_websocket_stream(
 /// The streaming body: everything that runs inside upstream's async IIFE.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &OpenAiCodexResponsesOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
@@ -1183,7 +1182,7 @@ async fn run(
     let account_id = extract_account_id(&api_key)?;
     let compat = model.compat.as_ref();
     let grammar_tool_input_properties = create_grammar_tool_input_properties(
-        context.tools.as_deref(),
+        Some(crate::utils::transcript::get_declared_tools(&context.messages).as_slice()),
         compat
             .and_then(|compat| compat.supports_open_ai_grammar_tools)
             .unwrap_or(false),
@@ -1550,16 +1549,27 @@ async fn run(
     Ok(done_reason(output))
 }
 
-/// `stream` (openai-codex-responses).
+/// `stream` (openai-codex-responses). The provider-facing transcript is
+/// normalized upstream; the entry resolves the mid-conversation policy per
+/// model compat (#9548, openai-codex-responses.ts:243) so `instructions`,
+/// the tool split, and the grammar property table all read the collapsed
+/// view on non-supporting models.
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: OpenAiCodexResponsesOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
     let task_stream = event_stream.clone();
     let model = model.clone();
-    let context = context.clone();
+    let context = crate::utils::transcript::resolve_transcript(
+        context,
+        model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.supports_mid_convo_system_messages)
+            .unwrap_or(false),
+    );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let mut output = initial_output(&model);
@@ -1598,7 +1608,7 @@ pub fn stream(
 /// `clampThinkingLevel`; a clamped "off" omits `reasoning_effort`.
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     // Auth check at the entry, before any stream is constructed
@@ -1647,7 +1657,7 @@ impl ProviderStreams for OpenAiCodexResponses {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -1663,7 +1673,7 @@ impl ProviderStreams for OpenAiCodexResponses {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
@@ -2057,10 +2067,9 @@ mod tests {
     #[test]
     fn test_build_request_body_shape_and_key_order() {
         let m = model(json!({"reasoning": false}));
-        let ctx = Context {
-            system_prompt: Some(String::new()),
-            ..common::context(vec![common::user_text("hi")], None)
-        };
+        // #9548: an empty leading system prompt still yields the default
+        // `instructions` (JS `"" || "You are a helpful assistant."`).
+        let ctx = common::context(vec![common::user_text("hi")], None);
         let options = OpenAiCodexResponsesOptions::default();
         let body =
             build_request_body(&m, &ctx, &options, Some("sess"), &HashMap::new()).expect("body");
@@ -2202,24 +2211,34 @@ mod tests {
         assert!(body.get("reasoning").is_none());
     }
 
-    /// e47b8e37a @ 4181f66 (#7709), upstream deferred-tools.test.ts "selects
-    /// additional tools, tool search, or top-level tools for Codex models"
-    /// (compat flags inlined; the catalog entries are T26 scope).
+    /// #9548 (transcript-tool-changes shape): tool additions ride a later
+    /// system message; `supportsAdditionalTools` anchors them as
+    /// `additional_tools` items, `supportsToolSearch` maps them to the
+    /// client search pair, otherwise every declared tool stays top-level.
     #[test]
-    fn test_build_request_body_deferred_tools_mode_selection() {
+    fn test_build_request_body_system_tool_additions_mode_selection() {
         let ctx = || {
             common::context(
                 vec![
-                    common::same_model_assistant(json!([
-                        {"type": "toolCall", "id": "call_1|fc_1", "name": "base_tool", "arguments": {}}
-                    ])),
-                    common::tool_result(
-                        "call_1|fc_1",
-                        json!([{"type": "text", "text": "ok"}]),
-                        json!({"addedToolNames": ["late_tool"]}),
-                    ),
+                    crate::types::Message::System(crate::types::SystemMessage {
+                        role: Default::default(),
+                        content: crate::types::SystemContent::Text("base prompt".to_owned()),
+                        sections: None,
+                        tools_added: Some(vec![common::tool("base_tool")]),
+                        tools_removed: None,
+                        timestamp: 0,
+                    }),
+                    common::user_text("before"),
+                    crate::types::Message::System(crate::types::SystemMessage {
+                        role: Default::default(),
+                        content: crate::types::SystemContent::Text("updated".to_owned()),
+                        sections: None,
+                        tools_added: Some(vec![common::tool("late_tool")]),
+                        tools_removed: None,
+                        timestamp: 2,
+                    }),
                 ],
-                Some(vec![common::tool("base_tool"), common::tool("late_tool")]),
+                None,
             )
         };
         let options = OpenAiCodexResponsesOptions::default();
@@ -2232,10 +2251,10 @@ mod tests {
                 .collect()
         };
 
-        // supportsAdditionalTools (GPT-5.6 family): message-anchored
-        // additional_tools, no tool-search pair.
+        // supportsMidConvoSystemMessages + supportsAdditionalTools:
+        // message-anchored additional_tools, request keeps the initial set.
         let m = model(json!({
-            "compat": {"supportsOpenAIGrammarTools": true, "supportsAdditionalTools": true}
+            "compat": {"supportsOpenAIGrammarTools": true, "supportsMidConvoSystemMessages": true, "supportsAdditionalTools": true}
         }));
         let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
         assert_eq!(top_level_names(&body), vec!["base_tool"]);
@@ -2247,9 +2266,10 @@ mod tests {
             .iter()
             .all(|item| item["type"] != json!("tool_search_output")));
 
-        // supportsToolSearch only: the client tool-search pair.
+        // supportsMidConvoSystemMessages + supportsToolSearch only: the
+        // client tool-search pair.
         let m = model(json!({
-            "compat": {"supportsOpenAIGrammarTools": true, "supportsToolSearch": true}
+            "compat": {"supportsOpenAIGrammarTools": true, "supportsMidConvoSystemMessages": true, "supportsToolSearch": true}
         }));
         let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
         assert_eq!(top_level_names(&body), vec!["base_tool"]);
@@ -2272,6 +2292,84 @@ mod tests {
         assert!(input
             .iter()
             .all(|item| item["type"] != json!("tool_search_output")));
+    }
+
+    /// #9548 (openai-codex-responses.ts:243): the stream entry resolves the
+    /// transcript per model compat, so `instructions`, the tool split, and
+    /// the grammar property table all read the collapsed view. Without the
+    /// entry-level resolve, a model without mid-conversation support would
+    /// drop later prompt updates from `instructions` and late tools from the
+    /// request (regression: only `input` re-resolved internally).
+    #[tokio::test]
+    async fn test_stream_entry_collapses_transcript_for_codex_models() {
+        use std::sync::{Arc, Mutex};
+
+        let ctx = common::context(
+            vec![
+                crate::types::Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("base prompt".to_owned()),
+                    sections: None,
+                    tools_added: Some(vec![common::tool("base_tool")]),
+                    tools_removed: None,
+                    timestamp: 0,
+                }),
+                common::user_text("before"),
+                crate::types::Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("updated".to_owned()),
+                    sections: None,
+                    tools_added: Some(vec![common::tool("late_tool")]),
+                    tools_removed: None,
+                    timestamp: 2,
+                }),
+            ],
+            None,
+        );
+
+        let payload = Arc::new(Mutex::new(Value::Null));
+        let slot = payload.clone();
+        let mut m = model(json!({}));
+        m.base_url = "http://127.0.0.1:9".to_owned();
+        let options = OpenAiCodexResponsesOptions {
+            stream: crate::types::StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    api_key: Some(mock_token()),
+                    on_payload: Some(Arc::new(move |value, _model| {
+                        let slot = slot.clone();
+                        Box::pin(async move {
+                            *slot.lock().unwrap_or_else(|e| e.into_inner()) = value;
+                            None
+                        })
+                    })),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let event_stream = stream(&m, &ctx, options);
+        // The endpoint is unreachable; the payload was captured first.
+        let _ = event_stream.result().await;
+        let body = payload.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_ne!(body, Value::Null, "payload captured");
+
+        // Collapsed head: the merged prompt text reaches `instructions`.
+        assert_eq!(body["instructions"], "base prompt\n\nupdated");
+        // The request-level tool list is the complete current set.
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["base_tool", "late_tool"]);
+        // No mid-conversation update item leaks into `input`.
+        let input = body["input"].as_array().expect("input");
+        assert!(
+            input.iter().all(|item| item["role"] != json!("developer")),
+            "collapsed transcript keeps later updates out of input: {input:?}"
+        );
     }
 
     // -- Error parsing -------------------------------------------------------------

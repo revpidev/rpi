@@ -282,12 +282,21 @@ fn subscribes_to_events_and_mutators_do_not_emit() {
 
     // No initial event on subscribe; state mutators don't emit events.
     assert_eq!(event_count.load(Ordering::SeqCst), 0);
-    agent.set_system_prompt("Test prompt".to_owned());
+    // #9548: `systemPrompt` is a derived view — state mutations that don't
+    // run the loop still emit nothing.
+    agent.set_messages(vec![AgentMessage::System(rpi_ai::types::SystemMessage {
+        role: Default::default(),
+        content: rpi_ai::types::SystemContent::Text("Test prompt".to_owned()),
+        sections: None,
+        tools_added: None,
+        tools_removed: None,
+        timestamp: 0,
+    })]);
     assert_eq!(event_count.load(Ordering::SeqCst), 0);
     assert_eq!(agent.state().system_prompt, "Test prompt");
 
     unsubscribe();
-    agent.set_system_prompt("Another prompt".to_owned());
+    agent.set_messages(Vec::new());
     assert_eq!(event_count.load(Ordering::SeqCst), 0);
 }
 
@@ -687,7 +696,15 @@ fn updates_state_with_mutators() {
     let provider = faux_provider();
     let agent = Agent::new(AgentOptions::new(unused_stream_fn()));
 
-    agent.set_system_prompt("Custom prompt".to_owned());
+    // #9548: the prompt rides the transcript's system messages.
+    agent.set_messages(vec![AgentMessage::System(rpi_ai::types::SystemMessage {
+        role: Default::default(),
+        content: rpi_ai::types::SystemContent::Text("Custom prompt".to_owned()),
+        sections: None,
+        tools_added: None,
+        tools_removed: None,
+        timestamp: 0,
+    })]);
     assert_eq!(agent.state().system_prompt, "Custom prompt");
 
     let model = provider.get_model(None).expect("faux model");
@@ -1165,9 +1182,11 @@ async fn forwards_should_stop_after_turn_through_agent_options() {
 
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
     assert!(saw_abort_signal.load(Ordering::SeqCst));
+    // #9548 (agent.test.ts:960): `initialState.tools` becomes the leading
+    // system message, so the snapshot leads with `system`.
     assert_eq!(
         callback_context_roles.lock().unwrap().as_slice(),
-        ["user", "assistant", "toolResult"]
+        ["system", "user", "assistant", "toolResult"]
     );
 }
 
@@ -1180,5 +1199,6 @@ fn role_str(message: &AgentMessage) -> &'static str {
         AgentMessage::Custom(_) => "custom",
         AgentMessage::BranchSummary(_) => "branchSummary",
         AgentMessage::CompactionSummary(_) => "compactionSummary",
+        AgentMessage::System(_) => "system",
     }
 }

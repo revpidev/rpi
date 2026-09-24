@@ -3596,6 +3596,9 @@ impl InteractiveUi {
     fn add_message_to_chat(&self, message: AgentMessage, populate_history: bool) {
         let markdown_transformers = self.markdown_transformers();
         match &message {
+            // #9548: prompt/tool state entries are not user-visible chat
+            // messages (upstream interactive-mode.ts:3711 `case "system": break`).
+            AgentMessage::System(_) => {}
             AgentMessage::BashExecution(bash_execution) => {
                 let mut component = BashExecutionComponent::new(
                     bash_execution.command.clone(),
@@ -7229,7 +7232,6 @@ mod tests {
                         is_error: false,
                         details: None,
                         usage: None,
-                        added_tool_names: None,
                         timestamp: 1_700_000_000_000,
                     },
                 ))

@@ -442,6 +442,9 @@ impl<TMetadata: Send + Sync + 'static> SessionTrait for Session<TMetadata> {
                 details: options.details,
                 usage: options.usage,
                 from_hook: options.from_hook,
+                // #9548: the harness compaction form carries no checkpoint
+                // (upstream harness session types keep the four-field entry).
+                system_message: None,
             }))
             .await
         })
@@ -707,6 +710,7 @@ mod tests {
             AgentMessage::Custom(_) => "custom",
             AgentMessage::BranchSummary(_) => "branchSummary",
             AgentMessage::CompactionSummary(_) => "compactionSummary",
+            AgentMessage::System(_) => "system",
         }
     }
 

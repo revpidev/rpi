@@ -416,12 +416,12 @@ fn model(base_url: &str, extra: Value) -> Model {
     serde_json::from_value(value).expect("model")
 }
 
-fn context(messages: Vec<Message>) -> Context {
-    Context {
+fn context(messages: Vec<Message>) -> rpi_ai::types::TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: Some("You are a helpful assistant.".to_owned()),
         messages,
         tools: None,
-    }
+    })
 }
 
 fn user_text(text: &str) -> Message {
@@ -855,10 +855,11 @@ async fn test_sse_tool_call_flow() {
         "parameters": {"type": "object", "properties": {"payload": {"type": "string"}}, "required": ["payload"]}
     }))
     .expect("tool");
-    let ctx = Context {
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
+        messages: vec![user_text("Use the tool")],
         tools: Some(vec![tool]),
-        ..context(vec![user_text("Use the tool")])
-    };
+    });
     let events = collect(codex_stream(
         &m,
         &ctx,
@@ -1256,14 +1257,15 @@ async fn test_websocket_cached_delta_and_reuse() {
 
     // Third request with a changed system prompt: the baseline check fails
     // and the full context is sent.
-    let ctx3 = Context {
+    let ctx3 = rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: Some("Different instructions.".to_owned()),
-        ..context(vec![
+        messages: vec![
             user_text("hi"),
             Message::Assistant(second),
             user_text("third"),
-        ])
-    };
+        ],
+        tools: None,
+    });
     let third = codex_stream(
         &m,
         &ctx3,

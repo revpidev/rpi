@@ -308,7 +308,9 @@ async fn print_json_mode_backpressure_slow_consumer() {
                         .expect("delta"),
                 );
             }
-            Some("message_end") => {
+            Some("message_end") if line["message"]["role"] == json!("assistant") => {
+                // #9548: the leading system declaration also emits
+                // message_end — only the assistant turn carries the text.
                 final_text = Some(
                     line["message"]["content"][0]["text"]
                         .as_str()
@@ -416,7 +418,8 @@ async fn rpc_mode_backpressure_slow_consumer() {
                     assembled.push_str(delta_event["delta"].as_str().expect("delta"));
                 }
             }
-            "message_end" => {
+            "message_end" if event["message"]["role"] == json!("assistant") => {
+                // #9548: skip the leading system declaration's message_end.
                 final_text = Some(
                     event["message"]["content"][0]["text"]
                         .as_str()

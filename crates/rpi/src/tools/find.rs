@@ -364,7 +364,6 @@ fn assemble_result(
             Value::Object(details)
         },
         usage: None,
-        added_tool_names: None,
         terminate: None,
     }
 }
@@ -377,7 +376,6 @@ fn no_files_found() -> AgentToolResult {
         })],
         details: Value::Null,
         usage: None,
-        added_tool_names: None,
         terminate: None,
     }
 }

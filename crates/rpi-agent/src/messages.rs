@@ -135,6 +135,7 @@ pub enum AgentMessage {
     User(UserMessage),
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
+    System(rpi_ai::types::SystemMessage),
     BashExecution(BashExecutionMessage),
     Custom(CustomMessage),
     BranchSummary(BranchSummaryMessage),
@@ -232,6 +233,9 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
             AgentMessage::User(u) => Some(Message::User(u.clone())),
             AgentMessage::Assistant(a) => Some(Message::Assistant(a.clone())),
             AgentMessage::ToolResult(t) => Some(Message::ToolResult(t.clone())),
+            // #9548 (agent messages.ts `case "system"`): the transcript's
+            // system messages pass through to the LLM context.
+            AgentMessage::System(s) => Some(Message::System(s.clone())),
         })
         .collect()
 }

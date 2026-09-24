@@ -14,7 +14,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rpi_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
-use rpi_ai::types::Context;
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_test_support::faux::{
     faux_assistant_message, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
@@ -143,15 +142,17 @@ fn tool_call_step(name: &str) -> FauxResponseStep {
 /// Second-response factory that records the request message roles.
 fn recording_step(seen: SeenContexts, text: &str) -> FauxResponseStep {
     let text = text.to_owned();
-    FauxResponseStep::Factory(Box::new(move |context: &Context, _opts, _state, _model| {
-        seen.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(context_roles(context).join(","));
-        faux_assistant_message(text.clone(), FauxAssistantOptions::default())
-    }))
+    FauxResponseStep::Factory(Box::new(
+        move |context: &rpi_ai::types::TranscriptContext, _opts, _state, _model| {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(context_roles(context).join(","));
+            faux_assistant_message(text.clone(), FauxAssistantOptions::default())
+        },
+    ))
 }
 
-fn context_roles(context: &Context) -> Vec<String> {
+fn context_roles(context: &rpi_ai::types::TranscriptContext) -> Vec<String> {
     context
         .messages
         .iter()
@@ -365,7 +366,14 @@ async fn trigger_turn_false_during_run_appends_after_tool_results() {
     // Post-run: tree order (upstream roles assertion).
     assert_eq!(
         session_roles(&fixture.session),
-        vec!["user", "assistant", "toolResult", "custom", "assistant"],
+        vec![
+            "system",
+            "user",
+            "assistant",
+            "toolResult",
+            "custom",
+            "assistant"
+        ],
     );
     // Session entries keep the same order (upstream entryKinds).
     let kinds = entry_kinds(
@@ -381,13 +389,27 @@ async fn trigger_turn_false_during_run_appends_after_tool_results() {
     );
     assert_eq!(
         kinds,
-        vec!["user", "assistant", "toolResult", "custom", "assistant"],
+        vec![
+            "system",
+            "user",
+            "assistant",
+            "toolResult",
+            "custom",
+            "assistant"
+        ],
         "entry kinds: {kinds:?}"
     );
     // message events mirror the tree.
     assert_eq!(
         *events.lock().unwrap_or_else(|e| e.into_inner()),
-        vec!["user", "assistant", "toolResult", "custom", "assistant"],
+        vec![
+            "system",
+            "user",
+            "assistant",
+            "toolResult",
+            "custom",
+            "assistant"
+        ],
     );
 
     // Provider-visible order (upstream intent 3): the queued message did
@@ -399,7 +421,7 @@ async fn trigger_turn_false_during_run_appends_after_tool_results() {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     assert_eq!(seen.len(), 1, "exactly one post-tool request: {seen:?}");
-    assert_eq!(seen[0], "user,assistant,toolResult", "request roles");
+    assert_eq!(seen[0], "system,user,assistant,toolResult", "request roles");
 
     // Second prompt (upstream intent 3): the queued message joins the
     // request built from session state, AFTER the tool result — the
@@ -425,7 +447,7 @@ async fn trigger_turn_false_during_run_appends_after_tool_results() {
         .clone();
     assert_eq!(seen.len(), 2, "two recorded requests: {seen:?}");
     assert_eq!(
-        seen[1], "user,assistant,toolResult,user,assistant,user",
+        seen[1], "system,user,assistant,toolResult,user,assistant,user",
         "second prompt request roles (custom→user after toolResult): {}",
         seen[1]
     );
@@ -469,7 +491,7 @@ async fn trigger_turn_absent_during_run_still_steers() {
         .clone();
     assert_eq!(seen.len(), 1, "second request happened: {seen:?}");
     assert_eq!(
-        seen[0], "user,assistant,toolResult,user",
+        seen[0], "system,user,assistant,toolResult,user",
         "steered message in request: {}",
         seen[0]
     );

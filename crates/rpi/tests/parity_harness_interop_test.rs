@@ -150,6 +150,7 @@ fn usage(
 /// `message.role` literal (upstream `message.role` comparisons).
 fn role_tag(message: &AgentMessage) -> &'static str {
     match message {
+        AgentMessage::System(_) => "system",
         AgentMessage::User(_) => "user",
         AgentMessage::Assistant(_) => "assistant",
         AgentMessage::ToolResult(_) => "toolResult",

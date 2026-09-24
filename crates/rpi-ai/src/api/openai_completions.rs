@@ -49,11 +49,12 @@ use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
     AssistantContent, AssistantMessage, CacheControlFormat, CacheRetention, ChatTemplateKwargValue,
-    ChatTemplateKwargVarKind, Context, DeferredToolsMode, DoneReason, ErrorReason, InputModality,
-    MaxTokensField, Message, Model, ModelThinkingLevel, OpenRouterRouting, ProviderHeaders,
-    ProviderResponse, Role, SessionAffinityFormat, SimpleStreamOptions, StopReason, StreamEvent,
-    StreamOptions, TextContent, ThinkingBudgets, ThinkingContent, ThinkingFormat, Tool, ToolCall,
-    ToolResultContent, Usage, UserContent, UserContentBlock, VercelGatewayRouting,
+    ChatTemplateKwargVarKind, DoneReason, ErrorReason, InputModality, MaxTokensField, Message,
+    Model, ModelThinkingLevel, OpenRouterRouting, ProviderHeaders, ProviderResponse, Role,
+    SessionAffinityFormat, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
+    TextContent, ThinkingBudgets, ThinkingContent, ThinkingFormat, Tool, ToolCall,
+    ToolResultContent, TranscriptContext, Usage, UserContent, UserContentBlock,
+    VercelGatewayRouting,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::send_provider_request;
@@ -132,24 +133,8 @@ pub fn has_tool_history(messages: &[Message]) -> bool {
             .content
             .iter()
             .any(|block| matches!(block, AssistantContent::ToolCall(_))),
-        Message::User(_) => false,
+        Message::User(_) | Message::System(_) => false,
     })
-}
-
-/// `getDeferredToolNames`: tool names introduced by tool results, in first
-/// appearance order (JS `Set` iteration semantics).
-pub fn get_deferred_tool_names(messages: &[Message]) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for message in messages {
-        if let Message::ToolResult(result) = message {
-            for name in result.added_tool_names.as_deref().unwrap_or(&[]) {
-                if !names.contains(name) {
-                    names.push(name.clone());
-                }
-            }
-        }
-    }
-    names
 }
 
 /// `getToolsByName`: tools from `tools` matching `names`, in `names` order.
@@ -208,7 +193,11 @@ pub struct ResolvedOpenAICompletionsCompat {
     pub supports_open_ai_grammar_tools: bool,
     pub cache_control_format: Option<CacheControlFormat>,
     pub send_session_affinity_headers: bool,
-    pub deferred_tools_mode: Option<DeferredToolsMode>,
+    /// #9548: later system messages sent in place.
+    pub supports_mid_convo_system_messages: bool,
+    /// #9548: tool additions can ride system messages (Kimi K3 family).
+    /// Replaces the old `deferredToolsMode: "kimi"` catalog face.
+    pub supports_mid_convo_tool_additions: bool,
     pub session_affinity_format: SessionAffinityFormat,
     pub supports_long_cache_retention: bool,
 }
@@ -336,7 +325,8 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         // #9102 (bbb61e34a): OpenRouter endpoints derive session affinity
         // headers by default (`x-session-id`, see [`session_affinity`]).
         send_session_affinity_headers: is_openrouter,
-        deferred_tools_mode: None,
+        supports_mid_convo_system_messages: false,
+        supports_mid_convo_tool_additions: false,
         session_affinity_format: if is_openrouter {
             SessionAffinityFormat::Openrouter
         } else {
@@ -417,7 +407,12 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         send_session_affinity_headers: compat
             .send_session_affinity_headers
             .unwrap_or(detected.send_session_affinity_headers),
-        deferred_tools_mode: compat.deferred_tools_mode.or(detected.deferred_tools_mode),
+        supports_mid_convo_system_messages: compat
+            .supports_mid_convo_system_messages
+            .unwrap_or(detected.supports_mid_convo_system_messages),
+        supports_mid_convo_tool_additions: compat
+            .supports_mid_convo_tool_additions
+            .unwrap_or(detected.supports_mid_convo_tool_additions),
         session_affinity_format: compat
             .session_affinity_format
             .unwrap_or(detected.session_affinity_format),
@@ -438,7 +433,7 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
 /// auth, case-insensitively — see `merge_headers_chain`).
 pub fn build_client_headers(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     api_key: &str,
     options_headers: Option<&ProviderHeaders>,
     session_id: Option<&str>,
@@ -510,10 +505,18 @@ pub fn build_client_headers(
 /// provider `openai` only.
 pub fn convert_messages(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     compat: &ResolvedOpenAICompletionsCompat,
     grammar_tool_input_properties: &HashMap<String, String>,
 ) -> Result<Vec<Value>, String> {
+    // #9548 (openai-completions.ts:1191): resolve the mid-conversation
+    // policy here as well — callers may pass an already-resolved transcript
+    // (idempotent for true, collapse-in-place for false).
+    let normalized_context = crate::utils::transcript::resolve_transcript(
+        context,
+        compat.supports_mid_convo_system_messages,
+    );
+    let context: &TranscriptContext = &normalized_context;
     let mut params: Vec<Value> = Vec::new();
 
     let provider = model.provider.clone();
@@ -565,14 +568,17 @@ pub fn convert_messages(
     let transformed_messages =
         transform_messages(&context.messages, model, Some(&mut normalize_tool_call_id));
 
-    if let Some(system_prompt) = &context.system_prompt {
-        let role = if model.reasoning && compat.supports_developer_role {
-            "developer"
-        } else {
-            "system"
-        };
-        params.push(json!({"role": role, "content": sanitize_surrogates(system_prompt)}));
-    }
+    // #9548: tools split between the request field and in-place additions
+    // (Kimi-style `tools` field on a system message).
+    let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
+        &context.messages,
+        compat.supports_mid_convo_system_messages && compat.supports_mid_convo_tool_additions,
+    );
+    let instruction_role = if model.reasoning && compat.supports_developer_role {
+        "developer"
+    } else {
+        "system"
+    };
 
     let mut last_role: Option<Role> = None;
     let mut i = 0;
@@ -591,6 +597,33 @@ pub fn convert_messages(
         }
 
         match msg {
+            Message::System(system) => {
+                // #9548 (openai-completions.ts:1240-1255): later system
+                // messages carry their in-place tool additions (Kimi), the
+                // leading one renders the full prompt text.
+                if i > 0 && transcript_tools.anchors_additions {
+                    let added: Vec<Tool> = system.tools_added.clone().unwrap_or_default();
+                    if !added.is_empty() {
+                        // Kimi accepts a system message with tools but omits
+                        // the standard content field.
+                        params.push(json!({
+                            "role": "system",
+                            "tools": convert_tools(&added, compat)?,
+                        }));
+                    }
+                }
+                let text = if i == 0 {
+                    crate::utils::text::get_system_message_text(system)
+                } else {
+                    crate::utils::text::render_system_message_update(system)
+                };
+                if !text.is_empty() {
+                    params.push(json!({
+                        "role": instruction_role,
+                        "content": sanitize_surrogates(&text),
+                    }));
+                }
+            }
             Message::User(user) => match &user.content {
                 UserContent::Text(text) => {
                     params.push(json!({
@@ -818,7 +851,6 @@ pub fn convert_messages(
             }
             Message::ToolResult(_) => {
                 let mut image_blocks: Vec<Value> = Vec::new();
-                let mut deferred_tool_names: Vec<String> = Vec::new();
                 let mut j = i;
 
                 while j < transformed_messages.len() {
@@ -859,14 +891,6 @@ pub fn convert_messages(
                     }
                     params.push(tool_result_msg);
 
-                    if compat.deferred_tools_mode == Some(DeferredToolsMode::Kimi) {
-                        for name in tool_msg.added_tool_names.as_deref().unwrap_or(&[]) {
-                            if !deferred_tool_names.contains(name) {
-                                deferred_tool_names.push(name.clone());
-                            }
-                        }
-                    }
-
                     if has_images && model.input.contains(&InputModality::Image) {
                         for block in &tool_msg.content {
                             if let ToolResultContent::Image(image) = block {
@@ -897,19 +921,6 @@ pub fn convert_messages(
                     last_role = Some(Role::User);
                 } else {
                     last_role = Some(Role::ToolResult);
-                }
-
-                if !deferred_tool_names.is_empty() {
-                    let deferred_tools =
-                        get_tools_by_name(context.tools.as_deref(), &deferred_tool_names);
-                    if !deferred_tools.is_empty() {
-                        // Kimi accepts a system message with tools but omits the
-                        // standard content field.
-                        params.push(json!({
-                            "role": "system",
-                            "tools": convert_tools(&deferred_tools, compat)?,
-                        }));
-                    }
                 }
 
                 i = j;
@@ -1280,7 +1291,7 @@ pub(crate) fn off_is_not_null(model: &Model) -> bool {
 /// snapshots compare byte-for-byte with the JS payloads.
 pub fn build_params(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &OpenAICompletionsOptions,
     compat: &ResolvedOpenAICompletionsCompat,
     cache_retention: CacheRetention,
@@ -1289,21 +1300,15 @@ pub fn build_params(
     let mut messages = convert_messages(model, context, compat, grammar_tool_input_properties)?;
     let cache_control = get_compat_cache_control(compat, cache_retention);
 
-    let deferred_tool_names = if compat.deferred_tools_mode == Some(DeferredToolsMode::Kimi) {
-        get_deferred_tool_names(&context.messages)
-    } else {
-        Vec::new()
-    };
-    let active_tools: Vec<Tool> = context
-        .tools
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter(|tool| !deferred_tool_names.contains(&tool.name))
-        .cloned()
-        .collect();
-    let mut tools: Option<Vec<Value>> = if !active_tools.is_empty() {
-        Some(convert_tools(&active_tools, compat)?)
+    // #9548 (openai-completions.ts:807-811): request-level tools split from
+    // in-place additions.
+    let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
+        &context.messages,
+        compat.supports_mid_convo_system_messages && compat.supports_mid_convo_tool_additions,
+    );
+    let request_tools = transcript_tools.request_tools;
+    let mut tools: Option<Vec<Value>> = if !request_tools.is_empty() {
+        Some(convert_tools(&request_tools, compat)?)
     } else if has_tool_history(&context.messages) {
         // Anthropic (via LiteLLM/proxy) requires tools param when the
         // conversation has tool_calls/tool_results.
@@ -2547,7 +2552,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
 /// message either way.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &OpenAICompletionsOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
@@ -2559,7 +2564,7 @@ async fn run(
     )?;
     let compat = get_compat(model);
     let grammar_tool_input_properties = create_grammar_tool_input_properties(
-        context.tools.as_deref(),
+        Some(crate::utils::transcript::get_declared_tools(&context.messages).as_slice()),
         compat.supports_open_ai_grammar_tools,
     )?;
     let cache_retention =
@@ -2771,13 +2776,16 @@ async fn run(
 /// `stream` (openai-completions).
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: OpenAICompletionsOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
     let task_stream = event_stream.clone();
     let model = model.clone();
-    let context = context.clone();
+    let context = crate::utils::transcript::resolve_transcript(
+        context,
+        get_compat(&model).supports_mid_convo_system_messages,
+    );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let mut output = initial_output(&model);
@@ -2816,7 +2824,7 @@ pub fn stream(
 /// `clampThinkingLevel`; a clamped "off" omits `reasoning_effort`.
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     // Auth check at the entry, before any stream is constructed
@@ -2866,7 +2874,7 @@ impl ProviderStreams for OpenAiCompletions {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -2882,7 +2890,7 @@ impl ProviderStreams for OpenAiCompletions {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
@@ -2958,12 +2966,15 @@ pub(crate) mod tests {
             .expect("user")
     }
 
-    pub(crate) fn context(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> Context {
-        Context {
+    pub(crate) fn context(
+        messages: Vec<Message>,
+        tools: Option<Vec<Tool>>,
+    ) -> crate::types::TranscriptContext {
+        crate::utils::transcript::normalize_context(&crate::types::Context {
             system_prompt: None,
             messages,
             tools,
-        }
+        })
     }
 
     pub(crate) fn tool(name: &str) -> Tool {
@@ -2980,7 +2991,7 @@ pub(crate) mod tests {
 
     fn convert(
         model: &Model,
-        ctx: &Context,
+        ctx: &crate::types::TranscriptContext,
         compat: &ResolvedOpenAICompletionsCompat,
     ) -> Vec<Value> {
         convert_messages(model, ctx, compat, &no_grammar()).expect("convert")
@@ -3005,7 +3016,9 @@ pub(crate) mod tests {
         assert!(!compat.supports_open_ai_grammar_tools);
         assert_eq!(compat.cache_control_format, None);
         assert!(!compat.send_session_affinity_headers);
-        assert_eq!(compat.deferred_tools_mode, None);
+        // #9548: the Kimi face moved to supportsMidConvo* (default false).
+        assert!(!compat.supports_mid_convo_system_messages);
+        assert!(!compat.supports_mid_convo_tool_additions);
         assert_eq!(
             compat.session_affinity_format,
             SessionAffinityFormat::Openai
@@ -3172,26 +3185,6 @@ pub(crate) mod tests {
         assert!(has_tool_history(&[tool_result("c1", json!([]), json!({}))]));
     }
 
-    #[test]
-    fn test_deferred_tool_names_and_lookup() {
-        let messages = vec![
-            tool_result("c1", json!([]), json!({"addedToolNames": ["a", "b"]})),
-            tool_result("c2", json!([]), json!({"addedToolNames": ["b", "c"]})),
-        ];
-        // First-appearance order, deduplicated (JS Set semantics).
-        assert_eq!(
-            get_deferred_tool_names(&messages),
-            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
-        );
-        let tools = vec![tool("c"), tool("a"), tool("b")];
-        let found = get_tools_by_name(Some(&tools), &get_deferred_tool_names(&messages));
-        assert_eq!(
-            found.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-            vec!["a", "b", "c"]
-        );
-        assert!(get_tools_by_name(None, &["a".to_owned()]).is_empty());
-    }
-
     // -- client headers --------------------------------------------------------
 
     #[test]
@@ -3292,8 +3285,11 @@ pub(crate) mod tests {
     #[test]
     fn test_convert_messages_system_prompt_role() {
         let model = make_model(json!({}));
-        let mut ctx = context(vec![user_text("hi")], None);
-        ctx.system_prompt = Some("be nice".to_owned());
+        let ctx = crate::utils::transcript::normalize_context(&crate::types::Context {
+            system_prompt: Some("be nice".to_owned()),
+            messages: vec![user_text("hi")],
+            tools: None,
+        });
         // reasoning + developer role support → "developer".
         let compat = get_compat(&model);
         let params = convert(&model, &ctx, &compat);
@@ -3625,55 +3621,77 @@ pub(crate) mod tests {
         assert_eq!(params[0]["name"], json!("bash"));
     }
 
+    /// #9548 (openai-completions.ts:1240-1248): a later system message with
+    /// `toolsAdded` becomes a Kimi-style system message carrying the tool
+    /// definitions (`tools` field, no content), anchored in place.
     #[test]
-    fn test_convert_messages_kimi_deferred_tools() {
-        let model = make_model(json!({"compat": {"deferredToolsMode": "kimi"}}));
+    fn test_convert_messages_kimi_tool_additions() {
+        let model = make_model(
+            json!({"compat": {"supportsMidConvoSystemMessages": true, "supportsMidConvoToolAdditions": true}}),
+        );
+        // Leading system message declares bash; a later one adds sql
+        // (upstream additionContext shape — no standalone Context.tools).
         let ctx = context(
-            vec![tool_result(
-                "c1",
-                json!([{"type": "text", "text": "schema"}]),
-                json!({"addedToolNames": ["sql"]}),
-            )],
-            Some(vec![tool("sql"), tool("bash")]),
+            vec![
+                Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("base".to_owned()),
+                    sections: None,
+                    tools_added: Some(vec![tool("bash")]),
+                    tools_removed: None,
+                    timestamp: 0,
+                }),
+                user_text("Hello"),
+                Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: Default::default(),
+                    sections: None,
+                    tools_added: Some(vec![tool("sql")]),
+                    tools_removed: None,
+                    timestamp: 1,
+                }),
+            ],
+            None,
         );
         let compat = get_compat(&model);
         let params = convert(&model, &ctx, &compat);
-        // A system message carrying the deferred tool (no content field).
-        assert_eq!(params.len(), 2);
-        assert_eq!(params[1]["role"], json!("system"));
-        assert!(params[1].get("content").is_none());
-        assert_eq!(params[1]["tools"][0]["function"]["name"], json!("sql"));
+        // Leading prompt, user message, then the in-place addition.
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0]["role"], json!("developer"));
+        assert_eq!(params[0]["content"], json!("base"));
+        assert_eq!(params[1]["role"], json!("user"));
+        assert_eq!(params[2]["role"], json!("system"));
+        assert!(params[2].get("content").is_none());
+        assert_eq!(params[2]["tools"][0]["function"]["name"], json!("sql"));
     }
 
+    /// #9548: without mid-conversation support the transcript collapses and
+    /// no `tools`-bearing system messages are emitted — every tool rides the
+    /// request-level list.
     #[test]
-    fn test_convert_messages_kimi_deferred_batch_after_all_tool_results() {
-        // Upstream "emits Kimi deferred schemas after all tool results in a
-        // batch": markers from every tool result in the run collect into one
-        // system message placed after all of them.
-        let model = make_model(json!({"compat": {"deferredToolsMode": "kimi"}}));
+    fn test_convert_messages_kimi_additions_collapse_without_support() {
+        let model = make_model(json!({"compat": {"supportsMidConvoToolAdditions": true}}));
         let ctx = context(
             vec![
+                Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("base".to_owned()),
+                    sections: None,
+                    tools_added: Some(vec![tool("bash")]),
+                    tools_removed: None,
+                    timestamp: 0,
+                }),
                 user_text("Hello"),
-                same_model_assistant(json!([
-                    {"type": "toolCall", "id": "call_1", "name": "base_tool", "arguments": {}}
-                ])),
-                tool_result(
-                    "call_1",
-                    json!([{"type": "text", "text": "done"}]),
-                    json!({"addedToolNames": ["late_tool"]}),
-                ),
-                tool_result(
-                    "call_2",
-                    json!([{"type": "text", "text": "done2"}]),
-                    json!({"addedToolNames": ["later_tool"]}),
-                ),
-                user_text("next"),
+                Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: Default::default(),
+                    sections: None,
+                    tools_added: Some(vec![tool("sql")]),
+                    tools_removed: None,
+                    timestamp: 1,
+                }),
             ],
-            Some(vec![
-                tool("base_tool"),
-                tool("late_tool"),
-                tool("later_tool"),
-            ]),
+            None,
         );
         let compat = get_compat(&model);
         let params = convert(&model, &ctx, &compat);
@@ -3681,18 +3699,10 @@ pub(crate) mod tests {
             .iter()
             .map(|msg| msg["role"].as_str().unwrap_or(""))
             .collect();
-        assert_eq!(
-            roles,
-            ["user", "assistant", "tool", "tool", "system", "user"]
-        );
-        assert_eq!(
-            params[4]["tools"][0]["function"]["name"],
-            json!("late_tool")
-        );
-        assert_eq!(
-            params[4]["tools"][1]["function"]["name"],
-            json!("later_tool")
-        );
+        // Collapsed: one leading developer message (base prompt), then user.
+        assert_eq!(roles, ["developer", "user"]);
+        assert_eq!(params[0]["content"], json!("base"));
+        assert!(params.iter().all(|msg| msg.get("tools").is_none()));
     }
 
     #[test]
@@ -3754,7 +3764,7 @@ mod build_and_stream_tests {
 
     fn params_for(
         model: &Model,
-        ctx: &Context,
+        ctx: &crate::types::TranscriptContext,
         opts: &OpenAICompletionsOptions,
         retention: CacheRetention,
     ) -> Value {
@@ -3791,6 +3801,62 @@ mod build_and_stream_tests {
         );
     }
 
+    /// "keeps Kimi K2 system text inline without dynamic tool messages"
+    /// (transcript-tool-changes.test.ts:304): mid-conversation system
+    /// messages without tool-addition support — updates render inline as
+    /// plain system text and the request keeps the complete current tool set.
+    #[test]
+    fn test_convert_messages_kimi_k2_inline_without_tool_additions() {
+        let model = make_model(json!({
+            "id": "kimi-k2.7-code", "provider": "moonshotai",
+            "compat": {"supportsMidConvoSystemMessages": true}
+        }));
+        let ctx = context(
+            vec![
+                Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("base prompt".to_owned()),
+                    sections: None,
+                    tools_added: Some(vec![tool("base_tool")]),
+                    tools_removed: None,
+                    timestamp: 0,
+                }),
+                user_text("before"),
+                Message::System(crate::types::SystemMessage {
+                    role: Default::default(),
+                    content: crate::types::SystemContent::Text("updated guidance".to_owned()),
+                    sections: None,
+                    tools_added: Some(vec![tool("late_tool")]),
+                    tools_removed: None,
+                    timestamp: 2,
+                }),
+            ],
+            None,
+        );
+        let compat = get_compat(&model);
+        let params = convert_messages(&model, &ctx, &compat, &no_grammar()).expect("messages");
+        // No message carries a `tools` field (additions not anchored).
+        assert!(params.iter().all(|msg| msg.get("tools").is_none()));
+        // System text inline: leading prompt + the rendered update
+        // (moonshotai is non-standard → instruction role stays "system").
+        let system_texts: Vec<&str> = params
+            .iter()
+            .filter(|msg| msg["role"] == json!("system"))
+            .filter_map(|msg| msg["content"].as_str())
+            .collect();
+        assert_eq!(system_texts, vec!["base prompt", "updated guidance"]);
+        // The request-level tool list is the complete current set.
+        let opts = options(StreamOptions::default());
+        let built = params_for(&model, &ctx, &opts, CacheRetention::Short);
+        let names: Vec<&str> = built["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(names, ["base_tool", "late_tool"]);
+    }
+
     #[test]
     fn test_convert_messages_without_kimi_mode_leaves_tools_unchanged() {
         // Upstream "leaves OpenAI Completions tools unchanged without Kimi
@@ -3804,7 +3870,7 @@ mod build_and_stream_tests {
                 tool_result(
                     "call_1",
                     json!([{"type": "text", "text": "done"}]),
-                    json!({"addedToolNames": ["late_tool"]}),
+                    json!({}),
                 ),
             ],
             Some(vec![tool("base_tool"), tool("late_tool")]),
@@ -5128,8 +5194,11 @@ mod build_and_stream_tests {
         let model = make_model(json!({
             "provider": "openrouter", "id": "anthropic/claude"
         }));
-        let mut ctx = context(vec![user_text("hi")], Some(vec![tool("bash")]));
-        ctx.system_prompt = Some("sys".to_owned());
+        let ctx = crate::utils::transcript::normalize_context(&crate::types::Context {
+            system_prompt: Some("sys".to_owned()),
+            messages: vec![user_text("hi")],
+            tools: Some(vec![tool("bash")]),
+        });
         let opts = options(StreamOptions::default());
         let params = params_for(&model, &ctx, &opts, CacheRetention::Short);
         assert_eq!(

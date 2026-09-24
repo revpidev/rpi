@@ -1559,10 +1559,7 @@ async fn no_ui_coordinator_strips_and_restores_tool() {
     let capture_a: FauxResponseStep =
         FauxResponseStep::Factory(Box::new(move |context, _options, _state, _model| {
             seen_a.lock().unwrap_or_else(|e| e.into_inner()).push(
-                context
-                    .tools
-                    .as_deref()
-                    .unwrap_or(&[])
+                rpi_ai::utils::transcript::get_current_tools(&context.messages)
                     .iter()
                     .map(|tool| tool.name.clone())
                     .collect(),
@@ -1572,10 +1569,7 @@ async fn no_ui_coordinator_strips_and_restores_tool() {
     let capture_b: FauxResponseStep =
         FauxResponseStep::Factory(Box::new(move |context, _options, _state, _model| {
             seen_b.lock().unwrap_or_else(|e| e.into_inner()).push(
-                context
-                    .tools
-                    .as_deref()
-                    .unwrap_or(&[])
+                rpi_ai::utils::transcript::get_current_tools(&context.messages)
                     .iter()
                     .map(|tool| tool.name.clone())
                     .collect(),

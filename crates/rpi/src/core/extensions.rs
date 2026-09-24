@@ -149,13 +149,16 @@ pub enum InputEventResult {
     },
 }
 
-/// `BeforeAgentStartResult` (extensions/types.ts).
+/// `BeforeAgentStartCombinedResult` (extensions/types.ts + runner.ts
+/// :113-117 @ #9548): the combined result across handlers — injected
+/// messages plus the (possibly handler-mutated) prompt options. A handler's
+/// `systemPrompt` return chains onto the options as `forceSystemPrompt`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BeforeAgentStartResult {
     /// Custom messages injected alongside the user message.
     pub messages: Vec<BeforeAgentStartMessage>,
-    /// Extension-modified system prompt for this turn.
-    pub system_prompt: Option<String>,
+    /// The effective prompt options for this run (mutations included).
+    pub system_prompt_options: crate::core::system_prompt::BuildSystemPromptOptions,
 }
 
 /// `BeforeAgentStartResult["messages"][number]` (extensions/types.ts).
@@ -297,8 +300,9 @@ pub struct ExtensionToolEntry {
     pub prompt_snippet: Option<String>,
     pub prompt_guidelines: Option<Vec<String>>,
     pub source_info: crate::core::skills::SourceInfo,
-    /// Executable wrapper (host tool definition + `addedToolNames` logic,
-    /// wrapper.ts:17-37).
+    /// Executable wrapper (host tool definition, wrapper.ts — post-#9548:
+    /// the `addedToolNames` attachment is gone; tool changes ride transcript
+    /// system messages).
     pub tool: Arc<dyn rpi_agent::types::AgentTool>,
 }
 
@@ -436,15 +440,16 @@ pub trait ExtensionRunner: Send + Sync {
         InputEventResult::Continue
     }
 
-    /// `before_agent_start` (extensions/types.ts). `system_prompt` is the
-    /// fully assembled base prompt and `system_prompt_options` the
-    /// `BuildSystemPromptOptions` JSON (agent-session.ts:1224-1230).
+    /// `before_agent_start` (extensions/types.ts @ #9548): the event carries
+    /// the base prompt options (rendered `systemPrompt` readable through
+    /// `ctx.getSystemPrompt()` inside the runner); handlers mutate the
+    /// options or return `systemPrompt` (chained as force). Returns the
+    /// combined result, or `None` when no handler is registered.
     async fn emit_before_agent_start(
         &self,
         _text: &str,
         _images: Option<&[ImageContent]>,
-        _system_prompt: &str,
-        _system_prompt_options: serde_json::Value,
+        _system_prompt_options: &crate::core::system_prompt::BuildSystemPromptOptions,
     ) -> Option<BeforeAgentStartResult> {
         None
     }

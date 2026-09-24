@@ -1,5 +1,5 @@
 //! Contract tests for `rpi_agent::proxy` (port of
-//! `external/pi/packages/agent/src/proxy.ts` @ 2efa728): drive `stream_proxy`
+//! `external/pi/packages/agent/src/proxy.ts` @ pin `19451accd`): drive `stream_proxy`
 //! against a scripted local HTTP server and assert both sides of the contract
 //! — the request shape (method / path / headers / whitelisted options body)
 //! and the emitted `StreamEvent` sequence: all 12 proxy event types with
@@ -15,8 +15,8 @@ use rpi_agent::proxy::{stream_proxy, ProxyStreamOptions};
 use rpi_ai::types::{
     ApiKind, AssistantContent, CacheRetention, Context, DoneReason, ErrorReason, InputModality,
     Message, Model, ModelCost, StopReason, StreamEvent, TextContent, ThinkingBudgets,
-    ThinkingContent, ThinkingLevel, ToolCall, Transport, Usage, UsageCost, UserContent,
-    UserMessage, UserRole,
+    ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Transport, Usage, UsageCost,
+    UserContent, UserMessage, UserRole,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -48,8 +48,11 @@ fn test_model() -> Model {
     }
 }
 
-fn test_context() -> Context {
-    Context {
+/// #9548: the stream input is the normalized transcript — the prompt and
+/// tools ride the leading system message, and the wire `context` field
+/// serializes as `{"messages": [...]}` only.
+fn test_context() -> TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: Some("sys".to_owned()),
         messages: vec![Message::User(UserMessage {
             role: UserRole::User,
@@ -57,7 +60,7 @@ fn test_context() -> Context {
             timestamp: 0,
         })],
         tools: None,
-    }
+    })
 }
 
 /// All eleven whitelisted fields set, so the options whitelist is fully
@@ -300,9 +303,14 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
     assert_eq!(body["model"]["id"], "test-model");
     assert_eq!(body["model"]["api"], "anthropic-messages");
     assert_eq!(body["model"]["provider"], "test-provider");
-    assert_eq!(body["context"]["systemPrompt"], "sys");
-    assert_eq!(body["context"]["messages"][0]["role"], "user");
-    assert_eq!(body["context"]["messages"][0]["content"], "hello");
+    // #9548: the wire `context` is the TranscriptContext serialization —
+    // `{messages}` only; the prompt rides the leading system message.
+    assert!(body["context"].get("systemPrompt").is_none());
+    assert!(body["context"].get("tools").is_none());
+    assert_eq!(body["context"]["messages"][0]["role"], "system");
+    assert_eq!(body["context"]["messages"][0]["content"], "sys");
+    assert_eq!(body["context"]["messages"][1]["role"], "user");
+    assert_eq!(body["context"]["messages"][1]["content"], "hello");
     // Whitelist: exactly the eleven serializable fields, nothing else
     // (`buildProxyRequestOptions`, :102-115).
     let options = body["options"].as_object().expect("options object");

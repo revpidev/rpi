@@ -64,10 +64,10 @@ use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
-    AssistantContent, AssistantMessage, AssistantRole, CacheRetention, Context, DoneReason,
-    ErrorReason, InputModality, Message, Model, ModelThinkingLevel, ProviderHeaders,
-    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, Tool,
-    ToolResultContent, Usage, UserContent, UserContentBlock,
+    AssistantContent, AssistantMessage, AssistantRole, CacheRetention, DoneReason, ErrorReason,
+    InputModality, Message, Model, ModelThinkingLevel, ProviderHeaders, ProviderResponse,
+    SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, Tool, ToolResultContent,
+    TranscriptContext, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::{send_provider_request, SendFailure};
@@ -294,30 +294,28 @@ fn build_request_headers(
 
 /// `buildChatPayload`: builds the camelCase payload that `onPayload`
 /// observes; [`to_mistral_wire_payload`] remaps it to snake_case at send
-/// time. Note the system prompt is prepended to `messages` (upstream
-/// `unshift`), not sent as a separate field.
+/// time. Note the system prompt rides the leading system message in
+/// `messages` (upstream `toChatMessages`), not a separate field (#9548).
 fn build_chat_payload(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     messages: &[Message],
     options: &MistralOptions,
 ) -> Result<Value, String> {
     let supports_images = model.input.contains(&InputModality::Image);
-    let mut chat_messages = to_chat_messages(messages, supports_images);
-    if let Some(system_prompt) = &context.system_prompt {
-        chat_messages.insert(
-            0,
-            json!({"role": "system", "content": sanitize_surrogates(system_prompt)}),
-        );
-    }
+    let chat_messages = to_chat_messages(messages, supports_images);
 
     let mut payload = Map::new();
     payload.insert("model".to_owned(), json!(model.id));
     payload.insert("stream".to_owned(), json!(true));
     payload.insert("messages".to_owned(), Value::Array(chat_messages));
 
-    if let Some(tools) = context.tools.as_ref().filter(|tools| !tools.is_empty()) {
-        payload.insert("tools".to_owned(), Value::Array(to_function_tools(tools)?));
+    let current_tools = crate::utils::transcript::get_current_tools(&context.messages);
+    if !current_tools.is_empty() {
+        payload.insert(
+            "tools".to_owned(),
+            Value::Array(to_function_tools(&current_tools)?),
+        );
     }
     if let Some(temperature) = options.stream.temperature {
         payload.insert("temperature".to_owned(), json!(temperature));
@@ -461,8 +459,20 @@ fn to_function_tools(tools: &[Tool]) -> Result<Vec<Value>, String> {
 fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
     let mut result: Vec<Value> = Vec::new();
 
-    for msg in messages {
+    for (index, msg) in messages.iter().enumerate() {
         match msg {
+            // #9548: the leading system message renders its full text; later
+            // ones render as framed updates (mistral-conversations.ts:786-790).
+            Message::System(system) => {
+                let text = if index == 0 {
+                    crate::utils::text::get_system_message_text(system)
+                } else {
+                    crate::utils::text::render_system_message_update(system)
+                };
+                if !text.is_empty() {
+                    result.push(json!({"role": "system", "content": sanitize_surrogates(&text)}));
+                }
+            }
             Message::User(user) => match &user.content {
                 UserContent::Text(text) => {
                     result.push(json!({"role": "user", "content": sanitize_surrogates(text)}));
@@ -1206,7 +1216,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
 /// message either way.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &MistralOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
@@ -1442,13 +1452,21 @@ fn finalize(options: &MistralOptions, output: &AssistantMessage) -> Result<DoneR
 /// `stream` (mistral-conversations).
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: MistralOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
     let task_stream = event_stream.clone();
     let model = model.clone();
-    let context = context.clone();
+    // #9548 (mistral-conversations.ts:130).
+    let context = crate::utils::transcript::resolve_transcript(
+        context,
+        model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.supports_mid_convo_system_messages)
+            .unwrap_or(false),
+    );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let mut output = initial_output(&model);
@@ -1488,7 +1506,7 @@ pub fn stream(
 /// `reasoningEffort` (Mistral Small 4 / Medium 3.5).
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     // Auth check at the entry, before any stream is constructed
@@ -1544,7 +1562,7 @@ impl ProviderStreams for MistralConversations {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -1560,7 +1578,7 @@ impl ProviderStreams for MistralConversations {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
@@ -1618,18 +1636,20 @@ mod tests {
             })],
             details: None,
             usage: None,
-            added_tool_names: None,
             is_error,
             timestamp: 0,
         })
     }
 
-    fn context(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> Context {
-        Context {
+    fn context(
+        messages: Vec<Message>,
+        tools: Option<Vec<Tool>>,
+    ) -> crate::types::TranscriptContext {
+        crate::utils::transcript::normalize_context(&crate::types::Context {
             system_prompt: None,
             messages,
             tools,
-        }
+        })
     }
 
     fn options() -> MistralOptions {
@@ -1862,8 +1882,13 @@ mod tests {
     #[test]
     fn test_build_chat_payload_system_prompt_prepended() {
         let model = make_model(json!({}));
-        let mut ctx = context(vec![user_text("hi")], None);
-        ctx.system_prompt = Some("be nice".to_owned());
+        let ctx = crate::utils::transcript::normalize_context(&crate::types::Context {
+            system_prompt: Some("be nice".to_owned()),
+            messages: vec![user_text("hi")],
+            tools: None,
+        });
+        // #9548: the prompt rides the leading system message in
+        // (toChatMessages renders it; no separate unshift).
         let payload =
             build_chat_payload(&model, &ctx, &ctx.messages.clone(), &options()).expect("payload");
         let messages = payload["messages"].as_array().expect("messages");

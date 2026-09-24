@@ -139,7 +139,7 @@ async fn passes_fetch_through_stream_simple_to_the_anthropic_sdk() {
     let events = collect(
         rpi_ai::api::anthropic_messages::stream_simple(
             &m,
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )
         .expect("stream_simple"),
@@ -163,7 +163,7 @@ async fn passes_fetch_through_stream_simple_to_openai_sdk_adapters() {
     let events = collect(
         rpi_ai::api::openai_completions::stream_simple(
             &completions,
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )
         .expect("stream_simple"),
@@ -175,7 +175,7 @@ async fn passes_fetch_through_stream_simple_to_openai_sdk_adapters() {
     let events = collect(
         rpi_ai::api::openai_responses::stream_simple(
             &responses,
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )
         .expect("stream_simple"),
@@ -192,7 +192,7 @@ async fn passes_fetch_through_stream_simple_to_openai_sdk_adapters() {
     let events = collect(
         rpi_ai::api::azure_openai_responses::stream_simple(
             &azure,
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )
         .expect("stream_simple"),
@@ -218,7 +218,7 @@ async fn uses_fetch_for_mistral_codex_sse_and_pi_messages() {
     let events = collect(
         rpi_ai::api::mistral_conversations::stream_simple(
             &mistral,
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )
         .expect("stream_simple"),
@@ -236,8 +236,12 @@ async fn uses_fetch_for_mistral_codex_sse_and_pi_messages() {
     let mut options = simple_options(canned_fetch(&probe), &mock_token());
     options.stream.transport = Some(Transport::Sse);
     let events = collect(
-        rpi_ai::api::openai_codex_responses::stream_simple(&codex, &context(), Some(options))
-            .expect("stream_simple"),
+        rpi_ai::api::openai_codex_responses::stream_simple(
+            &codex,
+            &rpi_ai::utils::transcript::normalize_context(&context()),
+            Some(options),
+        )
+        .expect("stream_simple"),
     )
     .await;
     assert!(
@@ -250,7 +254,7 @@ async fn uses_fetch_for_mistral_codex_sse_and_pi_messages() {
     let events = collect(
         rpi_ai::api::pi_messages::stream_simple(
             &pi,
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )
         .expect("stream_simple"),
@@ -276,7 +280,7 @@ async fn rejects_custom_fetch_for_google_adapters() {
     let events = collect(
         rpi_ai::api::google_generative_ai::stream_simple(
             &google,
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )
         .expect("stream_simple"),
@@ -291,7 +295,7 @@ async fn rejects_custom_fetch_for_google_adapters() {
     let events = collect(
         rpi_ai::api::google_vertex::stream_simple(
             &vertex,
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )
         .expect("stream_simple"),
@@ -319,8 +323,12 @@ async fn google_default_transport_is_not_rejected() {
     let mut options = simple_options(canned_fetch(&FetchProbe::default()), "test-key");
     options.stream.request.fetch = None;
     let events = collect(
-        rpi_ai::api::google_generative_ai::stream_simple(&google, &context(), Some(options))
-            .expect("stream_simple"),
+        rpi_ai::api::google_generative_ai::stream_simple(
+            &google,
+            &rpi_ai::utils::transcript::normalize_context(&context()),
+            Some(options),
+        )
+        .expect("stream_simple"),
     )
     .await;
     assert!(

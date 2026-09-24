@@ -170,12 +170,12 @@ fn model(base_url: &str, extra: Value) -> Model {
     serde_json::from_value(value).expect("model")
 }
 
-fn context(messages: Vec<Message>) -> Context {
-    Context {
+fn context(messages: Vec<Message>) -> rpi_ai::types::TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages,
         tools: None,
-    }
+    })
 }
 
 fn user_text(text: &str) -> Message {
@@ -361,7 +361,7 @@ async fn test_azure_reasoning_replay_preserves_output_item_done_encrypted_conten
 
     // Replay the assistant turn: the reasoning item keeps the
     // output_item.done encrypted_content (not the response.completed one).
-    let replay = Context {
+    let replay = rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages: vec![
             user_text("first"),
@@ -369,7 +369,7 @@ async fn test_azure_reasoning_replay_preserves_output_item_done_encrypted_conten
             user_text("follow-up"),
         ],
         tools: None,
-    };
+    });
     let input = convert_responses_messages(
         &m,
         &replay,
@@ -401,7 +401,7 @@ async fn test_azure_reasoning_replay_fills_encrypted_content_from_completed() {
 
     // output_item.done omitted encrypted_content → filled from
     // response.completed.
-    let replay = Context {
+    let replay = rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages: vec![
             user_text("first"),
@@ -409,7 +409,7 @@ async fn test_azure_reasoning_replay_fills_encrypted_content_from_completed() {
             user_text("follow-up"),
         ],
         tools: None,
-    };
+    });
     let input = convert_responses_messages(
         &m,
         &replay,
@@ -437,11 +437,11 @@ async fn test_azure_tool_call_stream() {
         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}
     }))
     .expect("tool");
-    let ctx = Context {
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages: vec![user_text("hi")],
         tools: Some(vec![tool]),
-    };
+    });
     let events = collect(AzureOpenAiResponses.stream(&m, &ctx, Some(options()))).await;
 
     let request = captured.recv().await.expect("request captured");

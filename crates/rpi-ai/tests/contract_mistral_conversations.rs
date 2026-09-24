@@ -240,12 +240,12 @@ fn model(id: &str, base_url: &str, extra: Value) -> Model {
     serde_json::from_value(value).expect("model")
 }
 
-fn context(messages: Vec<Message>) -> Context {
-    Context {
+fn context(messages: Vec<Message>) -> rpi_ai::types::TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages,
         tools: None,
-    }
+    })
 }
 
 fn user_text(text: &str) -> Message {
@@ -655,11 +655,11 @@ async fn test_mistral_tool_schema_strict_serialization() {
         "constrainedSampling": {"type": "json_schema", "strict": "require"}
     }))
     .expect("tool");
-    let ctx = Context {
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages: vec![user_text("Hi")],
         tools: Some(vec![tool]),
-    };
+    });
     let events = collect(MistralConversations.stream(&m, &ctx, Some(options()))).await;
 
     let request = captured.recv().await.expect("request captured");
@@ -705,7 +705,7 @@ async fn mistral_http_transport_serializes_sdk_style_payloads_to_the_mistral_wir
         &base_url,
         json!({"input": ["text", "image"]}),
     );
-    let ctx = Context {
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: Some("Be precise".to_owned()),
         messages: vec![serde_json::from_value(json!({
             "role": "user",
@@ -722,7 +722,7 @@ async fn mistral_http_transport_serializes_sdk_style_payloads_to_the_mistral_wir
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
         }))
         .expect("tool")]),
-    };
+    });
 
     let captured_payload = Arc::new(Mutex::new(None::<Value>));
     let captured_response = Arc::new(Mutex::new(None::<(u16, _)>));

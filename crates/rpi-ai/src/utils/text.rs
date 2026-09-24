@@ -7,7 +7,10 @@
 //! `[ToolResultContent]`), so there is one function per content kind. The
 //! filter-join semantics are identical.
 
-use crate::types::{AssistantContent, ToolResultContent, UserContent, UserContentBlock};
+use crate::types::{
+    AssistantContent, SystemContent, SystemMessage, ToolResultContent, UserContent,
+    UserContentBlock,
+};
 
 /// `contentText` for user/custom message content (`string | (TextContent | ImageContent)[]`).
 pub fn content_text_user(content: &UserContent, separator: &str) -> String {
@@ -46,6 +49,57 @@ pub fn content_text_tool_result(content: &[ToolResultContent], separator: &str) 
         })
         .collect::<Vec<_>>()
         .join(separator)
+}
+
+/// `contentText` for system message content (`string | TextContent[]`,
+/// #9548).
+pub fn content_text_system(content: &SystemContent, separator: &str) -> String {
+    match content {
+        SystemContent::Text(text) => text.clone(),
+        SystemContent::Blocks(blocks) => blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join(separator),
+    }
+}
+
+/// `getSystemMessageText` (utils/text.ts:14-21 @ #9548): render a system
+/// message as a complete prompt — its content followed by its sections.
+pub fn get_system_message_text(message: &SystemMessage) -> String {
+    let mut parts = vec![content_text_system(&message.content, "\n")];
+    for (_name, value) in message.iter_sections() {
+        if let Some(text) = value {
+            parts.push(text.to_owned());
+        }
+    }
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// `renderSystemMessageUpdate` (utils/text.ts:28-40 @ #9548): render a later
+/// system message for APIs that accept system messages mid-conversation.
+/// Section changes are framed by name so the model can relate them to the
+/// leading prompt. This framing is request-time only and may change between
+/// versions.
+pub fn render_system_message_update(message: &SystemMessage) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let text = content_text_system(&message.content, "\n");
+    if !text.is_empty() {
+        parts.push(text);
+    }
+    for (name, value) in message.iter_sections() {
+        parts.push(match value {
+            None => format!("Removed system prompt section \"{name}\"."),
+            Some(value) => {
+                format!("Updated system prompt section \"{name}\":\n\n{value}")
+            }
+        });
+    }
+    parts.join("\n\n")
 }
 
 /// `stripBom` (utils/text.ts:7-9 @ 1355cd36e): strip a leading UTF-8 BOM

@@ -72,6 +72,7 @@ fn usage(value: &Value) -> Usage {
 
 fn role_name(message: &AgentMessage) -> &'static str {
     match message {
+        AgentMessage::System(_) => "system",
         AgentMessage::User(_) => "user",
         AgentMessage::Assistant(_) => "assistant",
         AgentMessage::ToolResult(_) => "toolResult",
@@ -441,14 +442,15 @@ fn capture_usage() -> Usage {
 }
 
 struct Capture {
-    calls: Arc<Mutex<Vec<(Context, StreamOptions)>>>,
+    calls: Arc<Mutex<Vec<(rpi_ai::types::TranscriptContext, StreamOptions)>>>,
     stream_fn: rpi_agent::StreamFn,
 }
 
 /// `captureStreamFn(texts)` of the generator: each call captures the
 /// context/options and completes with the next scripted text.
 fn capture_stream_fn(texts: &[&str]) -> Capture {
-    let calls: Arc<Mutex<Vec<(Context, StreamOptions)>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls: Arc<Mutex<Vec<(rpi_ai::types::TranscriptContext, StreamOptions)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let texts: Arc<Vec<String>> = Arc::new(texts.iter().map(|s| (*s).to_owned()).collect());
     let index = Arc::new(Mutex::new(0usize));
     let stream_fn: rpi_agent::StreamFn = {
@@ -456,7 +458,9 @@ fn capture_stream_fn(texts: &[&str]) -> Capture {
         let texts = texts.clone();
         let index = index.clone();
         Arc::new(
-            move |model: Model, context: Context, options: StreamOptions| {
+            move |model: Model,
+                  context: rpi_ai::types::TranscriptContext,
+                  options: StreamOptions| {
                 let i = {
                     let mut index = index.lock().expect("index");
                     let i = (*index).min(texts.len() - 1);
@@ -501,8 +505,14 @@ fn capture_stream_fn(texts: &[&str]) -> Capture {
 fn captured_prompt(capture: &Capture, index: usize) -> String {
     let calls = capture.calls.lock().expect("calls");
     let (context, _) = &calls[index];
-    let Some(rpi_ai::types::Message::User(user)) = context.messages.first() else {
-        panic!("summarization request starts with a user message");
+    // #9548 (compaction.test.ts:516-520): the transcript leads with the
+    // summarization system prompt; the request is the first user message.
+    let Some(rpi_ai::types::Message::User(user)) = context
+        .messages
+        .iter()
+        .find(|message| matches!(message, rpi_ai::types::Message::User(_)))
+    else {
+        panic!("summarization request contains a user message");
     };
     let rpi_ai::types::UserContent::Blocks(blocks) = &user.content else {
         panic!("blocks content");
@@ -625,16 +635,19 @@ async fn prompt_history_update_byte_exact() {
 /// error text — the failure matrix driver.
 struct FailureCapture {
     #[allow(dead_code)]
-    calls: Arc<Mutex<Vec<(Context, StreamOptions)>>>,
+    calls: Arc<Mutex<Vec<(rpi_ai::types::TranscriptContext, StreamOptions)>>>,
     stream_fn: rpi_agent::StreamFn,
 }
 
 fn failure_capture_stream_fn(message: AssistantMessage) -> FailureCapture {
-    let calls: Arc<Mutex<Vec<(Context, StreamOptions)>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls: Arc<Mutex<Vec<(rpi_ai::types::TranscriptContext, StreamOptions)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let stream_fn: rpi_agent::StreamFn = {
         let calls = calls.clone();
         Arc::new(
-            move |model: Model, context: Context, options: StreamOptions| {
+            move |model: Model,
+                  context: rpi_ai::types::TranscriptContext,
+                  options: StreamOptions| {
                 calls.lock().expect("calls").push((context, options));
                 let mut message = message.clone();
                 message.api = model.api.clone();
@@ -761,11 +774,14 @@ async fn summarization_length_stop_rejects_with_byte_exact_message() {
 /// is rejected (summaries must not call tools).
 #[tokio::test]
 async fn summarization_tool_call_response_is_rejected() {
-    let calls: Arc<Mutex<Vec<(Context, StreamOptions)>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls: Arc<Mutex<Vec<(rpi_ai::types::TranscriptContext, StreamOptions)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let stream_fn: rpi_agent::StreamFn = {
         let calls = calls.clone();
         Arc::new(
-            move |model: Model, context: Context, options: StreamOptions| {
+            move |model: Model,
+                  context: rpi_ai::types::TranscriptContext,
+                  options: StreamOptions| {
                 calls.lock().expect("calls").push((context, options));
                 let message = AssistantMessage {
                     role: rpi_ai::types::AssistantRole::Assistant,
@@ -842,7 +858,15 @@ async fn summarization_request_shape_tools_none_no_tool_choice_signal_threaded()
     .expect("summary");
 
     let (context, options) = capture.calls.lock().expect("calls")[0].clone();
-    assert!(context.tools.is_none(), "summarization carries no tools");
+    // #9548: summarization requests carry only their system message — no
+    // tool declarations in the transcript.
+    assert!(
+        !context.messages.iter().any(|message| matches!(
+            message,
+            rpi_ai::types::Message::System(system) if system.tools_added.is_some()
+        )),
+        "summarization carries no tools"
+    );
     assert!(
         options.request.signal.is_some(),
         "abort signal threads into the summarization request"

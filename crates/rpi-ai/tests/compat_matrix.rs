@@ -54,7 +54,9 @@ fn test_detect_compat_standard_openai_baseline() {
     assert!(!compat.supports_open_ai_grammar_tools);
     assert_eq!(compat.cache_control_format, None);
     assert!(!compat.send_session_affinity_headers);
-    assert_eq!(compat.deferred_tools_mode, None);
+    // #9548: Kimi face moved to supportsMidConvo* (default false).
+    assert!(!compat.supports_mid_convo_system_messages);
+    assert!(!compat.supports_mid_convo_tool_additions);
     assert_eq!(
         compat.session_affinity_format,
         SessionAffinityFormat::Openai
@@ -479,25 +481,6 @@ fn test_catalog_openrouter_cache_control_baked() {
         get_compat(plain).cache_control_format,
         Some(CacheControlFormat::Anthropic)
     );
-}
-
-#[test]
-fn test_anthropic_tool_references_default_matrix() {
-    let anthropic = |id: &str| {
-        let mut model = make_model("anthropic", "https://api.anthropic.com", id);
-        model.api = rpi_ai::types::ApiKind("anthropic-messages".to_owned());
-        get_anthropic_compat(&model).supports_tool_references
-    };
-    // First-party, post-4.5 non-Haiku models support tool_reference blocks.
-    assert!(anthropic("claude-opus-4-5"));
-    assert!(anthropic("claude-sonnet-4-6"));
-    assert!(anthropic("claude-fable-5"));
-    // Haiku and pre-4.5 models reject them; non-anthropic providers default off.
-    assert!(!anthropic("claude-haiku-4-5"));
-    assert!(!anthropic("claude-sonnet-4"));
-    assert!(!anthropic("claude-opus-4-1"));
-    let other = make_model("bedrock", "https://example.com", "claude-opus-4-5");
-    assert!(!get_anthropic_compat(&other).supports_tool_references);
 }
 
 // ---------------------------------------------------------------------------

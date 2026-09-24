@@ -1091,11 +1091,99 @@ async fn runner_before_agent_start_collects_messages_and_chains_system_prompt() 
         }))
         .await
         .unwrap();
-    assert_eq!(result["systemPrompt"], "a-prompt");
+    // #9548 (runner.ts:1213-1236): the chained `systemPrompt` lands as
+    // `forceSystemPrompt` on the combined options; the result carries no
+    // top-level `systemPrompt` anymore.
+    assert_eq!(
+        result["systemPromptOptions"]["forceSystemPrompt"],
+        "a-prompt"
+    );
+    assert_eq!(result["systemPromptOptions"]["cwd"], "/test-cwd");
+    assert!(result.get("systemPrompt").is_none());
     let messages = result["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0]["customType"], "note");
     assert_eq!(messages[1]["customType"], "warn");
+}
+
+/// rpi bridge merge semantics (review M1): a handler's returned
+/// `systemPromptOptions` merges key-level onto the current options (partial
+/// objects keep untouched fields, `null` clears a key), and the map fields
+/// merge per-key so chained handlers accumulate custom sections.
+#[tokio::test]
+async fn runner_before_agent_start_options_merge_key_level() {
+    let host = host_with(vec![
+        inline_ext("ext-a", |api| {
+            api.on(
+                ext::EVENT_BEFORE_AGENT_START,
+                json_handler(|event| {
+                    // The full base options are visible (cwd + sections.a).
+                    assert_eq!(event["systemPromptOptions"]["cwd"], "/test-cwd");
+                    assert_eq!(event["systemPromptOptions"]["sections"]["a"], "alpha");
+                    Ok(json!({
+                        "systemPromptOptions": {
+                            "customPrompt": "custom-a",
+                            "sections": {"b": "bravo"},
+                            "toolSnippets": {"read": "read v2"},
+                            "toolGuidelines": {"bash": ["new bash rule"]}
+                        }
+                    }))
+                }),
+            )
+            .unwrap();
+        }),
+        inline_ext("ext-b", |api| {
+            api.on(
+                ext::EVENT_BEFORE_AGENT_START,
+                json_handler(|event| {
+                    // Chained: ext-a's merge accumulated — base fields kept,
+                    // customPrompt replaced, sections.a kept + sections.b added.
+                    let options = &event["systemPromptOptions"];
+                    assert_eq!(options["cwd"], "/test-cwd");
+                    assert_eq!(options["customPrompt"], "custom-a");
+                    assert_eq!(options["sections"]["a"], "alpha");
+                    assert_eq!(options["sections"]["b"], "bravo");
+                    // Map fields accumulate per key: base entry kept, the
+                    // handler's entry added/replaced by name.
+                    assert_eq!(options["toolSnippets"]["bash"], "bash base");
+                    assert_eq!(options["toolSnippets"]["read"], "read v2");
+                    assert_eq!(options["toolGuidelines"]["bash"][0], "new bash rule");
+                    Ok(json!({
+                        "systemPromptOptions": {
+                            "sections": {"a": null},
+                            "appendSystemPrompt": null
+                        }
+                    }))
+                }),
+            )
+            .unwrap();
+        }),
+    ])
+    .await;
+
+    let result = host
+        .emit_before_agent_start(json!({
+            "type": ext::EVENT_BEFORE_AGENT_START,
+            "prompt": "hi",
+            "systemPrompt": "base",
+            "systemPromptOptions": {
+                "cwd": "/test-cwd",
+                "appendSystemPrompt": "extra",
+                "sections": {"a": "alpha"},
+                "toolSnippets": {"bash": "bash base", "read": "read base"},
+                "toolGuidelines": {"bash": ["old bash rule"]}
+            },
+        }))
+        .await
+        .unwrap();
+    let options = &result["systemPromptOptions"];
+    assert_eq!(options["cwd"], "/test-cwd");
+    assert_eq!(options["customPrompt"], "custom-a");
+    // Per-key map merge: sections.b accumulated, sections.a removed by null.
+    assert_eq!(options["sections"]["b"], "bravo");
+    assert!(options["sections"].get("a").is_none());
+    // Top-level null clears the key.
+    assert!(options.get("appendSystemPrompt").is_none());
 }
 
 #[tokio::test]
@@ -1463,7 +1551,13 @@ async fn runner_before_agent_start_ctx_get_system_prompt_reflects_chain() {
         seen.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
         ["base"]
     );
-    assert_eq!(result["systemPrompt"], "chained-A+B");
+    // #9548: the chain rides `forceSystemPrompt` on the (normalized, never
+    // null) combined options — a missing `systemPromptOptions` payload field
+    // defaults to `{}` exactly like upstream's `normalizeBuildSystemPromptOptions`.
+    assert_eq!(
+        result["systemPromptOptions"]["forceSystemPrompt"],
+        "chained-A+B"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -293,7 +293,9 @@ async fn message_end_message_matches_assembled_deltas() {
                     assembled.push_str(delta_event["delta"].as_str().expect("delta string"));
                 }
             }
-            Some("message_end") => {
+            // #9548: skip the leading system declaration's message_end —
+            // its content is a plain string, not text blocks.
+            Some("message_end") if wire["message"]["role"] == serde_json::json!("assistant") => {
                 final_text = Some(
                     wire["message"]["content"][0]["text"]
                         .as_str()

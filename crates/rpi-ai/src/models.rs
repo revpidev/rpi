@@ -43,6 +43,7 @@ use crate::models_store::{
 };
 use crate::types::{
     Context, Model, ModelThinkingLevel, ProviderHeaders, SimpleStreamOptions, StreamOptions,
+    TranscriptContext,
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::merge_headers;
@@ -67,14 +68,14 @@ pub trait ProviderStreams: Send + Sync {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream;
 
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String>;
 }
@@ -160,14 +161,14 @@ pub trait Provider: Send + Sync {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream;
 
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String>;
 }
@@ -636,7 +637,7 @@ impl Provider for CreatedProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         self.dispatch(model, |streams| streams.stream(model, context, options))
@@ -645,7 +646,7 @@ impl Provider for CreatedProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         // A model whose api has no adapter entry keeps the in-stream setup
@@ -1528,7 +1529,10 @@ impl Models {
     }
 
     /// `stream` — resolves auth lazily behind the returned stream, then
-    /// delegates to the owning provider.
+    /// delegates to the owning provider. The caller's [`Context`] is
+    /// normalized into a [`TranscriptContext`] before any provider sees it
+    /// (models.ts:684, #9548): the prompt and tool declarations ride the
+    /// transcript's system messages.
     pub fn stream(
         &self,
         model: &Model,
@@ -1537,7 +1541,7 @@ impl Models {
     ) -> AssistantMessageEventStream {
         let this = self.clone();
         let model = model.clone();
-        let context = context.clone();
+        let transcript = crate::utils::transcript::normalize_context(context);
         lazy_stream(&model.clone(), async move {
             let provider = this.require_provider(&model)?;
             let (request_model, request_options) = this
@@ -1547,7 +1551,7 @@ impl Models {
                     options.as_ref().and_then(|o| o.transform_headers.as_ref()),
                 )
                 .await?;
-            Ok(provider.stream(&request_model, &context, request_options))
+            Ok(provider.stream(&request_model, &transcript, request_options))
         })
     }
 
@@ -1561,7 +1565,8 @@ impl Models {
         self.stream(model, context, options).result().await
     }
 
-    /// `streamSimple`.
+    /// `streamSimple`. Normalizes the caller's [`Context`] before dispatch
+    /// (models.ts:704, #9548).
     pub fn stream_simple(
         &self,
         model: &Model,
@@ -1570,7 +1575,7 @@ impl Models {
     ) -> AssistantMessageEventStream {
         let this = self.clone();
         let model = model.clone();
-        let context = context.clone();
+        let transcript = crate::utils::transcript::normalize_context(context);
         lazy_stream(&model.clone(), async move {
             let provider = this.require_provider(&model)?;
             let (request_model, request_options) = this
@@ -1589,7 +1594,7 @@ impl Models {
                 tool_choice: options.as_ref().and_then(|o| o.simple.tool_choice),
             });
             provider
-                .stream_simple(&request_model, &context, simple_options)
+                .stream_simple(&request_model, &transcript, simple_options)
                 .map_err(|message| {
                     // Upstream `lazyStream` catch: the adapter's synchronous
                     // auth throw surfaces as an in-stream setup error event
@@ -1788,7 +1793,7 @@ mod tests {
         fn stream(
             &self,
             model: &Model,
-            _context: &Context,
+            _context: &crate::types::TranscriptContext,
             options: Option<StreamOptions>,
         ) -> AssistantMessageEventStream {
             let stream = AssistantMessageEventStream::new();
@@ -1828,7 +1833,7 @@ mod tests {
         fn stream_simple(
             &self,
             model: &Model,
-            context: &Context,
+            context: &crate::types::TranscriptContext,
             options: Option<SimpleStreamOptions>,
         ) -> Result<AssistantMessageEventStream, String> {
             Ok(self.stream(model, context, options.map(|o| o.stream)))
@@ -2576,7 +2581,7 @@ mod tests {
         fn stream(
             &self,
             _model: &Model,
-            _context: &Context,
+            _context: &crate::types::TranscriptContext,
             _options: Option<StreamOptions>,
         ) -> AssistantMessageEventStream {
             unreachable!("not used in refresh tests")
@@ -2585,7 +2590,7 @@ mod tests {
         fn stream_simple(
             &self,
             _model: &Model,
-            _context: &Context,
+            _context: &crate::types::TranscriptContext,
             _options: Option<SimpleStreamOptions>,
         ) -> Result<AssistantMessageEventStream, String> {
             unreachable!("not used in refresh tests")
@@ -2807,7 +2812,7 @@ mod tests {
         fn stream(
             &self,
             model: &Model,
-            context: &Context,
+            context: &crate::types::TranscriptContext,
             options: Option<StreamOptions>,
         ) -> AssistantMessageEventStream {
             self.inner.stream(model, context, options)
@@ -2816,7 +2821,7 @@ mod tests {
         fn stream_simple(
             &self,
             model: &Model,
-            context: &Context,
+            context: &crate::types::TranscriptContext,
             options: Option<SimpleStreamOptions>,
         ) -> Result<AssistantMessageEventStream, String> {
             self.inner.stream_simple(model, context, options)
@@ -2916,7 +2921,7 @@ mod tests {
         fn stream(
             &self,
             _: &Model,
-            _: &Context,
+            _: &crate::types::TranscriptContext,
             _: Option<StreamOptions>,
         ) -> AssistantMessageEventStream {
             unreachable!("not used in refresh tests")
@@ -2924,7 +2929,7 @@ mod tests {
         fn stream_simple(
             &self,
             _: &Model,
-            _: &Context,
+            _: &crate::types::TranscriptContext,
             _: Option<SimpleStreamOptions>,
         ) -> Result<AssistantMessageEventStream, String> {
             unreachable!("not used in refresh tests")
@@ -2997,7 +3002,7 @@ mod tests {
         fn stream(
             &self,
             model: &Model,
-            _: &Context,
+            _: &crate::types::TranscriptContext,
             options: Option<StreamOptions>,
         ) -> AssistantMessageEventStream {
             self.calls
@@ -3009,7 +3014,7 @@ mod tests {
         fn stream_simple(
             &self,
             model: &Model,
-            ctx: &Context,
+            ctx: &crate::types::TranscriptContext,
             options: Option<SimpleStreamOptions>,
         ) -> Result<AssistantMessageEventStream, String> {
             Ok(self.stream(model, ctx, options.map(|o| o.stream)))
@@ -5014,7 +5019,7 @@ mod tests {
         fn stream(
             &self,
             model: &Model,
-            _context: &Context,
+            _context: &crate::types::TranscriptContext,
             options: Option<StreamOptions>,
         ) -> AssistantMessageEventStream {
             *self.captured_base_url.lock().unwrap() = Some(model.base_url.clone());
@@ -5049,7 +5054,7 @@ mod tests {
         fn stream_simple(
             &self,
             model: &Model,
-            context: &Context,
+            context: &crate::types::TranscriptContext,
             _options: Option<SimpleStreamOptions>,
         ) -> Result<AssistantMessageEventStream, String> {
             Ok(self.stream(model, context, None))

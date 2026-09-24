@@ -30,8 +30,8 @@ use rpi_ai::auth::{
 use rpi_ai::models::{now_millis, Provider, ProviderStreams, RefreshModelsContext};
 use rpi_ai::models_store::ModelsStoreEntry;
 use rpi_ai::types::{
-    ApiKind, Context, InputModality, MaxTokensField, Model, ModelCompat, ProviderEnv,
-    SimpleStreamOptions, StreamOptions,
+    ApiKind, InputModality, MaxTokensField, Model, ModelCompat, ProviderEnv, SimpleStreamOptions,
+    StreamOptions, TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use tokio_util::sync::CancellationToken;
@@ -335,7 +335,7 @@ impl Provider for LlamaProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         self.api.stream(model, context, options)
@@ -344,7 +344,7 @@ impl Provider for LlamaProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         self.api.stream_simple(model, context, options)

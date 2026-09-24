@@ -218,12 +218,12 @@ fn model(base_url: &str) -> Model {
     model_with_id("test-model", base_url, json!({}))
 }
 
-fn context(messages: Vec<Message>) -> Context {
-    Context {
+fn context(messages: Vec<Message>) -> rpi_ai::types::TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages,
         tools: None,
-    }
+    })
 }
 
 fn user_text(text: &str) -> Message {
@@ -388,8 +388,11 @@ async fn test_google_generative_ai_contract() {
 async fn test_google_generative_ai_system_prompt_and_generation_config() {
     let (base_url, mut captured) = serve(vec![(200, GOOGLE_TEXT_SSE)]).await;
     let m = model(&base_url);
-    let mut ctx = context(vec![user_text("hi")]);
-    ctx.system_prompt = Some("Be brief.".to_owned());
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: Some("Be brief.".to_owned()),
+        messages: vec![user_text("hi")],
+        tools: None,
+    });
     let mut opts = options();
     opts.temperature = Some(0.5);
     opts.max_tokens = Some(256);
@@ -455,12 +458,15 @@ async fn test_google_thinking_stream_retains_thought_signature() {
 async fn test_google_tool_call_stream() {
     let (base_url, mut captured) = serve(vec![(200, GOOGLE_TOOL_CALL_SSE)]).await;
     let m = model(&base_url);
-    let mut ctx = context(vec![user_text("hi")]);
-    ctx.tools = Some(vec![make_tool(json!({
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
-    }))]);
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
+        messages: vec![user_text("hi")],
+        tools: Some(vec![make_tool(json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }))]),
+    });
     let events = collect(GoogleGenerativeAi.stream(&m, &ctx, Some(options()))).await;
 
     let request = captured.recv().await.expect("request captured");
@@ -524,12 +530,15 @@ async fn test_google_tool_call_with_length_finish_keeps_length() {
     );
     let (base_url, _captured) = serve(vec![(200, LENGTH_TOOL_CALL_SSE)]).await;
     let m = model(&base_url);
-    let mut ctx = context(vec![user_text("hi")]);
-    ctx.tools = Some(vec![make_tool(json!({
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
-    }))]);
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
+        messages: vec![user_text("hi")],
+        tools: Some(vec![make_tool(json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }))]),
+    });
     let events = collect(GoogleGenerativeAi.stream(&m, &ctx, Some(options()))).await;
 
     let Some(StreamEvent::Done { reason, message }) = events.last() else {
@@ -550,8 +559,11 @@ async fn test_google_tool_call_with_length_finish_keeps_length() {
 async fn test_google_tool_choice_any_sets_validated_mode_off() {
     let (base_url, mut captured) = serve(vec![(200, GOOGLE_TOOL_CALL_SSE)]).await;
     let m = model(&base_url);
-    let mut ctx = context(vec![user_text("hi")]);
-    ctx.tools = Some(vec![make_tool(json!({"type": "object", "properties": {}}))]);
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
+        messages: vec![user_text("hi")],
+        tools: Some(vec![make_tool(json!({"type": "object", "properties": {}}))]),
+    });
     let events = collect(rpi_ai::api::google_generative_ai::stream(
         &m,
         &ctx,
@@ -1103,7 +1115,10 @@ fn gemini3_model(id: &str) -> Model {
     model_with_id(id, "https://example.com", json!({}))
 }
 
-fn tool_call_context(model: &Model, thought_signature: Option<&str>) -> Context {
+fn tool_call_context(
+    model: &Model,
+    thought_signature: Option<&str>,
+) -> rpi_ai::types::TranscriptContext {
     let mut call1 = json!({
         "type": "toolCall", "id": "call_1", "name": "bash",
         "arguments": {"command": "echo hi"},
@@ -1276,7 +1291,7 @@ fn test_convert_messages_drops_signature_for_other_model() {
 
 const VALID_SIG: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
 
-fn signed_empty_context(model: &Model, content: Value) -> Context {
+fn signed_empty_context(model: &Model, content: Value) -> rpi_ai::types::TranscriptContext {
     let assistant: Message = serde_json::from_value(json!({
         "role": "assistant",
         "content": content,
@@ -1396,7 +1411,7 @@ fn test_convert_messages_drops_signed_empty_blocks_for_other_model() {
 // Ported intent of upstream test: google-shared-image-tool-result-routing.test.ts
 // ---------------------------------------------------------------------------
 
-fn image_routing_context(model: &Model) -> Context {
+fn image_routing_context(model: &Model) -> rpi_ai::types::TranscriptContext {
     let assistant: Message = serde_json::from_value(json!({
         "role": "assistant",
         "content": [

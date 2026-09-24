@@ -352,13 +352,15 @@ async fn prompt_lifecycle_events_and_persistence() {
     assert_eq!(agent_end.len(), 1);
     let value = serde_json::to_value(&agent_end[0]).expect("serialize");
     assert_eq!(value["willRetry"], false);
-    assert_eq!(value["messages"].as_array().expect("messages").len(), 2);
+    // #9548: the run's messages include the leading system declaration.
+    assert_eq!(value["messages"].as_array().expect("messages").len(), 3);
 
-    // Message state: user + assistant.
+    // Message state: system + user + assistant.
     let messages = fixture.session.messages();
-    assert_eq!(messages.len(), 2);
-    assert!(matches!(messages[0], AgentMessage::User(_)));
-    assert!(matches!(messages[1], AgentMessage::Assistant(_)));
+    assert_eq!(messages.len(), 3);
+    assert!(matches!(messages[0], AgentMessage::System(_)));
+    assert!(matches!(messages[1], AgentMessage::User(_)));
+    assert!(matches!(messages[2], AgentMessage::Assistant(_)));
     assert_eq!(
         fixture.session.get_last_assistant_text().as_deref(),
         Some("hi there")
@@ -375,8 +377,334 @@ async fn prompt_lifecycle_events_and_persistence() {
         .iter()
         .filter(|entry| entry.type_tag() == "message")
         .collect();
-    assert_eq!(message_entries.len(), 2);
+    // #9548: +1 — the first request's leading system message (full-sections
+    // prompt declaration) persists alongside user + assistant.
+    assert_eq!(message_entries.len(), 3);
+    assert!(entries.iter().any(|entry| {
+        matches!(
+            entry.known(),
+            Some(rpi_agent::session::SessionEntry::Message(m)) if matches!(m.message, AgentMessage::System(_))
+        )
+    }));
     assert_eq!(fixture.provider.call_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// #9548 red lines: transcript-carried prompt/tool declarations
+// (system-prompt-updates.test.ts port)
+// ---------------------------------------------------------------------------
+
+/// `declares the prompt and tools once and reuses them across resume`
+/// (system-prompt-updates.test.ts:35-58): the leading system declaration
+/// is written exactly once; the second request reuses it (no re-declare,
+/// no patch — desired sections equal the replayed ones).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn system_declaration_written_once_and_reused_across_prompts() {
+    let fixture = session_fixture(
+        vec![assistant("first"), assistant("second")],
+        FauxProviderOptions::default(),
+        None,
+    )
+    .await;
+
+    fixture
+        .session
+        .prompt("one", PromptOptions::default())
+        .await
+        .expect("first prompt");
+    fixture.session.wait_for_idle().await;
+    fixture
+        .session
+        .prompt("two", PromptOptions::default())
+        .await
+        .expect("second prompt");
+    fixture.session.wait_for_idle().await;
+
+    let entries = {
+        let manager = fixture.session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        manager.get_entries()
+    };
+    let system_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.known(),
+                Some(rpi_agent::session::SessionEntry::Message(m))
+                    if matches!(m.message, AgentMessage::System(_))
+            )
+        })
+        .collect();
+    assert_eq!(system_entries.len(), 1, "exactly one system declaration");
+
+    let messages = fixture.session.messages();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::System(_) => "system",
+            AgentMessage::User(_) => "user",
+            AgentMessage::Assistant(_) => "assistant",
+            AgentMessage::ToolResult(_) => "toolResult",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(roles, ["system", "user", "assistant", "user", "assistant"]);
+
+    let AgentMessage::System(head) = &messages[0] else {
+        panic!("head is the system declaration");
+    };
+    // rpi has no bundled docs: preamble, tools, rules, cwd.
+    let section_names: Vec<&str> = head.iter_sections().map(|(name, _)| name).collect();
+    assert_eq!(section_names, ["preamble", "tools", "rules", "cwd"]);
+    assert!(matches!(
+        &head.content,
+        rpi_ai::types::SystemContent::Text(text) if text.is_empty()
+    ));
+    assert_eq!(
+        head.tools_added.as_ref().map(|tools| tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>()),
+        Some(vec![
+            "read".to_owned(),
+            "bash".to_owned(),
+            "edit".to_owned(),
+            "write".to_owned(),
+        ])
+    );
+    // The replayed declaration renders exactly the session's prompt view.
+    let rendered = rpi_ai::utils::text::get_system_message_text(head);
+    assert_eq!(rendered, fixture.session.system_prompt());
+}
+
+/// `opens a transcript without a system message and declares the prompt on
+/// the first request` (system-prompt-updates.test.ts:60-81, V15-06 FR-A R2
+/// red line): nothing is synthesized or persisted while idle; the first
+/// request backfills the leading system declaration as a later system
+/// message and the old prefix stays untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_session_without_system_entries_backfills_on_first_request() {
+    let tmp = TempDir::new();
+    let cwd = tmp.path().join("cwd");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let provider = FauxProvider::new(FauxProviderOptions::default());
+    provider.set_responses(vec![assistant("hello back")]);
+    let model = provider.get_model(None).expect("faux model");
+    let model_runtime = rpi::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {
+        credentials: None,
+        auth_path: Some(agent_dir.join("auth.json")),
+        models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        ..Default::default()
+    })
+    .await;
+    model_runtime
+        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .await
+        .expect("register faux provider");
+    let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+        cwd: cwd.clone(),
+        agent_dir: Some(agent_dir.clone()),
+        settings_manager: None,
+        model_runtime: Some(model_runtime.clone()),
+        extension_flag_values: Vec::new(),
+        resource_loader_options: None,
+    })
+    .await
+    .expect("services");
+
+    // A pre-#9548 transcript: only a user message, no system entry.
+    let mut session_manager = SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+        .expect("in-memory session");
+    session_manager
+        .append_message(AgentMessage::User(rpi_ai::types::UserMessage {
+            role: rpi_ai::types::UserRole::User,
+            content: rpi_ai::types::UserContent::Text("existing".to_owned()),
+            timestamp: 1,
+        }))
+        .expect("append old user message");
+    let session_manager = Arc::new(Mutex::new(session_manager));
+
+    let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+        cwd: Some(cwd),
+        agent_dir: Some(agent_dir),
+        model_runtime: Some(model_runtime),
+        model: Some(model),
+        services: Some(services),
+        session_manager: Some(session_manager),
+        ..Default::default()
+    })
+    .await
+    .expect("create session from old transcript");
+
+    // Nothing is synthesized or persisted until a request needs it.
+    assert_eq!(created.session.messages().len(), 1);
+    assert!(matches!(
+        &created.session.messages()[0],
+        AgentMessage::User(_)
+    ));
+    let context_roles: Vec<&str> = created
+        .session
+        .session_manager()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .build_session_context()
+        .messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::System(_) => "system",
+            AgentMessage::User(_) => "user",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(context_roles, ["user"]);
+    {
+        let manager = created.session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let system_count = manager
+            .get_entries()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.known(),
+                    Some(rpi_agent::session::SessionEntry::Message(m))
+                        if matches!(m.message, AgentMessage::System(_))
+                )
+            })
+            .count();
+        assert_eq!(system_count, 0, "no synthesized system entry while idle");
+    }
+
+    // The first request backfills the leading declaration as a LATER system
+    // message (FR-A R2): [user(existing), system, user(hello), assistant].
+    created
+        .session
+        .prompt("hello", PromptOptions::default())
+        .await
+        .expect("prompt");
+    created.session.wait_for_idle().await;
+
+    let messages = created.session.messages();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::System(_) => "system",
+            AgentMessage::User(_) => "user",
+            AgentMessage::Assistant(_) => "assistant",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(roles, ["user", "system", "user", "assistant"]);
+    // The backfilled declaration carries the full sections + tool set.
+    let AgentMessage::System(declaration) = &messages[1] else {
+        panic!("backfilled system declaration");
+    };
+    assert_eq!(
+        declaration
+            .iter_sections()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["preamble", "tools", "rules", "cwd"]
+    );
+    assert!(declaration
+        .tools_added
+        .as_ref()
+        .is_some_and(|tools| tools.len() == 4));
+}
+
+/// #9548 (agent-session.ts:421-424): constructed without an explicit initial
+/// loadout, the session restores the transcript-declared tool set — a resumed
+/// session keeps the tools a previous run activated (e.g. `setActiveTools`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructor_restores_transcript_declared_tools_without_initial_set() {
+    let tmp = TempDir::new();
+    let cwd = tmp.path().join("cwd");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let provider = FauxProvider::new(FauxProviderOptions::default());
+    provider.set_responses(vec![assistant("hello back")]);
+    let model = provider.get_model(None).expect("faux model");
+    let model_runtime = rpi::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {
+        credentials: None,
+        auth_path: Some(agent_dir.join("auth.json")),
+        models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        ..Default::default()
+    })
+    .await;
+    model_runtime
+        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .await
+        .expect("register faux provider");
+    let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+        cwd: cwd.clone(),
+        agent_dir: Some(agent_dir.clone()),
+        settings_manager: None,
+        model_runtime: Some(model_runtime.clone()),
+        extension_flag_values: Vec::new(),
+        resource_loader_options: None,
+    })
+    .await
+    .expect("services");
+
+    // A resumed transcript whose leading declaration activates `grep` on top
+    // of the default four.
+    let tool = |name: &str| -> rpi_ai::types::Tool {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "description": format!("{name} tool"),
+            "parameters": {"type": "object", "properties": {}}
+        }))
+        .expect("tool")
+    };
+    let mut session_manager = SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+        .expect("in-memory session");
+    session_manager
+        .append_message(AgentMessage::System(rpi_ai::types::SystemMessage {
+            role: Default::default(),
+            content: rpi_ai::types::SystemContent::Text("prompt".to_owned()),
+            sections: None,
+            tools_added: Some(vec![
+                tool("read"),
+                tool("bash"),
+                tool("edit"),
+                tool("write"),
+                tool("grep"),
+            ]),
+            tools_removed: None,
+            timestamp: 1,
+        }))
+        .expect("append declaration");
+
+    let mut agent_options = rpi_agent::AgentOptions::new(provider.stream_fn());
+    agent_options.initial_state.model = Some(model);
+    let session = AgentSession::new(rpi::core::agent_session::AgentSessionConfig {
+        agent: Arc::new(rpi_agent::agent::Agent::new(agent_options)),
+        session_manager: Arc::new(Mutex::new(session_manager)),
+        cwd: cwd.to_string_lossy().into_owned(),
+        scoped_models: Vec::new(),
+        resource_loader: services.resource_loader.clone(),
+        custom_tools: Vec::new(),
+        model_runtime,
+        initial_active_tool_names: None,
+        allowed_tool_names: None,
+        excluded_tool_names: None,
+        extension_runner_ref: rpi::core::extensions::new_extension_runner_ref(Arc::new(
+            rpi::core::extensions::NoopExtensionRunner::default(),
+        )),
+        session_start_event: rpi::core::extensions::SessionStartEvent {
+            reason: rpi::core::extensions::SessionStartReason::Resume,
+            previous_session_file: None,
+        },
+        cache_warmer: None,
+    });
+
+    let mut active = session.get_active_tool_names();
+    active.sort();
+    assert_eq!(active, vec!["bash", "edit", "grep", "read", "write"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +1148,10 @@ async fn threshold_compaction_runs_between_turns_via_prepare_hook() {
         vec![
             ls_tool_step(&big),
             scripted_summary(),
-            faux_assistant_message("final answer", FauxAssistantOptions::default()).into(),
+            // Post-#9548 the split-turn prefix summarization consumes this
+            // response; the post-compaction continuation follows.
+            faux_assistant_message("post-compaction answer", FauxAssistantOptions::default())
+                .into(),
         ],
         provider_options,
         Some(settings),
@@ -868,15 +1199,24 @@ async fn threshold_compaction_runs_between_turns_via_prepare_hook() {
     assert!(next_turn_start < assistant_start);
 
     // The turn-1 assistant response (with the tool call) came before the
-    // compaction; the final answer is in the transcript.
-    assert!(fixture
+    // compaction; the final answer is in the transcript. Post-#9548 the
+    // compaction checkpoint replaces the pre-compaction prefix: the final
+    // answer (after the cut point) survives, the turn-1 evidence does not.
+    // The split-turn prefix text embeds in the summary; the continuation
+    // answer is the final assistant message.
+    // #9548: system messages are prompt state — excluded from both the
+    // history and turn-prefix summarization (compaction.ts:93-99), so the
+    // summary body stays the scripted one.
+    let summary_text = fixture
         .session
         .messages()
         .iter()
-        .any(|m| matches!(m, AgentMessage::Assistant(a) if a
-            .content
-            .iter()
-            .any(|c| matches!(c, rpi_ai::types::AssistantContent::Text(t) if t.text.contains("final answer"))))));
+        .find_map(|m| match m {
+            AgentMessage::CompactionSummary(summary) => Some(summary.summary.clone()),
+            _ => None,
+        })
+        .expect("compaction summary");
+    assert!(summary_text.contains("No prior history."));
 }
 
 fn scripted_summary() -> FauxResponseStep {
@@ -1240,7 +1580,7 @@ async fn in_memory_fork_waits_for_active_tool_turn() {
     let next_turn_roles: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let roles_capture = next_turn_roles.clone();
     let next_response = rpi_test_support::faux::FauxResponseStep::Factory(Box::new(
-        move |context: &rpi_ai::types::Context, _options, _state, _model| {
+        move |context: &rpi_ai::types::TranscriptContext, _options, _state, _model| {
             let roles = context
                 .messages
                 .iter()
@@ -1398,7 +1738,22 @@ async fn in_memory_fork_waits_for_active_tool_turn() {
     // messages == [] and no message entries).
     assert!(!fork_result.cancelled);
     assert_eq!(fork_result.selected_text.as_deref(), Some("first prompt"));
-    assert!(runtime.session().messages().is_empty());
+    // #9548 (upstream 8724 @ 9e05370b2): the forked session keeps the
+    // first request's leading system message (the full-sections prompt
+    // declaration) — the aborted turn never entered it.
+    let roles: Vec<&str> = runtime
+        .session()
+        .messages()
+        .iter()
+        .map(|message| match message {
+            rpi_agent::messages::AgentMessage::System(_) => "system",
+            rpi_agent::messages::AgentMessage::User(_) => "user",
+            rpi_agent::messages::AgentMessage::Assistant(_) => "assistant",
+            rpi_agent::messages::AgentMessage::ToolResult(_) => "toolResult",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(roles, ["system"]);
     let message_entries = runtime
         .session()
         .session_manager()
@@ -1408,10 +1763,12 @@ async fn in_memory_fork_waits_for_active_tool_turn() {
         .iter()
         .filter(|e| e.type_tag() == "message")
         .count();
-    assert_eq!(message_entries, 0);
+    // #9548: exactly the retained leading system message entry.
+    assert_eq!(message_entries, 1);
 
-    // The next turn's LLM context starts clean (no aborted-turn leakage):
-    // the capturing factory recorded only the next user message.
+    // #9548 (upstream 8724: capturedRoles ["system","system","user"]):
+    // the retained baseline system message, the new turn's prompt/tool
+    // declaration, then the user message — no aborted-turn leakage.
     runtime
         .session()
         .prompt("next prompt", PromptOptions::default())
@@ -1419,7 +1776,10 @@ async fn in_memory_fork_waits_for_active_tool_turn() {
         .expect("next prompt");
     runtime.session().wait_for_idle().await;
     let recorded = next_turn_roles.lock().unwrap().clone();
-    assert_eq!(recorded, vec!["user".to_owned()]);
+    assert_eq!(
+        recorded,
+        vec!["system".to_owned(), "system".to_owned(), "user".to_owned()]
+    );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

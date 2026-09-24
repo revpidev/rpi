@@ -76,9 +76,9 @@ use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::ProviderStreams;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantRole, CacheRetention,
-    Context, DoneReason, ErrorReason, Message, Model, ProviderEnv, ProviderHeaders,
-    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets,
-    ThinkingLevel, Tool, ToolResultContent, Usage, UserContent, UserContentBlock,
+    DoneReason, ErrorReason, Message, Model, ProviderEnv, ProviderHeaders, ProviderResponse,
+    SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets, ThinkingLevel,
+    Tool, ToolResultContent, TranscriptContext, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::error_body::NormalizedProviderError;
@@ -616,9 +616,11 @@ pub fn build_system_prompt(
 }
 
 /// `convertMessages`: user / assistant / toolResult conversion with tool
-/// result grouping and the `<empty>` placeholder rules.
+/// result grouping and the `<empty>` placeholder rules. The leading system
+/// message is excluded — Bedrock has no mid-conversation system messages
+/// and the prompt rides the top-level `system` field (#9548).
 pub fn convert_messages(
-    context: &Context,
+    context: &TranscriptContext,
     model: &Model,
     cache_retention: CacheRetention,
     env: Option<&ProviderEnv>,
@@ -626,11 +628,15 @@ pub fn convert_messages(
     let mut result: Vec<Value> = Vec::new();
     let mut normalize =
         |id: &str, _model: &Model, _msg: &AssistantMessage| normalize_tool_call_id(id);
-    let transformed_messages = transform_messages(&context.messages, model, Some(&mut normalize));
+    let conversation = crate::utils::transcript::without_initial_system_message(&context.messages);
+    let transformed_messages = transform_messages(conversation, model, Some(&mut normalize));
 
     let mut i = 0;
     while i < transformed_messages.len() {
         match &transformed_messages[i] {
+            // Unreachable: the leading system message was excluded and later
+            // ones collapsed before conversion (#9548).
+            Message::System(_) => {}
             Message::User(user) => {
                 let mut content: Vec<Value> = Vec::new();
                 match &user.content {
@@ -919,11 +925,17 @@ pub fn build_additional_model_request_fields(
 /// path label) as handed to `on_payload`.
 fn build_command_input(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &BedrockOptions,
     cache_retention: CacheRetention,
 ) -> Result<Value, String> {
     let env = options.stream.env.as_ref();
+    // Bedrock has no mid-conversation system messages; fold them into the
+    // leading prompt (#9548, bedrock-converse-stream.ts:132).
+    let context = &crate::utils::transcript::collapse_system_messages(context);
+    let initial_system_prompt =
+        crate::utils::transcript::get_initial_system_message(&context.messages)
+            .map(crate::utils::text::get_system_message_text);
     let inference_max_tokens = options
         .stream
         .max_tokens
@@ -940,7 +952,7 @@ fn build_command_input(
         Value::Array(convert_messages(context, model, cache_retention, env)?),
     );
     if let Some(system) = build_system_prompt(
-        context.system_prompt.as_deref(),
+        initial_system_prompt.as_deref(),
         model,
         cache_retention,
         env,
@@ -965,8 +977,9 @@ fn build_command_input(
         .as_ref()
         .and_then(|compat| compat.supports_strict_mode)
         .unwrap_or(false);
+    let current_tools = crate::utils::transcript::get_current_tools(&context.messages);
     if let Some(tool_config) = convert_tool_config(
-        context.tools.as_deref(),
+        Some(current_tools.as_slice()),
         options.tool_choice.as_ref(),
         supports_strict_mode,
     )? {
@@ -1704,7 +1717,7 @@ fn host_header(endpoint: &str) -> Result<String, String> {
 /// `failure`.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &BedrockOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
@@ -2029,7 +2042,7 @@ fn finalize(options: &BedrockOptions, output: &AssistantMessage) -> Result<DoneR
 /// `stream` (bedrock-converse-stream).
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: BedrockOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
@@ -2092,7 +2105,7 @@ pub fn stream(
 /// thinking budget; other models just pass the level through.
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     let base = build_base_options(model, context, options.as_ref(), None);
@@ -2192,7 +2205,7 @@ impl ProviderStreams for BedrockConverseStream {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -2208,7 +2221,7 @@ impl ProviderStreams for BedrockConverseStream {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)

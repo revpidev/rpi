@@ -124,6 +124,12 @@ pub struct CompactionEntry {
     /// (backward compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_hook: Option<bool>,
+    /// Complete prompt and tool state at this compaction boundary (#9548,
+    /// session-manager.ts:87-88). It becomes the leading system message of
+    /// the compacted context; system messages among the kept entries are
+    /// dropped in its favor. Absent on older session entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<rpi_ai::types::SystemMessage>,
 }
 
 /// `BranchSummaryEntry`.
@@ -556,7 +562,9 @@ pub fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<AgentMessa
         SessionEntry::Message(m) => {
             // Null/missing message content is normalized to `[]` at the
             // serde boundary (`null_default` in rpi-ai types), matching the
-            // upstream null-content guard (session-manager.ts:388-394).
+            // upstream null-content guard (session-manager.ts:388-394); a
+            // system message's null content normalizes to "" (#9548,
+            // session-manager.ts:397).
             vec![m.message.clone()]
         }
         SessionEntry::CustomMessage(c) => vec![AgentMessage::Custom(create_custom_message(
@@ -574,9 +582,16 @@ pub fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<AgentMessa
             ))]
         }
         SessionEntry::Compaction(c) => {
-            let mut messages = vec![AgentMessage::CompactionSummary(
+            // #9548 (session-manager.ts:428-431): the replayed prompt/tool
+            // checkpoint leads the compacted context; pre-compaction system
+            // messages were dropped in its favor upstream of this expansion.
+            let mut messages = Vec::new();
+            if let Some(system) = &c.system_message {
+                messages.push(AgentMessage::System(system.clone()));
+            }
+            messages.push(AgentMessage::CompactionSummary(
                 create_compaction_summary_message(&c.summary, c.tokens_before, &c.timestamp),
-            )];
+            ));
             if let Some(tail) = &c.retained_tail {
                 messages.extend(tail.iter().cloned());
             }
@@ -778,6 +793,7 @@ mod tests {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         };
         assert_eq!(
             to_json(&FileEntry::Compaction(entry.clone())),
@@ -802,6 +818,7 @@ mod tests {
             details: Some(json!({"version": 1})),
             usage: Some(Usage::default()),
             from_hook: Some(true),
+            system_message: None,
         };
         let v: Value =
             serde_json::from_str(&to_json(&FileEntry::Compaction(entry.clone()))).expect("parse");

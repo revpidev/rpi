@@ -200,12 +200,12 @@ fn user_text(text: &str) -> Message {
         .expect("user message")
 }
 
-fn context(messages: Vec<Message>) -> Context {
-    Context {
+fn context(messages: Vec<Message>) -> rpi_ai::types::TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages,
         tools: None,
-    }
+    })
 }
 
 fn scoped_env(pairs: &[(&str, &str)]) -> ProviderEnv {
@@ -260,7 +260,7 @@ fn minimal_stream_body() -> Vec<u8> {
 
 async fn drive(
     model: &Model,
-    ctx: &Context,
+    ctx: &rpi_ai::types::TranscriptContext,
     options: BedrockOptions,
     response: (u16, &'static str, Vec<u8>),
 ) -> (Vec<StreamEvent>, CapturedRequest) {
@@ -1356,7 +1356,7 @@ async fn test_custom_headers_applied_reserved_not_overridden() {
 /// stream afterwards (the upstream tests abort after capture).
 async fn capture_payload(
     model: &Model,
-    ctx: &Context,
+    ctx: &rpi_ai::types::TranscriptContext,
     mut options: BedrockOptions,
 ) -> (Value, CapturedRequest) {
     let captured = Arc::new(Mutex::new(Value::Null));
@@ -1431,7 +1431,6 @@ async fn test_convert_messages_empty_text_placeholder() {
         )],
         details: None,
         usage: None,
-        added_tool_names: None,
         is_error: false,
         timestamp: 0,
     });
@@ -1745,8 +1744,12 @@ async fn test_on_response_receives_raw_response_headers() {
 #[tokio::test]
 async fn test_convert_messages_groups_tool_results_and_cache_points() {
     let model = claude_model("http://unused");
-    let mut ctx = context(vec![user_text("hi")]);
-    ctx.system_prompt = Some("be nice".to_owned());
+    // #9548: the prompt rides the leading system message.
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: Some("be nice".to_owned()),
+        messages: vec![user_text("hi")],
+        tools: None,
+    });
     let (payload, _) = capture_payload(&model, &ctx, sigv4_options(test_env())).await;
     // Default retention (short): system prompt and last user message get
     // cache points without ttl.
@@ -1766,8 +1769,12 @@ async fn test_convert_messages_groups_tool_results_and_cache_points() {
 #[tokio::test]
 async fn test_cache_point_long_retention_ttl_1h() {
     let model = claude_model("http://unused");
-    let mut ctx = context(vec![user_text("hi")]);
-    ctx.system_prompt = Some("be nice".to_owned());
+    // #9548: the prompt rides the leading system message.
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: Some("be nice".to_owned()),
+        messages: vec![user_text("hi")],
+        tools: None,
+    });
     let mut options = sigv4_options(test_env());
     options.stream.cache_retention = Some(rpi_ai::types::CacheRetention::Long);
     let (payload, _) = capture_payload(&model, &ctx, options).await;
@@ -1801,8 +1808,11 @@ async fn test_tool_config_strict_gating() {
         "constrainedSampling": {"type": "json_schema", "strict": "require"},
     }]))
     .expect("tools");
-    let mut ctx = context(vec![user_text("use the tool")]);
-    ctx.tools = Some(tools);
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
+        messages: vec![user_text("use the tool")],
+        tools: Some(tools),
+    });
 
     let strict_model = make_model(
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -1831,8 +1841,11 @@ async fn test_tool_config_strict_gating() {
         "constrainedSampling": {"type": "json_schema", "strict": "prefer"},
     }]))
     .expect("tools");
-    let mut prefer_ctx = context(vec![user_text("use the tool")]);
-    prefer_ctx.tools = Some(prefer_tools);
+    let prefer_ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
+        messages: vec![user_text("use the tool")],
+        tools: Some(prefer_tools),
+    });
     let (payload, _) = capture_payload(&nova_model, &prefer_ctx, no_cache_options()).await;
     assert!(payload["toolConfig"]["tools"][0]["toolSpec"]
         .get("strict")

@@ -4,7 +4,7 @@
 //! option construction, reasoning clamps and thinking budget defaults.
 
 use crate::types::{
-    Context, Model, SimpleStreamOptions, StreamOptions, ThinkingBudgets, ThinkingLevel,
+    Model, SimpleStreamOptions, StreamOptions, ThinkingBudgets, ThinkingLevel, TranscriptContext,
 };
 use crate::utils::estimate::estimate_context_tokens;
 
@@ -18,7 +18,11 @@ pub const MIN_ANSWER_TOKENS: u32 = 1024;
 /// `clampMaxTokensToContext`: `contextWindow - estimate - 4096` safety margin,
 /// `available` floored at 1. No outer floor — an explicit `maxTokens` of 0
 /// stays 0 (upstream `Math.min(maxTokens, Math.max(1, available))`).
-pub fn clamp_max_tokens_to_context(model: &Model, context: &Context, max_tokens: u32) -> u32 {
+pub fn clamp_max_tokens_to_context(
+    model: &Model,
+    context: &TranscriptContext,
+    max_tokens: u32,
+) -> u32 {
     if model.context_window == 0 {
         return max_tokens.max(MIN_MAX_TOKENS);
     }
@@ -33,7 +37,7 @@ pub fn clamp_max_tokens_to_context(model: &Model, context: &Context, max_tokens:
 /// `options.api_key` when set (upstream `apiKey || options?.apiKey`).
 pub fn build_base_options(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<&SimpleStreamOptions>,
     api_key: Option<String>,
 ) -> StreamOptions {
@@ -138,8 +142,8 @@ mod tests {
         .expect("model")
     }
 
-    fn context_with_text(text: &str) -> Context {
-        Context {
+    fn context_with_text(text: &str) -> crate::types::TranscriptContext {
+        crate::utils::transcript::normalize_context(&crate::types::Context {
             system_prompt: None,
             messages: vec![crate::types::Message::User(crate::types::UserMessage {
                 role: crate::types::UserRole::User,
@@ -147,7 +151,7 @@ mod tests {
                 timestamp: 0,
             })],
             tools: None,
-        }
+        })
     }
 
     #[test]

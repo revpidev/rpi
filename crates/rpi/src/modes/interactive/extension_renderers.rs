@@ -146,7 +146,6 @@ impl ToolDefinition for HostToolRenderDefinition {
             content: serde_json::from_value(serde_json::Value::Array(content)).unwrap_or_default(),
             details: result.details.clone().unwrap_or(serde_json::Value::Null),
             usage: None,
-            added_tool_names: None,
             terminate: None,
         };
         let tree = render(

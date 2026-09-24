@@ -25,7 +25,9 @@ use rpi_ai::models::{
     merge_models, now_millis, InflightRefresh, ModelsPublication, Provider, RefreshModelsContext,
 };
 use rpi_ai::models_store::ModelsStoreEntry;
-use rpi_ai::types::{Context, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions};
+use rpi_ai::types::{
+    Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
+};
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use tokio_util::sync::CancellationToken;
 
@@ -417,7 +419,7 @@ impl Provider for RemoteCatalogProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         self.inner.stream(model, context, options)
@@ -426,7 +428,7 @@ impl Provider for RemoteCatalogProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         self.inner.stream_simple(model, context, options)

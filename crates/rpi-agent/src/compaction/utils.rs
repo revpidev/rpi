@@ -144,6 +144,9 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
 
     for msg in messages {
         match msg {
+            // System messages carry prompt/tool state, not conversation
+            // content (#9548) — not serialized.
+            Message::System(_) => {}
             Message::User(user) => {
                 let content = content_text_user(&user.content, "");
                 if !content.is_empty() {

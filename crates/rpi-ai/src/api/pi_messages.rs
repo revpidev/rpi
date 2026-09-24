@@ -47,9 +47,9 @@ use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::ProviderStreams;
 use crate::types::{
     tagged_tool_call, AssistantContent, AssistantMessage, AssistantMessageDiagnostic,
-    AssistantRole, CacheRetention, Context, DiagnosticErrorInfo, DoneReason, ErrorReason, Model,
+    AssistantRole, CacheRetention, DiagnosticErrorInfo, DoneReason, ErrorReason, Model,
     NumberOrString, ProviderEnv, ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent,
-    StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage,
+    StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Usage,
 };
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -755,7 +755,7 @@ fn create_error_message(model: &Model, failure: StreamFailure, aborted: bool) ->
 #[allow(clippy::result_large_err)]
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &PiMessagesOptions,
     events: &AssistantMessageEventStream,
 ) -> Result<(), StreamFailure> {
@@ -950,7 +950,7 @@ fn push_converted(
 /// `stream` (pi-messages).
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: PiMessagesOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
@@ -988,7 +988,7 @@ pub fn stream(
 /// `reasoning`/`tool_choice` are mapped here (use [`stream`] for `debug`).
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     let reasoning = options.as_ref().and_then(|options| options.reasoning);
@@ -1024,7 +1024,7 @@ impl ProviderStreams for PiMessages {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -1040,7 +1040,7 @@ impl ProviderStreams for PiMessages {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)

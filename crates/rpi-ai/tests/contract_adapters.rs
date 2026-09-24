@@ -159,12 +159,12 @@ fn model(api: &str, provider: &str, base_url: &str, extra: Value) -> Model {
     serde_json::from_value(value).expect("model")
 }
 
-fn context(messages: Vec<Message>) -> Context {
-    Context {
+fn context(messages: Vec<Message>) -> rpi_ai::types::TranscriptContext {
+    rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
         messages,
         tools: None,
-    }
+    })
 }
 
 fn user_text(text: &str) -> Message {

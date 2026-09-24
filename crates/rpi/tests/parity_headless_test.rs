@@ -138,6 +138,78 @@ fn strip_keys(value: &mut Value) {
     }
 }
 
+/// #9548: the leading system message declares the prompt and tool loadout.
+/// rpi and the pinned pi differ in known, documented ways inside that
+/// declaration — brand wording (rpi vs pi), the bundled-docs section (rpi
+/// has no packaged docs, so `docs` is absent), `constrainedSampling` on the
+/// default tools (upstream bakes strict-prefer; rpi declares none), and
+/// JSON key order inside tool schemas. Normalize both sides to the rpi
+/// shape so the diff asserts the structural contract (sections patched by
+/// name + full tool declarations), not the packaging.
+fn normalize_system_declaration(value: &mut Value) {
+    // Single-message payloads ({type, message}) and agent_end-style arrays
+    // ({type, messages: [...]}) both carry the declaration.
+    if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages.iter_mut() {
+            normalize_one_system_message(message);
+        }
+    }
+    let Some(message) = value.get_mut("message") else {
+        return;
+    };
+    normalize_one_system_message(message);
+}
+
+fn normalize_one_system_message(message: &mut Value) {
+    if message.get("role").and_then(Value::as_str) != Some("system") {
+        return;
+    }
+    if let Some(sections) = message.get_mut("sections").and_then(Value::as_object_mut) {
+        // rpi brand: `pi` → `rpi` in the preamble and the env-var prefix in
+        // the rules section.
+        if let Some(Value::String(preamble)) = sections.get_mut("preamble") {
+            *preamble = preamble.replace("operating inside pi,", "operating inside rpi,");
+        }
+        if let Some(Value::String(rules)) = sections.get_mut("rules") {
+            *rules = rules.replace("PI_*", "RPI_*").replace("RRPI_*", "RPI_*");
+        }
+        // rpi carries no bundled package docs — drop upstream's docs section.
+        sections.remove("docs");
+    }
+    if let Some(tools) = message.get_mut("toolsAdded").and_then(Value::as_array_mut) {
+        // Tool descriptions and parameter schemas are rpi-authored (brand
+        // wording, per-property descriptions absent) — they were never part
+        // of the session-file contract before #9548 put tool declarations
+        // into the transcript. The cross-implementation invariant is the
+        // declared tool NAME SET; rpi's own schemas are covered by rpi
+        // tests. Reduce each declaration to its name on both sides.
+        for tool in tools.iter_mut() {
+            let name = tool.get("name").cloned().unwrap_or(Value::Null);
+            *tool = serde_json::json!({ "name": name });
+        }
+    }
+    // Canonical key order for the whole declaration (upstream JSON.stringify
+    // field order differs from rpi serde field order; sorting both sides
+    // makes the diff structural).
+    fn sort_recursive(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.sort_keys();
+                for (_, val) in map.iter_mut() {
+                    sort_recursive(val);
+                }
+            }
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    sort_recursive(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    sort_recursive(message);
+}
+
 fn prepare_session_lines(text: &str) -> String {
     let mut out = String::new();
     for line in text.lines() {
@@ -149,6 +221,7 @@ fn prepare_session_lines(text: &str) -> String {
             value["cwd"] = Value::from("<cwd>");
         }
         strip_keys(&mut value);
+        normalize_system_declaration(&mut value);
         out.push_str(&serde_json::to_string(&value).expect("render"));
         out.push('\n');
     }
@@ -171,6 +244,7 @@ fn prepare_event_lines(text: &str) -> String {
             continue;
         }
         strip_keys(&mut value);
+        normalize_system_declaration(&mut value);
         prepared.push(value);
     }
     let mut out = String::new();

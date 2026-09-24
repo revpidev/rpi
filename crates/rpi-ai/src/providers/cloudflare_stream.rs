@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::models::ProviderStreams;
-use crate::types::{Context, Model, ProviderEnv, SimpleStreamOptions, StreamOptions};
+use crate::types::{Model, ProviderEnv, SimpleStreamOptions, StreamOptions, TranscriptContext};
 use crate::utils::event_stream::AssistantMessageEventStream;
 
 pub const CLOUDFLARE_ACCOUNT_ID: &str = "CLOUDFLARE_ACCOUNT_ID";
@@ -59,7 +59,7 @@ impl ProviderStreams for CloudflareStreams {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         let model = resolve_cloudflare_model(model, options.as_ref().and_then(|o| o.env.as_ref()));
@@ -69,7 +69,7 @@ impl ProviderStreams for CloudflareStreams {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         let model =

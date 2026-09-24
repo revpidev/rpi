@@ -38,8 +38,8 @@ use rpi_ai::auth::{
 };
 use rpi_ai::models::{Models, Provider};
 use rpi_ai::types::{
-    CacheRetention, Context, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions,
-    TextContent, ToolResultContent,
+    CacheRetention, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TextContent,
+    ToolResultContent,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use rpi_test_support::faux::{
@@ -167,7 +167,6 @@ impl rpi_agent::harness::AgentHarnessTool<()> for CalculateTool {
             })],
             details: Value::Null,
             usage: None,
-            added_tool_names: None,
             terminate: None,
         })
     }
@@ -576,7 +575,7 @@ impl Provider for PayloadProbeProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &rpi_ai::types::TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         let options = options.unwrap_or_default();
@@ -603,7 +602,7 @@ impl Provider for PayloadProbeProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &rpi_ai::types::TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         Ok(self.stream(model, context, options.map(|simple| simple.stream)))

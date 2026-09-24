@@ -29,7 +29,9 @@ use crate::generated::get_builtin_models;
 use crate::models::{
     create_provider, CreateProviderOptions, Provider, ProviderApi, ProviderStreams,
 };
-use crate::types::{ApiKind, Context, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions};
+use crate::types::{
+    ApiKind, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
+};
 use crate::utils::event_stream::AssistantMessageEventStream;
 
 /// `githubCopilotProvider()`.
@@ -130,7 +132,7 @@ impl Provider for GithubCopilotProvider {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         self.inner.stream(model, context, options)
@@ -139,7 +141,7 @@ impl Provider for GithubCopilotProvider {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         self.inner.stream_simple(model, context, options)

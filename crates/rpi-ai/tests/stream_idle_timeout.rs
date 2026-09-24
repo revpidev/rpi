@@ -208,7 +208,7 @@ async fn active_stream_longer_than_timeout_completes() {
     let events = collect(
         rpi_ai::api::anthropic_messages::stream_simple(
             &model(&url),
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(options(250)),
         )
         .expect("stream_simple"),
@@ -233,7 +233,7 @@ async fn silent_stream_dies_at_idle_timeout() {
     let events = collect(
         rpi_ai::api::anthropic_messages::stream_simple(
             &model(&url),
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(options(200)),
         )
         .expect("stream_simple"),
@@ -259,7 +259,7 @@ async fn headers_wait_is_bounded() {
     let events = collect(
         rpi_ai::api::anthropic_messages::stream_simple(
             &model(&url),
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(options(150)),
         )
         .expect("stream_simple"),
@@ -284,7 +284,7 @@ async fn no_timeout_option_disables_enforcement() {
     let events = collect(
         rpi_ai::api::anthropic_messages::stream_simple(
             &model(&url),
-            &context(),
+            &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(SimpleStreamOptions {
                 stream: StreamOptions {
                     request: ProviderRequestOptions {

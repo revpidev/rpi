@@ -1,7 +1,10 @@
-//! Port of `packages/agent/src/proxy.ts` @ pi 0.82.1 (2efa728), updated to
-//! 4181f66 for the v0.84 frame/protocol changes (`toolcall_end` carries the
-//! server-authoritative `toolCall`, :46/:338-350; `samplingParams` joins the
-//! options whitelist, :62/:105).
+//! Port of `packages/agent/src/proxy.ts` @ pin `19451accd` (post-#9548:
+//! `streamProxy` takes the normalized `TranscriptContext`; the wire body's
+//! `context` field serializes as `{"messages": [...]}` — the brand symbol is
+//! invisible to `JSON.stringify`). Earlier anchors: pi 0.82.1 (2efa728),
+//! updated to 4181f66 for the v0.84 frame/protocol changes (`toolcall_end`
+//! carries the server-authoritative `toolCall`, :46/:338-350;
+//! `samplingParams` joins the options whitelist, :62/:105).
 //!
 //! SSE client that routes LLM calls through a server
 //! (`POST {proxyUrl}/api/stream`). The server strips the `partial` field from
@@ -50,9 +53,9 @@ use std::collections::HashMap;
 
 use futures::StreamExt;
 use rpi_ai::types::{
-    AssistantContent, AssistantMessage, AssistantRole, CacheRetention, Context, DoneReason,
-    ErrorReason, Model, ProviderHeaders, StopReason, StreamEvent, TextContent, ThinkingBudgets,
-    ThinkingContent, ThinkingLevel, ToolCall, Transport, Usage,
+    AssistantContent, AssistantMessage, AssistantRole, CacheRetention, DoneReason, ErrorReason,
+    Model, ProviderHeaders, StopReason, StreamEvent, TextContent, ThinkingBudgets, ThinkingContent,
+    ThinkingLevel, ToolCall, TranscriptContext, Transport, Usage,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use rpi_ai::utils::json_parse::parse_streaming_json;
@@ -249,7 +252,7 @@ pub struct ProxyStreamOptions {
 #[serde(rename_all = "camelCase")]
 struct ProxyRequestBody<'a> {
     model: &'a Model,
-    context: &'a Context,
+    context: &'a TranscriptContext,
     options: ProxySerializableStreamOptions,
 }
 
@@ -284,7 +287,7 @@ fn build_proxy_request_options(options: &ProxyStreamOptions) -> ProxySerializabl
 /// `StreamFn` body.
 pub fn stream_proxy(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: ProxyStreamOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
@@ -339,7 +342,7 @@ pub fn stream_proxy(
 /// either way.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &ProxyStreamOptions,
     partial: &mut AssistantMessage,
     partial_jsons: &mut HashMap<usize, String>,

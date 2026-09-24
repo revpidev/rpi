@@ -2130,6 +2130,7 @@ mod tests {
             details: None,
             usage: None,
             from_hook: Some(true),
+            system_message: None,
         }
     }
 

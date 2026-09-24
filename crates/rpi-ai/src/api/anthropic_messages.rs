@@ -43,15 +43,14 @@ use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::ProviderStreams;
 use crate::types::{
-    AnthropicAllowedFallbackModel, AssistantContent, AssistantMessage, CacheRetention, Context,
-    DoneReason, ErrorReason, Message, Model, ModelThinkingLevel, ProviderEnv, ProviderHeaders,
+    AnthropicAllowedFallbackModel, AssistantContent, AssistantMessage, CacheRetention, DoneReason,
+    ErrorReason, Message, Model, ModelThinkingLevel, ProviderEnv, ProviderHeaders,
     ProviderResponse, SessionAffinityFormat, SimpleStreamOptions, StopReason, StreamEvent,
-    StreamOptions, ThinkingLevel, Tool, ToolResultContent, ToolResultMessage, Usage, UserContent,
-    UserContentBlock,
+    StreamOptions, ThinkingLevel, Tool, ToolResultContent, ToolResultMessage, TranscriptContext,
+    Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::send_provider_request;
-use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
@@ -64,6 +63,7 @@ use crate::utils::provider_retry::{
     retry_provider_request, ProviderErrorInfo, ProviderRetryOptions,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
+use crate::utils::transcript::resolve_transcript;
 use crate::utils::transform_messages::transform_messages;
 
 // ---------------------------------------------------------------------------
@@ -75,6 +75,17 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+const MID_CONVERSATION_TOOL_CHANGES_BETA: &str = "mid-conversation-tool-changes-2026-07-01";
+
+/// Stable deferred tool declared whenever native tool changes are in use
+/// (anthropic-messages.ts:190-200 @ #9548). Anthropic adds hidden prompt
+/// scaffolding as soon as any tool has `defer_loading`; declaring this
+/// placeholder from the first request keeps that scaffolding in the cached
+/// prefix, so the first real late tool does not invalidate the cache. It is
+/// never activated and the model cannot see it.
+const DEFERRED_TOOL_PLACEHOLDER_NAME: &str = "__pi_deferred_placeholder__";
+const DEFERRED_TOOL_PLACEHOLDER_DESCRIPTION: &str =
+    "Reserved placeholder. Never available. Never call this.";
 
 /// Effective `allowedFallbackModels` read seam (#9294, b03a367a4 @
 /// d1230ea20): the composed model already carries the user models.json
@@ -119,8 +130,9 @@ fn should_use_server_side_fallback_beta(model: &Model) -> bool {
 /// equivalent wire form (empty set → no header).
 fn get_beta_features(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     is_oauth_token: bool,
+    native_tool_changes: bool,
     options: &AnthropicOptions,
 ) -> Vec<String> {
     // :985-1000 — explicit `anthropic-beta` overrides the computed set.
@@ -185,6 +197,9 @@ fn get_beta_features(
     {
         features.push(MID_CONVERSATION_OUTPUT_CONFIG_BETA.to_owned());
         features.push(THINKING_BINDING_CONTROLS_BETA.to_owned());
+    }
+    if native_tool_changes {
+        features.push(MID_CONVERSATION_TOOL_CHANGES_BETA.to_owned());
     }
     // :1017 — `[...new Set(features)]` (already unique by construction;
     // kept for parity with the upstream dedup step).
@@ -329,7 +344,12 @@ pub struct ResolvedAnthropicCompat {
     pub supports_temperature: bool,
     pub allow_empty_signature: bool,
     pub supports_strict_tools: bool,
-    pub supports_tool_references: bool,
+    /// #9548: system messages after the conversation started (default
+    /// false; catalog bakes per model).
+    pub supports_mid_convo_system_messages: bool,
+    /// #9548: the transport accepts `tool_addition`/`tool_removal` blocks
+    /// (first-party Anthropic only; proxies reject them).
+    pub supports_mid_convo_tool_changes: bool,
 }
 
 /// `getAnthropicCompat` (#9102, bbb61e34a: OpenRouter endpoints derive
@@ -361,37 +381,13 @@ pub fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
         supports_strict_tools: compat
             .and_then(|c| c.supports_strict_tools)
             .unwrap_or(false),
-        supports_tool_references: compat
-            .and_then(|c| c.supports_tool_references)
-            .unwrap_or_else(|| default_supports_tool_references(model)),
+        supports_mid_convo_system_messages: compat
+            .and_then(|c| c.supports_mid_convo_system_messages)
+            .unwrap_or(false),
+        supports_mid_convo_tool_changes: compat
+            .and_then(|c| c.supports_mid_convo_tool_changes)
+            .unwrap_or(false),
     }
-}
-
-static TOOL_REFERENCES_VERSION: LazyLock<regex::Regex> = LazyLock::new(|| {
-    // invariant: literal pattern compiles
-    #[allow(clippy::expect_used)]
-    regex::Regex::new(r"^claude-(?:opus|sonnet|fable)-(\d+)(?:-(\d+))?(?:-|$)")
-        .expect("static regex")
-});
-
-/// `defaultSupportsToolReferences`: first-party Anthropic models except Haiku
-/// and models predating tool search (Claude 3.x, Opus/Sonnet 4.0, Opus 4.1).
-pub fn default_supports_tool_references(model: &Model) -> bool {
-    if model.provider != "anthropic" || model.id.contains("haiku") {
-        return false;
-    }
-    let Some(captures) = TOOL_REFERENCES_VERSION.captures(&model.id) else {
-        return false;
-    };
-    let major: u32 = captures
-        .get(1)
-        .and_then(|m| m.as_str().parse().ok())
-        .unwrap_or(0);
-    let minor: u32 = match captures.get(2) {
-        Some(m) if m.as_str().len() < 8 => m.as_str().parse().unwrap_or(0),
-        _ => 0,
-    };
-    major > 4 || (major == 4 && minor >= 5)
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +478,8 @@ fn is_oauth_token(api_key: &str) -> bool {
 /// OAuth token.
 fn build_request_headers(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
+    native_tool_changes: bool,
     api_key: Option<&str>,
     options: &AnthropicOptions,
     dynamic_headers: Option<HashMap<String, String>>,
@@ -493,7 +490,7 @@ fn build_request_headers(
     // (4e69b0c28) — OAuth/Claude-Code identity headers still gate on the
     // token shape.
     let is_oauth = api_key.is_some_and(is_oauth_token);
-    let beta_features = get_beta_features(model, context, is_oauth, options);
+    let beta_features = get_beta_features(model, context, is_oauth, native_tool_changes, options);
     let beta_header = (!beta_features.is_empty()).then(|| beta_features.join(","));
 
     let dynamic_headers: Option<ProviderHeaders> = dynamic_headers.map(|headers| {
@@ -647,48 +644,17 @@ fn convert_content_blocks(content: &[ToolResultContent]) -> Value {
     Value::Array(blocks)
 }
 
-/// `convertToolResult`: a tool_result block plus any displaced sibling content
-/// (tool references cannot mix with ordinary tool-result content).
-fn convert_tool_result(
-    msg: &ToolResultMessage,
-    is_oauth_token: bool,
-    deferred_tool_names: &HashSet<String>,
-    loaded_tool_names: &mut HashSet<String>,
-    normalize_tool_name: &dyn Fn(&str) -> String,
-) -> (Value, Vec<Value>) {
-    let mut references: Vec<Value> = Vec::new();
-    for name in msg.added_tool_names.as_deref().unwrap_or(&[]) {
-        let normalized_name = normalize_tool_name(name);
-        if !deferred_tool_names.contains(&normalized_name)
-            || loaded_tool_names.contains(&normalized_name)
-        {
-            continue;
-        }
-        loaded_tool_names.insert(normalized_name);
-        references.push(json!({
-            "type": "tool_reference",
-            "tool_name": if is_oauth_token { to_claude_code_name(name) } else { name.clone() },
-        }));
-    }
+/// `convertToolResult` (post-#9548): a plain tool_result block. Deferred
+/// tool loading no longer rides tool results — later tool declarations
+/// travel as system-message `tool_addition` blocks instead.
+fn convert_tool_result(msg: &ToolResultMessage) -> Value {
     let converted_content = convert_content_blocks(&msg.content);
-    let has_references = !references.is_empty();
-    let tool_result = json!({
+    json!({
         "type": "tool_result",
         "tool_use_id": msg.tool_call_id,
-        "content": if has_references { Value::Array(references) } else { converted_content.clone() },
+        "content": converted_content,
         "is_error": msg.is_error,
-    });
-    let sibling_content = if !has_references {
-        Vec::new()
-    } else {
-        match converted_content {
-            Value::String(text) => vec![json!({"type": "text", "text": text})],
-            Value::Array(blocks) => blocks,
-            // invariant: convert_content_blocks returns only String or Array
-            _ => Vec::new(),
-        }
-    };
-    (tool_result, sibling_content)
+    })
 }
 
 /// `convertMessages`.
@@ -736,18 +702,67 @@ fn convert_messages(
     is_oauth_token: bool,
     cache_control: Option<&Value>,
     allow_empty_signature: bool,
-    deferred_tool_names: &HashSet<String>,
-    normalize_tool_name: &dyn Fn(&str) -> String,
+    native_tool_changes: bool,
     managed_provider: Option<&str>,
 ) -> ConvertedAnthropicMessages {
     let mut params: Vec<Value> = Vec::new();
     let mut assistant_levels: HashMap<usize, String> = HashMap::new();
-    let mut loaded_tool_names: HashSet<String> = HashSet::new();
+    // Later system messages are held back and emitted directly before the
+    // next assistant message (or at the end of the transcript). Anthropic
+    // requires `tool_result` blocks to immediately follow their `tool_use`,
+    // so a system message between them is rejected; this also mirrors where
+    // the managed-effort system messages are inserted. As a result an update
+    // placed before a user message in the transcript lands after it on the
+    // wire (#9548, anthropic-messages.ts:1236-1244).
+    let mut pending_system_messages: Vec<Value> = Vec::new();
 
     let mut i = 0;
     while i < transformed_messages.len() {
         let msg = &transformed_messages[i];
         match msg {
+            Message::System(system) => {
+                // Later system messages only reach this point when the model
+                // accepts them natively; otherwise the transcript was
+                // collapsed into the leading message before conversion.
+                let text = crate::utils::text::render_system_message_update(system);
+                let mut blocks: Vec<Value> = Vec::new();
+                if !text.is_empty() {
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": sanitize_surrogates(&text),
+                    }));
+                }
+                if native_tool_changes {
+                    if let Some(removed) = &system.tools_removed {
+                        for tool in removed {
+                            blocks.push(json!({
+                                "type": "tool_removal",
+                                "tool": {
+                                    "type": "tool_reference",
+                                    "name": if is_oauth_token { to_claude_code_name(&tool.name) } else { tool.name.clone() },
+                                },
+                            }));
+                        }
+                    }
+                    if let Some(added) = &system.tools_added {
+                        for tool in added {
+                            blocks.push(json!({
+                                "type": "tool_addition",
+                                "tool": {
+                                    "type": "tool_reference",
+                                    "name": if is_oauth_token { to_claude_code_name(&tool.name) } else { tool.name.clone() },
+                                },
+                            }));
+                        }
+                    }
+                }
+                if !blocks.is_empty() {
+                    pending_system_messages.push(json!({
+                        "role": "system",
+                        "content": blocks,
+                    }));
+                }
+            }
             Message::User(user) => match &user.content {
                 UserContent::Text(text) => {
                     if !text.trim().is_empty() {
@@ -787,6 +802,7 @@ fn convert_messages(
                 }
             },
             Message::Assistant(assistant) => {
+                params.append(&mut pending_system_messages);
                 let mut blocks: Vec<Value> = Vec::new();
                 for block in &assistant.content {
                     match block {
@@ -872,42 +888,42 @@ fn convert_messages(
                 // Collect all consecutive toolResult messages (z.ai Anthropic
                 // endpoint requires them grouped in one user message).
                 let mut tool_results: Vec<Value> = Vec::new();
-                let mut sibling_content: Vec<Value> = Vec::new();
                 let mut j = i;
                 while j < transformed_messages.len() {
                     let Message::ToolResult(result) = &transformed_messages[j] else {
                         break;
                     };
-                    let (tool_result, siblings) = convert_tool_result(
-                        result,
-                        is_oauth_token,
-                        deferred_tool_names,
-                        &mut loaded_tool_names,
-                        normalize_tool_name,
-                    );
-                    tool_results.push(tool_result);
-                    sibling_content.extend(siblings);
+                    tool_results.push(convert_tool_result(result));
                     j += 1;
                 }
                 i = j - 1;
-                // Displaced reference-bearing results follow every tool_result.
-                let mut content = tool_results;
-                content.extend(sibling_content);
-                params.push(json!({"role": "user", "content": content}));
+                params.push(json!({"role": "user", "content": tool_results}));
             }
         }
         i += 1;
     }
 
-    // Add cache_control to the last user message to cache conversation history.
+    params.append(&mut pending_system_messages);
+
+    // Add cache_control to the last user or system message to cache
+    // conversation history (#9548 also allows the trailing pending system
+    // message to carry the breakpoint; tool_addition/tool_removal blocks
+    // included).
     if let (Some(cache_control), Some(last_message)) = (cache_control, params.last_mut()) {
-        if last_message.get("role").and_then(Value::as_str) == Some("user") {
+        if matches!(
+            last_message.get("role").and_then(Value::as_str),
+            Some("user") | Some("system")
+        ) {
             match last_message.get_mut("content") {
                 Some(Value::Array(blocks)) => {
                     if let Some(last_block) = blocks.last_mut() {
                         if matches!(
                             last_block.get("type").and_then(Value::as_str),
-                            Some("text") | Some("image") | Some("tool_result")
+                            Some("text")
+                                | Some("image")
+                                | Some("tool_result")
+                                | Some("tool_addition")
+                                | Some("tool_removal")
                         ) {
                             last_block["cache_control"] = cache_control.clone();
                         }
@@ -932,11 +948,8 @@ fn convert_messages(
     }
 }
 
-fn should_use_fine_grained_tool_streaming_beta(model: &Model, context: &Context) -> bool {
-    context
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
+fn should_use_fine_grained_tool_streaming_beta(model: &Model, context: &TranscriptContext) -> bool {
+    !crate::utils::transcript::get_current_tools(&context.messages).is_empty()
         && !get_anthropic_compat(model).supports_eager_tool_input_streaming
 }
 
@@ -1005,11 +1018,14 @@ fn text_block(text: &str, cache_control: Option<&Value>) -> Value {
     block
 }
 
-/// `buildParams`.
+/// `buildParams` (#9548 restructure): the leading system message supplies the
+/// system text; conversation messages exclude it; native tool changes keep
+/// the initial tools active and defer later ones in place.
 fn build_params(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     is_oauth_token: bool,
+    native_tool_changes: bool,
     options: &AnthropicOptions,
 ) -> Result<Value, String> {
     let (_retention, cache_control) = get_cache_control(
@@ -1018,42 +1034,29 @@ fn build_params(
         options.stream.env.as_ref(),
     );
     let compat = get_anthropic_compat(model);
+    let initial_system_message =
+        crate::utils::transcript::get_initial_system_message(&context.messages);
+    let initial_system_text = initial_system_message
+        .map(crate::utils::text::get_system_message_text)
+        .unwrap_or_default();
     let transformed_messages = transform_messages(
         &context.messages,
         model,
         Some(&mut |id: &str, _model: &Model, _msg: &AssistantMessage| normalize_tool_call_id(id)),
     );
-    let normalize_tool_name = |name: &str| {
-        if is_oauth_token {
-            to_claude_code_name(name)
-        } else {
-            name.to_owned()
-        }
+    // The transformed list mirrors the input order; drop the leading system
+    // message if present so the prompt rides `params.system` instead.
+    let conversation_messages = match transformed_messages.first() {
+        Some(Message::System(_)) => &transformed_messages[1..],
+        _ => transformed_messages.as_slice(),
     };
-    let transformed_context = Context {
-        system_prompt: context.system_prompt.clone(),
-        messages: transformed_messages.clone(),
-        tools: context.tools.clone(),
-    };
-    let placement = split_deferred_tools(
-        &transformed_context,
-        compat.supports_tool_references,
-        normalize_tool_name,
-    );
-    let mut immediate_tools = placement.immediate;
-    let mut deferred_tools: Vec<Tool> = placement
-        .deferred
-        .into_iter()
-        .map(|(_, tool)| tool)
-        .collect();
-    if immediate_tools.is_empty() && !deferred_tools.is_empty() {
-        immediate_tools = deferred_tools;
-        deferred_tools = Vec::new();
-    }
-    let deferred_tool_names: HashSet<String> = deferred_tools
-        .iter()
-        .map(|tool| normalize_tool_name(&tool.name))
-        .collect();
+    // Native tool changes reference tools by name, so a redefined name
+    // cannot be expressed, and Anthropic rejects a tool list where every
+    // tool is deferred, so there must be an initial active tool to anchor
+    // the deferred ones. Otherwise the current tool list is sent.
+    let initial_tools: Vec<Tool> = initial_system_message
+        .and_then(|message| message.tools_added.clone())
+        .unwrap_or_default();
 
     // Managed-effort models (4e69b0c28): replay effort markers around the
     // history and pin the request-level controls below (:1053-1060).
@@ -1063,12 +1066,11 @@ fn build_params(
         .and_then(|compat| compat.supports_mid_convo_effort)
         == Some(true);
     let converted = convert_messages(
-        &transformed_messages,
+        conversation_messages,
         is_oauth_token,
         cache_control.as_ref(),
         compat.allow_empty_signature,
-        &deferred_tool_names,
-        &normalize_tool_name,
+        native_tool_changes,
         managed.then_some(model.provider.as_str()),
     );
     let messages = if managed {
@@ -1076,12 +1078,17 @@ fn build_params(
     } else {
         converted.messages
     };
+    let beta_features =
+        get_beta_features(model, context, is_oauth_token, native_tool_changes, options);
     let mut params = json!({
         "model": model.id,
         "messages": messages,
         "max_tokens": options.stream.max_tokens.unwrap_or(model.max_tokens),
         "stream": true,
     });
+    if !beta_features.is_empty() {
+        params["betas"] = json!(beta_features);
+    }
 
     // For OAuth tokens, we MUST include the Claude Code identity.
     if is_oauth_token {
@@ -1089,16 +1096,17 @@ fn build_params(
             "You are Claude Code, Anthropic's official CLI for Claude.",
             cache_control.as_ref(),
         )];
-        if let Some(system_prompt) = &context.system_prompt {
+        if !initial_system_text.is_empty() {
             system.push(text_block(
-                sanitize_surrogates(system_prompt),
+                sanitize_surrogates(&initial_system_text),
                 cache_control.as_ref(),
             ));
         }
         params["system"] = Value::Array(system);
-    } else if let Some(system_prompt) = &context.system_prompt {
+    } else if !initial_system_text.is_empty() {
+        // Add cache control to system prompt for non-OAuth tokens.
         params["system"] = json!([text_block(
-            sanitize_surrogates(system_prompt),
+            sanitize_surrogates(&initial_system_text),
             cache_control.as_ref(),
         )]);
     }
@@ -1111,28 +1119,63 @@ fn build_params(
         }
     }
 
-    if !immediate_tools.is_empty() || !deferred_tools.is_empty() {
+    let tool_cache_control = if compat.supports_cache_control_on_tools {
+        cache_control.as_ref()
+    } else {
+        None
+    };
+    if native_tool_changes {
+        // Initial tools stay active with the cache breakpoint on the last
+        // one. Every later declaration is deferred and only surfaced by its
+        // `tool_addition` block; removed tools stay declared and are
+        // withdrawn by `tool_removal`. The request-level list therefore only
+        // grows, keeping the cached prefix intact across tool changes
+        // (#9548, anthropic-messages.ts:1120-1137).
+        let initial_names: HashSet<&str> = initial_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let later_tools: Vec<Tool> =
+            crate::utils::transcript::get_declared_tools(&context.messages)
+                .into_iter()
+                .filter(|tool| !initial_names.contains(tool.name.as_str()))
+                .collect();
         let mut tools = convert_tools(
-            &immediate_tools,
+            &initial_tools,
             is_oauth_token,
             compat.supports_eager_tool_input_streaming,
             compat.supports_strict_tools,
-            if compat.supports_cache_control_on_tools {
-                cache_control.as_ref()
-            } else {
-                None
-            },
+            tool_cache_control,
             false,
         )?;
-        tools.extend(convert_tools(
-            &deferred_tools,
+        tools.push(json!({
+            "name": DEFERRED_TOOL_PLACEHOLDER_NAME,
+            "description": DEFERRED_TOOL_PLACEHOLDER_DESCRIPTION,
+            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "defer_loading": true,
+        }));
+        let mut later = convert_tools(
+            &later_tools,
             is_oauth_token,
             compat.supports_eager_tool_input_streaming,
             compat.supports_strict_tools,
             None,
             true,
-        )?);
+        )?;
+        tools.append(&mut later);
         params["tools"] = Value::Array(tools);
+    } else {
+        let tools = crate::utils::transcript::get_current_tools(&context.messages);
+        if !tools.is_empty() {
+            params["tools"] = Value::Array(convert_tools(
+                &tools,
+                is_oauth_token,
+                compat.supports_eager_tool_input_streaming,
+                compat.supports_strict_tools,
+                tool_cache_control,
+                false,
+            )?);
+        }
     }
 
     // Configure thinking mode: adaptive, budget-based, or explicitly disabled.
@@ -1819,13 +1862,26 @@ fn initial_output(model: &Model) -> AssistantMessage {
 /// message either way.
 async fn run(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &AnthropicOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
     let api_key = options.stream.api_key.as_deref();
     assert_request_auth(&model.provider, api_key, options.stream.headers.as_ref())?;
+
+    let compat = get_anthropic_compat(model);
+    let current_tools = crate::utils::transcript::get_current_tools(&context.messages);
+    // Native tool changes: the transport accepts tool_addition/tool_removal
+    // blocks, the transcript carries an initial active tool to anchor the
+    // deferred ones, and no name was redefined with a different definition
+    // (#9548, anthropic-messages.ts:1047-1051).
+    let native_tool_changes = compat.supports_mid_convo_system_messages
+        && compat.supports_mid_convo_tool_changes
+        && crate::utils::transcript::get_initial_system_message(&context.messages)
+            .and_then(|message| message.tools_added.as_ref())
+            .is_some_and(|tools| !tools.is_empty())
+        && !crate::utils::transcript::has_tool_redefinitions(&context.messages);
 
     let dynamic_headers = if model.provider == "github-copilot" {
         let has_images = has_copilot_vision_input(&context.messages);
@@ -1848,13 +1904,14 @@ async fn run(
     let (headers, is_oauth_token) = build_request_headers(
         model,
         context,
+        native_tool_changes,
         api_key,
         options,
         dynamic_headers,
         cache_session_id,
     );
 
-    let mut params = build_params(model, context, is_oauth_token, options)?;
+    let mut params = build_params(model, context, is_oauth_token, native_tool_changes, options)?;
     if let Some(on_payload) = &options.stream.on_payload {
         if let Some(mut next_params) = on_payload(params.clone(), model).await {
             // :571-572 — the SDK transport always streams; a caller-supplied
@@ -1943,8 +2000,12 @@ async fn run(
         partial: output.clone(),
     });
 
-    let mut processor =
-        StreamProcessor::new(output, model, is_oauth_token, context.tools.as_deref());
+    let mut processor = StreamProcessor::new(
+        output,
+        model,
+        is_oauth_token,
+        Some(current_tools.as_slice()),
+    );
     let mut decoder = SseDecoder::new();
     // Inter-chunk idle timeout (upstream bodyTimeout): actively streaming
     // responses never expire; only a silent stream does.
@@ -1979,16 +2040,21 @@ async fn run(
     processor.finish(options.stream.signal.as_ref())
 }
 
-/// `stream` (anthropic-messages).
+/// `stream` (anthropic-messages). The provider-facing transcript is
+/// normalized upstream; the entry resolves the mid-conversation policy per
+/// model compat (#9548, anthropic-messages.ts:511-517).
 pub fn stream(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: AnthropicOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
     let task_stream = event_stream.clone();
     let model = model.clone();
-    let context = context.clone();
+    let context = resolve_transcript(
+        context,
+        get_anthropic_compat(&model).supports_mid_convo_system_messages,
+    );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let mut output = initial_output(&model);
@@ -2077,7 +2143,7 @@ fn simple_tool_choice_to_anthropic(choice: crate::types::SimpleToolChoice) -> An
 /// `streamSimple` (anthropic-messages).
 pub fn stream_simple(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     // Auth check at the entry, before any stream is constructed
@@ -2167,7 +2233,7 @@ impl ProviderStreams for AnthropicMessages {
     fn stream(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         stream(
@@ -2183,7 +2249,7 @@ impl ProviderStreams for AnthropicMessages {
     fn stream_simple(
         &self,
         model: &Model,
-        context: &Context,
+        context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
@@ -2196,7 +2262,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::{ApiKind, AssistantRole, Usage};
+    use crate::types::{ApiKind, AssistantRole, Context, Usage};
 
     pub(crate) fn make_model(extra: serde_json::Value) -> Model {
         let mut value = json!({
@@ -2253,26 +2319,21 @@ pub(crate) mod tests {
         .expect("tool")
     }
 
-    fn tool_result(
-        tool_call_id: &str,
-        content: &str,
-        added_tool_names: Option<Vec<&str>>,
-    ) -> Message {
+    fn tool_result(tool_call_id: &str, content: &str) -> Message {
         serde_json::from_value(json!({
             "role": "toolResult", "toolCallId": tool_call_id, "toolName": "t",
             "content": [{"type": "text", "text": content}],
-            "addedToolNames": added_tool_names,
             "isError": false, "timestamp": 0
         }))
         .expect("toolResult")
     }
 
-    pub(crate) fn context(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> Context {
-        Context {
+    pub(crate) fn context(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> TranscriptContext {
+        crate::utils::transcript::normalize_context(&Context {
             system_prompt: None,
             messages,
             tools,
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2341,25 +2402,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_default_supports_tool_references() {
-        let mut m = make_model(json!({}));
-        assert!(default_supports_tool_references(&m)); // claude-sonnet-4-5
-        m.id = "claude-opus-4-1".to_owned();
-        assert!(!default_supports_tool_references(&m));
-        m.id = "claude-sonnet-4-0".to_owned();
-        assert!(!default_supports_tool_references(&m));
-        m.id = "claude-haiku-4-5".to_owned();
-        assert!(!default_supports_tool_references(&m));
-        m.id = "claude-fable-5".to_owned();
-        assert!(default_supports_tool_references(&m));
-        m.id = "claude-sonnet-4-5-20250929".to_owned();
-        assert!(default_supports_tool_references(&m));
-        m.provider = "bedrock".to_owned();
-        m.id = "claude-sonnet-4-5".to_owned();
-        assert!(!default_supports_tool_references(&m));
-    }
-
-    #[test]
     fn test_get_anthropic_compat_defaults() {
         let compat = get_anthropic_compat(&make_model(json!({})));
         assert!(compat.supports_eager_tool_input_streaming);
@@ -2369,7 +2411,9 @@ pub(crate) mod tests {
         assert!(compat.supports_temperature);
         assert!(!compat.allow_empty_signature);
         assert!(!compat.supports_strict_tools);
-        assert!(compat.supports_tool_references); // claude-sonnet-4-5 default
+        // #9548: mid-convo faces default false; catalog data gates them.
+        assert!(!compat.supports_mid_convo_system_messages);
+        assert!(!compat.supports_mid_convo_tool_changes);
     }
 
     #[test]
@@ -2407,11 +2451,12 @@ pub(crate) mod tests {
         };
         let (headers, is_oauth) = build_request_headers(
             &model,
-            &Context {
+            &crate::utils::transcript::normalize_context(&Context {
                 system_prompt: None,
                 messages: vec![],
                 tools: None,
-            },
+            }),
+            false,
             Some("sk-ant-api03-key"),
             &options,
             None,
@@ -2448,11 +2493,12 @@ pub(crate) mod tests {
         };
         let (headers, is_oauth) = build_request_headers(
             &model,
-            &Context {
+            &crate::utils::transcript::normalize_context(&Context {
                 system_prompt: None,
                 messages: vec![],
                 tools: Some(vec![tool("search")]),
-            },
+            }),
+            false,
             Some("sk-ant-oat01-token"),
             &options,
             None,
@@ -2482,7 +2528,8 @@ pub(crate) mod tests {
         let model = make_model(json!({"compat": {"forceAdaptiveThinking": true}}));
         let (headers, _) = build_request_headers(
             &model,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             Some("sk-key"),
             &AnthropicOptions::default(),
             None,
@@ -2496,7 +2543,8 @@ pub(crate) mod tests {
         let model = make_model(json!({"compat": {"sendSessionAffinityHeaders": true}}));
         let (headers, _) = build_request_headers(
             &model,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             Some("sk-key"),
             &AnthropicOptions::default(),
             None,
@@ -2533,7 +2581,8 @@ pub(crate) mod tests {
         );
         let (headers, _) = build_request_headers(
             &openrouter,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             Some("sk-key"),
             &AnthropicOptions::default(),
             None,
@@ -2556,7 +2605,8 @@ pub(crate) mod tests {
         assert!(!compat.send_session_affinity_headers);
         let (headers, _) = build_request_headers(
             &disabled,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             Some("sk-key"),
             &AnthropicOptions::default(),
             None,
@@ -2579,7 +2629,8 @@ pub(crate) mod tests {
         assert_eq!(compat.session_affinity_format, None);
         let (headers, _) = build_request_headers(
             &fireworks,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             Some("sk-key"),
             &AnthropicOptions::default(),
             None,
@@ -2610,15 +2661,7 @@ pub(crate) mod tests {
             user_text("again"),
         ];
         let cc = json!({"type": "ephemeral"});
-        let converted = convert_messages(
-            &messages,
-            false,
-            Some(&cc),
-            false,
-            &HashSet::new(),
-            &|n| n.to_owned(),
-            None,
-        );
+        let converted = convert_messages(&messages, false, Some(&cc), false, false, None);
         let params = converted.messages;
         assert_eq!(params.len(), 3);
         assert_eq!(params[0], json!({"role": "user", "content": "hello"}));
@@ -2640,15 +2683,7 @@ pub(crate) mod tests {
             assistant_message(vec![], "anthropic", "claude-sonnet-4-5"),
             user_text("real"),
         ];
-        let converted = convert_messages(
-            &messages,
-            false,
-            None,
-            false,
-            &HashSet::new(),
-            &|n| n.to_owned(),
-            None,
-        );
+        let converted = convert_messages(&messages, false, None, false, false, None);
         let params = converted.messages;
         assert_eq!(params.len(), 1);
         assert_eq!(params[0]["content"], json!("real"));
@@ -2673,15 +2708,7 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let converted = convert_messages(
-            &messages,
-            false,
-            None,
-            false,
-            &HashSet::new(),
-            &|n| n.to_owned(),
-            None,
-        );
+        let converted = convert_messages(&messages, false, None, false, false, None);
         let params = converted.messages;
         let blocks = params[0]["content"].as_array().expect("blocks");
         assert_eq!(
@@ -2697,15 +2724,7 @@ pub(crate) mod tests {
         assert_eq!(blocks.len(), 2);
 
         // allowEmptySignature keeps the block as thinking with "".
-        let converted = convert_messages(
-            &messages,
-            false,
-            None,
-            true,
-            &HashSet::new(),
-            &|n| n.to_owned(),
-            None,
-        );
+        let converted = convert_messages(&messages, false, None, true, false, None);
         let params = converted.messages;
         let blocks = params[0]["content"].as_array().expect("blocks");
         assert_eq!(
@@ -2725,15 +2744,7 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let converted = convert_messages(
-            &messages,
-            false,
-            None,
-            false,
-            &HashSet::new(),
-            &|n| n.to_owned(),
-            None,
-        );
+        let converted = convert_messages(&messages, false, None, false, false, None);
         let params = converted.messages;
         assert_eq!(
             params[0]["content"][0],
@@ -2744,19 +2755,11 @@ pub(crate) mod tests {
     #[test]
     fn test_convert_messages_tool_results_grouped() {
         let messages = vec![
-            tool_result("call_1", "one", None),
-            tool_result("call_2", "two", None),
+            tool_result("call_1", "one"),
+            tool_result("call_2", "two"),
             user_text("next"),
         ];
-        let converted = convert_messages(
-            &messages,
-            false,
-            None,
-            false,
-            &HashSet::new(),
-            &|n| n.to_owned(),
-            None,
-        );
+        let converted = convert_messages(&messages, false, None, false, false, None);
         let params = converted.messages;
         assert_eq!(params.len(), 2);
         let content = params[0]["content"].as_array().expect("content");
@@ -2767,34 +2770,6 @@ pub(crate) mod tests {
         assert_eq!(content[1]["tool_use_id"], json!("call_2"));
         assert_eq!(params[0]["role"], json!("user"));
         assert_eq!(params[1]["content"], json!("next"));
-    }
-
-    #[test]
-    fn test_convert_messages_tool_references() {
-        let deferred: HashSet<String> = ["search".to_owned()].into();
-        let messages = vec![tool_result("call_1", "result body", Some(vec!["search"]))];
-        let converted = convert_messages(
-            &messages,
-            false,
-            None,
-            false,
-            &deferred,
-            &|n| n.to_owned(),
-            None,
-        );
-        let params = converted.messages;
-        let content = params[0]["content"].as_array().expect("content");
-        // Reference replaces the tool result content; the original content is
-        // displaced into a sibling block.
-        assert_eq!(
-            content[0],
-            json!({
-                "type": "tool_result", "tool_use_id": "call_1",
-                "content": [{"type": "tool_reference", "tool_name": "search"}],
-                "is_error": false
-            })
-        );
-        assert_eq!(content[1], json!({"type": "text", "text": "result body"}));
     }
 
     #[test]
@@ -2810,26 +2785,10 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let converted = convert_messages(
-            &messages,
-            true,
-            None,
-            false,
-            &HashSet::new(),
-            &to_claude_code_name,
-            None,
-        );
+        let converted = convert_messages(&messages, true, None, false, false, None);
         let params = converted.messages;
         assert_eq!(params[0]["content"][0]["name"], json!("Bash"));
-        let converted = convert_messages(
-            &messages,
-            false,
-            None,
-            false,
-            &HashSet::new(),
-            &|n| n.to_owned(),
-            None,
-        );
+        let converted = convert_messages(&messages, false, None, false, false, None);
         let params = converted.messages;
         assert_eq!(params[0]["content"][0]["name"], json!("bash"));
     }
@@ -2910,10 +2869,13 @@ pub(crate) mod tests {
     #[test]
     fn test_build_params_oauth_system_and_identity() {
         let model = make_model(json!({}));
-        let mut ctx = context(vec![user_text("hi")], Some(vec![tool("bash")]));
-        ctx.system_prompt = Some("You are rpi.".to_owned());
+        let ctx = crate::utils::transcript::normalize_context(&Context {
+            system_prompt: Some("You are rpi.".to_owned()),
+            messages: vec![user_text("hi")],
+            tools: Some(vec![tool("bash")]),
+        });
         let options = AnthropicOptions::default();
-        let params = build_params(&model, &ctx, true, &options).expect("params");
+        let params = build_params(&model, &ctx, true, false, &options).expect("params");
 
         let system = params["system"].as_array().expect("system");
         assert_eq!(
@@ -2938,7 +2900,7 @@ pub(crate) mod tests {
         }));
         let ctx = context(vec![user_text("hi")], None);
         let params =
-            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
+            build_params(&model, &ctx, false, false, &AnthropicOptions::default()).expect("params");
         assert_eq!(
             params["fallbacks"],
             json!([{"model": "claude-haiku-9"}, {"model": "claude-sonnet-4-5-mini"}])
@@ -2947,11 +2909,11 @@ pub(crate) mod tests {
         // Absent or empty → the field is omitted entirely.
         let empty = make_model(json!({"compat": {"allowedFallbackModels": []}}));
         let params =
-            build_params(&empty, &ctx, false, &AnthropicOptions::default()).expect("params");
+            build_params(&empty, &ctx, false, false, &AnthropicOptions::default()).expect("params");
         assert!(params.get("fallbacks").is_none());
         let plain = make_model(json!({}));
         let params =
-            build_params(&plain, &ctx, false, &AnthropicOptions::default()).expect("params");
+            build_params(&plain, &ctx, false, false, &AnthropicOptions::default()).expect("params");
         assert!(params.get("fallbacks").is_none());
     }
 
@@ -2963,7 +2925,7 @@ pub(crate) mod tests {
         let ctx = context(vec![user_text("hi")], None);
         let mut options = AnthropicOptions::default();
         options.stream.temperature = Some(0.5);
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert!(params.get("temperature").is_none());
     }
 
@@ -2974,18 +2936,18 @@ pub(crate) mod tests {
         let mut options = AnthropicOptions::default();
         options.stream.temperature = Some(0.5);
 
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert_eq!(params["temperature"], json!(0.5));
 
         // Temperature is incompatible with extended thinking.
         options.thinking_enabled = Some(true);
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert!(params.get("temperature").is_none());
 
         // ... and unsupported on models without temperature support.
         let model = make_model(json!({"compat": {"supportsTemperature": false}}));
         options.thinking_enabled = None;
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert!(params.get("temperature").is_none());
     }
 
@@ -3000,7 +2962,7 @@ pub(crate) mod tests {
             thinking_budget_tokens: Some(2048),
             ..AnthropicOptions::default()
         };
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert_eq!(
             params["thinking"],
             json!({"type": "enabled", "budget_tokens": 2048, "display": "summarized"})
@@ -3009,7 +2971,7 @@ pub(crate) mod tests {
         // Adaptive thinking with effort.
         let model = make_model(json!({"compat": {"forceAdaptiveThinking": true}}));
         options.effort = Some("high".to_owned());
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert_eq!(
             params["thinking"],
             json!({"type": "adaptive", "display": "summarized"})
@@ -3021,17 +2983,17 @@ pub(crate) mod tests {
             thinking_enabled: Some(false),
             ..AnthropicOptions::default()
         };
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert_eq!(params["thinking"], json!({"type": "disabled"}));
 
         // thinkingLevelMap.off === null keeps thinking omitted.
         let model = make_model(json!({"thinkingLevelMap": {"off": null}}));
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert!(params.get("thinking").is_none());
 
         // thinkingEnabled None → no thinking param at all.
         options.thinking_enabled = None;
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert!(params.get("thinking").is_none());
     }
 
@@ -3048,14 +3010,14 @@ pub(crate) mod tests {
             .metadata
             .get_or_insert_with(serde_json::Map::new)
             .insert("user_id".to_owned(), json!("u-1"));
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert_eq!(params["metadata"], json!({"user_id": "u-1"}));
         assert_eq!(params["tool_choice"], json!({"type": "any"}));
 
         options.tool_choice = Some(AnthropicToolChoice::Tool {
             name: "search".to_owned(),
         });
-        let params = build_params(&model, &ctx, false, &options).expect("params");
+        let params = build_params(&model, &ctx, false, false, &options).expect("params");
         assert_eq!(
             params["tool_choice"],
             json!({"type": "tool", "name": "search"})
@@ -3078,11 +3040,11 @@ pub(crate) mod tests {
                 "openai",
                 "gpt-5",
             ),
-            tool_result("call_abc|item_xyz", "ok", None),
+            tool_result("call_abc|item_xyz", "ok"),
         ];
         let ctx = context(messages, None);
         let params =
-            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
+            build_params(&model, &ctx, false, false, &AnthropicOptions::default()).expect("params");
         let assistant = &params["messages"][0];
         assert_eq!(assistant["content"][0]["id"], json!("call_abc_item_xyz"));
         // The tool result id is remapped to the normalized id.
@@ -3093,8 +3055,12 @@ pub(crate) mod tests {
         );
     }
 
+    /// #9548: without mid-conversation support the transcript collapses —
+    /// every declared tool stays top-level (no defer_loading) and tool
+    /// results carry plain content (the tool_reference discovery blocks are
+    /// gone with the addedToolNames mechanism).
     #[test]
-    fn test_build_params_deferred_tools() {
+    fn test_build_params_collapsed_tools_without_mid_convo() {
         let model = make_model(json!({}));
         let messages = vec![
             assistant_message(
@@ -3108,39 +3074,47 @@ pub(crate) mod tests {
                 "anthropic",
                 "claude-sonnet-4-5",
             ),
-            tool_result("toolu_1", "loaded search", Some(vec!["search"])),
+            tool_result("toolu_1", "loaded search"),
         ];
         let ctx = context(messages, Some(vec![tool("read"), tool("search")]));
         let params =
-            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
+            build_params(&model, &ctx, false, false, &AnthropicOptions::default()).expect("params");
         let tools = params["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], json!("read"));
-        assert!(tools[0].get("defer_loading").is_none());
         assert_eq!(tools[1]["name"], json!("search"));
-        assert_eq!(tools[1]["defer_loading"], json!(true));
+        assert!(tools.iter().all(|tool| tool.get("defer_loading").is_none()));
 
-        // The tool result carries a tool_reference, content displaced.
+        // Plain tool_result content — no tool_reference blocks.
         let content = params["messages"][1]["content"]
             .as_array()
             .expect("content");
         assert_eq!(
-            content[0]["content"],
-            json!([{"type": "tool_reference", "tool_name": "search"}])
-        );
-        // The displaced sibling text is the last block of the last user
-        // message, so cache_control lands on it (upstream convertMessages).
-        assert_eq!(
-            content[1],
-            json!({"type": "text", "text": "loaded search", "cache_control": {"type": "ephemeral"}})
+            content[0],
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "loaded search",
+                "is_error": false,
+                "cache_control": {"type": "ephemeral"}
+            })
         );
     }
 
+    // -----------------------------------------------------------------------
+    // build_params
+    // -----------------------------------------------------------------------
+
+    /// FR-G R2 (eb1f87fa9): `fallbacks` is sent only when the compat lists
+    /// permitted targets, as `[{model}]` entries.
+    /// FR-C R2 (4e69b0c28): managed models never send `temperature`, even
+    /// with thinking off and a temperature requested.
     #[test]
-    fn test_build_params_oauth_used_name_keeps_tool_immediate() {
-        // Upstream "normalizes OAuth names before checking prior tool usage":
-        // an OAuth call to "Read" satisfies the "read" marker, so no tool is
-        // deferred and no tool_reference is emitted.
+    fn test_build_params_oauth_used_name_canonicalized_in_tool_list() {
+        // Post-#9548: the addedToolNames discovery mechanism is gone — the
+        // OAuth canonicalization applies to every declared tool name (a prior
+        // assistant call already used the canonical "Read"), and the request
+        // list carries the canonical name with no deferral split.
         let model = make_model(json!({}));
         let messages = vec![
             assistant_message(
@@ -3154,11 +3128,11 @@ pub(crate) mod tests {
                 "anthropic",
                 "claude-sonnet-4-5",
             ),
-            tool_result("toolu_1", "loaded", Some(vec!["read"])),
+            tool_result("toolu_1", "loaded"),
         ];
         let ctx = context(messages, Some(vec![tool("base_tool"), tool("read")]));
         let params =
-            build_params(&model, &ctx, true, &AnthropicOptions::default()).expect("params");
+            build_params(&model, &ctx, true, false, &AnthropicOptions::default()).expect("params");
         let tools = params["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], json!("base_tool"));
@@ -3169,10 +3143,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_build_params_oauth_canonicalized_markers_defer() {
-        // Upstream "matches OAuth-canonicalized markers to active tools":
-        // the "Read" marker canonicalizes to the "read" tool → deferred, and
-        // the tool_reference names the canonical Claude Code casing.
+    fn test_build_params_oauth_canonicalizes_declared_names() {
+        // Post-#9548: the addedToolNames discovery mechanism is gone — the
+        // OAuth canonicalization still applies to every declared tool name
+        // (request-level list), with no defer_loading splits.
         let model = make_model(json!({}));
         let messages = vec![
             assistant_message(
@@ -3186,84 +3160,17 @@ pub(crate) mod tests {
                 "anthropic",
                 "claude-sonnet-4-5",
             ),
-            tool_result("toolu_1", "loaded", Some(vec!["Read"])),
+            tool_result("toolu_1", "loaded"),
         ];
         let ctx = context(messages, Some(vec![tool("base_tool"), tool("read")]));
         let params =
-            build_params(&model, &ctx, true, &AnthropicOptions::default()).expect("params");
+            build_params(&model, &ctx, true, false, &AnthropicOptions::default()).expect("params");
         let tools = params["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], json!("base_tool"));
-        assert!(tools[0].get("defer_loading").is_none());
         assert_eq!(tools[1]["name"], json!("Read"));
-        assert_eq!(tools[1]["defer_loading"], json!(true));
-        let content = params["messages"][1]["content"]
-            .as_array()
-            .expect("content");
-        assert_eq!(
-            content[0]["content"],
-            json!([{"type": "tool_reference", "tool_name": "Read"}])
-        );
-    }
-
-    #[test]
-    fn test_build_params_all_tools_deferred_keeps_one_immediate() {
-        // Upstream "keeps one immediate Anthropic tool when every current
-        // tool is marked": the only tool stays immediate, no reference.
-        let model = make_model(json!({}));
-        let messages = vec![tool_result("toolu_1", "loaded", Some(vec!["late_tool"]))];
-        let ctx = context(messages, Some(vec![tool("late_tool")]));
-        let params =
-            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
-        let tools = params["tools"].as_array().expect("tools");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], json!("late_tool"));
-        assert!(tools[0].get("defer_loading").is_none());
-        let body = serde_json::to_string(&params).expect("serialize");
-        assert!(!body.contains("tool_reference"));
-    }
-
-    #[test]
-    fn test_build_params_missing_tool_marker_no_reference() {
-        // Upstream "does not resurrect a marked tool missing from
-        // Context.tools": markers only defer tools actually present.
-        let model = make_model(json!({}));
-        let messages = vec![tool_result("toolu_1", "loaded", Some(vec!["ghost"]))];
-        let ctx = context(messages, Some(vec![tool("base_tool")]));
-        let params =
-            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
-        let tools = params["tools"].as_array().expect("tools");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], json!("base_tool"));
-        let body = serde_json::to_string(&params).expect("serialize");
-        assert!(!body.contains("tool_reference"));
-    }
-
-    #[test]
-    fn test_build_params_transport_preference_ignored() {
-        // Transport is a codex-only preference; every other provider silently
-        // ignores it (upstream: only openai-codex-responses.ts reads it).
-        let model = make_model(json!({}));
-        let ctx = context(vec![user_text("hi")], None);
-        let plain =
-            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
-        let with_transport = build_params(
-            &model,
-            &ctx,
-            false,
-            &AnthropicOptions {
-                stream: StreamOptions {
-                    transport: Some(crate::types::Transport::Websocket),
-                    ..StreamOptions::default()
-                },
-                ..AnthropicOptions::default()
-            },
-        )
-        .expect("params");
-        assert_eq!(
-            serde_json::to_string(&plain).expect("serialize"),
-            serde_json::to_string(&with_transport).expect("serialize")
-        );
+        assert!(tools.iter().all(|tool| tool.get("defer_loading").is_none()));
+        assert!(!params.to_string().contains("tool_reference"));
     }
 
     // -----------------------------------------------------------------------
@@ -3897,6 +3804,7 @@ mod mid_convo_effort_tests {
 
     use super::tests::{assistant_message, context, make_model, user_text};
     use super::*;
+    use crate::types::Context;
 
     fn managed_model(provider: &str) -> Model {
         make_model(json!({
@@ -3941,7 +3849,7 @@ mod mid_convo_effort_tests {
 
     async fn capture(
         model: &Model,
-        context: &Context,
+        context: &crate::types::TranscriptContext,
         effort: Option<&str>,
     ) -> (Value, AssistantMessage) {
         let payload = Arc::new(Mutex::new(Value::Null));
@@ -4153,12 +4061,19 @@ mod mid_convo_effort_tests {
             thinking_enabled: Some(true),
             ..Default::default()
         };
-        let betas = get_beta_features(&model, &Context::default(), false, &options);
+        let betas = get_beta_features(
+            &model,
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
+            false,
+            &options,
+        );
         assert!(betas.contains(&"mid-conversation-output-config-2026-07-01".to_owned()));
         assert!(betas.contains(&"thinking-binding-controls-2026-08-01".to_owned()));
         let (headers, _) = build_request_headers(
             &model,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             Some("test-key"),
             &options,
             None,
@@ -4186,7 +4101,8 @@ mod mid_convo_effort_tests {
         }));
         let betas = get_beta_features(
             &with_fallbacks,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             false,
             &AnthropicOptions::default(),
         );
@@ -4196,7 +4112,8 @@ mod mid_convo_effort_tests {
             let model = make_model(json!({"compat": compat}));
             let betas = get_beta_features(
                 &model,
-                &Context::default(),
+                &crate::utils::transcript::normalize_context(&Context::default()),
+                false,
                 false,
                 &AnthropicOptions::default(),
             );
@@ -4217,7 +4134,7 @@ mod mid_convo_effort_tests {
             thinking_enabled: Some(true),
             ..Default::default()
         };
-        let base = Context::default();
+        let base = crate::utils::transcript::normalize_context(&Context::default());
 
         // String override wins and is normalized.
         let mut with_model_headers = managed_model("anthropic");
@@ -4227,7 +4144,7 @@ mod mid_convo_effort_tests {
                 .collect(),
         );
         assert_eq!(
-            get_beta_features(&with_model_headers, &base, false, &options),
+            get_beta_features(&with_model_headers, &base, false, false, &options),
             vec!["a".to_owned(), "b".to_owned()]
         );
 
@@ -4243,7 +4160,7 @@ mod mid_convo_effort_tests {
             thinking_enabled: Some(true),
             ..Default::default()
         };
-        assert!(get_beta_features(&model, &base, false, &null_options).is_empty());
+        assert!(get_beta_features(&model, &base, false, false, &null_options).is_empty());
 
         // options beat model headers; dedup keeps first occurrence.
         let mut model_headers = managed_model("anthropic");
@@ -4268,7 +4185,7 @@ mod mid_convo_effort_tests {
             ..Default::default()
         };
         assert_eq!(
-            get_beta_features(&model_headers, &base, false, &override_options),
+            get_beta_features(&model_headers, &base, false, false, &override_options),
             vec!["b".to_owned(), "a".to_owned()]
         );
     }
@@ -4280,6 +4197,7 @@ mod header_semantics_tests {
 
     use super::tests::make_model;
     use super::*;
+    use crate::types::Context;
 
     #[test]
     fn test_user_headers_override_key_derived_auth() {
@@ -4291,7 +4209,8 @@ mod header_semantics_tests {
             [("X-API-Key".to_owned(), Some("user-key".to_owned()))].into();
         let (headers, _) = build_request_headers(
             &model,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             Some("sk-key"),
             &AnthropicOptions {
                 stream: crate::types::StreamOptions {
@@ -4319,7 +4238,8 @@ mod header_semantics_tests {
         let options_headers: ProviderHeaders = [("x-api-key".to_owned(), None)].into();
         let (headers, _) = build_request_headers(
             &model,
-            &Context::default(),
+            &crate::utils::transcript::normalize_context(&Context::default()),
+            false,
             Some("sk-key"),
             &AnthropicOptions {
                 stream: crate::types::StreamOptions {
@@ -4343,33 +4263,24 @@ mod header_semantics_tests {
 }
 
 #[cfg(test)]
-mod fireworks_deferred_tools_tests {
-    //! Port of `packages/ai/test/fireworks-deferred-tools.test.ts` as
-    //! introduced in-range by `d92eb8d4b` (with `6b94ae2ec`, #9323). At pin
-    //! HEAD the file and the `supportsToolReferences` compat face were
-    //! reworked away by `9e05370b2` (#9548, mid-conversation tool updates —
-    //! V15-06/R3.3 scope); the rpi port targets the d92eb8d4b state and the
-    //! 2026-09-14 catalog snapshot, which predate that rework —
-    //! discovery/replay serialization for Fireworks Messages models,
-    //! asserted via the on_payload capture seam (upstream captures the SDK
-    //! payload; rpi captures at the same point and lets the unreachable
+mod fireworks_mid_convo_tools_tests {
+    //! Port of the Fireworks Messages-model replay face after #9548
+    //! (`9e05370b2`): the d92eb8d4b-era `supportsToolReferences` deferred
+    //! loading (addedToolNames + tool_reference blocks) is gone — tool
+    //! changes ride transcript system messages instead. The unsigned
+    //! thinking replay (allowEmptySignature) survives; asserted via the
+    //! on_payload capture seam (upstream captures the SDK payload; rpi
+    //! captures at the same point and lets the unreachable
     //! `http://127.0.0.1:9` endpoint fail the request).
     use std::sync::{Arc, Mutex};
 
     use serde_json::{json, Value};
 
-    use super::tests::{assistant_message, context, user_text};
+    use super::tests::{assistant_message, user_text};
     use super::*;
-    use crate::types::{AssistantContent, ToolResultContent};
+    use crate::types::{AssistantContent, Context, ToolResultContent};
+
     fn fireworks_catalog_model() -> Model {
-        // The V15-02 wire test pins the d92eb8d4b-era catalog face
-        // (supportsToolReferences + allowEmptySignature +
-        // forceAdaptiveThinking). The #9548 rework (9e05370b2) dropped
-        // `supportsToolReferences` from the vendored catalog (replaced by
-        // the supportsMidConvo* faces), so the gate is restored explicitly
-        // here; catalog-data sync landed with V15-03 and the adapter-gate
-        // convergence is V15-06 (T-V15-02-1). Only the endpoint is
-        // overridden for capture.
         let mut model = crate::generated::get_builtin_model(
             "fireworks",
             "accounts/fireworks/models/deepseek-v4-flash-0731",
@@ -4377,80 +4288,10 @@ mod fireworks_deferred_tools_tests {
         .expect("catalog model")
         .clone();
         model.base_url = "http://127.0.0.1:9".to_owned();
-        let mut compat = model.compat.clone().unwrap_or_default();
-        compat.supports_tool_references = Some(true);
-        model.compat = Some(compat);
         model
     }
 
-    fn lookup_tool() -> Tool {
-        serde_json::from_value(json!({
-            "name": "lookup", "description": "Look up a synthetic key",
-            "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}
-        }))
-        .expect("tool")
-    }
-
-    fn discovery_context(loader_name: &str) -> Context {
-        let model = fireworks_catalog_model();
-        let assistant = assistant_message(
-            vec![
-                AssistantContent::Thinking(crate::types::ThinkingContent {
-                    thinking: "Find a lookup tool.".to_owned(),
-                    thinking_signature: Some("".to_owned()),
-                    redacted: None,
-                }),
-                AssistantContent::ToolCall(crate::types::ToolCall {
-                    id: "search1".to_owned(),
-                    name: loader_name.to_owned(),
-                    arguments: json!({"query": "lookup"})
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                    thought_signature: None,
-                    namespace: None,
-                }),
-            ],
-            &model.provider,
-            &model.id,
-        );
-        let mut assistant = match assistant {
-            Message::Assistant(mut message) => {
-                message.stop_reason = StopReason::ToolUse;
-                message
-            }
-            _ => unreachable!("assistant"),
-        };
-        assistant.stop_reason = StopReason::ToolUse;
-        let _ = &mut assistant;
-        let tool_result = Message::ToolResult(crate::types::ToolResultMessage {
-            role: crate::types::ToolResultRole::ToolResult,
-            tool_call_id: "search1".to_owned(),
-            tool_name: loader_name.to_owned(),
-            content: vec![ToolResultContent::Text(crate::types::TextContent {
-                text: "Found lookup.".to_owned(),
-                text_signature: None,
-            })],
-            added_tool_names: Some(vec!["lookup".to_owned()]),
-            details: None,
-            usage: None,
-            is_error: false,
-            timestamp: 0,
-        });
-        context(
-            vec![user_text("Look up alpha."), Message::Assistant(assistant), tool_result],
-            Some(vec![
-                serde_json::from_value(json!({
-                    "name": loader_name, "description": "Find tools",
-                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
-                }))
-                .expect("loader tool"),
-                lookup_tool(),
-            ]),
-        )
-    }
-
-    async fn capture(model: &Model, context: &Context) -> Value {
+    async fn capture(model: &Model, context: &crate::types::TranscriptContext) -> Value {
         let payload = Arc::new(Mutex::new(Value::Null));
         let slot = payload.clone();
         let options = AnthropicOptions {
@@ -4480,56 +4321,83 @@ mod fireworks_deferred_tools_tests {
         captured
     }
 
-    /// "serializes discovery and replay" — payload assertions for each
-    /// accepted loader name (ToolSearch / tool_search / discover_tools).
+    /// Unsigned thinking replays with `signature: ""` (allowEmptySignature,
+    /// catalog face from #9323); a plain tool result carries no
+    /// tool_reference blocks post-#9548.
     #[tokio::test]
-    async fn serializes_discovery_and_replay_for_fireworks_messages_models() {
-        for loader_name in ["ToolSearch", "tool_search", "discover_tools"] {
-            let model = fireworks_catalog_model();
-            let context = discovery_context(loader_name);
-            let payload = capture(&model, &context).await;
+    async fn replays_unsigned_thinking_with_plain_tool_results() {
+        let model = fireworks_catalog_model();
+        let assistant = assistant_message(
+            vec![
+                AssistantContent::Thinking(crate::types::ThinkingContent {
+                    thinking: "Find a lookup tool.".to_owned(),
+                    thinking_signature: Some(String::new()),
+                    redacted: None,
+                }),
+                AssistantContent::ToolCall(crate::types::ToolCall {
+                    id: "search1".to_owned(),
+                    name: "ToolSearch".to_owned(),
+                    arguments: json!({"query": "lookup"})
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    thought_signature: None,
+                    namespace: None,
+                }),
+            ],
+            &model.provider,
+            &model.id,
+        );
+        let mut assistant = match assistant {
+            Message::Assistant(mut message) => {
+                message.stop_reason = StopReason::ToolUse;
+                message
+            }
+            _ => unreachable!("assistant"),
+        };
+        let _ = &mut assistant;
+        let tool_result = Message::ToolResult(crate::types::ToolResultMessage {
+            role: crate::types::ToolResultRole::ToolResult,
+            tool_call_id: "search1".to_owned(),
+            tool_name: "ToolSearch".to_owned(),
+            content: vec![ToolResultContent::Text(crate::types::TextContent {
+                text: "Found lookup.".to_owned(),
+                text_signature: None,
+            })],
+            details: None,
+            usage: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let context = crate::utils::transcript::normalize_context(&Context {
+            system_prompt: None,
+            messages: vec![
+                user_text("Look up alpha."),
+                Message::Assistant(assistant),
+                tool_result,
+            ],
+            tools: None,
+        });
+        let payload = capture(&model, &context).await;
 
-            // Tools: the loader stays immediate; lookup is deferred.
-            assert_eq!(
-                payload["tools"],
-                json!([
-                    {
-                        "name": loader_name,
-                        "description": "Find tools",
-                        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
-                    },
-                    {
-                        "name": "lookup",
-                        "description": "Look up a synthetic key",
-                        "input_schema": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]},
-                        "defer_loading": true
-                    }
-                ]),
-                "loader {loader_name}"
-            );
-
-            // Unsigned thinking replays with `signature: ""` (allowEmptySignature).
-            assert_eq!(
-                payload["messages"][1]["content"][0],
-                json!({"type": "thinking", "thinking": "Find a lookup tool.", "signature": ""}),
-                "loader {loader_name}"
-            );
-
-            // Discovery result: tool_reference block plus displaced text.
-            assert_eq!(
-                payload["messages"][2]["content"],
-                json!([
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "search1",
-                        "content": [{"type": "tool_reference", "tool_name": "lookup"}],
-                        "is_error": false
-                    },
-                    {"type": "text", "text": "Found lookup."}
-                ]),
-                "loader {loader_name}"
-            );
-        }
+        // Unsigned thinking replays with `signature: ""`.
+        assert_eq!(
+            payload["messages"][1]["content"][0],
+            json!({"type": "thinking", "thinking": "Find a lookup tool.", "signature": ""})
+        );
+        // Plain tool_result — the tool_reference discovery block is gone
+        // with the mechanism (#9548).
+        assert_eq!(
+            payload["messages"][2]["content"],
+            json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "search1",
+                    "content": "Found lookup.",
+                    "is_error": false
+                }
+            ])
+        );
     }
 }
 
@@ -4619,5 +4487,357 @@ mod vercel_unsigned_thinking_tests {
             Some("thinking"),
             "unsigned thinking must not replay as thinking without compat"
         );
+    }
+}
+
+#[cfg(test)]
+mod transcript_tool_changes_tests {
+    //! Port of the Anthropic face of `packages/ai/test/transcript-tool-changes.test.ts`
+    //! (#9548, 9e05370b2): native mid-conversation system messages with
+    //! `tool_addition`/`tool_removal` blocks, the deferred placeholder, the
+    //! capability gating, and the non-native collapse fallback. Asserted via
+    //! the on_payload capture seam (same pattern as the sibling modules:
+    //! capture, then let the unreachable endpoint fail the request).
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{json, Value};
+
+    use super::tests::{context, make_model, user_text};
+    use super::*;
+    use crate::types::{SystemMessage, TranscriptContext};
+
+    fn tool_declaration(name: &str) -> Tool {
+        // Upstream `tool(name)`: `{name, description: `${name} tool`, parameters: {}}`.
+        serde_json::from_value(json!({
+            "name": name,
+            "description": format!("{name} tool"),
+            "parameters": {"type": "object", "properties": {}}
+        }))
+        .expect("tool")
+    }
+
+    fn system_message(value: Value) -> Message {
+        let system: SystemMessage = serde_json::from_value(value).expect("system message");
+        Message::System(system)
+    }
+
+    /// Upstream `context` (transcript-tool-changes.test.ts:36-49): a leading
+    /// declaration, one user turn, then an update with a section patch
+    /// (`docs: null` removal) plus a tool swap.
+    fn base_context() -> TranscriptContext {
+        context(
+            vec![
+                system_message(json!({
+                    "role": "system",
+                    "content": "base prompt",
+                    "sections": {
+                        "rules": "<rules>\nold rules\n</rules>",
+                        "docs": "<docs>\nread docs\n</docs>"
+                    },
+                    "toolsAdded": [tool_declaration("base_tool")],
+                    "timestamp": 0
+                })),
+                user_text("before"),
+                system_message(json!({
+                    "role": "system",
+                    "content": "updated guidance",
+                    "sections": {
+                        "rules": "<rules>\nnew rules\n</rules>",
+                        "docs": null
+                    },
+                    "toolsRemoved": [{"name": "base_tool"}],
+                    "toolsAdded": [tool_declaration("late_tool")],
+                    "timestamp": 2
+                })),
+            ],
+            None,
+        )
+    }
+
+    fn native_model() -> Model {
+        let mut model = make_model(json!({
+            "id": "claude-opus-5",
+            "name": "Claude Opus 5",
+            "compat": {
+                "supportsMidConvoSystemMessages": true,
+                "supportsMidConvoToolChanges": true
+            }
+        }));
+        model.base_url = "http://127.0.0.1:9".to_owned();
+        model
+    }
+
+    async fn capture(model: &Model, context: &TranscriptContext) -> Value {
+        let payload = Arc::new(Mutex::new(Value::Null));
+        let slot = payload.clone();
+        let options = AnthropicOptions {
+            stream: crate::types::StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    api_key: Some("test-key".to_owned()),
+                    on_payload: Some(Arc::new(move |value, _model| {
+                        let slot = slot.clone();
+                        Box::pin(async move {
+                            *slot.lock().unwrap_or_else(|e| e.into_inner()) = value;
+                            None
+                        })
+                    })),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let event_stream = stream(model, context, options);
+        // The endpoint is unreachable; the payload was captured first.
+        let _ = event_stream.result().await;
+        let captured = payload.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        captured
+    }
+
+    /// "sends Anthropic updates and tool changes in native system messages"
+    /// (transcript-tool-changes.test.ts:82).
+    #[tokio::test]
+    async fn sends_updates_and_tool_changes_in_native_system_messages() {
+        let payload = capture(&native_model(), &base_context()).await;
+
+        let betas = payload["betas"].as_array().expect("betas");
+        assert!(
+            betas
+                .iter()
+                .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
+            "native tool changes beta present: {betas:?}"
+        );
+        assert_eq!(
+            payload["system"][0]["text"],
+            "base prompt\n\n<rules>\nold rules\n</rules>\n\n<docs>\nread docs\n</docs>"
+        );
+
+        // Initial tools stay active and carry the cache breakpoint; the
+        // placeholder and every later declaration are deferred; the removed
+        // tool stays declared.
+        let tools = payload["tools"].as_array().expect("tools");
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("base_tool"),
+                Some(super::DEFERRED_TOOL_PLACEHOLDER_NAME),
+                Some("late_tool")
+            ]
+        );
+        assert_eq!(tools[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(tools[0].get("defer_loading").is_none());
+        assert_eq!(tools[1]["defer_loading"], json!(true));
+        assert!(tools[1].get("cache_control").is_none());
+        assert_eq!(tools[2]["defer_loading"], json!(true));
+        assert!(tools[2].get("cache_control").is_none());
+
+        let messages = payload["messages"].as_array().expect("messages");
+        let update = messages.last().expect("trailing system update");
+        assert_eq!(update["role"], "system");
+        let block_types: Vec<&str> = update["content"]
+            .as_array()
+            .expect("content blocks")
+            .iter()
+            .map(|block| block["type"].as_str().expect("type"))
+            .collect();
+        assert_eq!(block_types, vec!["text", "tool_removal", "tool_addition"]);
+        assert_eq!(update["content"][1]["tool"]["name"], "base_tool");
+        assert_eq!(update["content"][2]["tool"]["name"], "late_tool");
+        let text = update["content"][0]["text"].as_str().expect("text");
+        assert!(text.contains("updated guidance"), "{text}");
+        assert!(text.contains("<rules>\nnew rules\n</rules>"), "{text}");
+        assert!(
+            text.contains("Removed system prompt section \"docs\"."),
+            "{text}"
+        );
+
+        // The placeholder is declared before any change so its scaffolding
+        // is cached from request one (upstream: initial-only transcript).
+        let initial = context(
+            vec![
+                system_message(json!({
+                    "role": "system",
+                    "content": "base prompt",
+                    "toolsAdded": [tool_declaration("base_tool")],
+                    "timestamp": 0
+                })),
+                user_text("before"),
+            ],
+            None,
+        );
+        let initial_payload = capture(&native_model(), &initial).await;
+        let names: Vec<&str> = initial_payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["base_tool", super::DEFERRED_TOOL_PLACEHOLDER_NAME]
+        );
+    }
+
+    /// "sends the current Anthropic tool list when native tool changes cannot
+    /// express the history" (transcript-tool-changes.test.ts:119): a same-name
+    /// redefinition, and a transcript with no initial tool to anchor deferred
+    /// ones, both fall back to the current tool list.
+    #[tokio::test]
+    async fn sends_current_tool_list_when_native_cannot_express_history() {
+        let redefined = serde_json::from_value::<Tool>(json!({
+            "name": "base_tool",
+            "description": "changed",
+            "parameters": {"type": "object", "properties": {}}
+        }))
+        .expect("tool");
+        let redefined_b = serde_json::from_value::<Tool>(json!({
+            "name": "base_tool",
+            "description": "changed",
+            "parameters": {"type": "object", "properties": {}}
+        }))
+        .expect("tool");
+        let fallback_contexts = vec![
+            // Same-name redefinition: blocks reference tools by name only.
+            context(
+                vec![
+                    system_message(json!({
+                        "role": "system",
+                        "content": "base prompt",
+                        "toolsAdded": [tool_declaration("base_tool")],
+                        "timestamp": 0
+                    })),
+                    system_message(json!({
+                        "role": "system",
+                        "content": "updated guidance",
+                        "toolsRemoved": [{"name": "base_tool"}],
+                        "toolsAdded": [redefined],
+                        "timestamp": 2
+                    })),
+                ],
+                None,
+            ),
+            // No initial tool: Anthropic rejects an all-deferred tool list.
+            context(
+                vec![
+                    system_message(json!({
+                        "role": "system",
+                        "content": "base prompt",
+                        "timestamp": 0
+                    })),
+                    system_message(json!({
+                        "role": "system",
+                        "content": "updated guidance",
+                        "toolsAdded": [redefined_b],
+                        "timestamp": 2
+                    })),
+                ],
+                None,
+            ),
+        ];
+        for fallback in fallback_contexts {
+            let payload = capture(&native_model(), &fallback).await;
+            let betas = payload["betas"].as_array().cloned().unwrap_or_default();
+            assert!(
+                !betas
+                    .iter()
+                    .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
+                "no native beta on the fallback: {betas:?}"
+            );
+            let tools = payload["tools"].as_array().expect("tools");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0]["name"], "base_tool");
+            assert_eq!(tools[0]["description"], "changed");
+            assert_eq!(tools[0]["cache_control"], json!({"type": "ephemeral"}));
+            assert!(tools[0].get("defer_loading").is_none());
+            // The update still rides an in-place system message (the model
+            // accepts mid-conversation system messages) — text only.
+            let messages = payload["messages"].as_array().expect("messages");
+            let update = messages.last().expect("trailing system update");
+            assert_eq!(update["role"], "system");
+            let block_types: Vec<&str> = update["content"]
+                .as_array()
+                .expect("content blocks")
+                .iter()
+                .map(|block| block["type"].as_str().expect("type"))
+                .collect();
+            assert_eq!(block_types, vec!["text"]);
+        }
+    }
+
+    /// "folds Anthropic updates into the system prompt without native
+    /// support" (transcript-tool-changes.test.ts:154).
+    #[tokio::test]
+    async fn folds_updates_into_system_prompt_without_native_support() {
+        let mut model = make_model(json!({}));
+        model.base_url = "http://127.0.0.1:9".to_owned();
+        let payload = capture(&model, &base_context()).await;
+
+        let betas = payload["betas"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !betas
+                .iter()
+                .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
+            "no native beta without support: {betas:?}"
+        );
+        assert_eq!(
+            payload["system"][0]["text"],
+            "base prompt\n\nupdated guidance\n\n<rules>\nnew rules\n</rules>"
+        );
+        let tools = payload["tools"].as_array().expect("tools");
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("late_tool")]
+        );
+        let roles: Vec<&str> = payload["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|message| message["role"].as_str().expect("role"))
+            .collect();
+        assert_eq!(roles, vec!["user"]);
+    }
+
+    /// "requires both Anthropic capabilities for native tool changes"
+    /// (transcript-tool-changes.test.ts:177): `supportsMidConvoToolChanges`
+    /// alone is not enough — without mid-conversation system messages the
+    /// transcript collapses.
+    #[tokio::test]
+    async fn requires_both_capabilities_for_native_tool_changes() {
+        let mut model = make_model(json!({
+            "id": "claude-opus-5",
+            "name": "Claude Opus 5",
+            "compat": {"supportsMidConvoToolChanges": true}
+        }));
+        model.base_url = "http://127.0.0.1:9".to_owned();
+        let payload = capture(&model, &base_context()).await;
+
+        let betas = payload["betas"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !betas
+                .iter()
+                .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
+            "no native beta with one capability: {betas:?}"
+        );
+        let tools = payload["tools"].as_array().expect("tools");
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("late_tool")]
+        );
+        let roles: Vec<&str> = payload["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|message| message["role"].as_str().expect("role"))
+            .collect();
+        assert_eq!(roles, vec!["user"]);
     }
 }

@@ -59,7 +59,7 @@ use futures::future::BoxFuture;
 use futures::StreamExt;
 use rpi_ai::models::Models;
 use rpi_ai::types::{
-    AssistantContent, AssistantMessage, AssistantRole, Context, ErrorReason, ImageContent, Model,
+    AssistantContent, AssistantMessage, AssistantRole, ErrorReason, ImageContent, Model,
     ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, TextContent,
     Usage, UserContent, UserContentBlock, UserMessage, UserRole,
 };
@@ -393,7 +393,7 @@ fn failure_stream(
 fn models_stream_fn(models: &Models) -> StreamFn {
     let models = models.clone();
     Arc::new(
-        move |model: Model, context: Context, options: StreamOptions| {
+        move |model: Model, context: rpi_ai::types::TranscriptContext, options: StreamOptions| {
             let models = models.clone();
             futures::stream::once(async move {
                 let simple = SimpleStreamOptions {
@@ -401,6 +401,13 @@ fn models_stream_fn(models: &Models) -> StreamFn {
                     thinking_budgets: None,
                     stream: options,
                     tool_choice: None,
+                };
+                // #9548: the harness materializes its prompt via the
+                // transcript; the facade re-normalizes (no-op here).
+                let context = rpi_ai::types::Context {
+                    system_prompt: None,
+                    messages: context.messages,
+                    tools: None,
                 };
                 let stream: BoxStream<'static, StreamEvent> = models
                     .stream_simple(&model, &context, Some(simple.into()))
@@ -436,6 +443,7 @@ fn agent_message_epoch_ms(message: &AgentMessage) -> i64 {
         AgentMessage::Custom(message) => message.timestamp,
         AgentMessage::BranchSummary(message) => message.timestamp,
         AgentMessage::CompactionSummary(message) => message.timestamp,
+        AgentMessage::System(message) => message.timestamp,
     }
 }
 
@@ -964,27 +972,47 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
         })
     }
 
-    /// `createContext` (agent-harness.ts:389-398).
+    /// `createContext` (agent-harness.ts:389-398, post-#9548): the turn's
+    /// prompt and tool declarations ride a leading system message in the
+    /// transcript (upstream sends them through the normalized `AiContext`).
     fn create_context(
         &self,
         turn_state: &TurnState<TContext>,
         system_prompt: Option<String>,
     ) -> AgentContext {
+        let tools: Vec<Arc<dyn AgentTool>> = turn_state
+            .active_tools
+            .iter()
+            .map(|tool| {
+                Arc::new(BoundTool {
+                    tool: Arc::clone(tool),
+                    context: turn_state.tool_context.clone(),
+                }) as Arc<dyn AgentTool>
+            })
+            .collect();
+        let mut messages = turn_state.messages.clone();
+        let declared_tools: Vec<rpi_ai::types::Tool> = tools
+            .iter()
+            .map(|tool| rpi_ai::types::Tool {
+                name: tool.name().to_owned(),
+                description: tool.description().to_owned(),
+                parameters: tool.parameters().clone(),
+                constrained_sampling: tool.constrained_sampling(),
+            })
+            .collect();
+        let effective_prompt = system_prompt.unwrap_or_else(|| turn_state.system_prompt.clone());
+        let initial = rpi_ai::utils::transcript::create_initial_system_message(
+            Some(&effective_prompt),
+            Some(&declared_tools),
+        );
+        if !matches!(messages.first(), Some(AgentMessage::System(_))) {
+            if let Some(initial) = initial {
+                messages.insert(0, AgentMessage::System(initial));
+            }
+        }
         AgentContext {
-            system_prompt: system_prompt.unwrap_or_else(|| turn_state.system_prompt.clone()),
-            messages: turn_state.messages.clone(),
-            tools: Some(
-                turn_state
-                    .active_tools
-                    .iter()
-                    .map(|tool| {
-                        Arc::new(BoundTool {
-                            tool: Arc::clone(tool),
-                            context: turn_state.tool_context.clone(),
-                        }) as Arc<dyn AgentTool>
-                    })
-                    .collect(),
-            ),
+            messages,
+            tools: Some(tools),
         }
     }
 
@@ -996,7 +1024,9 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
     fn create_stream_fn(self: &Arc<Self>, shared: Arc<RunShared<TContext>>) -> StreamFn {
         let this = Arc::clone(self);
         Arc::new(
-            move |model: Model, context: Context, options: StreamOptions| {
+            move |model: Model,
+                  context: rpi_ai::types::TranscriptContext,
+                  options: StreamOptions| {
                 let this = Arc::clone(&this);
                 let shared = Arc::clone(&shared);
                 futures::stream::once(async move {
@@ -1108,6 +1138,11 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                         reasoning: options.reasoning.and_then(thinking_level_from_model_level),
                         thinking_budgets: None,
                         tool_choice: None,
+                    };
+                    let context = rpi_ai::types::Context {
+                        system_prompt: None,
+                        messages: context.messages,
+                        tools: None,
                     };
                     this.models
                         .stream_simple(&model, &context, Some(simple.into()))
@@ -1282,6 +1317,7 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                     };
                     let update = AgentLoopTurnUpdate {
                         context: Some(this.create_context(&next_turn_state, None)),
+                        messages: None,
                         model: Some(next_turn_state.model.clone()),
                         thinking_level: Some(next_turn_state.thinking_level),
                     };
@@ -2513,6 +2549,7 @@ mod tests {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         })
     }
 

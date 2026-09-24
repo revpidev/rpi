@@ -112,7 +112,15 @@ fn get_message_from_entry_for_compaction(entry: &SessionEntry) -> Option<AgentMe
     if matches!(entry, SessionEntry::Compaction(_)) {
         return None;
     }
-    session_entry_to_context_messages(entry).into_iter().next()
+    // #9548 (compaction.ts:93-99): system messages are prompt state, not
+    // conversation; the compaction entry carries their replay.
+    let message = session_entry_to_context_messages(entry)
+        .into_iter()
+        .next()?;
+    if matches!(message, AgentMessage::System(_)) {
+        return None;
+    }
+    Some(message)
 }
 
 /// Result from [`compact`] — the SessionManager adds id/parentId when saving
@@ -306,6 +314,9 @@ fn estimate_user_content_chars(content: &rpi_ai::types::UserContent) -> usize {
 /// heuristic; do not "improve", ADR-0002 §4).
 pub fn estimate_tokens(message: &AgentMessage) -> u64 {
     let chars: usize = match message {
+        // #9548: system messages carry prompt/tool state; upstream's switch
+        // leaves them at 0 chars.
+        AgentMessage::System(_) => 0,
         AgentMessage::User(user) => estimate_user_content_chars(&user.content),
         AgentMessage::Assistant(assistant) => assistant
             .content
@@ -343,7 +354,8 @@ fn is_cut_point_message(message: &AgentMessage) -> bool {
         | AgentMessage::Custom(_)
         | AgentMessage::BranchSummary(_)
         | AgentMessage::CompactionSummary(_) => true,
-        AgentMessage::ToolResult(_) => false,
+        // #9548: prompt/tool state never anchors a cut.
+        AgentMessage::System(_) | AgentMessage::ToolResult(_) => false,
     }
 }
 
@@ -355,7 +367,8 @@ fn is_turn_start_message(message: &AgentMessage) -> bool {
         | AgentMessage::Custom(_)
         | AgentMessage::BranchSummary(_)
         | AgentMessage::CompactionSummary(_) => true,
-        AgentMessage::Assistant(_) | AgentMessage::ToolResult(_) => false,
+        // #9548: a system message is prompt state, not a turn start.
+        AgentMessage::Assistant(_) | AgentMessage::ToolResult(_) | AgentMessage::System(_) => false,
     }
 }
 
@@ -706,7 +719,9 @@ pub async fn complete_summarization(
         ..options.clone()
     };
     let produce = || async {
-        let stream = stream_fn(model.clone(), context.clone(), request_options.clone());
+        // #9548: the stream function consumes the normalized transcript.
+        let transcript = rpi_ai::utils::transcript::normalize_context(context);
+        let stream = stream_fn(model.clone(), transcript, request_options.clone());
         match request_options.signal.clone() {
             Some(signal) => tokio::select! {
                 // `biased` + stream first: a terminal event that already

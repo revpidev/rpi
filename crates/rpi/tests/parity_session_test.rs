@@ -283,13 +283,15 @@ async fn parity_fixture_session_prompt_continue_with_faux_provider() {
         .await
         .expect("prompt");
 
-    // The file appends exactly two lines (same model/thinking, no extra entries); the
-    // prefix is untouched.
+    // #9548: the file appends three lines — the first request's leading
+    // system declaration (old-session backfill), the user turn, and the
+    // assistant turn (same model/thinking, no extra entries); the prefix is
+    // untouched.
     let on_disk = std::fs::read_to_string(&staged).expect("read continued session");
     let continued_lines = non_empty_lines(&on_disk);
     assert_eq!(
         continued_lines.len(),
-        before_lines.len() + 2,
+        before_lines.len() + 3,
         "file appended exactly the continued turn"
     );
     assert_eq!(

@@ -246,7 +246,6 @@ impl AgentTool for LsTool {
                 })],
                 details: Value::Null,
                 usage: None,
-                added_tool_names: None,
                 terminate: None,
             });
         }
@@ -298,7 +297,6 @@ impl AgentTool for LsTool {
                 Value::Object(details)
             },
             usage: None,
-            added_tool_names: None,
             terminate: None,
         })
     }

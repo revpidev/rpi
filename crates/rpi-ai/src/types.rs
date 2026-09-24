@@ -559,6 +559,8 @@ pub enum Role {
     Assistant,
     #[serde(rename = "toolResult")]
     ToolResult,
+    #[serde(rename = "system")]
+    System,
 }
 
 /// Role marker for [`UserMessage`] (`role: "user"`).
@@ -583,6 +585,14 @@ pub enum ToolResultRole {
     #[default]
     #[serde(rename = "toolResult")]
     ToolResult,
+}
+
+/// Role marker for [`SystemMessage`] (`role: "system"`, #9548).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SystemRole {
+    #[default]
+    #[serde(rename = "system")]
+    System,
 }
 
 /// `TextSignatureV1` — structured payload that may appear inside
@@ -1028,6 +1038,83 @@ pub struct DeferredHandle {
     pub data: Option<Value>,
 }
 
+/// `SystemMessage` (#9548, 9e05370b2 — types.ts:480-514): system instructions
+/// and tool declarations at one point in the transcript.
+///
+/// The leading system message is the system prompt. Later system messages
+/// change it: `content` adds instructions from that point on, `sections`
+/// replace or remove named prompt sections, and `toolsAdded`/`toolsRemoved`
+/// change the tool set. Replaying every system message in order yields the
+/// current prompt and tools. Providers that accept system messages
+/// mid-conversation send each one in place; other providers rebuild the
+/// leading system message from the replayed state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemMessage {
+    pub role: SystemRole,
+    /// Instruction text. On the leading message this is the base prompt;
+    /// later, additional instructions. Both a missing key and an explicit
+    /// `null` normalize to `""` (upstream `message.content == null` covers
+    /// both; session-manager.ts:397 @ #9548).
+    #[serde(default, deserialize_with = "null_default")]
+    pub content: SystemContent,
+    /// Named, ordered prompt sections rendered verbatim after `content`.
+    /// The leading message declares them; later messages replace sections
+    /// by name, and `null` removes one. Ordered via `serde_json`'s
+    /// `preserve_order` (upstream TS object literal ordering).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<serde_json::Map<String, Value>>,
+    /// Complete definitions of tools that become available at this point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_added: Option<Vec<Tool>>,
+    /// Tools that stop being available at this point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_removed: Option<Vec<ToolReference>>,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: i64,
+}
+
+impl SystemMessage {
+    /// Read one section's value: `None` when absent, `Some(None)` when the
+    /// name maps to JSON `null` (the removal marker).
+    pub fn section(&self, name: &str) -> Option<Option<&str>> {
+        self.sections
+            .as_ref()
+            .and_then(|sections| sections.get(name))
+            .map(|value| value.as_str())
+    }
+
+    /// Iterate `(name, value)` pairs in declaration order; `null` values
+    /// surface as `None` (removal marker).
+    pub fn iter_sections(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.sections
+            .iter()
+            .flatten()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
+/// `SystemMessage.content: string | TextContent[]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SystemContent {
+    Text(String),
+    Blocks(Vec<TextContent>),
+}
+
+impl Default for SystemContent {
+    fn default() -> Self {
+        SystemContent::Text(String::new())
+    }
+}
+
+/// `ToolReference` — a tool named by reference (toolsRemoved entries).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolReference {
+    pub name: String,
+}
+
 /// `UserMessage`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1106,21 +1193,20 @@ pub struct ToolResultMessage {
     /// LLM context accounting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    /// Names from `Context.tools` that became available after this result
-    /// (deferred tool loading load point).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub added_tool_names: Option<Vec<String>>,
     pub is_error: bool,
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
 }
 
-/// `Message = UserMessage | AssistantMessage | ToolResultMessage`.
+/// `Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage`
+/// (post-#9548 order; system rides first-class for mid-conversation
+/// semantics).
 ///
 /// Untagged: the per-struct role markers disambiguate the variants.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Message {
+    System(SystemMessage),
     User(UserMessage),
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
@@ -1129,6 +1215,7 @@ pub enum Message {
 impl Message {
     pub fn role(&self) -> Role {
         match self {
+            Message::System(_) => Role::System,
             Message::User(_) => Role::User,
             Message::Assistant(_) => Role::Assistant,
             Message::ToolResult(_) => Role::ToolResult,
@@ -1241,6 +1328,61 @@ pub struct Context {
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+}
+
+/// Zero-sized brand type: its privacy keeps [`TranscriptContext`]
+/// construction inside `rpi-ai` (upstream `transcriptContextBrand`,
+/// types.ts:627-635).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptContextBrand;
+
+/// Crate-internal full constructor (brand + messages); the only sanctioned
+/// production path outside `normalize_context` is `collapse_system_messages`
+/// / `resolve_transcript` in `utils/transcript.rs`.
+pub(crate) fn make_transcript_context(messages: Vec<Message>) -> TranscriptContext {
+    TranscriptContext {
+        messages,
+        _brand: TranscriptContextBrand,
+    }
+}
+
+/// `TranscriptContext` (#9548): normalized request context passed to
+/// providers and API implementations. The prompt and tool declarations are
+/// carried by the transcript's system messages. Only
+/// [`crate::utils::transcript::normalize_context`] produces this type, so a
+/// raw [`Context`] cannot reach provider code by accident.
+///
+/// Serde note: the JSON form is exactly `{"messages": [...]}` (the TS brand
+/// symbol is invisible to `JSON.stringify`, so the proxy wire shape carries
+/// only `messages`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptContext {
+    pub messages: Vec<Message>,
+    /// Upstream brands via a unique symbol; the private field plays the same
+    /// role in Rust (external crates cannot construct the struct literally).
+    _brand: TranscriptContextBrand,
+}
+
+impl Serialize for TranscriptContext {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("TranscriptContext", 1)?;
+        state.serialize_field("messages", &self.messages)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranscriptContext {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            messages: Vec<Message>,
+        }
+        Ok(TranscriptContext {
+            messages: Raw::deserialize(deserializer)?.messages,
+            _brand: TranscriptContextBrand,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1519,13 +1661,6 @@ pub enum CacheControlFormat {
     Anthropic,
 }
 
-/// `OpenAICompletionsCompat.deferredToolsMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DeferredToolsMode {
-    #[serde(rename = "kimi")]
-    Kimi,
-}
-
 /// `OpenAICompletionsCompat.thinkingTokenBudgetField` (b23741269/#8275):
 /// the top-level request field carrying the thinking budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1651,9 +1786,6 @@ pub struct ModelCompat {
     /// Also in AnthropicMessagesCompat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub send_session_affinity_headers: Option<bool>,
-    /// Provider-specific deferred tool serialization mode.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deferred_tools_mode: Option<DeferredToolsMode>,
     /// Session-affinity header format. Also in OpenAIResponsesCompat; the
     /// Anthropic Messages adapter consumes it too (#9102: `openrouter`
     /// selects `x-session-id`, unset keeps `x-session-affinity`).
@@ -1711,15 +1843,10 @@ pub struct ModelCompat {
     /// models with no permitted fallback targets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_fallback_models: Option<Vec<AnthropicAllowedFallbackModel>>,
-    /// Whether the provider supports deferred tools loaded by
-    /// `tool_reference` blocks in tool results. Post-#9548 catalog data no
-    /// longer carries this key (replaced by the `supportsMidConvo*` faces
-    /// below; the adapter gate converges in V15-06 — T-V15-02-1).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supports_tool_references: Option<bool>,
     /// Whether the model accepts system messages / Kimi-style tool-bearing
     /// system messages after the conversation started (#9548, 9e05370b2 —
-    /// replaces the earlier `supportsToolReferences` catalog face). Declared
+    /// replaces the earlier `supportsToolReferences` catalog face, which
+    /// left the type surface with the deferred-tool mechanism). Declared
     /// in OpenAI-completions/responses and Anthropic-messages compat;
     /// catalog bake rules are V15-03 data sync, wire semantics V15-06.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2461,7 +2588,6 @@ mod tests {
             })],
             details: Some(json!({"truncated": false})),
             usage: None,
-            added_tool_names: Some(vec!["grep".to_owned()]),
             is_error: false,
             timestamp: 3,
         };
@@ -2470,7 +2596,8 @@ mod tests {
         assert_eq!(v["toolCallId"], json!("c1"));
         assert_eq!(v["toolName"], json!("read"));
         assert_eq!(v["details"], json!({"truncated": false}));
-        assert_eq!(v["addedToolNames"], json!(["grep"]));
+        // addedToolNames removed with the deferred-tool mechanism (#9548).
+        assert!(v.get("addedToolNames").is_none());
         assert_eq!(v["isError"], json!(false));
         assert!(
             v.get("usage").is_none(),
@@ -2478,6 +2605,23 @@ mod tests {
         );
         let back: ToolResultMessage = serde_json::from_str(&to_json(&msg)).expect("roundtrip");
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn system_message_content_tolerates_null_and_missing() {
+        // #9548 (session-manager.ts:397): `message.content == null` covers
+        // both explicit null and a missing key; both normalize to "".
+        let null_content: SystemMessage = serde_json::from_value(json!({
+            "role": "system", "content": null, "timestamp": 1
+        }))
+        .expect("null content parses");
+        assert_eq!(null_content.content, SystemContent::Text(String::new()));
+        let missing_content: SystemMessage = serde_json::from_value(json!({
+            "role": "system", "timestamp": 1
+        }))
+        .expect("missing content parses");
+        assert_eq!(missing_content.content, SystemContent::Text(String::new()));
+        assert_eq!(null_content, missing_content);
     }
 
     #[test]
