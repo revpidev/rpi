@@ -402,6 +402,40 @@ pub(crate) type PendingToolAborts = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
 >;
 
+/// Host-call subscriptions taken via the `on` method (#8967, V15-09): the
+/// pool maps `subscriptionId → unsubscribe` handle so the additive `off`
+/// host-call can drop exactly one registration. Lives on the guest Store
+/// (wasm) / plugin call context (native) — shared by every re-entrant host
+/// call, dropped with the extension (unload clears all handlers by
+/// construction: the pool and the `LoadedExtension` die together).
+/// `std::sync::Mutex`: the unsubscribe closures run OUTSIDE the lock
+/// (removed first, then invoked).
+pub type HostCallSubscriptions = std::sync::Arc<std::sync::Mutex<HostCallSubscriptionPool>>;
+
+/// Id-assigned pool of live `on` host-call registrations.
+#[derive(Default)]
+pub struct HostCallSubscriptionPool {
+    next_id: u64,
+    live: std::collections::HashMap<u64, crate::api::OnUnsubscribe>,
+}
+
+impl HostCallSubscriptionPool {
+    /// Park a fresh registration; the id is the guest-visible handle.
+    fn insert(&mut self, unsubscribe: crate::api::OnUnsubscribe) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.live.insert(id, unsubscribe);
+        id
+    }
+
+    /// Take one registration for removal (`off`). Unknown ids → `None`
+    /// (upstream `indexOf === -1` silent no-op, loader.ts:290-291 @
+    /// 46c9de402).
+    fn take(&mut self, id: u64) -> Option<crate::api::OnUnsubscribe> {
+        self.live.remove(&id)
+    }
+}
+
 /// State shared with the `rpi_host_call` import closure.
 pub struct HostState {
     pub api: ExtensionApi,
@@ -418,6 +452,8 @@ pub struct HostState {
     pub tool_updates: PendingToolUpdates,
     /// Per-extension in-flight abort signals (see [`PendingToolAborts`]).
     pub tool_aborts: PendingToolAborts,
+    /// Live `on` host-call subscriptions (see [`HostCallSubscriptions`]).
+    pub subscriptions: HostCallSubscriptions,
     /// P2-2: per-guest linear-memory cap (see [`MemoryLimiter`]).
     pub memory_limiter: MemoryLimiter,
 }
@@ -504,6 +540,7 @@ pub async fn instantiate_and_init(
                 in_command: std::cell::Cell::new(false),
                 tool_updates: PendingToolUpdates::default(),
                 tool_aborts: PendingToolAborts::default(),
+                subscriptions: HostCallSubscriptions::default(),
                 memory_limiter: MemoryLimiter,
             },
         );

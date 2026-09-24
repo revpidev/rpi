@@ -872,14 +872,15 @@ async fn api_stale_runtime_rejects_calls() {
 #[tokio::test]
 async fn api_on_typed_round_trips_payload_and_result() {
     let host = host_with(vec![inline_ext("ext-a", |api| {
-        api.on_typed::<ext::SessionStartEvent, ext::SessionBeforeSwitchResult, _, _>(
-            EVENT_SESSION_START,
-            |event, _ctx| async move {
-                assert_eq!(event.reason, ext::SessionStartReason::Startup);
-                Ok(Some(ext::SessionBeforeSwitchResult { cancel: Some(true) }))
-            },
-        )
-        .unwrap();
+        let _unsubscribe = api
+            .on_typed::<ext::SessionStartEvent, ext::SessionBeforeSwitchResult, _, _>(
+                EVENT_SESSION_START,
+                |event, _ctx| async move {
+                    assert_eq!(event.reason, ext::SessionStartReason::Startup);
+                    Ok(Some(ext::SessionBeforeSwitchResult { cancel: Some(true) }))
+                },
+            )
+            .unwrap();
     })])
     .await;
 
@@ -895,11 +896,12 @@ async fn api_on_typed_round_trips_payload_and_result() {
 #[tokio::test]
 async fn api_on_typed_deserialize_failure_is_a_handler_error() {
     let host = host_with(vec![inline_ext("ext-a", |api| {
-        api.on_typed::<ext::SessionStartEvent, Value, _, _>(
-            EVENT_SESSION_START,
-            |_event, _ctx| async move { Ok(None) },
-        )
-        .unwrap();
+        let _unsubscribe = api
+            .on_typed::<ext::SessionStartEvent, Value, _, _>(
+                EVENT_SESSION_START,
+                |_event, _ctx| async move { Ok(None) },
+            )
+            .unwrap();
     })])
     .await;
     let errors = Arc::new(Mutex::new(Vec::new()));

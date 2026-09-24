@@ -1813,3 +1813,357 @@ async fn cache_warming_decision_falls_back_to_own_action() {
         .await;
     assert_eq!(action, ext::CacheWarmingAction::Warm);
 }
+
+// ---------------------------------------------------------------------------
+// #8967: `pi.on()` unsubscribe + dispatch snapshot semantics
+// (landed as 46c9de402; upstream extensions-runner.test.ts
+// "event subscriptions", adapted: unsubscribe handles and the api/core are
+// delivered to handlers through shared slots — the Rust counterpart of the
+// upstream closures capturing `unsubscribe`/`runner` from the outer scope).
+// ---------------------------------------------------------------------------
+
+type UnsubSlot = Arc<Mutex<Option<rpi_ext_host::api::OnUnsubscribe>>>;
+
+async fn emit_agent_end(host: &NativeExtensionHost) {
+    host.emit(
+        ext::EVENT_AGENT_END,
+        json!({ "type": "agent_end", "messages": [] }),
+    )
+    .await;
+}
+
+/// "allows self-removal without skipping neighboring handlers".
+#[tokio::test]
+async fn on_unsubscribe_self_removal_keeps_neighbors() {
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let slot: UnsubSlot = Arc::new(Mutex::new(None));
+    let (calls_ext, slot_a) = (calls.clone(), slot.clone());
+    let host = host_with(vec![inline_ext("sub", move |api| {
+        // The factory is `Fn` (replayed on reload): re-clone captures
+        // before moving them into handler closures.
+        let (calls_a, slot_a) = (calls_ext.clone(), slot_a.clone());
+        let unsubscribe = api
+            .on(
+                ext::EVENT_AGENT_END,
+                json_handler(move |_| {
+                    if let Some(unsubscribe) = slot_a.lock().unwrap().take() {
+                        unsubscribe.unsubscribe();
+                    }
+                    calls_a.lock().unwrap().push("A".to_owned());
+                    Ok(Value::Null)
+                }),
+            )
+            .expect("on A");
+        *slot.lock().unwrap() = Some(unsubscribe);
+        let calls_b = calls_ext.clone();
+        api.on(
+            ext::EVENT_AGENT_END,
+            json_handler(move |_| {
+                calls_b.lock().unwrap().push("B".to_owned());
+                Ok(Value::Null)
+            }),
+        )
+        .expect("on B");
+    })])
+    .await;
+
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A", "B"]);
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A", "B", "B"]);
+}
+
+/// "removes duplicate registrations independently and cleans up the last
+/// handler": two registrations of the same closure shape (upstream: one
+/// shared function registered twice) — each handle removes exactly its own
+/// registration; after all three go away `has_handlers` reports false
+/// (upstream asserts the extension's handler-map key is deleted).
+#[tokio::test]
+async fn on_unsubscribe_duplicates_independent_and_last_cleanup() {
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let unsubs: Arc<Mutex<Vec<rpi_ext_host::api::OnUnsubscribe>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let (calls_ext, unsubs_ext) = (calls.clone(), unsubs.clone());
+    let host = host_with(vec![inline_ext("sub", move |api| {
+        // Registration order mirrors upstream: shared, B, shared.
+        let register_shared =
+            |api: &ExtensionApi, unsubs: &Arc<Mutex<Vec<rpi_ext_host::api::OnUnsubscribe>>>| {
+                let calls = calls_ext.clone();
+                let unsub = api
+                    .on(
+                        ext::EVENT_AGENT_END,
+                        json_handler(move |_| {
+                            calls.lock().unwrap().push("shared".to_owned());
+                            Ok(Value::Null)
+                        }),
+                    )
+                    .expect("on shared");
+                unsubs.lock().unwrap().push(unsub);
+            };
+        register_shared(api, &unsubs_ext);
+        let calls_b = calls_ext.clone();
+        let unsub_b = api
+            .on(
+                ext::EVENT_AGENT_END,
+                json_handler(move |_| {
+                    calls_b.lock().unwrap().push("B".to_owned());
+                    Ok(Value::Null)
+                }),
+            )
+            .expect("on B");
+        unsubs_ext.lock().unwrap().push(unsub_b);
+        register_shared(api, &unsubs_ext);
+    })])
+    .await;
+
+    let (stop_first, stop_b, stop_second) = {
+        let mut handles = unsubs.lock().unwrap();
+        (handles.remove(0), handles.remove(0), handles.remove(0))
+    };
+
+    // Double-unsubscribe of the second shared registration is an idempotent
+    // no-op (upstream `indexOf === -1` guard).
+    stop_second.unsubscribe();
+    stop_second.unsubscribe();
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["shared", "B"]);
+
+    stop_first.unsubscribe();
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["shared", "B", "B"]);
+
+    stop_b.unsubscribe();
+    assert!(!host.has_handlers(ext::EVENT_AGENT_END));
+}
+
+/// "keeps removed pending handlers in the current dispatch": A unsubscribes
+/// B during the dispatch — B still runs now, never again.
+#[tokio::test]
+async fn on_unsubscribe_during_dispatch_keeps_pending_handler() {
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let slot: UnsubSlot = Arc::new(Mutex::new(None));
+    let (calls_ext, slot_a) = (calls.clone(), slot.clone());
+    let host = host_with(vec![inline_ext("sub", move |api| {
+        let (calls_a, slot_a) = (calls_ext.clone(), slot_a.clone());
+        api.on(
+            ext::EVENT_AGENT_END,
+            json_handler(move |_| {
+                calls_a.lock().unwrap().push("A".to_owned());
+                if let Some(unsubscribe) = slot_a.lock().unwrap().take() {
+                    unsubscribe.unsubscribe();
+                }
+                Ok(Value::Null)
+            }),
+        )
+        .expect("on A");
+        let calls_b = calls_ext.clone();
+        let unsub_b = api
+            .on(
+                ext::EVENT_AGENT_END,
+                json_handler(move |_| {
+                    calls_b.lock().unwrap().push("B".to_owned());
+                    Ok(Value::Null)
+                }),
+            )
+            .expect("on B");
+        *slot.lock().unwrap() = Some(unsub_b);
+        let calls_c = calls_ext.clone();
+        api.on(
+            ext::EVENT_AGENT_END,
+            json_handler(move |_| {
+                calls_c.lock().unwrap().push("C".to_owned());
+                Ok(Value::Null)
+            }),
+        )
+        .expect("on C");
+    })])
+    .await;
+
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A", "B", "C"]);
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A", "B", "C", "A", "C"]);
+}
+
+/// "defers registrations made during dispatch until the next dispatch":
+/// A registers C from inside its handler — C runs from the next dispatch on.
+#[tokio::test]
+async fn on_registration_during_dispatch_defers_to_next() {
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let api_slot: Arc<Mutex<Option<ExtensionApi>>> = Arc::new(Mutex::new(None));
+    let (calls_ext, api_slot_a) = (calls.clone(), api_slot.clone());
+    let host = host_with(vec![inline_ext("sub", move |api| {
+        let (calls_a, api_slot_a) = (calls_ext.clone(), api_slot_a.clone());
+        api.on(
+            ext::EVENT_AGENT_END,
+            json_handler(move |_| {
+                calls_a.lock().unwrap().push("A".to_owned());
+                if let Some(api) = api_slot_a.lock().unwrap().clone() {
+                    let calls_c = calls_a.clone();
+                    api.on(
+                        ext::EVENT_AGENT_END,
+                        json_handler(move |_| {
+                            calls_c.lock().unwrap().push("C".to_owned());
+                            Ok(Value::Null)
+                        }),
+                    )
+                    .expect("on C at dispatch time");
+                }
+                Ok(Value::Null)
+            }),
+        )
+        .expect("on A");
+        api_slot.lock().unwrap().replace(api.clone());
+        let calls_b = calls_ext.clone();
+        api.on(
+            ext::EVENT_AGENT_END,
+            json_handler(move |_| {
+                calls_b.lock().unwrap().push("B".to_owned());
+                Ok(Value::Null)
+            }),
+        )
+        .expect("on B");
+    })])
+    .await;
+
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A", "B"]);
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A", "B", "A", "B", "C"]);
+}
+
+/// "uses a fresh handler list for nested dispatches": A unsubscribes itself
+/// and B, registers C, then re-emits from inside its handler. The nested
+/// dispatch takes a fresh snapshot ([C]); the outer dispatch's snapshot
+/// still finishes with B. Upstream expects ["A", "C", "B"].
+#[tokio::test]
+async fn on_nested_dispatch_uses_fresh_handler_list() {
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let slot_a: UnsubSlot = Arc::new(Mutex::new(None));
+    let slot_b: UnsubSlot = Arc::new(Mutex::new(None));
+    let core_slot: Arc<Mutex<Option<Arc<rpi_ext_host::runner::ExtensionRunnerCore>>>> =
+        Arc::new(Mutex::new(None));
+    let api_slot: Arc<Mutex<Option<ExtensionApi>>> = Arc::new(Mutex::new(None));
+    let (calls_a, slot_a_a, slot_b_a, core_a, api_slot_a) = (
+        calls.clone(),
+        slot_a.clone(),
+        slot_b.clone(),
+        core_slot.clone(),
+        api_slot.clone(),
+    );
+    let host = host_with(vec![inline_ext("sub", move |api| {
+        // `Fn` factory: re-clone captures for this invocation.
+        let (calls_a, slot_a_a, slot_b_a, core_a, api_slot_a) = (
+            calls_a.clone(),
+            slot_a_a.clone(),
+            slot_b_a.clone(),
+            core_a.clone(),
+            api_slot_a.clone(),
+        );
+        let unsub_a = api
+            .on(ext::EVENT_AGENT_END, {
+                let calls_a = calls_a.clone();
+                let slot_a_a = slot_a_a.clone();
+                let slot_b_a = slot_b_a.clone();
+                let core_a = core_a.clone();
+                let api_slot_a = api_slot_a.clone();
+                Arc::new(move |_payload, _ctx| {
+                    let calls_a = calls_a.clone();
+                    let slot_a_a = slot_a_a.clone();
+                    let slot_b_a = slot_b_a.clone();
+                    let core_a = core_a.clone();
+                    let api_slot_a = api_slot_a.clone();
+                    Box::pin(async move {
+                        calls_a.lock().unwrap().push("A".to_owned());
+                        if let Some(unsubscribe) = slot_a_a.lock().unwrap().take() {
+                            unsubscribe.unsubscribe();
+                        }
+                        if let Some(unsubscribe) = slot_b_a.lock().unwrap().take() {
+                            unsubscribe.unsubscribe();
+                        }
+                        // Register C (upstream `pi.on` inside the handler) —
+                        // visible only to dispatches starting after this one,
+                        // i.e. the nested emit below. (Bind through a let so
+                        // the MutexGuard temporary drops before any await.)
+                        let api = api_slot_a.lock().unwrap().clone();
+                        if let Some(api) = api {
+                            let calls_c = calls_a.clone();
+                            api.on(
+                                ext::EVENT_AGENT_END,
+                                json_handler(move |_| {
+                                    calls_c.lock().unwrap().push("C".to_owned());
+                                    Ok(Value::Null)
+                                }),
+                            )
+                            .expect("on C");
+                        }
+                        let core = core_a.lock().unwrap().clone();
+                        if let Some(core) = core {
+                            core.emit(
+                                ext::EVENT_AGENT_END,
+                                json!({ "type": "agent_end", "messages": [] }),
+                            )
+                            .await;
+                        }
+                        Ok(Value::Null)
+                    })
+                })
+            })
+            .expect("on A");
+        *slot_a.lock().unwrap() = Some(unsub_a);
+        let calls_b = calls_a.clone();
+        let unsub_b = api
+            .on(
+                ext::EVENT_AGENT_END,
+                json_handler(move |_| {
+                    calls_b.lock().unwrap().push("B".to_owned());
+                    Ok(Value::Null)
+                }),
+            )
+            .expect("on B");
+        *slot_b.lock().unwrap() = Some(unsub_b);
+        api_slot.lock().unwrap().replace(api.clone());
+    })])
+    .await;
+    *core_slot.lock().unwrap() = Some(host.core());
+
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A", "C", "B"]);
+}
+
+/// Invalidate interaction (#8967 + the v0.1.4 `TrackedEventBus` contract):
+/// after the runtime is invalidated the unsubscribe handles of a loaded
+/// extension remain callable without panicking (upstream splices from the
+/// dead list), and dispatch stops reaching the (stale) handlers.
+#[tokio::test]
+async fn on_unsubscribe_after_invalidate_is_harmless() {
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let unsub_slot: Arc<Mutex<Option<rpi_ext_host::api::OnUnsubscribe>>> =
+        Arc::new(Mutex::new(None));
+    let (calls_ext, unsub_ext) = (calls.clone(), unsub_slot.clone());
+    let host = host_with(vec![inline_ext("sub", move |api| {
+        let (calls_ext, unsub_ext) = (calls_ext.clone(), unsub_ext.clone());
+        let unsub = api
+            .on(
+                ext::EVENT_AGENT_END,
+                json_handler(move |_| {
+                    calls_ext.lock().unwrap().push("A".to_owned());
+                    Ok(Value::Null)
+                }),
+            )
+            .expect("on A");
+        unsub_ext.lock().unwrap().replace(unsub);
+    })])
+    .await;
+
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A"]);
+
+    host.invalidate(Some("extension unloaded".to_owned()));
+    if let Some(unsubscribe) = unsub_slot.lock().unwrap().take() {
+        unsubscribe.unsubscribe();
+    }
+    assert!(!host.has_handlers(ext::EVENT_AGENT_END));
+    emit_agent_end(&host).await;
+    assert_eq!(*calls.lock().unwrap(), vec!["A"]);
+}

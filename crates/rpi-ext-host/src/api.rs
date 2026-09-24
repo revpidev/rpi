@@ -42,6 +42,27 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Unsubscribe closure (`() => void` upstream).
 pub type Unsubscribe = Box<dyn FnOnce() + Send>;
 
+/// `pi.on()` unsubscribe handle (#8967, loader.ts:288-293 @ 46c9de402):
+/// call [`Self::unsubscribe`] to remove exactly that registration —
+/// repeatable and idempotent (upstream's JS closure can be invoked
+/// repeatedly; removal by id makes that natural here). Dropping the handle
+/// does NOT unsubscribe (explicit call only, like upstream).
+pub struct OnUnsubscribe(Box<dyn Fn() + Send>);
+
+impl OnUnsubscribe {
+    /// Remove the registration. A second call is a silent no-op
+    /// (upstream `indexOf === -1` guard).
+    pub fn unsubscribe(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for OnUnsubscribe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnUnsubscribe").finish_non_exhaustive()
+    }
+}
+
 fn read<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     m.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -1877,7 +1898,13 @@ pub struct LoadedExtension {
     pub resolved_path: String,
     hidden: std::sync::atomic::AtomicBool,
     pub source_info: ExtSourceInfo,
-    handlers: RwLock<HashMap<String, Vec<EventHandler>>>,
+    /// Handler registrations keyed by event name. Each entry carries the
+    /// registration id assigned by [`Self::insert_handler`] — the
+    /// `pi.on()` unsubscribe handle removes exactly its own registration
+    /// by id (#8967, loader.ts:277-293 @ 46c9de402; upstream wraps the
+    /// handler and splices by identity, ids are the Rust equivalent).
+    handlers: RwLock<HashMap<String, Vec<(u64, EventHandler)>>>,
+    next_handler_id: std::sync::atomic::AtomicU64,
     tools: RwLock<InsertionMap<RegisteredTool>>,
     message_renderers: RwLock<InsertionMap<MessageRenderFn>>,
     entry_renderers: RwLock<InsertionMap<EntryRenderFn>>,
@@ -1922,6 +1949,7 @@ impl LoadedExtension {
             hidden: std::sync::atomic::AtomicBool::new(false),
             source_info: ExtSourceInfo::synthetic(extension_path, &source, base_dir),
             handlers: RwLock::new(HashMap::new()),
+            next_handler_id: std::sync::atomic::AtomicU64::new(0),
             tools: RwLock::new(InsertionMap::new()),
             message_renderers: RwLock::new(InsertionMap::new()),
             entry_renderers: RwLock::new(InsertionMap::new()),
@@ -1963,15 +1991,47 @@ impl LoadedExtension {
         read(&self.wasm_guest).as_ref().map(|guest| guest.forward())
     }
 
-    pub(crate) fn push_handler(&self, event: &str, handler: EventHandler) {
+    /// `pi.on(event, handler)` registration (loader.ts:280-293 @ 46c9de402):
+    /// append with a fresh registration id; the unsubscribe handle returned
+    /// by [`ExtensionApi::on`] removes by that id.
+    pub(crate) fn insert_handler(&self, event: &str, handler: EventHandler) -> u64 {
+        let id = self
+            .next_handler_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         write(&self.handlers)
             .entry(event.to_owned())
             .or_default()
-            .push(handler);
+            .push((id, handler));
+        id
+    }
+
+    /// Unsubscribe by registration id (#8967, loader.ts:288-293 @
+    /// 46c9de402): removes exactly one registration; unknown ids are a
+    /// silent no-op (upstream `indexOf === -1` guard); removing the last
+    /// handler of an event drops the map entry (`handlers.delete(event)`).
+    pub(crate) fn remove_handler(&self, event: &str, id: u64) -> bool {
+        let mut handlers = write(&self.handlers);
+        let removed = handlers.get_mut(event).is_some_and(|list| {
+            let before = list.len();
+            list.retain(|(handler_id, _)| *handler_id != id);
+            before != list.len()
+        });
+        // `handlers.delete(event)` when the last registration goes away
+        // (loader.ts:292-293 @ 46c9de402).
+        if removed {
+            let now_empty = handlers.get(event).is_none_or(std::vec::Vec::is_empty);
+            if now_empty {
+                handlers.remove(event);
+            }
+        }
+        removed
     }
 
     pub(crate) fn handlers_for(&self, event: &str) -> Vec<EventHandler> {
-        read(&self.handlers).get(event).cloned().unwrap_or_default()
+        read(&self.handlers)
+            .get(event)
+            .map(|handlers| handlers.iter().map(|(_, h)| h.clone()).collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn has_handlers(&self, event: &str) -> bool {
@@ -2207,20 +2267,30 @@ impl ExtensionApi {
         )
     }
 
-    // -- event subscription (loader.ts:238-243) ------------------------------
+    // -- event subscription (loader.ts:238-243, :277-293 @ 46c9de402) ----
 
     /// `pi.on(event, handler)` — raw JSON handler (the L0/L1-shared shape).
-    pub fn on(&self, event: &str, handler: EventHandler) -> Result<(), ExtError> {
+    /// Returns the unsubscribe handle (#8967, loader.ts:280-293 @ 46c9de402):
+    /// calling it removes only that registration (idempotent — a second
+    /// call is a silent no-op). Handlers added or removed during a dispatch
+    /// apply to later dispatches; the runner snapshots the handler list
+    /// before each dispatch (`runner.ts:235-240` — `snapshotEventHandlers`).
+    pub fn on(&self, event: &str, handler: EventHandler) -> Result<OnUnsubscribe, ExtError> {
         self.assert_api_active()?;
         self.runtime.assert_active()?;
-        self.extension.push_handler(event, handler);
-        Ok(())
+        let id = self.extension.insert_handler(event, handler);
+        let extension = self.extension.clone();
+        let event = event.to_owned();
+        Ok(OnUnsubscribe(Box::new(move || {
+            extension.remove_handler(&event, id);
+        })))
     }
 
     /// Typed convenience wrapper over [`ExtensionApi::on`]: the payload is
     /// deserialized to `E`, the optional result serialized from `R`.
-    /// Deserialization failure is reported as a handler error.
-    pub fn on_typed<E, R, F, Fut>(&self, event: &str, handler: F) -> Result<(), ExtError>
+    /// Deserialization failure is reported as a handler error. Returns the
+    /// same unsubscribe handle as the raw form (#8967).
+    pub fn on_typed<E, R, F, Fut>(&self, event: &str, handler: F) -> Result<OnUnsubscribe, ExtError>
     where
         E: serde::de::DeserializeOwned,
         R: Serialize,

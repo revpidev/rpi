@@ -424,6 +424,7 @@ mod tests {
             in_command: std::cell::Cell::new(false),
             tool_updates: Default::default(),
             tool_aborts: Default::default(),
+            subscriptions: Default::default(),
             memory_limiter: crate::wasm::MemoryLimiter,
         };
         (state, runtime)
@@ -447,6 +448,7 @@ mod tests {
             in_command: std::cell::Cell::new(false),
             tool_updates: Default::default(),
             tool_aborts: Default::default(),
+            subscriptions: Default::default(),
             memory_limiter: crate::wasm::MemoryLimiter,
         };
         (state, runtime)

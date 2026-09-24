@@ -21,8 +21,8 @@ use crate::types::{FlagType, FlagValue};
 /// Capability gate outcome for a host method (docs/extension-abi.md table).
 pub enum CapabilityRequirement {
     /// No capability required: `capabilities: []` guests may subscribe to
-    /// events (`on`), and a flag read (`getFlag`) only ever sees the
-    /// extension's own flags.
+    /// events (`on`/`off` — #8967 removal is the same surface), and a flag
+    /// read (`getFlag`) only ever sees the extension's own flags.
     Free,
     /// The method requires the given manifest capability.
     Requires(Capability),
@@ -41,7 +41,7 @@ pub enum CapabilityRequirement {
 pub fn required_capability(method: &str) -> CapabilityRequirement {
     use CapabilityRequirement::{Free, Requires, UnknownMethod};
     match method {
-        "on" | "getFlag" => Free,
+        "on" | "off" | "getFlag" => Free,
         // ADR-0015 additions: unregisterTool (registry removal) and
         // toolUpdate (partial-result report) belong to the same capability
         // as registerTool — they write/affect only this extension's tools.
@@ -152,7 +152,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .to_owned();
             let forward = state.forward.clone();
             let dispatch_event = event.clone();
-            state
+            let unsubscribe = state
                 .api
                 .on(
                     &event,
@@ -174,6 +174,35 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     }),
                 )
                 .map_err(|e| ("stale", e.to_string()))?;
+            // #8967 (V15-09): park the unsubscribe in the per-extension pool
+            // and hand the id back — the additive `off` method removes
+            // exactly this registration. Additive on the wire: pre-V15-09
+            // guests received `null` and ignored the response.
+            let subscription_id = state
+                .subscriptions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(unsubscribe);
+            Ok(json!({ "subscriptionId": subscription_id }))
+        }
+
+        "off" => {
+            // #8967 (V15-09): remove one `on` registration by id. Unknown
+            // ids are a silent no-op (upstream `indexOf === -1` guard,
+            // loader.ts:290-291 @ 46c9de402) — double-unsubscribe and
+            // off-after-unload both land here harmlessly.
+            let subscription_id = args
+                .get("subscriptionId")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| ("invalidRequest", "off: missing subscriptionId".to_owned()))?;
+            let unsubscribe = state
+                .subscriptions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(subscription_id);
+            if let Some(unsubscribe) = unsubscribe {
+                unsubscribe.unsubscribe();
+            }
             Ok(Value::Null)
         }
 
@@ -1213,7 +1242,9 @@ mod tests {
     fn known_methods_map_to_their_documented_capabilities() {
         use CapabilityRequirement::{Free, Requires};
         assert!(matches!(required_capability("on"), Free));
+        assert!(matches!(required_capability("off"), Free));
         assert!(matches!(required_capability("getFlag"), Free));
+
         assert!(matches!(
             required_capability("registerTool"),
             Requires(Capability::Tools)
@@ -1376,6 +1407,7 @@ mod session_entries_tests {
             in_command: std::cell::Cell::new(false),
             tool_updates: Default::default(),
             tool_aborts: Default::default(),
+            subscriptions: Default::default(),
             memory_limiter: crate::wasm::MemoryLimiter,
         }
     }
@@ -1582,6 +1614,7 @@ mod session_tool_results_tests {
             in_command: std::cell::Cell::new(false),
             tool_updates: Default::default(),
             tool_aborts: Default::default(),
+            subscriptions: Default::default(),
             memory_limiter: crate::wasm::MemoryLimiter,
         }
     }
@@ -1766,6 +1799,7 @@ mod c3_dispose_tests {
             in_command: std::cell::Cell::new(false),
             tool_updates: Default::default(),
             tool_aborts: Default::default(),
+            subscriptions: Default::default(),
             memory_limiter: crate::wasm::MemoryLimiter,
         };
         (state, runtime, rx, bridge)
@@ -1911,5 +1945,95 @@ mod c3_dispose_tests {
                 bridge2.aborts()
             );
         }
+    }
+}
+
+/// #8967 (V15-09): the `on`/`off` host-call protocol — `on` answers a
+/// per-registration `subscriptionId`, `off` removes exactly that
+/// registration (dispatch-order semantics live in runner_test.rs
+/// "event subscriptions").
+#[cfg(test)]
+mod on_off_tests {
+    use super::*;
+    use crate::api::{ExtensionApi, ExtensionRuntime, LoadedExtension};
+    use crate::wasm::{Capability, DispatchTarget, HostState, WasmForward};
+    use std::collections::HashSet;
+
+    fn host_state(capabilities: HashSet<Capability>) -> HostState {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:v15-09>", "<inline:v15-09>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        }
+    }
+
+    #[test]
+    fn on_returns_subscription_id_and_off_removes_registration() {
+        let mut state = host_state(HashSet::new());
+        let first = dispatch(&mut state, "on", json!({ "event": "agent_end" }))
+            .expect("first on succeeds on a bare guest (Free capability)");
+        let second = dispatch(&mut state, "on", json!({ "event": "agent_end" }))
+            .expect("second on registers independently");
+        let first_id = first.get("subscriptionId").and_then(Value::as_u64);
+        let second_id = second.get("subscriptionId").and_then(Value::as_u64);
+        assert!(first_id.is_some(), "on answers a subscriptionId: {first}");
+        assert_ne!(first_id, second_id, "ids are per-registration");
+        assert!(state.api.extension().has_handlers("agent_end"));
+
+        // off with an unknown id: silent no-op (upstream indexOf === -1
+        // guard, loader.ts:290-291 @ 46c9de402).
+        let unknown = second_id.map(|id| id + 1_000).unwrap_or(9_999);
+        dispatch(&mut state, "off", json!({ "subscriptionId": unknown }))
+            .expect("unknown id is a silent no-op");
+        assert!(state.api.extension().has_handlers("agent_end"));
+
+        // off removes exactly its own registration; the last removal drops
+        // the event registration entirely.
+        dispatch(
+            &mut state,
+            "off",
+            json!({ "subscriptionId": first_id.unwrap() }),
+        )
+        .expect("off first");
+        assert!(state.api.extension().has_handlers("agent_end"));
+        dispatch(
+            &mut state,
+            "off",
+            json!({ "subscriptionId": second_id.unwrap() }),
+        )
+        .expect("off second");
+        assert!(
+            !state.api.extension().has_handlers("agent_end"),
+            "last removal drops the event registration"
+        );
+    }
+
+    #[test]
+    fn on_missing_event_and_off_missing_id_are_invalid_requests() {
+        let mut state = host_state(HashSet::new());
+        let error = dispatch(&mut state, "on", json!({})).expect_err("missing event");
+        assert_eq!(error.0, "invalidRequest");
+        let error = dispatch(&mut state, "off", json!({})).expect_err("missing subscriptionId");
+        assert_eq!(error.0, "invalidRequest");
+        let error = dispatch(
+            &mut state,
+            "off",
+            json!({ "subscriptionId": "not-a-number" }),
+        )
+        .expect_err("non-numeric subscriptionId");
+        assert_eq!(error.0, "invalidRequest");
     }
 }
