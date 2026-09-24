@@ -261,7 +261,7 @@ fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<u64>, BashExecError
     Ok(Some(ms as u64))
 }
 
-/// Map a child exit status to the conventional exit code (bash.ts:139-142,
+/// Map a child exit status to the conventional exit code (bash.ts:141-142,
 /// `a8b3dd199` / #9577): a signal-killed shell has no exit code, so report
 /// `128 + signal` (the standard shell convention — callers must not mistake
 /// the termination for success); an exit without a usable code or signal
@@ -598,7 +598,7 @@ impl AgentTool for BashTool {
     }
 
     fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
-        // bash.ts:238 (`fcff255b0`): strict-prefer by default, no gate.
+        // bash.ts:243 (`fcff255b0`): strict-prefer by default, no gate.
         crate::tools::builtin_strict_prefer_sampling()
     }
 
@@ -707,7 +707,7 @@ impl AgentTool for BashTool {
         match exec_result {
             Ok(exit_code) => {
                 let (text, _) = format_output(&snapshot, last_lb, "(no output)");
-                // bash.ts:368-373 (`a8b3dd199` / #9577): a missing exit code
+                // bash.ts:368-372 (`a8b3dd199` / #9577): a missing exit code
                 // (signal-terminated custom operations, exotic wait
                 // failures) fails the command with the partial output
                 // instead of reporting success.

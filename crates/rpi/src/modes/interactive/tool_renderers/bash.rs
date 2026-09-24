@@ -97,7 +97,7 @@ impl Drop for TickerGuard {
     }
 }
 
-/// `formatDuration` (renderers/bash.ts:33-41, `fe219d7f8` / #9628): under a
+/// `formatDuration` (renderers/bash.ts:32-40 @ pin, `fe219d7f8` / #9628): under a
 /// minute stays `(ms/1000).toFixed(1)` — the tenths digit rounds half away
 /// from zero (`toFixed` picks the larger n on ties, e.g. 1250ms → `1.3s`;
 /// Rust's `{:.1}` would round ties to even) — while ≥1min durations render

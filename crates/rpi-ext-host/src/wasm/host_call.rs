@@ -215,7 +215,8 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         .get("parameters")
                         .cloned()
                         // Missing/non-object schemas are rejected by
-                        // `register_tool` (loader.ts:289-293, `acaa253cc` /
+                        // `register_tool` (loader.ts:273-281 @ pin,
+                        // `acaa253cc` /
                         // #9300) instead of silently defaulting — pass the
                         // raw value (Null when absent) through.
                         .unwrap_or(Value::Null),

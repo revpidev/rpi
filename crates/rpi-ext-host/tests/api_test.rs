@@ -331,7 +331,7 @@ async fn api_register_tool_refreshes_only_when_bound() {
     );
 }
 
-/// #9300 (`acaa253cc`, loader.ts:289-293): tools whose `parameters` is not
+/// #9300 (`acaa253cc`, loader.ts:273-281 @ pin): tools whose `parameters` is not
 /// a JSON object are rejected at registration with the upstream message,
 /// instead of breaking provider request serialization later. Arrays and
 /// scalars are objects in JS `typeof` terms but explicitly rejected

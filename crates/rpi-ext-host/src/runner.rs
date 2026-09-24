@@ -89,7 +89,7 @@ struct BuiltinKeybinding {
     restrict_override: bool,
 }
 
-/// `isUserBashEventResult` (runner.ts:121-146, `509ee2bd0` / #9068): a
+/// `isUserBashEventResult` (runner.ts:124-149 @ pin, `509ee2bd0` / #9068): a
 /// valid defined result carries **exactly one** of `operations` / `result`.
 /// - `operations` must be an object whose `exec` is a function — functions
 ///   cannot cross the JSON dispatch boundary, so no JSON value satisfies
@@ -807,7 +807,7 @@ impl ExtensionRunnerCore {
         Ok(result)
     }
 
-    /// `emitUserBash` (runner.ts:1042-1068, `509ee2bd0` / #9068):
+    /// `emitUserBash` (runner.ts:1055-1084 @ pin, `509ee2bd0` / #9068):
     /// first defined result wins; `undefined` (JSON null) continues to the
     /// next handler. **Fail-closed**: a handler error or an invalid defined
     /// result aborts the command — reported through `onError` and returned
