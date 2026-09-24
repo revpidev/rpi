@@ -3119,6 +3119,7 @@ version = "0.1.4"
 dependencies = [
  "abi_stable",
  "async-trait",
+ "futures",
  "rpi-agent",
  "rpi-ai",
  "rpi-ext-sdk",

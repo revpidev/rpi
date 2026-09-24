@@ -20,6 +20,40 @@ use serde_json::Value;
 use crate::core::agent_session::{AgentSession, CustomDeliverAs, WeakAgentSession};
 use crate::core::extensions::StreamingBehavior;
 
+/// A stream that terminates immediately with an `error` event (and error
+/// result) — the `ctx.modelRegistry.stream()` answer for setup failures
+/// (#8964: "Setup failures produce error events and error results",
+/// docs/extensions.md streaming-model-calls section).
+fn setup_error_stream(message: &str) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+    use rpi_ai::types::{
+        ApiKind, AssistantMessage, AssistantRole, ErrorReason, StopReason, StreamEvent, Usage,
+    };
+    let stream = rpi_ai::utils::event_stream::AssistantMessageEventStream::new();
+    stream.push(StreamEvent::Error {
+        reason: ErrorReason::Error,
+        error: AssistantMessage {
+            role: AssistantRole::Assistant,
+            content: vec![],
+            api: ApiKind::from(""),
+            provider: String::new(),
+            model: String::new(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some(message.to_owned()),
+            timestamp: 0,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
+        },
+    });
+    stream.end(None);
+    stream
+}
+
 /// Build and bind the session-backed host actions
 /// (`runner.bindCore(actions, ...)`, agent-session.ts:2356).
 pub async fn bind_session_actions(
@@ -363,6 +397,40 @@ impl HostActions for SessionHostActions {
         let session = self.session()?;
         let model = session.model_runtime().find_model(provider, model_id)?;
         serde_json::to_value(model).ok()
+    }
+
+    /// `ctx.modelRegistry.stream(model, context, options)` (#8964,
+    /// 1f78cea7a — model-registry.ts:105-110): direct delegation to the
+    /// runtime's streaming facade (same lazy auth resolution + header merge
+    /// as built-in requests). An unbound session answers with an error
+    /// event stream — upstream setup failures "produce error events and
+    /// error results" (docs/extensions.md, #8964 section).
+    fn model_registry_stream(
+        &self,
+        model: rpi_ai::types::Model,
+        context: rpi_ai::types::Context,
+        options: Option<rpi_ai::models::ModelsStreamOptions>,
+    ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+        match self.session() {
+            Some(session) => session.model_runtime().stream(&model, &context, options),
+            None => setup_error_stream("model registry is not bound to a session"),
+        }
+    }
+
+    /// `ctx.modelRegistry.streamSimple(model, context, options)` (#8964,
+    /// model-registry.ts:112-116).
+    fn model_registry_stream_simple(
+        &self,
+        model: rpi_ai::types::Model,
+        context: rpi_ai::types::Context,
+        options: Option<rpi_ai::models::ModelsSimpleStreamOptions>,
+    ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+        match self.session() {
+            Some(session) => session
+                .model_runtime()
+                .stream_simple(&model, &context, options),
+            None => setup_error_stream("model registry is not bound to a session"),
+        }
     }
 
     /// `ctx.modelRegistry.hasConfiguredAuth(providerId)`

@@ -63,7 +63,8 @@ fn slot_api(slot: &ApiSlot) -> ExtensionApi {
 
 struct Fixture {
     api: ExtensionApi,
-    _session: rpi::core::agent_session::AgentSession,
+    provider: Arc<FauxProvider>,
+    session: rpi::core::agent_session::AgentSession,
     _tmp: TempDir,
 }
 
@@ -80,6 +81,7 @@ async fn fixture(models_json: Option<&str>) -> Fixture {
         std::fs::write(agent_dir.join("models.json"), models_json).expect("models.json");
     }
 
+    // FauxProvider::new returns Arc<FauxProvider> already.
     let provider = FauxProvider::new(FauxProviderOptions::default());
     let model = provider.get_model(None).expect("faux model");
 
@@ -95,7 +97,7 @@ async fn fixture(models_json: Option<&str>) -> Fixture {
     )
     .await;
     model_runtime
-        .register_native_provider(Arc::new(FauxAiProvider::new(provider)))
+        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
         .await
         .expect("register faux provider");
 
@@ -142,7 +144,8 @@ async fn fixture(models_json: Option<&str>) -> Fixture {
     let api = slot_api(&slot);
     Fixture {
         api,
-        _session: created.session,
+        provider,
+        session: created.session,
         _tmp: tmp,
     }
 }
@@ -273,4 +276,164 @@ async fn t27_ok_none_branch_omits_empty_keys() {
         result.get("baseUrl").is_none() || result["baseUrl"] == Value::Null,
         "baseUrl must be absent"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #8964 (1f78cea7a): ctx.modelRegistry.stream / streamSimple — extension
+// model calls through configured providers with resolved authentication.
+// Upstream anchor: test/suite/regressions/8964-extension-provider-streaming.test.ts
+// (adapted: the rpi carrier collects the stream server-side — both methods
+// drain the same event vocabulary + final result).
+// ---------------------------------------------------------------------------
+
+/// Both entries stream through the faux provider: text deltas accumulate
+/// into the collected events and the final message lands in `result`
+/// (upstream asserts `streamedText` + `result` content/stopReason).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_and_stream_simple_collect_events_and_result() {
+    use futures::StreamExt;
+
+    for simple in [false, true] {
+        let fixture = fixture(None).await;
+        fixture
+            .provider
+            .set_responses(vec![rpi_test_support::faux::faux_assistant_message(
+                "custom provider response",
+                rpi_test_support::faux::FauxAssistantOptions::default(),
+            )
+            .into()]);
+        let model = serde_json::to_value(fixture.provider.get_model(None).expect("faux model"))
+            .expect("model json");
+        let context = json!({"messages": [
+            {"role": "user", "content": "Hello", "timestamp": 0}
+        ]});
+
+        let stream = if simple {
+            fixture
+                .api
+                .model_registry_stream_simple(model, context, None)
+                .expect("streamSimple")
+        } else {
+            fixture
+                .api
+                .model_registry_stream(model, context, None)
+                .expect("stream")
+        };
+        let events: Vec<rpi_ai::types::StreamEvent> = stream.clone().collect().await;
+        let result = stream.result().await.expect("result resolves");
+
+        // Event vocabulary: start before updates, terminal done.
+        assert_eq!(events.first().map(|e| kind_of(e)), Some("start"));
+        assert_eq!(events.last().map(|e| kind_of(e)), Some("done"));
+        let streamed_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                rpi_ai::types::StreamEvent::TextDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed_text, "custom provider response");
+        assert_eq!(result.stop_reason, rpi_ai::types::StopReason::Stop);
+        let text = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                rpi_ai::types::AssistantContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "custom provider response");
+    }
+}
+
+fn kind_of(event: &rpi_ai::types::StreamEvent) -> &'static str {
+    use rpi_ai::types::StreamEvent;
+    match event {
+        StreamEvent::Start { .. } => "start",
+        StreamEvent::TextStart { .. } => "text_start",
+        StreamEvent::TextDelta { .. } => "text_delta",
+        StreamEvent::TextEnd { .. } => "text_end",
+        StreamEvent::ThinkingStart { .. } => "thinking_start",
+        StreamEvent::ThinkingDelta { .. } => "thinking_delta",
+        StreamEvent::ThinkingEnd { .. } => "thinking_end",
+        StreamEvent::ToolCallStart { .. } => "toolcall_start",
+        StreamEvent::ToolCallDelta { .. } => "toolcall_delta",
+        StreamEvent::ToolCallEnd { .. } => "toolcall_end",
+        StreamEvent::Done { .. } => "done",
+        StreamEvent::Error { .. } => "error",
+    }
+}
+
+/// `streamSimple` maps the provider-neutral `reasoning` option into the
+/// request (upstream docs: "provider-neutral options such as reasoning").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_simple_options_reach_the_provider() {
+    use futures::StreamExt;
+
+    let fixture = fixture(None).await;
+    fixture
+        .provider
+        .set_responses(vec![rpi_test_support::faux::faux_assistant_message(
+            "ok",
+            rpi_test_support::faux::FauxAssistantOptions::default(),
+        )
+        .into()]);
+    let model = serde_json::to_value(fixture.provider.get_model(None).expect("faux model"))
+        .expect("model json");
+    let context = json!({"messages": [
+        {"role": "user", "content": "Hello", "timestamp": 0}
+    ]});
+
+    // Invalid reasoning level for the simple shape ("off" is not a
+    // ThinkingLevel) → setup error surfaces as an Err at the API layer.
+    let error = match fixture.api.model_registry_stream_simple(
+        model.clone(),
+        context.clone(),
+        Some(json!({"reasoning": "off"})),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("off is not a ThinkingLevel; expected an error"),
+    };
+    assert!(error.to_string().contains("reasoning"), "{error}");
+
+    // Valid level parses and the request reaches the provider.
+    let stream = fixture
+        .api
+        .model_registry_stream_simple(model, context, Some(json!({"reasoning": "high"})))
+        .expect("streamSimple with reasoning");
+    let events: Vec<rpi_ai::types::StreamEvent> = stream.collect().await;
+    assert!(
+        events.iter().any(|event| kind_of(event) == "done"),
+        "terminal done event present"
+    );
+}
+
+/// A dead session (weak upgrade fails) answers ONE error event plus an
+/// error result — the collected shape of upstream "setup failures produce
+/// error events and error results".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_after_session_drop_collects_error_event() {
+    use futures::StreamExt;
+
+    let fixture = fixture(None).await;
+    let model = serde_json::to_value(fixture.provider.get_model(None).expect("faux model"))
+        .expect("model json");
+    drop(fixture.session);
+    // Let the weak handle observe the drop.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let stream = fixture
+        .api
+        .model_registry_stream(model, json!({"messages": []}), None)
+        .expect("api call succeeds (bound actions remain)");
+    let events: Vec<rpi_ai::types::StreamEvent> = stream.clone().collect().await;
+    let result = stream.result().await;
+    assert_eq!(events.len(), 1, "single terminal error event: {events:?}");
+    assert!(matches!(
+        events.first(),
+        Some(rpi_ai::types::StreamEvent::Error { .. })
+    ));
+    let result = result.expect("error result present");
+    assert_eq!(result.stop_reason, rpi_ai::types::StopReason::Error);
+    assert!(result.error_message.is_some());
 }

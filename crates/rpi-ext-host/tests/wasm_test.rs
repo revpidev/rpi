@@ -490,6 +490,24 @@ impl rpi_ext_host::api::HostActions for BlockingExecActions {
         None
     }
 
+    fn model_registry_stream(
+        &self,
+        _model: rpi_ai::types::Model,
+        _context: rpi_ai::types::Context,
+        _options: Option<rpi_ai::models::ModelsStreamOptions>,
+    ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+        rpi_ai::utils::event_stream::AssistantMessageEventStream::new()
+    }
+
+    fn model_registry_stream_simple(
+        &self,
+        _model: rpi_ai::types::Model,
+        _context: rpi_ai::types::Context,
+        _options: Option<rpi_ai::models::ModelsSimpleStreamOptions>,
+    ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+        rpi_ai::utils::event_stream::AssistantMessageEventStream::new()
+    }
+
     fn model_registry_has_configured_auth(&self, _provider_id: &str) -> bool {
         false
     }

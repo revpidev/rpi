@@ -16,6 +16,9 @@ tracing.workspace = true
 tokio-util.workspace = true
 # T15 W6 wasm host: oneshot + runtime handle for the guest-thread bridge.
 tokio.workspace = true
+# #8964 (V15-09): draining the collected `ctx.modelRegistry.stream` reply
+# on the guest-thread bridge (`StreamExt::collect`).
+futures.workspace = true
 rpi-ai.workspace = true
 rpi-agent.workspace = true
 # Wasm (L1) extension runtime, embedded into the single release binary

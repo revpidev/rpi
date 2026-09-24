@@ -101,6 +101,8 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "ctx.getSystemPromptSource"
         | "ctx.getAppendSystemPromptSources"
         | "ctx.modelRegistry.complete"
+        | "ctx.modelRegistry.stream"
+        | "ctx.modelRegistry.streamSimple"
         | "ctx.modelRegistry.find"
         | "ctx.modelRegistry.hasConfiguredAuth"
         | "ctx.modelRegistry.getApiKeyAndHeaders"
@@ -1057,6 +1059,43 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             })?;
             let result = result.map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(result.unwrap_or(Value::Null))
+        }
+        "ctx.modelRegistry.stream" | "ctx.modelRegistry.streamSimple" => {
+            // #8964 (1f78cea7a): the collected form of the upstream
+            // `AssistantMessageEventStream` — the synchronous JSON host-call
+            // boundary cannot carry a live async iterable, so the stream is
+            // drained server-side: every event plus the final message in
+            // one reply. Setup failures (bad model JSON, unbound session)
+            // surface as error events + error result, matching upstream's
+            // "setup failures produce error events and error results".
+            let model = args
+                .get("model")
+                .cloned()
+                .ok_or_else(|| ("invalidRequest", "missing model".to_owned()))?;
+            let context = args
+                .get("context")
+                .cloned()
+                .ok_or_else(|| ("invalidRequest", "missing context".to_owned()))?;
+            let options = args.get("options").cloned();
+            let simple = method == "ctx.modelRegistry.streamSimple";
+            let api = state.api.clone();
+            let outcome = block_on(&state.async_handle.clone(), async move {
+                let stream = if simple {
+                    api.model_registry_stream_simple(model, context, options)
+                } else {
+                    api.model_registry_stream(model, context, options)
+                };
+                let stream = stream?;
+                let events: Vec<rpi_ai::types::StreamEvent> =
+                    futures::StreamExt::collect(stream.clone()).await;
+                let result = stream.result().await;
+                Ok::<serde_json::Value, crate::error::ExtError>(json!({
+                    "events": events,
+                    "result": result,
+                }))
+            })?;
+            let outcome = outcome.map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(outcome)
         }
         "ctx.modelRegistry.find" => {
             let provider = str_arg(&args, "provider").unwrap_or_default();
@@ -2034,6 +2073,111 @@ mod on_off_tests {
             json!({ "subscriptionId": "not-a-number" }),
         )
         .expect_err("non-numeric subscriptionId");
+        assert_eq!(error.0, "invalidRequest");
+    }
+}
+
+/// #8964 (V15-09): the collected-stream host-call reply shape. The
+/// `on_off_tests` host state has no session bound — the setup failure
+/// surfaces as ONE error event plus an error result (upstream:
+/// "Setup failures produce error events and error results"), not as a
+/// host-call error envelope.
+#[cfg(test)]
+mod model_registry_stream_tests {
+    use super::*;
+    use crate::api::{ExtensionApi, ExtensionRuntime, LoadedExtension};
+    use crate::wasm::{Capability, DispatchTarget, HostState, WasmForward};
+    use std::collections::HashSet;
+
+    fn host_state(capabilities: HashSet<Capability>) -> HostState {
+        // The handle must outlive host_state: the stream host-call blocks
+        // on a task spawned onto it. Leaked per test invocation.
+        let runtime = Box::leak(Box::new(
+            tokio::runtime::Runtime::new().expect("tokio runtime"),
+        ));
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:v15-09b>", "<inline:v15-09b>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        }
+    }
+
+    fn model_json() -> Value {
+        json!({
+            "id": "test-model",
+            "name": "Test",
+            "api": "openai-completions",
+            "provider": "missing-provider",
+            "baseUrl": "https://example.test/v1",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000,
+            "maxTokens": 100,
+        })
+    }
+
+    #[test]
+    fn stream_methods_require_the_session_capability() {
+        // The gate runs in `handle_host_call` (before `dispatch`).
+        use CapabilityRequirement::Requires;
+        for method in ["ctx.modelRegistry.stream", "ctx.modelRegistry.streamSimple"] {
+            assert!(
+                matches!(required_capability(method), Requires(Capability::Session)),
+                "{method} requires capability session"
+            );
+        }
+        let mut state = host_state(HashSet::new());
+        let response = crate::wasm::handle_host_call(
+            &mut state,
+            br#"{"call":"ctx.modelRegistry.stream","args":{}}"#,
+        );
+        let parsed: Value = serde_json::from_slice(&response).expect("envelope");
+        assert_eq!(parsed["error"]["kind"], "capabilityDenied");
+    }
+
+    #[test]
+    fn stream_unbound_answers_the_unbound_error_envelope() {
+        // No actions bound: the ABI error-kind table answers `unbound`
+        // (extension-abi.md §4) — the collected error-event shape fires for
+        // a BOUND-but-dead session (SessionHostActions::session() → None,
+        // covered by the extension_host_model_registry_test fixture).
+        for method in ["ctx.modelRegistry.stream", "ctx.modelRegistry.streamSimple"] {
+            let mut state = host_state(HashSet::from([Capability::Session]));
+            let error = dispatch(
+                &mut state,
+                method,
+                json!({"model": model_json(), "context": {"messages": []}}),
+            )
+            .expect_err("unbound answers the error envelope");
+            assert_eq!(error.0, "unbound", "{method}");
+        }
+    }
+
+    #[test]
+    fn stream_missing_args_are_invalid_requests() {
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        let error =
+            dispatch(&mut state, "ctx.modelRegistry.stream", json!({})).expect_err("no model");
+        assert_eq!(error.0, "invalidRequest");
+        let error = dispatch(
+            &mut state,
+            "ctx.modelRegistry.stream",
+            json!({"model": model_json()}),
+        )
+        .expect_err("no context");
         assert_eq!(error.0, "invalidRequest");
     }
 }

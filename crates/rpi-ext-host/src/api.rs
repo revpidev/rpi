@@ -610,6 +610,30 @@ pub trait HostActions: Send + Sync {
     /// (model-registry.ts:70). Returns `Model` JSON or `None`.
     fn model_registry_find(&self, provider: &str, model_id: &str) -> Option<Value>;
 
+    /// `ctx.modelRegistry.stream(model, context, options)` (#8964,
+    /// 1f78cea7a — model-registry.ts:105-110): stream through the
+    /// configured provider with request-time authentication. Options are
+    /// pre-parsed by the caller (the JSON boundary cannot carry the
+    /// callback-bearing `StreamOptions`; only the portable subset
+    /// survives).
+    fn model_registry_stream(
+        &self,
+        model: rpi_ai::types::Model,
+        context: rpi_ai::types::Context,
+        options: Option<rpi_ai::models::ModelsStreamOptions>,
+    ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream;
+
+    /// `ctx.modelRegistry.streamSimple(model, context, options)` (#8964,
+    /// 1f78cea7a — model-registry.ts:112-116): the provider-neutral
+    /// options variant (`reasoning` / `toolChoice` mapping lives in the
+    /// adapters' `stream_simple`).
+    fn model_registry_stream_simple(
+        &self,
+        model: rpi_ai::types::Model,
+        context: rpi_ai::types::Context,
+        options: Option<rpi_ai::models::ModelsSimpleStreamOptions>,
+    ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream;
+
     /// `ctx.modelRegistry.hasConfiguredAuth(model)` — auth check
     /// (model-registry.ts:76). `provider_id` is the provider string.
     fn model_registry_has_configured_auth(&self, provider_id: &str) -> bool;
@@ -2150,6 +2174,98 @@ pub struct ExtensionApi {
     load: Arc<LoadTransaction>,
 }
 
+/// Portable wire subset of `ModelsStreamOptions` / `ModelsSimpleStreamOptions`
+/// for the JSON host-call boundary (#8964): the callback-bearing inherited
+/// fields (`signal`, `fetch`, `on_payload`, …) cannot cross JSON, so only
+/// the portable knobs are accepted — same contract as
+/// `ctx.modelRegistry.complete` (options accepted where expressible,
+/// the rest left to provider defaults).
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct StreamOptionsWire {
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    /// `stream`: `ModelThinkingLevel` ("off"-inclusive);
+    /// `streamSimple`: `ThinkingLevel` (no "off").
+    reasoning: Option<String>,
+    tool_choice: Option<rpi_ai::types::SimpleToolChoice>,
+}
+
+fn parse_model_and_context(
+    model: Value,
+    context: Value,
+) -> Result<(rpi_ai::types::Model, rpi_ai::types::Context), ExtError> {
+    let model = serde_json::from_value(model)
+        .map_err(|error| ExtError::Call(format!("invalid model: {error}")))?;
+    let context = serde_json::from_value(context)
+        .map_err(|error| ExtError::Call(format!("invalid context: {error}")))?;
+    Ok((model, context))
+}
+
+fn parse_wire(options: Option<Value>) -> Result<Option<StreamOptionsWire>, ExtError> {
+    match options {
+        Some(value) if !value.is_null() => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| ExtError::Call(format!("invalid options: {error}"))),
+        _ => Ok(None),
+    }
+}
+
+fn parse_level<L: serde::de::DeserializeOwned>(level: &str) -> Result<L, ExtError> {
+    serde_json::from_value(Value::String(level.to_owned()))
+        .map_err(|error| ExtError::Call(format!("invalid reasoning: {error}")))
+}
+
+/// `ctx.modelRegistry.stream` options: `reasoning` is `ModelThinkingLevel`
+/// ("off"-inclusive, the agent-side union).
+fn parse_stream_options(
+    options: Option<Value>,
+) -> Result<Option<rpi_ai::models::ModelsStreamOptions>, ExtError> {
+    let Some(wire) = parse_wire(options)? else {
+        return Ok(None);
+    };
+    let reasoning = match wire.reasoning.as_deref() {
+        Some(level) => Some(parse_level::<rpi_ai::types::ModelThinkingLevel>(level)?),
+        None => None,
+    };
+    Ok(Some(rpi_ai::models::ModelsStreamOptions {
+        stream: rpi_ai::types::StreamOptions {
+            temperature: wire.temperature,
+            max_tokens: wire.max_tokens,
+            reasoning,
+            ..rpi_ai::types::StreamOptions::default()
+        },
+        transform_headers: None,
+    }))
+}
+
+/// `ctx.modelRegistry.streamSimple` options: `reasoning` is `ThinkingLevel`
+/// (no "off") and `toolChoice` maps provider-neutrally.
+fn parse_simple_stream_options(
+    options: Option<Value>,
+) -> Result<Option<rpi_ai::models::ModelsSimpleStreamOptions>, ExtError> {
+    let Some(wire) = parse_wire(options)? else {
+        return Ok(None);
+    };
+    let reasoning = match wire.reasoning.as_deref() {
+        Some(level) => Some(parse_level::<rpi_ai::types::ThinkingLevel>(level)?),
+        None => None,
+    };
+    Ok(Some(rpi_ai::models::ModelsSimpleStreamOptions {
+        simple: rpi_ai::types::SimpleStreamOptions {
+            stream: rpi_ai::types::StreamOptions {
+                temperature: wire.temperature,
+                max_tokens: wire.max_tokens,
+                ..rpi_ai::types::StreamOptions::default()
+            },
+            reasoning,
+            thinking_budgets: None,
+            tool_choice: wire.tool_choice,
+        },
+        transform_headers: None,
+    }))
+}
+
 impl ExtensionApi {
     pub(crate) fn new(
         extension: Arc<LoadedExtension>,
@@ -2736,6 +2852,49 @@ impl ExtensionApi {
             .runtime
             .require_actions()?
             .model_registry_find(provider, model_id))
+    }
+
+    /// `ctx.modelRegistry.stream(model, context, options?)` (#8964,
+    /// 1f78cea7a — model-registry.ts:105-110): extension streaming call
+    /// through the configured provider with resolved authentication.
+    /// `model`/`context` are the upstream JSON; `options` carries the
+    /// portable subset (`temperature` / `maxTokens` / `reasoning`) — the
+    /// callback-bearing fields of `StreamOptions` cannot cross a JSON
+    /// boundary (same contract as `ctx.modelRegistry.complete`). Returns
+    /// the live event stream for native callers; the wasm host-call
+    /// collects it (`{events, result}`).
+    pub fn model_registry_stream(
+        &self,
+        model: Value,
+        context: Value,
+        options: Option<Value>,
+    ) -> Result<rpi_ai::utils::event_stream::AssistantMessageEventStream, ExtError> {
+        let (model, context) = parse_model_and_context(model, context)?;
+        let options = parse_stream_options(options)?;
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .model_registry_stream(model, context, options))
+    }
+
+    /// `ctx.modelRegistry.streamSimple(model, context, options?)` (#8964,
+    /// 1f78cea7a — model-registry.ts:112-116): the provider-neutral options
+    /// variant — `reasoning` / `toolChoice` map onto api-specific request
+    /// fields inside the adapters.
+    pub fn model_registry_stream_simple(
+        &self,
+        model: Value,
+        context: Value,
+        options: Option<Value>,
+    ) -> Result<rpi_ai::utils::event_stream::AssistantMessageEventStream, ExtError> {
+        let (model, context) = parse_model_and_context(model, context)?;
+        let options = parse_simple_stream_options(options)?;
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .model_registry_stream_simple(model, context, options))
     }
 
     /// `ctx.modelRegistry.hasConfiguredAuth(providerId)`
