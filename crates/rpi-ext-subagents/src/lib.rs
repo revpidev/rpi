@@ -553,6 +553,15 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             if let Err(error) = register("on", json!({ "event": "session_start" })) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
+            // #2302 tool budget: enforce in the child when the parent
+            // carried a resolved budget (the handler counts every tool call,
+            // nudges at the soft cap, and blocks past the hard cap for tools
+            // in the block list).
+            if crate::p1::tool_budget::budget_from_env().is_some() {
+                if let Err(error) = register("on", json!({ "event": "tool_call" })) {
+                    return json!({"error": {"kind": "init", "message": error.to_string()}});
+                }
+            }
             // #2333 reviewer diff tool: register when the parent captured a
             // launch baseline (gated by the agent's tools naming it).
             if crate::p1::diff_tool::baseline_from_env().is_some() {
@@ -1097,6 +1106,24 @@ fn dispatch_message(message: &Value) -> Value {
                     refresh_child_tool_diagnostic(&state.calls, state.cookie);
                     Value::Null
                 }
+                (PluginMode::ChildPlain | PluginMode::ChildFanout, "tool_call") => {
+                    // #2302: the budget handler's block decision returns as
+                    // the event result (`{block, reason}`); soft nudges ride
+                    // sendUserMessage (deliverAs steer).
+                    let calls = &state.calls;
+                    let cookie = state.cookie;
+                    crate::p1::tool_budget::handle_tool_call_event(message, &|text| {
+                        let _ = host_call_ok(
+                            calls,
+                            cookie,
+                            "sendUserMessage",
+                            json!({
+                                "content": text,
+                                "options": { "deliverAs": "steer" }
+                            }),
+                        );
+                    })
+                }
                 (PluginMode::Parent, "session_start") => {
                     let config = config::load_config();
                     artifacts::cleanup_all_artifact_dirs(config.cleanup_days_or_default());
@@ -1576,6 +1603,7 @@ pub mod parity {
             supervisor_channel: None,
             descendant_allowed_agents: None,
             diff_baseline: None,
+            tool_budget_env: None,
         };
         let result = crate::launch::args::build_rpi_args(&internal)?;
         Ok(BuildArgsResultPublic {

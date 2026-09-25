@@ -515,6 +515,12 @@ fn assemble_single_details(
     if let Some(saved) = &outcome.saved_output_path {
         single["savedOutputPath"] = json!(saved.to_string_lossy());
     }
+    // #2302: the tool-budget terminal state attaches with the blocked flag
+    // when the child reported a hard-block for this run's budget.
+    if let Some(state) = &outcome.tool_budget {
+        single["toolBudget"] = state.clone();
+        single["toolBudgetBlocked"] = json!(state.get("outcome") == Some(&json!("hard-blocked")));
+    }
     let mut details = json!({
         "mode": "single",
         "runId": run_id,

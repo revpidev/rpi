@@ -842,6 +842,12 @@ pub fn child_details(entry: &TaskEntry, outcome: &ChildOutcome, run_id: &str) ->
     if let Some(saved) = &outcome.saved_output_path {
         single["savedOutputPath"] = json!(saved.to_string_lossy());
     }
+    // #2302: the tool-budget terminal state attaches with the blocked flag
+    // when the child reported a hard-block for this run's budget.
+    if let Some(state) = &outcome.tool_budget {
+        single["toolBudget"] = state.clone();
+        single["toolBudgetBlocked"] = json!(state.get("outcome") == Some(&json!("hard-blocked")));
+    }
     // Acceptance ledger (FR-P1-09): drain this child's entry so parallel
     // results carry the same acceptance info as single runs.
     {

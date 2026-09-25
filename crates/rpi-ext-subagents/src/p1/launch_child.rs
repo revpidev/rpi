@@ -354,6 +354,11 @@ pub struct ChildOutcome {
     pub context: ContextMode,
     pub result: ForegroundRunResult,
     pub saved_output_path: Option<PathBuf>,
+    /// #2302 tool-budget terminal state: attached when the child reported a
+    /// hard-block reason generated for this run's budget (exact-message
+    /// match); `toolCount` floors at `hard + 1` so blocks before execution
+    /// start still read past-hard.
+    pub tool_budget: Option<Value>,
     /// #1615 child display name (`deriveChildSessionName`): threaded into
     /// the run status steps and result payloads.
     pub session_name: Option<String>,
@@ -462,6 +467,13 @@ pub async fn run_child_async(
     agent: &AgentConfig,
     ctx: &RunCtx,
 ) -> Result<ChildOutcome, String> {
+    // #2302: the effective tool budget validates at admission with the
+    // upstream error texts (spec override > top-level call param).
+    let effective_tool_budget = crate::p1::tool_budget::validate_tool_budget_config(
+        spec.tool_budget.as_ref().or(ctx.top_tool_budget.as_ref()),
+        "toolBudget",
+    )?;
+
     // #2338 descendant agent allowlists: the ceiling this session runs under
     // (inherited via env) gates every launch; it can only be narrowed.
     if let Some(ceiling) = crate::launch::args::DescendantAllowlist::from_env() {
@@ -846,6 +858,12 @@ pub async fn run_child_async(
         spec.task.clone()
     };
 
+    // #2302: the resolved tool budget rides the child env for the child-side
+    // tool_call enforcement.
+    let tool_budget_env = effective_tool_budget
+        .as_ref()
+        .map(crate::p1::tool_budget::budget_to_env_value);
+
     let input = ForegroundRunInput {
         agent_name: agent.name.clone(),
         agent_system_prompt: system_prompt,
@@ -856,6 +874,7 @@ pub async fn run_child_async(
         agent_subagent_only_extensions: agent.subagent_only_extensions.clone(),
         agent_allowed_agents: agent.allowed_agents.clone(),
         diff_baseline,
+        tool_budget_env,
         agent_inherit_project_context: agent.inherit_project_context,
         agent_inherit_skills: agent.inherit_skills,
         task: task_text,
@@ -896,6 +915,48 @@ pub async fn run_child_async(
     // candidate above); a provider failure fails the child and retrying
     // another model requires a later explicit launch.
     let mut result = foreground::run_foreground(&input).await;
+
+    // #2302: terminal tool-budget classification — the exact blocked message
+    // (this budget's hard value + tool attribution) attaches the
+    // ToolBudgetState; the toolResult that carried the reason is the
+    // authoritative tool attribution, with the final output / error text as
+    // fallbacks.
+    let tool_budget_report: Option<Value> = effective_tool_budget.as_ref().and_then(|budget| {
+        let from_transcript: Option<String> = result
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("toolResult"))
+            .find_map(|message| {
+                let text = message
+                    .get("content")
+                    .and_then(|content| content.as_array())
+                    .and_then(|blocks| {
+                        blocks
+                            .iter()
+                            .find_map(|block| block.get("text").and_then(Value::as_str))
+                    })
+                    .or_else(|| message.get("text").and_then(Value::as_str))?;
+                crate::p1::tool_budget::classify_blocked_message(budget, text)
+            });
+        let tool = from_transcript
+            .or_else(|| {
+                crate::p1::tool_budget::classify_blocked_message(budget, &result.final_output)
+            })
+            .or_else(|| {
+                crate::p1::tool_budget::classify_blocked_message(
+                    budget,
+                    result.error.as_deref().unwrap_or_default(),
+                )
+            })?;
+        // A block detected before execution start still reads past-hard.
+        let tool_count = result.tool_count.max(budget.hard + 1);
+        Some(crate::p1::tool_budget::tool_budget_state(
+            budget,
+            tool_count,
+            Some(tool.as_str()),
+        ))
+    });
 
     // Acceptance ledger (FR-P1-09): inferred level + parsed fenced report;
     // explicit gates run host-side and failing gates fail the run.
@@ -1060,6 +1121,7 @@ pub async fn run_child_async(
         context,
         result,
         saved_output_path,
+        tool_budget: tool_budget_report,
         session_name,
         output_mode,
     })

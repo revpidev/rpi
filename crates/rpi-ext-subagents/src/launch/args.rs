@@ -323,6 +323,8 @@ pub struct BuildArgsInput {
     pub descendant_allowed_agents: Option<DescendantAllowlist>,
     /// Reviewer diff baseline env value (#2333); `None` leaves the env unset.
     pub diff_baseline: Option<String>,
+    /// Resolved tool budget env value (#2302); `None` leaves the env unset.
+    pub tool_budget_env: Option<String>,
     /// Effective thinking ceiling (#1397 `subagents.maxThinking` + inherited
     /// env intersection): propagated to the child so grandchildren stay
     /// under the tightest ancestor ceiling (launch-contract
@@ -759,6 +761,14 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         if !retention.is_empty() {
             env.insert(ENV_CACHE_RETENTION.to_string(), Some(retention.to_string()));
         }
+    }
+    if let Some(budget) = &input.tool_budget_env {
+        env.insert(
+            crate::p1::tool_budget::TOOL_BUDGET_ENV.to_string(),
+            Some(budget.clone()),
+        );
+    } else {
+        cleared(&mut env, crate::p1::tool_budget::TOOL_BUDGET_ENV);
     }
     if let Some(baseline) = &input.diff_baseline {
         env.insert(

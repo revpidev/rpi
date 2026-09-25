@@ -226,6 +226,8 @@ pub struct ForegroundRunInput {
     /// tools include `watchdog_diff`; the child registers the bounded diff
     /// tool only when present.
     pub diff_baseline: Option<String>,
+    /// Resolved tool budget env value (#2302); `None` leaves the env unset.
+    pub tool_budget_env: Option<String>,
     pub agent_inherit_project_context: bool,
     pub agent_inherit_skills: bool,
     pub task: String,
@@ -355,6 +357,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             &input.agent_name,
         ),
         diff_baseline: input.diff_baseline.clone(),
+        tool_budget_env: input.tool_budget_env.clone(),
     });
 
     let launch = match launch {
@@ -1223,6 +1226,7 @@ mod terminal_classification_tests {
             agent_subagent_only_extensions: None,
             agent_allowed_agents: None,
             diff_baseline: None,
+            tool_budget_env: None,
             agent_inherit_project_context: true,
             agent_inherit_skills: false,
             task: "replay".to_string(),
