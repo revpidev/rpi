@@ -623,6 +623,13 @@ async fn launch_one(
             .unwrap_or(false)
         {
             let cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
+            // Allocation repeats the source probe (#2081): the dispatch-time
+            // preflight is advisory — the source state can change before this
+            // child's worktree is allocated, and a dirty tree must not reach
+            // `git worktree add`.
+            if let Err(message) = crate::p1::worktree::probe_worktree_source(&cwd) {
+                return Some(Err(message));
+            }
             let cwd_relative = match crate::p1::worktree::resolve_repo_cwd_relative(&cwd) {
                 Ok(relative) => relative,
                 Err(message) => return Some(Err(message)),

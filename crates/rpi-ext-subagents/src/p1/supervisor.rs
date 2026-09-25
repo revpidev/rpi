@@ -332,6 +332,29 @@ pub fn pending_asks_for_run(run_id: &str) -> Vec<Value> {
     asks
 }
 
+/// TE38 W7 (#2202 @ b72714de, `hasPendingRequests`): does this orchestrator
+/// session own any unanswered blocking ask (need_decision /
+/// interview_request)? The headless agent_end drain consults this and yields
+/// — a headless parent at turn end cannot answer asks, so waiting would only
+/// burn the drain budget while children block (upstream breaks the drain
+/// loop on a pending request).
+pub fn has_pending_blocking_requests(orchestrator_session_id: &str) -> bool {
+    let root = channels_root();
+    let Ok(channel_entries) = std::fs::read_dir(&root) else {
+        return false;
+    };
+    for channel in channel_entries.flatten() {
+        for request in read_requests(&channel.path()) {
+            let blocking = request["reason"].as_str() == Some("need_decision")
+                || request["reason"].as_str() == Some("interview_request");
+            if blocking && request_matches_session(&request, orchestrator_session_id) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Parent-side `subagent_supervisor` ({action: pending|reply}) —
 /// `NATIVE_SUPERVISOR_TOOL_NAME` handler (L559-587).
 pub fn parent_supervisor_action(
@@ -512,6 +535,47 @@ mod tests {
             1
         );
         assert_eq!(prompt.matches("Intercom orchestration channel:").count(), 1);
+    }
+
+    /// TE38 T1 (#2327 @ b72714de): supervisor scanning is fail-soft — a
+    /// vanished channel root or channel directory reads as "no requests",
+    /// never a panic or an error surface. Rust's read_dir treats every
+    /// failure uniformly (upstream needed the win32 `UNKNOWN` carve-out;
+    /// the uniform behavior subsumes it).
+    #[test]
+    fn scan_tolerates_vanished_directories() {
+        // Missing root: "pending" reads empty, no panic.
+        let missing_root = channels_root().join(format!("vanished-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing_root);
+        let pending =
+            parent_supervisor_action("pending", None, None, "session-vanished", &missing_root);
+        assert_eq!(pending["isError"], Value::Bool(false));
+        assert!(pending["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("(none)"));
+        // Session-scoped probe over the (missing) global root: false.
+        assert!(!has_pending_blocking_requests("session-vanished"));
+        // A channel dir that disappears between listing and reading: the
+        // flatten() + read_requests chain skips it silently. The channel
+        // sits directly under the global root (the scan is one level deep).
+        let channel =
+            channels_root().join(format!("vanish-mid-runz-worker-0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&channel);
+        ensure_channel(&channel);
+        std::fs::write(
+            channel.join("requests").join("r1.json"),
+            json!({ "id": "r1", "reason": "need_decision", "runId": "runz",
+                    "orchestratorSessionId": "session-mid", "createdAt": "2026-09-26T00:00:00.000Z" })
+                .to_string(),
+        )
+        .unwrap();
+        assert!(has_pending_blocking_requests("session-mid"));
+        // Remove the whole channel (simulating the race): scans stay quiet.
+        let _ = std::fs::remove_dir_all(&channel);
+        assert!(!has_pending_blocking_requests("session-mid"));
+        assert!(pending_asks("runz", 0).is_empty());
+        let _ = std::fs::remove_dir_all(&channel);
     }
 
     #[test]

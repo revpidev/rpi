@@ -251,7 +251,7 @@ pub fn create_worktree(
     };
     let mut synthetic_paths = Vec::new();
     let result = (|| -> Result<WorktreeInfo, String> {
-        let node_modules_linked = link_node_modules_if_present(toplevel, &worktree_path);
+        let node_modules_linked = link_node_modules_if_present(toplevel, &worktree_path)?;
         if node_modules_linked {
             synthetic_paths.push("node_modules".to_string());
         }
@@ -310,23 +310,62 @@ pub fn create_worktree(
     }
 }
 
-/// `linkNodeModulesIfPresent` (worktree.ts:243): symlink repo node_modules
-/// into the worktree (dependency reuse; excluded from diffs).
-fn link_node_modules_if_present(toplevel: &Path, worktree_path: &Path) -> bool {
+/// `linkNodeModulesIfPresent` (worktree.ts @ b72714de, #2288): fail-closed
+/// dependency linking. The link is optional only when there is nothing to
+/// link (no source, or a link already exists); any other outcome — source
+/// present but not a directory, link creation failure, or a created link
+/// that does not resolve back to the source — is an error the worktree
+/// setup surfaces (preserved-allocation handoff per #1902). The upstream
+/// win32 path creates a junction; Rust std has no junction API, so
+/// non-unix platforms keep the explicit skip (TE38 §4.2 O-5 note).
+fn link_node_modules_if_present(toplevel: &Path, worktree_path: &Path) -> Result<bool, String> {
     let source = toplevel.join("node_modules");
-    if !source.exists() {
-        return false;
+    let link = worktree_path.join("node_modules");
+    let wrap = |message: String| {
+        format!(
+            "failed to link node_modules from {} to {}: {message}",
+            source.to_string_lossy(),
+            link.to_string_lossy()
+        )
+    };
+    // An existing entry at the link path means dependency reuse is already
+    // in place (or the checkout ships its own) — skip.
+    if std::fs::symlink_metadata(&link).is_ok() {
+        return Ok(false);
     }
+    let source_meta = match std::fs::metadata(&source) {
+        Ok(meta) => meta,
+        // Source missing: nothing to reuse — optional skip.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(wrap(error.to_string())),
+    };
+    if !source_meta.is_dir() {
+        return Err(wrap("source node_modules is not a directory".to_string()));
+    }
+    let source_real = std::fs::canonicalize(&source).map_err(|error| wrap(error.to_string()))?;
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&source, worktree_path.join("node_modules")).is_ok()
+        std::os::unix::fs::symlink(&source, &link).map_err(|error| wrap(error.to_string()))?;
     }
     #[cfg(not(unix))]
     {
-        // No symlink fallback on non-unix (dependency reuse is unix-only).
-        let _ = worktree_path;
-        false
+        // No junction API in Rust std; upstream links via junction on win32.
+        // Keep the explicit skip rather than fail-closing a platform whose
+        // link mechanism std cannot express (see O-5).
+        let _ = (&source_real, &link);
+        return Ok(false);
     }
+    // Created-link verification (#2288): the link must be a symlink that
+    // resolves back to the source — a dangling or redirected link is a
+    // half-built worktree, not a reusable dependency.
+    let link_meta = std::fs::symlink_metadata(&link).map_err(|error| wrap(error.to_string()))?;
+    let link_real = std::fs::canonicalize(&link).map_err(|error| wrap(error.to_string()))?;
+    if !link_meta.file_type().is_symlink() || link_real != source_real {
+        return Err(wrap(
+            "created link does not resolve to the source node_modules".to_string(),
+        ));
+    }
+    Ok(true)
 }
 
 /// `validateHookPath` (worktree.ts:268-294): non-empty, `~/` expandable,
@@ -1062,13 +1101,11 @@ pub fn resolve_repo_base_with_ref(
     cwd: &Path,
     base_ref: Option<&str>,
 ) -> Result<(PathBuf, String), String> {
-    let toplevel = run_git_checked(
-        cwd,
-        &["rev-parse", "--show-toplevel"],
-        "git rev-parse --show-toplevel",
-    )?
-    .trim()
-    .to_string();
+    // Admission + allocation both go through the source probe (#2081 @
+    // b72714de semantics): the cwd must be inside a git work tree and the
+    // source tree must be clean before any worktree state is created —
+    // upstream `resolveRepoState` opens with `probeWorktreeSource`.
+    let toplevel = probe_worktree_source(cwd)?;
     let base_commit = match base_ref {
         Some(reference) => {
             let validated = validate_base_ref(reference)?;
@@ -1097,7 +1134,54 @@ pub fn resolve_repo_base_with_ref(
     if base_commit.is_empty() {
         return Err("worktree base commit could not be resolved".to_string());
     }
-    Ok((PathBuf::from(toplevel), base_commit))
+    Ok((toplevel, base_commit))
+}
+
+/// `probeWorktreeSource` / the probe half of `resolveRepoState`
+/// (worktree.ts @ b72714de, #2081/#2325): read-only source admission check.
+/// The cwd must be inside a git work tree, and the source tree must be clean
+/// — durable runtime state under `.rpi/subagents` is excluded so plugin
+/// bookkeeping cannot make managed isolation unusable (upstream excludes
+/// `.pi/subagents`, artifacts.ts:6). Returns the repo toplevel. Admission
+/// (dispatch) and allocation (`launch_one`) both run it — the source state
+/// can change between the two.
+pub fn probe_worktree_source(cwd: &Path) -> Result<PathBuf, String> {
+    // `rev-parse --is-inside-work-tree` exits 128 outside a repo (upstream
+    // accepts that code in `resolveRepoState` and maps it to the friendly
+    // repo error, worktree.ts @ b72714de).
+    let inside = run_git(cwd, &["rev-parse", "--is-inside-work-tree"])
+        .map_err(|error| format!("git rev-parse --is-inside-work-tree: {error}"))?;
+    if !inside.status.success() || String::from_utf8_lossy(&inside.stdout).trim() != "true" {
+        return Err("worktree isolation requires a git repository".to_string());
+    }
+    let toplevel = PathBuf::from(
+        run_git_checked(
+            cwd,
+            &["rev-parse", "--show-toplevel"],
+            "git rev-parse --show-toplevel",
+        )?
+        .trim(),
+    );
+    // TE38 W1 (#2081): the clean-tree gate mirrors upstream verbatim —
+    // `status --porcelain -- ':!<project-subagents-dir>'`, any output line
+    // rejects the admission before run state or children are created.
+    let status = run_git_checked(
+        &toplevel,
+        &[
+            "status",
+            "--porcelain",
+            "--",
+            &format!(":!{}", crate::paths::PROJECT_SUBAGENTS_RELATIVE_DIR),
+        ],
+        "git status --porcelain",
+    )?;
+    if !status.trim().is_empty() {
+        return Err(
+            "worktree isolation requires a clean git working tree. Commit or stash changes first."
+                .to_string(),
+        );
+    }
+    Ok(toplevel)
 }
 
 /// Resolve the repo toplevel + base commit for a run at the current HEAD.
@@ -1227,6 +1311,113 @@ mod tests {
             worktree_base_dir: Some(dir.join("worktrees").to_string_lossy().to_string()),
             ..ExtensionConfig::default()
         }
+    }
+
+    /// TE38 W1 (#2081 @ b72714de): the source admission probe — clean tree
+    /// passes and returns the toplevel; a dirty tree (tracked or untracked)
+    /// rejects with the upstream-verbatim message; dirt under
+    /// `.rpi/subagents` (durable runtime state) is excluded; a non-repo
+    /// rejects with the repo message.
+    #[test]
+    fn probe_worktree_source_admission_rules() {
+        let (dir, toplevel, _) = test_repo("probe");
+        // Clean tree → toplevel.
+        assert_eq!(probe_worktree_source(&toplevel).unwrap(), toplevel);
+        assert_eq!(probe_worktree_source(&dir.join("repo")).unwrap(), toplevel);
+        // Untracked dirt rejects with the verbatim message.
+        std::fs::write(toplevel.join("untracked.txt"), "dirty").unwrap();
+        let error = probe_worktree_source(&toplevel).unwrap_err();
+        assert_eq!(
+            error,
+            "worktree isolation requires a clean git working tree. Commit or stash changes first."
+        );
+        std::fs::remove_file(toplevel.join("untracked.txt")).unwrap();
+        // Tracked modifications reject too.
+        std::fs::write(toplevel.join("base.txt"), "mutated").unwrap();
+        assert!(probe_worktree_source(&toplevel)
+            .unwrap_err()
+            .contains("clean git working tree"));
+        run_git_checked(&toplevel, &["checkout", "--", "base.txt"], "checkout").unwrap();
+        // Dirt under .rpi/subagents is excluded (upstream excludes
+        // `.pi/subagents`, artifacts.ts:6).
+        std::fs::create_dir_all(toplevel.join(".rpi/subagents/runs/abc")).unwrap();
+        std::fs::write(
+            toplevel.join(".rpi/subagents/runs/abc/status.json"),
+            "{\"state\":\"running\"}",
+        )
+        .unwrap();
+        assert_eq!(probe_worktree_source(&toplevel).unwrap(), toplevel);
+        // Non-repo rejects with the repo message.
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let error = probe_worktree_source(&outside).unwrap_err();
+        assert_eq!(error, "worktree isolation requires a git repository");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TE38 W1: `resolve_repo_base_with_ref` inherits the probe — a dirty
+    /// source rejects before any base resolution (admission ordering, the
+    /// #2081/#2325 shared semantics).
+    #[test]
+    fn resolve_repo_base_rejects_dirty_source() {
+        let (dir, toplevel, _) = test_repo("probe-dirty");
+        std::fs::write(toplevel.join("untracked.txt"), "dirty").unwrap();
+        let error = resolve_repo_base_with_ref(&toplevel, None).unwrap_err();
+        assert_eq!(
+            error,
+            "worktree isolation requires a clean git working tree. Commit or stash changes first."
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TE38 W4 (#2288 @ b72714de): dependency linking is fail-closed —
+    /// happy path creates a verified symlink; missing source and existing
+    /// link stay optional skips; a non-directory source errors with the
+    /// wrapped message.
+    #[cfg(unix)]
+    #[test]
+    fn node_modules_link_fail_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-sub-nm-{}-{}",
+            std::process::id(),
+            crate::artifacts::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let toplevel = dir.join("repo");
+        let worktree = dir.join("wt");
+        std::fs::create_dir_all(toplevel.join("node_modules")).unwrap();
+        std::fs::write(toplevel.join("node_modules/dep.txt"), "d").unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        // Happy path: verified symlink back to the source.
+        assert!(link_node_modules_if_present(&toplevel, &worktree).unwrap());
+        let link = worktree.join("node_modules");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(link.join("dep.txt").exists());
+        // Existing link → optional skip.
+        assert!(!link_node_modules_if_present(&toplevel, &worktree).unwrap());
+        // Missing source → optional skip.
+        let empty_top = dir.join("empty");
+        let empty_wt = dir.join("empty-wt");
+        std::fs::create_dir_all((&empty_top, &empty_wt).0).unwrap();
+        std::fs::create_dir_all(&empty_wt).unwrap();
+        assert!(!link_node_modules_if_present(&empty_top, &empty_wt).unwrap());
+        assert!(!empty_wt.join("node_modules").exists());
+        // Source present but not a directory → fail-closed error.
+        let file_top = dir.join("file-top");
+        let file_wt = dir.join("file-wt");
+        std::fs::create_dir_all(&file_top).unwrap();
+        std::fs::create_dir_all(&file_wt).unwrap();
+        std::fs::write(file_top.join("node_modules"), "not a dir").unwrap();
+        let error = link_node_modules_if_present(&file_top, &file_wt).unwrap_err();
+        assert!(
+            error.contains("failed to link node_modules from")
+                && error.contains("source node_modules is not a directory"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

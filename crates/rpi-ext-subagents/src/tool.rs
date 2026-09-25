@@ -187,7 +187,7 @@ pub fn tool_parameters_schema() -> Value {
             "lines": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 1000,
+                "maximum": 500,
                 "description": "Line bound for status view:transcript (default 80)."
             },
             "childId": {
@@ -1031,6 +1031,99 @@ fn format_failed_single_run_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TE38 W1 (#2081/#2325 shared semantics): `build_worktree_plan` — the
+    /// dispatch-time admission seam — rejects a dirty source tree with the
+    /// upstream-verbatim message *before* any plan, budget, or run state
+    /// exists; a clean tree resolves the plan.
+    #[test]
+    fn build_worktree_plan_admission_preflight() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-sub-wt-plan-{}-{}",
+            std::process::id(),
+            crate::artifacts::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git");
+        }
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .output()
+            .expect("git");
+        std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "base"])
+            .current_dir(&repo)
+            .output()
+            .expect("git");
+        let ctx = crate::p1::launch_child::RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: repo.clone(),
+            parent_session: None,
+            parent_session_file: None,
+            parent_session_id: None,
+            parent_model: None,
+            registry: Vec::new(),
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "te38plan1".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: None,
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: None,
+            artifacts_dir: None,
+            session_root: dir.join("sessions"),
+            frame_sink: None,
+            step_status: None,
+            abort_probe: None,
+        };
+        let entries = vec![crate::p1::parallel::TaskEntry {
+            key: "a".to_string(),
+            spec: crate::p1::launch_child::ChildSpec::from_params(
+                serde_json::json!({ "agent": "scout", "task": "t" })
+                    .as_object()
+                    .unwrap(),
+            ),
+            worktree_override: None,
+        }];
+        let object = json!({ "worktree": true });
+        let object = object.as_object().unwrap();
+        // Clean tree: the plan resolves.
+        assert!(build_worktree_plan(&entries, object, &ctx).is_ok());
+        // Dirty tree: rejected with the verbatim message before any state.
+        std::fs::write(repo.join("untracked.txt"), "dirty").unwrap();
+        let error = build_worktree_plan(&entries, object, &ctx)
+            .err()
+            .expect("dirty tree must reject the admission");
+        assert_eq!(
+            error,
+            "worktree isolation requires a clean git working tree. Commit or stash changes first."
+        );
+        // No worktree opt-in: no probe at all (the plan is None without git).
+        std::fs::write(repo.join("untracked2.txt"), "dirty").unwrap();
+        let plain = json!({});
+        assert!(
+            build_worktree_plan(&entries, plain.as_object().unwrap(), &ctx)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn timeout_alias_rules() {

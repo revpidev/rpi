@@ -1690,9 +1690,25 @@ fn has_outstanding_work() -> bool {
 /// `drainOutstandingWork` (auto-drain.ts L37-73): headless `agent_end` —
 /// wait for every outstanding run to reach a terminal state, bounded by the
 /// total drain budget (default 30min). Returns an error on timeout.
-pub async fn drain_outstanding_work(timeout_ms: u64) -> Result<(), String> {
+pub async fn drain_outstanding_work(
+    timeout_ms: u64,
+    yield_on_pending_asks_for: Option<&str>,
+) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     while has_outstanding_work() {
+        // TE38 W7 (#2202 @ b72714de): a headless parent at agent_end cannot
+        // answer supervisor asks — if this session owns an unanswered
+        // blocking ask, yield immediately (upstream `drainOutstandingWork`
+        // breaks on `hasPendingSupervisorRequest`) instead of burning the
+        // drain budget on children nobody can unblock.
+        if let Some(session_id) = yield_on_pending_asks_for {
+            if crate::p1::supervisor::has_pending_blocking_requests(session_id) {
+                tracing::info!(
+                    "auto-drain yielded: pending supervisor ask for session {session_id}"
+                );
+                return Ok(());
+            }
+        }
         if std::time::Instant::now() >= deadline {
             return Err(
                 "Timed out waiting for background subagent runs to finish before exit.".to_string(),
@@ -2208,6 +2224,68 @@ pub(crate) mod tests {
         assert!(wait_for_runs(Some("nope"), false, 10, None, None)
             .await
             .is_err());
+    }
+
+    /// TE38 W7 (#2202 @ b72714de): the headless drain yields immediately
+    /// when the owning session has an unanswered blocking supervisor ask —
+    /// no burn of the drain budget on children nobody can unblock — and
+    /// drains normally once the ask is gone.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn drain_yields_on_pending_supervisor_ask() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = format!("te38-drain-session-{}", std::process::id());
+        let run = running_test_run("te38-drain-run");
+        // A blocking ask owned by this session (global supervisor channels
+        // root; unique ids keep concurrent scanners untouched).
+        let channel = crate::p1::supervisor::channel_dir("te38-drain-run", "worker", 0);
+        crate::p1::supervisor::ensure_channel(&channel);
+        let request_path = channel.join("requests").join("te38-drain-ask.json");
+        std::fs::write(
+            &request_path,
+            json!({
+                "id": "te38-drain-ask",
+                "reason": "need_decision",
+                "runId": "te38-drain-run",
+                "agent": "worker",
+                "childIndex": 0,
+                "orchestratorSessionId": session,
+                "message": "proceed?",
+                "createdAt": "2026-09-26T00:00:00.000Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(crate::p1::supervisor::has_pending_blocking_requests(
+            &session
+        ));
+        // With the ask pending: yield immediately (well under the 30s cap).
+        let started = std::time::Instant::now();
+        drain_outstanding_work(30_000, Some(&session))
+            .await
+            .expect("drain yields, not errors");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "yield must be immediate, took {:?}",
+            started.elapsed()
+        );
+        // Without a session filter (legacy path) the drain keeps waiting —
+        // bounded by a tiny budget here.
+        let result = drain_outstanding_work(50, None).await;
+        assert!(result.is_err(), "run still outstanding must time out");
+        // Ask answered (file removed): the drain no longer yields on this
+        // session — bounded by the tiny budget again.
+        std::fs::remove_file(&request_path).unwrap();
+        assert!(!crate::p1::supervisor::has_pending_blocking_requests(
+            &session
+        ));
+        let result = drain_outstanding_work(50, Some(&session)).await;
+        assert!(result.is_err(), "run still outstanding must time out");
+        unregister_run("te38-drain-run");
+        let _ = std::fs::remove_dir_all(&channel);
+        let _ = run;
     }
 
     #[tokio::test]

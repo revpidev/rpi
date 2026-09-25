@@ -740,6 +740,42 @@ mod tests {
         }
     }
 
+    /// TE38 T2 (#2334 @ b72714de, pinning): the per-spawn parent-session env
+    /// is pinned from the launching session — an explicit
+    /// `parent_session_id` always wins, so a stale inherited process env
+    /// (the legacy process-global face upstream removed) can never leak
+    /// into a grandchild's routing identity.
+    #[test]
+    fn parent_session_env_explicit_wins_over_inherited() {
+        // A stale inherited value (as a child host would carry).
+        std::env::set_var(SUBAGENT_PARENT_SESSION_ENV, "stale-orchestrator-session");
+        let dir = std::env::temp_dir().join(format!("rpi-sub-args-ps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut input = base_input();
+        input.session_dir = Some(dir.join("run-0"));
+        // Explicit wins.
+        input.parent_session_id = Some("child-host-session".into());
+        let result = build_rpi_args(&input).unwrap();
+        assert_eq!(
+            result.env.get(SUBAGENT_PARENT_SESSION_ENV),
+            Some(&Some("child-host-session".into()))
+        );
+        cleanup_temp_dir(&result.temp_dir);
+        // No explicit value: the inherited env is the documented fallback
+        // (args.rs:672-678) — recorded here so a future change to the
+        // fallback chain is a conscious one.
+        let mut inherited = base_input();
+        inherited.session_dir = Some(dir.join("run-1"));
+        let result = build_rpi_args(&inherited).unwrap();
+        assert_eq!(
+            result.env.get(SUBAGENT_PARENT_SESSION_ENV),
+            Some(&Some("stale-orchestrator-session".into()))
+        );
+        cleanup_temp_dir(&result.temp_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var(SUBAGENT_PARENT_SESSION_ENV);
+    }
+
     #[test]
     fn minimal_args_shape() {
         let dir = std::env::temp_dir().join(format!("rpi-sub-args-{}", std::process::id()));

@@ -193,7 +193,11 @@ impl MemoryConfig {
     }
 
     /// `resolveMemoryDir` (agent-memory.ts:79-103): traversal-guarded
-    /// directory under the scope root.
+    /// directory under the scope root. The project root is the nearest
+    /// project-root candidate (`.rpi`/`.agents` ancestor) with the git root
+    /// as fallback, mapped from a verified linked worktree onto the main
+    /// checkout (#2336 @ b72714de, `findNearestProjectRoot(cwd) ??
+    /// findNearestGitRoot(cwd)` + `resolveProjectMemoryRoot`).
     pub fn resolve_dir(&self, cwd: &Path, agent_name: &str) -> Option<PathBuf> {
         if self.path.is_empty()
             || self.path.contains('\0')
@@ -208,7 +212,10 @@ impl MemoryConfig {
         let base = if self.scope == "user" {
             crate::paths::get_agent_dir().join("agent-memory")
         } else {
-            crate::paths::get_project_config_dir(cwd).join("agent-memory")
+            let project_root =
+                find_configured_project_root(cwd).or_else(|| find_nearest_git_root(cwd))?;
+            crate::paths::get_project_config_dir(&resolve_project_memory_root(&project_root))
+                .join("agent-memory")
         };
         Some(
             base.join(&self.path)
@@ -228,6 +235,191 @@ fn sanitize_memory_segment(value: &str) -> String {
             }
         })
         .collect()
+}
+
+/// `findNearestGitRoot` (agents.ts @ b72714de): nearest ancestor holding a
+/// `.git` entry — a directory for the main checkout, a file for linked
+/// worktrees (both count).
+pub fn find_nearest_git_root(cwd: &Path) -> Option<PathBuf> {
+    let mut current = cwd.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        let parent = current.parent()?.to_path_buf();
+        if parent == current {
+            return None;
+        }
+        current = parent;
+    }
+}
+
+/// Bounded read of a small regular file (agent-memory.ts @ b72714de
+/// `readBoundedRegularFile`): refuses symlinks, non-files, and anything
+/// over 4 KiB — the gitdir markers are tiny by construction.
+fn read_bounded_regular_file(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 4 * 1024 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Canonical path identity (agent-memory.ts `samePath`): realpath equality;
+/// on unix that is byte equality of the canonicalized paths. Missing paths
+/// are not comparable (`None`).
+fn same_path(left: &Path, right: &Path) -> Option<bool> {
+    let left = std::fs::canonicalize(left).ok()?;
+    let right = std::fs::canonicalize(right).ok()?;
+    Some(left == right)
+}
+
+/// `gitConfirmsWorktree` (agent-memory.ts @ b72714de): `git -C root
+/// rev-parse --path-format=absolute --git-common-dir --show-toplevel` must
+/// report the common dir and the toplevel we derived — bounded (2s), stderr
+/// trimmed to 2 KiB like upstream's probe.
+fn git_confirms_worktree(project_root: &Path, common_git_dir: &Path) -> bool {
+    let child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--show-toplevel",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    let Ok(output) = child else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.trim().lines();
+    let (Some(common), Some(toplevel)) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    matches!(
+        (
+            same_path(Path::new(common), common_git_dir),
+            same_path(Path::new(toplevel), project_root),
+        ),
+        (Some(true), Some(true))
+    )
+}
+
+/// `resolveLinkedWorktreeMain` (agent-memory.ts @ b72714de): a verified
+/// linked worktree maps onto its main checkout. Verification is layered —
+/// the `.git` marker names the worktree gitdir, the gitdir's `gitdir`
+/// backlink must name the marker back, the layout must be
+/// `<repo>/.git/worktrees/<name>`, and a bounded `git rev-parse` confirms
+/// both halves. Any doubt returns the input unchanged.
+fn resolve_linked_worktree_main(worktree_root: &Path) -> PathBuf {
+    let marker = worktree_root.join(".git");
+    let Some(raw) = read_bounded_regular_file(&marker) else {
+        return worktree_root.to_path_buf();
+    };
+    let Some(gitdir) = raw.lines().find_map(|line| {
+        let rest = line.trim_start_matches("gitdir:");
+        if rest.len() == line.len() {
+            return None; // no prefix match
+        }
+        let trimmed = rest.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }) else {
+        return worktree_root.to_path_buf();
+    };
+    let worktree_git_dir = match std::fs::canonicalize(worktree_root.join(&gitdir)) {
+        Ok(path) => path,
+        Err(_) => return worktree_root.to_path_buf(),
+    };
+    let backlink = match read_bounded_regular_file(&worktree_git_dir.join("gitdir")) {
+        Some(value) => value.trim().to_string(),
+        None => return worktree_root.to_path_buf(),
+    };
+    if backlink.is_empty()
+        || !same_path(&worktree_git_dir.join(&backlink), &marker).unwrap_or(false)
+    {
+        return worktree_root.to_path_buf();
+    }
+    let worktrees_dir = worktree_git_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| worktree_root.to_path_buf());
+    let common_git_dir = worktrees_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| worktree_root.to_path_buf());
+    if worktrees_dir.file_name() != Some(std::ffi::OsStr::new("worktrees"))
+        || common_git_dir.file_name() != Some(std::ffi::OsStr::new(".git"))
+    {
+        return worktree_root.to_path_buf();
+    }
+    let main = match std::fs::canonicalize(common_git_dir.parent().unwrap_or(Path::new("/"))) {
+        Ok(path) => path,
+        Err(_) => return worktree_root.to_path_buf(),
+    };
+    let common_meta = match std::fs::symlink_metadata(&common_git_dir) {
+        Ok(meta) => meta,
+        Err(_) => return worktree_root.to_path_buf(),
+    };
+    if common_meta.file_type().is_symlink() || !common_meta.is_dir() {
+        return worktree_root.to_path_buf();
+    }
+    let relative_git_dir = match std::fs::canonicalize(&common_git_dir) {
+        Ok(common) => worktree_git_dir
+            .strip_prefix(&common)
+            .ok()
+            .map(|rel| rel.to_path_buf()),
+        Err(_) => None,
+    };
+    let confirmed = relative_git_dir
+        .map(|relative| {
+            let segments: Vec<std::ffi::OsString> = relative
+                .components()
+                .map(|component| component.as_os_str().to_os_string())
+                .collect();
+            segments.len() == 2
+                && segments[0] == "worktrees"
+                && git_confirms_worktree(worktree_root, &common_git_dir)
+        })
+        .unwrap_or(false);
+    if confirmed {
+        main
+    } else {
+        worktree_root.to_path_buf()
+    }
+}
+
+/// `resolveProjectMemoryRoot` (agent-memory.ts @ b72714de, #2336): map the
+/// selected project path from a verified linked worktree onto the main
+/// checkout so project-scoped memory is shared across worktrees. Missing
+/// mapped targets are returned as-is (the main checkout may not have the
+/// subdir yet — creating it there is the point); any verification failure
+/// keeps the original root.
+fn resolve_project_memory_root(project_root: &Path) -> PathBuf {
+    let Some(git_root) = find_nearest_git_root(project_root) else {
+        return project_root.to_path_buf();
+    };
+    let main = resolve_linked_worktree_main(&git_root);
+    let result = (|| -> Option<PathBuf> {
+        if same_path(&main, &git_root).unwrap_or(false) {
+            return None;
+        }
+        let git_real = std::fs::canonicalize(&git_root).ok()?;
+        let project_real = std::fs::canonicalize(project_root).ok()?;
+        let relative = project_real.strip_prefix(&git_real).ok()?.to_path_buf();
+        let mapped = main.join(&relative);
+        if !mapped.exists() {
+            return Some(mapped);
+        }
+        let canonical = std::fs::canonicalize(&mapped).ok()?;
+        canonical.starts_with(&main).then_some(canonical)
+    })();
+    result.unwrap_or_else(|| project_root.to_path_buf())
 }
 
 /// `readMemoryFile` (agent-memory.ts:143-171): first MAX_MEMORY_LINES (200)
@@ -1455,6 +1647,175 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// TE38 W2 (#2336 @ b72714de): project-scope memory resolves against the
+    /// project root (nearest `.rpi`/`.agents` ancestor, git root fallback)
+    /// — and a verified linked worktree maps onto the main checkout so the
+    /// memory scope is shared across worktrees.
+    #[test]
+    fn project_memory_root_linked_worktree_mapping() {
+        if !git_available() {
+            return;
+        }
+        let dir = temp_root("te38-mem");
+        let main = dir.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            git(&args, &main);
+        }
+        std::fs::write(main.join("base.txt"), "base").unwrap();
+        git(&["add", "-A"], &main);
+        git(&["commit", "-q", "-m", "base"], &main);
+        // The project root marker (`.rpi`) lives in the main checkout only —
+        // the worktree starts without one, exercising the git-root fallback
+        // inside the worktree.
+        std::fs::create_dir_all(main.join(".rpi")).unwrap();
+        std::fs::write(main.join(".rpi/.gitkeep"), "").unwrap();
+        git(&["add", "-A"], &main);
+        git(&["commit", "-q", "-m", "marker"], &main);
+        let worktree = dir.join("wt");
+        git(
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                "wt",
+            ],
+            &main,
+        );
+        // Sanity: the linked worktree carries a `.git` file, not a dir.
+        assert!(worktree.join(".git").is_file());
+        let memory = MemoryConfig {
+            scope: "project",
+            path: "notes".to_string(),
+        };
+        // Worktree cwd → the MAIN checkout's `.rpi/agent-memory` (the
+        // `.rpi` marker in the worktree comes from the branch checkout; the
+        // point is the mapping lands on the main path).
+        let resolved = memory.resolve_dir(&worktree, "scout").unwrap();
+        assert_eq!(
+            resolved,
+            main.join(".rpi/agent-memory/notes/scout"),
+            "linked worktree must map onto the main checkout"
+        );
+        // Main-checkout cwd unchanged.
+        assert_eq!(
+            memory.resolve_dir(&main, "scout").unwrap(),
+            main.join(".rpi/agent-memory/notes/scout")
+        );
+        // Subdirectory cwd walks up to the project root (both sides).
+        let sub = worktree.join("nested/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            memory.resolve_dir(&sub, "scout").unwrap(),
+            main.join(".rpi/agent-memory/notes/scout")
+        );
+        // A worktree WITHOUT the `.rpi` marker in its branch: the project
+        // root falls back to the git root (the worktree itself pre-mapping),
+        // which maps onto the main checkout anyway — same shared root.
+        let bare_worktree = dir.join("wt-bare");
+        git(
+            &[
+                "worktree",
+                "add",
+                "-q",
+                bare_worktree.to_str().unwrap(),
+                "HEAD~1",
+            ],
+            &main,
+        );
+        assert!(!bare_worktree.join(".rpi").exists());
+        assert_eq!(
+            memory.resolve_dir(&bare_worktree, "scout").unwrap(),
+            main.join(".rpi/agent-memory/notes/scout")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TE38 W2: the mapping is verification-gated — a plain repo (no
+    /// worktree marker layout) and a forged `.git` marker (no gitdir
+    /// backlink) never remap.
+    #[test]
+    fn project_memory_root_verification_gates() {
+        if !git_available() {
+            return;
+        }
+        let dir = temp_root("te38-mem-gate");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            git(&args, &repo);
+        }
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-q", "-m", "base"], &repo);
+        std::fs::create_dir_all(repo.join(".rpi")).unwrap();
+        let memory = MemoryConfig {
+            scope: "project",
+            path: "notes".to_string(),
+        };
+        // Plain repo: unchanged root.
+        assert_eq!(
+            memory.resolve_dir(&repo, "scout").unwrap(),
+            repo.join(".rpi/agent-memory/notes/scout")
+        );
+        // Forged marker: a `.git` FILE whose gitdir target has no backlink
+        // (a directory without `gitdir` inside) never remaps.
+        let forged = dir.join("forged");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::fs::write(
+            forged.join(".git"),
+            format!("gitdir: {}", dir.join("nowhere").to_string_lossy()),
+        )
+        .unwrap();
+        // No project-root candidate and no resolvable git root → the forged
+        // `.git` file is not a directory entry find_nearest_git_root would
+        // trust for a repo — but it IS an existing `.git` entry, so the
+        // mapping chain runs and the missing gitdir keeps it unmapped.
+        std::fs::create_dir_all(forged.join(".rpi")).unwrap();
+        assert_eq!(
+            memory.resolve_dir(&forged, "scout").unwrap(),
+            forged.join(".rpi/agent-memory/notes/scout")
+        );
+        // No git, no project marker at all → no injection.
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(memory.resolve_dir(&plain, "scout").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

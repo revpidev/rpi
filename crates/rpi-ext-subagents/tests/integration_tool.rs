@@ -204,6 +204,53 @@ fn tool_surface_integration() {
         .unwrap()
         .contains("without blocking"));
 
+    // TE38 W0 (admission ordering, #2326/#2101 semantics + W1's #2081
+    // preflight): a worktree dispatch against a dirty git tree is rejected
+    // BEFORE any run state — no receipt (`statusFile`), no run started.
+    // The rejection ordering (parse → collisions → worktree preflight →
+    // budget → capacity → start_run) is the structural guarantee; this
+    // pins the observable contract.
+    let proj = dir.join("proj");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&proj)
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+    std::fs::write(proj.join("base.txt"), "base").unwrap();
+    for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "base"]] {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&proj)
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+    std::fs::write(proj.join("untracked.txt"), "dirty").unwrap();
+    let result = execute(json!({
+        "tasks": [{ "agent": "scout", "task": "t" }],
+        "worktree": true,
+        "async": true
+    }));
+    assert_eq!(result["isError"], Value::Bool(true), "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("clean git working tree"),
+        "{result}"
+    );
+    assert!(
+        result["details"]["statusFile"].is_null(),
+        "rejected admission must not return a run receipt: {result}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -1043,7 +1043,16 @@ fn dispatch_message(message: &Value) -> Value {
                         .and_then(|value| value.as_bool())
                         .unwrap_or(false);
                     if !has_ui {
-                        state.runtime.block_on(async_move_drain());
+                        // W7 (#2202): pass the owning session id so the drain
+                        // can yield on that session's pending supervisor asks.
+                        let session_id =
+                            host_call_ok(&state.calls, state.cookie, "ctx.sessionFile", json!({}))
+                                .and_then(|value| {
+                                    value.get("id").and_then(Value::as_str).map(str::to_string)
+                                });
+                        state
+                            .runtime
+                            .block_on(async_move_drain(session_id.as_deref()));
                     }
                     Value::Null
                 }
@@ -1061,9 +1070,11 @@ async fn async_runner_shutdown() {
     runner::foreground::kill_all_children_for_shutdown().await;
 }
 
-async fn async_move_drain() {
+async fn async_move_drain(session_id: Option<&str>) {
     // DEFAULT_AUTO_DRAIN_TIMEOUT_MS (auto-drain.ts:9): 30 minutes.
-    if let Err(message) = runner::background::drain_outstanding_work(30 * 60 * 1000).await {
+    if let Err(message) =
+        runner::background::drain_outstanding_work(30 * 60 * 1000, session_id).await
+    {
         tracing::error!(%message, "auto-drain failed");
     }
 }

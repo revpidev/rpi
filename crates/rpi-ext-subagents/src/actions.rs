@@ -418,7 +418,7 @@ fn handle_management_action_inner(
                 let lines = raw_params
                     .get("lines")
                     .and_then(Value::as_u64)
-                    .map(|v| v.clamp(1, 1000))
+                    .map(|v| v.clamp(1, 500))
                     .unwrap_or(80) as usize;
                 let index = raw_params
                     .get("index")
@@ -690,9 +690,22 @@ fn handle_management_action_inner(
                     state = status["state"].as_str().unwrap_or("?")
                 ));
             }
-            let session_file = status["steps"]
-                .as_array()
-                .and_then(|steps| steps.last())
+            let steps = status["steps"].as_array().cloned().unwrap_or_default();
+            // TE38 W5 (#2242 @ b72714de): a stopped child has no continuation
+            // to revive — resume must not resurrect it (`resolveAsyncResumeTarget`
+            // rejects `status == "stopped" || stopped == true` for the selected
+            // step; rpi resumes the last step, so the gate lands there).
+            if let Some(last) = steps.last() {
+                if last["status"].as_str() == Some("stopped") || last["stopped"].as_bool() == Some(true)
+                {
+                    return ToolOutcome::error(format!(
+                        "Async run '{id}' child {} was stopped and cannot be resumed. Start a new run instead.",
+                        steps.len().saturating_sub(1)
+                    ));
+                }
+            }
+            let session_file = steps
+                .last()
                 .and_then(|step| step["sessionFile"].as_str())
                 .map(str::to_string);
             let Some(session_file) = session_file else {
@@ -700,9 +713,8 @@ fn handle_management_action_inner(
                     "Background run {id} has no persisted child session to resume from."
                 ));
             };
-            let agent_name = status["steps"]
-                .as_array()
-                .and_then(|steps| steps.last())
+            let agent_name = steps
+                .last()
                 .and_then(|step| step["agent"].as_str())
                 .unwrap_or("worker")
                 .to_string();
@@ -833,8 +845,11 @@ fn handle_management_action_inner(
 /// order: the step's live transcript artifact (`transcriptPath`, stamped at
 /// launch) → the step's saved output (`artifactPaths.outputPath` /
 /// `savedOutputPath`) → the persisted child session file. `lines` bounds the
-/// tail (default 80, cap 1000, fleet-view.ts `transcriptLineLimit`); each
-/// rendered line is capped so the body can never explode the tool result.
+/// tail (default 80, cap 500, fleet-view.ts `transcriptLineLimit`); the
+/// rendered body is additionally byte-bounded (#2017 @ b72714de:
+/// `MAX_TRANSCRIPT_BODY_BYTES` 32 KiB, whole recent lines preferred, "…
+/// [earlier lines omitted]" marker); each rendered line is capped so the
+/// body can never explode the tool result.
 pub fn format_status_transcript(
     id: &str,
     index: Option<usize>,
@@ -939,6 +954,8 @@ pub fn format_status_transcript(
             }
         }
     }
+    // #2017 body byte budget (TE38 W6): applies to whichever source won.
+    bound_transcript_body(&mut body);
     if body.is_empty() {
         lines.push(format!(
             "No transcript available for child {index} yet (the child may not have started or produced output)."
@@ -954,6 +971,33 @@ pub fn format_status_transcript(
 /// Per-rendered-line cap for transcript views (#2015 single-line bound;
 /// aligned with `MAX_STREAMED_OUTPUT_LINE_CHARS`, streaming.rs).
 const TRANSCRIPT_LINE_MAX_CHARS: usize = 2000;
+
+/// #2017 body bound (fleet-view.ts `appendTranscriptBody` @ b72714de): the
+/// rendered body — not just the line count — is capped at 32 KiB; whole
+/// recent lines are preferred and earlier lines collapse into one omission
+/// marker. Returns whether the marker was inserted.
+const TRANSCRIPT_BODY_MAX_BYTES: usize = 32 * 1024;
+const TRANSCRIPT_BODY_OMISSION: &str = "  … [earlier lines omitted]";
+
+fn bound_transcript_body(lines: &mut Vec<String>) -> bool {
+    let mut bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
+    if bytes <= TRANSCRIPT_BODY_MAX_BYTES {
+        return false;
+    }
+    // Work newest-first (upstream appends in reverse then flips): drop the
+    // oldest lines until the marker fits, then place the marker at the top.
+    lines.reverse();
+    let marker_bytes = TRANSCRIPT_BODY_OMISSION.len() + 1;
+    while bytes + marker_bytes > TRANSCRIPT_BODY_MAX_BYTES {
+        match lines.pop() {
+            Some(dropped) => bytes -= dropped.len() + 1,
+            None => break,
+        }
+    }
+    lines.push(TRANSCRIPT_BODY_OMISSION.to_string());
+    lines.reverse();
+    true
+}
 
 fn bounded_transcript_line(line: &str) -> String {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -1772,6 +1816,76 @@ mod tests {
         )
     }
 
+    /// TE38 W5 (#2242 @ b72714de): a stopped last child has no continuation
+    /// to revive — resume rejects it with the upstream-verbatim message
+    /// shape instead of resurrecting the session.
+    #[test]
+    fn resume_rejects_stopped_last_child() {
+        struct ResumeHost;
+        impl crate::HostContext for ResumeHost {
+            fn cwd(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+            fn parent_model(&self) -> Option<String> {
+                None
+            }
+            fn parent_session(&self, _settings: &SettingsPair) -> Option<crate::ParentSession> {
+                None
+            }
+        }
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("resume-stopped-{}", std::process::id());
+        let runtime = crate::PluginRuntime::new().expect("plugin runtime");
+        // `stopped` status form.
+        action_test_run(
+            &run_id,
+            "failed",
+            json!([{ "agent": "w", "status": "stopped", "sessionFile": "/tmp/s.json" }]),
+        );
+        let outcome = handle_management_action_with(
+            "resume",
+            None,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+            &ActionDeps {
+                host: Some(&ResumeHost),
+                runtime: Some(&runtime),
+                params: Some(json!({ "action": "resume", "id": run_id, "task": "continue" })),
+            },
+        );
+        assert!(outcome.is_error, "{}", outcome.text);
+        assert_eq!(
+            outcome.text,
+            format!("Async run '{run_id}' child 0 was stopped and cannot be resumed. Start a new run instead.")
+        );
+        cleanup_run(&run_id);
+        // `stopped: true` boolean form (upstream accepts either spelling).
+        let run_id2 = format!("resume-stopped2-{}", std::process::id());
+        action_test_run(
+            &run_id2,
+            "failed",
+            json!([{ "agent": "w", "stopped": true, "sessionFile": "/tmp/s.json" }]),
+        );
+        let outcome = handle_management_action_with(
+            "resume",
+            None,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+            &ActionDeps {
+                host: Some(&ResumeHost),
+                runtime: Some(&runtime),
+                params: Some(json!({ "action": "resume", "id": run_id2, "task": "continue" })),
+            },
+        );
+        assert!(outcome.is_error, "{}", outcome.text);
+        assert!(outcome.text.contains("was stopped and cannot be resumed"));
+        cleanup_run(&run_id2);
+    }
+
     #[test]
     fn stop_on_terminal_run_is_invalid_state() {
         let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
@@ -1910,6 +2024,60 @@ mod tests {
             outcome.text.contains("Valid: transcript"),
             "{}",
             outcome.text
+        );
+        cleanup_run(&run_id);
+    }
+
+    /// TE38 W6 (#2017 @ b72714de): the rendered body is byte-bounded —
+    /// whole recent lines preferred, earlier lines collapse into the
+    /// omission marker, and the surviving body stays under 32 KiB.
+    #[test]
+    fn status_transcript_body_byte_budget() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-budget-{}", std::process::id());
+        let base = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // 100 lines × ~900 chars ≈ 90 KiB rendered body — over the budget.
+        let transcript = base.join("run_transcript.jsonl");
+        let mut body = String::new();
+        for index in 0..100 {
+            body.push_str(
+                &json!({
+                    "type": "message_end",
+                    "message": { "role": "assistant", "content": [{ "type": "text", "text": format!("line-{index:03} {}", "x".repeat(900)) }] },
+                })
+                .to_string(),
+            );
+            body.push('\n');
+        }
+        action_test_run(
+            &run_id,
+            "running",
+            json!([{
+                "agent": "worker",
+                "status": "running",
+                "transcriptPath": transcript.to_string_lossy(),
+            }]),
+        );
+        std::fs::write(&transcript, body).unwrap();
+        let text = format_status_transcript(&run_id, None, 500).expect("view renders");
+        assert!(
+            text.contains("… [earlier lines omitted]"),
+            "marker missing: {}",
+            &text[text.len().saturating_sub(200)..]
+        );
+        assert!(text.contains("line-099"), "recent lines kept");
+        assert!(!text.contains("line-000"), "oldest lines dropped");
+        // Surviving body (marker .. end) stays under the byte budget.
+        let body_start = text.find("… [earlier lines omitted]").expect("marker");
+        let rendered = &text[body_start..];
+        assert!(
+            rendered.len() <= 32 * 1024 + 64,
+            "body budget exceeded: {}",
+            rendered.len()
         );
         cleanup_run(&run_id);
     }
