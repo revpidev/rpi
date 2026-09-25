@@ -228,7 +228,13 @@ mod tests {
 
     #[test]
     fn registers_under_the_tool_name_todo_with_expected_label() {
-        // Pin to the empty-config override (review P1-2): these
+        // Pin to the empty-config override (review P1-2): these tests
+        // read the config through load_config() but touch no store state.
+        // The TEST_LOCK serializes the global override against the
+        // hint/theme overlay tests that write richer configs (review R1).
+        let _guard = crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
         let definition = tool_definition();
         assert_eq!(definition["name"], json!(TOOL_NAME));
@@ -238,7 +244,13 @@ mod tests {
 
     #[test]
     fn prompt_snippet_is_the_default() {
-        // Pin to the empty-config override (review P1-2): these
+        // Pin to the empty-config override (review P1-2): these tests
+        // read the config through load_config() but touch no store state.
+        // The TEST_LOCK serializes the global override against the
+        // hint/theme overlay tests that write richer configs (review R1).
+        let _guard = crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
         assert_eq!(
             tool_definition()["promptSnippet"],
@@ -248,7 +260,13 @@ mod tests {
 
     #[test]
     fn description_is_the_upstream_literal() {
-        // Pin to the empty-config override (review P1-2): these
+        // Pin to the empty-config override (review P1-2): these tests
+        // read the config through load_config() but touch no store state.
+        // The TEST_LOCK serializes the global override against the
+        // hint/theme overlay tests that write richer configs (review R1).
+        let _guard = crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
         assert_eq!(tool_definition()["description"], json!(
             "Manage a task list for tracking multi-step progress. Actions: create (new task), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation."
@@ -270,7 +288,13 @@ mod tests {
 
     #[test]
     fn built_in_guidelines_snapshot() {
-        // Pin to the empty-config override (review P1-2): these
+        // Pin to the empty-config override (review P1-2): these tests
+        // read the config through load_config() but touch no store state.
+        // The TEST_LOCK serializes the global override against the
+        // hint/theme overlay tests that write richer configs (review R1).
+        let _guard = crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
         let guidelines = crate::tool::types::default_prompt_guidelines();
         assert_eq!(guidelines.len(), 8);
@@ -285,7 +309,13 @@ mod tests {
 
     #[test]
     fn parameters_schema_declares_the_six_actions() {
-        // Pin to the empty-config override (review P1-2): these
+        // Pin to the empty-config override (review P1-2): these tests
+        // read the config through load_config() but touch no store state.
+        // The TEST_LOCK serializes the global override against the
+        // hint/theme overlay tests that write richer configs (review R1).
+        let _guard = crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
         let schema = tool_definition()["parameters"].clone();
         let raw = schema.to_string();
@@ -302,7 +332,13 @@ mod tests {
 
     #[test]
     fn parameters_schema_field_descriptions_are_verbatim() {
-        // Pin to the empty-config override (review P1-2): these
+        // Pin to the empty-config override (review P1-2): these tests
+        // read the config through load_config() but touch no store state.
+        // The TEST_LOCK serializes the global override against the
+        // hint/theme overlay tests that write richer configs (review R1).
+        let _guard = crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
         let properties = &tool_definition()["parameters"]["properties"];
         assert_eq!(
@@ -380,7 +416,13 @@ mod tests {
 
     #[test]
     fn schema_status_enum_matches_the_state_machine() {
-        // Pin to the empty-config override (review P1-2): these
+        // Pin to the empty-config override (review P1-2): these tests
+        // read the config through load_config() but touch no store state.
+        // The TEST_LOCK serializes the global override against the
+        // hint/theme overlay tests that write richer configs (review R1).
+        let _guard = crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
         let properties = &tool_definition()["parameters"]["properties"];
         assert_eq!(
