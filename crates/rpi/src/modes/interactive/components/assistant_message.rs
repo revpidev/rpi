@@ -52,6 +52,16 @@ pub struct AssistantMessageComponent {
     /// Fingerprint of everything the `updateContent` rebuild depends on;
     /// `None` until the first rebuild. Equal fingerprints skip the rebuild.
     last_signature: Option<VisibleSignature>,
+    /// Global rebuild inputs shared by every Markdown child (V15-13 FR-L2):
+    /// the transform options depend on `is_streaming`, and every child pads
+    /// with `output_pad`. A change reconstructs all slots; during streaming
+    /// deltas both stay constant, so unchanged blocks are reused.
+    last_global_key: Option<(bool, usize)>,
+    /// Per-child slot descriptors parallel to `content_container.children`
+    /// (V15-13 FR-L2, rpi#53 root cause 2): `update_content` diffs slot by
+    /// slot — unchanged blocks keep their component instances (and their
+    /// per-component render caches); only new/changed slots construct.
+    last_slots: Vec<SlotDesc>,
     has_tool_calls: bool,
     theme: Arc<Theme>,
     /// Extension-registered Markdown transformers (assistant-message.ts:20).
@@ -85,6 +95,47 @@ fn block_fingerprint(text: &str) -> (u64, u64) {
     (text.len() as u64, hasher.finish())
 }
 
+/// Takes a retired child whose descriptor equals `slot` (first match;
+/// equal descriptors render identically, so which equal instance is reused
+/// cannot change the output). V15-13 FR-L2.
+fn take_matching(
+    available: &mut Vec<(SlotDesc, StdBox<dyn Component>)>,
+    slot: &SlotDesc,
+) -> Option<StdBox<dyn Component>> {
+    available
+        .iter()
+        .position(|(descriptor, _)| descriptor == slot)
+        .map(|index| available.swap_remove(index).1)
+}
+
+/// One `content_container` child and everything its construction depends on
+/// (V15-13 FR-L2). Two updates with equal descriptors render byte-identical
+/// children, so the old component instance (with its render cache) can be
+/// retained in place of a fresh construction.
+#[derive(Clone, PartialEq, Debug)]
+enum SlotDesc {
+    /// Leading spacer, present iff any visible block exists.
+    LeadingSpacer,
+    /// Assistant text block -> `Markdown(text.trim())`.
+    TextBlock { fp: (u64, u64) },
+    /// Thinking run -> `MouseRegion(Markdown(join) | hidden-label Text)`.
+    /// `fp` covers the joined ("\n\n") run text; `hidden` picks the label
+    /// branch (and the closure's flip direction); the label fingerprint is
+    /// folded in when hidden because the label text renders then.
+    ThinkingRun {
+        fp: (u64, u64),
+        run_index: usize,
+        hidden: bool,
+        label_fp: (u64, u64),
+    },
+    /// Spacer after a thinking run with visible content following.
+    RunSpacer,
+    /// Spacer before an incomplete/error trailer.
+    TrailerSpacer,
+    /// Incomplete/error trailer `Text` (fingerprint of the styled string).
+    TrailerText { fp: (u64, u64) },
+}
+
 /// Stable fingerprint of the thinking-visibility overrides (part of the
 /// rebuild signature since V14-14: a click toggle must invalidate the
 /// cached rebuild even when the message itself is unchanged).
@@ -100,8 +151,15 @@ fn overrides_fingerprint(overrides: &BTreeMap<usize, bool>) -> u64 {
 
 #[cfg(test)]
 thread_local! {
-    /// Counts container rebuilds inside `update_content` (perf tests).
+    /// Counts `update_content` calls that constructed at least one child
+    /// (perf tests). Since V15-13 FR-L2 a call only constructs the slots
+    /// whose descriptors changed — the count is the observable for "this
+    /// update changed something visible".
     static REBUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts `Markdown` component constructions inside `update_content`
+    /// (V15-13 FR-L2 assertion: per folded delta the count is bounded by the
+    /// number of changed blocks, not the message's block count).
+    static MARKDOWN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Test-only introspection for the V13-06 §3.4 integration anchor
@@ -140,6 +198,8 @@ impl AssistantMessageComponent {
             output_pad,
             last_message: None,
             last_signature: None,
+            last_global_key: None,
+            last_slots: Vec::new(),
             has_tool_calls: false,
             theme,
             markdown_transformers,
@@ -191,6 +251,9 @@ impl AssistantMessageComponent {
     /// visible fingerprint is unchanged (a write/edit streaming its args —
     /// no text/thinking/stop changes), the rebuild is skipped and only the
     /// stored message is refreshed.
+    /// `constructed` below feeds only the test-only rebuild counter
+    /// (`REBUILD_COUNT`); non-test builds never read it.
+    #[allow(unused_assignments, unused_variables)]
     pub fn update_content(&mut self, message: &AssistantMessage, is_streaming: bool) {
         self.is_streaming = is_streaming;
 
@@ -232,17 +295,50 @@ impl AssistantMessageComponent {
         self.last_signature = Some(signature);
         self.last_message = Some(message.clone());
         let message = self.last_message.as_ref().expect("stored above");
-        #[cfg(test)]
-        REBUILD_COUNT.with(|count| count.set(count.get() + 1));
 
-        // Clear content container
-        self.content_container.clear();
+        // V15-13 FR-L2 (rpi#53 root cause 2): instead of clearing the
+        // container and rebuilding every child on every visible delta, diff
+        // slot descriptors and retain unchanged component instances —
+        // keeping their per-component render caches (a fresh Markdown
+        // component starts with an empty cache and re-parses the whole
+        // block on the next render). Children are re-added in exactly the
+        // order a full rebuild produces, so the rendered output is
+        // byte-identical; only the construction (and re-parse) is skipped.
+        let global_key = (is_streaming, self.output_pad);
+        let global_changed = self.last_global_key.as_ref() != Some(&global_key);
+        self.last_global_key = Some(global_key);
+
+        // Retired children available for reuse, paired with their
+        // descriptors. A global input change empties the pool: transform
+        // options (`is_streaming`) and padding affect every child.
+        let old_children = std::mem::take(&mut self.content_container.children);
+        let mut available: Vec<(SlotDesc, StdBox<dyn Component>)> = if global_changed {
+            Vec::new()
+        } else {
+            self.last_slots
+                .clone()
+                .into_iter()
+                .zip(old_children)
+                .collect()
+        };
+        self.last_slots.clear();
+        let mut constructed = false;
+        let mut new_children: Vec<StdBox<dyn Component>> = Vec::new();
+        let mut new_slots: Vec<SlotDesc> = Vec::new();
 
         let has_visible_content = message.content.iter().any(has_visible_content_block);
 
         if has_visible_content {
-            self.content_container
-                .add_child(StdBox::new(Spacer::new(1)));
+            let slot = SlotDesc::LeadingSpacer;
+            let child = match take_matching(&mut available, &slot) {
+                Some(child) => child,
+                None => {
+                    constructed = true;
+                    StdBox::new(Spacer::new(1))
+                }
+            };
+            new_children.push(child);
+            new_slots.push(slot);
         }
 
         // Render content in order (assistant-message.ts:98-146).
@@ -254,15 +350,28 @@ impl AssistantMessageComponent {
                 // Set paddingY=0 to avoid extra spacing before tool executions
                 // (assistant-message.ts:100-103).
                 AssistantContent::Text(text) if !text.text.trim().is_empty() => {
-                    let markdown = Markdown::new(
-                        text.text.trim(),
-                        self.output_pad,
-                        0,
-                        Arc::clone(&self.markdown_theme),
-                        None,
-                        self.markdown_options("assistant"),
-                    );
-                    self.content_container.add_child(StdBox::new(markdown));
+                    let trimmed = text.text.trim();
+                    let slot = SlotDesc::TextBlock {
+                        fp: block_fingerprint(trimmed),
+                    };
+                    let child = match take_matching(&mut available, &slot) {
+                        Some(child) => child,
+                        None => {
+                            constructed = true;
+                            #[cfg(test)]
+                            MARKDOWN_COUNT.with(|count| count.set(count.get() + 1));
+                            StdBox::new(Markdown::new(
+                                trimmed,
+                                self.output_pad,
+                                0,
+                                Arc::clone(&self.markdown_theme),
+                                None,
+                                self.markdown_options("assistant"),
+                            ))
+                        }
+                    };
+                    new_children.push(child);
+                    new_slots.push(slot);
                     i += 1;
                 }
                 AssistantContent::Thinking(_) => {
@@ -304,66 +413,33 @@ impl AssistantMessageComponent {
                         .get(&run_index)
                         .copied()
                         .unwrap_or(self.hide_thinking_block);
-                    let thinking_component: StdBox<dyn Component> = if hidden {
-                        // Show one static label for the run when hidden
-                        // (assistant-message.ts:128-132).
-                        let label = Theme::italic(
-                            &self.theme.fg("thinkingText", &self.hidden_thinking_label),
-                        );
-                        StdBox::new(Text::new(label, self.output_pad, 0, None))
-                    } else {
-                        // Render the run of thinking blocks as one Markdown
-                        // section (assistant-message.ts:134-140).
-                        let thinking_style = DefaultTextStyle {
-                            color: Some(Box::new({
-                                let theme = Arc::clone(&self.theme);
-                                move |text: &str| theme.fg("thinkingText", text)
-                            })),
-                            italic: true,
-                            ..Default::default()
-                        };
-                        StdBox::new(Markdown::new(
-                            thinking_blocks.join("\n\n"),
-                            self.output_pad,
-                            0,
-                            Arc::clone(&self.markdown_theme),
-                            Some(thinking_style),
-                            self.markdown_options("assistant-thinking"),
-                        ))
+                    let joined = thinking_blocks.join("\n\n");
+                    let slot = SlotDesc::ThinkingRun {
+                        fp: block_fingerprint(&joined),
+                        run_index,
+                        hidden,
+                        label_fp: block_fingerprint(&self.hidden_thinking_label),
                     };
-                    let overrides = Arc::clone(&self.thinking_visibility_overrides);
-                    let pending = Arc::clone(&self.pending_visibility_toggles);
-                    self.content_container
-                        .add_child(StdBox::new(MouseRegion::new(
-                            shared_component_from_boxed(thinking_component),
-                            Box::new(move |event| {
-                                if event.event_type != TuiMouseEventType::Click
-                                    || event.button != TuiMouseButton::Left
-                                {
-                                    return None;
-                                }
-                                // Upstream flips the override synchronously and
-                                // rebuilds; the port records the toggle (the
-                                // component is locked for `handle_mouse`) and the
-                                // drain below applies it before the next render.
-                                let mut overrides = overrides
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                overrides.insert(run_index, !hidden);
-                                drop(overrides);
-                                pending
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .push(run_index);
-                                Some(TuiMouseEventResult {
-                                    handled: true,
-                                    ..Default::default()
-                                })
-                            }),
-                        )));
+                    let child = match take_matching(&mut available, &slot) {
+                        Some(child) => child,
+                        None => {
+                            constructed = true;
+                            self.build_thinking_run_child(&joined, run_index, hidden)
+                        }
+                    };
+                    new_children.push(child);
+                    new_slots.push(slot);
                     if has_visible_content_after {
-                        self.content_container
-                            .add_child(StdBox::new(Spacer::new(1)));
+                        let slot = SlotDesc::RunSpacer;
+                        let child = match take_matching(&mut available, &slot) {
+                            Some(child) => child,
+                            None => {
+                                constructed = true;
+                                StdBox::new(Spacer::new(1))
+                            }
+                        };
+                        new_children.push(child);
+                        new_slots.push(slot);
                     }
                 }
                 _ => {
@@ -380,18 +456,11 @@ impl AssistantMessageComponent {
         self.has_tool_calls = has_tool_calls;
         // Length stops: neutral truncation wording (assistant-message.ts:180
         // @ 32850ef7c).
-        if message.stop_reason == StopReason::Length {
-            self.content_container
-                .add_child(StdBox::new(Spacer::new(1)));
-            let text = self
-                .theme
-                .fg("error", "Response was truncated before completion.");
-            self.content_container.add_child(StdBox::new(Text::new(
-                text,
-                self.output_pad,
-                0,
-                None,
-            )));
+        let trailer: Option<String> = if message.stop_reason == StopReason::Length {
+            Some(
+                self.theme
+                    .fg("error", "Response was truncated before completion."),
+            )
         } else if !has_tool_calls {
             match message.stop_reason {
                 StopReason::Aborted => {
@@ -399,34 +468,121 @@ impl AssistantMessageComponent {
                         Some(msg) if msg != "Request was aborted" => msg.clone(),
                         _ => "Operation aborted".to_string(),
                     };
-                    self.content_container
-                        .add_child(StdBox::new(Spacer::new(1)));
-                    let text = self.theme.fg("error", &abort_message);
-                    self.content_container.add_child(StdBox::new(Text::new(
-                        text,
-                        self.output_pad,
-                        0,
-                        None,
-                    )));
+                    Some(self.theme.fg("error", &abort_message))
                 }
                 StopReason::Error => {
                     let error_msg = message
                         .error_message
                         .clone()
                         .unwrap_or_else(|| "Unknown error".to_string());
-                    self.content_container
-                        .add_child(StdBox::new(Spacer::new(1)));
-                    let text = self.theme.fg("error", &format!("Error: {error_msg}"));
-                    self.content_container.add_child(StdBox::new(Text::new(
-                        text,
-                        self.output_pad,
-                        0,
-                        None,
-                    )));
+                    Some(self.theme.fg("error", &format!("Error: {error_msg}")))
                 }
-                _ => {}
+                _ => None,
             }
+        } else {
+            None
+        };
+        if let Some(text) = &trailer {
+            let spacer_slot = SlotDesc::TrailerSpacer;
+            let child = match take_matching(&mut available, &spacer_slot) {
+                Some(child) => child,
+                None => {
+                    constructed = true;
+                    StdBox::new(Spacer::new(1))
+                }
+            };
+            new_children.push(child);
+            new_slots.push(spacer_slot);
+
+            let text_slot = SlotDesc::TrailerText {
+                fp: block_fingerprint(text),
+            };
+            let child = match take_matching(&mut available, &text_slot) {
+                Some(child) => child,
+                None => {
+                    constructed = true;
+                    StdBox::new(Text::new(text.clone(), self.output_pad, 0, None))
+                }
+            };
+            new_children.push(child);
+            new_slots.push(text_slot);
         }
+
+        self.content_container.children = new_children;
+        self.last_slots = new_slots;
+        #[cfg(test)]
+        if constructed {
+            REBUILD_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    }
+
+    /// Fresh `MouseRegion` child for one thinking run
+    /// (assistant-message.ts:104-171): the run renders as one Markdown
+    /// section, or a static italic label when hidden; the region records
+    /// click toggles (V15-13 FR-L2: construction only — reuse goes through
+    /// the slot descriptor diff).
+    fn build_thinking_run_child(
+        &self,
+        joined: &str,
+        run_index: usize,
+        hidden: bool,
+    ) -> StdBox<dyn Component> {
+        let thinking_component: StdBox<dyn Component> = if hidden {
+            // Show one static label for the run when hidden
+            // (assistant-message.ts:128-132).
+            let label = Theme::italic(&self.theme.fg("thinkingText", &self.hidden_thinking_label));
+            StdBox::new(Text::new(label, self.output_pad, 0, None))
+        } else {
+            // Render the run of thinking blocks as one Markdown section
+            // (assistant-message.ts:134-140).
+            #[cfg(test)]
+            MARKDOWN_COUNT.with(|count| count.set(count.get() + 1));
+            let thinking_style = DefaultTextStyle {
+                color: Some(Box::new({
+                    let theme = Arc::clone(&self.theme);
+                    move |text: &str| theme.fg("thinkingText", text)
+                })),
+                italic: true,
+                ..Default::default()
+            };
+            StdBox::new(Markdown::new(
+                joined,
+                self.output_pad,
+                0,
+                Arc::clone(&self.markdown_theme),
+                Some(thinking_style),
+                self.markdown_options("assistant-thinking"),
+            ))
+        };
+        let overrides = Arc::clone(&self.thinking_visibility_overrides);
+        let pending = Arc::clone(&self.pending_visibility_toggles);
+        StdBox::new(MouseRegion::new(
+            shared_component_from_boxed(thinking_component),
+            Box::new(move |event| {
+                if event.event_type != TuiMouseEventType::Click
+                    || event.button != TuiMouseButton::Left
+                {
+                    return None;
+                }
+                // Upstream flips the override synchronously and rebuilds;
+                // the port records the toggle (the component is locked for
+                // `handle_mouse`) and the drain below applies it before the
+                // next render.
+                let mut overrides = overrides
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                overrides.insert(run_index, !hidden);
+                drop(overrides);
+                pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(run_index);
+                Some(TuiMouseEventResult {
+                    handled: true,
+                    ..Default::default()
+                })
+            }),
+        ))
     }
 
     /// Markdown options carrying the width-aware transform chain for the
@@ -649,10 +805,16 @@ mod tests {
 
     /// `set_output_pad` and the thinking setters must not be swallowed by
     /// the signature skip: they change the rebuild inputs and must rebuild.
+    /// V15-13 FR-L2 (G2): the fixture carries a thinking run so the hide
+    /// and label setters have an affected child to reconstruct — with the
+    /// slot-level diff, a setter that changes no child (e.g. a label change
+    /// with no hidden run) correctly constructs nothing while the output
+    /// stays identical. The counts keep their pre-L2 meaning: every setter
+    /// here invalidates at least one slot.
     #[test]
     fn setters_bypass_the_signature_skip() {
         let mut component = AssistantMessageComponent::new(
-            Some(message(vec![text("hello")])),
+            Some(message(vec![thinking("secret"), text("hello")])),
             false,
             theme(),
             markdown_theme(&load_theme("dark", None).unwrap()),
@@ -671,6 +833,208 @@ mod tests {
         // the rendering would be identical anyway).
         component.set_output_pad(2);
         assert_eq!(REBUILD_COUNT.with(|c| c.get()), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // V15-13 FR-L2 (rpi#53 root cause 2): block-level component reuse.
+    // ------------------------------------------------------------------
+
+    /// Folded-delta replay (issue #53 shape: one stable thinking run + one
+    /// growing text block): per update, `Markdown` constructions must be
+    /// bounded by the number of CHANGED blocks — the stable thinking run
+    /// keeps its component (and its render cache) across every delta. The
+    /// final frame must be byte-identical to a freshly built component
+    /// rendering the same final message.
+    #[test]
+    fn block_diff_reuses_unchanged_markdown_components() {
+        let thinking_text = "稳定的思考内容，跨 delta 不变。\n\nsecond paragraph";
+        let mk = |grown: usize| {
+            message(vec![
+                thinking(thinking_text),
+                text(&format!(
+                    "输出前缀，第 {grown} 轮：{}",
+                    "数据".repeat(grown)
+                )),
+            ])
+        };
+
+        let mut component = AssistantMessageComponent::new(
+            None,
+            false,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            1,
+            Vec::new(),
+        );
+        // Initial build: one Markdown for the thinking run + one for text.
+        MARKDOWN_COUNT.with(|count| count.set(0));
+        component.update_content(&mk(1), true);
+        assert_eq!(MARKDOWN_COUNT.with(|c| c.get()), 2);
+
+        // 50 folded deltas growing only the text block: exactly one
+        // Markdown (the text block) per delta; the thinking run is never
+        // reconstructed.
+        for grown in 2..=51 {
+            component.update_content(&mk(grown), true);
+            assert_eq!(
+                MARKDOWN_COUNT.with(|c| c.get()),
+                2 + (grown - 1),
+                "delta {grown}: only the changed text block rebuilds"
+            );
+        }
+
+        // Frame parity: streamed component vs a fresh one with the final
+        // message (byte-identical lines).
+        let fresh = AssistantMessageComponent::new(
+            Some(mk(51)),
+            false,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            1,
+            Vec::new(),
+        );
+        // The fresh component renders the same content non-streaming; flip
+        // the streamed one to the same state first (is_streaming flips the
+        // transform context, which is part of the frame).
+        component.update_content(&mk(51), false);
+        assert_eq!(
+            component.render(100),
+            fresh.render(100),
+            "slot reuse must not change a single output byte"
+        );
+    }
+
+    /// V15-13 FR-Bench (rpi#53 headline table): per-folded-delta
+    /// `update_content` + `render` at 100-col width while a CJK thinking
+    /// block accumulates to 10/50/100/200 KB. Issue #53 measured
+    /// ~3.8/18.5/62/227 ms per delta (quadratic); the target is linear —
+    /// 200 KB ≤ ~30 ms. `#[ignore]`d benchmark; run with
+    /// `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "V15-13 FR-Bench: run explicitly with --release --ignored --nocapture"]
+    fn folded_delta_update_render_bench() {
+        let mut component = AssistantMessageComponent::new(
+            None,
+            false,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            1,
+            Vec::new(),
+        );
+        // ~1 KB CJK per delta (24 lines x ~14 chars).
+        let delta_line = "思考推理内容测试行";
+
+        let mut accumulated = String::new();
+        let mut next_checkpoint = 0usize;
+        let checkpoints_kb: [usize; 4] = [10, 50, 100, 200];
+        let mut checkpoint_idx = 0usize;
+        loop {
+            for _ in 0..24 {
+                accumulated.push_str(delta_line);
+                accumulated.push('\n');
+            }
+            let message = message(vec![thinking(&accumulated)]);
+            let start = std::time::Instant::now();
+            component.update_content(&message, true);
+            let lines = component.render(100);
+            let elapsed = start.elapsed();
+            next_checkpoint += 1;
+            if checkpoint_idx < checkpoints_kb.len()
+                && accumulated.len() >= checkpoints_kb[checkpoint_idx] * 1024
+            {
+                println!(
+                    "folded delta @ ~{} KB ({} source lines, {} frame lines): {:?}",
+                    accumulated.len() / 1024,
+                    accumulated.lines().count(),
+                    lines.len(),
+                    elapsed
+                );
+                checkpoint_idx += 1;
+            }
+            if checkpoint_idx >= checkpoints_kb.len() {
+                break;
+            }
+            let _ = next_checkpoint;
+        }
+    }
+
+    /// Multi-block interleavings: appending a new text block in the middle
+    /// (before the trailer) reconstructs only the new block; toggling a
+    /// thinking run's visibility reconstructs only that run.
+    #[test]
+    fn block_diff_scopes_rebuilds_to_changed_slots() {
+        let mut component = AssistantMessageComponent::new(
+            Some(message(vec![
+                thinking("第一段思考"),
+                text("first answer"),
+                thinking("第二段思考"),
+                text("second answer"),
+            ])),
+            false,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            1,
+            Vec::new(),
+        );
+        // Initial: 4 Markdown children (2 thinking runs + 2 text blocks).
+        MARKDOWN_COUNT.with(|count| count.set(0));
+        component.update_content(
+            &message(vec![
+                thinking("第一段思考"),
+                text("first answer"),
+                thinking("第二段思考"),
+                text("second answer"),
+            ]),
+            true,
+        );
+        assert_eq!(MARKDOWN_COUNT.with(|c| c.get()), 4);
+
+        // Same content, is_streaming flip → global change → all four
+        // reconstruct (bounded by block count, trivially).
+        component.update_content(
+            &message(vec![
+                thinking("第一段思考"),
+                text("first answer"),
+                thinking("第二段思考"),
+                text("second answer"),
+            ]),
+            false,
+        );
+        assert_eq!(MARKDOWN_COUNT.with(|c| c.get()), 8);
+
+        // A stop-reason change only touches the trailer slots: zero
+        // Markdown reconstructions.
+        let mut aborted = message(vec![
+            thinking("第一段思考"),
+            text("first answer"),
+            thinking("第二段思考"),
+            text("second answer"),
+        ]);
+        aborted.stop_reason = StopReason::Aborted;
+        aborted.error_message = Some("Request was aborted".to_string());
+        component.update_content(&aborted, false);
+        assert_eq!(
+            MARKDOWN_COUNT.with(|c| c.get()),
+            8,
+            "trailer-only change must not touch any Markdown child"
+        );
+        let rendered = strip_ansi(&component.render(80).join("\n"));
+        assert!(rendered.contains("Operation aborted"));
+
+        // Toggling run 0's visibility reconstructs exactly that run.
+        component.handle_mouse(&click(1));
+        assert_eq!(
+            MARKDOWN_COUNT.with(|c| c.get()),
+            8,
+            "hidden label is a Text, not Markdown"
+        );
+        // Toggling back reconstructs the run's Markdown again.
+        component.handle_mouse(&click(1));
+        assert_eq!(MARKDOWN_COUNT.with(|c| c.get()), 9);
     }
 
     #[test]
