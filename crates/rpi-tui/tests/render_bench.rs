@@ -97,16 +97,35 @@ fn fresh_render_lines_scaling() {
 #[test]
 #[ignore = "V15-13 FR-Bench: run explicitly with --release --ignored --nocapture"]
 fn fresh_render_size_scaling() {
-    // Issue #53 table: 10/50/100/200 KB accumulated CJK thinking. Before
-    // the fix the per-size cost was ~3.8/18.5/62/227 ms (clean 4x per 2x).
-    for kb in [10usize, 50, 100, 200] {
-        let doc = cjk_doc(kb * 1024 / 42, 12); // ~42 bytes per short line
-        let (elapsed, out) = fresh_render(&doc);
-        println!(
-            "fresh Markdown::render ~{kb} KB ({} lines): {:?} ({} out)",
-            doc.lines().count(),
-            elapsed,
-            out
-        );
+    // Issue #53 table: 10/50/100/200 KB accumulated CJK thinking, measured
+    // at byte-exact checkpoints (line byte length varies with the line
+    // number's digit count, so the document grows line by line until each
+    // target size is reached — printed sizes are actual bytes).
+    let mut doc = String::new();
+    let mut line_no = 0usize;
+    let targets_kb = [10usize, 50, 100, 200];
+    let mut next = 0usize;
+    loop {
+        let mut line = format!("行{line_no} ");
+        while line.chars().count() < 12 {
+            line.push('中');
+        }
+        doc.push_str(&line);
+        doc.push('\n');
+        line_no += 1;
+        if next < targets_kb.len() && doc.len() >= targets_kb[next] * 1024 {
+            let (elapsed, out) = fresh_render(&doc);
+            println!(
+                "fresh Markdown::render ~{} KB ({} lines): {:?} ({} out)",
+                doc.len() / 1024,
+                line_no,
+                elapsed,
+                out
+            );
+            next += 1;
+        }
+        if next >= targets_kb.len() {
+            break;
+        }
     }
 }
