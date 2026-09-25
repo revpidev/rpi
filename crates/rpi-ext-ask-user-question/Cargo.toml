@@ -1,6 +1,6 @@
 [package]
 name = "rpi-ext-ask-user-question"
-description = "Structured ask_user_question tool (L0 native plugin) — port of @juicesharp/rpiv-ask-user-question v2.9.0+ (338b264c)"
+description = "Structured ask_user_question tool (L0 native plugin) — port of @juicesharp/rpiv-ask-user-question v2.10.1+ (0fdf4f8)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

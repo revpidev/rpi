@@ -21,7 +21,7 @@ fixtures/
 > **The v0.1.5 window (TE37, 2026-09-20; ADR-0029 adopted)**: `external/pi` switched to `d1230ea`
 > (v0.86.0+2); the plugin pins stay at their v0.1.4 baselines until their atomic switch tasks —
 > `external/pi-subagents` **switched to `b72714de` (v0.70.0) with TE39 (2026-09-27)**, `external/pi-mcp-adapter`
-> **switched to `97435aab` (v2.34.0+9) with TE40 (2026-09-27)**, `external/rpiv-mono` @ `338b264` until TE41; `external/agent-smart-fetch` @
+> **switched to `97435aab` (v2.34.0+9) with TE40 (2026-09-27)**, `external/rpiv-mono` **switched to `0fdf4f8` (v2.10.1+1) with TE41 (2026-09-26)**; `external/agent-smart-fetch` @
 > `b0111612` unchanged (upstream HEAD, zero-diff re-verified). The committed goldens above remain
 > recorded against `9841914` except the five `generated/` scenarios, re-recorded @ `19451accd`
 > with V15-06 (#9548); the pi submodule

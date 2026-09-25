@@ -2,7 +2,7 @@
 //!
 //! Port of upstream `view/components/preview/{preview-layout-decider,
 //! preview-box-renderer,preview-block-renderer,markdown-content-cache}.ts` @
-//! `338b264c` (v2.9.0+): the layout math is ported line-for-line (it is pure
+//! `0fdf4f8` (v2.10.1+): the layout math is ported line-for-line (it is pure
 //! and parity-pinned by the `preview` harness group); the markdown body uses
 //! the rpi-tui `Markdown` component with the identity theme (the guest has no
 //! host markdown theme — visual [VARIANT], TE-D40).

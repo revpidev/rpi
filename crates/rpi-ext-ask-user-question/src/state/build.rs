@@ -2,7 +2,7 @@
 //!
 //! Port of upstream `buildItemsForQuestion`
 //! (`packages/rpiv-ask-user-question/ask-user-question.ts:...`) together with
-//! the `sentinelsToAppend` walker from `state/row-intent.ts` @ `338b264c`.
+//! the `sentinelsToAppend` walker from `state/row-intent.ts` @ `0fdf4f8`.
 //! Q0 lands the pure data surface only (row descriptors); rendering consumes
 //! it in Q2/Q3.
 

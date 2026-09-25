@@ -1,7 +1,7 @@
 //! Canonical questionnaire state machine (the single mutation entry point).
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/state/state-reducer.ts`
-//! @ `338b264c` (v2.9.0+) plus the `QuestionnaireState` shape of
+//! @ `0fdf4f8` (v2.10.1+) plus the `QuestionnaireState` shape of
 //! `state/state.ts`. [`apply`] is the only way state changes; every side
 //! effect is returned declaratively as [`Effect`] and executed by
 //! [`crate::state::session`] (or the parity harness).

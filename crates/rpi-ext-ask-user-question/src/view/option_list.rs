@@ -1,7 +1,7 @@
 //! Single-select option rows.
 //!
 //! Port of upstream `view/components/option-list-view.ts` +
-//! `view/components/wrapping-select.ts` @ `338b264c` reduced to the Q2
+//! `view/components/wrapping-select.ts` @ `0fdf4f8` reduced to the Q2
 //! surface: numbered rows with a `→ ` active pointer, the `Type something.`
 //! inline-input sentinel, a one-line wrapped description, and the `✔`
 //! previously-confirmed marker.

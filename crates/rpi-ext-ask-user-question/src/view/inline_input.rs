@@ -1,7 +1,7 @@
 //! Inline multiline input row (`Type something.` / notes drafts).
 //!
 //! Port of the rendering half of upstream
-//! `view/components/inline-input.ts` @ `338b264c`: the buffer occupies the
+//! `view/components/inline-input.ts` @ `0fdf4f8`: the buffer occupies the
 //! row prefix on its first line and a continuation prefix on wrapped/logical
 //! continuation lines; the cursor cell is reported to the host (explicit
 //! `cursor:{row,col}`, R-U3.2) instead of carrying upstream's reverse-video +

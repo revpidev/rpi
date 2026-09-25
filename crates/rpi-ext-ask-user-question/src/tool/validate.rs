@@ -1,7 +1,7 @@
 //! Pure runtime validator for `QuestionParams`.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/tool/validate-questionnaire.ts`
-//! @ `338b264c`. Covers every guard except `no_ui` (which depends on
+//! @ `0fdf4f8`. Covers every guard except `no_ui` (which depends on
 //! `ctx.hasUI` and stays inline at the call site). `reserved_label` MUST
 //! short-circuit before `duplicate_option_label` (upstream `:17`).
 

@@ -1,7 +1,7 @@
 //! Line-terminator normalization at the tool boundary.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/tool/normalize-params.ts`
-//! @ `338b264c` (issue #192). Some models serialize a bare carriage return
+//! @ `0fdf4f8` (issue #192). Some models serialize a bare carriage return
 //! inside tool-call string arguments at token boundaries where the text was
 //! meant to be contiguous (`GEMBA\r_LOG\r_FILE` for `GEMBA_LOG_FILE`). A raw
 //! CR is a cursor-control byte, not text: pi-tui ≤0.80 writes it straight

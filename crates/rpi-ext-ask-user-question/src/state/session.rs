@@ -1,6 +1,6 @@
 //! Component session driver: the guest side of the interactive-UI ABI.
 //!
-//! Port of upstream `state/questionnaire-session.ts` @ `338b264c` for route C:
+//! Port of upstream `state/questionnaire-session.ts` @ `0fdf4f8` for route C:
 //! owns the canonical state cell, the headless inline-input and notes buffers,
 //! the router/reducer loop and the effect runner, and exposes the
 //! [`Component`] surface the ABI drives (`render` / `handle_input` /

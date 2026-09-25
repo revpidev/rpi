@@ -1,6 +1,6 @@
 //! Dialog layout assembly + footer hints + scroll window.
 //!
-//! Port of upstream `view/dialog-builder.ts` @ `338b264c`: sticky tab bar +
+//! Port of upstream `view/dialog-builder.ts` @ `0fdf4f8`: sticky tab bar +
 //! heading, the active body (single-select options — composed with the
 //! markdown preview pane per the 100-column breakpoint when previews exist —
 //! / multi-select / Submit review), the notes editor when open, and one

@@ -2,7 +2,7 @@
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/config.ts` plus the
 //! `@juicesharp/rpiv-config` loader it calls (`config.ts`/`loadJsonConfig`/
-//! `loadJsonConfigWithLegacyFallback`/`validateGuidanceFields`) @ `338b264c`.
+//! `loadJsonConfigWithLegacyFallback`/`validateGuidanceFields`) @ `0fdf4f8`.
 //!
 //! Path policy (R-Q7.1 [VARIANT], deviation TE-D39): the upstream path
 //! `~/.config/rpiv-ask-user-question/config.json` is kept verbatim — it is

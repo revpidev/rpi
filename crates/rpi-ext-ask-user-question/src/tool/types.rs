@@ -1,7 +1,7 @@
 //! Tool contract constants, JSON Schema and wire types.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/tool/types.ts` @
-//! `338b264c` (v2.9.0+). The `parameters` JSON Schema is byte-equal to the
+//! `0fdf4f8` (v2.10.1+). The `parameters` JSON Schema is byte-equal to the
 //! TypeBox output (`QuestionParamsSchema`) — asserted by
 //! `scripts/ask-user-question-parity` and `types_schema_matches_upstream`.
 //!

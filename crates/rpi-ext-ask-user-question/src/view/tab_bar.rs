@@ -1,6 +1,6 @@
 //! Tab bar (multi-question mode).
 //!
-//! Port of upstream `view/components/tab-bar.ts` @ `338b264c`: a `← … →` row
+//! Port of upstream `view/components/tab-bar.ts` @ `0fdf4f8`: a `← … →` row
 //! of header chips (`■` answered / `□` open) plus the Submit chip. Hidden in
 //! single-question mode (the dialog skips it entirely).
 

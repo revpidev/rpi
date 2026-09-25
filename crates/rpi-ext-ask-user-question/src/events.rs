@@ -1,6 +1,6 @@
 //! Public event contract (`rpiv:ask-user:prompt` / `rpiv:ask-user:blocked`).
 //!
-//! Port of upstream `packages/rpiv-ask-user-question/events.ts` @ `338b264c`.
+//! Port of upstream `packages/rpiv-ask-user-question/events.ts` @ `0fdf4f8`.
 //! Stability policy (upstream header, applies to every `rpiv:*` event):
 //! channel names are immutable; payload changes are append-only; breaking
 //! changes require a new channel; payloads are JSON-safe.

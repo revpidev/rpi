@@ -1,7 +1,7 @@
 //! Raw key bytes → questionnaire action.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/state/key-router.ts` @
-//! `338b264c` (v2.9.0+). The router is a pure function over `(data, state,
+//! `0fdf4f8` (v2.10.1+). The router is a pure function over `(data, state,
 //! runtime)`: it never mutates state — every transition is expressed as an
 //! [`Action`] consumed by [`crate::state::reducer::apply`].
 //!

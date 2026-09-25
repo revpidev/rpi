@@ -1,7 +1,7 @@
 //! RPC / dialog-primitive fallback for `ask_user_question` (R-Q6).
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/rpc-fallback.ts` @
-//! `338b264c`. The canonical TUI path renders a tabbed overlay that needs a
+//! `0fdf4f8`. The canonical TUI path renders a tabbed overlay that needs a
 //! real terminal; RPC-mode hosts (VSCode pendant, ACP clients such as Zed or
 //! Paseo — upstream issue #78) report `hasUI: true` because the dialog
 //! sub-protocol works, but `ui.custom` cannot render there. This module walks

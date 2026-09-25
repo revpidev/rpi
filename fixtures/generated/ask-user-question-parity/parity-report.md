@@ -1,8 +1,8 @@
 # ask-user-question parity report (TE28/TE29/TE30/TE31 G3/G12 — preview group added by TE31)
 
-generated: 2026-09-12T05:17:58.736Z
+generated: 2026-09-25T23:00:45.944Z
 upstream submodule: external/rpiv-mono/packages/rpiv-ask-user-question
-submodule HEAD: 338b264c1ca4fd8828cc849b632f4f7ad88d2e78 (pinned 338b264c1ca4fd8828cc849b632f4f7ad88d2e78)
+submodule HEAD: 0fdf4f813980d380e826b84d1280a4960e5d088e (pinned 0fdf4f813980d380e826b84d1280a4960e5d088e)
 typebox: 1.3.6
 
 ## snapshot (sha256 of the driven upstream modules)
@@ -20,7 +20,7 @@ typebox: 1.3.6
 - view/components/preview/preview-layout-decider.ts: 7baf9ecd1db8af8383d2f792d69d4fd9b22623a7cbd29e1a95bc9fd480796a3b
 - view/components/preview/preview-box-renderer.ts: 20b900ead8a0e71f005aadb18c00103b2dff87391ec8c8011ebd3c47540a8c33
 - external/pi/packages/tui/src/keys.ts (pi-tui stub): b972facce4233a4623239fc38029e28cae15d0fb326558c0c09dc02cf4345fa7
-- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 014e017a0cb45d8f4e07af6e472c282c6dec7c5856a335a3e3beeb6054f385d3
+- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 8cda2d53e2361ac5aaf6d7345b2fee058c8df5743eae4e4e90c89a7072c026c3
 
 ## schema
 

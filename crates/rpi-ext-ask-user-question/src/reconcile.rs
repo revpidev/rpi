@@ -1,7 +1,7 @@
 //! Mid-session lifecycle reconciliation (`before_agent_start`).
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/reconcile.ts` @
-//! `338b264c`. Strips or re-adds `ask_user_question` to the active set so it
+//! `0fdf4f8`. Strips or re-adds `ask_user_question` to the active set so it
 //! is invisible to the LLM in non-interactive runs (no UI) and present in
 //! interactive ones. The only gating signal is `ctx.hasUI`; RPC hosts
 //! (`ctx.mode == "rpc"`) deliberately keep the tool — `hasUI` is true there

@@ -1,7 +1,7 @@
 //! Result envelope + answer scalar formatting.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/tool/response-envelope.ts`
-//! and `tool/format-answer.ts` @ `338b264c`. Both are pure of
+//! and `tool/format-answer.ts` @ `0fdf4f8`. Both are pure of
 //! `(result, params)` / `(answer)` and are the LLM-facing contract: text and
 //! `details` must stay byte/field-identical to upstream (R-Q3, 附录 C).
 

@@ -61,7 +61,7 @@ it is in scope.
    `UPSTREAM.md` (currently `19451accd`, Pi v0.86.1+1). Behavior changes that
    diverge from upstream require an ADR first (registered in the docs
    repository). The red-line pins (`19451accd` / subagents `b72714de` /
-   mcp-adapter `97435aab` / smart-fetch `b0111612` / rpiv-mono `338b264c`)
+   mcp-adapter `97435aab` / smart-fetch `b0111612` / rpiv-mono `0fdf4f8`)
    move only via the documented rebase process, never opportunistically.
 2. **Quality gates are local and mandatory.** CI builds releases but is not
    the test gate (see the rc.12 note in `changes/v0.1.4.md`). Before every

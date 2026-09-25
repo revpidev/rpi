@@ -1,6 +1,6 @@
 //! Multi-select question rows.
 //!
-//! Port of upstream `view/components/multi-select-view.ts` @ `338b264c` for
+//! Port of upstream `view/components/multi-select-view.ts` @ `0fdf4f8` for
 //! the Q2 surface: one row per option (`→ ` pointer + number + `[x]`/`[ ]`
 //! checkbox + label, description on continuation lines indented by two
 //! columns), the `Type something.` inline-input row, and the `Next` sentinel

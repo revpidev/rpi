@@ -1,7 +1,7 @@
 //! Row-kind metadata and sentinel derivation.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/state/row-intent.ts` @
-//! `338b264c`. Single source of truth for the runtime sentinel rows: the
+//! `0fdf4f8`. Single source of truth for the runtime sentinel rows: the
 //! auto-append walker, the reserved-label derivation and the i18n label
 //! lookup all read [`ROW_INTENT_META`].
 //!

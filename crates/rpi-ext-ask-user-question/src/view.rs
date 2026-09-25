@@ -4,7 +4,7 @@
 //! `Vec<String>` frames with ANSI SGR styling, and the interactive-UI ABI
 //! composites them into the host's overlay (ADR-0024 / R-U3). Visuals are the
 //! rpi design ([VARIANT], TE-D40); behavior and key handling stay aligned
-//! with upstream `packages/rpiv-ask-user-question` @ `338b264c`.
+//! with upstream `packages/rpiv-ask-user-question` @ `0fdf4f8`.
 //!
 //! Every emitted line is width-clipped here (ANSI-aware), so the host's own
 //! clipping is a no-op and golden frames are deterministic across widths.

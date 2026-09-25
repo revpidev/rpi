@@ -1,7 +1,7 @@
 //! Derived projections over [`QuestionnaireState`].
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/state/selectors/` @
-//! `338b264c`: `derivations.ts` (`selectConfirmedIndicator`,
+//! `0fdf4f8`: `derivations.ts` (`selectConfirmedIndicator`,
 //! `selectActivePreviewPaneIndex`) and `focus.ts` (`selectActiveView`). The
 //! per-props selectors of `projections.ts` are folded into
 //! [`crate::view::dialog`] because the rpi renderer computes rows directly

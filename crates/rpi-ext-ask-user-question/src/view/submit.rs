@@ -1,7 +1,7 @@
 //! Submit-tab rendering (answer review + Submit/Cancel picker).
 //!
 //! Port of upstream `view/components/submit-picker.ts` +
-//! `SubmitTabStrategy` (`view/tab-content-strategy.ts`) @ `338b264c`: the
+//! `SubmitTabStrategy` (`view/tab-content-strategy.ts`) @ `0fdf4f8`: the
 //! picker is a fixed two-row `Submit answers` / `Cancel` list; the body is
 //! the answered-question summary (`● header` + `→ answer`), and the footer
 //! names the unanswered questions or declares readiness.
