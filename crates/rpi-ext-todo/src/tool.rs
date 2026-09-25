@@ -15,23 +15,50 @@ pub mod envelope;
 pub mod sanitize;
 pub mod types;
 
+use crate::config;
+use crate::i18n::I18n;
 use crate::state::reducer::apply_task_mutation;
+use crate::state::selectors;
 use crate::state::store;
 use crate::tool::types::{
-    todo_params_schema, TaskAction, DEFAULT_PROMPT_SNIPPET, DEFAULT_TOOL_DESCRIPTION, TOOL_LABEL,
-    TOOL_NAME,
+    todo_params_schema, TaskAction, COMMAND_NAME, DEFAULT_PROMPT_SNIPPET, DEFAULT_TOOL_DESCRIPTION,
+    TOOL_LABEL, TOOL_NAME,
 };
 
-/// Build the `registerTool` payload (upstream `registerTodoTool`).
+/// Build the `registerTool` payload (upstream `registerTodoTool`): the
+/// guidance config overrides apply at registration time (a change needs
+/// a restart — upstream reads `loadConfig().guidance` once at factory
+/// scope), and the `renderCall`/`renderResult` flags advertise the
+/// transcript renderers (v0.1.4 C1 render-slot surface).
 pub fn tool_definition() -> Value {
+    tool_definition_with_guidance(load_config_guidance().as_ref())
+}
+
+/// Test/production seam over an explicit raw `guidance` value.
+pub fn tool_definition_with_guidance(guidance_value: Option<&Value>) -> Value {
+    let guidance = config::validate_guidance_fields(guidance_value);
+    let prompt_snippet = guidance
+        .prompt_snippet
+        .unwrap_or_else(|| DEFAULT_PROMPT_SNIPPET.to_owned());
+    let prompt_guidelines = guidance
+        .prompt_guidelines
+        .unwrap_or_else(crate::tool::types::default_prompt_guidelines);
     json!({
         "name": TOOL_NAME,
         "label": TOOL_LABEL,
         "description": DEFAULT_TOOL_DESCRIPTION,
-        "promptSnippet": DEFAULT_PROMPT_SNIPPET,
-        "promptGuidelines": crate::tool::types::default_prompt_guidelines(),
+        "promptSnippet": prompt_snippet,
+        "promptGuidelines": prompt_guidelines,
         "parameters": todo_params_schema(),
+        "renderCall": true,
+        "renderResult": true,
     })
+}
+
+/// The raw `guidance` object of the current config (registration-time
+/// read; test seam injects a value).
+fn load_config_guidance() -> Option<Value> {
+    config::load_config().get("guidance").cloned()
 }
 
 /// Content-only error envelope for pre-reducer input failures (missing or
@@ -67,6 +94,118 @@ pub fn execute(host: &dyn crate::HostCall, params: &Value) -> Value {
     let result = apply_task_mutation(store::store().state_for(&sid), action, map);
     store::store().commit_state(&sid, result.state.clone());
     envelope::build_tool_result(action, params, &result.state, &result.op)
+}
+
+// ---------------------------------------------------------------------------
+// /todos slash command (upstream `registerTodosCommand`)
+// ---------------------------------------------------------------------------
+
+/// `ctx.ui.notify` — level `"info" | "warning" | "error"`.
+fn notify(host: &dyn crate::HostCall, message: &str, level: &str) {
+    if let Err(error) = host.call(
+        "ui.notify",
+        json!({ "message": message, "notifyType": level }),
+    ) {
+        tracing::warn!(%error, "rpiv-todo: ui.notify rejected");
+    }
+}
+
+/// The `/todos` command body (upstream `registerTodosCommand` handler):
+/// error without UI, info notice when nothing is visible, else the
+/// grouped output (header counts line + pending/in_progress/completed
+/// sections, i18n keys driving the chrome strings). Reads the CALLING
+/// session's slot — the command ctx carries session identity, unlike
+/// the render hooks.
+pub fn handle_todos_command(host: &dyn crate::HostCall, i18n: &I18n) {
+    if !crate::has_ui(host) {
+        notify(
+            host,
+            i18n.t(
+                "command.requires_interactive",
+                "/todos requires interactive mode",
+            ),
+            "error",
+        );
+        return;
+    }
+    let sid = crate::sid_of(host);
+    let state = store::store().state_for(&sid);
+    if selectors::select_visible_tasks(&state).is_empty() {
+        notify(
+            host,
+            i18n.t(
+                "command.no_todos",
+                "No todos yet. Ask the agent to add some!",
+            ),
+            "info",
+        );
+        return;
+    }
+    let groups = selectors::select_tasks_by_status(&state);
+    let counts = selectors::select_todo_counts(&state);
+
+    let mut header: Vec<String> = Vec::new();
+    if counts.completed > 0 {
+        header.push(format!(
+            "{}/{} {}",
+            counts.completed,
+            counts.total,
+            i18n.format_status_label(crate::tool::types::TaskStatus::Completed)
+        ));
+    }
+    if counts.in_progress > 0 {
+        header.push(format!(
+            "{} {}",
+            counts.in_progress,
+            i18n.format_status_label(crate::tool::types::TaskStatus::InProgress)
+        ));
+    }
+    if counts.pending > 0 {
+        header.push(format!(
+            "{} {}",
+            counts.pending,
+            i18n.format_status_label(crate::tool::types::TaskStatus::Pending)
+        ));
+    }
+
+    let mut lines = vec![header.join(" · ")];
+    if !groups.pending.is_empty() {
+        lines.push(
+            i18n.t("command.section.pending", "── Pending ──")
+                .to_owned(),
+        );
+        for task in &groups.pending {
+            lines.push(crate::view::format_command_task_line(task, "○"));
+        }
+    }
+    if !groups.in_progress.is_empty() {
+        lines.push(
+            i18n.t("command.section.in_progress", "── In Progress ──")
+                .to_owned(),
+        );
+        for task in &groups.in_progress {
+            lines.push(crate::view::format_command_task_line(task, "◐"));
+        }
+    }
+    if !groups.completed.is_empty() {
+        lines.push(
+            i18n.t("command.section.completed", "── Completed ──")
+                .to_owned(),
+        );
+        for task in &groups.completed {
+            lines.push(crate::view::format_command_task_line(task, "✓"));
+        }
+    }
+
+    notify(host, &lines.join("\n"), "info");
+}
+
+/// The command registration payload.
+pub fn todos_command_definition() -> Value {
+    json!({
+        "name": COMMAND_NAME,
+        "description": "Show all todos on the current branch, grouped by status",
+    })
 }
 
 #[cfg(test)]
@@ -234,5 +373,361 @@ mod tests {
             properties["status"]["enum"],
             json!(["pending", "in_progress", "completed", "deleted"])
         );
+    }
+
+    // ------------------------------------------------------------------
+    // renderCall/renderResult registration flags (v0.1.4 C1 render slot;
+    // the upstream tool registers `renderCall`/`renderResult` closures)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tool_definition_advertises_the_render_hooks() {
+        let definition = tool_definition_with_guidance(None);
+        assert_eq!(definition["renderCall"], json!(true));
+        assert_eq!(definition["renderResult"], json!(true));
+    }
+
+    // ------------------------------------------------------------------
+    // Guidance overrides (upstream todo.guidance.test.ts — the config
+    // cases; the built-in snapshot is pinned above)
+    // ------------------------------------------------------------------
+
+    fn definition_with(guidance: Value) -> Value {
+        tool_definition_with_guidance(Some(&guidance))
+    }
+
+    #[test]
+    fn guidance_overrides_the_prompt_snippet() {
+        let definition = definition_with(json!({"promptSnippet": "Custom todo snippet"}));
+        assert_eq!(definition["promptSnippet"], json!("Custom todo snippet"));
+        // Guidelines stay at the built-in eight.
+        assert_eq!(
+            definition["promptGuidelines"].as_array().map(Vec::len),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn guidance_overrides_the_prompt_guidelines() {
+        let definition = definition_with(json!({"promptGuidelines": ["Rule one", "Rule two"]}));
+        assert_eq!(
+            definition["promptGuidelines"],
+            json!(["Rule one", "Rule two"])
+        );
+        assert_eq!(
+            definition["promptSnippet"],
+            json!("Manage a task list to track multi-step progress")
+        );
+    }
+
+    #[test]
+    fn guidance_overrides_both_fields() {
+        let definition =
+            definition_with(json!({"promptSnippet": "Custom", "promptGuidelines": ["Rule"]}));
+        assert_eq!(definition["promptSnippet"], json!("Custom"));
+        assert_eq!(definition["promptGuidelines"], json!(["Rule"]));
+    }
+
+    #[test]
+    fn guidance_falls_back_on_empty_snippet() {
+        let definition = definition_with(json!({"promptSnippet": ""}));
+        assert_eq!(
+            definition["promptSnippet"],
+            json!("Manage a task list to track multi-step progress")
+        );
+    }
+
+    #[test]
+    fn guidance_falls_back_on_wrong_types() {
+        let definition =
+            definition_with(json!({"promptSnippet": 123, "promptGuidelines": "not-array"}));
+        assert_eq!(
+            definition["promptSnippet"],
+            json!("Manage a task list to track multi-step progress")
+        );
+        assert_eq!(
+            definition["promptGuidelines"].as_array().map(Vec::len),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn guidance_falls_back_on_an_empty_guideline_item() {
+        let definition = definition_with(json!({"promptGuidelines": ["valid", ""]}));
+        assert_eq!(
+            definition["promptGuidelines"].as_array().map(Vec::len),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn guidance_absent_keeps_the_built_ins() {
+        let definition = tool_definition_with_guidance(Some(&json!({"otherField": true})));
+        assert_eq!(
+            definition["promptSnippet"],
+            json!("Manage a task list to track multi-step progress")
+        );
+        assert_eq!(
+            definition["promptGuidelines"].as_array().map(Vec::len),
+            Some(8)
+        );
+        let definition = tool_definition_with_guidance(None);
+        assert_eq!(
+            definition["promptSnippet"],
+            json!("Manage a task list to track multi-step progress")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // /todos command (upstream todo.command.test.ts)
+    // ------------------------------------------------------------------
+
+    /// Recording host for the command path: captures `ui.notify` calls,
+    /// answers ctx questions from a fixed shape.
+    struct CommandHost {
+        session_id: &'static str,
+        has_ui: bool,
+        notifies: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CommandHost {
+        fn interactive(session_id: &'static str) -> Self {
+            CommandHost {
+                session_id,
+                has_ui: true,
+                notifies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn headless() -> Self {
+            CommandHost {
+                session_id: "s1",
+                has_ui: false,
+                notifies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn output(&self) -> String {
+            self.notifies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .first()
+                .map(|(message, _)| message.clone())
+                .unwrap_or_default()
+        }
+
+        fn level(&self) -> String {
+            self.notifies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .first()
+                .map(|(_, level)| level.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl crate::HostCall for CommandHost {
+        fn call(&self, method: &str, args: Value) -> Result<Value, crate::HostError> {
+            match method {
+                "ctx.sessionFile" => Ok(json!({"path": null, "id": self.session_id})),
+                "ctx.hasUI" => Ok(json!(self.has_ui)),
+                "ui.notify" => {
+                    self.notifies
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push((
+                            args.get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            args.get("notifyType")
+                                .and_then(Value::as_str)
+                                .unwrap_or("info")
+                                .to_owned(),
+                        ));
+                    Ok(Value::Null)
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+    }
+
+    fn run_command(host: &CommandHost) {
+        crate::tool::handle_todos_command(host, &crate::i18n::I18n::for_locale("en"));
+    }
+
+    /// Lock the process-global store for the whole test body (the
+    /// upstream vitest suite runs serially; every rpi test that touches
+    /// the store holds this lock).
+    fn locked() -> std::sync::MutexGuard<'static, ()> {
+        crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn seeded(headless: bool, actions: &[Value]) -> CommandHost {
+        let host = if headless {
+            CommandHost::headless()
+        } else {
+            CommandHost::interactive("s1")
+        };
+        for params in actions {
+            let _ = crate::tool::execute(&host, params);
+        }
+        host
+    }
+
+    #[test]
+    fn todos_command_definition_registers_the_name_and_description() {
+        let definition = crate::tool::todos_command_definition();
+        assert_eq!(definition["name"], json!("todos"));
+        assert!(definition["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("todos")));
+    }
+
+    #[test]
+    fn command_notifies_an_error_when_the_session_has_no_ui() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(true, &[]);
+        run_command(&host);
+        let notifies = host
+            .notifies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(notifies.len(), 1);
+        assert_eq!(notifies[0].1, "error");
+        assert!(notifies[0].0.contains("interactive"));
+    }
+
+    #[test]
+    fn command_notifies_info_when_there_are_no_visible_tasks() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(false, &[]);
+        run_command(&host);
+        assert_eq!(host.level(), "info");
+        assert!(host.output().contains("No todos"));
+    }
+
+    #[test]
+    fn command_treats_all_deleted_tasks_as_empty() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(
+            false,
+            &[
+                json!({"action": "create", "subject": "a"}),
+                json!({"action": "update", "id": 1, "status": "deleted"}),
+            ],
+        );
+        run_command(&host);
+        assert!(host.output().contains("No todos"));
+    }
+
+    #[test]
+    fn command_renders_the_pending_group() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(false, &[json!({"action": "create", "subject": "research"})]);
+        run_command(&host);
+        let out = host.output();
+        assert!(out.contains("── Pending ──"), "{out}");
+        assert!(out.contains("○ #1 research"), "{out}");
+        assert!(out.contains("1 pending"), "{out}");
+    }
+
+    #[test]
+    fn command_renders_the_in_progress_group_with_active_form() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(
+            false,
+            &[
+                json!({"action": "create", "subject": "build", "activeForm": "Building"}),
+                json!({"action": "update", "id": 1, "status": "in_progress"}),
+            ],
+        );
+        run_command(&host);
+        let out = host.output();
+        assert!(out.contains("── In Progress ──"), "{out}");
+        assert!(out.contains("◐ #1 build (Building)"), "{out}");
+        assert!(out.contains("1 in progress"), "{out}");
+    }
+
+    #[test]
+    fn command_renders_the_completed_group_with_ratio_header() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(
+            false,
+            &[
+                json!({"action": "create", "subject": "ship"}),
+                json!({"action": "update", "id": 1, "status": "completed"}),
+            ],
+        );
+        run_command(&host);
+        let out = host.output();
+        assert!(out.contains("── Completed ──"), "{out}");
+        assert!(out.contains("✓ #1 ship"), "{out}");
+        assert!(out.contains("1/1 completed"), "{out}");
+    }
+
+    #[test]
+    fn command_header_parts_are_ordered_completed_progress_pending() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(
+            false,
+            &[
+                json!({"action": "create", "subject": "p"}),
+                json!({"action": "create", "subject": "ip"}),
+                json!({"action": "update", "id": 2, "status": "in_progress"}),
+                json!({"action": "create", "subject": "done"}),
+                json!({"action": "update", "id": 3, "status": "completed"}),
+            ],
+        );
+        run_command(&host);
+        let output = host.output();
+        let header = output.split('\n').next().unwrap_or("");
+        let i_c = header.find("completed");
+        let i_ip = header.find("in progress");
+        let i_p = header.find("pending");
+        assert!(i_c.is_some() && i_ip.unwrap_or(0) > i_c.unwrap_or(0));
+        assert!(i_p.unwrap_or(0) > i_ip.unwrap_or(0));
+    }
+
+    #[test]
+    fn command_appends_the_chain_suffix_for_blocked_tasks() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(
+            false,
+            &[
+                json!({"action": "create", "subject": "base"}),
+                json!({"action": "create", "subject": "follow-up", "blockedBy": [1]}),
+            ],
+        );
+        run_command(&host);
+        assert!(host.output().contains("⛓ #1"));
+    }
+
+    #[test]
+    fn command_omits_deleted_tombstones() {
+        let _guard = locked();
+        crate::__reset_state();
+        let host = seeded(
+            false,
+            &[
+                json!({"action": "create", "subject": "keep"}),
+                json!({"action": "create", "subject": "drop"}),
+                json!({"action": "update", "id": 2, "status": "deleted"}),
+            ],
+        );
+        run_command(&host);
+        let out = host.output();
+        assert!(out.contains("keep"));
+        assert!(!out.contains("drop"));
     }
 }

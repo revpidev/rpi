@@ -6,16 +6,15 @@
 //! P0 (TE34): the `todo` tool with its full six-action state machine and
 //! `blockedBy` dependency validation, the session-isolated state store,
 //! branch replay through `ctx.sessionToolResults` (ADR-0030, host side
-//! V15-14), and the prompt surface (promptSnippet + the eight built-in
-//! guidelines). Event wiring follows upstream `index.ts` @ `0fdf4f8`:
-//! `session_start` / `session_compact` / `session_tree` replay into the
-//! event's own session slot, `session_shutdown` evicts it (foreground
-//! teardown bumps the lifecycle generation and clears the render pointer),
-//! `tool_execution_end` / `agent_start` are logged placeholders until the
-//! overlay lands (TE35).
+//! V15-14), and the prompt surface. P1 (TE35): the persistent overlay
+//! widget above the editor (`setWidget` re-send shape mapping, design
+//! §4.1), the `/todos` command, the collapse shortcut, the XDG config,
+//! the embedded nine-locale i18n tables (TE-D43), and the
+//! renderCall/renderResult transcript renderers. Event wiring follows
+//! upstream `index.ts` @ `0fdf4f8` on both layers.
 //!
-//! Docs: `rpi-docs/extensions/rpiv-todo/{01,02}.md` and the task file
-//! `rpi-docs/plan/extensions/TE34-rpiv-todo-p0.md`.
+//! Docs: `rpi-docs/extensions/rpiv-todo/{01,02}.md` and the task files
+//! `rpi-docs/plan/extensions/TE34-rpiv-todo-p0.md` / `TE35-rpiv-todo-p1.md`.
 //!
 //! Native plugin runtime model (ask-user-question precedent):
 //! `rpi_extension_init` registers through the host-call handle and
@@ -27,6 +26,9 @@
 //! ask-user-question "newest channel wins" simplification, which would
 //! cross-wire child sessions onto the interactive session's context.
 
+pub mod config;
+pub mod i18n;
+pub mod overlay;
 pub mod state;
 pub mod tool;
 pub mod view;
@@ -184,6 +186,39 @@ fn channel_for(cookie: PluginCookie) -> Option<NativeHostCall> {
 }
 
 // ---------------------------------------------------------------------------
+// P1 globals: locale table, overlay controller, bound collapse key
+// (upstream index.ts closure state: the i18n registration at module
+// init, `todoOverlay`/`uiCtx`, and the factory-scope `collapseKey`)
+// ---------------------------------------------------------------------------
+
+/// The process locale table (detected once at install; upstream
+/// registers the rpiv-i18n strings once at module init — TE-D43 embeds
+/// the tables instead).
+static I18N: OnceLock<i18n::I18n> = OnceLock::new();
+
+fn current_i18n() -> &'static i18n::I18n {
+    I18N.get_or_init(i18n::I18n::detect)
+}
+
+/// The foreground overlay controller (upstream `todoOverlay`/`uiCtx`
+/// closure variables; foreground-unique like the store's render pointer).
+static OVERLAY: OnceLock<Mutex<overlay::OverlayController>> = OnceLock::new();
+
+fn overlay_controller() -> &'static Mutex<overlay::OverlayController> {
+    OVERLAY.get_or_init(|| Mutex::new(overlay::OverlayController::default()))
+}
+
+/// The registration-time collapse key (upstream factory-scope
+/// `resolveCollapseKey()` — register-once; a config change needs a
+/// restart to re-bind, requirements §7). Empty = the "off" sentinel
+/// (no shortcut registered).
+static COLLAPSE_KEY: OnceLock<String> = OnceLock::new();
+
+fn registered_collapse_key() -> &'static String {
+    COLLAPSE_KEY.get_or_init(config::resolve_collapse_key)
+}
+
+// ---------------------------------------------------------------------------
 // Install + dispatch
 // ---------------------------------------------------------------------------
 
@@ -191,13 +226,45 @@ fn error_envelope(kind: &str, message: impl std::fmt::Display) -> Value {
     json!({"error": {"kind": kind, "message": message.to_string()}})
 }
 
-/// Install: register the tool, subscribe the six lifecycle events, record
-/// the channel. Idempotent across reloads (fresh cookie per load).
+/// Install: register the tool (+ render flags), the `/todos` command,
+/// the collapse shortcut (unless `"off"`), subscribe the six lifecycle
+/// events, resolve the locale, and record the channel. Idempotent across
+/// reloads (fresh cookie per load).
 fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
+    install_with_key(calls, cookie, registered_collapse_key().clone())
+}
+
+/// Test/production seam over an explicit registration-time collapse key.
+fn install_with_key(calls: RpiHostCalls, cookie: PluginCookie, collapse_key: String) -> Value {
     let host = NativeHostCall::new(calls, cookie);
+
+    // Locale detection happens before any registration that could
+    // surface localized chrome (upstream registers strings at module
+    // init, before the factory export runs).
+    let _ = current_i18n();
 
     if let Err(error) = host.call("registerTool", tool::tool_definition()) {
         return error_envelope("init", error);
+    }
+    if let Err(error) = host.call("registerCommand", tool::todos_command_definition()) {
+        return error_envelope("init", error);
+    }
+    // Factory-scope key resolution (register-once contract): the binding
+    // is skipped entirely when collapseKey is "off" (upstream
+    // index.ts:156-168). The per-render hint still re-resolves the key
+    // from config so a config edit shows up in the collapsed hint
+    // without a re-bind (the "off" sentinel's static `collapsed` label
+    // covers exactly that window).
+    if collapse_key != config::COLLAPSE_KEY_OFF {
+        if let Err(error) = host.call(
+            "registerShortcut",
+            json!({
+                "shortcut": collapse_key,
+                "description": "Collapse or expand the todo overlay",
+            }),
+        ) {
+            return error_envelope("init", error);
+        }
     }
     for event in [
         "session_start",
@@ -230,11 +297,57 @@ fn dispatch_message(cookie: PluginCookie, message: &Value) -> Value {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             tool::execute(&host, &params)
         }
+        Some("command")
+            if message.get("name").and_then(Value::as_str)
+                == Some(crate::tool::types::COMMAND_NAME) =>
+        {
+            tool::handle_todos_command(&host, current_i18n());
+            Value::Null
+        }
+        Some("shortcut")
+            if message.get("shortcut").and_then(Value::as_str)
+                == Some(registered_collapse_key().as_str()) =>
+        {
+            let mut controller = overlay_controller()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            controller.handle_shortcut(&host, current_i18n());
+            Value::Null
+        }
+        Some("render") if message.get("toolName").and_then(Value::as_str) == Some(TOOL_NAME) => {
+            render_dispatch(&host, message)
+        }
         Some("event") => {
             let event = message.get("event").and_then(Value::as_str).unwrap_or("");
             let payload = message.get("payload").cloned().unwrap_or(Value::Null);
             handle_event(&host, event, &payload);
             Value::Null
+        }
+        _ => Value::Null,
+    }
+}
+
+/// The transcript render dispatch (`{"kind":"render","what":…}`):
+/// `renderCall` reads the FOREGROUND slot (the render context carries no
+/// session identity — upstream `renderTodoCall(args, theme, _context)`
+/// resolves through `getRenderState()`; a detached call falls back to
+/// `#<id>`, intentionally); `renderResult` inspects the result's
+/// `details`. The theme re-reads `ctx.ui.theme` per dispatch.
+fn render_dispatch(host: &NativeHostCall, message: &Value) -> Value {
+    let theme = match host.call("ui.theme", json!({})) {
+        Ok(theme) => view::AnsiTheme::from_theme_json(&theme),
+        Err(_) => view::AnsiTheme::from_theme_json(&Value::Null),
+    };
+    match message.get("what").and_then(Value::as_str) {
+        Some("toolCall") => {
+            let context = message.get("context").cloned().unwrap_or(Value::Null);
+            let args = context.get("args").cloned().unwrap_or(Value::Null);
+            let state = store().render_state();
+            view::render_todo_call(&args, &theme, &state, current_i18n())
+        }
+        Some("toolResult") => {
+            let result = message.get("result").cloned().unwrap_or(Value::Null);
+            view::render_todo_result(&result, &theme, current_i18n())
         }
         _ => Value::Null,
     }
@@ -267,8 +380,9 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) {
     match event {
         // Every session replays into its OWN data slot (Phase 1 isolation).
         // First UI-bearing session_start claims the foreground
-        // (creator-ownership) without loading any overlay; only the
-        // foreground re-binds (overlay wiring lands with TE35).
+        // (creator-ownership); only the foreground re-binds and refreshes
+        // the shared overlay (a child with a distinct sid is skipped —
+        // it must not rebind to a relay/stale ui).
         "session_start" => {
             let sid = sid_of(host);
             replay_into_slot(host, &sid);
@@ -281,6 +395,15 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) {
             if sid != store().active_render_session() {
                 return;
             }
+            // Foreground: bind the UI ctx to the current generation and
+            // refresh with a completed-display reset (upstream
+            // `uiCtx = ctx.ui; await updateTodoOverlay(true, generation)`).
+            let generation = store().lifecycle_generation();
+            let mut controller = overlay_controller()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            controller.bind_ui(generation);
+            controller.update_todo_overlay(host, current_i18n(), true);
             tracing::debug!(sid = %sid, "rpiv-todo: foreground claimed");
         }
         // Shared by session_compact and session_tree (verbatim-identical
@@ -290,6 +413,10 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) {
             let sid = sid_of(host);
             replay_into_slot(host, &sid);
             if sid == store().active_render_session() {
+                let mut controller = overlay_controller()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                controller.update_todo_overlay(host, current_i18n(), true);
                 tracing::debug!(event, "rpiv-todo: foreground replayed after {event}");
             }
         }
@@ -297,28 +424,41 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) {
         // teardown is sid-gated: a child shutdown must not dispose the
         // foreground; only the foreground's own shutdown (or an
         // unknown/stale sid, resolved to "") tears it down and clears the
-        // pointer + generation.
+        // pointer + generation (try/finally semantics: the pointer clears
+        // even when the dispose push fails).
         "session_shutdown" => {
             let sid = sid_of(host);
             store().evict_session(&sid);
             if sid.is_empty() || sid == store().active_render_session() {
                 store().clear_active_render_session();
+                overlay_controller()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .teardown(host);
                 tracing::debug!("rpiv-todo: foreground torn down");
             }
         }
         // Reads the store at render time; do NOT replay here (the branch
-        // is stale — message_end runs after tool_execution_end). The
-        // overlay refresh itself lands with TE35; P0 logs the trigger.
+        // is stale — message_end runs after tool_execution_end). A
+        // transient widget failure costs this one refresh and warns; it
+        // does not surface as an extension error (upstream catch).
         "tool_execution_end" => {
             let tool_name = payload.get("toolName").and_then(Value::as_str);
             let is_error = payload.get("isError").and_then(Value::as_bool);
             if tool_name == Some(TOOL_NAME) && is_error != Some(true) {
-                tracing::debug!("rpiv-todo: todo tool succeeded (overlay refresh: TE35)");
+                let mut controller = overlay_controller()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                controller.update_todo_overlay(host, current_i18n(), false);
             }
         }
-        // Completed-task fade-out migration lands with TE35.
+        // Completed-task fade-out migration (upstream
+        // `todoOverlay?.hideCompletedTasksFromPreviousTurn()`).
         "agent_start" => {
-            tracing::debug!("rpiv-todo: agent_start (fade-out migration: TE35)");
+            let mut controller = overlay_controller()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            controller.on_agent_start(host, current_i18n());
         }
         _ => {}
     }
@@ -385,10 +525,26 @@ pub fn dispatch_for_test(cookie: PluginCookie, message: &Value) -> Value {
     dispatch_message(cookie, message)
 }
 
-/// Test seam: store reset (upstream `__resetState` import path).
+/// Test seam: store reset (upstream `__resetState` import path — the
+/// upstream suite also gets a FRESH index.ts closure per `registerTodo`
+/// call, so the overlay controller resets alongside the store).
 #[doc(hidden)]
 pub fn __reset_state() {
     reset_store();
+    *overlay_controller()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = overlay::OverlayController::default();
+}
+
+/// Test seam: pin the process locale table to English before the first
+/// real detection (the upstream suite is always English — the rpiv-i18n
+/// SDK is absent under vitest, so the shim's inline fallbacks win; the
+/// rpi counterpart of that absence is a pinned test locale). Best-effort:
+/// returns false once a real detection has latched.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_test_locale(locale: &str) -> bool {
+    I18N.set(i18n::I18n::for_locale(locale)).is_ok()
 }
 
 /// Shared serializing lock for every test that touches the process-global
@@ -419,6 +575,10 @@ mod tests {
         session_results: Vec<Value>,
         has_ui: bool,
         stale: bool,
+        /// ctx.sessionToolResults fails with a NON-stale error (a real
+        /// replay bug — distinct from `stale`, which models the dead ctx
+        /// proxy).
+        replay_error: bool,
         calls: Mutex<Vec<(String, Value)>>,
     }
 
@@ -429,6 +589,7 @@ mod tests {
                 session_results: Vec::new(),
                 has_ui: true,
                 stale: false,
+                replay_error: false,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -473,6 +634,12 @@ mod tests {
                         return Err(HostError {
                             kind: "stale".to_owned(),
                             message: "stale ctx".to_owned(),
+                        });
+                    }
+                    if self.replay_error {
+                        return Err(HostError {
+                            kind: "internal".to_owned(),
+                            message: "boom: real replay bug".to_owned(),
                         });
                     }
                     Ok(json!(self.session_results))
@@ -737,6 +904,68 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // compact/tree stale-ctx handling (upstream todo.invalidation.test.ts)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn compact_and_tree_keep_state_on_a_stale_ctx() {
+        let _guard = serialized();
+        __reset_state();
+        store().replace_state(
+            "s1",
+            crate::state::TaskState {
+                tasks: vec![crate::tool::types::Task {
+                    id: 1,
+                    subject: "keep me".to_owned(),
+                    status: crate::tool::types::TaskStatus::Pending,
+                    description: None,
+                    active_form: None,
+                    blocked_by: None,
+                    owner: None,
+                    metadata: None,
+                }],
+                next_id: 2,
+            },
+        );
+        let mut host = MockHost::new("s1");
+        host.stale = true;
+        handle_event(&host, "session_compact", &json!({}));
+        // State untouched — no replay ran, the prior seed survives.
+        assert_eq!(store().state_for("s1").tasks[0].subject, "keep me");
+        handle_event(&host, "session_tree", &json!({}));
+        assert_eq!(store().state_for("s1").tasks[0].subject, "keep me");
+    }
+
+    #[test]
+    fn compact_survives_a_real_replay_error_without_panicking() {
+        // A non-stale replay failure (real bug) surfaces as a warn and
+        // keeps the current state — the native dispatch envelope has no
+        // error channel (upstream rethrows; task-file §7.3 ruling 6).
+        let _guard = serialized();
+        __reset_state();
+        store().commit_state(
+            "s1",
+            crate::state::TaskState {
+                tasks: vec![crate::tool::types::Task {
+                    id: 1,
+                    subject: "committed".to_owned(),
+                    status: crate::tool::types::TaskStatus::Pending,
+                    description: None,
+                    active_form: None,
+                    blocked_by: None,
+                    owner: None,
+                    metadata: None,
+                }],
+                next_id: 2,
+            },
+        );
+        let mut host = MockHost::new("s1");
+        host.replay_error = true;
+        handle_event(&host, "session_compact", &json!({}));
+        assert_eq!(store().state_for("s1").tasks[0].subject, "committed");
+    }
+
+    // ------------------------------------------------------------------
     // tool_execution_end / agent_start placeholders (FR-A: sid/log only)
     // ------------------------------------------------------------------
 
@@ -817,6 +1046,277 @@ mod tests {
             result["content"][0]["text"],
             json!("Error: action is required")
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Install registration surface (P1: command + shortcut + render flags)
+    // — upstream todo-overlay.shortcut.test.ts registration cases
+    // ------------------------------------------------------------------
+
+    /// Scripted transport: canned `ok` replies per method + a recording
+    /// of every call (the extern "C" boundary can capture nothing, so the
+    /// state lives in statics under TEST_LOCK).
+    struct Transport {
+        replies: Mutex<std::collections::HashMap<String, Value>>,
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+
+    impl Transport {
+        fn set_reply(&self, method: &str, reply: Value) {
+            self.replies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(method.to_owned(), reply);
+        }
+    }
+
+    static TRANSPORT: OnceLock<Transport> = OnceLock::new();
+
+    fn transport() -> &'static Transport {
+        TRANSPORT.get_or_init(|| Transport {
+            replies: Mutex::new(std::collections::HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    extern "C" fn scripted_call(_cookie: PluginCookie, request: RVec<u8>) -> RVec<u8> {
+        let parsed: Value = serde_json::from_slice(&request[..]).unwrap_or(Value::Null);
+        let method = parsed
+            .get("call")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let args = parsed.get("args").cloned().unwrap_or(Value::Null);
+        transport()
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((method.clone(), args));
+        let reply = transport()
+            .replies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&method)
+            .cloned()
+            .unwrap_or(Value::Null);
+        RVec::from(serde_json::to_vec(&json!({"ok": reply})).unwrap_or_default())
+    }
+
+    fn recorded(method: &str) -> Vec<Value> {
+        transport()
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|(recorded, _)| recorded == method)
+            .map(|(_, args)| args.clone())
+            .collect()
+    }
+
+    fn install_with(collapse_key: &str) -> Value {
+        transport()
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        let calls = RpiHostCalls {
+            call: scripted_call,
+        };
+        install_with_key(calls, 0xfeed as PluginCookie, collapse_key.to_owned())
+    }
+
+    #[test]
+    fn install_registers_the_command_and_default_shortcut() {
+        let _guard = serialized();
+        __reset_state();
+        let receipt = install_with("ctrl+shift+t");
+        assert_eq!(receipt, json!({"ok": true}));
+        let commands = recorded("registerCommand");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["name"], json!("todos"));
+        assert!(commands[0]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("todos")));
+        let shortcuts = recorded("registerShortcut");
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(shortcuts[0]["shortcut"], json!("ctrl+shift+t"));
+        assert!(shortcuts[0]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("Collapse")));
+    }
+
+    #[test]
+    fn install_registers_a_configured_key_instead_of_the_default() {
+        let _guard = serialized();
+        __reset_state();
+        install_with("alt+o");
+        let shortcuts = recorded("registerShortcut");
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(shortcuts[0]["shortcut"], json!("alt+o"));
+    }
+
+    #[test]
+    fn install_skips_the_shortcut_entirely_for_the_off_sentinel() {
+        let _guard = serialized();
+        __reset_state();
+        install_with("off");
+        assert!(recorded("registerShortcut").is_empty());
+    }
+
+    #[test]
+    fn install_falls_back_to_the_default_key_for_an_invalid_spec() {
+        let _guard = serialized();
+        __reset_state();
+        // The resolver runs at factory scope in production; the seam takes
+        // the RESOLVED key, so an invalid spec reaches install as the
+        // default (config.test.rs pins the resolver matrix).
+        install_with(crate::config::DEFAULT_COLLAPSE_KEY);
+        let shortcuts = recorded("registerShortcut");
+        assert_eq!(shortcuts[0]["shortcut"], json!("ctrl+shift+t"));
+    }
+
+    #[test]
+    fn install_registers_the_tool_with_render_flags() {
+        let _guard = serialized();
+        __reset_state();
+        install_with("ctrl+shift+t");
+        let tools = recorded("registerTool");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["renderCall"], json!(true));
+        assert_eq!(tools[0]["renderResult"], json!(true));
+    }
+
+    // ------------------------------------------------------------------
+    // Dispatch routing (P1: command / shortcut / render)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_routes_the_todos_command() {
+        let _guard = serialized();
+        __reset_state();
+        set_test_locale("en");
+        install_with("ctrl+shift+t");
+        transport().set_reply(
+            "ctx.sessionFile",
+            json!({"path": null, "id": "dispatch-sid"}),
+        );
+        transport().set_reply("ctx.hasUI", json!(true));
+        // Seed through the tool path against the scripted session.
+        let reply = dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "toolExecute", "toolName": "todo", "params": {"action": "create", "subject": "routed"}}),
+        );
+        assert_eq!(
+            reply["content"][0]["text"],
+            json!("Created #1: routed (pending)")
+        );
+        dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "command", "name": "todos", "args": ""}),
+        );
+        let notifies = recorded("ui.notify");
+        assert_eq!(notifies.len(), 1);
+        assert_eq!(notifies[0]["notifyType"], json!("info"));
+        let message = notifies[0]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("── Pending ──"), "{message}");
+        assert!(message.contains("○ #1 routed"), "{message}");
+    }
+
+    #[test]
+    fn dispatch_routes_the_collapse_shortcut() {
+        let _guard = serialized();
+        __reset_state();
+        set_test_locale("en");
+        install_with("ctrl+shift+t");
+        transport().set_reply(
+            "ctx.sessionFile",
+            json!({"path": null, "id": "dispatch-sid"}),
+        );
+        transport().set_reply("ctx.hasUI", json!(true));
+        transport().set_reply("ui.getToolsExpanded", json!(false));
+        // session_start claims the foreground, a tool call registers the
+        // widget, then the shortcut toggles collapse (forced re-send).
+        dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "event", "event": "session_start", "payload": {}}),
+        );
+        dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "toolExecute", "toolName": "todo", "params": {"action": "create", "subject": "a"}}),
+        );
+        dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "event", "event": "tool_execution_end", "payload": {"toolName": "todo", "isError": false}}),
+        );
+        let widgets_before = recorded("ui.setWidget").len();
+        assert!(widgets_before >= 1, "widget registered");
+        dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "shortcut", "shortcut": "ctrl+shift+t"}),
+        );
+        let widgets = recorded("ui.setWidget");
+        assert!(widgets.len() > widgets_before, "toggle forces a re-send");
+        let last = widgets.last().cloned().unwrap_or_default();
+        let lines: Vec<&str> = last["content"]
+            .as_array()
+            .map(|items| items.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            lines.len() == 3 && lines[1].contains("to expand"),
+            "{lines:?}"
+        );
+        // A foreign shortcut key is ignored (registered key only).
+        let before = recorded("ui.setWidget").len();
+        dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "shortcut", "shortcut": "ctrl+x"}),
+        );
+        assert_eq!(recorded("ui.setWidget").len(), before);
+    }
+
+    #[test]
+    fn dispatch_routes_the_render_calls() {
+        let _guard = serialized();
+        __reset_state();
+        set_test_locale("en");
+        install_with("ctrl+shift+t");
+        transport().set_reply("ctx.sessionFile", json!({"path": null, "id": "s"}));
+        transport().set_reply("ctx.hasUI", json!(true));
+        // Claim the foreground FIRST (session_start replays the branch —
+        // an empty branch would wipe a pre-seeded slot), then seed the
+        // task through the tool path.
+        dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "event", "event": "session_start", "payload": {}}),
+        );
+        dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({"kind": "toolExecute", "toolName": "todo", "params": {"action": "create", "subject": "render-me"}}),
+        );
+        let tree = dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({
+                "kind": "render", "what": "toolCall", "toolName": "todo",
+                "context": {"args": {"action": "update", "id": 1}, "toolCallId": "tc", "cwd": "/", "executionStarted": true, "argsComplete": true, "isPartial": false, "expanded": false, "showImages": false, "isError": false}
+            }),
+        );
+        let text = tree["props"]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("todo "), "{text}");
+        assert!(text.contains("→"), "{text}");
+        assert!(text.contains("render-me"), "{text}");
+
+        let tree = dispatch_for_test(
+            0xfeed as PluginCookie,
+            &json!({
+                "kind": "render", "what": "toolResult", "toolName": "todo",
+                "result": {"content": [], "details": {"action": "create", "params": {}, "tasks": [{"id": 1, "subject": "render-me", "status": "pending"}], "nextId": 2}},
+                "options": {"expanded": false, "isPartial": false},
+                "context": {"args": {}, "toolCallId": "tc", "cwd": "/", "executionStarted": true, "argsComplete": true, "isPartial": false, "expanded": false, "showImages": false, "isError": false}
+            }),
+        );
+        let text = tree["props"]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("○"), "{text}");
+        assert!(text.contains("pending"), "{text}");
     }
 
     #[test]

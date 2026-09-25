@@ -3,6 +3,6 @@
   "version": "0.1.4",
   "description": "Task-list todo tool (port of @juicesharp/rpiv-todo v2.10.1+)",
   "native": "librpi_ext_todo.so",
-  "capabilities": ["tools", "events", "session"],
+  "capabilities": ["tools", "commands", "ui", "session", "events"],
   "rpiAbi": 1
 }

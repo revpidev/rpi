@@ -3230,6 +3230,7 @@ version = "0.1.4"
 dependencies = [
  "abi_stable",
  "rpi-ext-host",
+ "rpi-tui",
  "serde",
  "serde_json",
  "tracing",
