@@ -10,13 +10,12 @@
 //! the rest extend [`InteractiveUi`].
 //!
 //! Intentional differences (vs upstream):
-//! - Clipboard (`handle_copy_command`): upstream prefers native clipboard
-//!   tools (clipboard-rs addon, pbcopy/clip, termux-clipboard-set, wl-copy,
-//!   xclip/xsel) and falls back to OSC 52 (utils/clipboard.ts:44-152); rpi
-//!   has no clipboard library, so [`InteractiveUi::copy_to_clipboard`] writes
-//!   the OSC 52 escape directly (`emitOsc52`, utils/clipboard.ts:26-33) with
-//!   the same 100 KB encoded-length cap. Native-tool integration is a TODO
-//!   hook.
+//! - Clipboard (`handle_copy_command`): the write chain lives in
+//!   [`crate::modes::interactive::clipboard`] — platform commands, WSL
+//!   interop and the #9618/#9688 OSC 52 gating, with the native helper
+//!   excluded per D-104 (see that module's header). Both clipboard doors
+//!   (`/copy` and the fullscreen `copySelection` injection) share it, so
+//!   they produce identical bytes and the same verified outcome.
 //! - Export (`handle_export_command`): the JSONL branch uses the local
 //!   `AgentSession::export_to_jsonl`; the HTML branch uses
 //!   `AgentSession::export_to_html` (T14 W5; no `renderedTools`
@@ -50,7 +49,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use base64::Engine;
 use rpi_agent::session::SessionEntry;
 use rpi_tui::components::markdown::Markdown;
 use rpi_tui::components::spacer::Spacer;
@@ -68,22 +66,6 @@ use crate::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveUi, ShareState, UiCommand,
 };
 use crate::RpiError;
-
-/// `MAX_OSC52_ENCODED_LENGTH` (utils/clipboard.ts:20).
-const MAX_OSC52_ENCODED_LENGTH: usize = 100_000;
-
-/// Build the OSC 52 clipboard write for `text` under the shared encoded
-/// length cap (`emitOsc52`, utils/clipboard.ts:26-33). Shared by the
-/// `/copy` / `app.message.copy` message path and the fullscreen selection
-/// `copySelection` injection (tui-renderer.ts:38-42 @ 9841914) so both
-/// clipboard doors produce identical bytes and the same verified outcome.
-pub(crate) fn emit_osc52_with_cap(text: &str) -> Result<String, String> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-    if encoded.len() > MAX_OSC52_ENCODED_LENGTH {
-        return Err("Text too large to copy via OSC 52 (100KB limit)".to_string());
-    }
-    Ok(format!("\x1b]52;c;{encoded}\x07"))
-}
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -368,16 +350,19 @@ impl InteractiveUi {
         }
     }
 
-    /// Clipboard write hook. Upstream `copyToClipboard` (utils/clipboard.ts:
-    /// 44-152) tries native clipboard tools (clipboard-rs addon, pbcopy /
-    /// clip / termux-clipboard-set / wl-copy / xclip / xsel) before falling
-    /// back to OSC 52; rpi has no clipboard library, so this port writes the
-    /// OSC 52 escape directly (`emitOsc52`, utils/clipboard.ts:26-33) with
-    /// the same encoded-length cap. TODO: native tool integration.
+    /// Clipboard write hook: the full chain from
+    /// `utils/clipboard.ts` @ 19451accd (platform commands → WSL interop →
+    /// OSC 52 gating, #9618/#9688) via [`crate::modes::interactive::clipboard`].
+    /// The environment comes from the test-overridable snapshot
+    /// ([`InteractiveUi::clipboard_env`]); OSC 52 goes to the shared
+    /// terminal.
     fn copy_to_clipboard(&self, text: &str) -> Result<(), String> {
-        let osc52 = emit_osc52_with_cap(text)?;
-        self.ui.with_terminal(|terminal| terminal.write(&osc52));
-        Ok(())
+        let env = self.clipboard_env();
+        self.ui.with_terminal(|terminal| {
+            crate::modes::interactive::clipboard::copy_to_clipboard(text, &env, &mut |payload| {
+                terminal.write(payload);
+            })
+        })
     }
 
     /// `handleExportCommand` (interactive-mode.ts:5422-5436): `.jsonl`
@@ -974,6 +959,19 @@ mod tests {
     async fn copy_command_writes_osc52() {
         let (mode, terminal) = mode_harness().await;
         let ui = &mode.ui_state;
+        // Hermetic headless-Linux env (#9688: the terminal is the only
+        // clipboard route, so the chain lands on OSC 52 regardless of the
+        // host running the test).
+        *lock(&ui.clipboard_env_override) =
+            Some(crate::modes::interactive::clipboard::ClipboardEnv {
+                platform: crate::modes::interactive::clipboard::ClipboardPlatform::Linux,
+                remote_session: false,
+                termux: false,
+                wayland: false,
+                x11: false,
+                wsl: false,
+                windows_terminal: false,
+            });
         ui.session().agent().set_messages(vec![assistant_message(
             vec![text_content("hello")],
             StopReason::Stop,
@@ -989,6 +987,39 @@ mod tests {
         assert!(
             rendered.contains("Copied last agent message to clipboard"),
             "rendered: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_command_desktop_failure_shows_platform_guidance() {
+        // #9618: a desktop Linux session with a display reports the failure
+        // (no unverified OSC 52 write) — xclip/xsel missing → guidance.
+        let (mode, terminal) = mode_harness().await;
+        let ui = &mode.ui_state;
+        *lock(&ui.clipboard_env_override) =
+            Some(crate::modes::interactive::clipboard::ClipboardEnv {
+                platform: crate::modes::interactive::clipboard::ClipboardPlatform::Linux,
+                remote_session: false,
+                termux: false,
+                wayland: false,
+                x11: true,
+                wsl: false,
+                windows_terminal: false,
+            });
+        ui.session().agent().set_messages(vec![assistant_message(
+            vec![text_content("hello")],
+            StopReason::Stop,
+        )]);
+        ui.handle_copy_command(false);
+        let writes = terminal.writes();
+        assert!(
+            !writes.contains("\x1b]52;c;"),
+            "no OSC 52 on a desktop session: {writes:?}"
+        );
+        let rendered = chat_render(ui);
+        assert!(
+            rendered.contains("Clipboard unavailable: install `xclip` or `xsel`"),
+            "platform guidance shown: {rendered}"
         );
     }
 

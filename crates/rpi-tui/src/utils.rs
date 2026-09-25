@@ -1240,6 +1240,52 @@ pub fn cjk_break_regex(segment: &str) -> bool {
         .any(|c| in_ranges(c as u32, CJK_BREAK_RANGES))
 }
 
+/// The `(?=\p{Punctuation})cjkBreakRegex` arm of upstream
+/// `cjkPunctuationRegex` (utils.ts:57-62, #9746 `bfa686240`), precomputed
+/// as ranges: the CJK-script characters whose Unicode general category is
+/// punctuation (`\p{P}` — same tables the `regex` crate uses at runtime).
+static CJK_PUNCTUATION_RANGES: &[(u32, u32)] = &[
+    (0x00B7, 0x00B7),
+    (0x3001, 0x3003),
+    (0x3008, 0x3011),
+    (0x3014, 0x301F),
+    (0x3030, 0x3030),
+    (0x303D, 0x303D),
+    (0x30A0, 0x30A0),
+    (0x30FB, 0x30FB),
+    (0xFE45, 0xFE46),
+    (0xFF61, 0xFF65),
+    (0x16FE2, 0x16FE2),
+];
+
+/// The explicit full-width arm of `cjkPunctuationRegex`
+/// (`[，．：；！？（）［］｛｝“”‘’…—]`, utils.ts:61): full-width punctuation
+/// whose Script_Extensions does not include the CJK scripts, so the
+/// intersection above misses it.
+const CJK_PUNCTUATION_EXPLICIT: [char; 18] = [
+    '，', '．', '：', '；', '！', '？', '（', '）', '［', '］', '｛', '｝', '“', '”', '‘', '’',
+    '…', '—',
+];
+
+/// Character-class contents for the CJK punctuation half of
+/// `autocompleteSeparatorRegex` (utils.ts:63, #9746) — embedded into the
+/// editor trigger/debounce patterns (editor.ts:254-267).
+pub const CJK_PUNCTUATION_CLASS_CONTENT: &str =
+    "\u{00B7}\u{3001}-\u{3003}\u{3008}-\u{3011}\u{3014}-\u{301F}\u{3030}\u{303D}\u{30A0}\u{30FB}\u{FE45}-\u{FE46}\u{FF61}-\u{FF65}\u{16FE2}\u{FF0C}\u{FF0E}\u{FF1A}\u{FF1B}\u{FF01}\u{FF1F}\u{FF08}\u{FF09}\u{FF3B}\u{FF3D}\u{FF5B}\u{FF5D}\u{201C}\u{201D}\u{2018}\u{2019}\u{2026}\u{2014}";
+
+/// `cjkPunctuationRegex` (utils.ts:57-62, #9746 `bfa686240`): CJK letters
+/// remain part of words and paths; only punctuation can separate prose
+/// from completions.
+pub fn is_cjk_punctuation_char(c: char) -> bool {
+    CJK_PUNCTUATION_EXPLICIT.contains(&c) || in_ranges(c as u32, CJK_PUNCTUATION_RANGES)
+}
+
+/// `autocompleteSeparatorRegex` (utils.ts:63, #9746): JS whitespace or
+/// CJK punctuation.
+pub fn is_autocomplete_separator(c: char) -> bool {
+    is_js_whitespace(c) || is_cjk_punctuation_char(c)
+}
+
 /// Wrap text with ANSI codes preserved (utils.ts:715-738, `wrapTextWithAnsi`).
 ///
 /// ONLY does word wrapping - NO padding, NO background colors.
@@ -5089,6 +5135,70 @@ mod tests {
     //! `regression-regional-indicator-width.test.ts`.
 
     use super::*;
+
+    /// #9746 (`bfa686240`): the precomputed CJK punctuation table must equal
+    /// the runtime derivation — exactly the `CJK_BREAK_RANGES` characters
+    /// the `regex` crate classifies as `\p{P}` (the tables the editor
+    /// patterns compile against).
+    #[test]
+    fn cjk_punctuation_table_matches_unicode_derivation() {
+        let punct = regex::Regex::new(r"^\p{P}$").expect("static punctuation regex");
+        for &(lo, hi) in CJK_BREAK_RANGES {
+            for cp in lo..=hi {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                let derived = punct.is_match(&c.to_string());
+                let in_table = in_ranges(cp, CJK_PUNCTUATION_RANGES);
+                assert_eq!(in_table, derived, "U+{cp:04X} table drift");
+            }
+        }
+    }
+
+    /// #9746: separators are whitespace or CJK punctuation — CJK letters
+    /// are NOT separators (they stay part of words and paths).
+    #[test]
+    fn autocomplete_separators_cover_cjk_punctuation_only() {
+        for separator in [
+            '，', '．', '：', '；', '！', '？', '（', '）', '［', '］', '｛', '｝', '\u{201c}',
+            '\u{201d}', '\u{2018}', '\u{2019}', '\u{2026}', '\u{2014}', '\u{3001}', '\u{3002}',
+            '\u{300c}', '\u{300d}', '\u{300a}', '\u{300b}', '\u{3010}', '\u{3011}',
+        ] {
+            assert!(
+                is_cjk_punctuation_char(separator),
+                "U+{:04X}",
+                separator as u32
+            );
+            assert!(
+                is_autocomplete_separator(separator),
+                "U+{:04X}",
+                separator as u32
+            );
+        }
+        for letter in [
+            '文',
+            '说',
+            '明',
+            'あ',
+            'カ',
+            '한',
+            'ㄅ',
+            '\u{3099}',
+            '\u{e0100}',
+            '々',
+            'Ａ',
+        ] {
+            assert!(
+                !is_autocomplete_separator(letter),
+                "U+{:04X}",
+                letter as u32
+            );
+        }
+        assert!(
+            is_autocomplete_separator('\u{3000}'),
+            "ideographic space is whitespace"
+        );
+    }
 
     // ---- wrapTextWithAnsi: underline styling (wrap-ansi.test.ts) ----
 

@@ -469,11 +469,12 @@ const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS: u64 = 20;
 /// Default autocomplete trigger characters (editor.ts:244).
 const DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS: [char; 2] = ['@', '#'];
 
-/// JS `\s` character class contents (ECMA-262; includes U+FEFF, excludes
-/// U+0085) — used to build the trigger/debounce patterns with the same
-/// semantics as the upstream `RegExp` literals.
-const JS_WHITESPACE_CLASS_CONTENT: &str =
-    r"\t\n\v\f\r \u{00a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}";
+/// Separator class contents shared by the trigger/debounce patterns (#9746
+/// `bfa686240`): JS whitespace + CJK punctuation — `autocompleteSeparatorRegex`
+/// (utils.rs). Unquoted completion suffixes negate the same set. Kept in
+/// sync with [`crate::utils::CJK_PUNCTUATION_CLASS_CONTENT`] (editor tests
+/// assert the composition).
+const AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT: &str = r"\t\n\v\f\r \u{00a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}\u{00B7}\u{3001}-\u{3003}\u{3008}-\u{3011}\u{3014}-\u{301F}\u{3030}\u{303D}\u{30A0}\u{30FB}\u{FE45}-\u{FE46}\u{FF61}-\u{FF65}\u{16FE2}\u{FF0C}\u{FF0E}\u{FF1A}\u{FF1B}\u{FF01}\u{FF1F}\u{FF08}\u{FF09}\u{FF3B}\u{FF3D}\u{FF5B}\u{FF5D}\u{201C}\u{201D}\u{2018}\u{2019}\u{2026}\u{2014}";
 
 /// `escapeCharacterClass` (editor.ts:246-248).
 fn escape_character_class(value: char) -> String {
@@ -485,19 +486,21 @@ fn escape_character_class(value: char) -> String {
     out
 }
 
-/// `buildTriggerPattern` (editor.ts:250-252).
+/// `buildTriggerPattern` (editor.ts:259-267, #9746 `bfa686240`):
+/// `(boundary)(?:@"[^"]*|[chars]suffix*)$` — the boundary is start or a
+/// separator; unquoted trigger contexts stop at separators.
 fn build_trigger_pattern(trigger_characters: &[char]) -> Regex {
     let class: String = trigger_characters
         .iter()
         .map(|c| escape_character_class(*c))
         .collect();
     Regex::new(&format!(
-        "(?:^|[{JS_WHITESPACE_CLASS_CONTENT}])[{class}][^{JS_WHITESPACE_CLASS_CONTENT}]*$"
+        r#"(?:^|[{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}])(?:@\"[^\"]*|[{class}][^{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}]*)$"#
     ))
     .expect("static trigger pattern")
 }
 
-/// `buildDebouncePattern` (editor.ts:254-257).
+/// `buildDebouncePattern` (editor.ts:269-273, #9746).
 fn build_debounce_pattern(trigger_characters: &[char]) -> Regex {
     let escaped_without_at: String = trigger_characters
         .iter()
@@ -505,7 +508,7 @@ fn build_debounce_pattern(trigger_characters: &[char]) -> Regex {
         .map(|c| escape_character_class(*c))
         .collect();
     Regex::new(&format!(
-        "(?:^|[ \\t])(?:@(?:\"[^\"]*|[^{JS_WHITESPACE_CLASS_CONTENT}]*)|[{escaped_without_at}][^{JS_WHITESPACE_CLASS_CONTENT}]*)$"
+        r#"(?:^|[{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}])(?:@(?:\"[^\"]*|[^{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}]*)|[{escaped_without_at}][^{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}]*)$"#
     ))
     .expect("static debounce pattern")
 }
@@ -1121,7 +1124,9 @@ impl Editor {
                 self.try_trigger_autocomplete(false);
             }
             // Auto-trigger for symbol-based completion like @, #, or
-            // provider triggers at token boundaries.
+            // provider triggers at token boundaries. #9746
+            // (`bfa686240`): the boundary check is the trigger pattern
+            // itself, so CJK punctuation before the symbol also qualifies.
             else if char
                 .chars()
                 .next()
@@ -1135,26 +1140,23 @@ impl Editor {
                     .unwrap_or_default();
                 let text_before_cursor =
                     current_line[..char_to_byte(&current_line, self.state.cursor_col)].to_string();
-                let char_count = text_before_cursor.chars().count();
-                let char_before_symbol = if char_count >= 2 {
-                    text_before_cursor.chars().nth(char_count - 2)
-                } else {
-                    None
-                };
-                if char_count == 1
-                    || char_before_symbol == Some(' ')
-                    || char_before_symbol == Some('\t')
+                if self
+                    .autocomplete_trigger_pattern
+                    .is_match(&text_before_cursor)
                 {
                     self.try_trigger_autocomplete(false);
                 }
             }
             // Also auto-trigger when typing letters in a slash command or
-            // symbol completion context.
-            else if char
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-            {
+            // symbol completion context. #9746: CJK characters count as
+            // continuation input too.
+            else if char.chars().next().is_some_and(|c| {
+                c.is_ascii_alphanumeric()
+                    || c == '.'
+                    || c == '-'
+                    || c == '_'
+                    || cjk_break_regex(&c.to_string())
+            }) {
                 let current_line = self
                     .state
                     .lines
@@ -6681,6 +6683,108 @@ mod tests {
         editor.handle_input("\t");
         assert_eq!(editor.get_text(), "readme.md");
         assert!(!editor.is_showing_autocomplete());
+    }
+
+    // ---------------------------------------------------------------------
+    // CJK punctuation boundaries (#9746, `bfa686240`)
+    // ---------------------------------------------------------------------
+
+    /// #9746: the trigger/debounce patterns treat CJK punctuation (and
+    /// ideographic space) as boundaries; CJK letters are prose, and
+    /// unquoted suffixes stop at separators.
+    #[test]
+    fn trigger_and_debounce_patterns_accept_cjk_punctuation_boundaries() {
+        let trigger = build_trigger_pattern(&DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS);
+        let debounce = build_debounce_pattern(&DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS);
+        for (text, expected) in [
+            ("@", true),
+            ("a @x", true),
+            ("查看，@x", true),
+            ("查看。#x", true),
+            ("查看\u{3000}@x", true),
+            ("查看，@a\"bc", true),
+            ("查看@x", false),
+            ("user@example.com", false),
+            ("あ@REA", false),
+            ("查看，@a，b", false),
+        ] {
+            assert_eq!(trigger.is_match(text), expected, "trigger {text:?}");
+        }
+        for (text, expected) in [
+            ("a @x", true),
+            ("查看，@x", true),
+            ("查看，@\"my folder", true),
+            ("查看，@a，b", false),
+            ("查看@x", false),
+        ] {
+            assert_eq!(debounce.is_match(text), expected, "debounce {text:?}");
+        }
+    }
+
+    /// #9746: typing `@` right after CJK punctuation auto-triggers symbol
+    /// completion; `@` after CJK letters does not (email-like prose).
+    #[test]
+    fn symbol_autocomplete_triggers_after_cjk_punctuation_but_not_after_cjk_letters() {
+        let after_punctuation_calls = Arc::new(AtomicUsize::new(0));
+        let after_letters_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut after_punctuation = editor();
+        {
+            let calls = Arc::clone(&after_punctuation_calls);
+            after_punctuation.set_autocomplete_provider(Arc::new(MockProvider::new(
+                move |lines, _cursor_line, cursor_col, _force| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let text = lines.first().cloned().unwrap_or_default();
+                    let prefix = text[..char_to_byte(&text, cursor_col)].to_string();
+                    Some(AutocompleteSuggestions {
+                        items: vec![AutocompleteItem {
+                            value: "@README.md".to_string(),
+                            label: "README.md".to_string(),
+                            description: None,
+                        }],
+                        prefix,
+                    })
+                },
+            )));
+        }
+        type_text(&mut after_punctuation, "查看，@");
+        std::thread::sleep(Duration::from_millis(50));
+        flush_autocomplete(&mut after_punctuation);
+        assert_eq!(
+            after_punctuation_calls.load(Ordering::SeqCst),
+            1,
+            "@ after CJK punctuation triggers completion"
+        );
+        assert!(after_punctuation.is_showing_autocomplete());
+
+        let mut after_letters = editor();
+        {
+            let calls = Arc::clone(&after_letters_calls);
+            after_letters.set_autocomplete_provider(Arc::new(MockProvider::new(
+                move |lines, _cursor_line, cursor_col, _force| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let text = lines.first().cloned().unwrap_or_default();
+                    let prefix = text[..char_to_byte(&text, cursor_col)].to_string();
+                    Some(AutocompleteSuggestions {
+                        items: vec![AutocompleteItem {
+                            value: "@example.com".to_string(),
+                            label: "example.com".to_string(),
+                            description: None,
+                        }],
+                        prefix,
+                    })
+                },
+            )));
+        }
+        type_text(&mut after_letters, "查看@");
+        std::thread::sleep(Duration::from_millis(50));
+        flush_autocomplete(&mut after_letters);
+        assert_eq!(
+            after_letters_calls.load(Ordering::SeqCst),
+            0,
+            "@ after CJK letters must not trigger completion"
+        );
+        assert!(!after_letters.is_showing_autocomplete());
     }
 
     #[test]

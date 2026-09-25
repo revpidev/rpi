@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::fuzzy::fuzzy_filter;
+use crate::utils::is_autocomplete_separator;
 
 /// Path delimiters that terminate a completion token (`PATH_DELIMITERS`,
 /// autocomplete.ts:7).
@@ -77,13 +78,17 @@ fn build_fd_path_query(query: &str) -> String {
     pattern
 }
 
-/// `findLastDelimiter` (autocomplete.ts:45-52): char index of the last path
-/// delimiter, or `None`.
+/// `findLastDelimiter` (autocomplete.ts:45-55, #9746 `bfa686240`): char
+/// index of the last path delimiter — now also CJK punctuation, so prose
+/// like `查看，` releases the completion token.
 fn find_last_delimiter(text: &str) -> Option<usize> {
-    text.char_indices()
-        .rev()
-        .find(|(_, ch)| PATH_DELIMITERS.contains(ch))
-        .map(|(byte, _)| text[..byte].chars().count())
+    let mut last_delimiter = None;
+    for (char_index, c) in text.chars().enumerate() {
+        if PATH_DELIMITERS.contains(&c) || is_autocomplete_separator(c) {
+            last_delimiter = Some(char_index);
+        }
+    }
+    last_delimiter
 }
 
 /// `findUnclosedQuoteStart` (autocomplete.ts:54-68): char index of the
@@ -102,13 +107,16 @@ fn find_unclosed_quote_start(text: &str) -> Option<usize> {
     in_quotes.then_some(quote_start)
 }
 
-/// `isTokenStart` (autocomplete.ts:70-72).
+/// `isTokenStart` (autocomplete.ts:70-72, #9746): the char before the
+/// index is a separator (path delimiter, whitespace, or CJK punctuation);
+/// index 0 is a token start via the `^` arm of the upstream boundary
+/// regex.
 fn is_token_start(text: &str, index: usize) -> bool {
     index == 0
         || text
             .chars()
             .nth(index - 1)
-            .is_none_or(|c| PATH_DELIMITERS.contains(&c))
+            .is_some_and(|c| PATH_DELIMITERS.contains(&c) || is_autocomplete_separator(c))
 }
 
 /// `extractQuotedPrefix` (autocomplete.ts:74-92): the quoted (or `@`-quoted)
@@ -168,7 +176,9 @@ fn parse_path_prefix(prefix: &str) -> PathPrefix {
 
 /// `buildCompletionValue` (autocomplete.ts:107-121).
 fn build_completion_value(path: &str, options: CompletionValueOptions) -> String {
-    let needs_quotes = options.is_quoted_prefix || path.contains(' ');
+    // #9746 (`bfa686240`): quote paths containing any separator
+    // (whitespace or CJK punctuation), not only the ASCII space.
+    let needs_quotes = options.is_quoted_prefix || path.chars().any(is_autocomplete_separator);
     let prefix = if options.is_at_prefix { "@" } else { "" };
 
     if !needs_quotes {
@@ -556,14 +566,24 @@ impl CombinedAutocompleteProvider {
                     .collect();
 
                 let filtered: Vec<AutocompleteItem> =
-                    fuzzy_filter(command_items, &prefix, |item| item.name.clone())
-                        .into_iter()
-                        .map(|item| AutocompleteItem {
-                            value: item.name,
-                            label: item.label,
-                            description: item.description,
-                        })
-                        .collect();
+                    fuzzy_filter(command_items, &prefix, |item| {
+                        // #9120 (`d7951ec36`): rank `skill:` commands by
+                        // their bare name so `/idea` finds
+                        // `skill:research-idea`; an explicit `skill:` query
+                        // keeps matching the full name.
+                        if !prefix.starts_with("skill:") && item.name.starts_with("skill:") {
+                            item.name["skill:".len()..].to_string()
+                        } else {
+                            item.name.clone()
+                        }
+                    })
+                    .into_iter()
+                    .map(|item| AutocompleteItem {
+                        value: item.name,
+                        label: item.label,
+                        description: item.description,
+                    })
+                    .collect();
 
                 if filtered.is_empty() {
                     return None;
@@ -785,10 +805,16 @@ impl CombinedAutocompleteProvider {
             return Some(path_prefix);
         }
 
-        // Return empty string only after a space (not for completely empty
-        // text). Empty text should not trigger file suggestions — that's for
-        // forced Tab completion.
-        if path_prefix.is_empty() && text.ends_with(' ') {
+        // Return an empty prefix after whitespace or CJK punctuation, but
+        // not for empty text (#9746 `bfa686240`). Empty text should not
+        // trigger file suggestions — that's for forced Tab completion.
+        if path_prefix.is_empty()
+            && !text.is_empty()
+            && text
+                .chars()
+                .next_back()
+                .is_some_and(is_autocomplete_separator)
+        {
             return Some(path_prefix);
         }
 
@@ -991,10 +1017,12 @@ impl CombinedAutocompleteProvider {
             });
         }
 
-        // Sort directories first, then alphabetically.
+        // Sort directories first, then alphabetically. Directory detection
+        // uses the label: a quoted value like `"my folder/"` does not end
+        // with `/` but its label does (#9746 `bfa686240`).
         suggestions.sort_by(|a, b| {
-            let a_is_dir = a.value.ends_with('/');
-            let b_is_dir = b.value.ends_with('/');
+            let a_is_dir = a.label.ends_with('/');
+            let b_is_dir = b.label.ends_with('/');
             if a_is_dir && !b_is_dir {
                 return std::cmp::Ordering::Less;
             }
@@ -2296,5 +2324,459 @@ mod tests {
             &result.as_ref().expect("checked above").prefix,
         );
         assert_eq!(applied.lines[0], "\"my folder/test.txt\"");
+    }
+
+    // ---------------------------------------------------------------------
+    // CJK punctuation in file autocomplete (#9746, `bfa686240`)
+    // ---------------------------------------------------------------------
+
+    /// #9746: `@` right after CJK punctuation (or ideographic space) starts
+    /// an attachment prefix without consuming the preceding prose — for
+    /// every separator, forced and natural triggers alike.
+    #[test]
+    fn recognizes_at_after_cjk_punctuation_without_consuming_preceding_text() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-cjk");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder("cwd", &folder_structure(&[], &[("README.md", "readme")]));
+        let provider =
+            CombinedAutocompleteProvider::new(Vec::new(), base_dir.clone(), Some(fd_path));
+
+        let separators = [
+            "\u{3000}", "，", "．", "：", "；", "！", "？", "（", "）", "［", "］", "｛", "｝",
+            "“", "”", "‘", "’", "…", "—", "。", "、", "「", "」", "『", "』", "《", "》", "【",
+            "】",
+        ];
+        for before in separators {
+            for force in [false, true] {
+                let line = format!("{before}@REA");
+                let result = get_suggestions(
+                    &provider,
+                    std::slice::from_ref(&line),
+                    0,
+                    line.chars().count(),
+                    force,
+                )
+                .unwrap_or_else(|| panic!("no suggestions for {line:?} (force={force})"));
+                assert_eq!(result.prefix, "@REA", "prefix for {line:?}");
+                assert_eq!(
+                    item_values(&Some(result.clone())),
+                    vec!["@README.md".to_string()]
+                );
+                let item = result.items[0].clone();
+                let applied = provider.apply_completion(
+                    std::slice::from_ref(&line),
+                    0,
+                    line.chars().count(),
+                    &item,
+                    &result.prefix,
+                );
+                assert_eq!(
+                    applied.lines[0],
+                    format!("{before}@README.md "),
+                    "applied for {before:?}"
+                );
+            }
+        }
+    }
+
+    /// #9746: `@` after ASCII or CJK letters is prose (email addresses), not
+    /// an attachment prefix.
+    #[test]
+    fn does_not_interpret_email_addresses_or_at_after_letters_as_prefixes() {
+        let provider = CombinedAutocompleteProvider::new(Vec::new(), "/tmp".to_string(), None);
+        for before in [
+            "user",
+            "查看",
+            "あ",
+            "カ",
+            "한",
+            "ㄅ",
+            "𠮷",
+            "か\u{3099}",
+            "禰\u{e0100}",
+            "々",
+            "Ａ",
+        ] {
+            for name in ["REA", "example.com"] {
+                let line = format!("{before}@{name}");
+                assert!(
+                    get_suggestions(
+                        &provider,
+                        std::slice::from_ref(&line),
+                        0,
+                        line.chars().count(),
+                        false,
+                    )
+                    .is_none(),
+                    "unexpected suggestions for {line:?}"
+                );
+            }
+        }
+    }
+
+    /// #9746: Tab completion of Chinese path prefixes works after whitespace
+    /// or CJK punctuation, and the applied completion preserves the
+    /// following prose.
+    #[test]
+    fn completes_chinese_path_prefixes_after_separators_on_tab() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-cjk");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder(
+            "cwd",
+            &folder_structure(
+                &["文档"],
+                &[("说明.md", "file"), ("文档/说明.md", "nested")],
+            ),
+        );
+        let provider =
+            CombinedAutocompleteProvider::new(Vec::new(), base_dir.clone(), Some(fd_path));
+
+        let completions = [
+            ("说", "说明.md"),
+            ("文", "文档/"),
+            ("文档/说", "文档/说明.md"),
+            ("./文档/说", "./文档/说明.md"),
+            (
+                &format!("{base_dir}/文档/说"),
+                &format!("{base_dir}/文档/说明.md"),
+            ),
+        ];
+        for separator in [
+            " ", "\t", "\u{3000}", "\u{00a0}", "，", "：", "。", "（", "「", "《",
+        ] {
+            for (prefix, value) in completions
+                .iter()
+                .map(|(p, v)| (p.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+            {
+                let before = format!("查看𠮷{separator}");
+                let line = format!("{before}{prefix} 后文");
+                let cursor_col = before.chars().count() + prefix.chars().count();
+                let result =
+                    get_suggestions(&provider, std::slice::from_ref(&line), 0, cursor_col, true)
+                        .unwrap_or_else(|| panic!("no Tab suggestions for {line:?}"));
+                assert_eq!(result.prefix, prefix, "prefix for {line:?}");
+                assert_eq!(
+                    item_values(&Some(result.clone())),
+                    vec![value.clone()],
+                    "items for {line:?}"
+                );
+                let item = result.items[0].clone();
+                let applied = provider.apply_completion(
+                    std::slice::from_ref(&line),
+                    0,
+                    cursor_col,
+                    &item,
+                    &result.prefix,
+                );
+                assert_eq!(
+                    applied.lines[0],
+                    format!("{before}{value} 后文"),
+                    "applied for {line:?}"
+                );
+            }
+        }
+    }
+
+    /// #9746: an unquoted separator is a boundary even when a literal path
+    /// with that separator exists; quoted prefixes keep the whole segment.
+    #[test]
+    fn treats_unquoted_separators_as_boundaries_even_when_literal_path_exists() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-cjk");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder(
+            "cwd",
+            &folder_structure(&["归档"], &[("归档/说明.md", "other")]),
+        );
+        for separator in [" ", "\u{3000}", "，", "。"] {
+            let directory = format!("资料{separator}归档");
+            let archive_file = format!("{directory}/说明.md");
+            temp.setup_folder(
+                "cwd",
+                &folder_structure(&[], &[(archive_file.as_str(), "archive")]),
+            );
+            let provider = CombinedAutocompleteProvider::new(
+                Vec::new(),
+                base_dir.clone(),
+                Some(fd_path.clone()),
+            );
+            for marker in ["", "@"] {
+                let line = format!("{marker}{directory}/说");
+                let result = get_suggestions(
+                    &provider,
+                    std::slice::from_ref(&line),
+                    0,
+                    line.chars().count(),
+                    true,
+                )
+                .unwrap_or_else(|| panic!("no suggestions for {line:?}"));
+                assert_eq!(result.prefix, "归档/说", "prefix for {line:?}");
+                // The `@` cannot hold an unquoted separator-containing path
+                // (upstream: the @ prefix extraction yields to the plain path
+                // prefix), so both markers produce the plain value.
+                assert_eq!(
+                    item_values(&Some(result.clone())),
+                    vec!["归档/说明.md".to_string()]
+                );
+            }
+            let quoted = format!("查看，\"{directory}/说\"后文");
+            let cursor_col = quoted.chars().count() - "后文\"".chars().count();
+            let result = get_suggestions(
+                &provider,
+                std::slice::from_ref(&quoted),
+                0,
+                cursor_col,
+                true,
+            )
+            .expect("quoted CJK path completes");
+            assert_eq!(result.prefix, format!("\"{directory}/说"));
+            assert_eq!(
+                item_values(&Some(result.clone())),
+                vec![format!("\"{directory}/说明.md\"")]
+            );
+            let item = result.items[0].clone();
+            let applied =
+                provider.apply_completion(&[quoted], 0, cursor_col, &item, &result.prefix);
+            assert_eq!(
+                applied.lines[0],
+                format!("查看，\"{directory}/说明.md\"后文")
+            );
+            let missing = format!("查看，\"不存在{separator}归档/说");
+            assert!(get_suggestions(
+                &provider,
+                std::slice::from_ref(&missing),
+                0,
+                missing.chars().count(),
+                true
+            )
+            .is_none());
+        }
+    }
+
+    /// #9746: the empty prefix behaves consistently after whitespace or CJK
+    /// punctuation (forced and natural); completely empty text never
+    /// triggers.
+    #[test]
+    fn handles_empty_prefix_after_separators_consistently() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-cjk");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder("cwd", &folder_structure(&[], &[("说明.md", "text")]));
+        let provider = CombinedAutocompleteProvider::new(Vec::new(), base_dir, Some(fd_path));
+        for separator in [" ", "\t", "\u{3000}", "，", "。"] {
+            for force in [false, true] {
+                let line = format!("查看{separator}");
+                let result = get_suggestions(
+                    &provider,
+                    std::slice::from_ref(&line),
+                    0,
+                    line.chars().count(),
+                    force,
+                )
+                .unwrap_or_else(|| panic!("no suggestions after {separator:?} (force={force})"));
+                assert_eq!(result.prefix, "");
+                assert_eq!(item_values(&Some(result)), vec!["说明.md".to_string()]);
+            }
+        }
+        assert!(get_suggestions(&provider, &[String::new()], 0, 0, false).is_none());
+    }
+
+    /// #9746: CJK characters survive in unprefixed Tab completions.
+    #[test]
+    fn preserves_cjk_characters_in_unprefixed_tab_completions() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-cjk");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder(
+            "cwd",
+            &folder_structure(&["文档"], &[("文档/说明.md", "text")]),
+        );
+        let provider = CombinedAutocompleteProvider::new(Vec::new(), base_dir, Some(fd_path));
+        let line = "文档/说".to_string();
+        let result = get_suggestions(
+            &provider,
+            std::slice::from_ref(&line),
+            0,
+            line.chars().count(),
+            true,
+        )
+        .expect("completes");
+        assert_eq!(result.prefix, "文档/说");
+        assert_eq!(item_values(&Some(result)), vec!["文档/说明.md".to_string()]);
+    }
+
+    /// #9746: paths containing whitespace or CJK punctuation are quoted for
+    /// direct completion, and completion continues inside the quotes.
+    #[test]
+    fn quotes_paths_containing_cjk_punctuation_for_direct_completion() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-cjk");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        for separator in [" ", "\u{3000}", "，", "。"] {
+            let directory = format!("my{separator}folder");
+            let test_file = format!("{directory}/test.txt");
+            temp.setup_folder(
+                "cwd",
+                &folder_structure(&[], &[(test_file.as_str(), "content")]),
+            );
+            let provider = CombinedAutocompleteProvider::new(
+                Vec::new(),
+                base_dir.clone(),
+                Some(fd_path.clone()),
+            );
+            let line = "my".to_string();
+            let result = get_suggestions(
+                &provider,
+                std::slice::from_ref(&line),
+                0,
+                line.chars().count(),
+                true,
+            )
+            .expect("direct completion");
+            let item = result
+                .items
+                .iter()
+                .find(|entry| entry.value == format!("\"{directory}/\""))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no quoted dir for {directory:?}: {:?}",
+                        item_values(&Some(result.clone()))
+                    )
+                })
+                .clone();
+            let applied = provider.apply_completion(
+                std::slice::from_ref(&line),
+                0,
+                line.chars().count(),
+                &item,
+                &result.prefix,
+            );
+            let continued = get_suggestions(&provider, &applied.lines, 0, applied.cursor_col, true)
+                .expect("continues inside quotes");
+            assert_eq!(continued.prefix, format!("\"{directory}/"));
+            assert_eq!(
+                continued
+                    .items
+                    .iter()
+                    .map(|item| item.value.clone())
+                    .collect::<Vec<_>>(),
+                vec![format!("\"{directory}/test.txt\"")]
+            );
+        }
+    }
+
+    /// #9746: quoted directories sort before files — directory detection
+    /// follows the label (which carries the `/` suffix), not the quoted
+    /// value.
+    #[test]
+    fn keeps_quoted_directories_before_files() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-cjk");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder(
+            "cwd",
+            &folder_structure(&["z folder", "z，folder"], &[("a.txt", "text")]),
+        );
+        let provider = CombinedAutocompleteProvider::new(Vec::new(), base_dir, Some(fd_path));
+        let line = String::new();
+        let result =
+            get_suggestions(&provider, &[line], 0, 0, true).expect("empty-prefix completion");
+        let is_dir: Vec<bool> = result
+            .items
+            .iter()
+            .map(|item| item.label.ends_with('/'))
+            .collect();
+        assert_eq!(is_dir, vec![true, true, false]);
+    }
+
+    // ---------------------------------------------------------------------
+    // test/autocomplete-skill-slash.test.ts (#9120, `d7951ec36`)
+    // ---------------------------------------------------------------------
+
+    fn skill_commands() -> Vec<SlashCommandOrItem> {
+        [
+            ("skill:deep-research", "Multi-agent deep research"),
+            (
+                "skill:research-idea",
+                "Refine a raw idea into a falsifiable seed",
+            ),
+            ("skill:to-sidecar", "Route work to a sidecar"),
+            ("model", "Select the active model"),
+        ]
+        .into_iter()
+        .map(|(name, description)| {
+            SlashCommandOrItem::Item(AutocompleteItem {
+                value: name.to_string(),
+                label: name.to_string(),
+                description: Some(description.to_string()),
+            })
+        })
+        .collect()
+    }
+
+    fn skill_suggestions_for(prefix: &str) -> Vec<String> {
+        let provider = CombinedAutocompleteProvider::new(
+            skill_commands(),
+            std::env::temp_dir().display().to_string(),
+            None,
+        );
+        let line = format!("/{prefix}");
+        let result = get_suggestions(&provider, std::slice::from_ref(&line), 0, line.len(), false)
+            .unwrap_or_else(|| panic!("expected suggestions for /{prefix}"));
+        result.items.into_iter().map(|item| item.value).collect()
+    }
+
+    /// #9120: rank `skill:` commands by their bare name.
+    #[test]
+    fn ranks_skill_research_idea_first_for_query_idea() {
+        let items = skill_suggestions_for("idea");
+        assert_eq!(
+            items.first().map(String::as_str),
+            Some("skill:research-idea")
+        );
+        assert!(!items.contains(&"skill:deep-research".to_string()));
+    }
+
+    #[test]
+    fn keeps_ordinary_slash_commands_matching() {
+        let items = skill_suggestions_for("mod");
+        assert!(items.contains(&"model".to_string()));
+    }
+
+    #[test]
+    fn keeps_explicit_skill_queries_working() {
+        let items = skill_suggestions_for("skill:side");
+        assert!(items.contains(&"skill:to-sidecar".to_string()));
     }
 }

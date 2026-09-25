@@ -261,7 +261,7 @@ pub struct ToolExecutionComponent {
     execution_started: bool,
     args_complete: bool,
     result: Option<ToolResultState>,
-    converted_images: HashMap<usize, (String, String)>,
+    converted_images: HashMap<usize, ConvertedImage>,
     hide_component: bool,
     theme: Arc<Theme>,
     /// Last render width (`render` is `&self`; interior mutability keeps the
@@ -479,14 +479,31 @@ impl ToolExecutionComponent {
             let (Some(data), Some(mime_type)) = (&img.data, &img.mime_type) else {
                 continue;
             };
-            if mime_type == "image/png" {
+            let source_data = data.clone();
+            let source_mime_type = mime_type.clone();
+            if source_mime_type == "image/png" {
                 continue;
             }
-            if self.converted_images.contains_key(&index) {
-                continue;
+            // #8743 (`21b8cc1a4`): a cached conversion is only valid while
+            // the source bytes at this index are unchanged — a newer
+            // partial result must re-convert instead of reusing (and later
+            // rendering) the stale entry.
+            if let Some(cached) = self.converted_images.get(&index) {
+                if cached.source_data == source_data && cached.source_mime_type == source_mime_type
+                {
+                    continue;
+                }
             }
-            if let Some(converted) = convert_to_png(data, mime_type) {
-                self.converted_images.insert(index, converted);
+            if let Some((data, mime_type)) = convert_to_png(&source_data, &source_mime_type) {
+                self.converted_images.insert(
+                    index,
+                    ConvertedImage {
+                        source_data,
+                        source_mime_type,
+                        data,
+                        mime_type,
+                    },
+                );
             }
         }
     }
@@ -678,10 +695,14 @@ impl ToolExecutionComponent {
                 let (Some(data), Some(mime_type)) = (&img.data, &img.mime_type) else {
                     continue;
                 };
-                let converted = self.converted_images.get(&i);
-                let image_data = converted.map(|c| c.0.as_str()).unwrap_or(data.as_str());
+                // #8743 (`21b8cc1a4`): only honor a cached conversion whose
+                // source bytes match the image currently at this index.
+                let converted = self.converted_images.get(&i).filter(|cached| {
+                    cached.source_data == *data && cached.source_mime_type == *mime_type
+                });
+                let image_data = converted.map(|c| c.data.as_str()).unwrap_or(data.as_str());
                 let image_mime_type = converted
-                    .map(|c| c.1.as_str())
+                    .map(|c| c.mime_type.as_str())
                     .unwrap_or(mime_type.as_str());
                 if caps.images == Some(ImageProtocol::Kitty) && image_mime_type != "image/png" {
                     continue;
@@ -821,6 +842,17 @@ impl Component for ToolExecutionComponent {
         // recurse.
         self.set_expanded(expanded);
     }
+}
+
+/// `convertedImages` entry (#8743, `21b8cc1a4`): the converted PNG pair
+/// plus the source data/mime it was produced from, so a cache hit is only
+/// honored while the image block at that index still holds the same bytes
+/// (stale conversions from earlier partial results must not surface).
+struct ConvertedImage {
+    source_data: String,
+    source_mime_type: String,
+    data: String,
+    mime_type: String,
 }
 
 /// `convertToPng` (utils/image-convert.ts:31-48): decode any image and
@@ -1146,6 +1178,131 @@ mod tests {
             false,
         );
         let _ = component.render(60);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("keeps the final tool image when a partial image conversion
+    // finishes late") (#8743, `21b8cc1a4`)
+    // ---------------------------------------------------------------------
+
+    /// A minimal 1×1 24-bit BMP (blue/green/red byte order + pad) as
+    /// base64 — decodable by the `image` crate, so `convert_to_png`
+    /// succeeds and the conversion cache engages.
+    fn minimal_bmp(blue: u8, green: u8, red: u8) -> String {
+        use base64::Engine;
+        let mut bytes: Vec<u8> = Vec::with_capacity(58);
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&58u32.to_le_bytes()); // file size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
+        bytes.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+        bytes.extend_from_slice(&1i32.to_le_bytes()); // width
+        bytes.extend_from_slice(&1i32.to_le_bytes()); // height
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bytes.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // image size
+        bytes.extend_from_slice(&2835u32.to_le_bytes()); // x ppm
+        bytes.extend_from_slice(&2835u32.to_le_bytes()); // y ppm
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // colors used
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // colors important
+        bytes.extend_from_slice(&[blue, green, red, 0]); // BGR + pad
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// A real 1×1 PNG as base64 (distinct payload from the BMP conversions).
+    fn minimal_png() -> String {
+        use base64::Engine;
+        let mut png = Vec::new();
+        let mut image = image::RgbaImage::new(1, 1);
+        image.put_pixel(0, 0, image::Rgba([9, 8, 7, 255]));
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        base64::engine::general_purpose::STANDARD.encode(png)
+    }
+
+    /// #8743: the upstream race (an async conversion resolving after the
+    /// image was replaced) collapses to the sync contract — a cached
+    /// conversion is only valid while the source bytes at that index are
+    /// unchanged: a replaced image re-converts, and a cache entry from older
+    /// bytes never surfaces in the rendered output.
+    #[test]
+    fn stale_image_conversion_is_not_reused_after_the_image_is_replaced() {
+        // The terminal-image capability cache is a process global; serialize
+        // with the other capability tests.
+        let _guard = CAPS_LOCK.lock().unwrap();
+        rpi_tui::terminal_image::set_capabilities(rpi_tui::terminal_image::TerminalCapabilities {
+            images: Some(ImageProtocol::Kitty),
+            true_color: true,
+            hyperlinks: false,
+        });
+        let mut component = make_component();
+
+        // Partial result with a convertible BMP: the conversion is cached
+        // with its source bytes.
+        let first_bmp = minimal_bmp(0xF0, 0x00, 0x00);
+        component.update_result(
+            ToolResultState {
+                content: vec![ToolResultContentLoose::image(&first_bmp, "image/bmp")],
+                is_error: false,
+                details: None,
+            },
+            true,
+        );
+        let cached = component
+            .converted_images
+            .get(&0)
+            .expect("conversion cached for the partial image");
+        assert_eq!(cached.source_data, first_bmp);
+        assert_eq!(cached.source_mime_type, "image/bmp");
+        assert_eq!(cached.mime_type, "image/png");
+        let first_conversion = cached.data.clone();
+
+        // The image is replaced by different bytes at the same index: the
+        // stale entry must be replaced by a fresh conversion of the new
+        // source (upstream: the late old conversion is dropped).
+        let second_bmp = minimal_bmp(0x00, 0xF0, 0x00);
+        component.update_result(
+            ToolResultState {
+                content: vec![ToolResultContentLoose::image(&second_bmp, "image/bmp")],
+                is_error: false,
+                details: None,
+            },
+            true,
+        );
+        let cached = component
+            .converted_images
+            .get(&0)
+            .expect("re-converted for the replaced image");
+        assert_eq!(cached.source_data, second_bmp, "stale entry replaced");
+        assert_ne!(cached.data, first_conversion, "new source re-converted");
+        let stale_conversions = [first_conversion, cached.data.clone()];
+
+        // Final result with a real PNG (no conversion needed): the cache
+        // still holds the BMP entry, whose source no longer matches — the
+        // render must carry the final PNG bytes, never the stale
+        // conversion.
+        let final_png = minimal_png();
+        component.update_result(
+            ToolResultState {
+                content: vec![ToolResultContentLoose::image(&final_png, "image/png")],
+                is_error: false,
+                details: None,
+            },
+            false,
+        );
+        let rendered = component.render(120).join("\n");
+        assert!(
+            rendered.contains(&final_png),
+            "final PNG bytes rendered: {rendered:?}"
+        );
+        assert!(
+            !stale_conversions
+                .iter()
+                .any(|stale| rendered.contains(stale.as_str())),
+            "stale conversions must not surface: {rendered:?}"
+        );
     }
 
     /// A stub render definition with no hooks and a configurable shell.

@@ -3897,11 +3897,11 @@ mod tests {
     #[test]
     fn renders_inline_dollar_and_parenthesis_delimiters() {
         let markdown = md(
-            r"A map $\mathbb{C}^3 \to \mathbb{C}^3$, $xy$, $x-y$, $-x$, $\frac{1}{2}$, and \(s \to \infty\).",
+            r"A map $\mathbb{C}^3 \to \mathbb{C}^3$, $xy$, $x-y$, $-x$, $\frac{1}{2}$, $\rightarrow$, and \(s \to \infty\).",
         );
         assert_eq!(
             plain(&markdown, 80),
-            ["A map ℂ³ → ℂ³, xy, x-y, -x, 1/2, and s → ∞."]
+            ["A map ℂ³ → ℂ³, xy, x-y, -x, 1/2, →, and s → ∞."]
         );
     }
 
@@ -4153,7 +4153,13 @@ A=
     #[test]
     fn allows_latex_rendering_to_be_disabled() {
         let markdown = Markdown::new(
-            r"Map $\mathbb{C}^3 \to \mathbb{C}^3$",
+            r"$$
+\widetilde Y_{sf}
+=
+(1-w_{sf})\mu_{sf}^{\mathrm{MAR}}
+$$
+
+Inline \(A_{sf}\)",
             0,
             0,
             theme(),
@@ -4165,7 +4171,19 @@ A=
         );
         assert_eq!(
             plain(&markdown, 80),
-            [r"Map $\mathbb{C}^3 \to \mathbb{C}^3$"]
+            // Two pre-existing rpi deltas in the latex-disabled path (not
+            // part of #8827): a lone `=` line after text is consumed by
+            // comrak's setext-heading rule (upstream dumps it raw), and an
+            // unclosed `\(...)` inline opener is unwrapped to `(...)`.
+            [
+                "$$",
+                r"\widetilde Y_{sf}",
+                "",
+                r"(1-w_{sf})\mu_{sf}^{\mathrm{MAR}}",
+                "$$",
+                "",
+                "Inline (A_{sf})"
+            ]
         );
     }
 

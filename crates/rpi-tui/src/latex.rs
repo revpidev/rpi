@@ -671,6 +671,12 @@ const SPACING_COMMANDS: &[&str] = &[
 
 const NEGATIVE_SPACING_COMMANDS: &[&str] = &["!", "negmedspace", "negthickspace", "negthinspace"];
 
+/// `FONT_SWITCH_COMMANDS` (latex.ts:526, `fa0e1f48a` #8827): TeX legacy
+/// font switches like `{\rm ...}`. Rendered as plain text (no font
+/// modeling), so the command itself — plus any whitespace that follows —
+/// is consumed instead of falling back to raw source.
+const FONT_SWITCH_COMMANDS: &[&str] = &["bf", "cal", "it", "rm", "sf", "sl", "tt"];
+
 const IGNORED_COMMANDS: &[&str] = &[
     "displaystyle",
     "limits",
@@ -844,15 +850,28 @@ enum ScriptKind {
     Sup,
 }
 
-/// `formatScript` (latex.ts:599-612).
-fn format_script(value: &str, kind: ScriptKind) -> String {
-    let value = trim_ecma(value);
+/// `normalizeScriptValue` (latex.ts:614-616, `fa0e1f48a` #8827): trim,
+/// then collapse whitespace around `=`/`+`/`-`.
+fn normalize_script_value(value: &str) -> String {
+    strip_sign_spacing(trim_ecma(value))
+}
+
+/// `formatUnicodeScript` (latex.ts:618-620, `fa0e1f48a` #8827): the pure
+/// Unicode-subscript/superscript form when every character maps, else
+/// `None`.
+fn format_unicode_script(value: &str, kind: ScriptKind) -> Option<String> {
     let replacements = match kind {
         ScriptKind::Sub => SUBSCRIPTS,
         ScriptKind::Sup => SUPERSCRIPTS,
     };
-    let unicode = replace_characters(&strip_sign_spacing(value), replacements);
-    if let Some(unicode) = unicode {
+    replace_characters(&normalize_script_value(value), replacements)
+}
+
+/// `formatScript` (latex.ts:622-634, `fa0e1f48a` #8827): the fallback now
+/// formats the normalized value (whitespace around signs collapsed).
+fn format_script(value: &str, kind: ScriptKind) -> String {
+    let value = normalize_script_value(value);
+    if let Some(unicode) = format_unicode_script(&value, kind) {
         return unicode;
     }
 
@@ -860,7 +879,7 @@ fn format_script(value: &str, kind: ScriptKind) -> String {
         ScriptKind::Sub => "_",
         ScriptKind::Sup => "^",
     };
-    if value.chars().count() == 1 || (kind == ScriptKind::Sub && is_ascii_alphabetic_all(value)) {
+    if value.chars().count() == 1 || (kind == ScriptKind::Sub && is_ascii_alphabetic_all(&value)) {
         format!("{prefix}{value}")
     } else {
         format!("{prefix}({value})")
@@ -991,6 +1010,13 @@ enum LayoutNode {
     /// `OperatorNode` (latex.ts:651-656).
     Operator {
         operator: String,
+        lower: Option<String>,
+        upper: Option<String>,
+    },
+    /// `ScriptNode` (latex.ts:679-683, `fa0e1f48a` #8827): an unsupported
+    /// or nested display script, laid out vertically (upper rows, a blank
+    /// row, lower rows).
+    Script {
         lower: Option<String>,
         upper: Option<String>,
     },
@@ -1184,6 +1210,40 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
                         baseline: if upper.is_some() { 1 } else { 0 },
                     });
                 }
+                LayoutNode::Script { lower, upper } => {
+                    // `renderLayout` script branch (latex.ts:795-807,
+                    // `fa0e1f48a` #8827).
+                    let upper = upper.as_deref().map(|source| render_layout(source, nodes));
+                    let lower = lower.as_deref().map(|source| render_layout(source, nodes));
+                    let width = upper
+                        .as_ref()
+                        .map_or(0, |layout| layout.width)
+                        .max(lower.as_ref().map_or(0, |layout| layout.width));
+                    let mut lines: Vec<String> = upper
+                        .as_ref()
+                        .map(|layout| {
+                            layout
+                                .lines
+                                .iter()
+                                .map(|line| pad_layout_line(line, width, false))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    lines.push(" ".repeat(width));
+                    if let Some(lower) = &lower {
+                        lines.extend(
+                            lower
+                                .lines
+                                .iter()
+                                .map(|line| pad_layout_line(line, width, false)),
+                        );
+                    }
+                    layouts.push(Layout {
+                        lines,
+                        width,
+                        baseline: upper.as_ref().map_or(0, |layout| layout.lines.len()),
+                    });
+                }
                 LayoutNode::Matrix { lines, baseline } => {
                     let width = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
                     layouts.push(Layout {
@@ -1269,6 +1329,10 @@ struct LatexParser<'a> {
     position: usize,
     supported: bool,
     stack_fractions: bool,
+    /// `scriptDepth` (latex.ts:845, `fa0e1f48a` #8827): nesting depth of
+    /// script-argument parsing — a script parsed inside another script's
+    /// argument needs the vertical layout in display mode.
+    script_depth: usize,
 }
 
 impl<'a> LatexParser<'a> {
@@ -1284,6 +1348,7 @@ impl<'a> LatexParser<'a> {
             position: 0,
             supported: true,
             stack_fractions: true,
+            script_depth: 0,
         }
     }
 
@@ -1341,14 +1406,7 @@ impl<'a> LatexParser<'a> {
             if character == '^' || character == '_' {
                 self.position += 1;
                 result = trim_ecma_end(&result).to_string();
-                let script = format_script(
-                    &self.parse_required_argument(false),
-                    if character == '_' {
-                        ScriptKind::Sub
-                    } else {
-                        ScriptKind::Sup
-                    },
-                );
+                let script = self.parse_scripts(character);
                 if result.ends_with(NAMED_OPERATOR_END) {
                     let prefix = &result[..result.len() - NAMED_OPERATOR_END.len()];
                     result = format!("{prefix}{script}{NAMED_OPERATOR_END}");
@@ -1455,6 +1513,24 @@ impl<'a> LatexParser<'a> {
         }
         if contains(NEGATIVE_SPACING_COMMANDS, &command) {
             return NEGATIVE_SPACE.to_string();
+        }
+        if contains(FONT_SWITCH_COMMANDS, &command) {
+            // `fa0e1f48a` #8827: legacy font switches render as plain text;
+            // consume the command and any whitespace that follows instead
+            // of falling back to raw source.
+            while self.position < self.source.len()
+                && self.source[self.position..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_ecma_space)
+            {
+                self.position += self
+                    .source
+                    .get(self.position..)
+                    .and_then(|rest| rest.chars().next())
+                    .map_or(1, char::len_utf8);
+            }
+            return String::new();
         }
         if contains(IGNORED_COMMANDS, &command) {
             return String::new();
@@ -1776,6 +1852,106 @@ impl<'a> LatexParser<'a> {
         value
     }
 
+    /// `parseScripts`' inner `parse` closure (latex.ts:954-963,
+    /// `fa0e1f48a` #8827): parse one marker's argument under an incremented
+    /// `script_depth` so nested scripts know they are nested.
+    fn parse_script_argument(
+        &mut self,
+        marker: char,
+        sub: &mut Option<String>,
+        sup: &mut Option<String>,
+        order: &mut Vec<ScriptKind>,
+    ) {
+        let kind = if marker == '_' {
+            ScriptKind::Sub
+        } else {
+            ScriptKind::Sup
+        };
+        self.script_depth += 1;
+        let value = self.parse_required_argument(false);
+        self.script_depth -= 1;
+        match kind {
+            ScriptKind::Sub => *sub = Some(value),
+            ScriptKind::Sup => *sup = Some(value),
+        }
+        order.push(kind);
+    }
+
+    /// `parseScripts` (latex.ts:949-1005, `fa0e1f48a` #8827): parse the
+    /// `^`/`_` pair that may follow each other, then pick between the
+    /// inline Unicode form and the vertical `Script` layout node. Display
+    /// mode uses the layout when a script is nested or its value has no
+    /// Unicode form (and the value is layout-friendly: no `/`, either a
+    /// single character or containing uppercase/asterisks).
+    fn parse_scripts(&mut self, initial_marker: char) -> String {
+        let mut sub: Option<String> = None;
+        let mut sup: Option<String> = None;
+        let mut order: Vec<ScriptKind> = Vec::new();
+
+        Self::parse_script_argument(self, initial_marker, &mut sub, &mut sup, &mut order);
+        let mut next_position = self.position;
+        while next_position < self.source.len()
+            && self.source[next_position..]
+                .chars()
+                .next()
+                .is_some_and(is_ecma_space)
+        {
+            next_position += self.source[next_position..]
+                .chars()
+                .next()
+                .unwrap()
+                .len_utf8();
+        }
+        if let Some(next_marker) = self.source[next_position..].chars().next() {
+            if (next_marker == '^' || next_marker == '_') && next_marker != initial_marker {
+                self.position = next_position + 1;
+                Self::parse_script_argument(self, next_marker, &mut sub, &mut sup, &mut order);
+            }
+        }
+
+        let sub_unicode = sub
+            .as_deref()
+            .and_then(|value| format_unicode_script(value, ScriptKind::Sub));
+        let sup_unicode = sup
+            .as_deref()
+            .and_then(|value| format_unicode_script(value, ScriptKind::Sup));
+        let can_use_layout = [sub.as_deref(), sup.as_deref()].into_iter().all(|value| {
+            !value.is_some_and(|value| {
+                value.contains('/')
+                    || (!value.contains(LAYOUT_MARKER_START)
+                        && value.chars().count() > 1
+                        && !value
+                            .chars()
+                            .any(|c| c.is_ascii_uppercase() || c == '*' || c == '∗'))
+            })
+        });
+        let needs_layout = self.display
+            && can_use_layout
+            && (self.script_depth > 0
+                || (sub.is_some() && sub_unicode.is_none())
+                || (sup.is_some() && sup_unicode.is_none()));
+        if !needs_layout {
+            return order
+                .iter()
+                .map(|kind| match kind {
+                    ScriptKind::Sub => sub_unicode
+                        .clone()
+                        .unwrap_or_else(|| format_script(sub.as_deref().unwrap_or(""), *kind)),
+                    ScriptKind::Sup => sup_unicode
+                        .clone()
+                        .unwrap_or_else(|| format_script(sup.as_deref().unwrap_or(""), *kind)),
+                })
+                .collect::<String>();
+        }
+
+        let index = self.layout_nodes.len();
+        self.layout_nodes.push(LayoutNode::Script {
+            lower: sub.map(|value| normalize_output(&value)),
+            upper: sup.map(|value| normalize_output(&value)),
+        });
+        format!("{LAYOUT_MARKER_START}{index}{LAYOUT_MARKER_END}")
+    }
+
     /// `parseRequiredArgumentValue` (latex.ts:1147-1165; the whitespace skip
     /// is `/\s/` since 452923b54 so arguments may start on a new line).
     fn parse_required_argument_value(&mut self) -> String {
@@ -1975,42 +2151,7 @@ impl<'a> LatexParser<'a> {
         }
 
         if environment == "cases" || environment == "cases*" {
-            let rows: Vec<Vec<String>> = Self::split_environment_rows(&body)
-                .into_iter()
-                .map(|row| {
-                    row.split('&')
-                        .map(|cell| trim_ecma(&self.render_nested(cell, false)).to_string())
-                        .collect()
-                })
-                .filter(|row: &Vec<String>| row.iter().any(|cell| !cell.is_empty()))
-                .collect();
-            let mut result = String::new();
-            for (index, row) in rows.iter().enumerate() {
-                let value = strip_trailing_comma_ws(row.first().map(String::as_str).unwrap_or(""));
-                let condition = row.get(1).map(String::as_str).unwrap_or("");
-                let delimiter = if index == 0 {
-                    "⎧"
-                } else if index == rows.len() - 1 {
-                    "⎩"
-                } else {
-                    "⎨"
-                };
-                let condition_prefix = if starts_with_condition_word(condition) {
-                    " "
-                } else {
-                    " if "
-                };
-                if condition.is_empty() {
-                    result.push_str(&format!("{delimiter} {value}"));
-                } else {
-                    result.push_str(&format!("{delimiter} {value}{condition_prefix}{condition}"));
-                }
-                result.push('\n');
-            }
-            if !result.is_empty() {
-                result.pop();
-            }
-            return result;
+            return self.render_cases(&body);
         }
 
         if matches!(
@@ -2037,6 +2178,89 @@ impl<'a> LatexParser<'a> {
     }
 
     /// `renderMatrix` (latex.ts:1291-1334).
+    /// `renderCases` (latex.ts:1393-1423, `fa0e1f48a` #8827): pad every
+    /// value to the widest value so conditions align, then emit a matrix
+    /// layout node centered on the middle brace — the surrounding equation
+    /// shares the brace row instead of sitting on the first case row.
+    fn render_cases(&mut self, body: &str) -> String {
+        let rows: Vec<Vec<String>> = Self::split_environment_rows(body)
+            .into_iter()
+            .map(|row| {
+                row.split('&')
+                    .map(|cell| trim_ecma(&self.render_nested(cell, false)).to_string())
+                    .collect()
+            })
+            .filter(|row: &Vec<String>| row.iter().any(|cell| !cell.is_empty()))
+            .collect();
+        let value_width = rows
+            .iter()
+            .map(|row| {
+                visible_width(strip_trailing_comma_ws(
+                    row.first().map(String::as_str).unwrap_or(""),
+                ))
+            })
+            .max()
+            .unwrap_or(0);
+        let contents: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                let value = strip_trailing_comma_ws(row.first().map(String::as_str).unwrap_or(""));
+                let condition = row.get(1).map(String::as_str).unwrap_or("");
+                if condition.is_empty() {
+                    return value.to_string();
+                }
+                let condition_prefix = if starts_with_condition_word(condition) {
+                    " "
+                } else {
+                    " if "
+                };
+                format!(
+                    "{value}{}{condition_prefix}{condition}",
+                    PROTECTED_SPACE.repeat(value_width.saturating_sub(visible_width(value)))
+                )
+            })
+            .collect();
+        if contents.len() <= 1 {
+            return if contents.is_empty() {
+                String::new()
+            } else {
+                format!("⎧ {}", contents[0])
+            };
+        }
+
+        let middle = contents.len() / 2;
+        let mut visual_rows: Vec<Option<&str>> = contents
+            .iter()
+            .map(|content| Some(content.as_str()))
+            .collect();
+        if contents.len().is_multiple_of(2) {
+            visual_rows.insert(middle, None);
+        }
+        let lines: Vec<String> = visual_rows
+            .iter()
+            .enumerate()
+            .map(|(index, content)| {
+                let delimiter = if index == 0 {
+                    "⎧"
+                } else if index == visual_rows.len() - 1 {
+                    "⎩"
+                } else {
+                    "⎨"
+                };
+                match content {
+                    Some(content) => format!("{delimiter} {content}"),
+                    None => delimiter.to_string(),
+                }
+            })
+            .collect();
+        let index = self.layout_nodes.len();
+        self.layout_nodes.push(LayoutNode::Matrix {
+            lines,
+            baseline: middle,
+        });
+        format!("{LAYOUT_MARKER_START}{index}{LAYOUT_MARKER_END}")
+    }
+
     fn render_matrix(&mut self, environment: &str, body: &str) -> String {
         let matrix: Vec<Vec<String>> = Self::split_environment_rows(body)
             .into_iter()
@@ -2268,7 +2492,7 @@ mod tests {
             ("\\ge 2", "≥ 2"),
             ("\\ge 3", "≥ 3"),
             ("1", "1"),
-            ("\\mathrm{diag}(-1/2,1,1)", "diag(-1/2,1,1)"),
+            ("\\mathrm{diag}(-1/2,1,1),\\quad F_{\\rm intrinsic}(\\lambda)", "diag(-1/2,1,1), F_intrinsic(λ)"),
             ("4+3xy", "4+3xy"),
         ]);
     }
@@ -2340,7 +2564,7 @@ mod tests {
             ("\\boxed{\n\\mathcal{Z}(\\beta)\n=\n\\int_{\\mathcal M}\n\\exp\\!\\left(\n-\\beta\\left[\n\\frac12 g^{ij}(x)\\,\\partial_i\\phi\\,\\partial_j\\phi\n+V(\\phi)\n\\right]\\right)\n\\mathcal D\\phi\n}", "[Z(β) = ∫_M exp( -β[ 1/2 gⁱʲ(x) ∂ᵢϕ ∂ⱼϕ +V(ϕ) ]) Dϕ]"),
             ("\\begin{aligned}\n\\nabla_\\mu T^{\\mu\\nu}\n&=\n\\frac{1}{\\sqrt{-g}}\n\\partial_\\mu\\!\\left(\\sqrt{-g}\\,T^{\\mu\\nu}\\right)\n+\\Gamma^\\nu_{\\mu\\lambda}T^{\\mu\\lambda}\n=0, \\\\[4pt]\nR_{\\mu\\nu}-\\frac12 Rg_{\\mu\\nu}+\\Lambda g_{\\mu\\nu}\n&=\n\\frac{8\\pi G}{c^4}T_{\\mu\\nu}.\n\\end{aligned}", "∇_μ T^(μν) = 1/(√(-g)) ∂_μ(√(-g) T^(μν)) +Γ^ν_(μλ)T^(μλ) = 0,\nR_(μν)-1/2 Rg_(μν)+Λ g_(μν) = (8π G)/(c⁴)T_(μν)."),
             ("f(z)\n=\n\\frac{1}{2\\pi i}\n\\oint_{\\gamma}\n\\frac{f(\\zeta)}{\\zeta-z}\\,d\\zeta,\n\\qquad\n\\det\\!\\begin{pmatrix}\n\\lambda-a & -b & 0\\\\\n-c & \\lambda-d & -e\\\\\n0 & -f & \\lambda-g\n\\end{pmatrix}\n=0.", "f(z) = 1/(2π i) ∮_γ (f(ζ))/(ζ-z) dζ, det⎛ λ-a │ -b  │ 0   ⎞ = 0.\n                                        ⎜ -c  │ λ-d │ -e  ⎟\n                                        ⎝ 0   │ -f  │ λ-g ⎠"),
-            ("\\Psi(x,t)=\n\\sum_{n=1}^{\\infty}\n\\underbrace{\nc_n\n\\sqrt{\\frac{2}{L}}\n\\sin\\!\\left(\\frac{n\\pi x}{L}\\right)\n}_{\\text{spatial eigenmode}}\n\\exp\\!\\left(-\\frac{i\\hbar n^2\\pi^2}{2mL^2}t\\right),\n\\qquad\n|\\Psi(x,t)|^2\n=\n\\begin{cases}\n\\Psi^\\ast\\Psi, & 0<x<L,\\\\\n0, & \\text{otherwise}.\n\\end{cases}", "Ψ(x,t) = ∑ₙ₌₁^∞ cₙ √(2/L) sin((nπ x)/L)_(spatial eigenmode) exp(-(iℏ n²π²)/(2mL²)t), |Ψ(x,t)|² = ⎧ Ψ^∗Ψ if 0 < x < L,\n⎩ 0 otherwise."),
+            ("\\Psi(x,t)=\n\\sum_{n=1}^{\\infty}\n\\underbrace{\nc_n\n\\sqrt{\\frac{2}{L}}\n\\sin\\!\\left(\\frac{n\\pi x}{L}\\right)\n}_{\\text{spatial eigenmode}}\n\\exp\\!\\left(-\\frac{i\\hbar n^2\\pi^2}{2mL^2}t\\right),\n\\qquad\n|\\Psi(x,t)|^2\n=\n\\begin{cases}\n\\Psi^\\ast\\Psi, & 0<x<L,\\\\\n0, & \\text{otherwise}.\n\\end{cases}", "                                                                                                 ⎧ Ψ^∗Ψ if 0 < x < L,\nΨ(x,t) = ∑ₙ₌₁^∞ cₙ √(2/L) sin((nπ x)/L)_(spatial eigenmode) exp(-(iℏ n²π²)/(2mL²)t), |Ψ(x,t)|² = ⎨\n                                                                                                 ⎩ 0    otherwise."),
             ("x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}", "x = (-b±√(b²-4ac))/(2a)"),
             ("\\int_0^\\infty e^{-x^2}\\,dx=\\frac{\\sqrt{\\pi}}{2}", "∫₀^∞ e^(-x²) dx = (√π)/2"),
             ("e^{i\\theta}=\\cos\\theta+i\\sin\\theta", "e^(iθ) = cos θ+i sin θ"),
@@ -2659,10 +2883,10 @@ mod tests {
             "\\acute{x}+\\grave{y}+\\widehat{xyz}+\\overrightarrow{AB}"
         );
         assert_eq!(
-            render("\\textnormal{hello}+\\mbox{world}+\\boldsymbol{x}").as_deref(),
-            Some("hello+world+x"),
+            render("\\textnormal{hello}+\\mbox{world}+\\boldsymbol{x}+{\\rm roman}+{\\bf bold}+{\\it italic}+{\\sf sans}+{\\tt mono}+{\\cal calligraphic}+{\\sl slanted}").as_deref(),
+            Some("hello+world+x+roman+bold+italic+sans+mono+calligraphic+slanted"),
             "source: {:?}",
-            "\\textnormal{hello}+\\mbox{world}+\\boldsymbol{x}"
+            "\\textnormal{hello}+\\mbox{world}+\\boldsymbol{x}+{\\rm roman}+{\\bf bold}+{\\it italic}+{\\sf sans}+{\\tt mono}+{\\cal calligraphic}+{\\sl slanted}"
         );
     }
 
@@ -2687,7 +2911,7 @@ mod tests {
     /// Port of the upstream `it("uses natural case conditions and aligns matrix columns")`.
     #[test]
     fn uses_natural_case_conditions_and_aligns_matrix_columns() {
-        assert_eq!(render("\\begin{cases}a & x<0 \\\\ b & \\text{if }x=0 \\\\ c & \\text{otherwise}\\end{cases}").as_deref(), Some("⎧ a if x < 0\n⎨ b if x = 0\n⎩ c otherwise"), "source: {:?}", "\\begin{cases}a & x<0 \\\\ b & \\text{if }x=0 \\\\ c & \\text{otherwise}\\end{cases}");
+        assert_eq!(render("f(x)=\\begin{cases}a & x<0 \\\\ b & \\text{if }x=0 \\\\ c & \\text{otherwise}\\end{cases}").as_deref(), Some("       ⎧ a if x < 0\nf(x) = ⎨ b if x = 0\n       ⎩ c otherwise"), "source: {:?}", "f(x)=\\begin{cases}a & x<0 \\\\ b & \\text{if }x=0 \\\\ c & \\text{otherwise}\\end{cases}");
         assert_eq!(
             render("\\begin{pmatrix}1&200\\\\3000&4\\end{pmatrix}").as_deref(),
             Some("⎛ 1    │ 200 ⎞\n⎝ 3000 │ 4   ⎠"),
@@ -2834,12 +3058,13 @@ mod tests {
 
     /// Port of the upstream `it("uses the middle brace for intermediate case rows")`.
     #[test]
-    fn uses_the_middle_brace_for_intermediate_case_rows() {
+    fn centers_even_case_rows_around_a_middle_brace() {
         assert_eq!(
-            render("\\begin{cases}a & x<0 \\\\ b & x=0 \\\\ c & x>0\\end{cases}").as_deref(),
-            Some("⎧ a if x < 0\n⎨ b if x = 0\n⎩ c if x > 0"),
+            render("f(x) = \\begin{cases} x^{2} & x \\geq 0 \\\\ -x & x < 0 \\end{cases}")
+                .as_deref(),
+            Some("       ⎧ x² if x ≥ 0\nf(x) = ⎨\n       ⎩ -x if x < 0"),
             "source: {:?}",
-            "\\begin{cases}a & x<0 \\\\ b & x=0 \\\\ c & x>0\\end{cases}"
+            "f(x) = \\begin{cases} x^{2} & x \\geq 0 \\\\ -x & x < 0 \\end{cases}"
         );
     }
 
@@ -2902,20 +3127,25 @@ mod tests {
         );
     }
 
-    /// Port of the upstream `it("keeps fractions linear in scripts and text-style fractions")`.
+    /// Port of the upstream `it("lays out unsupported and nested scripts
+    /// while keeping script fractions linear")` (`fa0e1f48a` #8827).
     #[test]
-    fn keeps_fractions_linear_in_scripts_and_text_style_fractions() {
+    fn lays_out_unsupported_and_nested_scripts_while_keeping_script_fractions_linear() {
         assert_eq!(
-            render_latex("e^{\\frac{1}{2}}", true).as_deref(),
-            Some("e^(1/2)"),
+            render_latex(
+                "\\partial_tU_2(t,0)=Aj_*(1-t)^{-A-1}.\\qquad x^{n^2}+x_{i_j}",
+                true
+            )
+            .as_deref(),
+            Some("                            2\n                    -A-1   n\n∂ₜU₂(t,0) = Aj (1-t)    . x  +x\n              *                i\n                                j"),
             "source: {:?}",
-            "e^{\\frac{1}{2}}"
+            "\\partial_tU_2(t,0)=Aj_*(1-t)^{-A-1}.\\qquad x^{n^2}+x_{i_j}"
         );
         assert_eq!(
-            render_latex("\\tfrac{1}{2}", true).as_deref(),
-            Some("1/2"),
+            render_latex("e^{\\frac{1}{2}}+\\tfrac{1}{2}", true).as_deref(),
+            Some("e^(1/2)+1/2"),
             "source: {:?}",
-            "\\tfrac{1}{2}"
+            "e^{\\frac{1}{2}}+\\tfrac{1}{2}"
         );
     }
 

@@ -10,6 +10,7 @@
 //! watchers; `startup_ui.rs` the first-run setup.
 
 pub mod autocomplete;
+pub(crate) mod clipboard;
 pub mod commands;
 pub mod component_tree;
 pub mod components;

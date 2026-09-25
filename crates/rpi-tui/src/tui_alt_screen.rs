@@ -58,6 +58,10 @@ use crate::alt_screen_search::{
     AltScreenSearchMatch, NavigationButtonStyleFn,
 };
 use crate::components::alt_screen_flash::{AltScreenFlashContainer, DEFAULT_DURATION_MS};
+/// `COPY_ERROR_FLASH_DURATION_MS` (tui-alt-screen.ts:80, #9618
+/// `60e7e76bd`): clipboard errors stay on screen longer than the default
+/// flash so the platform guidance is readable.
+const COPY_ERROR_FLASH_DURATION_MS: u64 = 5000;
 use crate::components::scroll_view::{
     Follow, Overscroll, ScrollView, ScrollViewOptions, ScrollViewScrollToOptions, ScrollbarMode,
 };
@@ -117,6 +121,10 @@ const BEGIN_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026h";
 const END_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026l";
 /// `PAGE_SCROLL_OVERLAP` (tui-alt-screen.ts:57).
 const PAGE_SCROLL_OVERLAP: usize = 4;
+/// `ALT_WHEEL_SCROLL_MULTIPLIER` (tui-alt-screen.ts:75, #9166
+/// `ab9e6f89b`): Alt-modified wheel events scroll this many times the
+/// base line count.
+const ALT_WHEEL_SCROLL_MULTIPLIER: u64 = 5;
 /// `DOUBLE_CLICK_INTERVAL_MS` (tui-alt-screen.ts:61).
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -128,6 +136,15 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const TERMINAL_WORD_SELECTION_JOINERS: [&str; 2] = ["/", "-"];
 /// The selection auto-scroll `setInterval` period (tui-alt-screen.ts:737).
 const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// WezTerm detection for the #9169 clear-before-draw path (`803f0e906`):
+/// JS truthiness of `WEZTERM_PANE` or `TERM_PROGRAM` (lowercased) equal to
+/// `"wezterm"` — the same conditions as the Kitty capability probe in
+/// terminal-image.rs.
+fn is_wezterm_env() -> bool {
+    std::env::var("WEZTERM_PANE").is_ok_and(|value| !value.is_empty())
+        || std::env::var("TERM_PROGRAM").is_ok_and(|value| value.to_lowercase() == "wezterm")
+}
 
 /// Strip a leading run of OSC 133 prompt-zone markers (`OSC133_ZONE_PREFIX`,
 /// tui-alt-screen.ts:55): `^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+`. Same
@@ -372,13 +389,25 @@ pub type SearchTextStyleFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// 79680533c): the label text composited on the last row.
 pub type ScrollToEndIndicatorFn = Arc<dyn Fn() -> String + Send + Sync>;
 
-/// `copySelection?: (text: string) => Promise<boolean>`
-/// (tui-alt-screen.ts:190 @ 9841914, 4caa3c440): copy selected text to the
-/// system clipboard, returning success. Upstream's hook is async; the rpi
-/// render loop is synchronous, so the seam runs the clipboard write inline
-/// and returns `bool` — same terminal bytes, same flash timing (established
-/// async-flattening convention, cf. the V13 host_call synchronization).
-pub type CopySelectionFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// `copySelection?: (text: string) => Promise<boolean | string>`
+/// (tui-alt-screen.ts:188-192 @ 9841914, 4caa3c440 + #9618 `60e7e76bd`):
+/// copy selected text to the system clipboard, returning success, an
+/// error message to display, or `false` for a generic failure. Upstream's
+/// hook is async; the rpi render loop is synchronous, so the seam runs the
+/// clipboard write inline and returns a [`CopySelectionOutcome`] — same
+/// terminal bytes, same flash timing (established async-flattening
+/// convention, cf. the V13 host_call synchronization).
+pub type CopySelectionFn = Arc<dyn Fn(&str) -> CopySelectionOutcome + Send + Sync>;
+
+/// The `true | string | false` result of upstream `copySelection`
+/// (#9618 `60e7e76bd`): `true` → "Copied!"; a message → the platform
+/// guidance from the clipboard chain; `false` → generic "Copy failed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopySelectionOutcome {
+    Copied,
+    Failed,
+    Error(String),
+}
 
 /// `TuiAltScreenOptions` (tui-alt-screen.ts:117-126). Not serialized (holds
 /// callbacks); see the header note.
@@ -2222,7 +2251,10 @@ impl TuiAltScreenInner {
                 wheel_event.button,
                 wheel_event.x,
                 wheel_event.y,
-                Some(i64::from(wheel_event.direction) * self.wheel_scroll_lines as i64),
+                Some(
+                    i64::from(wheel_event.direction)
+                        * self.get_wheel_scroll_lines(wheel_event.button),
+                ),
                 None,
             );
             let overlay = self.dispatch_mouse_to_overlay(&event);
@@ -2727,11 +2759,24 @@ impl TuiAltScreenInner {
         self.handle_selection_mouse_event(raw);
     }
 
+    /// `getWheelScrollLines` (tui-alt-screen.ts:968-970 @ #9166
+    /// `ab9e6f89b`): SGR mouse button codes use bit 3 (value 8) for the
+    /// Alt modifier — Alt-modified wheel events scroll at the accelerated
+    /// rate.
+    fn get_wheel_scroll_lines(&self, button: u32) -> i64 {
+        let lines = self.wheel_scroll_lines;
+        if button & 8 != 0 {
+            (lines * ALT_WHEEL_SCROLL_MULTIPLIER) as i64
+        } else {
+            lines as i64
+        }
+    }
+
     /// `routeWheel` (tui-alt-screen.ts:489-501): deepest scroll view under
     /// the pointer first, chaining the unconsumed delta; the primary scroll
     /// view is the fallback. `overscroll: "contain"` stops the chain.
     fn route_wheel(&mut self, event: WheelEvent) {
-        let mut remaining = i64::from(event.direction) * self.wheel_scroll_lines as i64;
+        let mut remaining = i64::from(event.direction) * self.get_wheel_scroll_lines(event.button);
         let mut seen: Vec<*const Mutex<Box<dyn Component>>> = Vec::new();
         let scroll_views = self
             .current_layout
@@ -3569,11 +3614,18 @@ impl TuiAltScreenInner {
     /// keeps the historical unconditional success.
     fn copy_text_to_clipboard(&mut self, text: &str) -> bool {
         if let Some(copy_selection) = &self.copy_selection {
-            let ok = copy_selection(text);
-            self.flashes.flash(
-                if ok { "Copied!" } else { "Copy failed" },
-                DEFAULT_DURATION_MS,
-            );
+            let result = copy_selection(text);
+            // #9618 (`60e7e76bd`): surface the chain's error message (or
+            // the generic failure) with the longer error flash.
+            let ok = result == CopySelectionOutcome::Copied;
+            let (message, duration) = match &result {
+                CopySelectionOutcome::Copied => ("Copied!", DEFAULT_DURATION_MS),
+                CopySelectionOutcome::Error(message) => {
+                    (message.as_str(), COPY_ERROR_FLASH_DURATION_MS)
+                }
+                CopySelectionOutcome::Failed => ("Copy failed", COPY_ERROR_FLASH_DURATION_MS),
+            };
+            self.flashes.flash(message, duration);
             return ok;
         }
         let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
@@ -4045,6 +4097,27 @@ impl TuiAltScreenInner {
             buffer.push_str(&prepared.evicted_image_deletion);
         }
 
+        // WezTerm erases intersecting Kitty image cells when a later EL
+        // clears a covered row (`803f0e906`, #9169). Only separate clearing
+        // from drawing for WezTerm frames that place images; preserve the
+        // existing interleaved output for text-only frames and every other
+        // terminal.
+        let clear_rows_before_kitty_images = redraw_images
+            && self.image_protocol == Some(ImageProtocol::Kitty)
+            && screen.iter().any(|line| is_image_line(line))
+            && is_wezterm_env();
+        if clear_rows_before_kitty_images {
+            for row in 0..height {
+                if !full_redraw
+                    && !images_need_redraw
+                    && screen.get(row) == self.previous_screen.get(row)
+                {
+                    continue;
+                }
+                buffer.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+            }
+        }
+
         for row in 0..height {
             if !full_redraw
                 && !images_need_redraw
@@ -4052,7 +4125,10 @@ impl TuiAltScreenInner {
             {
                 continue;
             }
-            buffer.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+            buffer.push_str(&format!("\x1b[{};1H", row + 1));
+            if !clear_rows_before_kitty_images {
+                buffer.push_str("\x1b[2K");
+            }
             if let Some(line) = out_lines.get(row) {
                 buffer.push_str(line);
             }
@@ -4469,6 +4545,100 @@ mod tests {
     // ---------------------------------------------------------------------
     // it("renders a terminal-height viewport and preserves manual scroll position")
     // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // it("scrolls faster while Alt is held during wheel input") (#9166)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn scrolls_faster_while_alt_is_held_during_wheel_input() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = VirtualTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let (text, _) = numbered_text(12);
+        tui.add_child(text);
+        tui.start();
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), 8, "follows output at the tail");
+
+        // Alt modifier sets bit 8 on the wheel button (72 = 64 + 8);
+        // default wheel_scroll_lines is 1, so the accelerated event scrolls
+        // 5 lines: viewportTop 8 → 3.
+        send_input(&terminal, &tui, "\x1b[<72;1;1M");
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), 3, "Alt wheel scrolls 5 lines");
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("flashes a specific error returned by the injected copySelection
+    // handler") (#9618, `60e7e76bd`)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn flashes_a_specific_error_returned_by_the_injected_copy_selection_handler() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(80, 4);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                copy_on_select: Some(false),
+                copy_selection: Some(Arc::new(|_text: &str| {
+                    CopySelectionOutcome::Error(
+                        "Clipboard unavailable: install wl-clipboard".to_string(),
+                    )
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        send_input(&terminal, &tui, "\x1b[<0;4;2m");
+        settle(&tui);
+        assert!(!tui.copy_active_selection_to_clipboard());
+        settle(&tui);
+
+        let visible = |terminal: &RecordingTerminal| {
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("Clipboard unavailable: install wl-clipboard"))
+        };
+        let no_generic_failure = |terminal: &RecordingTerminal| {
+            terminal
+                .get_viewport()
+                .iter()
+                .all(|line| !line.contains("Copy failed"))
+        };
+        assert!(visible(&terminal), "chain error message shown");
+        assert!(no_generic_failure(&terminal), "no generic Copy failed");
+
+        // The 5s error flash outlives the 1s default window (the deadline
+        // model replaces upstream's captured `durationMs` assertion).
+        let mut now = settle(&tui) + Duration::from_millis(1100);
+        loop {
+            tui.tick(now);
+            if !tui.has_pending_work() {
+                break;
+            }
+            now += Duration::from_millis(20);
+        }
+        assert!(
+            visible(&terminal),
+            "error flash persists past the default 1s flash window"
+        );
+        stop(&tui);
+    }
 
     #[test]
     fn renders_a_terminal_height_viewport_and_preserves_manual_scroll_position() {
@@ -5792,7 +5962,7 @@ mod tests {
             TuiAltScreenOptions {
                 copy_selection: Some(Arc::new(move |text: &str| {
                     lock_shared(&copied_handle).push(text.to_string());
-                    true
+                    CopySelectionOutcome::Copied
                 })),
                 ..TuiAltScreenOptions::default()
             },
@@ -5842,7 +6012,7 @@ mod tests {
                 copy_on_select: Some(false),
                 copy_selection: Some(Arc::new(move |text: &str| {
                     lock_shared(&copied_handle).push(text.to_string());
-                    true
+                    CopySelectionOutcome::Copied
                 })),
                 ..TuiAltScreenOptions::default()
             },
@@ -5889,7 +6059,7 @@ mod tests {
             TuiAltScreenOptions {
                 copy_selection: Some(Arc::new(move |text: &str| {
                     lock_shared(&copied_handle).push(text.to_string());
-                    true
+                    CopySelectionOutcome::Copied
                 })),
                 ..TuiAltScreenOptions::default()
             },
@@ -5937,7 +6107,7 @@ mod tests {
             None,
             None,
             TuiAltScreenOptions {
-                copy_selection: Some(Arc::new(|_text: &str| false)),
+                copy_selection: Some(Arc::new(|_text: &str| CopySelectionOutcome::Failed)),
                 ..TuiAltScreenOptions::default()
             },
         );
@@ -6411,6 +6581,91 @@ mod tests {
         )));
 
         stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("preserves fullscreen images in WezTerm") (#9169, `803f0e906`)
+    // ---------------------------------------------------------------------
+
+    /// #9169: WezTerm erases intersecting Kitty image cells when a later
+    /// EL clears a covered row, so frames that place images must separate
+    /// the row clears from the drawing pass. Text-only frames and other
+    /// terminals keep the interleaved `CUP + EL + line` form.
+    #[test]
+    fn separates_row_clears_from_drawing_for_wezterm_kitty_frames() {
+        fn frame_output(wezterm: bool) -> String {
+            let _caps = CapsGuard::kitty();
+            let _wezterm_pane = EnvGuard::set("WEZTERM_PANE", wezterm.then_some("1"));
+            let terminal = RecordingTerminal::new(20, 4);
+            let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+            let image_id = 321u32;
+            let image_line = encode_kitty(
+                "BBBB",
+                &KittyEncodeOptions {
+                    columns: Some(2),
+                    rows: Some(2),
+                    image_id: Some(image_id),
+                    move_cursor: Some(false),
+                },
+            );
+            register_kitty_image_metadata(KittyImageMetadata {
+                image_id,
+                columns: 2,
+                rows: 2,
+                width_px: 100.0,
+                height_px: 100.0,
+            });
+            let (content, _) = test_text(&[
+                "before".to_string(),
+                image_line,
+                String::new(),
+                "after".to_string(),
+            ]);
+            tui.add_child(content);
+            tui.start();
+            settle(&tui);
+            let output = terminal
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    VtEvent::Write(data) => Some(data.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            stop(&tui);
+            output
+        }
+
+        // WezTerm frame: every changed-row EL comes before any drawn line
+        // (the clear pass runs first, then the draw pass without ELs).
+        let wezterm_output = frame_output(true);
+        let last_clear = wezterm_output
+            .rfind("\x1b[2K")
+            .expect("WezTerm kitty frame clears rows");
+        let first_content = wezterm_output
+            .find("before")
+            .expect("frame draws the text row");
+        assert!(
+            last_clear < first_content,
+            "all row clears precede drawing: {wezterm_output:?}"
+        );
+        // Two changed rows prove the clear pass groups the ELs together
+        // (a clear immediately followed by the next row's CUP).
+        assert!(
+            wezterm_output.contains("\x1b[2K\x1b[2;1H"),
+            "clears are grouped before drawing: {wezterm_output:?}"
+        );
+
+        // Non-WezTerm frame: the interleaved CUP + EL + line form is kept
+        // (a row's EL lands after earlier rows' content).
+        let other_output = frame_output(false);
+        let first_content = other_output
+            .find("before")
+            .expect("frame draws the text row");
+        assert!(
+            other_output[first_content..].contains("\x1b[2K"),
+            "non-WezTerm frames keep interleaved clears: {other_output:?}"
+        );
     }
 
     // ---------------------------------------------------------------------

@@ -105,6 +105,7 @@ use crate::core::settings_manager::DoubleEscapeAction;
 use crate::core::themes::{load_theme, TerminalTheme, Theme};
 use crate::core::trust_manager::has_trust_requiring_project_resources;
 use crate::error::RpiError;
+use crate::modes::interactive::clipboard;
 use crate::modes::interactive::components::keybinding_hints::key_display_text;
 use crate::modes::interactive::components::session_selector::SessionSelectorComponent;
 use crate::modes::interactive::components::settings_selector::SettingsSelectorComponent;
@@ -1120,23 +1121,25 @@ fn select_list_theme(theme: &Arc<Theme>) -> Arc<SelectListTheme> {
 }
 
 /// `createInteractiveTui` fullscreen branch (tui-renderer.ts:21-42 @ 9841914,
-/// 00121ed99 + 79680533c + 4e4949299 + 4caa3c440): theme-aware search
-/// styling, the clickable jump-to-end indicator, the copyOnSelect default
-/// and the verified `copySelection` injection. The closures capture the
-/// shared theme handle so they follow theme changes without recreating the
-/// renderer.
+/// 00121ed99 + 79680533c + 4e4949299 + 4caa3c440 + #9618 `60e7e76bd`):
+/// theme-aware search styling, the clickable jump-to-end indicator, the
+/// copyOnSelect default and the verified `copySelection` injection. The
+/// closures capture the shared theme handle so they follow theme changes
+/// without recreating the renderer.
 ///
-/// The injected clipboard write reuses the commands.rs OSC 52 path
-/// (upstream injects `copyToClipboard` with its native-tool chain; rpi has
-/// no clipboard library — the write returns real success so the flash
-/// reflects the verified outcome, TODO: native tool integration).
+/// The injected clipboard write runs the full chain from
+/// [`clipboard::copy_to_clipboard`] (#9618/#9688 platform commands, WSL
+/// interop, gated OSC 52 — the same chain as the `/copy` door); failures
+/// return the chain's error message for the 5s flash.
 fn fullscreen_alt_screen_options(
     theme_handle: &Arc<Mutex<Arc<Theme>>>,
     copy_on_select: bool,
     terminal: &rpi_tui::tui::SharedTerminal,
+    clipboard_env_override: &Arc<Mutex<Option<clipboard::ClipboardEnv>>>,
 ) -> rpi_tui::tui_alt_screen::TuiAltScreenOptions {
     use rpi_tui::tui_alt_screen::{
-        CopySelectionFn, ScrollToEndIndicatorFn, SearchTextStyleFn, TuiAltScreenOptions,
+        CopySelectionFn, CopySelectionOutcome, ScrollToEndIndicatorFn, SearchTextStyleFn,
+        TuiAltScreenOptions,
     };
     use std::sync::Arc as StdArc;
 
@@ -1179,12 +1182,21 @@ fn fullscreen_alt_screen_options(
 
     let copy_selection: CopySelectionFn = {
         let terminal = Arc::clone(terminal);
+        let clipboard_env_override = Arc::clone(clipboard_env_override);
         StdArc::new(move |text: &str| {
-            crate::modes::interactive::commands::emit_osc52_with_cap(text)
-                .map(|osc52| {
-                    lock(&terminal).write(&osc52);
-                })
-                .is_ok()
+            // The full #9618/#9688 chain (see the clipboard module header):
+            // platform commands → WSL interop → gated OSC 52. Errors carry
+            // the platform guidance for the 5s flash.
+            let env = lock(&clipboard_env_override)
+                .clone()
+                .unwrap_or_else(clipboard::ClipboardEnv::from_env);
+            let result = clipboard::copy_to_clipboard(text, &env, &mut |payload| {
+                lock(&terminal).write(payload);
+            });
+            match result {
+                Ok(()) => CopySelectionOutcome::Copied,
+                Err(message) => CopySelectionOutcome::Error(message),
+            }
         })
     };
 
@@ -1301,6 +1313,10 @@ pub(crate) struct InteractiveUi {
     footer_region: Mutex<Option<SharedComponent>>,
     custom_header: Mutex<Option<SharedComponent>>,
     custom_footer: Mutex<Option<SharedComponent>>,
+    /// Clipboard environment override (V15-11 FR-A test seam): `None` →
+    /// live snapshot per call ([`Self::clipboard_env`]). Shared with the
+    /// fullscreen `copySelection` closure so both doors see the same env.
+    pub(crate) clipboard_env_override: Arc<Mutex<Option<clipboard::ClipboardEnv>>>,
     /// The active selector entry, if any (T12-S5a).
     active_selector: Mutex<Option<SharedComponent>>,
     /// Weak self-reference for callbacks that need the `Arc<InteractiveUi>`
@@ -1655,7 +1671,12 @@ impl InteractiveUi {
                     Arc::clone(&terminal),
                     Some(show_hardware_cursor),
                     Some(agent_dir),
-                    fullscreen_alt_screen_options(&self.scrollbar_theme, copy_on_select, &terminal),
+                    fullscreen_alt_screen_options(
+                        &self.scrollbar_theme,
+                        copy_on_select,
+                        &terminal,
+                        &self.clipboard_env_override,
+                    ),
                 ))
             }
             TuiMode::Regular => Renderer::Main(TuiMainScreen::with_shared_terminal(
@@ -2989,6 +3010,16 @@ impl InteractiveUi {
             // `showStatusIndicator` decides the final embed state.
             embedded: false,
         });
+    }
+
+    /// The clipboard environment for the write chain (V15-11 FR-A): the
+    /// test override when set ([`Self::clipboard_env_override`]), else a
+    /// live snapshot of the process environment (upstream reads
+    /// `process.env` per call).
+    pub(crate) fn clipboard_env(&self) -> clipboard::ClipboardEnv {
+        lock(&self.clipboard_env_override)
+            .clone()
+            .unwrap_or_else(clipboard::ClipboardEnv::from_env)
     }
 
     /// `setHeader`/`setFooter` region swap: a declarative tree replaces the
@@ -4485,6 +4516,11 @@ impl InteractiveMode {
         let session = runtime.session().clone();
         let theme = resolve_theme(&session, options.initial_theme_setting.as_deref());
         let markdown_theme = markdown_theme(&theme);
+        // Clipboard env override seam (V15-11 FR-A): created before the
+        // renderer (the fullscreen copySelection closure captures it) and
+        // owned by InteractiveUi afterwards.
+        let clipboard_env_override: Arc<Mutex<Option<clipboard::ClipboardEnv>>> =
+            Arc::new(Mutex::new(None));
         let agent_dir = runtime.services().agent_dir.clone();
         let show_hardware_cursor =
             session.settings_manager(|settings| settings.get_show_hardware_cursor());
@@ -4512,7 +4548,12 @@ impl InteractiveMode {
                 Arc::clone(&terminal),
                 Some(show_hardware_cursor),
                 Some(agent_dir.clone()),
-                fullscreen_alt_screen_options(&theme_handle, copy_on_select, &terminal),
+                fullscreen_alt_screen_options(
+                    &theme_handle,
+                    copy_on_select,
+                    &terminal,
+                    &clipboard_env_override,
+                ),
             );
             let handle = TuiHandle::from_alt(alt);
             handle.set_clear_on_shrink(clear_on_shrink);
@@ -4619,6 +4660,7 @@ impl InteractiveMode {
             footer_region: Mutex::new(None),
             custom_header: Mutex::new(None),
             custom_footer: Mutex::new(None),
+            clipboard_env_override,
             active_selector: Mutex::new(None),
             self_arc: Mutex::new(None),
             extension_ui_bridge: Mutex::new(None),
@@ -4938,7 +4980,10 @@ impl InteractiveMode {
                         footer_region,
                         rpi_tui::components::stack::StackEntryOptions {
                             shrink: Some(1.0),
-                            min_size: Some(1.0),
+                            // `minSize: 0` (#8919, f53ac1135): a custom
+                            // footer that renders zero lines must not
+                            // reserve a blank row in fullscreen mode.
+                            min_size: Some(0.0),
                             ..Default::default()
                         },
                     ),
@@ -8460,6 +8505,58 @@ mod tests {
             lock(&ui.editor).get_text(),
             "abcx",
             "fullscreen input works after hot switch"
+        );
+        mode.shutdown().await;
+    }
+
+    /// #8919 (`f53ac1135` "collapse empty fullscreen footers"): a footer
+    /// that renders zero lines must not reserve a blank row in the
+    /// fullscreen dock. Upstream lowered the chat-viewport footer entry's
+    /// `minSize` from 1 to 0; the rpi dock footer entry follows
+    /// (`min_size: Some(0.0)`). The zero-render footer is modeled by
+    /// replacing the footer region's content with an empty `column` (an
+    /// empty box renders zero lines).
+    #[tokio::test]
+    async fn fullscreen_zero_line_footer_reserves_no_blank_row() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let (footer_region, empty_footer, render_handle) = {
+            let ui = &mode.ui_state;
+            (
+                lock(&ui.footer_region).clone().expect("footer region"),
+                crate::modes::interactive::component_tree::component_from_tree(
+                    &serde_json::json!({"type": "column", "props": {}}),
+                    &Arc::clone(&lock(&ui.theme)),
+                ),
+                ui.render_handle.clone(),
+            )
+        };
+        *lock(&footer_region) = empty_footer;
+        assert!(mode.switch_tui_mode(TuiMode::Fullscreen, false, false));
+
+        let ui = &mode.ui_state;
+        let root = lock(&ui.fullscreen_layout_root)
+            .clone()
+            .expect("fullscreen layout root");
+        let frame = rpi_tui::layout::render_layout_frame(&root, 80, 24, render_handle);
+
+        fn find_box<'a>(
+            node: &'a rpi_tui::layout::LayoutBox,
+            region: &rpi_tui::tui::SharedComponent,
+        ) -> Option<&'a rpi_tui::layout::LayoutBox> {
+            if std::sync::Arc::ptr_eq(&node.component, region) {
+                return Some(node);
+            }
+            node.children
+                .iter()
+                .find_map(|child| find_box(child, region))
+        }
+
+        let footer_box = find_box(&frame.root, &footer_region)
+            .expect("footer region present in the fullscreen layout");
+        assert_eq!(
+            footer_box.rect.height, 0,
+            "zero-line footer must not reserve a blank row"
         );
         mode.shutdown().await;
     }
