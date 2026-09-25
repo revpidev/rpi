@@ -100,7 +100,7 @@ use crate::core::agent_session::{
 };
 use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::compaction_runner::{CompactionEvent, CompactionReason, RetrySource};
-use crate::core::extensions::{ExtensionRunner, StreamingBehavior};
+use crate::core::extensions::{ExtensionRunner, InputSource, StreamingBehavior};
 use crate::core::settings_manager::DoubleEscapeAction;
 use crate::core::themes::{load_theme, TerminalTheme, Theme};
 use crate::core::trust_manager::has_trust_requiring_project_resources;
@@ -5539,9 +5539,15 @@ impl InteractiveMode {
                     self.prompt_or_shutdown(&message.text, PromptOptions::default())
                         .await;
                 } else if message.mode == StreamingBehavior::FollowUp {
-                    let _ = self.session.follow_up(&message.text, None).await;
+                    let _ = self
+                        .session
+                        .follow_up(&message.text, None, InputSource::Interactive)
+                        .await;
                 } else {
-                    let _ = self.session.steer(&message.text, None).await;
+                    let _ = self
+                        .session
+                        .steer(&message.text, None, InputSource::Interactive)
+                        .await;
                 }
             }
             self.ui_state.update_pending_messages_display();
@@ -5625,9 +5631,13 @@ impl InteractiveMode {
                         .prompt(&message.text, PromptOptions::default())
                         .await
                 } else if message.mode == StreamingBehavior::FollowUp {
-                    self.session.follow_up(&message.text, None).await
+                    self.session
+                        .follow_up(&message.text, None, InputSource::Interactive)
+                        .await
                 } else {
-                    self.session.steer(&message.text, None).await
+                    self.session
+                        .steer(&message.text, None, InputSource::Interactive)
+                        .await
                 }
             };
             let result = tokio::select! {
@@ -7731,8 +7741,14 @@ mod tests {
             "pending: {pending}"
         );
         // The session queues merge into the display too (seed them directly).
-        let _ = ui.session().steer("session steer", None).await;
-        let _ = ui.session().follow_up("session follow", None).await;
+        let _ = ui
+            .session()
+            .steer("session steer", None, InputSource::Interactive)
+            .await;
+        let _ = ui
+            .session()
+            .follow_up("session follow", None, InputSource::Interactive)
+            .await;
         ui.update_pending_messages_display();
         let pending = lock(&ui.pending_messages_container).render(60).join("\n");
         assert!(
@@ -7751,7 +7767,10 @@ mod tests {
         mode.init().await;
         let ui = &mode.ui_state;
         ui.queue_compaction_message("compaction q".to_string(), StreamingBehavior::Steer);
-        let _ = ui.session().steer("session q", None).await;
+        let _ = ui
+            .session()
+            .steer("session q", None, InputSource::Interactive)
+            .await;
         lock(&ui.editor).set_text("draft");
         // de2de549b/#9340: the abort now routes through `session.abort()`
         // (spawned); on this idle harness session it must settle cleanly.
@@ -8369,7 +8388,10 @@ mod tests {
 
         // Mimic enqueueing mid-stream (session.steer queues directly; no real
         // streaming needed).
-        let _ = ui.session().steer("steer message", None).await;
+        let _ = ui
+            .session()
+            .steer("steer message", None, InputSource::Interactive)
+            .await;
         ui.update_pending_messages_display();
         let pending = lock(&ui.pending_messages_container).render(60).join("\n");
         assert!(

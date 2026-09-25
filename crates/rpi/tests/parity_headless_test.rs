@@ -551,7 +551,11 @@ async fn parity_steering_followup() {
         });
         wait_for_message_update(&events, mark).await;
         run.session
-            .steer("Change of plans: answer briefly.", None)
+            .steer(
+                "Change of plans: answer briefly.",
+                None,
+                rpi::core::extensions::InputSource::Interactive,
+            )
             .await
             .expect("steer");
         first
@@ -568,7 +572,11 @@ async fn parity_steering_followup() {
         });
         wait_for_message_update(&events, mark).await;
         run.session
-            .follow_up("And one more thing.", None)
+            .follow_up(
+                "And one more thing.",
+                None,
+                rpi::core::extensions::InputSource::Interactive,
+            )
             .await
             .expect("follow_up");
         second

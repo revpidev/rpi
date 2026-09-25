@@ -2030,7 +2030,7 @@ impl AgentSession {
     pub async fn prompt(&self, text: &str, options: PromptOptions) -> Result<(), RpiError> {
         let expand_prompt_templates = options.expand_prompt_templates.unwrap_or(true);
         let mut preflight_result = options.preflight_result;
-        let mut images = options.images;
+        let images = options.images;
 
         let result: Result<Option<Vec<AgentMessage>>, RpiError> = async {
             // Extension commands first (agent-session.ts:1121-1129) — no-op
@@ -2060,33 +2060,24 @@ impl AgentSession {
                 ));
             }
 
-            // Input event for extension interception (agent-session.ts:1132-1149).
-            let mut current_text = text.to_owned();
-            if self.runner().has_handlers("input") {
-                match self
-                    .runner()
-                    .emit_input(
-                        &current_text,
-                        images.as_deref(),
-                        options.source.unwrap_or(InputSource::Interactive),
-                        if self.is_streaming() {
-                            options.streaming_behavior
-                        } else {
-                            None
-                        },
-                    )
-                    .await
-                {
-                    InputEventResult::Handled => return Ok(None),
-                    InputEventResult::Transform { text, images: new_images } => {
-                        current_text = text;
-                        if let Some(new_images) = new_images {
-                            images = Some(new_images);
-                        }
-                    }
-                    InputEventResult::Continue => {}
-                }
-            }
+            // Input event for extension interception (agent-session.ts:1132-1149
+            // @ faa9863cb — #8718: the shared `_runInputHandlers` helper).
+            let Some((current_text, current_images)) = self
+                .run_input_handlers(
+                    text,
+                    images,
+                    options.source.unwrap_or(InputSource::Interactive),
+                    if self.is_streaming() {
+                        options.streaming_behavior
+                    } else {
+                        None
+                    },
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let images = current_images;
 
             // Skill commands and prompt templates (agent-session.ts:1151-1156).
             let mut expanded_text = current_text;
@@ -2314,34 +2305,105 @@ impl AgentSession {
         }
     }
 
-    /// `steer` (agent-session.ts:1335-1346).
+    /// `_runInputHandlers` (agent-session.ts:1150-1169 @ faa9863cb —
+    /// #8718): run the `input` extension handlers over one message.
+    /// `Ok(None)` = handled (drop the message); `Ok(Some((text, images)))`
+    /// = the (possibly transformed) input to deliver. With no handlers the
+    /// input passes through unchanged (the `hasHandlers` short-circuit
+    /// upstream keeps).
+    async fn run_input_handlers(
+        &self,
+        text: &str,
+        images: Option<Vec<ImageContent>>,
+        source: InputSource,
+        streaming_behavior: Option<StreamingBehavior>,
+    ) -> Result<Option<(String, Option<Vec<ImageContent>>)>, RpiError> {
+        if !self.runner().has_handlers("input") {
+            return Ok(Some((text.to_owned(), images)));
+        }
+        match self
+            .runner()
+            .emit_input(text, images.as_deref(), source, streaming_behavior)
+            .await
+        {
+            // `handled` → the extension consumed the input; no queueing.
+            InputEventResult::Handled => Ok(None),
+            InputEventResult::Transform {
+                text,
+                images: new_images,
+            } => {
+                // `result.images ?? currentImages` (runner contract) — an
+                // absent transform payload keeps the caller's images,
+                // including staying absent.
+                Ok(Some((text, new_images.or(images))))
+            }
+            InputEventResult::Continue => Ok(Some((text.to_owned(), images))),
+        }
+    }
+
+    /// `_queueUserInput` (agent-session.ts:1392-1412 @ faa9863cb — #8718):
+    /// the shared steer/followUp path — extension-command rejection, input
+    /// handlers (preserving the caller's `source`), skill/template
+    /// expansion, then the queue. A `handled` input is dropped silently.
+    async fn queue_user_input(
+        &self,
+        text: &str,
+        images: Option<Vec<ImageContent>>,
+        behavior: StreamingBehavior,
+        source: InputSource,
+    ) -> Result<(), RpiError> {
+        if text.starts_with('/') {
+            self.throw_if_extension_command(text)?;
+        }
+
+        let Some((text, images)) = self
+            .run_input_handlers(
+                text,
+                images,
+                source,
+                if self.is_streaming() {
+                    Some(behavior)
+                } else {
+                    None
+                },
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let mut expanded_text = self.expand_skill_command(&text);
+        expanded_text = expand_prompt_template(&expanded_text, &self.prompt_templates());
+
+        match behavior {
+            StreamingBehavior::Steer => self.queue_steer(&expanded_text, images).await,
+            StreamingBehavior::FollowUp => self.queue_follow_up(&expanded_text, images).await,
+        }
+        Ok(())
+    }
+
+    /// `steer` (agent-session.ts:1335-1346 @ faa9863cb: gains `options
+    /// .source`; Rust spells the parameter directly). `source` defaults to
+    /// interactive at the call sites, mirroring the upstream default.
     pub async fn steer(
         &self,
         text: &str,
         images: Option<Vec<ImageContent>>,
+        source: InputSource,
     ) -> Result<(), RpiError> {
-        if text.starts_with('/') {
-            self.throw_if_extension_command(text)?;
-        }
-        let mut expanded = self.expand_skill_command(text);
-        expanded = expand_prompt_template(&expanded, &self.prompt_templates());
-        self.queue_steer(&expanded, images).await;
-        Ok(())
+        self.queue_user_input(text, images, StreamingBehavior::Steer, source)
+            .await
     }
 
-    /// `followUp` (agent-session.ts:1355-1366).
+    /// `followUp` (agent-session.ts:1355-1366 @ faa9863cb).
     pub async fn follow_up(
         &self,
         text: &str,
         images: Option<Vec<ImageContent>>,
+        source: InputSource,
     ) -> Result<(), RpiError> {
-        if text.starts_with('/') {
-            self.throw_if_extension_command(text)?;
-        }
-        let mut expanded = self.expand_skill_command(text);
-        expanded = expand_prompt_template(&expanded, &self.prompt_templates());
-        self.queue_follow_up(&expanded, images).await;
-        Ok(())
+        self.queue_user_input(text, images, StreamingBehavior::FollowUp, source)
+            .await
     }
 
     /// `_queueSteer` (agent-session.ts:1371-1383).

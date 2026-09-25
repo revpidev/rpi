@@ -867,7 +867,7 @@ async fn dispatch(
             message, images, ..
         } => state
             .session()
-            .steer(&message, images)
+            .steer(&message, images, crate::core::extensions::InputSource::Rpc)
             .await
             .map(|_| None)
             .map_err(|error| error_message(&error)),
@@ -875,7 +875,7 @@ async fn dispatch(
             message, images, ..
         } => state
             .session()
-            .follow_up(&message, images)
+            .follow_up(&message, images, crate::core::extensions::InputSource::Rpc)
             .await
             .map(|_| None)
             .map_err(|error| error_message(&error)),

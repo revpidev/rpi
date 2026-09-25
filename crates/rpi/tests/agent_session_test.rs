@@ -737,12 +737,20 @@ async fn queue_update_lifecycle() {
 
     fixture
         .session
-        .steer("steer note", None)
+        .steer(
+            "steer note",
+            None,
+            rpi::core::extensions::InputSource::Interactive,
+        )
         .await
         .expect("steer");
     fixture
         .session
-        .follow_up("later", None)
+        .follow_up(
+            "later",
+            None,
+            rpi::core::extensions::InputSource::Interactive,
+        )
         .await
         .expect("follow_up");
 
