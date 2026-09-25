@@ -294,7 +294,14 @@ fn parser_options() -> Options<'static> {
 
 /// Byte offset of the (line, column) position in `source`. comrak columns are
 /// 1-based UTF-8 byte offsets (comrak `LineColumn` docs).
-fn byte_offset_of(source: &str, line: usize, column: usize) -> usize {
+///
+/// V15-13 (rpi#53): this scan is O(source lines) per call and the render
+/// path performs O(lines) sourcepos lookups per frame, making streaming
+/// renders O(L²). It is replaced by the [`LineIndex`] table below; the scan
+/// stays (test-only) as the equivalence oracle for the regression test
+/// `line_index_byte_offset_matches_scan_reference`.
+#[cfg(test)]
+fn byte_offset_of_scan(source: &str, line: usize, column: usize) -> usize {
     let mut offset = 0usize;
     for (index, part) in source.split_inclusive('\n').enumerate() {
         if index + 1 == line {
@@ -307,21 +314,67 @@ fn byte_offset_of(source: &str, line: usize, column: usize) -> usize {
     offset
 }
 
+/// Precomputed line-start byte offsets for one source text (V15-13 FR-L1,
+/// rpi#53 root cause 1). Built in a single `split_inclusive('\n')` pass
+/// next to the comrak parse products of a cache-miss render (the index
+/// shares the render-cache lifecycle: cache hits return stored lines and
+/// never need offsets), then used by every former
+/// [`byte_offset_of_scan`] call site.
+struct LineIndex {
+    /// Byte offset of the start of line `i + 1`; empty for an empty source
+    /// (no `split_inclusive` parts). `u32` per the task spec — rendered
+    /// sources are megabytes at most (clamped below `u32::MAX`).
+    line_starts: Vec<u32>,
+    /// Source length, for the past-the-end clamp (line past the last).
+    len: usize,
+}
+
+impl LineIndex {
+    /// Single pass over the source (FR-L1 R1). `line_starts[i]` is the byte
+    /// offset where line `i + 1` begins; a final part without a trailing
+    /// newline still yields its own entry (it is a line).
+    fn build(source: &str) -> Self {
+        let mut line_starts = Vec::new();
+        let mut offset = 0usize;
+        for part in source.split_inclusive('\n') {
+            line_starts.push(offset.min(u32::MAX as usize) as u32);
+            offset += part.len();
+        }
+        LineIndex {
+            line_starts,
+            len: source.len(),
+        }
+    }
+
+    /// Table-lookup replacement of the scan: the line number addresses the
+    /// table directly (O(1), within the task's O(log L) bound). Byte-for-byte
+    /// the same results as [`byte_offset_of_scan`] — line 0 and lines past
+    /// the end clamp to the source length, matching the scan's fallthrough.
+    fn byte_offset_of(&self, line: usize, column: usize) -> usize {
+        match self.line_starts.get(line.wrapping_sub(1)) {
+            // `line == 0` wraps to `usize::MAX`, missing the table — the
+            // scan never matches `index + 1 == 0` and clamps to the end.
+            Some(&start) => (start as usize).saturating_add(column.saturating_sub(1)),
+            None => self.len,
+        }
+    }
+}
+
 /// The source text covered by `sp`, end inclusive.
-fn node_slice(source: &str, sp: Sourcepos) -> &str {
-    let start = byte_offset_of(source, sp.start.line, sp.start.column);
-    let end = byte_offset_of(source, sp.end.line, sp.end.column);
+fn node_slice<'a>(source: &'a str, index: &LineIndex, sp: Sourcepos) -> &'a str {
+    let start = index.byte_offset_of(sp.start.line, sp.start.column);
+    let end = index.byte_offset_of(sp.end.line, sp.end.column);
     source.get(start..=end).unwrap_or("")
 }
 
 /// `token.raw` reconstruction (markdown.ts): the source slice, plus the
 /// trailing newline when the source line actually has one (marked's `raw`
 /// includes it for tables; comrak's sourcepos excludes it).
-fn node_raw(source: &str, sp: Sourcepos) -> &str {
-    let slice = node_slice(source, sp);
-    let end = byte_offset_of(source, sp.end.line, sp.end.column);
+fn node_raw<'a>(source: &'a str, index: &LineIndex, sp: Sourcepos) -> &'a str {
+    let slice = node_slice(source, index, sp);
+    let end = index.byte_offset_of(sp.end.line, sp.end.column);
     if source.as_bytes().get(end + 1) == Some(&b'\n') {
-        let start = byte_offset_of(source, sp.start.line, sp.start.column);
+        let start = index.byte_offset_of(sp.start.line, sp.start.column);
         return source.get(start..=end + 1).unwrap_or(slice);
     }
     slice
@@ -906,22 +959,23 @@ fn is_blank_quoted_line(line: &str) -> bool {
 fn synthesize_blocks<'a>(
     children: Vec<Node<'a>>,
     source: &str,
+    index: &LineIndex,
     container_start: usize,
     container_end: usize,
 ) -> Vec<Block<'a>> {
     let mut blocks: Vec<Block<'a>> = Vec::with_capacity(children.len() * 2 + 1);
 
     if let Some(first) = children.first() {
-        let start = node_start_offset(source, first);
+        let start = node_start_offset(source, index, first);
         if contains_blank_line(&source[container_start..start]) {
             blocks.push(Block::Space);
         }
     }
 
-    for (index, child) in children.iter().enumerate() {
-        if index > 0 {
-            let prev_end = node_end_offset(source, children[index - 1]);
-            let next_start = node_start_offset(source, child);
+    for (position, child) in children.iter().enumerate() {
+        if position > 0 {
+            let prev_end = node_end_offset(source, index, children[position - 1]);
+            let next_start = node_start_offset(source, index, child);
             if contains_blank_line(&source[prev_end + 1..next_start]) {
                 blocks.push(Block::Space);
             }
@@ -930,7 +984,7 @@ fn synthesize_blocks<'a>(
     }
 
     if let Some(last) = children.last() {
-        let last_end = node_end_offset(source, last);
+        let last_end = node_end_offset(source, index, last);
         if last_end < container_end && contains_blank_line(&source[last_end + 1..container_end]) {
             blocks.push(Block::Space);
         }
@@ -939,22 +993,24 @@ fn synthesize_blocks<'a>(
     blocks
 }
 
-fn node_start_offset(source: &str, node: Node<'_>) -> usize {
+// `source` is kept for signature parity with the other helpers (FR-L1 R3);
+// the index alone answers position lookups now.
+fn node_start_offset(_source: &str, index: &LineIndex, node: Node<'_>) -> usize {
     let sp = node.data.borrow().sourcepos;
-    byte_offset_of(source, sp.start.line, sp.start.column)
+    index.byte_offset_of(sp.start.line, sp.start.column)
 }
 
-fn node_end_offset(source: &str, node: Node<'_>) -> usize {
+fn node_end_offset(_source: &str, index: &LineIndex, node: Node<'_>) -> usize {
     let sp = node.data.borrow().sourcepos;
-    byte_offset_of(source, sp.end.line, sp.end.column)
+    index.byte_offset_of(sp.end.line, sp.end.column)
 }
 
 /// `trimPartialClosingFences` (markdown.ts:25-48): recursively find the last
 /// code token (through list items / blockquotes) and trim a streamed partial
 /// closing fence from its text so code blocks do not shrink/flicker when the
 /// final fence character arrives.
-fn trim_partial_closing_fences<'a>(node: Node<'a>, source: &str) {
-    fn walk<'a>(node: Node<'a>, source: &str) {
+fn trim_partial_closing_fences<'a>(node: Node<'a>, source: &str, index: &LineIndex) {
+    fn walk<'a>(node: Node<'a>, source: &str, index: &LineIndex) {
         let is_container = matches!(
             node.data.borrow().value,
             NodeValue::List(_)
@@ -964,7 +1020,7 @@ fn trim_partial_closing_fences<'a>(node: Node<'a>, source: &str) {
         );
         if is_container {
             if let Some(last_child) = node.children().last() {
-                walk(last_child, source);
+                walk(last_child, source, index);
             }
             return;
         }
@@ -973,7 +1029,7 @@ fn trim_partial_closing_fences<'a>(node: Node<'a>, source: &str) {
         }
 
         let sp = node.data.borrow().sourcepos;
-        let raw = node_slice(source, sp);
+        let raw = node_slice(source, index, sp);
 
         // /^(`{3,}|~{3,})/ (markdown.ts:41)
         let Some(marker_char) = fence_marker(raw) else {
@@ -1002,7 +1058,7 @@ fn trim_partial_closing_fences<'a>(node: Node<'a>, source: &str) {
         }
     }
     if let Some(last_child) = node.children().last() {
-        walk(last_child, source);
+        walk(last_child, source, index);
     }
 }
 
@@ -1282,9 +1338,10 @@ impl Markdown {
         &self,
         node: Node<'_>,
         source: &str,
+        index: &LineIndex,
         style_context: &InlineStyleContext<'_>,
     ) -> String {
-        self.render_inline_tokens_in_range(node, source, style_context, None)
+        self.render_inline_tokens_in_range(node, source, index, style_context, None)
     }
 
     /// `renderInlineTokens` restricted to an absolute source byte range —
@@ -1295,6 +1352,7 @@ impl Markdown {
         &self,
         node: Node<'_>,
         source: &str,
+        index: &LineIndex,
         style_context: &InlineStyleContext<'_>,
         range: Option<(usize, usize)>,
     ) -> String {
@@ -1312,7 +1370,7 @@ impl Markdown {
             Some((start, end)) => node
                 .children()
                 .filter(|child| {
-                    let child_start = node_start_offset(source, child);
+                    let child_start = node_start_offset(source, index, child);
                     if child_start < start || child_start >= end {
                         return false;
                     }
@@ -1327,15 +1385,15 @@ impl Markdown {
             None => node.children().collect(),
         };
 
-        let mut index = 0;
-        while index < children.len() {
-            let token = children[index];
+        let mut position = 0;
+        while position < children.len() {
+            let token = children[position];
             let value = &token.data.borrow().value;
             match value {
                 NodeValue::Text(text) => {
                     // Escape tokens (upstream `escape`) are resolved into
                     // text nodes; re-emit the backslash when preserving.
-                    let raw = node_slice(source, token.data.borrow().sourcepos);
+                    let raw = node_slice(source, index, token.data.borrow().sourcepos);
                     if self.options.render_latex {
                         if let Some(pending_tail) = self.render_inline_text_with_latex(
                             raw,
@@ -1347,9 +1405,12 @@ impl Markdown {
                             // inline source, i.e. the rest of this text node
                             // plus the raw slices of the remaining siblings.
                             let mut pending_raw = pending_tail.to_string();
-                            for sibling in &children[index + 1..] {
-                                pending_raw
-                                    .push_str(node_slice(source, sibling.data.borrow().sourcepos));
+                            for sibling in &children[position + 1..] {
+                                pending_raw.push_str(node_slice(
+                                    source,
+                                    index,
+                                    sibling.data.borrow().sourcepos,
+                                ));
                             }
                             result.push_str(&apply_text_with_newlines(&pending_raw));
                             break;
@@ -1364,12 +1425,14 @@ impl Markdown {
                     }
                 }
                 NodeValue::Strong => {
-                    let bold_content = self.render_inline_tokens(token, source, style_context);
+                    let bold_content =
+                        self.render_inline_tokens(token, source, index, style_context);
                     result.push_str(&(self.theme.bold)(&bold_content));
                     result.push_str(style_context.style_prefix);
                 }
                 NodeValue::Emph => {
-                    let italic_content = self.render_inline_tokens(token, source, style_context);
+                    let italic_content =
+                        self.render_inline_tokens(token, source, index, style_context);
                     result.push_str(&(self.theme.italic)(&italic_content));
                     result.push_str(style_context.style_prefix);
                 }
@@ -1378,7 +1441,7 @@ impl Markdown {
                     result.push_str(style_context.style_prefix);
                 }
                 NodeValue::Link(link) => {
-                    let link_text = self.render_inline_tokens(token, source, style_context);
+                    let link_text = self.render_inline_tokens(token, source, index, style_context);
                     let styled_link = (self.theme.link)(&(self.theme.underline)(&link_text));
                     if get_capabilities().hyperlinks {
                         // OSC 8: clickable hyperlink; the URL is not printed
@@ -1402,9 +1465,10 @@ impl Markdown {
                     }
                 }
                 NodeValue::Strikethrough => {
-                    let raw = node_slice(source, token.data.borrow().sourcepos);
+                    let raw = node_slice(source, index, token.data.borrow().sourcepos);
                     if is_marked_strikethrough(raw) {
-                        let del_content = self.render_inline_tokens(token, source, style_context);
+                        let del_content =
+                            self.render_inline_tokens(token, source, index, style_context);
                         result.push_str(&(self.theme.strikethrough)(&del_content));
                         result.push_str(style_context.style_prefix);
                     } else {
@@ -1414,9 +1478,9 @@ impl Markdown {
                         let children: Vec<Node<'_>> = token.children().collect();
                         let (prefix, suffix) = match (children.first(), children.last()) {
                             (Some(first), Some(last)) => {
-                                let raw_start = node_start_offset(source, token);
-                                let first_start = node_start_offset(source, first);
-                                let last_end = node_end_offset(source, last);
+                                let raw_start = node_start_offset(source, index, token);
+                                let first_start = node_start_offset(source, index, first);
+                                let last_end = node_end_offset(source, index, last);
                                 let p = first_start.saturating_sub(raw_start);
                                 let s = last_end.saturating_sub(raw_start) + 1;
                                 if p <= raw.len() && s <= raw.len() && p <= s {
@@ -1436,6 +1500,7 @@ impl Markdown {
                             result.push_str(&self.render_inline_tokens(
                                 token,
                                 source,
+                                index,
                                 style_context,
                             ));
                             if !suffix.is_empty() {
@@ -1452,7 +1517,7 @@ impl Markdown {
                 // matching the upstream default case (no `text` property).
                 _ => {}
             }
-            index += 1;
+            position += 1;
         }
 
         while !style_context.style_prefix.is_empty() && result.ends_with(style_context.style_prefix)
@@ -1633,10 +1698,11 @@ impl Markdown {
         &self,
         token: Node<'_>,
         source: &str,
+        index: &LineIndex,
         next_token_type: Option<TokenType>,
         style_context: &InlineStyleContext<'_>,
     ) -> Option<Vec<String>> {
-        let raw = node_raw(source, token.data.borrow().sourcepos);
+        let raw = node_raw(source, index, token.data.borrow().sourcepos);
         let segments = split_latex_blocks(raw);
         if !segments
             .iter()
@@ -1645,15 +1711,16 @@ impl Markdown {
             return None;
         }
 
-        let paragraph_start = node_start_offset(source, token);
+        let paragraph_start = node_start_offset(source, index, token);
         let segment_count = segments.len();
         let mut lines: Vec<String> = Vec::new();
-        for (index, segment) in segments.iter().enumerate() {
+        for (position, segment) in segments.iter().enumerate() {
             let is_latex = match segment {
                 LatexParagraphSegment::Plain { start, end } => {
                     let text = self.render_inline_tokens_in_range(
                         token,
                         source,
+                        index,
                         style_context,
                         Some((paragraph_start + start, paragraph_start + end)),
                     );
@@ -1680,7 +1747,7 @@ impl Markdown {
                 }
             };
 
-            if index + 1 < segment_count {
+            if position + 1 < segment_count {
                 lines.push(String::new());
             } else {
                 let spaced = match next_token_type {
@@ -1702,6 +1769,7 @@ impl Markdown {
         &self,
         block: &Block<'_>,
         source: &str,
+        index: &LineIndex,
         width: usize,
         next_token_type: Option<TokenType>,
         style_context: &InlineStyleContext<'_>,
@@ -1742,7 +1810,8 @@ impl Markdown {
                     wrap_style_prefix: "",
                 };
 
-                let heading_text = self.render_inline_tokens(token, source, &heading_style_context);
+                let heading_text =
+                    self.render_inline_tokens(token, source, index, &heading_style_context);
                 let styled_heading = if heading_level >= 3 {
                     heading_style_fn(&heading_prefix) + &heading_text
                 } else {
@@ -1758,13 +1827,14 @@ impl Markdown {
                     if let Some(latex_lines) = self.render_paragraph_with_latex(
                         token,
                         source,
+                        index,
                         next_token_type,
                         style_context,
                     ) {
                         return latex_lines;
                     }
                 }
-                let paragraph_text = self.render_inline_tokens(token, source, style_context);
+                let paragraph_text = self.render_inline_tokens(token, source, index, style_context);
                 lines.push(paragraph_text);
                 // Don't add spacing if next token is space or list, or if
                 // there is no next token at all.
@@ -1792,7 +1862,7 @@ impl Markdown {
                         .unwrap_or(&code_block.literal)
                         .to_string()
                 } else {
-                    remove_code_indent(node_slice(source, token.data.borrow().sourcepos))
+                    remove_code_indent(node_slice(source, index, token.data.borrow().sourcepos))
                 };
                 if let Some(highlight_code) = &self.theme.highlight_code {
                     let highlighted_lines = highlight_code(
@@ -1813,12 +1883,13 @@ impl Markdown {
                 }
             }
             NodeValue::List(_) => {
-                lines.extend(self.render_list(token, source, 0, width, style_context));
+                lines.extend(self.render_list(token, source, index, 0, width, style_context));
             }
             NodeValue::Table(_) => {
                 lines.extend(self.render_table(
                     token,
                     source,
+                    index,
                     width,
                     next_token_type,
                     style_context,
@@ -1849,19 +1920,25 @@ impl Markdown {
                     style_prefix: &quote_style_prefix,
                     wrap_style_prefix: &quote_style_prefix,
                 };
-                let source_start = node_start_offset(source, token);
-                let source_end = node_end_offset(source, token);
-                let quote_blocks =
-                    synthesize_blocks(token.children().collect(), source, source_start, source_end);
+                let source_start = node_start_offset(source, index, token);
+                let source_end = node_end_offset(source, index, token);
+                let quote_blocks = synthesize_blocks(
+                    token.children().collect(),
+                    source,
+                    index,
+                    source_start,
+                    source_end,
+                );
                 let mut rendered_quote_lines: Vec<String> = Vec::new();
-                for (index, quote_block) in quote_blocks.iter().enumerate() {
+                for (position, quote_block) in quote_blocks.iter().enumerate() {
                     let next_quote_type = quote_blocks
-                        .get(index + 1)
+                        .get(position + 1)
                         .map(Block::token_type)
                         .unwrap_or(TokenType::Other);
                     rendered_quote_lines.extend(self.render_token(
                         quote_block,
                         source,
+                        index,
                         quote_content_width,
                         Some(next_quote_type),
                         &quote_style_context,
@@ -1910,6 +1987,7 @@ impl Markdown {
         &self,
         token: Node<'a>,
         source: &str,
+        index: &LineIndex,
         depth: usize,
         width: usize,
         style_context: &InlineStyleContext<'_>,
@@ -1924,16 +2002,16 @@ impl Markdown {
         let ordered = list.list_type == comrak::nodes::ListType::Ordered;
         let items: Vec<Node<'_>> = token.children().collect();
 
-        for (index, item) in items.iter().enumerate() {
-            let is_last_item = index == items.len() - 1;
-            let item_raw = node_slice(source, item.data.borrow().sourcepos);
+        for (position, item) in items.iter().enumerate() {
+            let is_last_item = position == items.len() - 1;
+            let item_raw = node_slice(source, index, item.data.borrow().sourcepos);
 
             let bullet = if ordered {
                 if self.options.preserve_ordered_list_markers {
                     Self::get_ordered_list_marker(item_raw)
-                        .unwrap_or_else(|| format!("{}. ", start_number + index))
+                        .unwrap_or_else(|| format!("{}. ", start_number + position))
                 } else {
-                    format!("{}. ", start_number + index)
+                    format!("{}. ", start_number + position)
                 }
             } else if self.options.preserve_ordered_list_markers {
                 Self::get_unordered_list_marker(item_raw).unwrap_or_else(|| "- ".to_string())
@@ -1980,10 +2058,15 @@ impl Markdown {
                 rendered_any_line = true;
             }
 
-            let item_start = node_start_offset(source, item);
-            let item_end = node_end_offset(source, item);
-            let item_blocks =
-                synthesize_blocks(item.children().collect(), source, item_start, item_end);
+            let item_start = node_start_offset(source, index, item);
+            let item_end = node_end_offset(source, index, item);
+            let item_blocks = synthesize_blocks(
+                item.children().collect(),
+                source,
+                index,
+                item_start,
+                item_end,
+            );
             for item_block in &item_blocks {
                 match item_block {
                     Block::Space => {
@@ -2000,6 +2083,7 @@ impl Markdown {
                             lines.extend(self.render_list(
                                 nested,
                                 source,
+                                index,
                                 depth + 1,
                                 width,
                                 style_context,
@@ -2008,8 +2092,14 @@ impl Markdown {
                             continue;
                         }
 
-                        let item_lines =
-                            self.render_token(item_block, source, item_width, None, style_context);
+                        let item_lines = self.render_token(
+                            item_block,
+                            source,
+                            index,
+                            item_width,
+                            None,
+                            style_context,
+                        );
                         for item_line in item_lines {
                             for wrapped_line in wrap_text_with_ansi(&item_line, item_width) {
                                 let line_prefix = if rendered_any_line {
@@ -2056,6 +2146,7 @@ impl Markdown {
         &self,
         token: Node<'a>,
         source: &str,
+        index: &LineIndex,
         available_width: usize,
         next_token_type: Option<TokenType>,
         style_context: &InlineStyleContext<'_>,
@@ -2083,7 +2174,7 @@ impl Markdown {
         let available_for_cells = available_width as i64 - border_overhead as i64;
         if available_for_cells < num_cols as i64 {
             // Too narrow to render a stable table: fall back to raw markdown.
-            let raw = node_raw(source, token.data.borrow().sourcepos);
+            let raw = node_raw(source, index, token.data.borrow().sourcepos);
             let mut fallback_lines = wrap_text_with_ansi(raw, available_width);
             if matches!(next_token_type, Some(t) if t != TokenType::Space) {
                 fallback_lines.push(String::new());
@@ -2097,7 +2188,7 @@ impl Markdown {
         let mut natural_widths: Vec<i64> = vec![0; num_cols];
         let mut min_word_widths: Vec<i64> = vec![1; num_cols];
         for (i, cell) in header_cells.iter().enumerate() {
-            let header_text = self.render_inline_tokens(cell, source, style_context);
+            let header_text = self.render_inline_tokens(cell, source, index, style_context);
             natural_widths[i] = visible_width(&header_text) as i64;
             min_word_widths[i] =
                 Self::get_longest_word_width(&header_text, Some(max_unbroken_word_width)).max(1)
@@ -2108,7 +2199,7 @@ impl Markdown {
                 if i >= num_cols {
                     break;
                 }
-                let cell_text = self.render_inline_tokens(cell, source, style_context);
+                let cell_text = self.render_inline_tokens(cell, source, index, style_context);
                 natural_widths[i] = natural_widths[i].max(visible_width(&cell_text) as i64);
                 min_word_widths[i] = min_word_widths[i].max(Self::get_longest_word_width(
                     &cell_text,
@@ -2222,7 +2313,7 @@ impl Markdown {
             .iter()
             .enumerate()
             .map(|(i, cell)| {
-                let text = self.render_inline_tokens(cell, source, style_context);
+                let text = self.render_inline_tokens(cell, source, index, style_context);
                 Self::wrap_cell_text(
                     &text,
                     column_widths[i] as usize,
@@ -2265,7 +2356,7 @@ impl Markdown {
                 .enumerate()
                 .filter(|(i, _)| *i < num_cols)
                 .map(|(i, cell)| {
-                    let text = self.render_inline_tokens(cell, source, style_context);
+                    let text = self.render_inline_tokens(cell, source, index, style_context);
                     Self::wrap_cell_text(
                         &text,
                         column_widths[i] as usize,
@@ -2404,16 +2495,20 @@ impl Component for Markdown {
             &normalized_text
         };
 
-        // Parse markdown (comrak replaces marked's lexer).
+        // Parse markdown (comrak replaces marked's lexer). The line index
+        // is built once here (single pass, FR-L1) and shared by every
+        // sourcepos → offset translation below.
+        let line_index = LineIndex::build(&normalized_text);
         let arena = Arena::new();
         let root = parse_document(&arena, parse_source, &parser_options());
-        trim_partial_closing_fences(root, &normalized_text);
+        trim_partial_closing_fences(root, &normalized_text, &line_index);
 
         // Convert tokens to styled terminal output.
         let mut rendered_lines: Vec<String> = Vec::new();
         let blocks = synthesize_blocks(
             root.children().collect(),
             &normalized_text,
+            &line_index,
             0,
             normalized_text.len(),
         );
@@ -2429,6 +2524,7 @@ impl Component for Markdown {
             let token_lines = self.render_token(
                 block,
                 &normalized_text,
+                &line_index,
                 content_width,
                 next_type,
                 &default_context,
@@ -2523,6 +2619,91 @@ mod tests {
 
     use super::*;
     use crate::terminal_image::{reset_capabilities_cache, set_capabilities, TerminalCapabilities};
+
+    /// V15-13 FR-L1 R3 (rpi#53): the [`LineIndex`] table must produce
+    /// byte-identical offsets to the pre-fix scan ([`byte_offset_of_scan`])
+    /// on a randomized document corpus — the equivalence oracle that makes
+    /// the table swap output-preserving. Documents cover CJK (multi-byte
+    /// columns), blank lines, trailing/absent final newlines, and the empty
+    /// string; probes cover every line (including 0 and past-the-end) and
+    /// columns 0/1/mid/way-past-the-end. The build-length assertion pins the
+    /// single-pass shape (one entry per `split_inclusive` part).
+    #[test]
+    fn line_index_byte_offset_matches_scan_reference() {
+        // Deterministic xorshift — no `rand` dependency (coding-standards
+        // appendix A).
+        fn next(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+
+        let mut corpus: Vec<String> = [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "a\nb",
+            "a\nb\n",
+            "\n\n\n",
+            "hello world\nsecond line\n\nfourth",
+            "中文短行\nenglish mixed 中文\n\n末尾无换行",
+            "line with trailing spaces   \n\ttab line\n> quote\n",
+            "```\ncode\n```\n",
+            "日\u{00a0}本\u{3000}語\nmixed width 字\n",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // Random documents: 1-40 lines of random lengths/mixes.
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for _ in 0..64 {
+            let line_count = (next(&mut seed) % 40) as usize + 1;
+            let mut doc = String::new();
+            for _ in 0..line_count {
+                let kind = next(&mut seed) % 4;
+                let len = (next(&mut seed) % 30) as usize;
+                match kind {
+                    0 => doc.push_str(&"x".repeat(len)),
+                    1 => doc.push_str(&"中".repeat(len)),
+                    2 => doc.push_str(&"字a混".repeat(len)),
+                    _ => {
+                        // Occasionally blank or whitespace-only lines.
+                        if next(&mut seed).is_multiple_of(2) {
+                            doc.push_str(&" \t ".repeat(len % 3));
+                        }
+                    }
+                }
+                doc.push('\n');
+            }
+            if next(&mut seed).is_multiple_of(2) {
+                doc.pop(); // drop the trailing newline half the time
+            }
+            corpus.push(doc);
+        }
+
+        for doc in &corpus {
+            let index = LineIndex::build(doc);
+            // Single-pass length assertion: one entry per split part.
+            assert_eq!(
+                index.line_starts.len(),
+                doc.split_inclusive('\n').count(),
+                "line-count mismatch for {doc:?}"
+            );
+            let max_line = doc.split_inclusive('\n').count() + 2;
+            for line in 0..=max_line {
+                for &column in &[0usize, 1, 2, 7, 100, 1 << 20] {
+                    assert_eq!(
+                        index.byte_offset_of(line, column),
+                        byte_offset_of_scan(doc, line, column),
+                        "mismatch at line={line} column={column} for {doc:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn theme() -> Arc<MarkdownTheme> {
         // Mirrors test-themes.ts `defaultMarkdownTheme` (chalk level 3).
