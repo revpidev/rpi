@@ -2640,6 +2640,16 @@ impl InteractiveUi {
         tool_call_id: &str,
         args: &serde_json::Value,
     ) -> ToolExecutionComponent {
+        // The theme clone is hoisted out of the constructor call: a
+        // temporary `lock(&self.theme)` guard in an argument expression
+        // lives until the whole `new(...)` statement ends, and the
+        // constructor synchronously runs `update_display()` → extension
+        // render closures — a renderer that host-calls `ui.theme` (the
+        // only channel for multi-color single lines, ComponentTree v1
+        // has no `row`) would re-enter the same mutex on this thread and
+        // self-deadlock (TE41 e2e; same class for the custom entry/message
+        // constructors below).
+        let theme = Arc::clone(&lock(&self.theme));
         let mut component = ToolExecutionComponent::new(
             tool_name.to_string(),
             tool_call_id.to_string(),
@@ -2655,7 +2665,7 @@ impl InteractiveUi {
                 &self.session(),
                 tool_name,
             ),
-            Arc::clone(&lock(&self.theme)),
+            theme,
             self.render_handle.clone(),
             self.cwd.clone(),
         );
@@ -3641,11 +3651,11 @@ impl InteractiveUi {
                 &custom_entry.custom_type,
             )
             .unwrap_or_else(|| Box::new(|_, _, _| None));
-        let mut component = CustomEntryComponent::new(
-            custom_entry.clone(),
-            renderer,
-            Arc::clone(&lock(&self.theme)),
-        );
+        // Hoisted for the same reason as `new_tool_execution_component`
+        // above: `CustomEntryComponent::new` runs `rebuild()` → the entry
+        // renderer closure synchronously.
+        let theme = Arc::clone(&lock(&self.theme));
+        let mut component = CustomEntryComponent::new(custom_entry.clone(), renderer, theme);
         component.set_expanded(*lock(&self.tool_output_expanded));
         if !component.has_content() {
             return;
@@ -3730,6 +3740,12 @@ impl InteractiveUi {
             }
             AgentMessage::Custom(custom_message) => {
                 if custom_message.display {
+                    // Hoisted for the same reason as
+                    // `new_tool_execution_component` above:
+                    // `CustomMessageComponent::new` runs `rebuild()` → the
+                    // message renderer closure synchronously.
+                    let theme = Arc::clone(&lock(&self.theme));
+                    let markdown_theme = Arc::clone(&lock(&self.markdown_theme));
                     let mut component = CustomMessageComponent::new(
                         custom_message.clone(),
                         // `getMessageRenderer` (custom-message.ts:69-85).
@@ -3737,8 +3753,8 @@ impl InteractiveUi {
                             &self.session(),
                             &custom_message.custom_type,
                         ),
-                        Arc::clone(&lock(&self.theme)),
-                        Arc::clone(&lock(&self.markdown_theme)),
+                        theme,
+                        markdown_theme,
                         self.output_pad.load(Ordering::Relaxed),
                     );
                     component.set_expanded(*lock(&self.tool_output_expanded));
