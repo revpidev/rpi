@@ -1223,6 +1223,10 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
         &default_thinking,
         &default_extensions,
     );
+    apply_default_subagent_only_extensions(
+        &mut builtin,
+        &settings.default_subagent_only_extensions,
+    );
     apply_default_provider(&mut builtin, &settings.default_provider);
     apply_builtin_overrides(&mut builtin, settings);
 
@@ -1242,6 +1246,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
     apply_default_model(&mut user, &default_model);
     apply_default_thinking(&mut user, &default_thinking);
     apply_default_extensions(&mut user, &default_extensions);
+    apply_default_subagent_only_extensions(&mut user, &settings.default_subagent_only_extensions);
     apply_default_provider(&mut user, &settings.default_provider);
     apply_custom_overrides(
         &mut user,
@@ -1264,6 +1269,10 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
     apply_default_model(&mut project, &default_model);
     apply_default_thinking(&mut project, &default_thinking);
     apply_default_extensions(&mut project, &default_extensions);
+    apply_default_subagent_only_extensions(
+        &mut project,
+        &settings.default_subagent_only_extensions,
+    );
     apply_default_provider(&mut project, &settings.default_provider);
     apply_custom_overrides(
         &mut project,
@@ -1351,6 +1360,26 @@ fn apply_default_extensions(agents: &mut [AgentConfig], default_extensions: &Opt
     for agent in agents.iter_mut() {
         if agent.extensions.is_none() {
             agent.extensions = Some(default_extensions.clone());
+        }
+    }
+}
+
+/// `applySubagentDefaultSubagentOnlyExtensions` (#2322 /
+/// 85a9d72b, agents.ts): agents without a `subagentOnlyExtensions` field
+/// (frontmatter — including an explicit `[]` — suppresses the default, and
+/// `agentOverrides` replace/false-clear per the existing override seams)
+/// get the shared child-only extension list; ambient discovery is never
+/// disabled by this default.
+fn apply_default_subagent_only_extensions(
+    agents: &mut [AgentConfig],
+    default: &Option<Vec<String>>,
+) {
+    let Some(default) = default else {
+        return;
+    };
+    for agent in agents.iter_mut() {
+        if agent.subagent_only_extensions.is_none() {
+            agent.subagent_only_extensions = Some(default.clone());
         }
     }
 }
@@ -2657,6 +2686,40 @@ mod te18_tools_tests {
             agent_with("name: a\ndescription: d\ntools:  inherit ").tools,
             None
         );
+    }
+
+    #[test]
+    fn default_subagent_only_extensions_fill_only() {
+        // #2322: agents without the field get the default; an explicit
+        // frontmatter `subagentOnlyExtensions` (including `[]`) suppresses
+        // it.
+        let mut undeclared = agent_with("name: a\ndescription: d");
+        let mut declared = agent_with("name: b\ndescription: d\nsubagentOnlyExtensions: /own.so");
+        let mut declared_empty = agent_with("name: c\ndescription: d\nsubagentOnlyExtensions:");
+        for agent in [&mut undeclared, &mut declared, &mut declared_empty] {
+            agent.subagent_only_extensions = None;
+            if agent.name == "b" {
+                agent.subagent_only_extensions = Some(vec!["/own.so".to_string()]);
+            }
+            if agent.name == "c" {
+                agent.subagent_only_extensions = Some(Vec::new());
+            }
+        }
+        let mut agents = vec![undeclared, declared, declared_empty];
+        apply_default_subagent_only_extensions(&mut agents, &Some(vec!["/shared.so".to_string()]));
+        assert_eq!(
+            agents[0].subagent_only_extensions,
+            Some(vec!["/shared.so".to_string()])
+        );
+        assert_eq!(
+            agents[1].subagent_only_extensions,
+            Some(vec!["/own.so".to_string()])
+        );
+        assert_eq!(agents[2].subagent_only_extensions, Some(Vec::new()));
+        // No default → untouched.
+        let mut agents = vec![agent_with("name: a\ndescription: d")];
+        apply_default_subagent_only_extensions(&mut agents, &None);
+        assert_eq!(agents[0].subagent_only_extensions, None);
     }
 
     #[test]

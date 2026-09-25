@@ -655,6 +655,12 @@ pub struct SubagentSettings {
     pub default_thinking: Option<String>,
     pub disable_thinking: Option<bool>,
     pub default_extensions: Option<Vec<String>>,
+    /// `defaultSubagentOnlyExtensions` (#2322): child-only extension paths
+    /// for agents without their own `subagentOnlyExtensions` field; unlike
+    /// `defaultExtensions: []` this never disables ambient discovery. An
+    /// explicitly present project value wins over the user value; the two
+    /// defaults resolve independently.
+    pub default_subagent_only_extensions: Option<Vec<String>>,
     pub model_scope: Option<crate::launch::model::ModelScopeConfig>,
     // —— v0.66 keys (TE19 / R7.1.10.x, R7.1.11.x) ——
     /// `maxThinking` (#1397): thinking ceiling across subagent launches
@@ -760,6 +766,36 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
             None => {
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'defaultExtensions'; expected an array of non-empty strings.",
+                    path.to_string_lossy()
+                ))
+            }
+        }
+    }
+    if let Some(value) = subagents.get("defaultSubagentOnlyExtensions") {
+        match value.as_array() {
+            Some(items) => {
+                let mut names = Vec::new();
+                let mut valid = true;
+                for item in items {
+                    match item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(name) => names.push(name.to_string()),
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid {
+                    return Err(format!(
+                        "Subagent settings in '{}' have invalid 'defaultSubagentOnlyExtensions'; expected an array of non-empty strings.",
+                        path.to_string_lossy()
+                    ));
+                }
+                parsed.default_subagent_only_extensions = Some(names);
+            }
+            None => {
+                return Err(format!(
+                    "Subagent settings in '{}' have invalid 'defaultSubagentOnlyExtensions'; expected an array of non-empty strings.",
                     path.to_string_lossy()
                 ))
             }
@@ -1165,6 +1201,10 @@ pub struct SettingsPair {
     pub project_thinking_configured: bool,
     /// `resolveSubagentDefaultExtensions` (agents.ts:1013-1019): project wins.
     pub default_extensions: Option<Vec<String>>,
+    /// Merged `defaultSubagentOnlyExtensions` (#2322); an explicitly present
+    /// project value wins over the user value (resolves independently from
+    /// `defaultExtensions`).
+    pub default_subagent_only_extensions: Option<Vec<String>>,
     /// `modelScope` — project wins when a project settings file exists
     /// (same mask discipline as the other defaults).
     pub model_scope: Option<crate::launch::model::ModelScopeConfig>,
@@ -1219,6 +1259,12 @@ pub fn read_settings_pair(cwd: &std::path::Path) -> SettingsPair {
     } else {
         user.default_extensions.clone()
     };
+    let default_subagent_only_extensions =
+        if project_settings_present && project.default_subagent_only_extensions.is_some() {
+            project.default_subagent_only_extensions.clone()
+        } else {
+            user.default_subagent_only_extensions.clone()
+        };
     let disable_thinking = if project_settings_present && project.disable_thinking.is_some() {
         project.disable_thinking == Some(true)
     } else {
@@ -1256,6 +1302,7 @@ pub fn read_settings_pair(cwd: &std::path::Path) -> SettingsPair {
         disable_thinking,
         project_thinking_configured,
         default_extensions,
+        default_subagent_only_extensions,
         model_scope,
         max_thinking,
         default_provider,
@@ -1690,5 +1737,39 @@ mod te18_override_parse_tests {
         );
         // Non-string entries are settings errors.
         assert!(parse_entry(r#"{"excludeTools":[1]}"#).is_err());
+    }
+    #[test]
+    fn default_subagent_only_extensions_parse_and_merge() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-cfg-dsoe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.json");
+        std::fs::write(
+            &user,
+            r#"{"subagents":{"defaultSubagentOnlyExtensions":["/x/ext.so"]}}"#,
+        )
+        .unwrap();
+        let settings = read_subagent_settings(&user).unwrap();
+        assert_eq!(
+            settings.default_subagent_only_extensions,
+            Some(vec!["/x/ext.so".to_string()])
+        );
+        // Non-array / blank entries fail the load with the key named.
+        let bad = dir.join("bad.json");
+        std::fs::write(
+            &bad,
+            r#"{"subagents":{"defaultSubagentOnlyExtensions":"x"}}"#,
+        )
+        .unwrap();
+        let error = read_subagent_settings(&bad).unwrap_err();
+        assert!(error.contains("defaultSubagentOnlyExtensions"), "{error}");
+        let blank = dir.join("blank.json");
+        std::fs::write(
+            &blank,
+            r#"{"subagents":{"defaultSubagentOnlyExtensions":["  "]}}"#,
+        )
+        .unwrap();
+        assert!(read_subagent_settings(&blank).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

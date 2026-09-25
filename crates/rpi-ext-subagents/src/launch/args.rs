@@ -63,6 +63,12 @@ pub const CHILD_TOOL_DIAGNOSTIC_PATH_ENV: &str = "RPI_SUBAGENT_TOOL_DIAGNOSTIC_P
 /// carried into fanout-authorized children; the child's own launches (and the
 /// list output) intersect against it and it can never be widened.
 pub const SUBAGENT_ALLOWED_AGENTS_ENV: &str = "RPI_SUBAGENT_ALLOWED_AGENTS";
+/// `PI_SUBAGENT_CACHE_RETENTION` (#2190) — RPI rename (ADR-0001): child-only
+/// prompt-cache retention tier (`short`/`long`, accepted verbatim by the
+/// host's `RPI_CACHE_RETENTION` resolution).
+pub const SUBAGENT_CACHE_RETENTION_ENV: &str = "RPI_SUBAGENT_CACHE_RETENTION";
+/// The host-side retention variable the child-only tier overrides.
+pub const ENV_CACHE_RETENTION: &str = "RPI_CACHE_RETENTION";
 
 /// The inherited descendant-agent allowlist decoded from the environment
 /// (`None` = unrestricted; an empty `allowedAgents` list denies every
@@ -743,6 +749,15 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     } else {
         cleared(&mut env, crate::p1::supervisor::SUPERVISOR_CHANNEL_DIR_ENV);
     }
+    // `PI_SUBAGENT_CACHE_RETENTION` → RPI rename (#2190 / ce3cff20,
+    // ADR-0001): a child-only prompt-cache retention tier; unset leaves the
+    // child on the parent's `RPI_CACHE_RETENTION`.
+    if let Ok(retention) = std::env::var(SUBAGENT_CACHE_RETENTION_ENV) {
+        let retention = retention.trim();
+        if !retention.is_empty() {
+            env.insert(ENV_CACHE_RETENTION.to_string(), Some(retention.to_string()));
+        }
+    }
     if let Some(allowlist) = &input.descendant_allowed_agents {
         env.insert(
             SUBAGENT_ALLOWED_AGENTS_ENV.to_string(),
@@ -993,6 +1008,39 @@ mod tests {
             tools: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn child_cache_retention_env_override() {
+        // #2190: RPI_SUBAGENT_CACHE_RETENTION maps onto the child's
+        // RPI_CACHE_RETENTION; unset leaves the inherited value alone.
+        let dir = std::env::temp_dir().join(format!("rpi-sub-args-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        static LOCK2: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK2.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("RPI_SUBAGENT_CACHE_RETENTION");
+        std::env::remove_var("RPI_CACHE_RETENTION");
+        let input = base_input();
+        let plain = build_rpi_args(&input).expect("args build");
+        assert!(!plain.env.contains_key("RPI_CACHE_RETENTION"));
+        std::env::set_var("RPI_SUBAGENT_CACHE_RETENTION", "short");
+        let overridden = build_rpi_args(&input).expect("args build");
+        assert_eq!(
+            overridden.env.get("RPI_CACHE_RETENTION"),
+            Some(&Some("short".to_string()))
+        );
+        // An explicit parent RPI_CACHE_RETENTION does not block the
+        // child-only tier (the child-only value wins for children).
+        std::env::set_var("RPI_CACHE_RETENTION", "long");
+        let both = build_rpi_args(&input).expect("args build");
+        assert_eq!(
+            both.env.get("RPI_CACHE_RETENTION"),
+            Some(&Some("short".to_string()))
+        );
+        std::env::remove_var("RPI_SUBAGENT_CACHE_RETENTION");
+        std::env::remove_var("RPI_CACHE_RETENTION");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TE38 T2 (#2334 @ b72714de, pinning): the per-spawn parent-session env
