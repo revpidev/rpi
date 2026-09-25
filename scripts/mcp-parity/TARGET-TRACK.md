@@ -29,6 +29,20 @@ vector re-records, no crate implementation changes — those belong to
 TE23/TE24/TE21/TE22 respectively (the landing order of G10's "parity before implementation" is in
 each task's document).
 
+## 1b. TE40 completion record (2026-09-27) — the pin switch
+
+> `external/pi-mcp-adapter` switched `10a45367` (v2.32.1) → **`97435aab` (v2.34.0+9)** atomically
+> with TE40 (ADR-0029 five-pin table; the default driver = the submodule worktree now serves the
+> NEW pin, so the regression and target tracks converge).
+
+| Leg | Result @ `97435aab` | Notes |
+|----|------------|-------|
+| Protocol leg (7 scenarios) | **7/7 MATCH** | re-verified post-switch (stdio / http-streamable / 404/405/406/415 / auth-401) |
+| renderCall leg (24 cases) | **24/24 byte-identical** | re-verified post-switch |
+| OAuth leg | **MATCH** | oauth-authorization-code |
+| config-merge goldens | **re-recorded @ `97435aab`** | `gen-mcp-adapter-fixtures.mjs` gained the TE40 cases (`command-switch-drops-bearer-store-and-cafile` #552/#539, `socket-switch-drops-bearer-store-and-cafile`, `url-change-strips-cafile` #539, `blank-optional-config-is-absent` #568, `ancestor-config-roots-opt-in` / `-not-opted-in` #556 with the `projectSubdir`/`ancestorLayers` harness fields); `golden_config_merge.rs` consumes `ancestorLayers`/`projectSubdir` |
+| Other goldens | unchanged | names/glob/search/config-hash/tsshape/truncate faces are untouched by the 59-commit span (verified: all green without re-record) |
+
 ## 2. Running the target track (skeleton verification)
 
 ```bash

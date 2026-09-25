@@ -58,10 +58,10 @@ it is in scope.
 ## Non-negotiable rules
 
 1. **Upstream parity pin.** The behavioral gold standard is pinned in
-   `UPSTREAM.md` (currently `9841914`, Pi v0.85.0+). Behavior changes that
+   `UPSTREAM.md` (currently `19451accd`, Pi v0.86.1+1). Behavior changes that
    diverge from upstream require an ADR first (registered in the docs
-   repository). The red-line pins (`9841914` / subagents `0fc0eebb` /
-   mcp-adapter `10a45367` / smart-fetch `b0111612` / rpiv-mono `338b264c`)
+   repository). The red-line pins (`19451accd` / subagents `b72714de` /
+   mcp-adapter `97435aab` / smart-fetch `b0111612` / rpiv-mono `338b264c`)
    move only via the documented rebase process, never opportunistically.
 2. **Quality gates are local and mandatory.** CI builds releases but is not
    the test gate (see the rc.12 note in `changes/v0.1.4.md`). Before every
