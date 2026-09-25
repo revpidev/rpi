@@ -38,7 +38,8 @@ pub use error::ExtError;
 // `@earendil-works/pi-coding-agent`'s entry). Native extension authors
 // import these from the crate root; everything was already reachable via
 // `types::` (Rust `pub mod` ≠ upstream's unexported modules), so this is
-// surface alignment, zero behavior.
+// surface alignment, zero behavior. 60 types (review Finding B: the
+// initial list omitted SessionInfoChangedEvent).
 pub use types::{
     AfterProviderResponseEvent, AgentEndEvent, BeforeAgentStartCombinedResult,
     BeforeAgentStartEvent, BeforeAgentStartEventResult, BeforeAgentStartMessage,
@@ -50,10 +51,10 @@ pub use types::{
     ResourcesDiscoverEvent, ResourcesDiscoverReason, ResourcesDiscoverResult,
     SessionBeforeCompactEvent, SessionBeforeCompactResult, SessionBeforeForkEvent,
     SessionBeforeForkResult, SessionBeforeSwitchEvent, SessionBeforeSwitchResult,
-    SessionBeforeTreeEvent, SessionBeforeTreeResult, SessionCompactEvent, SessionShutdownEvent,
-    SessionShutdownReason, SessionStartEvent, SessionStartReason, SessionSwitchReason,
-    SessionTreeEvent, StreamingBehavior, ThinkingLevelSelectEvent, ToolCallEvent,
-    ToolCallEventResult, ToolExecutionEndEvent, ToolExecutionStartEvent, ToolExecutionUpdateEvent,
-    ToolResultEvent, ToolResultEventResult, TreePreparation, TurnEndEvent, TurnStartEvent,
-    UserBashEvent, UserBashEventResult,
+    SessionBeforeTreeEvent, SessionBeforeTreeResult, SessionCompactEvent, SessionInfoChangedEvent,
+    SessionShutdownEvent, SessionShutdownReason, SessionStartEvent, SessionStartReason,
+    SessionSwitchReason, SessionTreeEvent, StreamingBehavior, ThinkingLevelSelectEvent,
+    ToolCallEvent, ToolCallEventResult, ToolExecutionEndEvent, ToolExecutionStartEvent,
+    ToolExecutionUpdateEvent, ToolResultEvent, ToolResultEventResult, TreePreparation,
+    TurnEndEvent, TurnStartEvent, UserBashEvent, UserBashEventResult,
 };
