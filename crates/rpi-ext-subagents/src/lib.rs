@@ -613,6 +613,66 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                     );
                 }
             }
+            // #2087/#2272 (v0.70): a fanout child that itself coordinates
+            // descendants must be able to answer their supervisor asks and
+            // wait on its own async runs — register the parent-side
+            // supervisor tool and the wait tool in ChildFanout mode too
+            // (both operate session-scoped: replies resolve only requests
+            // stamped with this session as orchestrator, and the wait polls
+            // this process's own run registry).
+            if std::env::var(launch::args::SUBAGENT_FANOUT_CHILD_ENV)
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                if let Err(error) = register(
+                    "registerTool",
+                    json!({
+                        "name": "subagent_supervisor",
+                        "label": "Subagent supervisor",
+                        "description": "Handle child supervisor requests: {action: \"pending\"} lists requests from this session's children; {action: \"reply\", replyTo, message} answers one.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "action": { "type": "string", "enum": ["pending", "reply"] },
+                                "replyTo": { "type": "string", "description": "Request id being answered (reply)." },
+                                "message": { "type": "string", "description": "The reply text." }
+                            },
+                            "required": ["action"]
+                        }
+                    }),
+                ) {
+                    tracing::warn!(
+                        error = %error.to_string(),
+                        "subagent_supervisor registration denied for nested coordinator"
+                    );
+                }
+                if config::load_config().wait_tool_enabled() {
+                    if let Err(error) = register(
+                        "registerTool",
+                        json!({
+                            "name": "subagent_wait",
+                            "label": "Subagent wait",
+                            "description": "Wait for background subagent runs to reach a terminal state (first-terminal by default, all with { all: true }); non-blocking with { nonBlocking: true }. Disabled by config.waitTool.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Run id or unique id prefix; omit to wait on any background run." },
+                                    "all": { "type": "boolean", "description": "Wait for every background run to finish (default: first terminal)." },
+                                    "nonBlocking": { "type": "boolean", "description": "Register a wake and return immediately." },
+                                    "timeoutMs": { "type": "integer", "description": "Wait timeout in milliseconds (default 30 minutes)." },
+                                    "stopOnAttention": { "type": "boolean", "description": "False keeps the wait open through idle attention; pending supervisor requests still stop the wait." }
+                                }
+                            },
+                        }),
+                    ) {
+                        tracing::warn!(
+                            error = %error.to_string(),
+                            "subagent_wait registration denied for nested coordinator"
+                        );
+                    }
+                }
+            }
             // Steer inbox consumer (FR-P1-04, subagent-prompt-runtime.ts
             // registerSteeringInbox L333): when the parent launched this
             // child with a steer inbox, poll it and inject messages through
@@ -915,25 +975,26 @@ fn dispatch_message(message: &Value) -> Value {
                 return crate::p1::diff_tool::execute(&params);
             }
             if tool_name == "subagent_supervisor" {
-                let orchestrator_session_id =
-                    std::env::var(launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV)
+                // The orchestrator identity is THIS process's own session
+                // (root: V13-02 `ctx.sessionFile`, ADR-0022; nested
+                // coordinator: its own child session — the inherited env
+                // value names the ROOT orchestrator and must NOT filter a
+                // nested coordinator's own children, #2087).
+                let mut session_id = HostCallsContext {
+                    calls: &state.calls,
+                    cookie: state.cookie,
+                }
+                .parent_session(&config::read_settings_pair(
+                    &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                ))
+                .map(|session| session.id)
+                .unwrap_or_default();
+                if session_id.is_empty() && state.mode == PluginMode::Parent {
+                    // Root fallback only: the env var is unset in a root
+                    // process, so this stays empty in practice.
+                    session_id = std::env::var(launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV)
                         .unwrap_or_default();
-                // The parent's own session id comes from its authoritative
-                // session (V13-02 `ctx.sessionFile`, ADR-0022), falling back
-                // to the env.
-                let session_id = if orchestrator_session_id.is_empty() {
-                    HostCallsContext {
-                        calls: &state.calls,
-                        cookie: state.cookie,
-                    }
-                    .parent_session(&config::read_settings_pair(
-                        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                    ))
-                    .map(|session| session.id)
-                    .unwrap_or_default()
-                } else {
-                    orchestrator_session_id
-                };
+                }
                 return crate::p1::supervisor::parent_supervisor_action(
                     params.get("action").and_then(Value::as_str).unwrap_or(""),
                     params.get("replyTo").and_then(Value::as_str),
@@ -1098,6 +1159,29 @@ async fn async_move_drain(session_id: Option<&str>) {
     }
 }
 
+/// The orchestrator identity for supervisor surfaces: this process's own
+/// authoritative session (V13-02 `ctx.sessionFile`, ADR-0022); the env value
+/// names the ROOT orchestrator and is only a root-mode fallback.
+fn orchestrator_session_id(state: &PluginState) -> Option<String> {
+    let session = HostCallsContext {
+        calls: &state.calls,
+        cookie: state.cookie,
+    }
+    .parent_session(&config::read_settings_pair(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    ))
+    .map(|session| session.id);
+    match session {
+        Some(id) if !id.is_empty() => Some(id),
+        _ if state.mode == PluginMode::Parent => {
+            std::env::var(launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV)
+                .ok()
+                .filter(|id| !id.is_empty())
+        }
+        _ => None,
+    }
+}
+
 /// `subagent_wait` execution (subagent-wait.ts waitForSubagents subset +
 /// the per-cycle asyncWaitUpdate stream, TE09 FR-C).
 fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Option<&str>) -> Value {
@@ -1184,8 +1268,19 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
         let abort_probe = abort_probe
             .as_ref()
             .map(|probe| &**probe as &(dyn Fn() -> bool + Send + Sync));
-        runner::background::wait_for_runs(id.as_deref(), all, timeout_ms, on_update, abort_probe)
-            .await
+        runner::background::wait_for_runs_with_session_asks(
+            id.as_deref(),
+            all,
+            timeout_ms,
+            on_update,
+            abort_probe,
+            // The orchestrator identity for the #2345 session barrier: this
+            // process's own session (root `ctx.sessionFile` per ADR-0022;
+            // nested coordinator = its own session; the inherited env value
+            // names the ROOT and must not own a child's barrier).
+            orchestrator_session_id(state).as_deref(),
+        )
+        .await
     });
     match result {
         Ok(waited) => {

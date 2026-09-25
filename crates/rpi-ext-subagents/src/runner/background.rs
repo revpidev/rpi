@@ -1844,6 +1844,23 @@ pub async fn wait_for_runs(
     on_update: Option<&(dyn Fn(&str) + Send + Sync)>,
     is_aborted: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> Result<Value, String> {
+    wait_for_runs_with_session_asks(id, all, timeout_ms, on_update, is_aborted, None).await
+}
+
+/// `subagent_wait` with the #2345 session-wide supervisor barrier: besides
+/// the per-run attention check (#1315), the wait yields when the
+/// orchestrator session owns ANY unanswered blocking ask — including asks
+/// from runs outside the waited set (e.g. an owned nested child waiting on
+/// `contact_supervisor`; upstream `hasPendingSupervisorRequest` wiring,
+/// wait-tool.ts:577/752).
+pub async fn wait_for_runs_with_session_asks(
+    id: Option<&str>,
+    all: bool,
+    timeout_ms: u64,
+    on_update: Option<&(dyn Fn(&str) + Send + Sync)>,
+    is_aborted: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    orchestrator_session_id: Option<&str>,
+) -> Result<Value, String> {
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_millis(timeout_ms.max(1));
     let is_terminal = |state: &str| {
@@ -1937,6 +1954,31 @@ pub async fn wait_for_runs(
                         "childIndex": child_index,
                     },
                     "runs": snapshots,
+                }));
+            }
+        }
+        // #2345 session-wide supervisor barrier: yield for pending blocking
+        // asks this orchestrator session owns outside the waited runs.
+        if let Some(session_id) = orchestrator_session_id {
+            if !session_id.is_empty()
+                && crate::p1::supervisor::has_pending_blocking_requests(session_id)
+            {
+                let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+                let snapshots: Vec<Value> = initial_ids
+                    .iter()
+                    .filter_map(|id| runs.get(id.as_str()).map(|h| status_snapshot(h)))
+                    .collect();
+                drop(runs);
+                return Ok(json!({
+                    "waited": 0,
+                    "all": all,
+                    "wait": {
+                        "reason": "supervisor_request",
+                        "timedOut": false,
+                        "activeRunIds": initial_ids,
+                    },
+                    "runs": snapshots,
+                    "text": "Wait yielded for a pending supervisor request. Background work remains active and will continue after the supervisor reply.",
                 }));
             }
         }
@@ -2227,6 +2269,73 @@ pub(crate) mod tests {
     /// when the owning session has an unanswered blocking supervisor ask —
     /// no burn of the drain budget on children nobody can unblock — and
     /// drains normally once the ask is gone.
+    #[tokio::test]
+    async fn wait_yields_for_session_wide_pending_ask() {
+        // #2345: a blocking ask from a run OUTSIDE the waited set still
+        // yields the wait (upstream hasPendingSupervisorRequest wiring) with
+        // the supervisor-yield shape.
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = format!("te39-wait-session-{}", std::process::id());
+        let _waited = running_test_run("te39-wait-run");
+        // The pending ask belongs to a DIFFERENT run owned by the session.
+        let channel = crate::p1::supervisor::channel_dir("te39-other-run", "reviewer", 1);
+        crate::p1::supervisor::ensure_channel(&channel);
+        let request_path = channel.join("requests").join("te39-wait-ask.json");
+        std::fs::write(
+            &request_path,
+            json!({
+                "id": "te39-wait-ask",
+                "reason": "interview_request",
+                "runId": "te39-other-run",
+                "agent": "reviewer",
+                "childIndex": 1,
+                "orchestratorSessionId": session,
+                "message": "structured input?",
+                "createdAt": "2026-09-27T00:00:00.000Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let result = wait_for_runs_with_session_asks(
+            Some("te39-wait-run"),
+            false,
+            30_000,
+            None,
+            None,
+            Some(&session),
+        )
+        .await
+        .expect("wait yields, not errors");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "yield must be immediate, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result["wait"]["reason"], json!("supervisor_request"));
+        assert_eq!(result["waited"], json!(0));
+        assert_eq!(
+            result["text"],
+            json!("Wait yielded for a pending supervisor request. Background work remains active and will continue after the supervisor reply.")
+        );
+        // No session barrier → the wait proceeds normally (times out bounded).
+        let _ = std::fs::remove_file(&request_path);
+        let result = wait_for_runs_with_session_asks(
+            Some("te39-wait-run"),
+            false,
+            50,
+            None,
+            None,
+            Some(&session),
+        )
+        .await
+        .expect("bounded wait returns");
+        assert!(result.get("wait").is_none(), "{result}");
+        unregister_run("te39-wait-run");
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn drain_yields_on_pending_supervisor_ask() {
