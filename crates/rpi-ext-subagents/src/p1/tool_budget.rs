@@ -205,6 +205,7 @@ fn blocked_message_parts(text: &str) -> Option<(u64, u64, String)> {
 /// `isToolBudgetBlockedMessage` (tool-budget.ts:76-84): the whole message
 /// must match the runtime format AND the embedded hard limit and tool name
 /// must belong to this run.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_tool_budget_blocked_message(
     budget: &ResolvedToolBudget,
     result_text: &str,
@@ -232,6 +233,7 @@ pub fn classify_blocked_message(budget: &ResolvedToolBudget, result_text: &str) 
 }
 
 /// `initialToolBudgetState` (tool-budget.ts:39-41).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn initial_tool_budget_state(budget: &ResolvedToolBudget) -> Value {
     tool_budget_state(budget, 0, None)
 }
@@ -304,6 +306,7 @@ static TOOL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 static SOFT_NUDGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Reset the runtime counters (tests).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn reset_runtime_for_test() {
     TOOL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     SOFT_NUDGED.store(false, std::sync::atomic::Ordering::SeqCst);
