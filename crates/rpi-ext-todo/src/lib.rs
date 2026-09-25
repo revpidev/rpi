@@ -191,13 +191,26 @@ fn channel_for(cookie: PluginCookie) -> Option<NativeHostCall> {
 // init, `todoOverlay`/`uiCtx`, and the factory-scope `collapseKey`)
 // ---------------------------------------------------------------------------
 
-/// The process locale table (detected once at install; upstream
+/// The process locale table, detected once at install (upstream
 /// registers the rpiv-i18n strings once at module init — TE-D43 embeds
-/// the tables instead).
+/// the tables instead). Under `cfg(test)` the table pins to English:
+/// the upstream vitest suite is always English because the rpiv-i18n
+/// SDK is absent there, and the rpi counterpart of that absence is a
+/// deterministic test locale (review P1-2 — a developer machine's
+/// LANG must not flip the wiring assertions).
 static I18N: OnceLock<i18n::I18n> = OnceLock::new();
 
 fn current_i18n() -> &'static i18n::I18n {
-    I18N.get_or_init(i18n::I18n::detect)
+    I18N.get_or_init(|| {
+        #[cfg(test)]
+        {
+            i18n::I18n::for_locale("en")
+        }
+        #[cfg(not(test))]
+        {
+            i18n::I18n::detect()
+        }
+    })
 }
 
 /// The foreground overlay controller (upstream `todoOverlay`/`uiCtx`
@@ -306,7 +319,11 @@ fn dispatch_message(cookie: PluginCookie, message: &Value) -> Value {
         }
         Some("shortcut")
             if message.get("shortcut").and_then(Value::as_str)
-                == Some(registered_collapse_key().as_str()) =>
+                == Some(registered_collapse_key().as_str())
+                // The "off" sentinel never registers a shortcut, so the
+                // host never dispatches it; guard anyway (upstream has no
+                // dispatch surface for an unregistered key — review P2-3).
+                && registered_collapse_key().as_str() != config::COLLAPSE_KEY_OFF =>
         {
             let mut controller = overlay_controller()
                 .lock()
@@ -527,24 +544,19 @@ pub fn dispatch_for_test(cookie: PluginCookie, message: &Value) -> Value {
 
 /// Test seam: store reset (upstream `__resetState` import path — the
 /// upstream suite also gets a FRESH index.ts closure per `registerTodo`
-/// call, so the overlay controller resets alongside the store).
+/// call, so the overlay controller resets alongside the store). Under
+/// `cfg(test)` this also installs the empty config override (review
+/// P1-2: the suite must not read the developer machine's real
+/// `~/.config/rpiv-todo/`; individual tests may install a richer object
+/// through [`crate::config::set_test_config`]).
 #[doc(hidden)]
 pub fn __reset_state() {
     reset_store();
+    #[cfg(test)]
+    crate::config::set_test_config(Some(serde_json::json!({})));
     *overlay_controller()
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = overlay::OverlayController::default();
-}
-
-/// Test seam: pin the process locale table to English before the first
-/// real detection (the upstream suite is always English — the rpiv-i18n
-/// SDK is absent under vitest, so the shim's inline fallbacks win; the
-/// rpi counterpart of that absence is a pinned test locale). Best-effort:
-/// returns false once a real detection has latched.
-#[cfg(test)]
-#[doc(hidden)]
-pub fn set_test_locale(locale: &str) -> bool {
-    I18N.set(i18n::I18n::for_locale(locale)).is_ok()
 }
 
 /// Shared serializing lock for every test that touches the process-global
@@ -1194,7 +1206,6 @@ mod tests {
     fn dispatch_routes_the_todos_command() {
         let _guard = serialized();
         __reset_state();
-        set_test_locale("en");
         install_with("ctrl+shift+t");
         transport().set_reply(
             "ctx.sessionFile",
@@ -1226,7 +1237,6 @@ mod tests {
     fn dispatch_routes_the_collapse_shortcut() {
         let _guard = serialized();
         __reset_state();
-        set_test_locale("en");
         install_with("ctrl+shift+t");
         transport().set_reply(
             "ctx.sessionFile",
@@ -1278,7 +1288,6 @@ mod tests {
     fn dispatch_routes_the_render_calls() {
         let _guard = serialized();
         __reset_state();
-        set_test_locale("en");
         install_with("ctrl+shift+t");
         transport().set_reply("ctx.sessionFile", json!({"path": null, "id": "s"}));
         transport().set_reply("ctx.hasUI", json!(true));

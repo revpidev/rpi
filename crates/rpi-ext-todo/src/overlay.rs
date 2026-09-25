@@ -1117,6 +1117,119 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Collapse hint resolves the key from config per render
+    // (todo-overlay.render.test.ts — collapse hint describe; review P1-1)
+    // ------------------------------------------------------------------
+
+    fn collapsed_hint_with(config: &serde_json::Value) -> String {
+        crate::config::set_test_config(Some(config.clone()));
+        seed(&[json!({"action": "create", "subject": "a"})]);
+        let host = MockHost::new();
+        let mut overlay = TodoOverlay::new();
+        overlay.set_ui_ctx();
+        let i18n = I18n::for_locale("en");
+        overlay.toggle_collapse(&host, &i18n);
+        let lines = overlay.test_render(&host, &i18n, 200);
+        assert_eq!(lines.len(), 3);
+        lines[1].clone()
+    }
+
+    #[test]
+    fn hint_renders_the_configured_key_and_never_leaks_the_placeholder() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let hint = collapsed_hint_with(&json!({"collapseKey": "alt+o"}));
+        assert!(hint.contains("alt+o to expand"), "{hint}");
+        assert!(!hint.contains("{key}"), "{hint}");
+        assert!(!hint.contains("ctrl+shift+t"), "{hint}");
+    }
+
+    #[test]
+    fn hint_renders_the_default_key_when_config_is_missing() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let hint = collapsed_hint_with(&json!({}));
+        assert!(hint.contains("ctrl+shift+t to expand"), "{hint}");
+        assert!(!hint.contains("{key}"), "{hint}");
+    }
+
+    #[test]
+    fn hint_renders_the_default_key_when_the_configured_spec_is_invalid() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let hint = collapsed_hint_with(&json!({"collapseKey": "ctr+t"}));
+        assert!(hint.contains("ctrl+shift+t to expand"), "{hint}");
+    }
+
+    #[test]
+    fn hint_renders_a_static_collapsed_label_for_the_off_sentinel() {
+        // Reachable mid-session: collapse with a bound key, then edit the
+        // config to "off" — the per-render resolver returns the sentinel;
+        // the hint must not splice it into the {key} placeholder.
+        let _guard = serialized();
+        crate::__reset_state();
+        let hint = collapsed_hint_with(&json!({"collapseKey": "off"}));
+        assert!(hint.contains("collapsed"), "{hint}");
+        assert!(!hint.contains("off to expand"), "{hint}");
+        assert!(!hint.contains("{key}"), "{hint}");
+    }
+
+    // ------------------------------------------------------------------
+    // Theme invalidation (todo-overlay.lifecycle.test.ts — "uses the
+    // current UI theme after invalidation without re-registering";
+    // review P1-1: a theme change must defeat the fingerprint and
+    // re-send the re-themed lines)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_theme_change_defeats_the_fingerprint_and_resends_the_new_colors() {
+        let _guard = serialized();
+        crate::__reset_state();
+        seed(&[json!({"action": "create", "subject": "a"})]);
+        let mut host = MockHost::new();
+        host.theme = json!({
+            "vars": {"a-color": "#8abeb7"},
+            "colors": {"accent": "a-color"}
+        });
+        let mut overlay = TodoOverlay::new();
+        overlay.set_ui_ctx();
+        let i18n = I18n::for_locale("en");
+        overlay.update(&host, &i18n);
+        assert_eq!(host.push_count(), 1);
+        let first = host.last_lines().expect("initial push");
+        assert!(
+            first
+                .iter()
+                .any(|line| line.contains("\x1b[38;2;138;190;183m")),
+            "initial heading carries theme A's accent: {first:?}"
+        );
+        // Theme switch: the next assembly re-reads ui.theme, the changed
+        // ANSI defeats the equal-value skip, and the re-send carries the
+        // new accent — without any re-registration bookkeeping beyond the
+        // same setWidget channel.
+        host.theme = json!({
+            "vars": {"a-color": "#ff0000"},
+            "colors": {"accent": "a-color"}
+        });
+        overlay.update(&host, &i18n);
+        assert_eq!(host.push_count(), 2, "theme change forces a re-send");
+        let second = host.last_lines().expect("re-themed push");
+        assert!(
+            second
+                .iter()
+                .any(|line| line.contains("\x1b[38;2;255;0;0m")),
+            "re-themed heading carries theme B's accent: {second:?}"
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|line| line.contains("\x1b[38;2;138;190;183m")),
+            "stale accent must be gone: {second:?}"
+        );
+        assert!(overlay.is_registered());
+    }
+
+    // ------------------------------------------------------------------
     // Width truncation
     // ------------------------------------------------------------------
 

@@ -210,10 +210,43 @@ pub fn load_config_from(xdg_config_home: Option<&str>, home: &Path) -> Value {
 }
 
 /// Load the config for the current process (upstream `loadConfig`).
+/// Tests inject through [`set_test_config`] (the `__reset_state` seam
+/// installs an empty object, so the suite never reads the developer
+/// machine's real `~/.config/rpiv-todo/` — the rpi counterpart of the
+/// upstream suite's `beforeEach(removeConfigFile())`).
 pub fn load_config() -> Value {
+    #[cfg(test)]
+    if let Some(overridden) = test_config_override()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+    {
+        return overridden.clone();
+    }
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let home = home_dir().unwrap_or_else(|| PathBuf::from("/"));
     load_config_from(xdg.as_deref(), &home)
+}
+
+/// Test-only config override (empty = defaults; the value is the raw
+/// config object). Process-global — every caller runs under the crate
+/// `TEST_LOCK`.
+#[cfg(test)]
+fn test_config_override() -> &'static std::sync::Mutex<Option<Value>> {
+    static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<Value>>> =
+        std::sync::OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Install the test config (TE35 review P1-2). `None` clears back to
+/// real-disk reads (config.rs's own suite uses the parameter seam and
+/// never sets this).
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_test_config(config: Option<Value>) {
+    *test_config_override()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = config;
 }
 
 // ---------------------------------------------------------------------------

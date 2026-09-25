@@ -228,6 +228,8 @@ mod tests {
 
     #[test]
     fn registers_under_the_tool_name_todo_with_expected_label() {
+        // Pin to the empty-config override (review P1-2): these
+        crate::config::set_test_config(Some(serde_json::json!({})));
         let definition = tool_definition();
         assert_eq!(definition["name"], json!(TOOL_NAME));
         assert_eq!(definition["name"], json!("todo"));
@@ -236,6 +238,8 @@ mod tests {
 
     #[test]
     fn prompt_snippet_is_the_default() {
+        // Pin to the empty-config override (review P1-2): these
+        crate::config::set_test_config(Some(serde_json::json!({})));
         assert_eq!(
             tool_definition()["promptSnippet"],
             json!("Manage a task list to track multi-step progress")
@@ -244,6 +248,8 @@ mod tests {
 
     #[test]
     fn description_is_the_upstream_literal() {
+        // Pin to the empty-config override (review P1-2): these
+        crate::config::set_test_config(Some(serde_json::json!({})));
         assert_eq!(tool_definition()["description"], json!(
             "Manage a task list for tracking multi-step progress. Actions: create (new task), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation."
         ));
@@ -264,6 +270,8 @@ mod tests {
 
     #[test]
     fn built_in_guidelines_snapshot() {
+        // Pin to the empty-config override (review P1-2): these
+        crate::config::set_test_config(Some(serde_json::json!({})));
         let guidelines = crate::tool::types::default_prompt_guidelines();
         assert_eq!(guidelines.len(), 8);
         for (index, expected) in UPSTREAM_GUIDELINES.iter().enumerate() {
@@ -277,6 +285,8 @@ mod tests {
 
     #[test]
     fn parameters_schema_declares_the_six_actions() {
+        // Pin to the empty-config override (review P1-2): these
+        crate::config::set_test_config(Some(serde_json::json!({})));
         let schema = tool_definition()["parameters"].clone();
         let raw = schema.to_string();
         for action in ["create", "update", "list", "get", "delete", "clear"] {
@@ -292,6 +302,8 @@ mod tests {
 
     #[test]
     fn parameters_schema_field_descriptions_are_verbatim() {
+        // Pin to the empty-config override (review P1-2): these
+        crate::config::set_test_config(Some(serde_json::json!({})));
         let properties = &tool_definition()["parameters"]["properties"];
         assert_eq!(
             properties["subject"]["description"],
@@ -368,6 +380,8 @@ mod tests {
 
     #[test]
     fn schema_status_enum_matches_the_state_machine() {
+        // Pin to the empty-config override (review P1-2): these
+        crate::config::set_test_config(Some(serde_json::json!({})));
         let properties = &tool_definition()["parameters"]["properties"];
         assert_eq!(
             properties["status"]["enum"],
