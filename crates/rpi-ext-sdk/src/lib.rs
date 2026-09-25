@@ -14,6 +14,7 @@
 
 use serde_json::{json, Value};
 
+pub mod events;
 pub mod interactive_ui;
 pub mod model_registry;
 pub mod session_entries;

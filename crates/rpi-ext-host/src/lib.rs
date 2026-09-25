@@ -32,3 +32,28 @@ pub mod wasm;
 mod test_bridge;
 
 pub use error::ExtError;
+
+// Package-entry re-export of the hook event/result type surface (#9642,
+// 4c2d91339 — upstream completed the same export from
+// `@earendil-works/pi-coding-agent`'s entry). Native extension authors
+// import these from the crate root; everything was already reachable via
+// `types::` (Rust `pub mod` ≠ upstream's unexported modules), so this is
+// surface alignment, zero behavior.
+pub use types::{
+    AfterProviderResponseEvent, AgentEndEvent, BeforeAgentStartCombinedResult,
+    BeforeAgentStartEvent, BeforeAgentStartEventResult, BeforeAgentStartMessage,
+    BeforeProviderHeadersEvent, BeforeProviderRequestEvent, CacheWarmingAction,
+    CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult, CompactionReason, ContextEvent,
+    ContextEventResult, ExtensionBranchSummary, ForkPosition, InputEvent, InputEventResult,
+    InputSource, MessageEndEventResult, MessageEvent, MessageUpdateEvent, ModelSelectEvent,
+    ModelSelectSource, ProjectTrustDecision, ProjectTrustEvent, ProjectTrustEventResult,
+    ResourcesDiscoverEvent, ResourcesDiscoverReason, ResourcesDiscoverResult,
+    SessionBeforeCompactEvent, SessionBeforeCompactResult, SessionBeforeForkEvent,
+    SessionBeforeForkResult, SessionBeforeSwitchEvent, SessionBeforeSwitchResult,
+    SessionBeforeTreeEvent, SessionBeforeTreeResult, SessionCompactEvent, SessionShutdownEvent,
+    SessionShutdownReason, SessionStartEvent, SessionStartReason, SessionSwitchReason,
+    SessionTreeEvent, StreamingBehavior, ThinkingLevelSelectEvent, ToolCallEvent,
+    ToolCallEventResult, ToolExecutionEndEvent, ToolExecutionStartEvent, ToolExecutionUpdateEvent,
+    ToolResultEvent, ToolResultEventResult, TreePreparation, TurnEndEvent, TurnStartEvent,
+    UserBashEvent, UserBashEventResult,
+};
