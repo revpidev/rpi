@@ -2270,6 +2270,7 @@ pub(crate) mod tests {
     /// no burn of the drain budget on children nobody can unblock — and
     /// drains normally once the ask is gone.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn wait_yields_for_session_wide_pending_ask() {
         // #2345: a blocking ask from a run OUTSIDE the waited set still
         // yields the wait (upstream hasPendingSupervisorRequest wiring) with
