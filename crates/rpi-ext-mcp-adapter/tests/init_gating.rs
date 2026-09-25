@@ -131,6 +131,8 @@ async fn gate_ready_transitions_and_fires_on_ready() {
             fired_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })),
         on_connect_sync: None,
+        on_connect_report: None,
+        on_search_activations: None,
     });
     dispatcher.start_init_with(ready);
 
@@ -345,6 +347,8 @@ async fn start_init_background_driver_fires_on_ready() {
             fired_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })),
         on_connect_sync: None,
+        on_connect_report: None,
+        on_search_activations: None,
     });
 
     dispatcher.start_init(dir.clone(), None);
@@ -408,6 +412,8 @@ async fn try_runtime_gated_until_on_ready_hook_completes() {
     dispatcher.set_hooks(DispatcherHooks {
         on_ready: Some(hook),
         on_connect_sync: None,
+        on_connect_report: None,
+        on_search_activations: None,
     });
 
     let init_dir = dir.clone();
@@ -497,6 +503,8 @@ async fn current_gate_parks_until_on_ready_hook_completes() {
     dispatcher.set_hooks(DispatcherHooks {
         on_ready: Some(hook),
         on_connect_sync: None,
+        on_connect_report: None,
+        on_search_activations: None,
     });
 
     let init_dir = dir.clone();
@@ -593,6 +601,8 @@ async fn try_runtime_after_hooks_distinguishes_gate_window_from_initializing() {
     dispatcher.set_hooks(DispatcherHooks {
         on_ready: Some(hook),
         on_connect_sync: None,
+        on_connect_report: None,
+        on_search_activations: None,
     });
 
     let init_dir = dir.clone();

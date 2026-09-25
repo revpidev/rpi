@@ -113,6 +113,12 @@ struct DirectSurface {
     /// `proxyToolDescription`): `syncProxyTool` re-registers when the pure
     /// description changes (R7.2.5.1/#432).
     proxy_description: Option<String>,
+    /// #484/#502: per-server direct-tool counts from the last sync and the
+    /// connect-scoped addedToolNames (each server's discovery names are
+    /// consumed once; deactivation re-opens the report).
+    direct_tool_counts: std::collections::HashMap<String, usize>,
+    connect_additions: std::collections::HashMap<String, Vec<String>>,
+    reported_connect_names: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
@@ -205,7 +211,18 @@ fn sync_tool_surface(state: &PluginState) {
             std::mem::take(&mut surface.registry),
         )
     };
-    let cache = cache::load_metadata_cache(&cache::get_metadata_cache_path());
+    let persistent_cache = cache::load_metadata_cache(&cache::get_metadata_cache_path());
+    // #566 (464337b, index.ts loadToolSurfaceCache @ 97435aab): overlay the
+    // LIVE connection catalogs on the persistent cache for the tool-surface
+    // sync — a live server (connected, enabled, definition hash unchanged)
+    // contributes its current tools/resources even when the persistent
+    // entry is expired or zero-TTL. The overlay is never written back.
+    let cache = match state.dispatcher.try_runtime() {
+        Some(runtime) => {
+            proxy::overlay_live_tool_surface_cache(persistent_cache, &config, &runtime.manager)
+        }
+        None => persistent_cache,
+    };
     let prefix = config.global_tool_prefix();
     let env_raw = std::env::var("MCP_DIRECT_TOOLS").ok();
     let env_selectors = if env_raw.as_deref() == Some("__none__") {
@@ -250,6 +267,56 @@ fn sync_tool_surface(state: &PluginState) {
         };
         registry.sync(&specs, &mut surface)
     };
+
+    // #484/#502 (e32bb08/f430a9a, index.ts:614-619 + connectAndReport):
+    // per-server direct-tool counts from the last sync; connect-scoped
+    // additions report each server's discovery names once (search-held
+    // tools never report; a deactivation re-opens the report).
+    let mut direct_tool_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for spec in &specs {
+        *direct_tool_counts
+            .entry(spec.server_name.clone())
+            .or_insert(0) += 1;
+    }
+    let mut connect_additions: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    {
+        let mut surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
+        for name in report.added.iter().chain(report.updated.iter()) {
+            let Some(spec) = registry.spec(name) else {
+                continue;
+            };
+            if spec.held_out {
+                continue;
+            }
+            let reported = surface
+                .reported_connect_names
+                .entry(spec.server_name.clone())
+                .or_default();
+            if !reported.insert(name.clone()) {
+                continue;
+            }
+            connect_additions
+                .entry(spec.server_name.clone())
+                .or_default()
+                .push(name.clone());
+        }
+        for name in report.deactivated.iter() {
+            let server = surface
+                .reported_connect_names
+                .iter_mut()
+                .find(|(_, names)| names.contains(name))
+                .map(|(server, _)| server.clone());
+            if let Some(server) = server {
+                if let Some(names) = surface.reported_connect_names.get_mut(&server) {
+                    names.remove(name);
+                }
+            }
+        }
+        surface.direct_tool_counts = direct_tool_counts.clone();
+        surface.connect_additions = connect_additions;
+    }
 
     // syncProxyTool (index.ts:1192-1219 @ 10a45367): register on first use and
     // re-register when the pure config description changes.
@@ -302,6 +369,15 @@ fn sync_tool_surface(state: &PluginState) {
         );
     }
 
+    // #484: the live runtime's per-server direct-tool counts (the status
+    // surface reads them).
+    if let Some(runtime) = state.dispatcher.try_runtime() {
+        *runtime
+            .direct_tool_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = direct_tool_counts.clone();
+    }
+
     let mut surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
     surface.registry = registry;
     surface.proxy_registered = proxy_registered;
@@ -315,14 +391,35 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// `updateStatusBar` (init.ts:520-556) wired to `ui.setStatus`: computes
-/// the "mcp" footer text from the ready runtime (no runtime yet → clear)
-/// and publishes it to the host.
+/// `updateStatusBar` (init.ts:636-660) wired to `ui.setStatus`: computes
+/// the "mcp" footer text from the ready runtime; with NO runtime yet the
+/// #604 deferred path restores the footer from the early config with
+/// zero connections (index.ts:1060-1075 — the status shows before the
+/// deferred runtime ever initializes).
 fn update_status_bar(state: &PluginState) {
-    let text = state
-        .dispatcher
-        .try_runtime()
-        .and_then(|runtime| status::build_status_bar_text(&runtime.config, &runtime.manager));
+    let text = match state.dispatcher.try_runtime() {
+        Some(runtime) => status::build_status_bar_text(&runtime.config, &runtime.manager),
+        None => {
+            let early_config = {
+                let surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
+                surface.early_config.clone()
+            };
+            let snapshot = status::FooterStateSnapshot {
+                enabled_count: early_config
+                    .mcp_servers
+                    .values()
+                    .filter(|definition| !definition.is_disabled())
+                    .count(),
+                disabled_count: early_config
+                    .mcp_servers
+                    .values()
+                    .filter(|definition| definition.is_disabled())
+                    .count(),
+                connected_count: 0,
+            };
+            status::format_mcp_footer_status(&early_config, &snapshot)
+        }
+    };
     set_status(state, text);
 }
 
@@ -459,6 +556,9 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                 early_config,
                 proxy_registered: false,
                 proxy_description: None,
+                direct_tool_counts: std::collections::HashMap::new(),
+                connect_additions: std::collections::HashMap::new(),
+                reported_connect_names: std::collections::HashMap::new(),
             };
         }
         // Config discovery from the new session's cwd (ctx.cwd through the
@@ -529,6 +629,9 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             early_config,
             proxy_registered: false,
             proxy_description: None,
+            direct_tool_counts: std::collections::HashMap::new(),
+            connect_additions: std::collections::HashMap::new(),
+            reported_connect_names: std::collections::HashMap::new(),
         })),
         pending_leaf: Mutex::new(None),
     };
@@ -653,6 +756,37 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                 sync_tool_surface(plugin);
                 update_status_bar(plugin);
             }
+        })),
+        // #502: the post-sync per-server additions recorded by
+        // `sync_tool_surface`.
+        on_connect_report: Some(Arc::new(|server: &str| {
+            STATE
+                .get()
+                .map(|plugin| {
+                    let surface = plugin.direct.lock().unwrap_or_else(|e| e.into_inner());
+                    surface
+                        .connect_additions
+                        .get(server)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        })),
+        // #525: activate the search-matched held-out tools on the plugin
+        // surface (registry + host active-tools set).
+        on_search_activations: Some(Arc::new(|matches: &[(String, String)]| {
+            let Some(plugin) = STATE.get() else {
+                return Vec::new();
+            };
+            let channel = plugin.channel();
+            let mut surface_guard = plugin.direct.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = HostSurface {
+                calls: &channel.calls(),
+                cookie: channel.cookie,
+            };
+            surface_guard
+                .registry
+                .activate_search_matches(matches, &mut host)
         })),
     });
 
@@ -1350,6 +1484,83 @@ fn handle_mcp_command(state: &PluginState, args: &str) -> Value {
             }
             commands::text_result(text)
         }
+        // #601 (e9f9366): `/mcp edit [project|global]` — open the shared
+        // config in the host external editor, validate it as a JSONC
+        // object, and write it back through the symlink-safe atomic path.
+        // [VARIANT] upstream `ctx.ui.editor(title, before)` carries the
+        // path in the editor title; the frozen `ui.editExternal` ABI takes
+        // only {text, language}, so the path is announced via ui.notify
+        // first and the buffer is edited with language "json".
+        commands::McpSubcommand::Edit => {
+            let target = target.as_deref().unwrap_or("project");
+            if target != "project" && target != "global" {
+                let text = "Usage: /mcp edit [project|global]".to_string();
+                host.notify(&text, "error");
+                return commands::error_result(text, "invalid_args");
+            }
+            if !host.has_ui() {
+                let text = "MCP edit requires an interactive UI (external editor).".to_string();
+                host.notify(&text, "error");
+                return commands::error_result(text, "no_ui");
+            }
+            let cwd = session_cwd(state);
+            let Some(path) = config::get_shared_config_path(target, &cwd) else {
+                let text = "MCP edit target \"global\" requires a home directory.".to_string();
+                host.notify(&text, "error");
+                return commands::error_result(text, "invalid_args");
+            };
+            let before = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| "{\n  \"mcpServers\": {}\n}\n".to_string());
+            host.notify(
+                &format!(
+                    "Editing {} (external editor; Ctrl+G opens $EDITOR)",
+                    path.display()
+                ),
+                "info",
+            );
+            let channel = state.channel();
+            let after = host_call(
+                &channel.calls(),
+                channel.cookie,
+                "ui.editExternal",
+                json!({ "text": before, "language": "json" }),
+            );
+            let Some(after_text) = after.get("text").and_then(Value::as_str) else {
+                // Cancelled (text:null) or a structural error — nothing is
+                // written.
+                return commands::text_result(format!(
+                    "MCP: edit cancelled ({} unchanged).",
+                    path.display()
+                ));
+            };
+            if after_text == before.as_str() {
+                return commands::text_result(format!("MCP: {} unchanged.", path.display()));
+            }
+            match config::write_shared_config_text(&path, after_text) {
+                Ok(()) => {
+                    // commandReload: re-discover the config and refresh the
+                    // surface/footer from the (possibly new) layer stack.
+                    {
+                        let cwd_for_reload = session_cwd(state);
+                        let mut surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
+                        surface.early_config = config::load_mcp_config(
+                            crate::utils::get_config_path_from_argv().as_deref(),
+                            &cwd_for_reload,
+                        );
+                    }
+                    sync_tool_surface(state);
+                    update_status_bar(state);
+                    let text = format!("MCP: saved {}.", path.display());
+                    host.notify(&text, "info");
+                    commands::text_result(text)
+                }
+                Err(error) => {
+                    let text = format!("MCP: not saved: {error}");
+                    host.notify(&text, "error");
+                    commands::error_result(text, "edit_failed")
+                }
+            }
+        }
         commands::McpSubcommand::Tools => {
             let runtime = match command_runtime(state) {
                 Ok(runtime) => runtime,
@@ -1444,10 +1655,21 @@ fn handle_mcp_command(state: &PluginState, args: &str) -> Value {
             }
             let options = crate::oauth::store::AuthStorageOptions {
                 base_dir: oauth_dir(&runtime),
+                credential_store: crate::oauth::store::CredentialStoreSelection::from_settings(
+                    runtime.config.settings.as_ref(),
+                ),
             };
+            // #546/#563 surviving logout ordering (commands.ts logoutServer @
+            // 97435aab): quiesce the transport FIRST — a server that cannot
+            // be closed keeps its credentials (no half-logged-out state); only
+            // a successful close clears them. [VARIANT] rpi's
+            // `manager.close` is infallible (transport teardown errors are
+            // contained in the manager, v0.1.4 frozen surface), so the
+            // upstream close-failure branch is structurally unreachable
+            // here — the ORDERING is the surviving semantic.
+            state.runtime.block_on(runtime.manager.close(&server));
             match crate::oauth::remove_auth(&server, &options) {
                 Ok(()) => {
-                    state.runtime.block_on(runtime.manager.close(&server));
                     update_status_bar(state);
                     let text = format!(
                         "OAuth credentials cleared for \"{server}\". Run /mcp-auth {server} to authenticate again."
@@ -1611,6 +1833,9 @@ fn handle_mcp_auth_command(state: &PluginState, args: &str) -> Value {
     let options = crate::oauth::AuthenticateOptions {
         auth_storage_options: crate::oauth::store::AuthStorageOptions {
             base_dir: oauth_dir(&runtime),
+            credential_store: crate::oauth::store::CredentialStoreSelection::from_settings(
+                runtime.config.settings.as_ref(),
+            ),
         },
         on_authorization_url: Some(Arc::new(move |url: &str| {
             let calls = RpiHostCalls { call };

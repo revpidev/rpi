@@ -35,4 +35,18 @@ pub enum AdapterError {
     /// registration so the next flow re-registers (#503).
     #[error("OAuth refresh token rejected (invalid_grant)")]
     OAuthInvalidGrant,
+
+    /// `OAuthCredentialStoreError` (#580, mcp-auth.ts:135-147): a backend
+    /// credential-store failure (never a plain "absent"). `operation` is
+    /// read/write/remove; `backend` mirrors `store.kind`; `cause` carries
+    /// the underlying error text — the classifier
+    /// (`format_oauth_credential_store_unavailable`) pattern-matches it to
+    /// pick the user-facing setup guidance (env-key missing / revoked
+    /// keyring / Windows logon 1312).
+    #[error("OAuth credential store unavailable ({operation}, {backend}): {cause}")]
+    OAuthCredentialStoreUnavailable {
+        operation: &'static str,
+        backend: &'static str,
+        cause: String,
+    },
 }

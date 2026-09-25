@@ -56,6 +56,9 @@ pub struct ServerConnection {
     pub resources: Mutex<Vec<Value>>,
     pub prompts: Mutex<Vec<Value>>,
     pub prompt_discovery_failed: bool,
+    /// #566: resources were advertised but discovery failed — the live
+    /// tool-surface overlay falls back to the persistent cache.
+    pub resource_discovery_failed: bool,
     pub instructions: Option<String>,
     pub last_used_at: AtomicU64,
     pub in_flight: AtomicUsize,
@@ -1222,6 +1225,7 @@ fn build_connection(
         resources: Mutex::new(metadata.resources),
         prompts: Mutex::new(metadata.prompts),
         prompt_discovery_failed: metadata.prompt_discovery_failed,
+        resource_discovery_failed: metadata.resource_discovery_failed,
         last_used_at: AtomicU64::new(now_ms()),
         in_flight: AtomicUsize::new(0),
         status: Mutex::new(ConnectionStatus::Connected),
@@ -1239,6 +1243,7 @@ fn needs_auth_connection(definition: &ServerEntry) -> ServerConnection {
         resources: Mutex::new(Vec::new()),
         prompts: Mutex::new(Vec::new()),
         prompt_discovery_failed: false,
+        resource_discovery_failed: false,
         instructions: None,
         last_used_at: AtomicU64::new(now_ms()),
         in_flight: AtomicUsize::new(0),
@@ -1582,6 +1587,23 @@ async fn enrich_http_connection_error(
             "{original_message} — endpoint is temporarily unavailable (HTTP 503)"
         ));
     }
+    // #544 (2c861d7, server-manager.ts @ 97435aab): on macOS, an
+    // unreachable/unauthorized failure against a LITERAL local address
+    // (RFC1918/link-local/ULA) points at Local Network Privacy — the hint
+    // replaces the probe (no amplified request). [VARIANT] the guidance
+    // names rpi instead of Pi (brand policy).
+    if cfg!(target_os = "macos") {
+        if let Ok(Some(url)) = crate::utils::resolve_server_url(definition.get("url")) {
+            if is_literal_local_address(&url)
+                && !local_network_failure_codes(&original_message).is_empty()
+            {
+                let codes = local_network_failure_codes(&original_message).join(", ");
+                return ProtocolError::Transport(format!(
+                    "{original_message} — {codes} — macOS Local Network Privacy may be blocking access. Check System Settings > Privacy & Security > Local Network for the app hosting rpi; enable access if listed and restart it. Try launching rpi from Terminal.app or SSH. Routing or firewall problems can also cause this error."
+                ));
+            }
+        }
+    }
     let url = match crate::utils::resolve_server_url(definition.get("url")) {
         Ok(Some(url)) => url,
         _ => return error,
@@ -1592,6 +1614,50 @@ async fn enrich_http_connection_error(
         }
         None => error,
     }
+}
+
+/// `isLiteralLocalAddress` (#544, server-manager.ts): a literal IP host in
+/// the private (RFC1918), link-local (169.254/16, fe80::/10) or unique
+/// local (fc00::/7) ranges — hostnames never match (DNS could resolve
+/// anywhere, so only literals are diagnosable).
+fn is_literal_local_address(server_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(server_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            // Unique local fc00::/7 + link local fe80::/10.
+            (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// `localNetworkFailureCodes` (#544): the network-unreachability error
+/// signatures. Upstream matches Node errno codes (EHOSTUNREACH/
+/// ENETUNREACH/EACCES) over the cause chain; the Rust transport surfaces
+/// the io::Error text instead ("host unreachable"/"network unreachable"/
+/// "permission denied") — both spellings match, codes keep the upstream
+/// names for message parity.
+fn local_network_failure_codes(message: &str) -> Vec<&'static str> {
+    let lowered = message.to_ascii_lowercase();
+    let mut codes = Vec::new();
+    if lowered.contains("ehostunreachable") || lowered.contains("host unreachable") {
+        codes.push("EHOSTUNREACH");
+    }
+    if lowered.contains("enetunreach") || lowered.contains("network unreachable") {
+        codes.push("ENETUNREACH");
+    }
+    if lowered.contains("eacces") || lowered.contains("permission denied") {
+        codes.push("EACCES");
+    }
+    codes
 }
 
 #[cfg(test)]

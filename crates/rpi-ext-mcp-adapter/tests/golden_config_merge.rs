@@ -70,9 +70,31 @@ fn config_merge_matches_upstream_load_mcp_config() {
                 index
             ));
             let home = sandbox.join("home");
-            let project = sandbox.join("proj");
+            // TE40 #556: ancestor-root cases nest the cwd inside the home
+            // sandbox (`projectSubdir`, path relative to home).
+            let project = case["projectSubdir"]
+                .as_str()
+                .map(|sub| home.join(sub))
+                .unwrap_or_else(|| sandbox.join("proj"));
             std::fs::create_dir_all(&home).expect("home dir");
             std::fs::create_dir_all(&project).expect("project dir");
+            // TE40 #556: ancestor configs (`ancestorLayers`, relative to
+            // the home sandbox; only read when the global layer opts in).
+            if let Some(ancestors) = case["ancestorLayers"].as_object() {
+                for (relative, content) in ancestors {
+                    let path = home.join(relative);
+                    std::fs::create_dir_all(path.parent().expect("ancestor parent"))
+                        .expect("mkdir");
+                    std::fs::write(
+                        &path,
+                        format!(
+                            "{}\n",
+                            serde_json::to_string_pretty(content).unwrap_or_default()
+                        ),
+                    )
+                    .expect("write ancestor layer");
+                }
+            }
 
             if let Some(layers) = case["layers"].as_object() {
                 for (layer, content) in layers {

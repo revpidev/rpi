@@ -15,7 +15,11 @@
 //! `authenticate` function resolves tokens via the store only; error
 //! messages never embed token values.
 
+pub mod encrypted_store;
 pub mod store;
+
+pub use encrypted_store::format_oauth_credential_store_unavailable;
+pub use store::{CredentialStoreSelection, SecretStoreKind};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,14 +33,150 @@ use crate::error::AdapterError;
 use crate::metadata::ServerEntry;
 use store::{AuthStorageOptions, OAuthCredentialStore, StoredTokens};
 
+/// `resolveOAuthRequestTimeoutMs` (#486, mcp-auth-fetch.ts:38-43):
+/// every OAuth discovery/registration/exchange/refresh request is bounded.
+/// [VARIANT] rpi default is 10s (stricter than the upstream 30s default —
+/// the v0.1.4 port chose 10s and the bound, not the number, is the
+/// #486 contract); `RPI_MCP_OAUTH_REQUEST_TIMEOUT_MS` overrides (brand
+/// rename per coding-standards §env).
+fn oauth_request_timeout() -> Duration {
+    std::env::var("RPI_MCP_OAUTH_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(10))
+}
+
+/// #535 (0829964, mcp-auth-fetch.ts createOAuthFetch @ 97435aab): the
+/// configured `headers` are SERVICE headers for the configured MCP origin
+/// only — they never ride along to a discovered issuer, SDK-constructed
+/// request headers win, and a credential-bearing request refuses redirects
+/// (fail closed, generic error text so the cause cannot leak secrets).
+/// Only an explicit `auth: "oauth"` coexists with configured headers
+/// (implicit auto-detection is disabled by their presence).
+#[derive(Clone)]
+struct OAuthFetch {
+    server_origin: String,
+    headers: Vec<(String, String)>,
+    /// #539: the per-server CA client (`caFile`); used for same-origin
+    /// requests (redirects already refused on it).
+    ca_client: Option<reqwest::Client>,
+}
+
+impl OAuthFetch {
+    fn new(definition: &ServerEntry, server_url: &str, server_name: &str) -> Self {
+        let explicit_oauth = definition.get_str("auth") == Some("oauth");
+        let headers = if explicit_oauth {
+            crate::utils::resolve_command_secrets_record(definition.get("headers"), &|key| {
+                format!("MCP server \"{server_name}\" OAuth HTTP header \"{key}\"")
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|map| {
+                map.into_iter()
+                    .filter_map(|(key, value)| value.as_str().map(|text| (key, text.to_string())))
+            })
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let origin = url::Url::parse(server_url)
+            .map(|parsed| {
+                let port_suffix = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+                format!(
+                    "{}://{}{}",
+                    parsed.scheme(),
+                    parsed.host_str().unwrap_or("localhost"),
+                    port_suffix
+                )
+            })
+            .unwrap_or_else(|_| server_url.to_string());
+        // #539: connection CA trust applies to the OAuth provider requests
+        // (same origin). An unloadable bundle fails the connect boundary
+        // first; here a failure degrades to the system trust store.
+        let ca_client = crate::protocol::http::ca_aware_client(definition, server_name).ok();
+        Self {
+            server_origin: origin,
+            headers,
+            ca_client,
+        }
+    }
+
+    fn protected(&self, target: &str) -> bool {
+        !self.headers.is_empty() && Self::origin_of(target) == Some(self.server_origin.clone())
+    }
+
+    fn origin_of(target: &str) -> Option<String> {
+        let parsed = url::Url::parse(target).ok()?;
+        let port_suffix = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+        Some(format!(
+            "{}://{}{}",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or("localhost"),
+            port_suffix
+        ))
+    }
+
+    /// The service headers for this target (same-origin only).
+    fn service_headers(&self, target: &str) -> Vec<(String, String)> {
+        if self.protected(target) {
+            self.headers.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A client for this target: same-origin requests prefer the #539 CA
+    /// client; redirects are refused while service headers are attached
+    /// (no trust-bearing redirect hops).
+    fn client(&self, target: &str) -> Result<reqwest::Client, AdapterError> {
+        let same_origin = Self::origin_of(target).as_deref() == Some(self.server_origin.as_str());
+        if same_origin && self.ca_client.is_some() {
+            return Ok(self.ca_client.clone().unwrap_or_default());
+        }
+        let mut builder = reqwest::Client::builder().timeout(oauth_request_timeout());
+        if self.protected(target) {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        builder
+            .build()
+            .map_err(|e| AdapterError::InvalidConfigValue(format!("HTTP client: {e}")))
+    }
+
+    /// `#535`: a failed protected request reports a generic cause.
+    fn map_send_error(&self, target: &str, context: &str, error: reqwest::Error) -> AdapterError {
+        if self.protected(target) {
+            AdapterError::InvalidConfigValue("OAuth HTTP request failed".to_string())
+        } else {
+            AdapterError::InvalidConfigValue(format!("{context}: {error}"))
+        }
+    }
+}
+
 /// `MODERN_PROTOCOL_VERSION` (mcp-probe.ts:2).
 pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 
 /// `LEGACY_PROTOCOL_VERSION` (mcp-probe.ts:3).
 pub const LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// `DEFAULT_OAUTH_CALLBACK_PORT` — 0 means OS-assigned (mcp-oauth-provider.ts).
-pub const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 0;
+/// `DEFAULT_OAUTH_CALLBACK_PORT` (mcp-oauth-provider.ts:92): 19876, the
+/// fixed loopback port for pre-registered clients relying on the default
+/// `/callback` path; overridable via `MCP_OAUTH_CALLBACK_PORT`. (v0.1.4
+// ported this as `0` = always OS-assigned; #483 completes the semantics —
+// strict binding for pre-registered clients, OS-assigned for dynamic
+// clients — closing the drift registered with the #483 anchor.)
+pub const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 19876;
+
+/// The configured callback port (`MCP_OAUTH_CALLBACK_PORT`, 1-65535,
+/// default 19876).
+fn configured_oauth_callback_port() -> u16 {
+    std::env::var("MCP_OAUTH_CALLBACK_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEFAULT_OAUTH_CALLBACK_PORT)
+}
 
 /// `DEFAULT_OAUTH_CALLBACK_PATH` (mcp-oauth-provider.ts).
 pub const DEFAULT_OAUTH_CALLBACK_PATH: &str = "/callback";
@@ -134,6 +274,11 @@ struct AuthServerMetadata {
     // callback parameter (mcp-auth-flow.ts:675-676).
     #[serde(default)]
     authorization_response_iss_parameter_supported: Option<bool>,
+    // #571 (b8fbc9c): when advertised, an operator-supplied
+    // `oauth.clientMetadataUrl` is used as the client_id (CIMD) and Dynamic
+    // Client Registration is skipped.
+    #[serde(default)]
+    client_id_metadata_document_supported: Option<bool>,
 }
 
 /// Discover the authorization server metadata (RFC 8414). Upstream uses
@@ -148,12 +293,10 @@ async fn discover_auth_server_metadata_with_override(
     server_url: &str,
     skip_validation: bool,
     override_url: Option<&str>,
+    fetch: &OAuthFetch,
 ) -> Result<AuthServerMetadata, AdapterError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("HTTP client: {e}")))?;
-
+    // The metadata URL is resolved first so the #535 service-header scope
+    // can key off the actual target (same-origin only).
     let (metadata_url, metadata_origin): (String, Option<String>) = match override_url {
         Some(configured) => {
             let parsed = url::Url::parse(configured).map_err(|e| {
@@ -179,15 +322,17 @@ async fn discover_auth_server_metadata_with_override(
             )
         }
     };
-
-    let response = client
+    let client = fetch.client(&metadata_url)?;
+    let mut request = client
         .get(&metadata_url)
-        .header("accept", "application/json")
+        .header("accept", "application/json");
+    for (key, value) in fetch.service_headers(&metadata_url) {
+        request = request.header(&key, &value);
+    }
+    let response = request
         .send()
         .await
-        .map_err(|e| {
-            AdapterError::InvalidConfigValue(format!("auth server metadata fetch: {e}"))
-        })?;
+        .map_err(|e| fetch.map_send_error(&metadata_url, "auth server metadata fetch", e))?;
 
     if !response.status().is_success() {
         if override_url.is_some() {
@@ -321,6 +466,9 @@ struct OAuthConfig {
     scope: Option<String>,
     grant_type: String,
     redirect_uri: Option<String>,
+    /// `oauth.clientMetadataUrl` (#571): an advanced, operator-supplied
+    /// public HTTPS Client ID Metadata Document URL.
+    client_metadata_url: Option<String>,
 }
 
 /// The #458 validation ladder, message-for-message
@@ -376,7 +524,39 @@ fn parse_oauth_config(definition: &ServerEntry) -> OAuthConfig {
             .and_then(|o| o.get("redirectUri"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        client_metadata_url: oauth
+            .and_then(|o| o.get("clientMetadataUrl"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
+}
+
+/// The #571 validation ladder (mcp-oauth-provider.ts constructor @
+/// 97435aab): a CIMD URL must be HTTPS with a non-root path; a client
+/// secret without an explicit client id cannot be combined with CIMD
+/// (ambiguous which credential authorizes the request). An explicit
+/// `clientId` always wins (CIMD is then ignored, matching the provider's
+/// `clientMetadataUrl` getter).
+fn validate_oauth_config(config: &OAuthConfig) -> Result<(), AdapterError> {
+    if let Some(metadata_url) = &config.client_metadata_url {
+        if config.client_id.is_none() && config.client_secret.is_some() {
+            return Err(AdapterError::InvalidConfigValue(
+                "clientSecret requires an explicit clientId".to_string(),
+            ));
+        }
+        let valid = url::Url::parse(metadata_url)
+            .ok()
+            .filter(|parsed| {
+                parsed.scheme() == "https" && parsed.path() != "/" && !parsed.path().is_empty()
+            })
+            .is_some();
+        if !valid {
+            return Err(AdapterError::InvalidConfigValue(
+                "clientMetadataUrl must be a valid HTTPS URL with a non-root pathname".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `config.authServerMetadataUrl` (#458): the VALIDATED value consumed by
@@ -407,7 +587,8 @@ pub fn configured_grant_type(definition: &ServerEntry) -> String {
 async fn register_client(
     metadata: &AuthServerMetadata,
     _server_name: &str,
-    callback_port: u16,
+    redirect_uri: &str,
+    fetch: &OAuthFetch,
 ) -> Result<(String, Option<String>), AdapterError> {
     let endpoint = metadata.registration_endpoint.as_ref().ok_or_else(|| {
         AdapterError::InvalidConfigValue(
@@ -415,14 +596,9 @@ async fn register_client(
         )
     })?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("HTTP client: {e}")))?;
+    let client = fetch.client(endpoint)?;
 
-    let redirect_uris = json!([format!(
-        "http://localhost:{callback_port}{DEFAULT_OAUTH_CALLBACK_PATH}"
-    )]);
+    let redirect_uris = json!([redirect_uri]);
 
     // clientMetadata (mcp-oauth-provider.ts:230-246): field order mirrored
     // for byte-level parity of the recorded request body. `client_uri` is
@@ -438,14 +614,18 @@ async fn register_client(
         "application_type": "native",
     });
 
-    let response = client
+    let mut request = client
         .post(endpoint)
         .header("content-type", "application/json")
-        .header("accept", "application/json")
+        .header("accept", "application/json");
+    for (key, value) in fetch.service_headers(endpoint) {
+        request = request.header(&key, &value);
+    }
+    let response = request
         .json(&body)
         .send()
         .await
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("DCR request: {e}")))?;
+        .map_err(|e| fetch.map_send_error(endpoint, "DCR request", e))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -483,6 +663,7 @@ async fn authenticate_client_credentials(
     _definition: &ServerEntry,
     metadata: &AuthServerMetadata,
     config: &OAuthConfig,
+    fetch: &OAuthFetch,
 ) -> Result<AuthStatus, AdapterError> {
     let client_id = match &config.client_id {
         Some(id) => id.clone(),
@@ -498,7 +679,10 @@ async fn authenticate_client_credentials(
             match stored_id {
                 Some(id) => id,
                 None => {
-                    let (id, secret) = register_client(metadata, server_name, 0).await?;
+                    let default_redirect =
+                        format!("http://localhost:0{DEFAULT_OAUTH_CALLBACK_PATH}");
+                    let (id, secret) =
+                        register_client(metadata, server_name, &default_redirect, fetch).await?;
                     // Persist the registration so refreshes can use the
                     // DCR-issued client_id (same write as the no-entry
                     // branch — the entry branch previously lost it).
@@ -517,10 +701,7 @@ async fn authenticate_client_credentials(
         }
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("HTTP client: {e}")))?;
+    let client = fetch.client(&metadata.token_endpoint)?;
 
     let mut body = json!({
         "grant_type": "client_credentials",
@@ -533,14 +714,18 @@ async fn authenticate_client_credentials(
         body["scope"] = json!(scope);
     }
 
-    let response = client
+    let mut request = client
         .post(&metadata.token_endpoint)
         .header("content-type", "application/x-www-form-urlencoded")
-        .header("accept", "application/json")
+        .header("accept", "application/json");
+    for (key, value) in fetch.service_headers(&metadata.token_endpoint) {
+        request = request.header(&key, &value);
+    }
+    let response = request
         .form(&body)
         .send()
         .await
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("token request: {e}")))?;
+        .map_err(|e| fetch.map_send_error(&metadata.token_endpoint, "token request", e))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -706,6 +891,12 @@ pub async fn authenticate_with_store(
     options: &AuthenticateOptions,
 ) -> Result<AuthStatus, AdapterError> {
     let config = parse_oauth_config(definition);
+    // #571: the CIMD validation ladder runs at the auth boundary (upstream
+    // throws from the McpOAuthProvider constructor).
+    validate_oauth_config(&config)?;
+    // #535: origin-scoped service headers for this auth leg (explicit
+    // `auth: "oauth"` only).
+    let fetch = OAuthFetch::new(definition, server_url, server_name);
 
     // Check existing credentials first.
     if let Some(entry) = store.get_for_url(server_name, server_url)? {
@@ -729,6 +920,7 @@ pub async fn authenticate_with_store(
                         server_url,
                         options.skip_issuer_metadata_validation,
                         metadata_override.as_deref(),
+                        &fetch,
                     )
                     .await
                     {
@@ -751,6 +943,7 @@ pub async fn authenticate_with_store(
                             &refresh_client_id,
                             refresh,
                             &refresh_client_secret,
+                            &fetch,
                         )
                         .await
                         {
@@ -781,6 +974,7 @@ pub async fn authenticate_with_store(
         server_url,
         options.skip_issuer_metadata_validation,
         metadata_override.as_deref(),
+        &fetch,
     )
     .await?;
 
@@ -792,52 +986,106 @@ pub async fn authenticate_with_store(
             definition,
             &metadata,
             &config,
+            &fetch,
         )
         .await;
     }
 
     // Authorization code + PKCE flow
-    // Bind the callback listener FIRST (mcp-callback-server.ts
-    // ensureCallbackServer): an OS-assigned port (0) must be resolved to the
-    // real one before DCR and the authorization URL are built — the
-    // registered redirect_uris and the redirect_uri in the authorization
-    // URL have to match the bound listener exactly.
-    let port = DEFAULT_OAUTH_CALLBACK_PORT;
-    let callback_listener = bind_callback_listener(port).await?;
-    let actual_port = callback_listener
-        .local_addr()
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("callback server addr: {e}")))?
-        .port();
+    // #483 (cb8e316): the callback endpoint comes from `oauth.redirectUri`
+    // when it is a loopback `http://` URI — an explicit port is bound
+    // exactly, `{port}` (or no port) takes an OS-assigned port, and the
+    // URI's host (localhost / 127.0.0.1 / [::1]) is the bound host. Bind
+    // FIRST so the registered redirect_uris and the authorization URL
+    // carry the resolved port.
+    let loopback = config
+        .redirect_uri
+        .as_deref()
+        .and_then(parse_loopback_redirect_uri);
+    // `strictPort: Boolean(config.clientId)` (mcp-auth-flow.ts:507 @
+    // 97435aab): a pre-registered client relying on the default path binds
+    // the configured default port exactly.
+    let pre_registered_default = config.client_id.is_some() && config.redirect_uri.is_none();
+    let (callback_listener, actual_port) =
+        bind_callback_endpoint(loopback.as_ref(), pre_registered_default).await?;
+    let redirect_uri = match &config.redirect_uri {
+        Some(uri) if uri.contains("{port}") => uri.replace("{port}", &actual_port.to_string()),
+        Some(uri) => uri.clone(),
+        None => format!("http://localhost:{actual_port}{DEFAULT_OAUTH_CALLBACK_PATH}"),
+    };
 
-    let client_id;
+    // Client identity ladder (#571 + stored-DCR reuse): an explicit
+    // `clientId` wins; else CIMD when the discovered metadata advertises
+    // `client_id_metadata_document_supported`; else a stored DCR
+    // registration whose redirect_uris still cover the current callback
+    // (#503: a stale redirect only drops the registration when the
+    // credentials are not refresh-capable); else a fresh DCR.
     let mut client_secret = config.client_secret.clone();
-    match &config.client_id {
-        Some(id) => client_id = id.clone(),
+    let client_id = match &config.client_id {
+        Some(id) => id.clone(),
         None => {
-            let (id, secret) = register_client(&metadata, server_name, actual_port).await?;
-            store.update_client_info(
-                server_name,
-                store::StoredClientInfo {
-                    client_id: id.clone(),
-                    client_secret: secret.clone(),
-                    ..Default::default()
-                },
-                Some(server_url),
-            )?;
-            client_id = id;
-            // DCR-issued secret authenticates the token exchange even
-            // though it is not in the config (upstream stores it on the
-            // provider and the SDK applies it automatically).
-            if client_secret.is_none() {
-                client_secret = secret;
+            if config.client_metadata_url.is_some()
+                && metadata.client_id_metadata_document_supported == Some(true)
+            {
+                // CIMD (#571): the operator-supplied URL IS the client_id;
+                // no secret accompanies it and DCR is skipped. A stored DCR
+                // registration is kept untouched so an earlier refresh pair
+                // survives the migration (upstream "preserves a stored DCR
+                // refresh pair before transitioning to CIMD").
+                config.client_metadata_url.clone().unwrap_or_default()
+            } else {
+                let stored = store
+                    .get_entry(server_name)?
+                    .and_then(|entry| entry.client_info)
+                    .filter(|info| {
+                        // #503 stale-redirect gate: reuse unless the stored
+                        // redirect_uris miss the current callback AND the
+                        // stored tokens are not refresh-capable.
+                        let stale_redirect = info
+                            .redirect_uris
+                            .as_ref()
+                            .is_some_and(|uris| !uris.contains(&redirect_uri));
+                        let refresh_capable = store
+                            .get_entry(server_name)
+                            .ok()
+                            .flatten()
+                            .and_then(|e| e.tokens)
+                            .and_then(|t| t.refresh_token)
+                            .is_some();
+                        !(stale_redirect && !refresh_capable)
+                    });
+                match stored {
+                    Some(info) => {
+                        if client_secret.is_none() {
+                            client_secret = info.client_secret.clone();
+                        }
+                        info.client_id
+                    }
+                    None => {
+                        let (id, secret) =
+                            register_client(&metadata, server_name, &redirect_uri, &fetch).await?;
+                        store.update_client_info(
+                            server_name,
+                            store::StoredClientInfo {
+                                client_id: id.clone(),
+                                client_secret: secret.clone(),
+                                redirect_uris: Some(vec![redirect_uri.clone()]),
+                                ..Default::default()
+                            },
+                            Some(server_url),
+                        )?;
+                        // DCR-issued secret authenticates the token exchange even
+                        // though it is not in the config (upstream stores it on
+                        // the provider and the SDK applies it automatically).
+                        if client_secret.is_none() {
+                            client_secret = secret;
+                        }
+                        id
+                    }
+                }
             }
         }
     };
-
-    let redirect_uri = config
-        .redirect_uri
-        .clone()
-        .unwrap_or_else(|| format!("http://localhost:{actual_port}{DEFAULT_OAUTH_CALLBACK_PATH}"));
 
     let (auth_url, code_verifier, state) = build_authorization_url(
         &metadata.authorization_endpoint,
@@ -889,6 +1137,7 @@ pub async fn authenticate_with_store(
         &redirect_uri,
         &code_verifier,
         client_secret.as_ref(),
+        &fetch,
     )
     .await?;
 
@@ -905,11 +1154,9 @@ async fn exchange_code(
     redirect_uri: &str,
     code_verifier: &str,
     client_secret: Option<&String>,
+    fetch: &OAuthFetch,
 ) -> Result<StoredTokens, AdapterError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("HTTP client: {e}")))?;
+    let client = fetch.client(token_endpoint)?;
 
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
@@ -977,11 +1224,9 @@ async fn refresh_token(
     client_id: &Option<String>,
     refresh_token: &str,
     client_secret: &Option<String>,
+    fetch: &OAuthFetch,
 ) -> Result<StoredTokens, AdapterError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("HTTP client: {e}")))?;
+    let client = fetch.client(token_endpoint)?;
 
     let mut form: Vec<(&str, String)> = vec![
         ("grant_type", "refresh_token".to_string()),
@@ -1055,27 +1300,108 @@ async fn refresh_token(
     })
 }
 
-/// Localhost callback server: binds `127.0.0.1:{port}`, waits for a single
-/// redirect with `?code=...&state=...`, then closes. Uses
-/// `tokio::net::TcpListener` (design §3.7: no axum).
-///
-/// Upstream `mcp-callback-server.ts`: the server is a singleton with
-/// pending-auth state tracking. Here we simplify to a one-shot server per
-/// call (sufficient for the P1-wave automated and manual flows).
-async fn bind_callback_listener(port: u16) -> Result<tokio::net::TcpListener, AdapterError> {
-    let bind_addr = if port == 0 {
-        "127.0.0.1:0".to_string()
+/// `parseOAuthRedirectUri` (mcp-auth-flow.ts:373-427 @ 97435aab, #483):
+/// classify `oauth.redirectUri`. A `{port}` placeholder (at most one, in
+/// the port position) takes an OS-assigned port; an explicit port binds
+/// exactly; `https://` non-loopback is the manual mode; everything else is
+/// an error. Returns `(callback_host, Option<port>, callback_path)` for
+/// the local mode.
+fn parse_loopback_redirect_uri(redirect_uri: &str) -> Option<(String, Option<u16>, String)> {
+    let placeholder_count = redirect_uri.matches("{port}").count();
+    if placeholder_count > 1 {
+        // At most one {port} placeholder; surface as a parse error via the
+        // manual `None` path is wrong — this is a hard config error, but
+        // the caller validates first; keep the classification total here.
+        return None;
+    }
+    let dynamic_port = placeholder_count == 1;
+    let parseable = if dynamic_port {
+        let authority_start = redirect_uri.find("://")? + 3;
+        let authority_end = redirect_uri[authority_start..]
+            .find(['/', '?', '#'])
+            .map(|offset| authority_start + offset)
+            .unwrap_or(redirect_uri.len());
+        let authority = &redirect_uri[authority_start..authority_end];
+        if !authority.ends_with(":{port}") {
+            return None;
+        }
+        redirect_uri.replace("{port}", "1")
     } else {
-        format!("127.0.0.1:{port}")
+        redirect_uri.to_string()
     };
+    let Ok(url) = url::Url::parse(&parseable) else {
+        return None;
+    };
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let is_loopback =
+        host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+    if dynamic_port && (url.scheme() != "http" || !is_loopback) {
+        return None;
+    }
+    let port = url.port();
+    if url.scheme() == "https" && !is_loopback {
+        // Manual mode — no local listener (rpi surfaces the manual guidance
+        // through the 5-minute callback wait; a non-loopback callback can
+        // never reach it).
+        return None;
+    }
+    if url.scheme() != "http" || !is_loopback {
+        return None;
+    }
+    if port.is_none() && !dynamic_port {
+        // An http:// loopback URI needs an explicit port (or {port}).
+        return None;
+    }
+    let callback_host = if host == "[::1]" {
+        "::1".to_string()
+    } else {
+        host
+    };
+    Some((callback_host, port, url.path().to_string()))
+}
+
+/// `ensureCallbackServer` (#483): bind the callback listener. With a
+/// loopback redirect target the explicit port binds EXACTLY (strictPort);
+/// a `{port}` placeholder or the dynamic-client default takes an
+/// OS-assigned port. Without a redirect target, a pre-registered
+/// (`clientId`) client binds the configured default port strictly and a
+/// dynamic client takes an OS-assigned port.
+async fn bind_callback_endpoint(
+    loopback: Option<&(String, Option<u16>, String)>,
+    pre_registered_default: bool,
+) -> Result<(tokio::net::TcpListener, u16), AdapterError> {
+    let (bind_host, strict_port): (&str, Option<u16>) = match loopback {
+        Some((host, Some(port), _)) => (host.as_str(), Some(*port)),
+        Some((host, None, _)) => (host.as_str(), None),
+        None => (
+            "127.0.0.1",
+            pre_registered_default.then(configured_oauth_callback_port),
+        ),
+    };
+    let bind_addr = format!(
+        "{bind_host}:{}",
+        strict_port
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "0".to_string())
+    );
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("callback server bind: {e}")))?;
+        .map_err(|e| {
+            AdapterError::InvalidConfigValue(format!("callback server bind {bind_addr}: {e}"))
+        })?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| AdapterError::InvalidConfigValue(format!("callback server addr: {e}")))?
+        .port();
     tracing::debug!(
-        port = listener.local_addr().map(|a| a.port()).unwrap_or(0),
+        port,
+        host = bind_host,
         "MCP OAuth callback server listening"
     );
-    Ok(listener)
+    Ok((listener, port))
 }
 
 async fn wait_for_callback(
@@ -1267,10 +1593,12 @@ pub async fn resolve_access_token(
     let metadata_override = configured_auth_server_metadata_url(definition)
         .ok()
         .flatten();
+    let fetch = OAuthFetch::new(definition, server_url, server_name);
     let metadata = match discover_auth_server_metadata_with_override(
         server_url,
         false,
         metadata_override.as_deref(),
+        &fetch,
     )
     .await
     {
@@ -1298,6 +1626,7 @@ pub async fn resolve_access_token(
         &client_id,
         &refresh,
         &client_secret,
+        &fetch,
     )
     .await
     {

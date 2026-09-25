@@ -142,60 +142,79 @@ pub fn format_status_bar_text(config: &McpConfig, message: &str) -> Option<Strin
     Some(format!("{prefix}{message}"))
 }
 
-/// `updateStatusBar` (init.ts:520-556): build the footer status-bar text
-/// for key "mcp" (`None` clears the status). Reads connection state
-/// without triggering connections.
+/// `updateStatusBar` (init.ts:636-660 + utils.ts formatMcpFooterStatus @
+/// 97435aab, #604): build the footer status-bar text for key "mcp"
+/// (`None` clears the status). Reads connection state without triggering
+/// connections.
 pub fn build_status_bar_text(config: &McpConfig, manager: &McpServerManager) -> Option<String> {
-    let entries: Vec<(&String, &ServerEntry)> = config.mcp_servers.iter().collect();
-    if entries.is_empty() {
-        return None;
-    }
-    let disabled_count = entries
-        .iter()
-        .filter(|(_, definition)| definition.is_disabled())
-        .count();
-    let enabled_count = entries.len() - disabled_count;
-    if enabled_count == 0 {
-        return None;
-    }
-    let connected_count = manager
-        .get_all_connections()
-        .into_iter()
-        .filter(|(name, connection)| {
-            connection.status() == ConnectionStatus::Connected
-                && config
-                    .mcp_servers
-                    .get(name)
-                    .is_some_and(|definition| !definition.is_disabled())
-        })
-        .count();
+    format_mcp_footer_status(config, &FooterStateSnapshot::from_manager(config, manager))
+}
 
+/// The counts `formatMcpFooterStatus` needs (utils.ts:429-443 @ 97435aab).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FooterStateSnapshot {
+    pub enabled_count: usize,
+    pub disabled_count: usize,
+    pub connected_count: usize,
+}
+
+impl FooterStateSnapshot {
+    /// Count from a live manager (init.ts `updateStatusBar` inputs).
+    pub fn from_manager(config: &McpConfig, manager: &McpServerManager) -> Self {
+        let entries: Vec<(&String, &ServerEntry)> = config.mcp_servers.iter().collect();
+        let disabled_count = entries
+            .iter()
+            .filter(|(_, definition)| definition.is_disabled())
+            .count();
+        let enabled_count = entries.len() - disabled_count;
+        let connected_count = manager
+            .get_all_connections()
+            .into_iter()
+            .filter(|(name, connection)| {
+                connection.status() == ConnectionStatus::Connected
+                    && config
+                        .mcp_servers
+                        .get(name)
+                        .is_some_and(|definition| !definition.is_disabled())
+            })
+            .count();
+        Self {
+            enabled_count,
+            disabled_count,
+            connected_count,
+        }
+    }
+}
+
+/// `formatMcpFooterStatus` (utils.ts:429-443 @ 97435aab, #604): `off` wins
+/// first; an EMPTY server table clears the footer, but a table whose
+/// servers are all disabled still shows (`enabledCount + disabledCount ===
+/// 0` is the empty test — the pre-fix `enabledCount === 0` cleared
+/// all-disabled tables); `compact` renders `MCP c/e`.
+pub fn format_mcp_footer_status(config: &McpConfig, state: &FooterStateSnapshot) -> Option<String> {
     let footer_status = FooterStatus::from_settings(config.settings.as_ref());
-    if footer_status == FooterStatus::Off {
+    if state.enabled_count + state.disabled_count == 0 || footer_status == FooterStatus::Off {
         return None;
     }
-    let status = if footer_status == FooterStatus::Compact {
-        format!("MCP {connected_count}/{enabled_count}")
-    } else {
-        let plural = if enabled_count == 1 {
-            "server"
-        } else {
-            "servers"
-        };
-        let mut text = format!("{enabled_count} {plural} enabled");
-        if connected_count > 0 {
-            text.push_str(&format!(" ({connected_count} connected)"));
-        }
-        if disabled_count > 0 {
-            text.push_str(&format!(" ({disabled_count} disabled)"));
-        }
-        text
-    };
     if footer_status == FooterStatus::Compact {
-        Some(status)
-    } else {
-        format_status_bar_text(config, &status)
+        return Some(format!(
+            "MCP {}/{}",
+            state.connected_count, state.enabled_count
+        ));
     }
+    let plural = if state.enabled_count == 1 {
+        "server"
+    } else {
+        "servers"
+    };
+    let mut text = format!("{} {} enabled", state.enabled_count, plural);
+    if state.connected_count > 0 {
+        text.push_str(&format!(" ({} connected)", state.connected_count));
+    }
+    if state.disabled_count > 0 {
+        text.push_str(&format!(" ({} disabled)", state.disabled_count));
+    }
+    format_status_bar_text(config, &text)
 }
 
 /// `createMcpStatusSnapshot` (mcp-status.ts:24-77): build a sanitized
@@ -572,7 +591,10 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_disabled_only_config_clears() {
+    /// #604 (7248ba0): an all-disabled table is NOT empty — the footer
+    /// shows "0 servers enabled (N disabled)" instead of clearing (the
+    /// empty test is `enabled + disabled === 0`). Old expectation: `None`.
+    fn status_bar_disabled_only_config_still_shows() {
         let mut servers = IndexMap::new();
         servers.insert(
             "b".to_string(),
@@ -585,6 +607,35 @@ mod tests {
         );
         let config = McpConfig {
             mcp_servers: servers,
+            ..Default::default()
+        };
+        let text =
+            build_status_bar_text(&config, &McpServerManager::new(None)).expect("footer shows");
+        assert!(text.contains("0 servers enabled"));
+        assert!(text.contains("(1 disabled)"));
+    }
+
+    #[test]
+    fn footer_status_off_wins_over_disabled_only_table() {
+        // #604: `off` clears even when the table is non-empty.
+        let mut servers = IndexMap::new();
+        servers.insert(
+            "b".to_string(),
+            ServerEntry(
+                json!({ "disabled": true })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
+        let config = McpConfig {
+            mcp_servers: servers,
+            settings: Some(
+                json!({ "mcpFooterStatus": "off" })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
             ..Default::default()
         };
         assert!(build_status_bar_text(&config, &McpServerManager::new(None)).is_none());

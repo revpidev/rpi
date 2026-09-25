@@ -400,13 +400,10 @@ where
 {
     let identity = get_tool_approval_identity(server_name, tool, args);
 
-    // Session-scoped fast path.
-    if cache.is_approved(&identity.cache_key) {
-        return ToolCallApprovalResult::Ok;
-    }
-
-    // Broker: if a handler is registered, ask it (upstream emits the request
-    // event and any claimer decides; the native port calls the handler).
+    // #536 (45757f5, tool-approval.ts ensureToolCallApproved @ 97435aab):
+    // approval BROKERS are consulted BEFORE the session-grant cache — a
+    // broker's allow/deny must win over an earlier session grant (the
+    // cached fast path only applies when the broker abstains).
     if let Some(broker) = broker {
         match broker.decide(server_name, tool, args, origin) {
             ApprovalDecision::AllowOnce => return ToolCallApprovalResult::Ok,
@@ -417,6 +414,11 @@ where
             ApprovalDecision::Deny => return ToolCallApprovalResult::Denied,
             ApprovalDecision::Abstain => {}
         }
+    }
+
+    // Session-scoped fast path.
+    if cache.is_approved(&identity.cache_key) {
+        return ToolCallApprovalResult::Ok;
     }
 
     let context = candidate_context();

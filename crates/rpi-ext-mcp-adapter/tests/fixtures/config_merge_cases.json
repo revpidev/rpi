@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/config.ts loadMcpConfig @ 7a7b01b, executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/config.ts loadMcpConfig @ 97435aab, executed by gen-mcp-adapter-fixtures.mjs",
   "note": "imports are expanded by upstream loadMcpConfig but NOT by the P0 rpi port [VARIANT]; no fixture case uses imports-dependent servers.",
   "cases": [
     {
@@ -181,6 +181,216 @@
         "mcpServers": {
           "litellm": {
             "url": "https://attacker.example/mcp/"
+          }
+        }
+      }
+    },
+    {
+      "name": "command-switch-drops-bearer-store-and-cafile",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "bearerTokenStore": "rpi-mcp-adapter.bearer",
+              "caFile": "~/certs/internal-bundle.pem",
+              "headers": {
+                "Authorization": "Bearer secret-vk"
+              }
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "command": "node",
+              "args": [
+                "server.js"
+              ]
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "command": "node",
+            "args": [
+              "server.js"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "socket-switch-drops-bearer-store-and-cafile",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "bearerTokenStore": "rpi-mcp-adapter.bearer",
+              "caFile": "~/certs/internal-bundle.pem"
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "socket": "/run/mcp.sock"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "socket": "/run/mcp.sock"
+          }
+        }
+      }
+    },
+    {
+      "name": "url-change-strips-cafile",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "caFile": "~/certs/a.pem"
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://attacker.example/mcp/"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "url": "https://attacker.example/mcp/"
+          }
+        }
+      }
+    },
+    {
+      "name": "blank-optional-config-is-absent",
+      "layers": {
+        "pi-global": {
+          "mcpServers": {
+            "pi": {
+              "command": "node"
+            }
+          }
+        }
+      },
+      "rawLayers": {
+        "shared-global": "// only a comment\n/* and a block\n*/\n"
+      },
+      "expected": {
+        "mcpServers": {
+          "pi": {
+            "command": "node"
+          }
+        }
+      }
+    },
+    {
+      "name": "ancestor-config-roots-opt-in",
+      "layers": {
+        "pi-global": {
+          "settings": {
+            "ancestorConfigRoots": [
+              "~/workspace"
+            ]
+          },
+          "mcpServers": {
+            "fromGlobal": {
+              "command": "global"
+            }
+          }
+        },
+        "shared-project": {
+          "mcpServers": {
+            "cwdWins": {
+              "command": "cwd"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "ancestorLayers": {
+        "workspace/.mcp.json": {
+          "mcpServers": {
+            "ancFar": {
+              "command": "anc-far"
+            }
+          }
+        },
+        "workspace/a/.mcp.json": {
+          "mcpServers": {
+            "ancNear": {
+              "command": "anc-near"
+            }
+          }
+        }
+      },
+      "projectSubdir": "workspace/a/proj",
+      "expected": {
+        "mcpServers": {
+          "fromGlobal": {
+            "command": "global"
+          },
+          "ancFar": {
+            "command": "anc-far"
+          },
+          "ancNear": {
+            "command": "anc-near"
+          },
+          "cwdWins": {
+            "command": "cwd"
+          }
+        },
+        "settings": {
+          "ancestorConfigRoots": [
+            "~/workspace"
+          ]
+        }
+      }
+    },
+    {
+      "name": "ancestor-config-roots-not-opted-in",
+      "layers": {
+        "pi-global": {
+          "mcpServers": {
+            "fromGlobal": {
+              "command": "global"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "ancestorLayers": {
+        "workspace/.mcp.json": {
+          "mcpServers": {
+            "ancFar": {
+              "command": "anc-far"
+            }
+          }
+        }
+      },
+      "projectSubdir": "workspace/a/proj",
+      "expected": {
+        "mcpServers": {
+          "fromGlobal": {
+            "command": "global"
           }
         }
       }
@@ -481,27 +691,6 @@
             "command": "x"
           }
         }
-      }
-    },
-    {
-      "name": "jsonc-comments-and-trailing-commas",
-      "layers": {},
-      "rawLayers": {
-        "pi-global": "{\n        // leading comment\n        \"imports\": [\"vscode\",],\n        \"mcpServers\": {\n          \"global\": { \"command\": \"global-server\", },\n        },\n      }",
-        "shared-project": "{\n        /* block\n           comment */\n        \"mcpServers\": {\n          \"project\": { \"command\": \"project-server\", },\n        },\n      }"
-      },
-      "expected": {
-        "mcpServers": {
-          "global": {
-            "command": "global-server"
-          },
-          "project": {
-            "command": "project-server"
-          }
-        },
-        "imports": [
-          "vscode"
-        ]
       }
     }
   ]

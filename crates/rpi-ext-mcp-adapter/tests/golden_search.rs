@@ -167,6 +167,7 @@ fn search_matches_upstream_scores_and_ordering() {
             &search_state,
             case["name"].as_str().unwrap_or_default(),
             case["limit"].as_u64().unwrap_or(5) as usize,
+            None,
         );
         let expected: Vec<&str> = case["expected"]
             .as_array()

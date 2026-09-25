@@ -40,7 +40,11 @@ const BUILTIN_NAMES: [&str; 8] = ["read", "bash", "edit", "write", "grep", "find
 /// `DIRECT_TOOLS_ADVISORY_THRESHOLD` (direct-tools.ts:27).
 pub const DIRECT_TOOLS_ADVISORY_THRESHOLD: usize = 75;
 
-/// `DirectToolSpec` (types.ts:570-579, minus P2 UI fields).
+/// `DirectToolSpec` (types.ts:570-579, minus P2 UI fields). `held_out`
+/// marks a `directTools: "search"` spec (#525, c76993f): registered with
+/// its full schema but held out of the ACTIVE set until a `mcp({ search })`
+/// activates it; search-mode tools do not count toward the 75-tool
+/// advisory and connect never reports them as loaded.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DirectToolSpec {
     pub server_name: String,
@@ -49,6 +53,7 @@ pub struct DirectToolSpec {
     pub description: String,
     pub input_schema: Option<Value>,
     pub resource_uri: Option<String>,
+    pub held_out: bool,
 }
 
 /// `parseDirectToolSelectors` (metadata-cache.ts:122-146): `server` or
@@ -171,6 +176,9 @@ pub fn resolve_direct_tools(
             }
             None => match definition.get("directTools") {
                 Some(Value::Bool(true)) => ToolFilter::All,
+                // #525: the string form "search" registers schema-backed
+                // direct tools held out of the active set.
+                Some(Value::String(mode)) if mode == "search" => ToolFilter::SearchMode,
                 Some(Value::Array(list)) => ToolFilter::List(
                     list.iter()
                         .filter_map(Value::as_str)
@@ -222,6 +230,7 @@ pub fn resolve_direct_tools(
                 description: tool.description.clone().unwrap_or_default(),
                 input_schema: tool.input_schema.clone(),
                 resource_uri: None,
+                held_out: tool_filter.holds_out(),
             });
         }
 
@@ -260,6 +269,7 @@ pub fn resolve_direct_tools(
                         .unwrap_or_else(|| format!("Read resource: {}", resource.uri)),
                     input_schema: None,
                     resource_uri: Some(resource.uri.clone()),
+                    held_out: tool_filter.holds_out(),
                 });
             }
         }
@@ -286,7 +296,9 @@ pub fn resolve_direct_tools(
         .and_then(|s| s.get("warnOnLargeDirectTools"))
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    if advisory_enabled && emitted.len() >= DIRECT_TOOLS_ADVISORY_THRESHOLD {
+    // #525: search-mode tools do not count toward the advisory.
+    let active_count = emitted.iter().filter(|spec| !spec.held_out).count();
+    if advisory_enabled && active_count >= DIRECT_TOOLS_ADVISORY_THRESHOLD {
         warn!(
             count = emitted.len(),
             "MCP: {} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered. Set settings.warnOnLargeDirectTools to false to hide this advisory.",
@@ -298,6 +310,9 @@ pub fn resolve_direct_tools(
 
 enum ToolFilter {
     All,
+    /// `directTools: "search"` (#525): like All, but the specs are held out
+    /// of the active set until a search activates them.
+    SearchMode,
     List(Vec<String>),
     None,
 }
@@ -305,10 +320,15 @@ enum ToolFilter {
 impl ToolFilter {
     fn allows(&self, name: &str) -> bool {
         match self {
-            ToolFilter::All => true,
+            ToolFilter::All | ToolFilter::SearchMode => true,
             ToolFilter::List(list) => list.iter().any(|n| n == name),
             ToolFilter::None => false,
         }
+    }
+
+    /// #525: "search"-mode specs are held out of the active set.
+    fn holds_out(&self) -> bool {
+        matches!(self, ToolFilter::SearchMode)
     }
 }
 
@@ -399,12 +419,20 @@ pub struct SyncReport {
 }
 
 /// Registered-surface state (`registeredDirectTools` +
-/// `fallbackDeactivatedTools` in index.ts).
+/// `fallbackDeactivatedTools` + `lazyDirectTools` in index.ts; the lazy set
+/// is #525 `directTools: "search"` — registered schema-backed tools held
+/// out of the active set until a search activates them).
 #[derive(Default)]
 pub struct DirectToolRegistry {
     pub registered: HashMap<String, String>,
     pub fallback_deactivated: HashSet<String>,
     pub specs: HashMap<String, DirectToolSpec>,
+    pub lazy: HashSet<String>,
+    /// #525: names a search has already activated — a re-sync of the same
+    /// held-out spec keeps them active ("the one place a search-mode tool
+    /// becomes active" — nothing else deactivates); dropped when the spec
+    /// itself goes away.
+    pub search_activated: HashSet<String>,
 }
 
 impl DirectToolRegistry {
@@ -433,6 +461,25 @@ impl DirectToolRegistry {
                     }
                 }
             }
+            // #525: a held-out ("search"-mode) registration stays OUT of the
+            // active set — remove it if a previously active tool switched
+            // into search mode, and remember it in the lazy set. A tool a
+            // search already activated stays active across re-syncs.
+            if spec.held_out && !self.search_activated.contains(&spec.prefixed_name) {
+                self.lazy.insert(spec.prefixed_name.clone());
+                if let Some(active) = surface.get_active_tools() {
+                    if active.contains(&spec.prefixed_name) {
+                        let next: Vec<String> = active
+                            .iter()
+                            .filter(|name| *name != &spec.prefixed_name)
+                            .cloned()
+                            .collect();
+                        surface.set_active_tools(next);
+                    }
+                }
+            } else {
+                self.lazy.remove(&spec.prefixed_name);
+            }
             if was_registered {
                 report.updated.push(spec.prefixed_name.clone());
             } else {
@@ -447,6 +494,8 @@ impl DirectToolRegistry {
             }
             self.registered.remove(&name);
             self.specs.remove(&name);
+            self.lazy.remove(&name);
+            self.search_activated.remove(&name);
             report.deactivated.push(name);
         }
         self.deactivate(&report.deactivated.clone(), surface);
@@ -499,6 +548,41 @@ impl DirectToolRegistry {
 
     pub fn spec(&self, prefixed_name: &str) -> Option<&DirectToolSpec> {
         self.specs.get(prefixed_name)
+    }
+
+    /// #525 `activateSearchMatches`: activate the search-matched held-out
+    /// tools additively (they join the active set; the rest stay held) and
+    /// return the names that actually activated — the search result's
+    /// `addedToolNames` reports only real activations. A match only
+    /// activates its own server's tool (the registered server must equal
+    /// the match's server).
+    pub fn activate_search_matches(
+        &mut self,
+        matches: &[(String, String)],
+        surface: &mut dyn ToolSurface,
+    ) -> Vec<String> {
+        let mut activated: Vec<String> = Vec::new();
+        let mut active = match surface.get_active_tools() {
+            Some(active) => active,
+            None => return activated,
+        };
+        for (match_server, name) in matches {
+            if !self.lazy.contains(name) || active.contains(name) || activated.contains(name) {
+                continue;
+            }
+            let registered_server = self.specs.get(name).map(|spec| spec.server_name.clone());
+            if registered_server.as_deref() != Some(match_server.as_str()) {
+                continue;
+            }
+            active.push(name.clone());
+            self.lazy.remove(name);
+            self.search_activated.insert(name.clone());
+            activated.push(name.clone());
+        }
+        if !activated.is_empty() {
+            surface.set_active_tools(active);
+        }
+        activated
     }
 }
 
@@ -1125,6 +1209,7 @@ mod tests {
             description: format!("{name} description"),
             input_schema: None,
             resource_uri: None,
+            held_out: false,
         }
     }
 
@@ -1983,5 +2068,48 @@ mod tests {
         )
         .expect("non-object schema passes");
         assert_eq!(passthrough, json!({ "anything": 1 }));
+    }
+
+    #[test]
+    fn search_mode_tools_register_held_out_and_activate_on_search() {
+        // #525 (c76993f): "search"-mode specs register schema-backed but
+        // stay OUT of the active set; a search activates only its own
+        // server's matches, and activated tools survive a re-sync.
+        let mut registry = DirectToolRegistry::default();
+        let mut surface = FakeSurface::default();
+        let mut held = spec("query", "lazy");
+        held.held_out = true;
+        let plain = spec("run", "eager");
+
+        let plain_name = plain.prefixed_name.clone();
+        let report = registry.sync(&[held.clone(), plain], &mut surface);
+        assert_eq!(report.added.len(), 2);
+        assert!(registry.lazy.contains(&held.prefixed_name));
+        assert!(!surface.active.contains(&held.prefixed_name));
+        assert!(surface.active.contains(&plain_name));
+
+        // A search match for a DIFFERENT server does not activate.
+        let wrong_server = [("other".to_string(), held.prefixed_name.clone())];
+        assert!(registry
+            .activate_search_matches(&wrong_server, &mut surface)
+            .is_empty());
+
+        // The matching activation lands additively.
+        let right = [("lazy".to_string(), held.prefixed_name.clone())];
+        let activated = registry.activate_search_matches(&right, &mut surface);
+        assert_eq!(activated, vec![held.prefixed_name.clone()]);
+        assert!(surface.active.contains(&held.prefixed_name));
+        assert!(registry.search_activated.contains(&held.prefixed_name));
+
+        // A re-sync of the same held-out spec keeps it active.
+        let mut surface_after = FakeSurface {
+            tools: surface.tools.clone(),
+            active: surface.active.clone(),
+            ..Default::default()
+        };
+        let report = registry.sync(&[held.clone()], &mut surface_after);
+        assert!(report.added.is_empty() && report.updated.is_empty());
+        assert!(surface_after.active.contains(&held.prefixed_name));
+        assert!(!registry.lazy.contains(&held.prefixed_name));
     }
 }

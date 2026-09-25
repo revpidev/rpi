@@ -47,6 +47,10 @@ libc.workspace = true
 # FR-P0-06: MCP blob resource decoding before temp-file materialization
 # (tool-registrar.ts materializeBinaryResource; workspace baseline).
 base64.workspace = true
+# TE40 #580: encrypted-file OAuth credential store — AES-256-GCM envelope
+# (RustCrypto; design v0.1.5 §5). `getrandom` feature supplies the OS RNG
+# (`aead::rand_core::OsRng`) for IVs and temp-file names.
+aes-gcm = { workspace = true, features = ["getrandom"] }
 # FR-P1-04: OAuth credential storage (upstream @napi-rs/keyring → Rust
 # keyring crate, same underlying native backend; design §3.7).
 # On Linux headless without Secret Service / dbus, the store is unavailable

@@ -579,6 +579,81 @@ const CONFIG_CASES = [
     },
   },
   {
+    // TE40 #552/#539: a `command` override drops the store-backed bearer
+    // AND the custom trust bundle alongside the url-side fields.
+    name: "command-switch-drops-bearer-store-and-cafile",
+    layers: {
+      "shared-global": { mcpServers: { litellm: {
+        url: URL_A,
+        bearerTokenStore: "rpi-mcp-adapter.bearer",
+        caFile: "~/certs/internal-bundle.pem",
+        headers: { Authorization: "Bearer secret-vk" },
+      } } },
+      "pi-global": { mcpServers: { litellm: { command: "node", args: ["server.js"] } } },
+    },
+  },
+  {
+    // TE40 #552/#539: a `socket` override clears both sides.
+    name: "socket-switch-drops-bearer-store-and-cafile",
+    layers: {
+      "shared-global": { mcpServers: { litellm: {
+        url: URL_A,
+        bearerTokenStore: "rpi-mcp-adapter.bearer",
+        caFile: "~/certs/internal-bundle.pem",
+      } } },
+      "pi-global": { mcpServers: { litellm: { socket: "/run/mcp.sock" } } },
+    },
+  },
+  {
+    // TE40 #539: `caFile` is url-bound credential material.
+    name: "url-change-strips-cafile",
+    layers: {
+      "shared-global": { mcpServers: { litellm: { url: URL_A, caFile: "~/certs/a.pem" } } },
+      "pi-global": { mcpServers: { litellm: { url: URL_B } } },
+    },
+  },
+  {
+    // TE40 #568: a comments-only optional config is absent (no parse
+    // error, no inherited-anything surprise).
+    name: "blank-optional-config-is-absent",
+    rawLayers: {
+      "shared-global": "// only a comment\n/* and a block\n*/\n",
+    },
+    layers: {
+      "pi-global": { mcpServers: { pi: { command: "node" } } },
+    },
+  },
+  {
+    // TE40 #556: opt-in ancestor project config roots — the ancestor
+    // `.mcp.json` sits BETWEEN the global layers and the cwd project
+    // layer (cwd wins; ancestors beat nothing else).
+    name: "ancestor-config-roots-opt-in",
+    projectSubdir: "workspace/a/proj",
+    ancestorLayers: {
+      "workspace/.mcp.json": { mcpServers: { ancFar: { command: "anc-far" } } },
+      "workspace/a/.mcp.json": { mcpServers: { ancNear: { command: "anc-near" } } },
+    },
+    layers: {
+      "pi-global": {
+        settings: { ancestorConfigRoots: ["~/workspace"] },
+        mcpServers: { fromGlobal: { command: "global" } },
+      },
+      "shared-project": { mcpServers: { cwdWins: { command: "cwd" } } },
+    },
+  },
+  {
+    // TE40 #556: without the opt-in setting the ancestor configs stay
+    // invisible.
+    name: "ancestor-config-roots-not-opted-in",
+    projectSubdir: "workspace/a/proj",
+    ancestorLayers: {
+      "workspace/.mcp.json": { mcpServers: { ancFar: { command: "anc-far" } } },
+    },
+    layers: {
+      "pi-global": { mcpServers: { fromGlobal: { command: "global" } } },
+    },
+  },
+  {
     name: "url-change-keeps-only-override-auth",
     layers: {
       "shared-global": { mcpServers: { litellm: { url: URL_A, headers: { Authorization: "Bearer secret-vk" } } } },
@@ -704,15 +779,28 @@ async function genConfigMerge() {
     mkdirSync(home, { recursive: true });
     mkdirSync(proj, { recursive: true });
 
+    // TE40: ancestor-root cases nest the project inside the sandbox home
+    // (`projectSubdir`) and write extra ancestor configs (`ancestorLayers`,
+    // paths relative to the sandbox home).
+    const cwd = testCase.projectSubdir ? join(home, testCase.projectSubdir) : proj;
+    if (testCase.projectSubdir) mkdirSync(cwd, { recursive: true });
+    const layerPaths = {};
+    for (const [relative, content] of Object.entries(testCase.ancestorLayers ?? {})) {
+      const path = join(home, relative);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `${JSON.stringify(content, null, 2)}\n`, "utf-8");
+      layerPaths[relative] = content;
+    }
+
     const layers = testCase.layers ?? {};
     for (const [layer, content] of Object.entries(layers)) {
-      const path = LAYERS[layer](home, proj);
+      const path = LAYERS[layer](home, cwd);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, `${JSON.stringify(content, null, 2)}\n`, "utf-8");
     }
     const rawLayers = testCase.rawLayers ?? {};
     for (const [layer, raw] of Object.entries(rawLayers)) {
-      const path = LAYERS[layer](home, proj);
+      const path = LAYERS[layer](home, cwd);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, raw, "utf-8");
     }
@@ -724,12 +812,14 @@ async function genConfigMerge() {
     const configModule = await import(
       `${pathToFileURL(join(UPSTREAM, "config.ts")).href}?case=${testCase.name}`
     );
-    const merged = configModule.loadMcpConfig(undefined, proj);
+    const merged = configModule.loadMcpConfig(undefined, cwd);
 
     cases.push({
       name: testCase.name,
       layers: testCase.layers ?? {},
       rawLayers: testCase.rawLayers ?? {},
+      ...(testCase.ancestorLayers ? { ancestorLayers: layerPaths } : {}),
+      ...(testCase.projectSubdir ? { projectSubdir: testCase.projectSubdir } : {}),
       expected: {
         mcpServers: merged.mcpServers,
         ...(merged.settings !== undefined ? { settings: merged.settings } : {}),

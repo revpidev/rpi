@@ -454,12 +454,20 @@ fn summarize_structured_content(value: &Value) -> Value {
         fields.insert((*key).clone(), candidate);
         preserved_bytes += entry_bytes;
     }
+    // #603 (de0dc45, mcp-output-guard.ts:404-420 @ 97435aab): an omitted
+    // object summary self-identifies and accounts for preserved vs dropped
+    // fields so extension consumers never mistake a partial preview for the
+    // original payload.
+    let preserved_count = fields.len();
     json!({
+        "omitted": true,
         "preservedFields": Value::Object(fields),
         "summary": {
             "type": "object",
             "estimatedBytes": estimate_value_bytes(value, 0),
             "keyCount": key_count,
+            "preservedCount": preserved_count,
+            "droppedCount": key_count - preserved_count,
             "keysPreview": preview_keys,
             "omitted": true,
         },

@@ -164,12 +164,211 @@ pub fn get_config_sources(override_path: Option<&str>, cwd: &Path) -> Vec<Config
         read_path: user_path.clone(),
         write_path: user_path.clone(),
     });
+    // #556 (f0b83bc, config.ts getConfigSources @ 97435aab): opt-in
+    // ancestor project config roots sit between the user-global sources and
+    // the cwd project sources — lower precedence than `<cwd>/.mcp.json`, and
+    // among ancestors the NEAREST directory wins.
+    sources.extend(ancestor_sources(
+        &sources,
+        cwd,
+        &home,
+        &project_path,
+        &project_rpi_path,
+    ));
     sources.extend(project_sources_with_paths(
         &user_path,
         project_path,
         project_rpi_path,
     ));
     sources
+}
+
+/// `getConfigPathIdentity` (config.ts:564-571 @ 97435aab): the real path
+/// when it resolves (symlinks followed), else the lexically resolved path.
+/// Missing/inaccessible paths still participate in deduplication.
+fn config_path_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_resolve(path))
+}
+
+/// Lexical `path.resolve` equivalent: absolutize against the process cwd
+/// (component-wise cleanup — `..`/`.` folded without following symlinks).
+fn lexical_resolve(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut cleaned = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                cleaned.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    cleaned
+}
+
+/// `isWithin` (config.ts:573-576): `target` is inside (or equal to) `base`.
+fn is_within(base: &Path, target: &Path) -> bool {
+    match target.strip_prefix(base) {
+        Ok(relative) => !relative.starts_with("..") && relative != Path::new(".."),
+        Err(_) => false,
+    }
+}
+
+/// `getConfiguredAncestorRoot` (config.ts:578-622 @ 97435aab): read
+/// `settings.ancestorConfigRoots` from the user-global sources (last
+/// definition wins), validate each entry (`~/` expansion, absolute, an
+/// existing directory under HOME that contains cwd) and return the LONGEST
+/// (nearest) valid root.
+fn get_configured_ancestor_root(
+    global_sources: &[ConfigSource],
+    cwd: &Path,
+    home: &Path,
+) -> Option<PathBuf> {
+    let mut configured: Option<Value> = None;
+    for source in global_sources {
+        if let Some(roots) = read_validated_config(&source.read_path)
+            .as_ref()
+            .and_then(|config| config.settings.as_ref())
+            .and_then(|settings| settings.get("ancestorConfigRoots"))
+        {
+            configured = Some(roots.clone());
+        }
+    }
+    let configured = configured?;
+    let Some(entries) = configured.as_array() else {
+        warn!("Invalid settings.ancestorConfigRoots: expected an array of paths");
+        return None;
+    };
+    if entries.is_empty() {
+        return None;
+    }
+
+    let home_identity = config_path_identity(&lexical_resolve(home));
+    let cwd_identity = config_path_identity(&lexical_resolve(cwd));
+    let mut valid: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let Some(text) = entry.as_str() else {
+            warn!(
+                entry = %entry,
+                "Invalid settings.ancestorConfigRoots entry: expected an absolute path or ~/..."
+            );
+            continue;
+        };
+        let expanded: std::borrow::Cow<Path> = if let Some(rest) = text.strip_prefix("~/") {
+            std::borrow::Cow::Owned(home.join(rest))
+        } else {
+            std::borrow::Cow::Borrowed(Path::new(text))
+        };
+        if !expanded.is_absolute() {
+            warn!(
+                entry = %text,
+                "Invalid settings.ancestorConfigRoots entry: expected an absolute path or ~/..."
+            );
+            continue;
+        }
+        let root = match std::fs::canonicalize(&*expanded).ok().filter(|root| {
+            root.is_dir() && is_within(&home_identity, root) && is_within(root, &cwd_identity)
+        }) {
+            Some(root) => root,
+            None => {
+                warn!(
+                    entry = %text,
+                    "Invalid settings.ancestorConfigRoots entry: expected an existing directory under HOME containing cwd"
+                );
+                continue;
+            }
+        };
+        valid.push(root);
+    }
+    // Longest (nearest to cwd) wins: `sort((l, r) => r.length - l.length)[0]`.
+    valid.sort_by_key(|root| std::cmp::Reverse(root.as_os_str().len()));
+    valid.into_iter().next()
+}
+
+/// `getAncestorProjectDirs` (config.ts:624-634 @ 97435aab): from the PARENT
+/// of the canonical cwd up to (and including) `root`, ordered far → near.
+fn get_ancestor_project_dirs(cwd: &Path, root: &Path) -> Vec<PathBuf> {
+    let start = config_path_identity(&lexical_resolve(cwd));
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut current = start
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| start.clone());
+    while is_within(root, &current) {
+        dirs.insert(0, current.clone());
+        if current == root {
+            break;
+        }
+        let parent = current
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| current.clone());
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+    dirs
+}
+
+/// Ancestor project sources (`getConfigSources` ancestor block @ 97435aab):
+/// both `<dir>/.mcp.json` and `<dir>/.rpi/mcp.json` per ancestor dir;
+/// identities reserved by the main sources never re-enter, and a symlink
+/// alias rediscovered in a nearer dir reinserts at its nearest precedence
+/// (Map delete+set → IndexMap shift_remove+insert).
+fn ancestor_sources(
+    global_sources: &[ConfigSource],
+    cwd: &Path,
+    home: &Path,
+    project_path: &Path,
+    project_rpi_path: &Path,
+) -> Vec<ConfigSource> {
+    let mut reserved: std::collections::HashSet<PathBuf> = global_sources
+        .iter()
+        .map(|source| config_path_identity(&source.read_path))
+        .collect();
+    reserved.insert(config_path_identity(project_path));
+    reserved.insert(config_path_identity(project_rpi_path));
+
+    let mut result: indexmap::IndexMap<PathBuf, ConfigSource> = indexmap::IndexMap::new();
+    let Some(root) = get_configured_ancestor_root(global_sources, cwd, home) else {
+        return Vec::new();
+    };
+    for dir in get_ancestor_project_dirs(cwd, &root) {
+        for (id, path) in [
+            ("shared-project-ancestor", get_project_config_path(&dir)),
+            (
+                "rpi-project-ancestor", // upstream id: "pi-project-ancestor"
+                get_project_rpi_config_path(&dir),
+            ),
+        ] {
+            if !path.exists() {
+                continue;
+            }
+            let identity = config_path_identity(&path);
+            if reserved.contains(&identity) {
+                continue;
+            }
+            // Reinsert aliases at their nearest precedence position.
+            result.shift_remove(&identity);
+            result.insert(
+                identity,
+                ConfigSource {
+                    id,
+                    read_path: path.clone(),
+                    write_path: path,
+                },
+            );
+        }
+    }
+    result.into_iter().map(|(_, source)| source).collect()
 }
 
 fn project_sources(override_path: Option<&str>, cwd: &Path) -> Vec<ConfigSource> {
@@ -371,26 +570,32 @@ fn merge_imports(left: Option<&Vec<String>>, right: Option<&Vec<String>>) -> Opt
 }
 
 /// Credential-bearing fields whose value is bound to a specific server
-/// `url` (config.ts:521-527 @ 10a45367 + #514): the store-backed bearer
-/// (`bearerTokenStore`) and the per-request derivation command
-/// (`requestHeadersCommand`) joined the original three.
-const URL_BOUND_AUTH_FIELDS: [&str; 5] = [
+/// `url` (config.ts:521-527 @ 10a45367 + #514 + #539): the store-backed bearer
+/// (`bearerTokenStore`), the per-request derivation command
+/// (`requestHeadersCommand`) and the custom trust bundle (`caFile`) joined
+/// the original three.
+const URL_BOUND_AUTH_FIELDS: [&str; 6] = [
     "headers",
     "bearerToken",
     "bearerTokenEnv",
     "bearerTokenStore",
     "requestHeadersCommand",
+    "caFile",
 ];
 
 /// Fields dropped when an override switches a server to `command` transport
-/// (config.ts:539-545 @ 10a45367): the whole url/socket/auth side goes.
-const COMMAND_SWITCH_CLEARED_FIELDS: [&str; 9] = [
+/// (config.ts:539-545 @ 10a45367 + #514 + #539 + #552): the whole
+/// url/socket/auth side goes, including the store-backed bearer
+/// (`bearerTokenStore`) and the custom trust bundle (`caFile`).
+const COMMAND_SWITCH_CLEARED_FIELDS: [&str; 11] = [
     "url",
     "headers",
     "requestHeadersCommand",
+    "caFile",
     "auth",
     "bearerToken",
     "bearerTokenEnv",
+    "bearerTokenStore",
     "oauth",
     "httpTransport",
     "socket",
@@ -410,8 +615,9 @@ const URL_SWITCH_CLEARED_FIELDS: [&str; 8] = [
 ];
 
 /// Fields dropped when an override switches a server to `socket` transport
-/// (config.ts:553-566 @ 10a45367; `inheritEnv` added by #514/7a7b01b).
-const SOCKET_SWITCH_CLEARED_FIELDS: [&str; 15] = [
+/// (config.ts:553-566 @ 10a45367; `inheritEnv` #514/`caFile` #539/
+/// `bearerTokenStore` #552 additions).
+const SOCKET_SWITCH_CLEARED_FIELDS: [&str; 17] = [
     "command",
     "args",
     "env",
@@ -422,9 +628,11 @@ const SOCKET_SWITCH_CLEARED_FIELDS: [&str; 15] = [
     "url",
     "headers",
     "requestHeadersCommand",
+    "caFile",
     "auth",
     "bearerToken",
     "bearerTokenEnv",
+    "bearerTokenStore",
     "oauth",
     "httpTransport",
 ];
@@ -536,12 +744,100 @@ pub fn read_validated_config(path: &Path) -> Option<McpConfig> {
             return None;
         }
     };
+    // #568 (cfbade4, config.ts readValidatedConfig): a blank (comments-only)
+    // optional config is absent — skipped silently, without a parse warning.
+    if strip_json_comments(&raw).trim().is_empty() {
+        return None;
+    }
     match parse_json_config(&raw) {
         Ok(value) => Some(validate_config(&value)),
         Err(err) => {
             warn!(path = %path.display(), error = %err, "failed to load MCP config");
             None
         }
+    }
+}
+
+/// `getSharedConfigPath` (config.ts:198-200): the `/mcp edit` targets —
+/// `project` → `<cwd>/.mcp.json`, `global` → `~/.config/mcp/mcp.json`.
+pub fn get_shared_config_path(target: &str, cwd: &Path) -> Option<PathBuf> {
+    match target {
+        "project" => Some(get_project_config_path(cwd)),
+        "global" => crate::utils::home_dir().map(|home| home.join(GENERIC_GLOBAL_CONFIG_PATH)),
+        _ => None,
+    }
+}
+
+/// `writeConfigText` (#601, e9f9366 — config.ts @ 97435aab): symlink-safe
+/// atomic config write — a RESOLVABLE existing symlink is followed (the
+/// replace lands on its target, preserving the link), the previous mode is
+/// preserved, and the write goes through a fresh temp file + rename so a
+/// crash never truncates the config.
+pub fn write_config_text(write_path: &Path, text: &str) -> Result<(), crate::error::AdapterError> {
+    let mut write_path = write_path.to_path_buf();
+    let mut mode: Option<u32> = None;
+    if let Ok(resolved) = std::fs::canonicalize(&write_path) {
+        if let Ok(metadata) = std::fs::metadata(&resolved) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                mode = Some(metadata.permissions().mode() & 0o777);
+            }
+            #[cfg(not(unix))]
+            let _ = metadata;
+        }
+        write_path = resolved;
+    }
+    if let Some(parent) = write_path.parent() {
+        std::fs::create_dir_all(parent).map_err(crate::error::AdapterError::CacheIo)?;
+    }
+    let tmp_path = write_path.with_extension("mcp.tmp");
+    let _ = std::fs::remove_file(&tmp_path);
+    let write_result = (|| -> Result<(), std::io::Error> {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode.unwrap_or(0o644))
+                .open(&tmp_path)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        use std::io::Write;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        if let Some(mode) = mode {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode));
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+        }
+        std::fs::rename(&tmp_path, &write_path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result.map_err(crate::error::AdapterError::CacheIo)
+}
+
+/// `writeSharedConfigText` (#601): the edited text must parse as a JSONC
+/// object before it is written.
+pub fn write_shared_config_text(path: &Path, text: &str) -> Result<(), crate::error::AdapterError> {
+    match parse_json_config(text) {
+        Ok(value) if value.is_object() => write_config_text(path, text),
+        _ => Err(crate::error::AdapterError::InvalidConfigValue(
+            "top-level value must be an object".to_string(),
+        )),
     }
 }
 

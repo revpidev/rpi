@@ -100,11 +100,7 @@ fn read_record(
     server_name: &str,
 ) -> Result<Option<(String, String)>, AdapterError> {
     let account = bearer_account(server_name)?;
-    let payload = store
-        .read(&account)
-        .ok_or_else(|| AdapterError::InvalidConfigValue("no bearer record".to_string()))
-        .ok();
-    let Some(payload) = payload else {
+    let Some(payload) = store.read(&account)? else {
         return Ok(None);
     };
     let record_payload = match parse_chunk_manifest(&payload) {
@@ -112,7 +108,7 @@ fn read_record(
             let mut chunks: Vec<String> = Vec::with_capacity(count);
             for index in 0..count {
                 let chunk = store
-                    .read(&chunk_account(&account, &digest, index))
+                    .read(&chunk_account(&account, &digest, index))?
                     .ok_or_else(|| {
                         AdapterError::InvalidConfigValue("missing bearer chunk".to_string())
                     })?;
@@ -140,7 +136,7 @@ fn read_record(
 fn remove_chunks(store: &dyn SecretStore, account: &str, manifest: Option<(usize, String)>) {
     if let Some((count, digest)) = manifest {
         for index in 0..count {
-            store.remove(&chunk_account(account, &digest, index));
+            let _ = store.remove(&chunk_account(account, &digest, index));
         }
     }
 }
@@ -161,7 +157,7 @@ fn write_record(
         "serverUrl": server_url,
     }))
     .unwrap_or_default();
-    let previous_manifest = store.read(&account).and_then(|p| parse_chunk_manifest(&p));
+    let previous_manifest = store.read(&account)?.and_then(|p| parse_chunk_manifest(&p));
     let manifest = if payload.len() > BEARER_SECRET_CHUNK_SIZE {
         Some(create_manifest(&payload))
     } else {
@@ -209,9 +205,9 @@ fn write_record(
 /// `removeBearerRecordFromStore` (mcp-bearer-store.ts:331-343).
 fn remove_record(store: &dyn SecretStore, server_name: &str) -> Result<(), AdapterError> {
     let account = bearer_account(server_name)?;
-    let manifest = store.read(&account).and_then(|p| parse_chunk_manifest(&p));
+    let manifest = store.read(&account)?.and_then(|p| parse_chunk_manifest(&p));
     remove_chunks(store, &account, manifest);
-    store.remove(&account);
+    store.remove(&account)?;
     Ok(())
 }
 
@@ -323,7 +319,10 @@ mod tests {
         save_bearer_token_for_url(&store, "srv", &long_token, url).expect("save");
         // Manifest + 3 chunks exist under the sha256 account.
         let account = bearer_account("srv").expect("account");
-        let manifest = store.read(&account).expect("manifest");
+        let manifest = store
+            .read(&account)
+            .expect("manifest")
+            .expect("chunked manifest");
         assert!(manifest.contains("__piMcpAdapterBearerChunked"));
         assert_eq!(
             get_bearer_token_for_url(&store, "srv", url),
@@ -338,7 +337,10 @@ mod tests {
         );
         // No stray chunk accounts remain (the manifest is gone).
         let manifest_after = store.read(&account).expect("short record");
-        assert!(!manifest_after.contains("__piMcpAdapterBearerChunked"));
+        assert!(!manifest_after
+            .as_deref()
+            .unwrap_or_default()
+            .contains("__piMcpAdapterBearerChunked"));
     }
 
     #[test]

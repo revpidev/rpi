@@ -91,6 +91,7 @@ async fn main() {
         })),
         auth_storage_options: AuthStorageOptions {
             base_dir: Some(store_dir),
+            credential_store: None,
         },
         ..Default::default()
     };

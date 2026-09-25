@@ -83,6 +83,10 @@ pub struct McpRuntime {
     /// Insertion-ordered like the upstream `Map` (search iteration order).
     pub tool_metadata: Mutex<IndexMap<String, Vec<ToolMetadata>>>,
     pub resource_counts: Mutex<HashMap<String, usize>>,
+    /// #484: tools currently registered directly, by server — the last
+    /// active tool-surface sync result (a frozen surface may intentionally
+    /// keep registrations while a server is in failure backoff).
+    pub direct_tool_counts: Mutex<HashMap<String, usize>>,
     pub prompt_metadata: Mutex<HashMap<String, Vec<PromptMetadata>>>,
     pub server_instructions: Mutex<HashMap<String, String>>,
     pub cache_path: PathBuf,
@@ -241,6 +245,7 @@ pub async fn initialize_mcp(
         owner_cancel: owner_cancel.clone(),
         tool_metadata: Mutex::new(IndexMap::new()),
         resource_counts: Mutex::new(HashMap::new()),
+        direct_tool_counts: Mutex::new(HashMap::new()),
         prompt_metadata: Mutex::new(HashMap::new()),
         server_instructions: Mutex::new(HashMap::new()),
         cache_path: cache_path.clone(),
@@ -520,16 +525,40 @@ pub fn mark_keep_alive_after_connect(state: &McpRuntime, server_name: &str) {
 
 /// `updateServerMetadata` (init.ts:423-452).
 pub fn update_server_metadata(state: &McpRuntime, server_name: &str) {
+    // #566 (464337b "retire stale live metadata on disconnect"): a missing
+    // or non-connected server loses its live metadata instead of keeping a
+    // stale catalog.
+    let retire = |state: &McpRuntime| {
+        state
+            .tool_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shift_remove(server_name);
+        state
+            .resource_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(server_name);
+        state
+            .direct_tool_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(server_name);
+    };
     let Some(connection) = state.manager.get_connection(server_name) else {
+        retire(state);
         return;
     };
     if connection.status() != ConnectionStatus::Connected {
+        retire(state);
         return;
     }
     let Some(definition) = state.config.mcp_servers.get(server_name) else {
+        retire(state);
         return;
     };
     if definition.is_disabled() {
+        retire(state);
         state
             .tool_metadata
             .lock()
@@ -629,6 +658,86 @@ fn prompt_values_to_cached(prompts: &[Value]) -> Vec<crate::cache::CachedPrompt>
             })
         })
         .collect()
+}
+
+/// `loadToolSurfaceCache` (#566, 464337b — index.ts @ 97435aab): overlay
+/// the live connection catalogs on the persistent metadata cache for a
+/// tool-surface sync. Live = connected + enabled + definition hash equal
+/// to the runtime config's. The overlaid entry is NEVER written back, so
+/// zero-TTL metadata stays unusable on reload. Resource discovery failures
+/// fall back to the persistent entry's (still valid) resources.
+pub(crate) fn overlay_live_tool_surface_cache(
+    persistent: Option<crate::cache::MetadataCache>,
+    config: &McpConfig,
+    manager: &McpServerManager,
+) -> Option<crate::cache::MetadataCache> {
+    let mut servers = persistent
+        .as_ref()
+        .map(|c| c.servers.clone())
+        .unwrap_or_default();
+    let mut has_live = false;
+    for (name, connection) in manager.get_all_connections() {
+        if connection.status() != ConnectionStatus::Connected {
+            continue;
+        }
+        let Some(definition) = config.mcp_servers.get(&name) else {
+            continue;
+        };
+        if definition.is_disabled() {
+            continue;
+        }
+        let (Ok(config_hash), Ok(declared_hash)) = (
+            crate::cache::compute_server_hash(definition),
+            crate::cache::compute_server_hash(&connection.definition),
+        ) else {
+            continue;
+        };
+        if config_hash != declared_hash {
+            continue;
+        }
+        has_live = true;
+        let persistent_entry = persistent.as_ref().and_then(|c| c.servers.get(&name));
+        let fallback_resources = persistent_entry
+            .filter(|entry| {
+                crate::cache::is_server_cache_valid(
+                    entry,
+                    definition,
+                    crate::cache::CACHE_MAX_AGE_MS,
+                    now_ms(),
+                )
+            })
+            .map(|entry| entry.resources.clone())
+            .unwrap_or_default();
+        let tools = serialize_tools(&wire_tools(&connection.tools_snapshot()));
+        let resources = if !definition.exposes_resources() {
+            Vec::new()
+        } else if connection.resource_discovery_failed {
+            fallback_resources
+        } else {
+            serialize_resources(&wire_resources(&connection.resources_snapshot()))
+        };
+        let hints = connection.tool_list_hints_snapshot();
+        servers.insert(
+            name,
+            crate::cache::ServerCacheEntry {
+                config_hash,
+                tools,
+                resources,
+                prompts: persistent_entry.and_then(|entry| entry.prompts.clone()),
+                instructions: connection.instructions.clone(),
+                ttl_ms: hints.as_ref().and_then(|h| h.ttl_ms),
+                cache_scope: hints.as_ref().and_then(|h| h.cache_scope.clone()),
+                cached_at: now_ms(),
+            },
+        );
+    }
+    if !has_live {
+        return persistent;
+    }
+    Some(crate::cache::MetadataCache {
+        version: crate::cache::CACHE_VERSION,
+        servers,
+    })
 }
 
 /// `updateMetadataCache` (init.ts:454-495).
@@ -901,25 +1010,33 @@ fn omit_binary(uri: &str, mime: &str, reason: &str) -> String {
     .join("\n")
 }
 
-/// `resolveMcpResultContent` (tool-registrar.ts:236-245): content blocks,
-/// falling back to `structuredContent` (pretty JSON).
+/// `resolveMcpResultContent` (tool-registrar.ts:230-250 @ 97435aab,
+/// #605): content blocks — `structuredContent` is APPENDED as a
+/// `structuredContent:\n<pretty JSON>` text block when it coexists with
+/// ordinary content (previously it was silently dropped), and remains the
+/// fallback when `content` is empty.
 pub fn resolve_mcp_result_content(result: &Value) -> Vec<Value> {
     let blocks = result
         .get("content")
         .and_then(Value::as_array)
         .map(|a| transform_mcp_content(a))
         .unwrap_or_default();
-    if !blocks.is_empty() {
-        return blocks;
-    }
     if let Some(structured) = result.get("structuredContent") {
         if !structured.is_null() {
             let text =
                 serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string());
+            if !blocks.is_empty() {
+                let mut combined = blocks;
+                combined.push(json!({
+                    "type": "text",
+                    "text": format!("structuredContent:\n{text}"),
+                }));
+                return combined;
+            }
             return vec![json!({ "type": "text", "text": text })];
         }
     }
-    Vec::new()
+    blocks
 }
 
 /// `transformMcpResourceContents` (tool-registrar.ts:179-185).
@@ -988,7 +1105,7 @@ pub fn tool_parameters_schema() -> Value {
             "includeSchemas": { "type": "boolean", "description": "Include parameter schemas in search results (default: true)" },
             "limit": { "type": "number", "minimum": 1, "description": "Maximum search results to return (default: 12)" },
             "offset": { "type": "number", "minimum": 0, "description": "Search result offset (default: 0)" },
-            "server": { "type": "string", "description": "Filter to specific server (also disambiguates tool calls)" },
+            "server": { "type": "string", "description": "Server name: filters searches, disambiguates calls and describe operations, and optionally names an install" },
             "action": { "type": "string", "description": "Action: 'ui-messages', 'auth-start', or 'auth-complete'" }
         }
     })
@@ -1131,6 +1248,11 @@ pub async fn attempt_auto_auth(state: &McpRuntime, server_name: &str) -> Result<
     let options = crate::oauth::AuthenticateOptions {
         auth_storage_options: crate::oauth::store::AuthStorageOptions {
             base_dir: oauth_dir,
+            // #580: `settings.oauthCredentialStore` selects the
+            // encrypted-file backend for OAuth credentials.
+            credential_store: crate::oauth::store::CredentialStoreSelection::from_settings(
+                state.config.settings.as_ref(),
+            ),
         },
         ..Default::default()
     };
@@ -1224,10 +1346,24 @@ pub fn execute_status(state: &McpRuntime) -> Value {
         } else {
             metadata.map_or(0, Vec::len)
         };
+        // #484 (e32bb08): the last active direct-tool sync result per
+        // server; disabled servers report 0.
+        let direct_tool_count = if disabled {
+            0
+        } else {
+            state
+                .direct_tool_counts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+        };
         let mut entry = json!({
             "name": name,
             "status": status,
             "toolCount": tool_count,
+            "directToolCount": direct_tool_count,
             "failedAgo": failed_ago,
         });
         if disabled {
@@ -1688,40 +1824,54 @@ fn get_tool_matches<'a>(
     }
 }
 
-/// `getServerScopedToolMatch` (proxy-modes.ts:99-113 @ 10a45367): the raw
-/// upstream tool name (`originalName`) resolves before normalized
-/// fallbacks; a tie at the winning precedence level is fail-closed.
+/// `getServerScopedToolMatch` (proxy-modes.ts:99-127 @ 97435aab, #600):
+/// precedence levels are UNIONS — exact displayed ∪ exact original first
+/// (fail-closed when the union names two different tools), then the
+/// normalized pair. A tie at the winning level is fail-closed.
 fn get_server_scoped_tool_match<'a>(
     metadata: &'a [ToolMetadata],
     tool_name: &str,
 ) -> Option<ToolMatch<'a>> {
-    let normalized = tool_name.replace('-', "_");
-    let by_precedence: [Vec<&ToolMetadata>; 4] = [
-        metadata
-            .iter()
-            .filter(|tool| tool.name == tool_name)
-            .collect(),
-        metadata
-            .iter()
-            .filter(|tool| tool.original_name == tool_name)
-            .collect(),
-        metadata
-            .iter()
-            .filter(|tool| tool.name.replace('-', "_") == normalized)
-            .collect(),
-        metadata
-            .iter()
-            .filter(|tool| tool.original_name.replace('-', "_") == normalized)
-            .collect(),
-    ];
-    for matches in by_precedence {
-        match matches.len() {
-            0 => {}
-            1 => return Some(ToolMatch::Found(matches[0])),
-            _ => return Some(ToolMatch::Ambiguous),
+    fn dedup_union<'a>(lists: [&[&'a ToolMetadata]; 2]) -> Vec<&'a ToolMetadata> {
+        let mut union: Vec<&'a ToolMetadata> = Vec::new();
+        for tool in lists.iter().flat_map(|list| list.iter()) {
+            if !union.iter().any(|existing| {
+                existing.name == tool.name && existing.original_name == tool.original_name
+            }) {
+                union.push(tool);
+            }
         }
+        union
     }
-    None
+    let normalized = tool_name.replace('-', "_");
+    let exact_displayed: Vec<&ToolMetadata> = metadata
+        .iter()
+        .filter(|tool| tool.name == tool_name)
+        .collect();
+    let exact_original: Vec<&ToolMetadata> = metadata
+        .iter()
+        .filter(|tool| tool.original_name == tool_name)
+        .collect();
+    let exact_union = dedup_union([&exact_displayed, &exact_original]);
+    if exact_union.len() > 1 {
+        return Some(ToolMatch::Ambiguous);
+    }
+    if let Some(tool) = exact_union.first() {
+        return Some(ToolMatch::Found(tool));
+    }
+    let normalized_displayed: Vec<&ToolMetadata> = metadata
+        .iter()
+        .filter(|tool| tool.name.replace('-', "_") == normalized)
+        .collect();
+    let normalized_original: Vec<&ToolMetadata> = metadata
+        .iter()
+        .filter(|tool| tool.original_name.replace('-', "_") == normalized)
+        .collect();
+    let normalized_union = dedup_union([&normalized_displayed, &normalized_original]);
+    if normalized_union.len() > 1 {
+        return Some(ToolMatch::Ambiguous);
+    }
+    normalized_union.first().map(|tool| ToolMatch::Found(tool))
 }
 
 /// `getSingleToolMatch` (proxy-modes.ts:91-95 @ 10a45367): exact prefixed
@@ -1761,6 +1911,47 @@ fn get_enabled_tool_matches<'a>(
         }
     }
     matches
+}
+
+/// `proxyArgumentValidationError` (proxy-modes.ts:84-107 @ 97435aab,
+/// #602): client-side JSON-Schema validation of the proxy arguments before
+/// dispatch. `None` = valid OR not locally evaluable (preserve
+/// server-side validation for dialects the validator cannot compile).
+fn proxy_argument_validation_error(
+    input_schema: &Value,
+    args: &Option<serde_json::Map<String, Value>>,
+) -> Option<String> {
+    if !input_schema.is_object() {
+        return None;
+    }
+    let validator = match jsonschema::validator_for(input_schema) {
+        Ok(validator) => validator,
+        Err(_) => return None,
+    };
+    let instance = Value::Object(args.clone().unwrap_or_default());
+    let mut errors = validator.iter_errors(&instance);
+    let first = errors.next()?;
+    let instance_path = if first.instance_path.as_str().is_empty() {
+        "/".to_string()
+    } else {
+        first.instance_path.as_str().to_string()
+    };
+    Some(format!("{first} at '{instance_path}'"))
+}
+
+/// `ambiguousServerToolResult` (proxy-modes.ts:129-138 @ 97435aab, #600):
+/// a server-scoped request that names two different tools on that server.
+fn ambiguous_server_tool_result(mode: &str, tool_name: &str, server_name: &str) -> Value {
+    let message = format!(
+        "Tool \"{tool_name}\" matches multiple tools on server \"{server_name}\". Use an exact displayed or upstream tool name; run mcp({{ server: \"{server_name}\" }}) to list available tools."
+    );
+    text_result(
+        message.clone(),
+        json!({
+            "mode": mode, "error": "ambiguous_tool",
+            "server": server_name, "requestedTool": tool_name, "message": message,
+        }),
+    )
 }
 
 /// `ambiguousToolResult` (proxy-modes.ts:115-121 @ 10a45367).
@@ -1809,7 +2000,7 @@ fn tool_not_found_after_reconnect_result(
         tool_metadata: &snapshot,
         unavailable_servers: &unavailable,
     };
-    let suggestions = rank_suggestions(&search_state, tool_name, 5);
+    let suggestions = rank_suggestions(&search_state, tool_name, 5, None);
     let suggestion_text = if suggestions.is_empty() {
         String::new()
     } else {
@@ -1827,13 +2018,65 @@ fn tool_not_found_after_reconnect_result(
     )
 }
 
-/// `executeDescribe` (proxy-modes.ts:406-456) with the P1 approval marker
-/// (proxy-modes.ts:567 @ 10a45367).
-pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
+/// `executeDescribe` (proxy-modes.ts:406-456 @ 97435aab + #600 approval
+/// marker @ 10a45367): with a `server` override the lookup is scoped to
+/// that server (raw upstream names resolve through the union-precedence
+/// matcher; unknown server / ambiguity / disabled / backoff each fail
+/// closed with their own result shapes).
+pub fn execute_describe(
+    state: &McpRuntime,
+    tool_name: &str,
+    server_override: Option<&str>,
+) -> Value {
     let tool_metadata = state
         .tool_metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // #600 (9bd91f4): the server-scoped arm resolves entirely within the
+    // selected server's metadata.
+    if let Some(server_override) = server_override {
+        if !state.config.mcp_servers.contains_key(server_override) {
+            return text_result(
+                format!(
+                    "Server \"{server_override}\" not found. Use mcp({{}}) to see available servers."
+                ),
+                json!({
+                    "mode": "describe", "error": "server_not_found",
+                    "server": server_override, "requestedTool": tool_name,
+                }),
+            );
+        }
+        let server_tools = tool_metadata
+            .get(server_override)
+            .map(|tools| tools.as_slice())
+            .unwrap_or(&[]);
+        if matches!(
+            get_server_scoped_tool_match(server_tools, tool_name),
+            Some(ToolMatch::Ambiguous)
+        ) {
+            return ambiguous_server_tool_result("describe", tool_name, server_override);
+        }
+        if state.config.is_server_disabled(server_override) {
+            return disabled_result("describe", server_override);
+        }
+        if state.is_server_in_active_failure_backoff(server_override) {
+            return server_backoff_result(state, "describe", server_override);
+        }
+        let tool_meta = match get_server_scoped_tool_match(server_tools, tool_name) {
+            Some(ToolMatch::Found(tool)) => Some((*tool).clone()),
+            _ => None,
+        };
+        drop(tool_metadata);
+        return describe_found_or_missing(
+            state,
+            tool_name,
+            Some(server_override),
+            Some(server_override.to_string()),
+            tool_meta,
+            None,
+            None,
+        );
+    }
     // proxy-modes.ts:526-531 @ 10a45367 (#346): cross-server ambiguity is
     // checked before any first-match selection; backoff servers are not
     // matches for this surface (TE22).
@@ -1884,7 +2127,30 @@ pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
         }
     }
     drop(tool_metadata);
+    describe_found_or_missing(
+        state,
+        tool_name,
+        None,
+        server_name,
+        tool_meta,
+        disabled_match,
+        failed_match,
+    )
+}
 
+/// The shared describe tail (#600): render the found tool, or produce the
+/// disabled/backoff/not-found results — with server-scoped suggestions and
+/// search hints when a `scope` override was supplied.
+#[allow(clippy::too_many_arguments)]
+fn describe_found_or_missing(
+    state: &McpRuntime,
+    tool_name: &str,
+    scope: Option<&str>,
+    server_name: Option<String>,
+    tool_meta: Option<ToolMetadata>,
+    disabled_match: Option<String>,
+    failed_match: Option<String>,
+) -> Value {
     let (Some(server_name), Some(tool_meta)) = (server_name, tool_meta) else {
         if let Some(disabled) = disabled_match {
             return disabled_result("describe", &disabled);
@@ -1898,22 +2164,34 @@ pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
             tool_metadata: &snapshot,
             unavailable_servers: &unavailable,
         };
-        let suggestions = rank_suggestions(&search_state, tool_name, 5);
+        // #600: suggestions and the search hint scope to the selected
+        // server when one was given.
+        let suggestions = rank_suggestions(&search_state, tool_name, 5, scope);
         let suggestion_text = if suggestions.is_empty() {
             String::new()
         } else {
             format!(" Did you mean: {}", suggestions.join(", "))
         };
+        let scope_text = scope
+            .map(|server| format!(" on server \"{server}\""))
+            .unwrap_or_default();
+        let search_hint = scope
+            .map(|server| format!("mcp({{ search: \"...\", server: \"{server}\" }})"))
+            .unwrap_or_else(|| "mcp({{ search: \"...\" }})".to_string());
+        let mut details = json!({
+            "mode": "describe",
+            "error": "tool_not_found",
+            "requestedTool": tool_name,
+            "suggestions": suggestions,
+        });
+        if let Some(server) = scope {
+            details["server"] = json!(server);
+        }
         return text_result(
             format!(
-                "Tool \"{tool_name}\" not found. Use mcp({{ search: \"...\" }}) to search.{suggestion_text}"
+                "Tool \"{tool_name}\" not found{scope_text}. Use {search_hint} to search.{suggestion_text}"
             ),
-            json!({
-                "mode": "describe",
-                "error": "tool_not_found",
-                "requestedTool": tool_name,
-                "suggestions": suggestions,
-            }),
+            details,
         );
     };
 
@@ -2664,7 +2942,7 @@ pub async fn execute_call(
             tool_metadata: &snapshot,
             unavailable_servers: &unavailable,
         };
-        let suggestions = rank_suggestions(&search_state, tool_name, 5);
+        let suggestions = rank_suggestions(&search_state, tool_name, 5, None);
         if !suggestions.is_empty() {
             msg.push_str(&format!(" Did you mean: {}", suggestions.join(", ")));
         }
@@ -2874,6 +3152,36 @@ pub async fn execute_call(
         return json!({ "content": content, "details": details });
     }
 
+    // #602 (89c1b07, proxy-modes.ts proxyArgumentValidationError @
+    // 97435aab): validate the arguments against the advertised schema
+    // BEFORE dispatch. A failure is a local call_failed with the
+    // "Expected parameters" guidance; dialects the validator cannot
+    // evaluate fall through to server-side validation. Resource tools
+    // take no arguments and are exempt.
+    if tool_meta.resource_uri.is_none() {
+        if let Some(schema) = tool_meta.input_schema.as_ref() {
+            if let Some(validation_error) = proxy_argument_validation_error(schema, &args) {
+                let guard_options =
+                    crate::guard::resolve_guard_options(state.config.settings.as_ref());
+                let schema_text =
+                    format!("\n\nExpected parameters:\n{}", format_schema(schema, "  "));
+                let guarded = crate::guard::guard_mcp_output(
+                    vec![json!({ "type": "text", "text": validation_error.clone() })],
+                    &crate::guard::GuardOptions {
+                        prefix: Some("Failed to call tool: ".to_string()),
+                        suffix: Some(schema_text),
+                        ..guard_options
+                    },
+                );
+                let mut details = json!({ "mode": "call", "error": "call_failed" });
+                merge_objects(&mut details, &call_identity);
+                details["message"] = json!(validation_error);
+                merge_objects(&mut details, &crate::guard::guarded_mcp_details(&guarded));
+                return json!({ "content": guarded.content, "details": details });
+            }
+        }
+    }
+
     let request_timeout = state
         .config
         .mcp_servers
@@ -3016,20 +3324,12 @@ pub async fn execute_call(
                 } else {
                     content
                 };
-                let schema_text = tool_meta
-                    .input_schema
-                    .as_ref()
-                    .map(|s| format!("\n\nExpected parameters:\n{}", format_schema(s, "  ")))
-                    .unwrap_or_default();
+                // #602: server-returned errors no longer append input-schema
+                // guidance (the pre-dispatch validator owns that hint).
                 let guarded = crate::guard::guard_mcp_output(
                     content,
                     &crate::guard::GuardOptions {
                         prefix: Some("Error: ".to_string()),
-                        suffix: if schema_text.is_empty() {
-                            None
-                        } else {
-                            Some(schema_text)
-                        },
                         empty_text_fallback: Some("Tool execution failed".to_string()),
                         raw_mcp_result: Some(value),
                         ..guard_options.clone()
@@ -3059,20 +3359,12 @@ pub async fn execute_call(
             json!({ "content": guarded.content, "details": details })
         }
         Err(message) => {
-            let schema_text = tool_meta
-                .input_schema
-                .as_ref()
-                .map(|s| format!("\n\nExpected parameters:\n{}", format_schema(s, "  ")))
-                .unwrap_or_default();
+            // #602: the transport/execution failure carries no schema
+            // guidance; the pre-dispatch validator failure does.
             let guarded = crate::guard::guard_mcp_output(
                 vec![json!({ "type": "text", "text": message.clone() })],
                 &crate::guard::GuardOptions {
                     prefix: Some("Failed to call tool: ".to_string()),
-                    suffix: if schema_text.is_empty() {
-                        None
-                    } else {
-                        Some(schema_text)
-                    },
                     ..guard_options.clone()
                 },
             );
@@ -3149,6 +3441,11 @@ impl Drop for InitDriverGuard {
     }
 }
 
+/// #502 hook: per-server connect addedToolNames after the post-connect sync.
+pub type ConnectReportHook = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+/// #525 hook: activate search-matched held-out tools on the plugin surface.
+pub type SearchActivationHook = Arc<dyn Fn(&[(String, String)]) -> Vec<String> + Send + Sync>;
+
 /// Surface-sync hooks fired by the dispatcher (the directTools surface
 /// lives in lib.rs behind host calls).
 #[derive(Default)]
@@ -3158,6 +3455,14 @@ pub struct DispatcherHooks {
     /// Fires after `mcp({ connect })` (index.ts:822-824 — unconditional
     /// syncToolSurface, freeze-exempt).
     pub on_connect_sync: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #502 (f430a9a connectAndReport): after the post-connect sync, return
+    /// the connect-scoped addedToolNames for the server (each server's
+    /// discovery names are consumed once).
+    pub on_connect_report: Option<ConnectReportHook>,
+    /// #525 (c76993f activateSearchMatches): activate the search-matched
+    /// held-out direct tools on the plugin surface; returns the actual
+    /// activations.
+    pub on_search_activations: Option<SearchActivationHook>,
 }
 
 /// The proxy tool dispatcher: owns the runtime init state.
@@ -3382,6 +3687,28 @@ impl ProxyDispatcher {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    /// #502: the connect-scoped addedToolNames after the post-connect sync.
+    fn connect_added_tool_names(&self, server: &str) -> Vec<String> {
+        let hook = self
+            .hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_connect_report
+            .clone();
+        hook.map(|hook| hook(server)).unwrap_or_default()
+    }
+
+    /// #525: activate the search-matched held-out tools.
+    fn activate_search_matches(&self, matches: &[(String, String)]) -> Vec<String> {
+        let hook = self
+            .hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_search_activations
+            .clone();
+        hook.map(|hook| hook(matches)).unwrap_or_default()
     }
 
     /// Start initialization (session_start / load-time prewarm).
@@ -3783,18 +4110,25 @@ impl ProxyDispatcher {
             return execute_call(&runtime, tool, parsed_args, server, native_tools).await;
         }
         if let Some(connect) = params.get("connect").and_then(Value::as_str) {
-            let result = execute_connect(&runtime, connect).await;
+            let mut result = execute_connect(&runtime, connect).await;
             self.fire_on_connect_sync();
+            // #502: report the connect-discovered direct tools as the
+            // result-scoped load-point signal.
+            let added = self.connect_added_tool_names(connect);
+            if !added.is_empty() && result.get("details").is_some_and(Value::is_object) {
+                result["details"]["addedToolNames"] = json!(added);
+            }
             return result;
         }
         if let Some(describe) = params.get("describe").and_then(Value::as_str) {
-            return execute_describe(&runtime, describe);
+            let server_override = params.get("server").and_then(Value::as_str);
+            return execute_describe(&runtime, describe, server_override);
         }
         if let Some(instructions) = params.get("instructions").and_then(Value::as_str) {
             return execute_instructions(&runtime, instructions);
         }
         if let Some(search) = params.get("search").and_then(Value::as_str) {
-            return execute_search(
+            let mut result = execute_search(
                 &runtime,
                 search,
                 params.get("regex").and_then(Value::as_bool) == Some(true),
@@ -3803,6 +4137,50 @@ impl ProxyDispatcher {
                 params.get("limit").and_then(Value::as_i64),
                 params.get("offset").and_then(Value::as_i64),
             );
+            // #525: a search is the ONLY trigger that activates held-out
+            // ("search"-mode) direct tools; the result reports the actual
+            // activations.
+            let matches: Vec<(String, String)> = result
+                .get("details")
+                .and_then(|details| details.get("matches"))
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let server = entry.get("server").and_then(Value::as_str)?;
+                            let tool = entry.get("tool").and_then(Value::as_str)?;
+                            Some((server.to_string(), tool.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let added = self.activate_search_matches(&matches);
+            if !added.is_empty() {
+                let existing_text = result
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|blocks| blocks.first())
+                    .and_then(|block| block.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(block) = result
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|blocks| blocks.first_mut())
+                {
+                    block["text"] = json!(format!(
+                        "Activated as direct tools: {}.\n\n{existing_text}",
+                        added.join(", ")
+                    ));
+                }
+                if result.get("details").is_some_and(Value::is_object) {
+                    result["details"]["activated"] = json!(added);
+                    result["details"]["addedToolNames"] = json!(added);
+                }
+            }
+            return result;
         }
         if let Some(server) = params.get("server").and_then(Value::as_str) {
             return execute_list(&runtime, server);
@@ -3884,12 +4262,31 @@ mod tests {
         assert_eq!(found.name, "codegraph_codegraph_explore");
     }
 
+    /// #600 (9bd91f4 / #587): a name that exactly identifies DIFFERENT
+    /// displayed and upstream tools on the same server is now AMBIGUOUS
+    /// (the union-precedence matcher fail-closes; old expectation — the
+    /// displayed match won).
     #[test]
-    fn server_scoped_match_prefers_exact_prefixed_name() {
+    fn server_scoped_match_fails_closed_on_exact_displayed_original_tie() {
         let metadata = vec![tool("demo_x", "foo"), tool("demo_y", "demo_x")];
+        assert!(matches!(
+            get_server_scoped_tool_match(&metadata, "demo_x"),
+            Some(ToolMatch::Ambiguous)
+        ));
+    }
+
+    #[test]
+    fn server_scoped_match_prefers_exact_displayed_over_original() {
+        // Union precedence within one identity: when only ONE tool matches
+        // (either way), it wins regardless of which side matched.
+        let metadata = vec![tool("demo_x", "foo")];
         let Some(ToolMatch::Found(found)) = get_server_scoped_tool_match(&metadata, "demo_x")
         else {
-            panic!("expected exact prefixed match");
+            panic!("expected displayed match");
+        };
+        assert_eq!(found.name, "demo_x");
+        let Some(ToolMatch::Found(found)) = get_server_scoped_tool_match(&metadata, "foo") else {
+            panic!("expected original match");
         };
         assert_eq!(found.name, "demo_x");
     }
@@ -3924,5 +4321,111 @@ mod tests {
             get_single_tool_match(&metadata, "demo_search"),
             Some(ToolMatch::Ambiguous)
         ));
+    }
+
+    // ---- TE40 behavior tests -------------------------------------------
+
+    #[test]
+    fn structured_content_coexists_with_content_blocks() {
+        // #605 (97435aa): structuredContent survives alongside ordinary
+        // content as an appended `structuredContent:` block; empty content
+        // still falls back to it whole.
+        let both = json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "structuredContent": { "result": "table" },
+        });
+        let blocks = resolve_mcp_result_content(&both);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], json!("ok"));
+        assert_eq!(
+            blocks[1]["text"],
+            json!("structuredContent:\n{\n  \"result\": \"table\"\n}")
+        );
+
+        let structured_only = json!({
+            "content": [],
+            "structuredContent": { "result": "table" },
+        });
+        let blocks = resolve_mcp_result_content(&structured_only);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"result\": \"table\""));
+    }
+
+    #[test]
+    fn proxy_argument_validation_pre_dispatch() {
+        // #602 (89c1b07): arguments are validated against the advertised
+        // schema before dispatch; non-object schemas preserve the
+        // server-side validation path.
+        let schema = json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"],
+        });
+        assert!(proxy_argument_validation_error(&schema, &None).is_some());
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), json!("find"));
+        assert!(proxy_argument_validation_error(&schema, &Some(args)).is_none());
+        assert!(proxy_argument_validation_error(&json!(null), &None).is_none());
+        assert!(proxy_argument_validation_error(&json!(42), &None).is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnected_server_retires_live_metadata() {
+        // #566 (464337b): a server with no connection loses its live
+        // metadata instead of keeping a stale catalog.
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-mcp-retire-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let runtime = initialize_mcp(&dir, None, None).await;
+        runtime
+            .tool_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                "ghost".to_string(),
+                vec![ToolMetadata {
+                    name: "ghost_tool".to_string(),
+                    original_name: "tool".to_string(),
+                    ..Default::default()
+                }],
+            );
+        runtime
+            .resource_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("ghost".to_string(), 3);
+        runtime
+            .direct_tool_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("ghost".to_string(), 1);
+        update_server_metadata(&runtime, "ghost");
+        assert!(runtime
+            .tool_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("ghost")
+            .is_none());
+        assert!(runtime
+            .resource_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("ghost")
+            .is_none());
+        assert!(runtime
+            .direct_tool_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("ghost")
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

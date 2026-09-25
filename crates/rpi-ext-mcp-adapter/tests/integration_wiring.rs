@@ -773,6 +773,7 @@ async fn direct_tools_auto_auth_headless_auth_required() {
         description: String::new(),
         input_schema: None,
         resource_uri: None,
+        held_out: false,
     };
     let result =
         rpi_ext_mcp_adapter::direct::execute_direct_tool(&runtime, &spec, &json!({})).await;
@@ -1401,6 +1402,7 @@ async fn direct_tool_approval_gate_applies() {
             json!({ "type": "object", "properties": { "query": { "type": "string" } } }),
         ),
         resource_uri: None,
+        held_out: false,
     };
 
     let denied =
@@ -1449,7 +1451,7 @@ async fn describe_and_search_show_approval_marker() {
     let (port, _call_count) = spawn_approval_stub(stop.clone()).await;
     let runtime = build_approval_runtime(&dir, port).await;
 
-    let describe = proxy::execute_describe(&runtime, "demo_echo");
+    let describe = proxy::execute_describe(&runtime, "demo_echo", None);
     let text = describe["content"][0]["text"].as_str().unwrap_or_default();
     assert!(
         text.starts_with("demo_echo (requires approval)\n"),

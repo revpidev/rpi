@@ -25,7 +25,7 @@ pub fn command_definitions() -> [(&'static str, &'static str); 2] {
     [
         (
             "mcp",
-            "Show MCP server status (status/tools/enable/disable/reconnect/logout)",
+            "Show MCP server status (status/tools/enable/disable/reconnect/logout/edit)",
         ),
         ("mcp-auth", "Authenticate with an MCP server (OAuth)"),
     ]
@@ -37,6 +37,7 @@ pub fn command_definitions() -> [(&'static str, &'static str); 2] {
 pub enum McpSubcommand {
     Status,
     Tools,
+    Edit,
     Enable,
     Disable,
     Reconnect,
@@ -55,6 +56,7 @@ pub fn parse_subcommand(args: &str) -> (McpSubcommand, Option<String>) {
     let subcommand = match head {
         "" | "status" => McpSubcommand::Status,
         "tools" => McpSubcommand::Tools,
+        "edit" => McpSubcommand::Edit,
         "enable" => McpSubcommand::Enable,
         "disable" => McpSubcommand::Disable,
         "reconnect" => McpSubcommand::Reconnect,
@@ -65,7 +67,7 @@ pub fn parse_subcommand(args: &str) -> (McpSubcommand, Option<String>) {
 }
 
 /// Usage line for the `/mcp` family (unknown subcommand / missing target).
-pub const MCP_USAGE: &str = "Usage: /mcp [status|tools|enable <server>|disable <server>|reconnect [server]|logout <server>]";
+pub const MCP_USAGE: &str = "Usage: /mcp [status|tools|edit [project|global]|enable <server>|disable <server>|reconnect [server]|logout <server>]";
 
 /// AgentToolResult-shaped text result. The host's command dispatch drops
 /// the return value today, so every handler also mirrors its text through

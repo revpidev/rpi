@@ -512,16 +512,21 @@ pub fn paginate<T: Clone>(items: &[T], offset: i64, limit: i64) -> Page<T> {
     }
 }
 
-/// `rankSuggestions` (search-ranking.ts:279-288 @ 10a45367): strip the
+/// `rankSuggestions` (search-ranking.ts:269-278 @ 97435aab): strip the
 /// longest matching server prefix (any of server/short/mcp forms) from the
-/// requested name, then rank the remainder without keyword boosts. The
-/// prepared catalog is built once for the snapshot and used by the single
-/// ranking pass (#392).
-pub fn rank_suggestions(state: &SearchState, name: &str, limit: usize) -> Vec<String> {
+/// requested name, then rank the remainder without keyword boosts,
+/// optionally scoped to one server (#600). The prepared catalog is built
+/// once for the snapshot and used by the single ranking pass (#392).
+pub fn rank_suggestions(
+    state: &SearchState,
+    name: &str,
+    limit: usize,
+    server: Option<&str>,
+) -> Vec<String> {
     let mut stripped: Vec<String> = Vec::new();
-    for server in state.config.mcp_servers.keys() {
+    for server_name in state.config.mcp_servers.keys() {
         for prefix in [ToolPrefix::Server, ToolPrefix::Short, ToolPrefix::Mcp] {
-            let candidate = get_server_prefix(server, prefix);
+            let candidate = get_server_prefix(server_name, prefix);
             if !candidate.is_empty() && name.starts_with(&format!("{candidate}_")) {
                 stripped.push(candidate);
             }
@@ -534,7 +539,7 @@ pub fn rank_suggestions(state: &SearchState, name: &str, limit: usize) -> Vec<St
         None => name,
     };
     let catalog = PreparedSearchCatalog::prepare(state, false);
-    rank_prepared_matches(&catalog, state, query, None)
+    rank_prepared_matches(&catalog, state, query, server)
         .into_iter()
         .take(limit)
         .map(|m| m.tool.name)
@@ -744,7 +749,7 @@ mod tests {
         // Suggestions build one prepared catalog for the single stripped
         // query (no per-suggestion re-preparation).
         reset_prepared_tool_calls();
-        let suggestions = rank_suggestions(&state, "demo_search_records", 5);
+        let suggestions = rank_suggestions(&state, "demo_search_records", 5, None);
         assert!(suggestions.contains(&"search_records".to_string()));
         assert_eq!(prepared_tool_calls(), 3);
     }

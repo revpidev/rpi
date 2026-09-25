@@ -69,6 +69,10 @@ axum = "0.8"
 # T13 Bedrock adapter: handwritten SigV4 (design doc §14: no aws-sdk).
 sha2 = "0.10"
 hmac = "0.12"
+# TE40 #580: MCP OAuth encrypted-file credential store — AES-256-GCM
+# (RustCrypto; design v0.1.5 §5 ruling ①: ciphertext NOT interoperable with
+# the upstream Node crypto envelope — behavior-level parity only).
+aes-gcm = "0.10"
 # T13 Codex adapter: WebSocket transport + zstd-compressed SSE request bodies (design doc §14).
 # rustls + webpki-roots, consistent with reqwest's rustls-tls (single-file deployment target).
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }

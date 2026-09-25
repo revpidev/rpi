@@ -145,6 +145,10 @@ pub struct DiscoveredMetadata {
     pub prompts: Vec<Value>,
     /// True when prompts were advertised but `prompts/list` failed.
     pub prompt_discovery_failed: bool,
+    /// True when resources were advertised but `resources/list` failed
+    /// (#566: the live tool-surface overlay falls back to the persistent
+    /// cache entry's resources instead of an empty list).
+    pub resource_discovery_failed: bool,
     /// `tools/list` cache hints (absent when the server declares neither).
     pub tool_list_hints: Option<ToolListHints>,
 }
@@ -552,12 +556,16 @@ impl McpClient {
         self.fetch_all_prompts(timeout).await
     }
 
-    /// `fetchAllResources` for the list-changed refresh (public seam).
+    /// `fetchAllResources` for the list-changed refresh (public seam). A
+    /// failed refresh keeps the connection's current catalog (the bool
+    /// failure flag is only meaningful at initial discovery).
     pub async fn fetch_all_resources_shared(
         &self,
         timeout: Duration,
     ) -> Result<Vec<Value>, ProtocolError> {
-        self.fetch_all_resources(timeout).await
+        self.fetch_all_resources(timeout)
+            .await
+            .map(|(resources, _)| resources)
     }
 
     /// `client.onclose` (server-manager.ts:453-457).
@@ -713,13 +721,15 @@ impl McpClient {
         );
 
         let (tools, tool_list_hints) = self.fetch_all_tools(request_timeout).await?;
-        let resources = self.fetch_all_resources(request_timeout).await?;
+        let (resources, resource_discovery_failed) =
+            self.fetch_all_resources(request_timeout).await?;
         let (prompts, prompt_discovery_failed) = self.fetch_all_prompts(request_timeout).await?;
         Ok(DiscoveredMetadata {
             tools,
             resources,
             prompts,
             prompt_discovery_failed,
+            resource_discovery_failed,
             tool_list_hints,
         })
     }
@@ -843,14 +853,17 @@ impl McpClient {
 
     /// `fetchAllResources` (server-manager.ts:887-910): capability-gated;
     /// listing failures degrade to `[]` (401 aborts the connect).
-    async fn fetch_all_resources(&self, timeout: Duration) -> Result<Vec<Value>, ProtocolError> {
+    async fn fetch_all_resources(
+        &self,
+        timeout: Duration,
+    ) -> Result<(Vec<Value>, bool), ProtocolError> {
         if !self.advertises("resources") {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         match self.fetch_all("resources/list", "resources", timeout).await {
-            Ok(resources) => Ok(resources),
+            Ok(resources) => Ok((resources, false)),
             Err(error @ ProtocolError::Unauthorized) => Err(error),
-            Err(_) => Ok(Vec::new()),
+            Err(_) => Ok((Vec::new(), true)),
         }
     }
 

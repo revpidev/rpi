@@ -196,6 +196,122 @@ pub struct HttpConfig {
     /// `requestHeadersCommand` (#353): raw config; headers are derived
     /// per request (fail-closed). `None` for the vast majority of servers.
     pub request_headers_command: Option<Value>,
+    /// #539: a per-connection client built with the server's `caFile` trust
+    /// bundle (redirects refused); `None` keeps the default shared client.
+    pub ca_client: Option<reqwest::Client>,
+}
+
+/// `validateCaFile` + the PEM-bundle half of `createCaFetch` (#539,
+/// f6cabbd — http-ca.ts @ 97435aab): `caFile` is only supported for HTTPS
+/// HTTP servers (no command/socket transport), must be a non-empty
+/// (env-interpolated) path, and the file must be a PEM certificate BUNDLE
+/// — only `-----BEGIN CERTIFICATE-----…-----END CERTIFICATE-----` blocks
+/// and whitespace. `reqwest::Certificate::from_pem_bundle` performs the
+/// per-certificate parse on the Rust side.
+pub fn load_ca_bundle(
+    definition: &ServerEntry,
+    server_name: &str,
+) -> Result<Vec<reqwest::Certificate>, ProtocolError> {
+    let transport_error = |message: String| ProtocolError::Transport(message);
+    let Some(raw) = definition.get_str("caFile") else {
+        return Ok(Vec::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(transport_error(
+            "MCP caFile must be a non-empty path string".into(),
+        ));
+    }
+    if definition.get("command").is_some() || definition.get("socket").is_some() {
+        return Err(transport_error(
+            "MCP caFile is only supported for HTTPS HTTP servers".into(),
+        ));
+    }
+    let server_url = crate::utils::resolve_server_url(definition.get("url"))
+        .map_err(|e| transport_error(e.to_string()))?
+        .unwrap_or_default();
+    let is_https = url::Url::parse(&server_url)
+        .map(|parsed| parsed.scheme() == "https")
+        .unwrap_or(false);
+    if !is_https {
+        return Err(transport_error(
+            "MCP caFile is only supported for HTTPS HTTP servers".into(),
+        ));
+    }
+    let interpolated = crate::utils::interpolate_env_vars(trimmed);
+    let expanded = if let Some(rest) = interpolated
+        .strip_prefix("~/")
+        .or_else(|| interpolated.strip_prefix("~\\"))
+    {
+        crate::utils::home_dir()
+            .map(|home| home.join(rest).to_string_lossy().into_owned())
+            .unwrap_or_else(|| interpolated.clone())
+    } else if interpolated == "~" {
+        crate::utils::home_dir()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_else(|| interpolated.clone())
+    } else {
+        interpolated.clone()
+    };
+    let bundle = std::fs::read_to_string(&expanded).map_err(|_| {
+        transport_error(format!(
+            "Failed to load MCP caFile PEM certificate bundle ({server_name}): {}",
+            expanded
+        ))
+    })?;
+    // Strict bundle shape: only certificate blocks and whitespace.
+    let certs_only = strip_certificate_blocks(&bundle).trim().is_empty();
+    if !certs_only || !bundle.contains("-----BEGIN CERTIFICATE-----") {
+        return Err(transport_error(
+            "Failed to load MCP caFile PEM certificate bundle: expected a PEM certificate bundle"
+                .into(),
+        ));
+    }
+    reqwest::Certificate::from_pem_bundle(bundle.as_bytes()).map_err(|_| {
+        transport_error(
+            "Failed to load MCP caFile PEM certificate bundle: invalid certificate".to_string(),
+        )
+    })
+}
+
+/// Blank out every `-----BEGIN CERTIFICATE-----…-----END CERTIFICATE-----`
+/// block so the remainder exposes any non-certificate content.
+fn strip_certificate_blocks(bundle: &str) -> String {
+    let mut out = String::with_capacity(bundle.len());
+    let mut rest = bundle;
+    while let Some(begin) = rest.find("-----BEGIN CERTIFICATE-----") {
+        out.push_str(&rest[..begin]);
+        let after_begin = &rest[begin..];
+        match after_begin.find("-----END CERTIFICATE-----") {
+            Some(end) => {
+                rest = &after_begin[end + "-----END CERTIFICATE-----".len()..];
+            }
+            None => {
+                // Unterminated block: keep it so the strict check fails.
+                out.push_str(after_begin);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// #539: the per-server CA-aware client — same-origin trust augmentation
+/// with redirects refused (upstream routes same-origin requests through the
+/// CA dispatcher with `redirect: "error"`; off-origin requests never use
+/// it, and this client only ever talks to the configured server origin).
+pub fn ca_aware_client(
+    definition: &ServerEntry,
+    server_name: &str,
+) -> Result<reqwest::Client, ProtocolError> {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    for certificate in load_ca_bundle(definition, server_name)? {
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .map_err(|e| ProtocolError::Transport(format!("HTTP client: {e}")))
 }
 
 pub fn resolve_http_config(definition: &ServerEntry) -> Result<HttpConfig, ProtocolError> {
@@ -223,6 +339,14 @@ pub fn resolve_http_config_with_server(
         .into_iter()
         .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
         .collect();
+
+    // #539: build the per-connection CA client when `caFile` is present
+    // (validating HTTPS-only + the PEM bundle at the connection boundary).
+    let ca_client = if definition.get("caFile").is_some() {
+        Some(ca_aware_client(definition, server_name)?)
+    } else {
+        None
+    };
 
     // Bearer injection (server-manager.ts:730-738, FR-P1-03): only
     // `auth: "bearer"` triggers it; a `!command` bearerToken is executed at
@@ -282,6 +406,7 @@ pub fn resolve_http_config_with_server(
         url,
         headers,
         request_headers_command,
+        ca_client,
     })
 }
 
@@ -296,28 +421,48 @@ fn bearer_store_backend() -> std::sync::Arc<dyn crate::oauth::store::SecretStore
 struct BearerKeyringBackend;
 
 impl crate::oauth::store::SecretStore for BearerKeyringBackend {
-    fn read(&self, account: &str) -> Option<String> {
-        let entry = keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account).ok()?;
-        entry.get_password().ok()
+    fn read(&self, account: &str) -> Result<Option<String>, crate::error::AdapterError> {
+        let entry =
+            keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account).map_err(|e| {
+                crate::error::AdapterError::InvalidConfigValue(format!(
+                    "Bearer secure credential storage is unavailable: {e}"
+                ))
+            })?;
+        match entry.get_password() {
+            Ok(password) => Ok(Some(password)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(other) => Err(crate::error::AdapterError::InvalidConfigValue(format!(
+                "Failed to read bearer token from the OS credential store: {other}"
+            ))),
+        }
     }
 
     fn write(&self, account: &str, payload: &str) -> Result<(), crate::error::AdapterError> {
         let entry =
-            keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account).map_err(|_| {
-                crate::error::AdapterError::InvalidConfigValue(
-                    "Bearer secure credential storage is unavailable".to_string(),
-                )
+            keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account).map_err(|e| {
+                crate::error::AdapterError::InvalidConfigValue(format!(
+                    "Bearer secure credential storage is unavailable: {e}"
+                ))
             })?;
-        entry.set_password(payload).map_err(|_| {
-            crate::error::AdapterError::InvalidConfigValue(
-                "Failed to write bearer token to the OS credential store".to_string(),
-            )
+        entry.set_password(payload).map_err(|e| {
+            crate::error::AdapterError::InvalidConfigValue(format!(
+                "Failed to write bearer token to the OS credential store: {e}"
+            ))
         })
     }
 
-    fn remove(&self, account: &str) {
-        if let Ok(entry) = keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account) {
-            let _ = entry.delete_credential();
+    fn remove(&self, account: &str) -> Result<(), crate::error::AdapterError> {
+        let entry =
+            keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account).map_err(|e| {
+                crate::error::AdapterError::InvalidConfigValue(format!(
+                    "Bearer secure credential storage is unavailable: {e}"
+                ))
+            })?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(crate::error::AdapterError::InvalidConfigValue(format!(
+                "Failed to remove bearer token from the OS credential store: {e}"
+            ))),
         }
     }
 }
@@ -402,7 +547,7 @@ impl StreamableHttpTransport {
     pub fn new(config: HttpConfig) -> (Arc<Self>, mpsc::UnboundedReceiver<Value>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let transport = Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: config.ca_client.clone().unwrap_or_default(),
             config,
             session_id: Mutex::new(None),
             protocol_version: Mutex::new(None),
@@ -835,7 +980,7 @@ impl LegacySseTransport {
         let (tx, rx) = mpsc::unbounded_channel();
         let origin = config.url.origin().ascii_serialization();
         let transport = Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: config.ca_client.clone().unwrap_or_default(),
             config,
             endpoint: Mutex::new(None),
             incoming: tx,
@@ -1123,6 +1268,7 @@ mod tests {
             url: url::Url::parse(&format!("http://{addr}/mcp")).expect("url"),
             headers: Vec::new(),
             request_headers_command: None,
+            ca_client: None,
         };
         let (transport, mut rx) = StreamableHttpTransport::new(config);
         // The server never closes the stream, so a `send` that awaits the

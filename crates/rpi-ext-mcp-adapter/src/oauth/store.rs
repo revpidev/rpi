@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::AdapterError;
+use crate::oauth::encrypted_store;
 
 /// `AUTH_SECRET_SERVICE` (mcp-auth.ts:23) — product-name rename [VARIANT].
 pub const AUTH_SECRET_SERVICE: &str = "rpi-mcp-adapter.oauth";
@@ -136,19 +137,62 @@ struct ChunkManifest {
     chunk_digest: String,
 }
 
-/// `AuthStorageOptions` (mcp-auth.ts:82-85).
+/// `AuthStorageOptions` (mcp-auth.ts:82-85 + #580 `credentialStore`).
 #[derive(Debug, Clone, Default)]
 pub struct AuthStorageOptions {
     pub base_dir: Option<PathBuf>,
+    /// `settings.oauthCredentialStore` selection (#580): `Some(_)` builds
+    /// the encrypted-file backend instead of the OS keyring.
+    pub credential_store: Option<CredentialStoreSelection>,
+}
+
+/// Which concrete backend a store is (`AuthSecretStore.kind`, #580).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretStoreKind {
+    /// The OS secure credential store (keyring).
+    OsSecureCredentialStore,
+    /// The encrypted-file backend (`settings.oauthCredentialStore:
+    /// "encrypted-file"`, #580).
+    EncryptedFile,
+}
+
+/// `credentialStore` selection (`AuthStorageOptions.credentialStore`,
+/// mcp-auth.ts:129-133 @ 97435aab).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStoreSelection {
+    EncryptedFile,
+}
+
+impl CredentialStoreSelection {
+    /// Parse `settings.oauthCredentialStore` ("encrypted-file"; anything
+    /// else — including a wrongly-typed value — keeps the default keyring).
+    pub fn from_settings(settings: Option<&serde_json::Map<String, Value>>) -> Option<Self> {
+        let value = settings?.get("oauthCredentialStore")?.as_str()?;
+        (value == "encrypted-file").then_some(CredentialStoreSelection::EncryptedFile)
+    }
 }
 
 /// Trait abstracting the secret store so tests can inject a mock without
 /// touching the real OS keyring (design §5.5: `keyring` crate mock
 /// credential store feature — implemented as an in-memory backend here).
+/// Operations are fallible (`#580`): backend failures surface as
+/// [`AdapterError::OAuthCredentialStoreUnavailable`] classified errors
+/// instead of silently reading as "absent".
 pub trait SecretStore: Send + Sync {
-    fn read(&self, account: &str) -> Option<String>;
+    fn read(&self, account: &str) -> Result<Option<String>, AdapterError>;
     fn write(&self, account: &str, payload: &str) -> Result<(), AdapterError>;
-    fn remove(&self, account: &str);
+    fn remove(&self, account: &str) -> Result<(), AdapterError>;
+    /// `store.kind` (mcp-auth.ts:196): the encrypted-file backend never
+    /// chunks and never runs the legacy plaintext import.
+    fn kind(&self) -> SecretStoreKind {
+        SecretStoreKind::OsSecureCredentialStore
+    }
+    /// Whether this backend imposes the small per-value ceiling that makes
+    /// chunking necessary regardless of platform (`sizeLimitedAuthSecretStore`,
+    /// #565: `PI_MCP_ADAPTER_TEST_AUTH_STORE === "sizelimited"`).
+    fn forces_chunking(&self) -> bool {
+        false
+    }
 }
 
 /// In-memory secret store for tests (upstream `memoryAuthSecretStore`).
@@ -179,12 +223,13 @@ impl MemorySecretStore {
 }
 
 impl SecretStore for MemorySecretStore {
-    fn read(&self, account: &str) -> Option<String> {
-        self.entries
+    fn read(&self, account: &str) -> Result<Option<String>, AdapterError> {
+        Ok(self
+            .entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(account)
-            .cloned()
+            .cloned())
     }
 
     fn write(&self, account: &str, payload: &str) -> Result<(), AdapterError> {
@@ -195,30 +240,25 @@ impl SecretStore for MemorySecretStore {
         Ok(())
     }
 
-    fn remove(&self, account: &str) {
+    fn remove(&self, account: &str) -> Result<(), AdapterError> {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(account);
+        Ok(())
     }
 }
 
 /// Size-limited store that mimics the Windows Credential Manager per-value
-/// ceiling (upstream `sizeLimitedAuthSecretStore`).
+/// ceiling (upstream `sizeLimitedAuthSecretStore`; #565: also the
+/// platform-independent chunking stand-in via `forces_chunking`).
+#[derive(Clone, Default)]
 pub struct SizeLimitedSecretStore {
     entries: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 /// `AUTH_SECRET_VALUE_LIMIT` (mcp-auth.ts:34).
 const AUTH_SECRET_VALUE_LIMIT: usize = 1280;
-
-impl Default for SizeLimitedSecretStore {
-    fn default() -> Self {
-        Self {
-            entries: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-        }
-    }
-}
 
 impl SizeLimitedSecretStore {
     pub fn new() -> Self {
@@ -227,12 +267,13 @@ impl SizeLimitedSecretStore {
 }
 
 impl SecretStore for SizeLimitedSecretStore {
-    fn read(&self, account: &str) -> Option<String> {
-        self.entries
+    fn read(&self, account: &str) -> Result<Option<String>, AdapterError> {
+        Ok(self
+            .entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(account)
-            .cloned()
+            .cloned())
     }
 
     fn write(&self, account: &str, payload: &str) -> Result<(), AdapterError> {
@@ -249,11 +290,16 @@ impl SecretStore for SizeLimitedSecretStore {
         Ok(())
     }
 
-    fn remove(&self, account: &str) {
+    fn remove(&self, account: &str) -> Result<(), AdapterError> {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(account);
+        Ok(())
+    }
+
+    fn forces_chunking(&self) -> bool {
+        true
     }
 }
 
@@ -261,17 +307,29 @@ impl SecretStore for SizeLimitedSecretStore {
 pub struct UnavailableSecretStore;
 
 impl SecretStore for UnavailableSecretStore {
-    fn read(&self, _account: &str) -> Option<String> {
-        None
-    }
-
-    fn write(&self, _account: &str, _payload: &str) -> Result<(), AdapterError> {
-        Err(AdapterError::InvalidConfigValue(
-            "secure credential store unavailable".to_string(),
+    fn read(&self, _account: &str) -> Result<Option<String>, AdapterError> {
+        Err(encrypted_store::credential_store_unavailable(
+            "read",
+            false,
+            "simulated secure credential store unavailable".to_string(),
         ))
     }
 
-    fn remove(&self, _account: &str) {}
+    fn write(&self, _account: &str, _payload: &str) -> Result<(), AdapterError> {
+        Err(encrypted_store::credential_store_unavailable(
+            "write",
+            false,
+            "simulated secure credential store unavailable".to_string(),
+        ))
+    }
+
+    fn remove(&self, _account: &str) -> Result<(), AdapterError> {
+        Err(encrypted_store::credential_store_unavailable(
+            "remove",
+            false,
+            "simulated secure credential store unavailable".to_string(),
+        ))
+    }
 }
 
 /// `getAuthEntryAccount` (mcp-auth.ts:433-438): `sha256-<hex>`.
@@ -319,15 +377,54 @@ pub fn get_auth_entry_file_path(server_name: &str, options: &AuthStorageOptions)
     get_server_dir(server_name, options).join("tokens.json")
 }
 
-/// `createChunkManifest` (mcp-auth.ts:599-605).
-fn create_chunk_manifest(payload: &str) -> ChunkManifest {
+/// `createChunkManifest` (mcp-auth.ts:599-605 → #565 form: chunk count
+/// comes from the actual split, digest from the joined payload).
+fn create_chunk_manifest(payload: &str, chunk_count: usize) -> ChunkManifest {
     let digest = Sha256::digest(payload.as_bytes());
     let hex_digest: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     ChunkManifest {
         marker: 1,
-        chunk_count: payload.len().div_ceil(AUTH_SECRET_CHUNK_SIZE),
+        chunk_count,
         chunk_digest: hex_digest,
     }
+}
+
+/// `getAuthEntryChunkDigest` (mcp-auth.ts:795-797).
+fn get_auth_entry_chunk_digest(payload: &str) -> String {
+    let digest = Sha256::digest(payload.as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// `shouldChunkAuthPayload` (mcp-auth.ts:791-793 @ 97435aab / #565):
+/// chunking is a Windows Credential Manager workaround — it only applies
+/// on Windows or when the backend forces it (the size-limited test store);
+/// the encrypted-file backend never chunks.
+fn should_chunk_auth_payload(store: &dyn SecretStore, payload: &str) -> bool {
+    store.kind() != SecretStoreKind::EncryptedFile
+        && payload.chars().count() > AUTH_SECRET_CHUNK_SIZE
+        && (cfg!(windows) || store.forces_chunking())
+}
+
+/// `splitAuthPayload` (mcp-auth.ts:799-810): fixed-size chunks that rejoin
+/// to the exact payload. Upstream splits JS UTF-16 code units with a
+/// surrogate-pair guard; the Rust port splits by characters (code points)
+/// at `AUTH_SECRET_CHUNK_SIZE` — the chunks are only ever re-read by this
+/// same store (round-trip integrity is pinned by the digest), so the unit
+/// difference is not observable through the store API.
+fn split_auth_payload(payload: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut remaining = payload;
+    while !remaining.is_empty() {
+        let take = remaining
+            .char_indices()
+            .nth(AUTH_SECRET_CHUNK_SIZE)
+            .map(|(offset, _)| offset)
+            .unwrap_or(remaining.len());
+        let (chunk, rest) = remaining.split_at(take);
+        chunks.push(chunk);
+        remaining = rest;
+    }
+    chunks
 }
 
 /// `getAuthEntryChunkAccount` (mcp-auth.ts:562-564).
@@ -364,7 +461,10 @@ fn parse_chunk_manifest(payload: &str) -> Option<ChunkManifest> {
     })
 }
 
-/// `readChunkedAuthEntry` (mcp-auth.ts:607-624).
+/// `readChunkedAuthEntry` (mcp-auth.ts:607-630 @ 97435aab): join the
+/// digest-addressed chunks and verify the integrity digest (#565) — a
+/// corrupted or partial chunk set fails closed instead of parsing a
+/// truncated payload.
 fn read_chunked_entry(
     store: &dyn SecretStore,
     server_name: &str,
@@ -373,17 +473,36 @@ fn read_chunked_entry(
 ) -> Result<AuthEntry, AdapterError> {
     let mut chunks = Vec::new();
     for chunk_account in get_chunk_accounts(account, manifest) {
-        match store.read(&chunk_account) {
+        match store.read(&chunk_account)? {
             Some(chunk) => chunks.push(chunk),
             None => {
-                return Err(AdapterError::InvalidConfigValue(format!(
-                    "Missing OAuth credential chunk {chunk_account} for {server_name}"
-                )));
+                return Err(encrypted_store::credential_store_unavailable(
+                    "read",
+                    store.kind() == SecretStoreKind::EncryptedFile,
+                    format!("Missing OAuth credential chunk {chunk_account} for {server_name}"),
+                ));
             }
         }
     }
     let payload = chunks.join("");
-    parse_auth_entry_payload(server_name, &payload, "OS secure credential store chunks")
+    if get_auth_entry_chunk_digest(&payload) != manifest.chunk_digest {
+        return Err(encrypted_store::credential_store_unavailable(
+            "read",
+            store.kind() == SecretStoreKind::EncryptedFile,
+            "OAuth credential chunk integrity check failed".to_string(),
+        ));
+    }
+    let label = auth_secret_store_label(store);
+    parse_auth_entry_payload(server_name, &payload, &format!("{label} chunks"))
+}
+
+/// `authSecretStoreLabel` (mcp-auth.ts:201-203).
+fn auth_secret_store_label(store: &dyn SecretStore) -> &'static str {
+    if store.kind() == SecretStoreKind::EncryptedFile {
+        "encrypted OAuth credential file store"
+    } else {
+        "OS secure credential store"
+    }
 }
 
 /// `readLegacyAuthEntry` (mcp-auth.ts:626-631).
@@ -404,7 +523,32 @@ fn remove_legacy_entry(server_name: &str, options: &AuthStorageOptions) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `writeSecureAuthEntryToStore` (mcp-auth.ts:650-680).
+/// `readExistingChunkManifest` (mcp-auth.ts:767-772).
+fn read_existing_chunk_manifest(store: &dyn SecretStore, account: &str) -> Option<ChunkManifest> {
+    let payload = store.read(account).ok()?;
+    let payload = payload.as_deref()?;
+    parse_chunk_manifest(payload)
+}
+
+/// `tryRemoveChunkPayloads` (mcp-auth.ts:782-789): stale chunk cleanup must
+/// not hide a successful credential write.
+fn try_remove_chunk_payloads(
+    store: &dyn SecretStore,
+    account: &str,
+    manifest: Option<&ChunkManifest>,
+) {
+    if let Some(manifest) = manifest {
+        for chunk_account in get_chunk_accounts(account, manifest) {
+            let _ = store.remove(&chunk_account);
+        }
+    }
+}
+
+/// `writeSecureAuthEntryToStore` (mcp-auth.ts:809-842 @ 97435aab): chunk
+/// when the backend needs it (#565 platform gate), compact otherwise
+/// (multiline secrets corrupt gnome-keyring plaintext collections), clean
+/// stale chunks when the digest changed, and fail closed (removing the
+/// just-written chunks) on any write error.
 fn write_secure_entry(
     store: &dyn SecretStore,
     server_name: &str,
@@ -413,44 +557,52 @@ fn write_secure_entry(
     let account = get_auth_entry_account(server_name);
     let payload = serialize_auth_entry(entry);
 
-    // Check for an existing manifest to clean up stale chunks.
-    let previous_manifest = store
-        .read(&account)
-        .as_deref()
-        .and_then(parse_chunk_manifest);
-
-    let manifest = if payload.len() > AUTH_SECRET_CHUNK_SIZE {
-        Some(create_chunk_manifest(&payload))
+    let previous_manifest = read_existing_chunk_manifest(store, &account);
+    let chunks = if should_chunk_auth_payload(store, &payload) {
+        Some(split_auth_payload(&payload))
     } else {
         None
     };
+    let manifest = chunks
+        .as_ref()
+        .map(|chunks| create_chunk_manifest(&payload, chunks.len()));
 
-    if let Some(manifest) = &manifest {
-        for index in 0..manifest.chunk_count {
-            let start = index * AUTH_SECRET_CHUNK_SIZE;
-            let end = ((index + 1) * AUTH_SECRET_CHUNK_SIZE).min(payload.len());
-            let chunk = &payload[start..end];
-            let chunk_account = get_chunk_account(&account, manifest, index);
-            store.write(&chunk_account, chunk)?;
-        }
-        let manifest_json = serde_json::to_string(manifest).unwrap_or_default();
-        store.write(&account, &manifest_json)?;
-    } else {
-        store.write(&account, &payload)?;
-    }
-
-    // Clean up previous chunks if the digest changed.
-    if previous_manifest.as_ref().map(|m| &m.chunk_digest)
-        != manifest.as_ref().map(|m| &m.chunk_digest)
-    {
-        if let Some(prev) = &previous_manifest {
-            for chunk_account in get_chunk_accounts(&account, prev) {
-                store.remove(&chunk_account);
+    let write_result = (|| -> Result<(), AdapterError> {
+        if let (Some(manifest), Some(chunks)) = (&manifest, &chunks) {
+            for (index, chunk) in chunks.iter().enumerate() {
+                let chunk_account = get_chunk_account(&account, manifest, index);
+                store.write(&chunk_account, chunk)?;
             }
+            let manifest_json = serde_json::to_string(manifest).unwrap_or_default();
+            store.write(&account, &manifest_json)?;
+        } else {
+            store.write(&account, &payload)?;
+        }
+        if previous_manifest.as_ref().map(|m| &m.chunk_digest)
+            != manifest.as_ref().map(|m| &m.chunk_digest)
+        {
+            try_remove_chunk_payloads(store, &account, previous_manifest.as_ref());
+        }
+        Ok(())
+    })();
+
+    match write_result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            try_remove_chunk_payloads(store, &account, manifest.as_ref());
+            let label = auth_secret_store_label(store);
+            Err(match error {
+                AdapterError::OAuthCredentialStoreUnavailable { .. } => {
+                    AdapterError::InvalidConfigValue(format!(
+                        "Failed to write OAuth credentials for {server_name} to the {label}: {error}"
+                    ))
+                }
+                other => AdapterError::InvalidConfigValue(format!(
+                    "Failed to write OAuth credentials for {server_name} to the {label}: {other}"
+                )),
+            })
         }
     }
-
-    Ok(())
 }
 
 /// Serialize an AuthEntry to JSON matching the upstream wire format.
@@ -471,29 +623,60 @@ fn parse_auth_entry_payload(
     })
 }
 
-/// `readAuthEntryFromStore` (mcp-auth.ts:706-739).
+/// `readAuthEntryFromStore` (mcp-auth.ts:751-786 @ 97435aab): manifest
+/// reads verify the digest and compact on the next non-encrypted read when
+/// the payload no longer needs chunking (#565); the encrypted-file backend
+/// never chunks and never runs the legacy plaintext import (#580).
 fn read_entry_from_store(
     store: &dyn SecretStore,
     server_name: &str,
     options: &AuthStorageOptions,
+    migrate_legacy: bool,
 ) -> Result<Option<AuthEntry>, AdapterError> {
     let account = get_auth_entry_account(server_name);
-    let payload = store.read(&account);
+    let payload = store.read(&account).map_err(|error| {
+        let label = auth_secret_store_label(store);
+        AdapterError::InvalidConfigValue(format!(
+            "Failed to read OAuth credentials for {server_name} from the {label}: {error}"
+        ))
+    })?;
 
     if let Some(payload) = payload {
-        // Check for chunk manifest
-        if let Some(manifest) = parse_chunk_manifest(&payload) {
-            let entry = read_chunked_entry(store, server_name, &account, &manifest)?;
+        let manifest = if store.kind() == SecretStoreKind::EncryptedFile {
+            None
+        } else {
+            parse_chunk_manifest(&payload)
+        };
+        let entry = match &manifest {
+            Some(manifest) => read_chunked_entry(store, server_name, &account, manifest)?,
+            None => {
+                let label = auth_secret_store_label(store);
+                parse_auth_entry_payload(server_name, &payload, label)?
+            }
+        };
+        if store.kind() != SecretStoreKind::EncryptedFile {
             remove_legacy_entry(server_name, options);
-            return Ok(Some(entry));
+            // #565 compaction: an existing chunked record whose payload no
+            // longer needs chunking is rewritten as a single entry.
+            if manifest.is_some()
+                && migrate_legacy
+                && !should_chunk_auth_payload(store, &serialize_auth_entry(&entry))
+            {
+                write_secure_entry(store, server_name, &entry)?;
+            }
         }
-        let entry = parse_auth_entry_payload(server_name, &payload, "OS secure credential store")?;
-        remove_legacy_entry(server_name, options);
         return Ok(Some(entry));
+    }
+
+    if store.kind() == SecretStoreKind::EncryptedFile {
+        return Ok(None);
     }
 
     // Try legacy plaintext import
     if let Some(legacy_entry) = read_legacy_entry(server_name, options) {
+        if !migrate_legacy {
+            return Ok(Some(legacy_entry));
+        }
         // Migrate to secure store
         write_secure_entry(store, server_name, &legacy_entry)?;
         remove_legacy_entry(server_name, options);
@@ -510,12 +693,17 @@ pub struct OAuthCredentialStore {
 }
 
 impl OAuthCredentialStore {
-    /// Create a store backed by the OS keyring (production).
+    /// Create the production store: the encrypted-file backend when
+    /// `settings.oauthCredentialStore` selected it (#580), else the OS
+    /// keyring (`getAuthSecretStore`, mcp-auth.ts:430-440).
     pub fn new(options: AuthStorageOptions) -> Self {
-        Self {
-            backend: Box::new(KeyringBackend::new()),
-            options,
-        }
+        let backend: Box<dyn SecretStore> =
+            if options.credential_store == Some(CredentialStoreSelection::EncryptedFile) {
+                Box::new(encrypted_store::EncryptedFileSecretStore::new())
+            } else {
+                Box::new(KeyringBackend::new())
+            };
+        Self { backend, options }
     }
 
     /// Create a store backed by a test-provided in-memory backend.
@@ -525,7 +713,14 @@ impl OAuthCredentialStore {
 
     /// `getAuthEntry` (mcp-auth.ts:768-769).
     pub fn get_entry(&self, server_name: &str) -> Result<Option<AuthEntry>, AdapterError> {
-        read_entry_from_store(self.backend.as_ref(), server_name, &self.options)
+        read_entry_from_store(self.backend.as_ref(), server_name, &self.options, true)
+    }
+
+    /// A status-shaped read (`hasStoredTokens`/`isTokenExpired` path,
+    /// mcp-auth.ts readAuthEntry `{ migrateLegacy: false }`): no legacy
+    /// import, no compaction — reads never mutate.
+    pub fn get_entry_status(&self, server_name: &str) -> Result<Option<AuthEntry>, AdapterError> {
+        read_entry_from_store(self.backend.as_ref(), server_name, &self.options, false)
     }
 
     /// `getAuthForUrl` (mcp-auth.ts:776-787).
@@ -561,17 +756,19 @@ impl OAuthCredentialStore {
         Ok(())
     }
 
-    /// `removeAuthEntry` (mcp-auth.ts:840-849).
+    /// `removeAuthEntry` (mcp-auth.ts:840-849 @ 97435aab): chunk payloads
+    /// are removed first, then the manifest/account entry; the legacy
+    /// plaintext file follows.
     pub fn remove_entry(&self, server_name: &str) -> Result<(), AdapterError> {
         let account = get_auth_entry_account(server_name);
-        if let Some(payload) = self.backend.read(&account) {
+        if let Some(payload) = self.backend.read(&account)? {
             if let Some(manifest) = parse_chunk_manifest(&payload) {
                 for chunk_account in get_chunk_accounts(&account, &manifest) {
-                    self.backend.remove(&chunk_account);
+                    self.backend.remove(&chunk_account)?;
                 }
             }
         }
-        self.backend.remove(&account);
+        self.backend.remove(&account)?;
         remove_legacy_entry(server_name, &self.options);
         Ok(())
     }
@@ -589,9 +786,9 @@ impl OAuthCredentialStore {
         self.save_entry(server_name, entry, server_url.as_deref())
     }
 
-    /// `isTokenExpired` (mcp-auth.ts:958-963).
+    /// `isTokenExpired` (mcp-auth.ts:958-963) — status read.
     pub fn is_token_expired(&self, server_name: &str) -> Result<Option<bool>, AdapterError> {
-        let entry = self.get_entry(server_name)?;
+        let entry = self.get_entry_status(server_name)?;
         match entry.and_then(|e| e.tokens) {
             None => Ok(None),
             Some(tokens) => match tokens.expires_at {
@@ -607,9 +804,9 @@ impl OAuthCredentialStore {
         }
     }
 
-    /// `hasStoredTokens` (mcp-auth.ts:968-971).
+    /// `hasStoredTokens` (mcp-auth.ts:968-971) — status read.
     pub fn has_stored_tokens(&self, server_name: &str) -> bool {
-        self.get_entry(server_name)
+        self.get_entry_status(server_name)
             .ok()
             .flatten()
             .and_then(|e| e.tokens)
@@ -709,27 +906,57 @@ impl KeyringBackend {
 }
 
 impl SecretStore for KeyringBackend {
-    fn read(&self, account: &str) -> Option<String> {
-        let entry = keyring::Entry::new(&self.service, account).ok()?;
-        entry.get_password().ok()
+    fn read(&self, account: &str) -> Result<Option<String>, AdapterError> {
+        let entry = keyring::Entry::new(&self.service, account).map_err(|e| {
+            encrypted_store::credential_store_unavailable(
+                "read",
+                false,
+                format!("OAuth secure credential storage is unavailable: {e}"),
+            )
+        })?;
+        match entry.get_password() {
+            Ok(password) => Ok(Some(password)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(other) => Err(encrypted_store::credential_store_unavailable(
+                "read",
+                false,
+                format!("{other}"),
+            )),
+        }
     }
 
     fn write(&self, account: &str, payload: &str) -> Result<(), AdapterError> {
-        let entry = keyring::Entry::new(&self.service, account).map_err(|_| {
-            AdapterError::InvalidConfigValue(
-                "OAuth secure credential storage is unavailable".to_string(),
+        let entry = keyring::Entry::new(&self.service, account).map_err(|e| {
+            encrypted_store::credential_store_unavailable(
+                "write",
+                false,
+                format!("OAuth secure credential storage is unavailable: {e}"),
             )
         })?;
-        entry.set_password(payload).map_err(|_| {
-            AdapterError::InvalidConfigValue(
-                "Failed to write OAuth credentials to the OS credential store".to_string(),
+        entry.set_password(payload).map_err(|e| {
+            encrypted_store::credential_store_unavailable(
+                "write",
+                false,
+                format!("Failed to write OAuth credentials to the OS credential store: {e}"),
             )
         })
     }
 
-    fn remove(&self, account: &str) {
-        if let Ok(entry) = keyring::Entry::new(&self.service, account) {
-            let _ = entry.delete_credential();
+    fn remove(&self, account: &str) -> Result<(), AdapterError> {
+        let entry = keyring::Entry::new(&self.service, account).map_err(|e| {
+            encrypted_store::credential_store_unavailable(
+                "remove",
+                false,
+                format!("OAuth secure credential storage is unavailable: {e}"),
+            )
+        })?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(encrypted_store::credential_store_unavailable(
+                "remove",
+                false,
+                format!("Failed to remove OAuth credentials from the OS credential store: {e}"),
+            )),
         }
     }
 }
@@ -799,7 +1026,10 @@ mod tests {
             ..Default::default()
         };
 
-        let store = MemorySecretStore::new();
+        // #565: chunking applies on Windows or with a size-limited backend
+        // (upstream tests set PI_MCP_ADAPTER_TEST_AUTH_STORE=sizelimited);
+        // the size-limited backend is the platform-independent stand-in.
+        let store = SizeLimitedSecretStore::new();
         let cred_store = OAuthCredentialStore::with_backend(
             Box::new(store.clone()),
             AuthStorageOptions::default(),
@@ -926,6 +1156,7 @@ mod tests {
         ));
         let options = AuthStorageOptions {
             base_dir: Some(dir.clone()),
+            credential_store: None,
         };
         let store = MemorySecretStore::new();
 
@@ -1006,7 +1237,8 @@ mod tests {
             ..Default::default()
         };
 
-        let store = MemorySecretStore::new();
+        // #565: the size-limited backend forces chunking on every platform.
+        let store = SizeLimitedSecretStore::new();
         let cred_store = OAuthCredentialStore::with_backend(
             Box::new(store.clone()),
             AuthStorageOptions::default(),
@@ -1031,5 +1263,129 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A test backend whose chunking ceiling can flip (#565: the upstream
+    /// sizelimited→memory env switch — both share one entries map there;
+    /// here the flag is on the same underlying store).
+    #[derive(Clone, Default)]
+    struct FlipChunkingStore {
+        entries: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
+        force: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SecretStore for FlipChunkingStore {
+        fn read(&self, account: &str) -> Result<Option<String>, AdapterError> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(account)
+                .cloned())
+        }
+
+        fn write(&self, account: &str, payload: &str) -> Result<(), AdapterError> {
+            self.entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(account.to_string(), payload.to_string());
+            Ok(())
+        }
+
+        fn remove(&self, account: &str) -> Result<(), AdapterError> {
+            self.entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(account);
+            Ok(())
+        }
+
+        fn forces_chunking(&self) -> bool {
+            self.force.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn chunked_record_compacts_on_next_read_when_chunking_no_longer_needed() {
+        // #565: write chunked while the backend forces chunking, then stop
+        // forcing — the next read rewrites the record as a single entry and
+        // removes the digest-addressed chunks.
+        let backend = FlipChunkingStore::default();
+        let big_token = "x".repeat(AUTH_SECRET_CHUNK_SIZE * 2);
+        let entry = AuthEntry {
+            tokens: Some(StoredTokens {
+                access_token: big_token,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        backend
+            .force
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cred_store = OAuthCredentialStore::with_backend(
+            Box::new(backend.clone()),
+            AuthStorageOptions::default(),
+        );
+        cred_store.save_entry("big", entry, None).unwrap();
+        let account = get_auth_entry_account("big");
+        {
+            let entries = backend.entries.lock().unwrap();
+            assert!(entries.keys().any(|k| k.contains(".chunk.")));
+        }
+
+        backend
+            .force
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let read = cred_store.get_entry("big").unwrap().expect("entry");
+        assert_eq!(
+            read.tokens.unwrap().access_token.len(),
+            AUTH_SECRET_CHUNK_SIZE * 2
+        );
+        {
+            let entries = backend.entries.lock().unwrap();
+            assert!(
+                !entries.keys().any(|k| k.contains(".chunk.")),
+                "chunks must be compacted away"
+            );
+            let payload = entries.get(&account).expect("single payload");
+            assert!(!payload.contains(AUTH_CHUNK_MANIFEST_KEY));
+        }
+    }
+
+    #[test]
+    fn corrupted_chunk_fails_integrity_check() {
+        // #565: a chunk set that no longer rejoins to the manifest digest
+        // fails closed instead of parsing a truncated payload.
+        let backend = FlipChunkingStore::default();
+        backend
+            .force
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let big_token = "x".repeat(AUTH_SECRET_CHUNK_SIZE * 2);
+        let entry = AuthEntry {
+            tokens: Some(StoredTokens {
+                access_token: big_token,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cred_store = OAuthCredentialStore::with_backend(
+            Box::new(backend.clone()),
+            AuthStorageOptions::default(),
+        );
+        cred_store.save_entry("big", entry, None).unwrap();
+        {
+            let mut entries = backend.entries.lock().unwrap();
+            let chunk_key = entries
+                .keys()
+                .find(|k| k.contains(".chunk.0"))
+                .expect("chunk 0")
+                .clone();
+            if let Some(chunk) = entries.get_mut(&chunk_key) {
+                // Flip one character inside the chunk.
+                chunk.replace_range(0..1, "y");
+            }
+        }
+        let error = cred_store.get_entry("big").expect_err("integrity failure");
+        assert!(error.to_string().contains("integrity check failed"));
     }
 }

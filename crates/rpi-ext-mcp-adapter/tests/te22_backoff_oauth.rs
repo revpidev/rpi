@@ -282,7 +282,7 @@ async fn backoff_hides_failed_server_from_every_tool_surface() {
     assert_eq!(search_regex["details"]["count"], json!(0), "{search_regex}");
 
     // A2: describe 不可达。
-    let describe = proxy::execute_describe(&runtime, "demo_echo");
+    let describe = proxy::execute_describe(&runtime, "demo_echo", None);
     assert_eq!(describe["details"]["error"], json!("server_backoff"));
     assert!(describe["content"][0]["text"]
         .as_str()
@@ -335,7 +335,7 @@ async fn backoff_hides_failed_server_from_every_tool_surface() {
     assert!(!runtime.is_server_in_active_failure_backoff("demo"));
     let restored = proxy::execute_search(&runtime, "echo", false, None, None, None, None);
     assert_eq!(restored["details"]["count"], json!(1), "{restored}");
-    let restored_describe = proxy::execute_describe(&runtime, "demo_echo");
+    let restored_describe = proxy::execute_describe(&runtime, "demo_echo", None);
     assert_eq!(restored_describe["details"]["mode"], json!("describe"));
     let restored_list = proxy::execute_list(&runtime, "demo");
     assert!(restored_list["content"][0]["text"]
@@ -664,6 +664,7 @@ async fn oauth_invalid_grant_reregisters_stale_dynamic_client() {
         Box::new(MemorySecretStore::new()),
         AuthStorageOptions {
             base_dir: Some(dir.clone()),
+            credential_store: None,
         },
     );
     // 陈旧动态客户端 + 过期 token + 可刷新 refresh token（issuer 绑定让
@@ -701,6 +702,7 @@ async fn oauth_invalid_grant_reregisters_stale_dynamic_client() {
         })),
         auth_storage_options: AuthStorageOptions {
             base_dir: Some(dir.clone()),
+            credential_store: None,
         },
         ..Default::default()
     };
