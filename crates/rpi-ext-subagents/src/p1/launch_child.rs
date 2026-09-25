@@ -1448,4 +1448,51 @@ mod te18_gate_budget_tests {
         assert!(spec.context.is_none());
         assert!(spec.context_profile);
     }
+    /// W3 (#2324 pin): the child tool plan derives from the agent's own
+    /// declaration — the parent session's runtime tool face never
+    /// intersects it (the v0.66 hostAvailableBuiltins machinery was removed
+    /// upstream at v0.70; rpi never ported it). The argv assembly reads the
+    /// agent's declared allowlist only, whatever the parent runs with.
+    #[test]
+    fn child_tools_come_from_the_agent_declaration_not_the_parent_session() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-w3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let launch = crate::launch::args::build_rpi_args(&crate::launch::args::BuildArgsInput {
+            base_args: vec!["--mode".into(), "json".into()],
+            task: "t".into(),
+            session_enabled: true,
+            tools: Some(vec!["read".to_string(), "bash".to_string()]),
+            ..Default::default()
+        })
+        .expect("args build");
+        let tools_flag = launch
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--tools")
+            .map(|pair| pair[1].clone())
+            .expect("declared allowlist produces --tools");
+        assert_eq!(tools_flag, "read,bash");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W3 (#2043 pin): the intercom bridge applies AFTER system-prompt
+    /// assembly (bridge guidance rides the assembled prompt; prompt
+    /// filtering cannot strip bridge content).
+    #[test]
+    fn intercom_bridge_appends_after_prompt_assembly() {
+        let mut child_tools = None;
+        let mut prompt = "AGENT PROMPT BODY".to_string();
+        crate::p1::supervisor::apply_intercom_bridge(
+            "always",
+            Some("fresh"),
+            &mut child_tools,
+            &mut prompt,
+        );
+        assert!(
+            prompt.contains("AGENT PROMPT BODY"),
+            "the assembled agent prompt survives the bridge: {prompt}"
+        );
+        assert_ne!(prompt, "AGENT PROMPT BODY", "bridge guidance is added");
+    }
 }
