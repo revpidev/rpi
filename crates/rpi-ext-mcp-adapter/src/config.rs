@@ -791,7 +791,10 @@ pub fn write_config_text(write_path: &Path, text: &str) -> Result<(), crate::err
     if let Some(parent) = write_path.parent() {
         std::fs::create_dir_all(parent).map_err(crate::error::AdapterError::CacheIo)?;
     }
-    let tmp_path = write_path.with_extension("mcp.tmp");
+    // #601 (review P2-4): the pid suffix keeps concurrent writers from
+    // colliding on (or deleting) each other's in-flight temp file — the
+    // rename stays atomic per writer.
+    let tmp_path = write_path.with_extension(format!("{}.mcp.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp_path);
     let write_result = (|| -> Result<(), std::io::Error> {
         #[cfg(unix)]

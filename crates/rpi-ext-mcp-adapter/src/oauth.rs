@@ -95,7 +95,21 @@ impl OAuthFetch {
         // #539: connection CA trust applies to the OAuth provider requests
         // (same origin). An unloadable bundle fails the connect boundary
         // first; here a failure degrades to the system trust store.
-        let ca_client = crate::protocol::http::ca_aware_client(definition, server_name).ok();
+        // #486 (P1 review fix): this OAuth-side CA client carries the OAuth
+        // request timeout — the bounded-request invariant covers EVERY
+        // OAuth fetch; the transport's own CA client stays timeout-free
+        // (streaming legs must not inherit a request deadline).
+        let ca_client = crate::protocol::http::load_ca_bundle(definition, server_name)
+            .ok()
+            .and_then(|certificates| {
+                let mut builder = reqwest::Client::builder()
+                    .timeout(oauth_request_timeout())
+                    .redirect(reqwest::redirect::Policy::none());
+                for certificate in certificates {
+                    builder = builder.add_root_certificate(certificate);
+                }
+                builder.build().ok()
+            });
         Self {
             server_origin: origin,
             headers,
@@ -997,11 +1011,15 @@ pub async fn authenticate_with_store(
     // exactly, `{port}` (or no port) takes an OS-assigned port, and the
     // URI's host (localhost / 127.0.0.1 / [::1]) is the bound host. Bind
     // FIRST so the registered redirect_uris and the authorization URL
-    // carry the resolved port.
-    let loopback = config
-        .redirect_uri
-        .as_deref()
-        .and_then(parse_loopback_redirect_uri);
+    // carry the resolved port. A hard-invalid redirectUri fails the flow
+    // BEFORE anything binds (#483 upstream error ladder).
+    let loopback = match &config.redirect_uri {
+        Some(uri) => parse_loopback_redirect_uri(uri)?,
+        // Manual mode (https + non-loopback): no loopback target —
+        // the default listener + callback window is the existing
+        // manual shape ([VARIANT], see the parser doc).
+        None => None,
+    };
     // `strictPort: Boolean(config.clientId)` (mcp-auth-flow.ts:507 @
     // 97435aab): a pre-registered client relying on the default path binds
     // the configured default port exactly.
@@ -1014,9 +1032,15 @@ pub async fn authenticate_with_store(
         None => format!("http://localhost:{actual_port}{DEFAULT_OAUTH_CALLBACK_PATH}"),
     };
 
-    // Client identity ladder (#571 + stored-DCR reuse): an explicit
-    // `clientId` wins; else CIMD when the discovered metadata advertises
-    // `client_id_metadata_document_supported`; else a stored DCR
+    // Client identity ladder (#571 + #503 + stored-DCR reuse, ordered as
+    // the upstream provider resolves it — mcp-oauth-provider.ts
+    // clientInformation @ 97435aab): an explicit `clientId` wins; else a
+    // stored DCR registration that is still REFRESH-CAPABLE (the DCR→CIMD
+    // migration defers until the stored pair is invalidated — a refresh in
+    // the transition window goes out with the registered client_id);
+    // else CIMD when `oauth.clientMetadataUrl` is configured and the
+    // discovered metadata advertises
+    // `client_id_metadata_document_supported`; else the remaining stored
     // registration whose redirect_uris still cover the current callback
     // (#503: a stale redirect only drops the registration when the
     // credentials are not refresh-capable); else a fresh DCR.
@@ -1024,65 +1048,70 @@ pub async fn authenticate_with_store(
     let client_id = match &config.client_id {
         Some(id) => id.clone(),
         None => {
-            if config.client_metadata_url.is_some()
-                && metadata.client_id_metadata_document_supported == Some(true)
-            {
-                // CIMD (#571): the operator-supplied URL IS the client_id;
-                // no secret accompanies it and DCR is skipped. A stored DCR
-                // registration is kept untouched so an earlier refresh pair
-                // survives the migration (upstream "preserves a stored DCR
-                // refresh pair before transitioning to CIMD").
+            let stored_entry = store.get_entry(server_name)?;
+            let refresh_capable = stored_entry
+                .as_ref()
+                .and_then(|entry| entry.tokens.as_ref())
+                .and_then(|tokens| tokens.refresh_token.as_ref())
+                .is_some();
+            let cimd_active = config.client_metadata_url.is_some()
+                && metadata.client_id_metadata_document_supported == Some(true);
+            let stored = stored_entry
+                .and_then(|entry| entry.client_info)
+                .filter(|info| {
+                    // #503 stale-redirect gate: reuse unless the stored
+                    // redirect_uris miss the current callback AND the stored
+                    // tokens are not refresh-capable.
+                    let stale_redirect = info
+                        .redirect_uris
+                        .as_ref()
+                        .is_some_and(|uris| !uris.contains(&redirect_uri));
+                    !(stale_redirect && !refresh_capable)
+                });
+            if let Some(info) = &stored {
+                if refresh_capable {
+                    // The stored DCR pair still refreshes — it wins over
+                    // CIMD until invalidation (review P2-1 fix; upstream
+                    // "preserves a stored DCR refresh pair before
+                    // transitioning to CIMD").
+                    if client_secret.is_none() {
+                        client_secret = info.client_secret.clone();
+                    }
+                    info.client_id.clone()
+                } else if cimd_active {
+                    // CIMD (#571): the operator-supplied URL IS the
+                    // client_id; no secret accompanies it and DCR is
+                    // skipped. The stored registration stays untouched in
+                    // the credential store.
+                    config.client_metadata_url.clone().unwrap_or_default()
+                } else {
+                    if client_secret.is_none() {
+                        client_secret = info.client_secret.clone();
+                    }
+                    info.client_id.clone()
+                }
+            } else if cimd_active {
                 config.client_metadata_url.clone().unwrap_or_default()
             } else {
-                let stored = store
-                    .get_entry(server_name)?
-                    .and_then(|entry| entry.client_info)
-                    .filter(|info| {
-                        // #503 stale-redirect gate: reuse unless the stored
-                        // redirect_uris miss the current callback AND the
-                        // stored tokens are not refresh-capable.
-                        let stale_redirect = info
-                            .redirect_uris
-                            .as_ref()
-                            .is_some_and(|uris| !uris.contains(&redirect_uri));
-                        let refresh_capable = store
-                            .get_entry(server_name)
-                            .ok()
-                            .flatten()
-                            .and_then(|e| e.tokens)
-                            .and_then(|t| t.refresh_token)
-                            .is_some();
-                        !(stale_redirect && !refresh_capable)
-                    });
-                match stored {
-                    Some(info) => {
-                        if client_secret.is_none() {
-                            client_secret = info.client_secret.clone();
-                        }
-                        info.client_id
-                    }
-                    None => {
-                        let (id, secret) =
-                            register_client(&metadata, server_name, &redirect_uri, &fetch).await?;
-                        store.update_client_info(
-                            server_name,
-                            store::StoredClientInfo {
-                                client_id: id.clone(),
-                                client_secret: secret.clone(),
-                                redirect_uris: Some(vec![redirect_uri.clone()]),
-                                ..Default::default()
-                            },
-                            Some(server_url),
-                        )?;
-                        // DCR-issued secret authenticates the token exchange even
-                        // though it is not in the config (upstream stores it on
-                        // the provider and the SDK applies it automatically).
-                        if client_secret.is_none() {
-                            client_secret = secret;
-                        }
-                        id
-                    }
+                let (id, secret) =
+                    register_client(&metadata, server_name, &redirect_uri, &fetch).await?;
+                store.update_client_info(
+                    server_name,
+                    store::StoredClientInfo {
+                        client_id: id.clone(),
+                        client_secret: secret.clone(),
+                        redirect_uris: Some(vec![redirect_uri.clone()]),
+                        ..Default::default()
+                    },
+                    Some(server_url),
+                )?;
+                // DCR-issued secret authenticates the token exchange even
+                // though it is not in the config (upstream stores it on
+                // the provider and the SDK applies it automatically).
+                if client_secret.is_none() {
+                    client_secret = secret;
                 }
+                id
             }
         }
     };
@@ -1303,64 +1332,110 @@ async fn refresh_token(
 /// `parseOAuthRedirectUri` (mcp-auth-flow.ts:373-427 @ 97435aab, #483):
 /// classify `oauth.redirectUri`. A `{port}` placeholder (at most one, in
 /// the port position) takes an OS-assigned port; an explicit port binds
-/// exactly; `https://` non-loopback is the manual mode; everything else is
-/// an error. Returns `(callback_host, Option<port>, callback_path)` for
-/// the local mode.
-fn parse_loopback_redirect_uri(redirect_uri: &str) -> Option<(String, Option<u16>, String)> {
+/// exactly; `https://` non-loopback is the MANUAL mode; everything else
+/// is a HARD config error that fails the flow fast (upstream messages).
+/// Returns `Ok(None)` for the manual mode — [VARIANT] rpi has no manual
+/// completion input surface (`auth-complete` is not in scope), so the
+/// default listener plus the 5-minute callback window is the existing
+/// observable shape for manual flows.
+fn parse_loopback_redirect_uri(
+    redirect_uri: &str,
+) -> Result<Option<(String, Option<u16>, String)>, AdapterError> {
+    let invalid = |message: &str| AdapterError::InvalidConfigValue(message.to_string());
     let placeholder_count = redirect_uri.matches("{port}").count();
     if placeholder_count > 1 {
-        // At most one {port} placeholder; surface as a parse error via the
-        // manual `None` path is wrong — this is a hard config error, but
-        // the caller validates first; keep the classification total here.
-        return None;
+        return Err(invalid(
+            "OAuth redirectUri may contain at most one {port} placeholder",
+        ));
     }
     let dynamic_port = placeholder_count == 1;
     let parseable = if dynamic_port {
-        let authority_start = redirect_uri.find("://")? + 3;
+        let authority_start = match redirect_uri.find("://") {
+            Some(offset) => offset + 3,
+            None => {
+                return Err(invalid(&format!(
+                    "Invalid OAuth redirectUri: {redirect_uri}"
+                )))
+            }
+        };
         let authority_end = redirect_uri[authority_start..]
             .find(['/', '?', '#'])
             .map(|offset| authority_start + offset)
             .unwrap_or(redirect_uri.len());
         let authority = &redirect_uri[authority_start..authority_end];
         if !authority.ends_with(":{port}") {
-            return None;
+            return Err(invalid(
+                "OAuth redirectUri {port} placeholder must be the loopback URI port",
+            ));
         }
         redirect_uri.replace("{port}", "1")
     } else {
         redirect_uri.to_string()
     };
-    let Ok(url) = url::Url::parse(&parseable) else {
-        return None;
+    let url = match url::Url::parse(&parseable) {
+        Ok(url) => url,
+        Err(_) => {
+            return Err(invalid(&format!(
+                "Invalid OAuth redirectUri: {redirect_uri}"
+            )))
+        }
     };
-    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-        return None;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid(
+            "OAuth redirectUri must not include username or password",
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(invalid("OAuth redirectUri must not include a fragment"));
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let is_loopback =
         host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
     if dynamic_port && (url.scheme() != "http" || !is_loopback) {
-        return None;
+        return Err(invalid(
+            "OAuth redirectUri {port} placeholder is allowed only for an http:// localhost or loopback URI",
+        ));
     }
-    let port = url.port();
+    if let Some(port) = url.port() {
+        if port == 0 {
+            return Err(invalid(
+                "OAuth redirectUri port must be a positive numeric port",
+            ));
+        }
+    } else if let Some(raw_port) = url
+        .authority()
+        .rsplit_once(':')
+        .map(|(_, raw)| raw)
+        .filter(|raw| raw.chars().all(|c| c.is_ascii_digit()) && !raw.is_empty())
+    {
+        // A syntactically numeric but out-of-range port (WHATWG parsing
+        // drops it from `port()`); upstream's Number.parseInt gate rejects
+        // anything that is not a positive integer ≤ 65535.
+        let _ = raw_port;
+        return Err(invalid(
+            "OAuth redirectUri port must be a positive numeric port",
+        ));
+    }
     if url.scheme() == "https" && !is_loopback {
-        // Manual mode — no local listener (rpi surfaces the manual guidance
-        // through the 5-minute callback wait; a non-loopback callback can
-        // never reach it).
-        return None;
+        // Manual mode (see the [VARIANT] note above).
+        return Ok(None);
     }
     if url.scheme() != "http" || !is_loopback {
-        return None;
+        return Err(invalid(
+            "OAuth redirectUri must be an https:// URI or an http:// localhost or loopback URI",
+        ));
     }
-    if port.is_none() && !dynamic_port {
-        // An http:// loopback URI needs an explicit port (or {port}).
-        return None;
+    if url.port().is_none() && !dynamic_port {
+        return Err(invalid(
+            "OAuth localhost redirectUri must include an explicit numeric port",
+        ));
     }
     let callback_host = if host == "[::1]" {
         "::1".to_string()
     } else {
         host
     };
-    Some((callback_host, port, url.path().to_string()))
+    Ok(Some((callback_host, url.port(), url.path().to_string())))
 }
 
 /// `ensureCallbackServer` (#483): bind the callback listener. With a
@@ -1785,6 +1860,65 @@ mod tests {
             "https://a.test"
         ));
     }
+    /// #483 (review P2-2 fix): the redirect-URI classification ladder —
+    /// hard errors fail fast with the upstream messages; only the
+    /// https-non-loopback MANUAL mode maps to `None`.
+    #[test]
+    fn loopback_redirect_uri_error_ladder() {
+        use super::parse_loopback_redirect_uri as parse;
+        // Valid local forms.
+        assert!(parse("http://localhost:3118/callback").is_ok());
+        assert!(parse("http://127.0.0.1:{port}/callback").is_ok());
+        assert!(parse("http://[::1]:4321/cb").is_ok());
+        // Manual mode.
+        assert!(parse("https://client.example.com/client.json")
+            .expect("manual")
+            .is_none());
+        // Hard errors, message for message with upstream.
+        let cases = [
+            (
+                "http://localhost:{port}:{port}/cb",
+                "OAuth redirectUri may contain at most one {port} placeholder",
+            ),
+            (
+                "http://localhost:8080{port}/cb",
+                "OAuth redirectUri {port} placeholder must be the loopback URI port",
+            ),
+            (
+                "http://localhost:8080/cb#frag",
+                "OAuth redirectUri must not include a fragment",
+            ),
+            (
+                "http://user:pass@localhost:8080/cb",
+                "OAuth redirectUri must not include username or password",
+            ),
+            (
+                "https://client.example.test:{port}/c.json",
+                "OAuth redirectUri {port} placeholder is allowed only for an http:// localhost or loopback URI",
+            ),
+            (
+                "http://localhost:0/cb",
+                "OAuth redirectUri port must be a positive numeric port",
+            ),
+            (
+                "http://localhost/cb",
+                "OAuth localhost redirectUri must include an explicit numeric port",
+            ),
+            (
+                "ftp://localhost:8080/cb",
+                "OAuth redirectUri must be an https:// URI or an http:// localhost or loopback URI",
+            ),
+        ];
+        for (uri, expected) in cases {
+            let error = parse(uri).expect_err(uri);
+            assert_eq!(
+                error.to_string(),
+                format!("invalid config value: {expected}"),
+                "uri: {uri}"
+            );
+        }
+    }
+
     #[test]
     fn auth_server_metadata_url_validation_ladder() {
         // #458 (mcp-auth-flow.ts:243-261 @ 10a45367).
