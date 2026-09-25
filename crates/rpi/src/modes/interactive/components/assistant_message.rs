@@ -123,8 +123,10 @@ enum SlotDesc {
     TextBlock { fp: (u64, u64) },
     /// Thinking run -> `MouseRegion(Markdown(join) | hidden-label Text)`.
     /// `fp` covers the joined ("\n\n") run text; `hidden` picks the label
-    /// branch (and the closure's flip direction); the label fingerprint is
-    /// folded in when hidden because the label text renders then.
+    /// branch (and the closure's flip direction); `label_fp` is ALWAYS part
+    /// of the descriptor (a superset of the strictly-necessary fields): the
+    /// label renders when hidden, and when visible it only costs one extra
+    /// reconstruction on a label change — behavior-equivalent either way.
     ThinkingRun {
         fp: (u64, u64),
         run_index: usize,

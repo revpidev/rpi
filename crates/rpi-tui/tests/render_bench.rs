@@ -55,9 +55,10 @@ fn fresh_render(text: &str) -> (std::time::Duration, usize) {
 #[test]
 #[ignore = "V15-13 FR-Bench: run explicitly with --release --ignored --nocapture"]
 fn fresh_render_lines_scaling() {
-    // Issue #53 variable isolation: 3500 short lines (~150 KB) vs 35 long
-    // lines (~5.1 MB, same identity theme). Before L1: ~127 ms vs ~200 ms
-    // (line-count quadratic). After L1 both must be line-linear.
+    // Issue #53 variable isolation: 3500 short lines (~94 KB at 12 CJK
+    // chars/line) vs 35 long lines (~4.8 MB, same identity theme). Before
+    // L1: ~127 ms vs ~200 ms (line-count quadratic). After L1 both must be
+    // line-linear.
     let (short, short_out) = {
         let doc = cjk_doc(3500, 12);
         let (elapsed, out) = fresh_render(&doc);
