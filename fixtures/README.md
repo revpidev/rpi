@@ -10,17 +10,17 @@
 fixtures/
 ├── README.md                # This file: runbook + itemized parity baseline list
 ├── generate-fixtures.mjs    # Generation script (pinned commit + fixed prompt scripts)
-├── subagents-v066/          # subagents target-track recorded fixtures (the pin switched with TE27; this directory is the current baseline — see its README)
+├── subagents-v066/          # subagents recorded fixtures (TE27-era v0.66 recording; superseded as the active parity anchor by subagents-parity-v070 with TE39 — see its README)
 └── generated/
     ├── <scenario>/
     │   ├── session.jsonl    # Real on-disk session file (file-backed SessionManager)
     │   └── events.jsonl     # AgentSession event transcript (same event shape as json mode)
-    └── subagents-parity-v066/  # subagents target-track parity reports (the only active track since the pin switch)
+    └── subagents-parity-v070/  # subagents parity reports (the active track since the TE39 pin switch; v066 reports retired, kept for history)
 ```
 
 > **The v0.1.5 window (TE37, 2026-09-20; ADR-0029 adopted)**: `external/pi` switched to `d1230ea`
 > (v0.86.0+2); the plugin pins stay at their v0.1.4 baselines until their atomic switch tasks —
-> `external/pi-subagents` @ `0fc0eebb` (v0.66.0) until TE39, `external/pi-mcp-adapter` @ `10a45367`
+> `external/pi-subagents` **switched to `b72714de` (v0.70.0) with TE39 (2026-09-27)**, `external/pi-mcp-adapter` @ `10a45367`
 > (v2.32.1) until TE40, `external/rpiv-mono` @ `338b264` until TE41; `external/agent-smart-fetch` @
 > `b0111612` unchanged (upstream HEAD, zero-diff re-verified). The committed goldens above remain
 > recorded against `9841914` except the five `generated/` scenarios, re-recorded @ `19451accd`
@@ -31,11 +31,12 @@ fixtures/
 > (TE37); the current-pin regression tracks (`subagents-parity-v066/`, default driver = submodule)
 > stay green as the zero-regression baselines of the window.
 >
-> **Plugin rebases (effective, TE27 2026-09-11)**: `external/pi-subagents` @ `0fc0eebb` (v0.66.0),
-> `external/pi-mcp-adapter` @ `10a45367` (v2.32.1) — the pins switched atomically with TE27 (ADR-0025 adopted;
-> see rpi-docs `adr/0025-extension-upstream-rebase.md`);
-> `external/pi` @ `9841914` and `external/agent-smart-fetch` @ `b0111612` are unchanged.
-> `fixtures/subagents-v066/` and `fixtures/generated/subagents-parity-v066/` are the current baseline anchors.
+> **Plugin rebases**: `external/pi-subagents` @ **`b72714de` (v0.70.0)** — switched atomically with TE39
+> (2026-09-27; ADR-0029 five-pin table; the fallback/model parity legs re-anchored at v0.70
+> `model-resolution.ts`, argv/env stays the frozen v0.48 golden) — and `external/pi-mcp-adapter` @
+> `10a45367` (v2.32.1, TE27/ADR-0025); `external/pi` @ `19451accd` and `external/agent-smart-fetch` @
+> `b0111612` are unchanged. `fixtures/generated/subagents-parity-v070/` is the current parity anchor;
+> the v0.66 snapshot reports under `subagents-parity-v066/` are retired (kept for history).
 > **The old-tag regression tracks (subagents v0.48.0 / mcp v2.24.0) reached end-of-life with the pin switch**:
 > historical reports are preserved under `fixtures/generated/subagents-parity/` (subagents — its
 > zero-regression red-line mission complete) and the pre-tag archived versions of

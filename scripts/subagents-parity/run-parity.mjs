@@ -50,7 +50,10 @@ const GOLDEN_PATH = `${HERE}/args-golden-v048.json`;
 const TRACK_FLAG = process.argv.find((arg) => arg.startsWith("--track="));
 // Default = regression (the live submodule pin) for the whole v0.1.5 window;
 // TE39 flips the default back to `target` together with the pin switch.
-const TRACK = TRACK_FLAG ? TRACK_FLAG.slice("--track=".length) : "regression";
+// TE39 pin switch: the default track flips back to `target` (v0.70 = the
+// submodule pin); `--track=regression` still drives the retired v0.66
+// snapshot for archaeology.
+const TRACK = TRACK_FLAG ? TRACK_FLAG.slice("--track=".length) : "target";
 if (!["regression", "target"].includes(TRACK)) {
 	console.error(`unknown track: ${TRACK}`);
 	process.exit(2);

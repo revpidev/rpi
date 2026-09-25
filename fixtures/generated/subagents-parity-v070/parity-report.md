@@ -1,6 +1,6 @@
 # subagents parity report (target track: pi-subagents v0.70.0 @ b72714de snapshot, ADR-0029)
 
-generated: 2026-09-20T03:24:01.105Z
+generated: 2026-09-25T16:11:24.001Z
 
 ## args
 
@@ -62,7 +62,6 @@ generated: 2026-09-20T03:24:01.105Z
 - empty-model-inherits-parent: MATCH
 - candidates-explicit-miss-throws: MATCH
 - candidates-configured-miss-deferred-throw: MATCH
-- candidates-empty-registry-passthrough: MATCH
 - candidates-inherited-passthrough: MATCH
 - candidates-empty-chain-no-throw: MATCH
 

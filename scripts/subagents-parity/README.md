@@ -8,12 +8,12 @@ points with the same fixture set, then diffs the normalized outputs item by item
 
 | Track | Upstream | Purpose | Report directory |
 |----|------|------|----------|
-| `regression` (**default for the v0.1.5 window**) | the current pin v0.66.0 (`0fc0eebb`, an out-of-repo snapshot of the submodule HEAD) | zero-regression baseline of the window (full mode set) | `fixtures/generated/subagents-parity-v066/` (the TE27-era baseline directory, kept comparable) |
-| `target` | the new pin v0.70.0 (`b72714de`, an out-of-repo snapshot until TE39 switches the pin) | new-semantics parity and golden re-records | `fixtures/generated/subagents-parity-v070/` |
+| `target` (**default since the TE39 pin switch**) | the current pin v0.70.0 (`b72714de`, an out-of-repo snapshot) | active parity baseline (full mode set) | `fixtures/generated/subagents-parity-v070/` |
+| `regression` | the retired v0.66.0 snapshot (`0fc0eebb`) | archaeology only (the zero-regression mission ended with the pin switch) | `fixtures/generated/subagents-parity-v066/` (historical) |
 
-Track names rotate each rebase cycle (TE13 convention): during v0.1.4 the current pin was named
-`target`; for v0.1.5 it is named `regression` (the default), and `target` denotes the new pin.
-TE39 flips the default back to `target` together with the pin switch. The retired v0.48
+Track names rotate each rebase cycle (TE13 convention): the v0.1.5 window named the then-current
+pin `regression` (default) and the new pin `target`; **TE39 flipped the default back to `target`
+together with the pin switch** (2026-09-27). The retired v0.48
 archaeology face (live `pi-args.ts`) was removed with the TE37 rotation — the args leg is the
 frozen v0.48 golden on both tracks. The two fixture files (`fixtures.json`, `fixtures-target.json`)
 are shared and concatenated on both tracks. Both upstream legs read **snapshots** extracted by
@@ -29,12 +29,12 @@ mkdir -p /tmp/rpi-subagents-parity-deps && cd /tmp/rpi-subagents-parity-deps \
 
 cd <repo-root>
 
-# Regression track (v0.66.0 = the submodule pin; default for the window)
+# Default track (v0.70.0 snapshot = the submodule pin since TE39)
 bash scripts/subagents-parity/setup-target-source.sh   # extracts BOTH snapshots (target v0.70 + regression v0.66) + prod deps
 node scripts/subagents-parity/run-parity.mjs
 
-# Target track (v0.70.0 snapshot)
-node scripts/subagents-parity/run-parity.mjs --track=target
+# The retired v0.66.0 snapshot track (archaeology)
+node scripts/subagents-parity/run-parity.mjs --track=regression
 
 # Re-record the argv/env frozen baseline ([RPI-OWN], ADR-0025 §4; v0.48-era worktree + RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1 required)
 node scripts/subagents-parity/run-parity.mjs --record-args-golden
