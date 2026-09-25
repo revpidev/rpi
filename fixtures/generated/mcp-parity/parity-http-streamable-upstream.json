@@ -28,12 +28,12 @@
       "method": "notifications/initialized"
     },
     {
-      "method": "tools/list",
+      "method": "resources/list",
       "jsonrpc": "2.0",
       "id": "$id"
     },
     {
-      "method": "resources/list",
+      "method": "tools/list",
       "jsonrpc": "2.0",
       "id": "$id"
     },
