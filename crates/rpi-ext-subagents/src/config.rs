@@ -673,6 +673,9 @@ pub struct SubagentSettings {
     /// (one-segment `*` wildcard allowed); user-scope and project-scope
     /// settings stay scoped to their own discovery level.
     pub agent_scan_dirs: Option<Vec<String>>,
+    /// `agentExcludeDirs` (#2146): directory trees excluded from agent
+    /// discovery (resolved against this settings file's directory).
+    pub agent_exclude_dirs: Option<Vec<String>>,
 }
 
 /// `readSubagentSettings` (agents.ts:860-928) — fail-fast on invalid values.
@@ -871,6 +874,37 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
             None => {
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'agentScanDirs'; expected an array of strings.",
+                    path.to_string_lossy()
+                ))
+            }
+        }
+    }
+
+    if let Some(value) = subagents.get("agentExcludeDirs") {
+        match value.as_array() {
+            Some(items) => {
+                let mut dirs = Vec::new();
+                let mut valid = true;
+                for item in items {
+                    match item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(dir) => dirs.push(dir.to_string()),
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid {
+                    return Err(format!(
+                        "Subagent settings in '{}' have invalid 'agentExcludeDirs'; expected an array of non-empty strings.",
+                        path.to_string_lossy()
+                    ));
+                }
+                parsed.agent_exclude_dirs = Some(dirs);
+            }
+            None => {
+                return Err(format!(
+                    "Subagent settings in '{}' have invalid 'agentExcludeDirs'; expected an array of non-empty strings.",
                     path.to_string_lossy()
                 ))
             }
@@ -1205,6 +1239,10 @@ pub struct SettingsPair {
     /// project value wins over the user value (resolves independently from
     /// `defaultExtensions`).
     pub default_subagent_only_extensions: Option<Vec<String>>,
+    /// Resolved agent-exclusion roots (#2146): user + project entries, each
+    /// resolved against its own settings file's directory (`~` and absolute
+    /// entries honored); empty = no exclusions.
+    pub agent_exclude_roots: Vec<std::path::PathBuf>,
     /// `modelScope` — project wins when a project settings file exists
     /// (same mask discipline as the other defaults).
     pub model_scope: Option<crate::launch::model::ModelScopeConfig>,
@@ -1290,6 +1328,30 @@ pub fn read_settings_pair(cwd: &std::path::Path) -> SettingsPair {
     } else {
         user.default_provider.clone()
     };
+    // #2146: exclusion roots — user entries resolve against the user agent
+    // dir, project entries against the project settings dir; `~` expands and
+    // absolute entries pass through.
+    let mut agent_exclude_roots: Vec<std::path::PathBuf> = Vec::new();
+    for (base, entries) in [
+        (user_path.parent(), user.agent_exclude_dirs.as_deref()),
+        (
+            project_path.as_deref().and_then(std::path::Path::parent),
+            project.agent_exclude_dirs.as_deref(),
+        ),
+    ] {
+        let Some(base) = base else { continue };
+        let Some(entries) = entries else { continue };
+        for entry in entries {
+            let expanded = if entry.starts_with('~') || std::path::Path::new(entry).is_absolute() {
+                paths::expand_tilde_and_resolve(entry)
+            } else {
+                base.join(entry)
+            };
+            if !agent_exclude_roots.contains(&expanded) {
+                agent_exclude_roots.push(expanded);
+            }
+        }
+    }
     SettingsPair {
         default_model: project
             .default_model
@@ -1303,6 +1365,7 @@ pub fn read_settings_pair(cwd: &std::path::Path) -> SettingsPair {
         project_thinking_configured,
         default_extensions,
         default_subagent_only_extensions,
+        agent_exclude_roots,
         model_scope,
         max_thinking,
         default_provider,
@@ -1770,6 +1833,28 @@ mod te18_override_parse_tests {
         )
         .unwrap();
         assert!(read_subagent_settings(&blank).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn agent_exclude_dirs_parse() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-cfg-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentExcludeDirs":["nested/vendor"]}}"#,
+        )
+        .unwrap();
+        let settings = read_subagent_settings(&path).unwrap();
+        assert_eq!(
+            settings.agent_exclude_dirs,
+            Some(vec!["nested/vendor".to_string()])
+        );
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, r#"{"subagents":{"agentExcludeDirs":["  "]}}"#).unwrap();
+        let error = read_subagent_settings(&bad).unwrap_err();
+        assert!(error.contains("agentExcludeDirs"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -791,6 +791,32 @@ pub fn agent_from_content(
     }))
 }
 
+/// #2146 `agentExclusions`: a file path is excluded when it sits under any
+/// exclusion root — compared lexically and, failing that, against the
+/// canonicalized path (symlink aliasing: missing targets canonicalize
+/// through their nearest existing ancestor).
+pub fn path_is_agent_excluded(roots: &[std::path::PathBuf], file_path: &std::path::Path) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    if roots.iter().any(|root| file_path.starts_with(root)) {
+        return true;
+    }
+    fn canonical(path: &std::path::Path) -> std::path::PathBuf {
+        if let Ok(resolved) = path.canonicalize() {
+            return resolved;
+        }
+        match path.parent() {
+            Some(parent) => canonical(parent).join(path.file_name().unwrap_or_default()),
+            None => path.to_path_buf(),
+        }
+    }
+    let real_file = canonical(file_path);
+    roots
+        .iter()
+        .any(|root| real_file.starts_with(canonical(root)))
+}
+
 /// Load agents from one directory (`loadAgentsFromDir`, agents.ts:2166-2168 +
 /// `loadAgentsFromDefinitionFiles`, agents.ts:1960-2163). Per-file failures
 /// are isolated: they become [`DiscoverDiagnostic`] entries and the remaining
@@ -1240,6 +1266,11 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
             agents.append(&mut dir_agents);
             diagnostics.append(&mut dir_diagnostics);
         }
+        // #2146: exclusion roots from both settings levels filter discovery
+        // (nested plugin sources and symlink aliases included).
+        agents.retain(|agent| {
+            !path_is_agent_excluded(&settings.agent_exclude_roots, &agent.file_path)
+        });
         // Same-source dedupe: first definition wins (agents.ts:1844-1849).
         dedupe_by_name(agents)
     };
@@ -1264,6 +1295,9 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
             agents.append(&mut dir_agents);
             diagnostics.append(&mut dir_diagnostics);
         }
+        agents.retain(|agent| {
+            !path_is_agent_excluded(&settings.agent_exclude_roots, &agent.file_path)
+        });
         dedupe_by_name(agents)
     };
     apply_default_model(&mut project, &default_model);
@@ -1627,12 +1661,16 @@ pub fn resolve_agent_name<'a>(
     agents: &'a [AgentConfig],
     raw: &str,
 ) -> Result<Option<&'a AgentConfig>, String> {
-    let exact: Vec<&AgentConfig> = agents
-        .iter()
-        .filter(|a| a.name == raw || a.local_name == raw)
-        .collect();
-    if !exact.is_empty() {
-        return finish_agent_match(exact, raw, "name");
+    // #2214 (v0.70, 8d2976e6): canonical full-name matches win over local
+    // (short) names, each tier with its own ambiguity error — a bare local
+    // name never shadows or blurs a canonical one.
+    let canonical: Vec<&AgentConfig> = agents.iter().filter(|a| a.name == raw).collect();
+    if !canonical.is_empty() {
+        return finish_agent_match(canonical, raw, "name");
+    }
+    let local: Vec<&AgentConfig> = agents.iter().filter(|a| a.local_name == raw).collect();
+    if !local.is_empty() {
+        return finish_agent_match(local, raw, "local name");
     }
     let by_alias: Vec<&AgentConfig> = agents
         .iter()
@@ -2720,6 +2758,54 @@ mod te18_tools_tests {
         let mut agents = vec![agent_with("name: a\ndescription: d")];
         apply_default_subagent_only_extensions(&mut agents, &None);
         assert_eq!(agents[0].subagent_only_extensions, None);
+    }
+
+    #[test]
+    fn agent_exclusion_roots_filter_paths() {
+        // #2146: lexical containment and symlink-alias canonicalization.
+        let base = std::env::temp_dir().join(format!("rpi-sub-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("vendor");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.clone()];
+        assert!(path_is_agent_excluded(&roots, &root.join("pkg/agent.md")));
+        assert!(!path_is_agent_excluded(&roots, &base.join("keep/agent.md")));
+        assert!(!path_is_agent_excluded(&[], &root.join("any.md")));
+        // A symlink under the root aliases an outside file → excluded via
+        // the canonical comparison.
+        #[cfg(unix)]
+        {
+            let outside = base.join("outside.md");
+            std::fs::write(&outside, "x").unwrap();
+            let alias_dir = root.join("alias");
+            std::fs::create_dir_all(&alias_dir).unwrap();
+            std::os::unix::fs::symlink(&outside, alias_dir.join("link.md")).unwrap();
+            assert!(path_is_agent_excluded(&roots, &alias_dir.join("link.md")));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_agent_name_canonical_wins_over_local() {
+        // #2214: canonical name matches first; a local-name ambiguity gets
+        // its own error wording.
+        let mut a = agent_with("name: pkg.worker\ndescription: d1");
+        a.local_name = "worker".to_string();
+        let mut b = agent_with("name: other.worker\ndescription: d2");
+        b.local_name = "worker".to_string();
+        let agents = vec![a, b];
+        // Canonical hit resolves unambiguously even though the local name is
+        // ambiguous.
+        let resolved = resolve_agent_name(&agents, "pkg.worker")
+            .expect("canonical resolves")
+            .expect("present");
+        assert_eq!(resolved.name, "pkg.worker");
+        // The bare local name is ambiguous with its own wording.
+        let error = resolve_agent_name(&agents, "worker").unwrap_err();
+        assert!(
+            error.contains("Ambiguous agent local name 'worker'"),
+            "{error}"
+        );
     }
 
     #[test]

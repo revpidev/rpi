@@ -227,8 +227,14 @@ pub fn format_agent_capabilities_list(agents: &[AgentConfig]) -> String {
                 crate::agents::discover::ThinkingSpec::Disabled => "off".to_string(),
                 crate::agents::discover::ThinkingSpec::Unset => "default".to_string(),
             };
+            // #2213: report the acceptance policy in capability rows.
+            let acceptance = agent
+                .acceptance_role
+                .as_deref()
+                .map(|role| format!("; Acceptance: {role}"))
+                .unwrap_or_default();
             lines.push(format!(
-                "- {} ({}): Description: {}; Tools: {}; Model: {}; Thinking: {}",
+                "- {} ({}): Description: {}; Tools: {}; Model: {}; Thinking: {}{acceptance}",
                 agent.name,
                 agent.source_str(),
                 truncate_chars(&agent.description, 240),

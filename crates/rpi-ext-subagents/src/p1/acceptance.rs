@@ -60,17 +60,22 @@ pub fn infer_level(
     let read_only_name = ["reviewer", "oracle", "scout", "researcher", "analyst"]
         .iter()
         .any(|name| agent_name.contains(name));
-    let risky_task = [
-        "release",
-        "migration",
-        "security",
-        "data-loss",
-        "destructive",
-        "post-review",
-        "fix pass",
-    ]
-    .iter()
-    .any(|word| lowered_task.contains(word));
+    // #2191 (v0.70): topic keywords cannot override a classified read-only
+    // intent — risky keywords gate only tasks that are NOT read-only
+    // (unknown/unclassified tasks keep their risk gate).
+    let read_only_classified = read_only_name || is_read_only_task(&lowered_task);
+    let risky_task = !read_only_classified
+        && [
+            "release",
+            "migration",
+            "security",
+            "data-loss",
+            "destructive",
+            "post-review",
+            "fix pass",
+        ]
+        .iter()
+        .any(|word| lowered_task.contains(word));
     let writer =
         acceptance_role == Some("writer") || (!read_only_name && acceptance_role.is_some());
 

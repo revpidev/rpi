@@ -198,6 +198,14 @@ impl ChildSupervisorContext {
             "childIndex": self.child_index,
             "interview": params.get("interview").cloned().unwrap_or(Value::Null),
         });
+        // progress_update (L265-270 + 3d78e6ec at v0.70): non-blocking note —
+        // upstream writes then deletes it on the watcher read so it never
+        // reaches the parent; rpi has no watcher, so the write is skipped
+        // outright (identical net semantics: no parent turn, no pending
+        // entry, no channel litter).
+        if reason == "progress_update" {
+            return ok_result("Progress update delivered.");
+        }
         let serialized = request.to_string();
         if serialized.len() > MAX_REQUEST_BYTES {
             return error_result(
@@ -211,10 +219,6 @@ impl ChildSupervisorContext {
             .join(format!("{request_id}.json"));
         if let Err(error) = std::fs::write(&request_path, serialized) {
             return error_result(&format!("failed to write the supervisor request: {error}"));
-        }
-        // progress_update writes and returns immediately (L265-270).
-        if reason == "progress_update" {
-            return ok_result("Progress update delivered.");
         }
         // Poll the reply inbox (≤500ms interval, 10min timeout, L272-279).
         let reply_path = self
@@ -372,6 +376,12 @@ pub fn parent_supervisor_action(
                 for channel in channel_entries.flatten() {
                     for request in read_requests(&channel.path()) {
                         if !request_matches_session(&request, orchestrator_session_id) {
+                            continue;
+                        }
+                        // #2229/#2230 + 3d78e6ec (v0.70): progress updates never
+                        // reach the parent — only reply-expecting requests
+                        // surface in the pending listing.
+                        if request["reason"].as_str() == Some("progress_update") {
                             continue;
                         }
                         found += 1;
