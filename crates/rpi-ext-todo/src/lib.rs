@@ -524,6 +524,7 @@ mod tests {
 
     #[test]
     fn install_registers_the_tool_and_six_events() {
+        let _guard = serialized();
         __reset_state();
         let calls = RpiHostCalls { call: fake_call };
         let cookie = 0xdead as PluginCookie;
