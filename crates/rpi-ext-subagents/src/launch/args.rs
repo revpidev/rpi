@@ -767,7 +767,7 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
             crate::p1::tool_budget::TOOL_BUDGET_ENV.to_string(),
             Some(budget.clone()),
         );
-    } else {
+    } else if std::env::var_os(crate::p1::tool_budget::TOOL_BUDGET_ENV).is_some() {
         cleared(&mut env, crate::p1::tool_budget::TOOL_BUDGET_ENV);
     }
     if let Some(baseline) = &input.diff_baseline {
@@ -775,7 +775,9 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
             crate::p1::diff_tool::DIFF_BASELINE_ENV.to_string(),
             Some(baseline.clone()),
         );
-    } else {
+    } else if std::env::var_os(crate::p1::diff_tool::DIFF_BASELINE_ENV).is_some() {
+        // Clear only when this process itself carries a baseline (a fanout
+        // child launching its own children); avoids blank-overlay noise.
         cleared(&mut env, crate::p1::diff_tool::DIFF_BASELINE_ENV);
     }
     if let Some(allowlist) = &input.descendant_allowed_agents {
@@ -783,7 +785,9 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
             SUBAGENT_ALLOWED_AGENTS_ENV.to_string(),
             Some(allowlist.to_env_value()),
         );
-    } else {
+    } else if std::env::var_os(SUBAGENT_ALLOWED_AGENTS_ENV).is_some() {
+        // Only clear an actually-inherited ceiling (a fanout child's own
+        // launches); effective_descendant_allowlist consumed it above.
         cleared(&mut env, SUBAGENT_ALLOWED_AGENTS_ENV);
     }
     cleared(&mut env, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV);
