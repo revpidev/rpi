@@ -33,6 +33,7 @@ fn format_list_line(task: &Task) -> String {
     let form = if task.status == crate::tool::types::TaskStatus::InProgress {
         task.active_form
             .as_deref()
+            .filter(|label| !label.is_empty())
             .map(|label| format!(" ({})", sanitize_terminal_text(label)))
             .unwrap_or_default()
     } else {
@@ -62,13 +63,17 @@ fn format_get_lines(task: &Task, state: &TaskState) -> String {
         task.status.as_str(),
         sanitize_terminal_text(&task.subject)
     )];
-    if let Some(description) = task.description.as_deref() {
+    if let Some(description) = task.description.as_deref().filter(|text| !text.is_empty()) {
         lines.push(format!(
             "  description: {}",
             sanitize_terminal_text(description)
         ));
     }
-    if let Some(active_form) = task.active_form.as_deref() {
+    if let Some(active_form) = task
+        .active_form
+        .as_deref()
+        .filter(|label| !label.is_empty())
+    {
         lines.push(format!(
             "  activeForm: {}",
             sanitize_terminal_text(active_form)
@@ -93,7 +98,7 @@ fn format_get_lines(task: &Task, state: &TaskState) -> String {
                 .join(", ")
         ));
     }
-    if let Some(owner) = task.owner.as_deref() {
+    if let Some(owner) = task.owner.as_deref().filter(|text| !text.is_empty()) {
         lines.push(format!("  owner: {}", sanitize_terminal_text(owner)));
     }
     lines.join("\n")
@@ -110,10 +115,9 @@ pub fn format_content(op: &Op, state: &TaskState) -> String {
                 return format!("Created #{task_id}");
             };
             format!(
-                "Created #{}: {} ({})",
+                "Created #{}: {} (pending)",
                 task.id,
-                sanitize_terminal_text(&task.subject),
-                task.status.as_str()
+                sanitize_terminal_text(&task.subject)
             )
         }
         Op::Update {
@@ -454,6 +458,41 @@ mod tests {
     }
 
     #[test]
+    fn empty_string_fields_render_no_lines_or_parenthetical() {
+        // Upstream truthiness gates: an update may STORE "" (defined,
+        // `!== undefined`), but the formatters' `if (task.x)` skips it
+        // (F3).
+        let state = state_with(vec![task_with(1, "x", |task| {
+            task.description = Some(String::new());
+            task.active_form = Some(String::new());
+            task.owner = Some(String::new());
+        })]);
+        assert_eq!(
+            format_content(
+                &Op::Get {
+                    task: state.tasks[0].clone()
+                },
+                &state
+            ),
+            "#1 [pending] x"
+        );
+        let state = state_with(vec![task_with(1, "x", |task| {
+            task.status = TaskStatus::InProgress;
+            task.active_form = Some(String::new());
+        })]);
+        assert_eq!(
+            format_content(
+                &Op::List {
+                    status_filter: None,
+                    include_deleted: false
+                },
+                &state
+            ),
+            "[in_progress] #1 x"
+        );
+    }
+
+    #[test]
     fn error_prefixes_message() {
         assert_eq!(
             format_content(
@@ -564,11 +603,11 @@ mod tests {
             task.status = TaskStatus::InProgress;
             task.active_form = Some("clear\u{001b}[2Jing".to_owned());
         })]);
-        // Note: the task fixture's status is staged in_progress by the
-        // updater, but the create branch prints the stored status.
+        // The create branch prints the literal "(pending)" even when the
+        // stored status differs (upstream hardcodes it; F5).
         assert_eq!(
             format_content(&Op::Create { task_id: 1 }, &state),
-            "Created #1: evil (in_progress)"
+            "Created #1: evil (pending)"
         );
         assert_eq!(
             format_content(

@@ -98,7 +98,17 @@ pub fn js_string(value: &Value) -> String {
         Value::Null => "null".to_owned(),
         Value::Bool(true) => "true".to_owned(),
         Value::Bool(false) => "false".to_owned(),
-        Value::Number(number) => number.to_string(),
+        Value::Number(number) => {
+            // JS `String(number)`: integral floats render without the
+            // fractional part (`String(2.0) === "2"`) — serde's f64 Display
+            // would print `2.0` (F6).
+            match number.as_f64() {
+                Some(float) if float.fract() == 0.0 && float.abs() <= 9.007_199_254_740_992e15 => {
+                    format!("{}", float as i64)
+                }
+                _ => number.to_string(),
+            }
+        }
         Value::String(text) => text.clone(),
         Value::Object(_) => "[object Object]".to_owned(),
         Value::Array(items) => items.iter().map(js_string).collect::<Vec<_>>().join(","),
@@ -265,9 +275,9 @@ pub fn apply_task_mutation(
                 new_task.owner = Some(owner.to_owned());
             }
             if let Some(metadata) = params.get("metadata").and_then(Value::as_object) {
-                if !metadata.is_empty() {
-                    new_task.metadata = Some(metadata.clone());
-                }
+                // Upstream `if (params.metadata)` — any object is truthy in
+                // JS, so an empty `{}` is stored verbatim (F2).
+                new_task.metadata = Some(metadata.clone());
             }
 
             let task_id = new_task.id;
@@ -631,6 +641,19 @@ mod tests {
         // Immutability: the input state is untouched.
         assert!(state.tasks.is_empty());
         assert_eq!(result.op, Op::Create { task_id: 1 });
+    }
+
+    #[test]
+    fn create_stores_an_empty_metadata_object_verbatim() {
+        // Upstream `if (params.metadata)` — any object is truthy in JS, so
+        // `metadata: {}` IS stored and appears in the details snapshot
+        // (F2).
+        let result = apply_task_mutation(
+            empty_state(),
+            TaskAction::Create,
+            &params(json!({"subject": "x", "metadata": {}})),
+        );
+        assert_eq!(result.state.tasks[0].metadata, Some(serde_json::Map::new()));
     }
 
     #[test]
@@ -1067,6 +1090,15 @@ mod tests {
         assert_eq!(js_string(&Value::Null), "null");
         assert_eq!(js_string(&json!(true)), "true");
         assert_eq!(js_string(&json!({})), "[object Object]");
+    }
+
+    #[test]
+    fn js_string_renders_integral_floats_without_fraction() {
+        // `String(2.0) === "2"` in JS; serde's f64 Display prints "2.0"
+        // (F6).
+        assert_eq!(js_string(&json!(2.0)), "2");
+        assert_eq!(js_string(&json!(1.5)), "1.5");
+        assert_eq!(js_string(&json!(2)), "2");
     }
 
     #[test]

@@ -103,10 +103,15 @@ fn strip_escape_sequences(value: &str) -> String {
                 Some(']') => {
                     index = consume_osc_payload(&chars, index + 2);
                 }
-                // Bare two-character ESC sequence (`\u001b.`) — includes
-                // the None case's trailing ESC handling below.
+                // Bare two-character ESC sequence (`\u001b.`) — the JS
+                // regex `.` never matches a line terminator (\n, \r,
+                // U+2028, U+2029), so an ESC before one does NOT pair: the
+                // ESC stays for the control-character pass (dropped there)
+                // and the terminator survives to become a space (F4).
                 _ => {
-                    if index + 1 < chars.len() {
+                    let next_is_terminator = index + 1 < chars.len()
+                        && matches!(chars[index + 1], '\n' | '\r' | '\u{2028}' | '\u{2029}');
+                    if index + 1 < chars.len() && !next_is_terminator {
                         index += 2;
                     } else {
                         out.push(character);
@@ -198,6 +203,14 @@ mod tests {
         // OSC payload stops before the ESC; `ESC X` is then consumed by the
         // two-char ESC rule; `b` survives.
         assert_eq!(sanitize_terminal_text("a\u{001b}]0;t\u{001b}Xb"), "ab");
+    }
+
+    #[test]
+    fn bare_esc_before_a_line_terminator_does_not_pair() {
+        // JS `\u001b.` — `.` never matches a line terminator, so the ESC
+        // is dropped by the control pass and the \n becomes a space (F4).
+        assert_eq!(sanitize_terminal_text("a\u{001b}\nb"), "a b");
+        assert_eq!(sanitize_terminal_text("a\u{001b}\rb"), "a b");
     }
 
     #[test]
