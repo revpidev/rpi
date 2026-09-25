@@ -1,7 +1,7 @@
 //! Tool definition + `execute` orchestration.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/ask-user-question.ts` @
-//! `338b264c` for the Q0/Q1 surface: registration payload (schema/description/
+//! `0fdf4f8` for the Q0/Q1 surface: registration payload (schema/description/
 //! promptSnippet/promptGuidelines with config overrides), the fixed
 //! `execute` order (normalize → `ctx.hasUI` guard → validate → `prompt` event
 //! → branch) and the envelope shapes for every failure exit.
@@ -49,6 +49,13 @@ pub const ERROR_NO_CUSTOM_UI: &str = "Error: this client cannot render the quest
 /// Build the `registerTool` payload with config overrides applied
 /// (`registerAskUserQuestionTool`): guidance fields replace the defaults only
 /// when non-empty (validated by [`crate::config::validate_guidance_fields`]).
+///
+/// The `renderCall`/`renderResult` flags are the rpi#52 [RPI-OWN]
+/// addition (TE41): upstream registers no render hooks (in pi the args
+/// never reach the transcript), while rpi's host renders hook-less
+/// extension tools through the generic pretty-printed-args branch —
+/// the flags make the host install the render closures that dispatch
+/// `{"kind":"render"}` back into [`crate::render`].
 pub fn tool_definition(config: &AskUserQuestionConfig) -> Value {
     let guidance = &config.guidance;
     json!({
@@ -58,6 +65,8 @@ pub fn tool_definition(config: &AskUserQuestionConfig) -> Value {
         "promptSnippet": guidance.prompt_snippet.clone().unwrap_or_else(default_prompt_snippet),
         "promptGuidelines": guidance.prompt_guidelines.clone().unwrap_or_else(default_prompt_guidelines),
         "parameters": question_params_schema(),
+        "renderCall": true,
+        "renderResult": true,
     })
 }
 
@@ -430,6 +439,9 @@ mod tests {
             4
         );
         assert_eq!(definition["parameters"]["type"], "object");
+        // TE41 (rpi#52): the render capability flags ride the registration.
+        assert_eq!(definition["renderCall"], json!(true));
+        assert_eq!(definition["renderResult"], json!(true));
 
         let config = AskUserQuestionConfig {
             guidance: crate::config::GuidanceFields {

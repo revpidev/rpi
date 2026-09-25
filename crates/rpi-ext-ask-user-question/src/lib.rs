@@ -1,6 +1,8 @@
 //! `rpi-ext-ask-user-question` — L0 native plugin, port of
-//! `@juicesharp/rpiv-ask-user-question` v2.9.0+ (`juicesharp/rpiv-mono`
-//! `packages/rpiv-ask-user-question/` @ `338b264c`).
+//! `@juicesharp/rpiv-ask-user-question` v2.10.1+ (`juicesharp/rpiv-mono`
+//! `packages/rpiv-ask-user-question/` @ `0fdf4f8`; the `338b264..0fdf4f8`
+//! span is comment/version-level for this package — TE41 FR-F review,
+//! zero behavior delta over the v2.9.0+7 port).
 //!
 //! Registers the single `ask_user_question` tool: a structured questionnaire
 //! the model can put to the user when it would otherwise guess, with typed
@@ -9,6 +11,9 @@
 //! tool schema/description/guidance, line-terminator normalization, validation
 //! and error codes, the result envelope, the `rpiv:ask-user:*` event payloads,
 //! the `before_agent_start` reconciler, XDG config and the 9 embedded locales.
+//! TE41 adds the rpi#52 [RPI-OWN] transcript renderers
+//! ([`render`]: collapsed summary / `Ctrl+O` expanded detail / streaming
+//! tolerance — no upstream counterpart).
 //!
 //! Docs: `rpi-docs/extensions/rpiv-ask-user-question/{00,01,02}.md` and the
 //! task file `rpi-docs/plan/extensions/TE28-ask-user-question-contract.md`.
@@ -27,6 +32,7 @@ pub mod golden;
 pub mod i18n;
 pub mod parity_cases;
 pub mod reconcile;
+pub mod render;
 pub mod rpc_fallback;
 pub mod state;
 pub mod tool;
@@ -190,6 +196,11 @@ fn dispatch_message(message: &Value) -> Value {
         return Value::Null;
     };
     match message.get("kind").and_then(Value::as_str) {
+        // Render protocol (host_call.rs render arms): synchronous, pure
+        // JSON on the TUI update path — the theme read (`ui.theme`) is a
+        // synchronous host-side getter, never a nested dispatch
+        // (rpiv-todo render-dispatch precedent).
+        Some("render") => render::dispatch_render(&host, message),
         Some("toolExecute")
             if message.get("toolName").and_then(Value::as_str) == Some(tool::TOOL_NAME) =>
         {
@@ -227,22 +238,37 @@ pub extern "C" fn init(calls: RpiHostCalls, cookie: PluginCookie) -> RVec<u8> {
 }
 
 /// Dispatch entry (abi_stable).
+///
+/// Render messages get their own panic guard answering `null` (the
+/// host-side `render_call` closure degrades `null` to the per-hook
+/// fallback — the pi-identical bold title line). The generic isError
+/// tool-result envelope must never leak into a render answer: it is not
+/// a component tree, and the fail-visible unknown-node rendering would
+/// resurrect exactly the JSON dump rpi#52 removes (FR-D red line).
 #[allow(clippy::missing_safety_doc)]
 pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let message: Value = serde_json::from_slice(&message[..]).unwrap_or(Value::Null);
-        dispatch_message(&message)
-    }))
-    .unwrap_or_else(|_panic| {
-        json!({
-            "content": [{
-                "type": "text",
-                "text": "rpiv-ask-user-question panicked while handling a dispatch",
-            }],
-            "isError": true,
+    let parsed: Value = serde_json::from_slice(&message[..]).unwrap_or(Value::Null);
+    pack(&guarded_dispatch(&parsed))
+}
+
+/// The guarded dispatch over a parsed message (shared by the FFI entry
+/// and [`dispatch_for_test`]): `render` panics answer `null`, every
+/// other kind keeps the isError tool-result panic envelope.
+fn guarded_dispatch(parsed: &Value) -> Value {
+    if parsed.get("kind").and_then(Value::as_str) == Some("render") {
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch_message(parsed)))
+            .unwrap_or(Value::Null);
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch_message(parsed)))
+        .unwrap_or_else(|_panic| {
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "rpiv-ask-user-question panicked while handling a dispatch",
+                }],
+                "isError": true,
+            })
         })
-    });
-    pack(&result)
 }
 
 /// The root module export (abi_stable).
@@ -262,10 +288,12 @@ pub fn install_for_test(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     install(calls, cookie)
 }
 
-/// Test seam: dispatch a message against the stored channel.
+/// Test seam: dispatch a message against the stored channel (through
+/// the same guarded path as the FFI entry, so the render panic guard is
+/// observable in tests).
 #[doc(hidden)]
 pub fn dispatch_for_test(message: &Value) -> Value {
-    dispatch_message(message)
+    guarded_dispatch(message)
 }
 
 /// Parity harness facade: exposes the pure-port functions for
@@ -392,6 +420,10 @@ mod tests {
         assert_eq!(calls[0].1["name"], "ask_user_question");
         assert_eq!(calls[0].1["label"], "Ask User Question");
         assert_eq!(calls[0].1["parameters"]["type"], "object");
+        // TE41 (rpi#52): the render hooks are advertised so the host
+        // installs the render closures.
+        assert_eq!(calls[0].1["renderCall"], json!(true));
+        assert_eq!(calls[0].1["renderResult"], json!(true));
         assert_eq!(calls[1].0, "on");
         assert_eq!(calls[1].1["event"], "before_agent_start");
     }
@@ -479,6 +511,81 @@ mod tests {
             Value::Null
         );
         assert!(requests().is_empty());
+    }
+
+    #[test]
+    fn lib_dispatch_routes_render_messages() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        reset_fake();
+        queue_reply(Ok(Value::Null)); // registerTool
+        queue_reply(Ok(Value::Null)); // on(before_agent_start)
+        let _ = install_for_test(RpiHostCalls { call: fake_call }, std::ptr::null());
+        reset_fake();
+        queue_reply(Err(("unknownMethod", "no ui"))); // ui.theme (unstyled fallback)
+
+        let result = dispatch_for_test(&json!({
+            "kind": "render",
+            "what": "toolCall",
+            "toolName": "ask_user_question",
+            "context": {
+                "args": {"questions": [{
+                    "question": "Pick?", "header": "Pick",
+                    "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]
+                }]},
+                "argsComplete": true,
+                "expanded": false
+            }
+        }));
+        assert_eq!(
+            result["props"]["text"]
+                .as_str()
+                .expect("text")
+                .replace('\u{1b}', "")
+                .replace("[1m", "")
+                .replace("[22m", "")
+                .replace("[39m", ""),
+            "ask_user_question 1 question (Pick)"
+        );
+        // The theme read went through the stored channel.
+        assert_eq!(requests()[0].0, "ui.theme");
+
+        // A render for a different tool is not ours: null (the host-side
+        // render closure degrades null to the per-hook fallback).
+        reset_fake();
+        assert_eq!(
+            dispatch_for_test(&json!({
+                "kind": "render", "what": "toolCall", "toolName": "other"
+            })),
+            Value::Null
+        );
+        assert!(requests().is_empty());
+    }
+
+    #[test]
+    fn lib_render_panic_guard_answers_null_never_the_error_envelope() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        reset_fake();
+        queue_reply(Ok(Value::Null)); // registerTool
+        queue_reply(Ok(Value::Null)); // on
+        let _ = install_for_test(RpiHostCalls { call: fake_call }, std::ptr::null());
+        reset_fake();
+
+        // FR-D red line: a panicking render arm must surface as `null` so
+        // the host degrades to the pi-identical title fallback — the
+        // isError tool-result envelope (not a component tree) would
+        // render as JSON, resurrecting the dump rpi#52 removes.
+        render::FORCE_PANIC.store(true, std::sync::atomic::Ordering::SeqCst);
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let result = dispatch_for_test(&json!({
+            "kind": "render",
+            "what": "toolCall",
+            "toolName": "ask_user_question",
+            "context": {"args": {"questions": []}, "argsComplete": false}
+        }));
+        std::panic::set_hook(previous_hook);
+        render::FORCE_PANIC.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(result, Value::Null);
     }
 
     #[test]

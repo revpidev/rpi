@@ -363,5 +363,135 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
         Some(&serde_json::json!("A"))
     );
 
+    // 8. TE41 (rpi#52) render round-trip through the real ABI: the
+    //    registration's render flags install the closures; `renderCall`
+    //    answers a component tree (collapsed summary / expanded detail /
+    //    streaming tolerance) and `renderResult` answers the three result
+    //    states. The tree text must never contain the pretty-printed args
+    //    JSON — reverting the capability flags must fail this assertion
+    //    (the hooks would be absent and the host would fall back to the
+    //    generic dump).
+    let render_call = definition
+        .render_call
+        .clone()
+        .expect("renderCall closure installed");
+    let render_result = definition
+        .render_result
+        .clone()
+        .expect("renderResult closure installed");
+    let strip_ansi = |line: &str| {
+        line.replace('\u{1b}', "")
+            .replace("[1m", "")
+            .replace("[22m", "")
+            .replace("[39m", "")
+    };
+    let render_args = serde_json::json!({
+        "questions": [
+            {
+                "question": "Which storage backend should the CLI default to?",
+                "header": "Scope",
+                "options": [
+                    {"label": "Local SQLite", "description": "zero setup, single machine"},
+                    {"label": "Postgres", "description": "networked, concurrent access"}
+                ]
+            },
+            {
+                "question": "How urgent is the migration?",
+                "header": "Priority",
+                "options": [
+                    {"label": "Now", "description": "this sprint"}
+                ]
+            }
+        ]
+    });
+    let call_context =
+        |args_complete: bool, expanded: bool| rpi_ext_host::types::ToolRenderContext {
+            args: render_args.clone(),
+            tool_call_id: "l0-render".to_owned(),
+            cwd: "/tmp".to_owned(),
+            execution_started: true,
+            args_complete,
+            is_partial: !args_complete,
+            expanded,
+            show_images: false,
+            is_error: false,
+            terminal_width: Some(100),
+        };
+
+    // Collapsed summary (the issue #52 §1 example shape).
+    let tree = render_call(call_context(true, false)).expect("collapsed tree");
+    let serialized = serde_json::to_string(&tree).unwrap_or_default();
+    assert_eq!(
+        strip_ansi(tree["props"]["text"].as_str().unwrap_or("")),
+        "ask_user_question 2 questions (Scope, Priority)"
+    );
+    assert_eq!(tree["props"]["truncate"], serde_json::json!(true));
+    // The rpi#52 regression floor: no pretty-printed args anywhere in the
+    // tree (the dump would carry the raw question/description strings).
+    assert!(!serialized.contains("Which storage backend"));
+    assert!(!serialized.contains("zero setup, single machine"));
+
+    // Expanded detail (Ctrl+O / app.tools.expand).
+    let tree = render_call(call_context(true, true)).expect("expanded tree");
+    assert_eq!(tree["type"], "column");
+    let children = tree["children"].as_array().expect("children");
+    assert_eq!(
+        strip_ansi(children[2]["props"]["text"].as_str().unwrap_or("")),
+        "  1. Scope — Which storage backend should the CLI default to?"
+    );
+    assert_eq!(
+        strip_ansi(children[3]["props"]["text"].as_str().unwrap_or("")),
+        "       1. Local SQLite — zero setup, single machine"
+    );
+
+    // Streaming tolerance: a truncated array counts what is there.
+    let mut streaming = call_context(false, false);
+    streaming.args["questions"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    let tree = render_call(streaming).expect("streaming tree");
+    assert_eq!(
+        strip_ansi(tree["props"]["text"].as_str().unwrap_or("")),
+        "ask_user_question 1 question (Scope, …)"
+    );
+
+    // renderResult over a real answered envelope (from step 7's execute).
+    let answered = serde_json::json!({
+        "content": serde_json::to_value(&result.content).unwrap_or_default(),
+        "details": result.details.clone()
+    });
+    let answered: rpi_agent::types::AgentToolResult =
+        serde_json::from_value(answered).expect("agent result");
+    let mut result_context = call_context(true, false);
+    result_context.is_error = false;
+    let tree = render_result(
+        answered.clone(),
+        rpi_ext_host::types::ToolRenderResultOptions {
+            expanded: false,
+            is_partial: false,
+        },
+        result_context.clone(),
+    )
+    .expect("result tree");
+    assert_eq!(
+        strip_ansi(tree["props"]["text"].as_str().unwrap_or("")),
+        "✓ 1 answered"
+    );
+    // Expanded result carries the per-answer detail line.
+    let tree = render_result(
+        answered,
+        rpi_ext_host::types::ToolRenderResultOptions {
+            expanded: true,
+            is_partial: false,
+        },
+        result_context,
+    )
+    .expect("expanded result tree");
+    assert_eq!(
+        strip_ansi(tree["children"][1]["props"]["text"].as_str().unwrap_or("")),
+        "✓ Pick one? = A"
+    );
+
     let _ = std::fs::remove_dir_all(full.parent().unwrap());
 }
