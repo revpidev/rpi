@@ -8,10 +8,10 @@
 # `git -C external/pi-subagents status --porcelain` stays empty and the
 # submodule HEAD is untouched):
 #
-#   1. TARGET snapshot — the NEW pin v0.70.0 @ b72714de (ADR-0029), the
-#      pre-switch stand-in until TE39 performs the atomic switch.
-#   2. REGRESSION snapshot — the CURRENT submodule pin (v0.66.0 @ 0fc0eebb
-#      until TE39), the zero-regression baseline of the window. The live
+#   1. TARGET snapshot — the current pin v0.70.0 @ b72714de (ADR-0029;
+#      switched with TE39 on 2026-09-27).
+#   2. REGRESSION snapshot — the retired v0.66.0 pin snapshot (0fc0eebb;
+#      archaeology only — its zero-regression mission ended with TE39). The live
 #      worktree cannot serve as the upstream leg directly because the
 #      v0.66 discovery chain (agents.ts) imports the `yaml` package, which
 #      is unresolvable from a pristine external/ (no node_modules may be

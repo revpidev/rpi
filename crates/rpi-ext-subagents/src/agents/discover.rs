@@ -1656,7 +1656,8 @@ fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::A
     }
 }
 
-/// `resolveAgentName` + `effectiveAgentMatch` (agents.ts:501-529).
+/// `resolveAgentName` + `effectiveAgentMatch` (agents.ts:700-736 @ b72714de;
+/// the v0.48-era :501-529 anchor drifted upstream).
 pub fn resolve_agent_name<'a>(
     agents: &'a [AgentConfig],
     raw: &str,

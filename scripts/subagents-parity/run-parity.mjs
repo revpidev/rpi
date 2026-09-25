@@ -4,7 +4,7 @@
 //   node scripts/subagents-parity/run-parity.mjs [--track=regression|target]
 //   node scripts/subagents-parity/run-parity.mjs --record-args-golden
 //
-// v0.1.5 rotation (TE37; until TE39 flips the submodule pin):
+// v0.1.5 rotation (TE37; the pin flipped with TE39 on 2026-09-27):
 //   - `target` (DEFAULT since the TE39 pin switch, 2026-09-27) = the
 //     CURRENT-pin snapshot, pi-subagents v0.70.0 @ b72714de (ADR-0029),
 //     extracted read-only by setup-target-source.sh into
@@ -40,9 +40,7 @@ const TSX = "/tmp/rpi-subagents-parity-deps/node_modules/.bin/tsx";
 const GOLDEN_PATH = `${HERE}/args-golden-v048.json`;
 
 const TRACK_FLAG = process.argv.find((arg) => arg.startsWith("--track="));
-// Default = regression (the live submodule pin) for the whole v0.1.5 window;
-// TE39 flips the default back to `target` together with the pin switch.
-// TE39 pin switch: the default track flips back to `target` (v0.70 = the
+// TE39 pin switch (2026-09-27): the default track is `target` (v0.70 = the
 // submodule pin); `--track=regression` still drives the retired v0.66
 // snapshot for archaeology.
 const TRACK = TRACK_FLAG ? TRACK_FLAG.slice("--track=".length) : "target";

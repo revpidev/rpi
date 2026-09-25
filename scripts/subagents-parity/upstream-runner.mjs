@@ -1,9 +1,8 @@
 // Upstream leg of the subagents parity harness (TE04 G3; dual-track TE13;
 // re-rotated by TE37 for the v0.1.5 window, ADR-0029).
 //
-// Track `regression` (default): the live submodule worktree — pi-subagents
-// v0.66.0 @ 0fc0eebb until TE39 switches the pin (the zero-regression
-// baseline of the window).
+// Track `target` (default since the TE39 pin switch, 2026-09-27): the
+// v0.70.0 snapshot = the current pin (see setup-target-source.sh).
 //
 // Track `target`: the v0.70.0 snapshot extracted by `setup-target-source.sh`
 // (never a checkout of `external/`) into /tmp/rpi-subagents-parity-target-v070.
@@ -32,9 +31,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TRACK = process.env.RPI_SUBAGENTS_PARITY_TRACK ?? "regression";
-// regression = the CURRENT-pin snapshot (v0.66.0 @ 0fc0eebb until TE39; the
-// live worktree cannot serve directly — its discovery chain imports `yaml`,
-// unresolvable from a pristine external/); target = the v0.70.0 snapshot
+// regression = the retired v0.66.0 snapshot (0fc0eebb; archaeology only);
+// target = the v0.70.0 snapshot = the current pin
 // (TE37, ADR-0029). Both are extracted by setup-target-source.sh.
 const REGRESSION_ROOT =
 	process.env.RPI_SUBAGENTS_REGRESSION_SRC ?? "/tmp/rpi-subagents-parity-regression-v066";
