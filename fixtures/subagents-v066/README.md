@@ -1,7 +1,8 @@
-# subagents target-track recorded fixtures (pi-subagents v0.66.0)
+# subagents recorded fixtures (pi-subagents v0.66.0, TE27-era recording)
 
-> **The pin switched with TE27 (2026-09-11, ADR-0025 adopted)**: the `external/pi-subagents` submodule HEAD is
-> `0fc0eebb9604970c506708b7508d6aa38921fde2` (v0.66.0), and this directory is the current baseline (recorded by TE13 as a read-only snapshot outside the repository; zero writes to `external/`).
+> **Superseded as the active parity anchor by TE39 (2026-09-27)**: the `external/pi-subagents` submodule HEAD is
+> now `b72714de95e612406b3461e63dfc182856333a7e` (v0.70.0; the active track reports live in `fixtures/generated/subagents-parity-v070/`).
+> These v0.66.0 recordings remain the historical baseline (recorded by TE13 as a read-only snapshot outside the repository; zero writes to `external/`); the v0.70 track reuses the fixtures.json/fixtures-target.json corpus with the fallback/model legs re-anchored at v0.70 `model-resolution.ts` (TE39).
 
 ## Purpose and consumers
 
