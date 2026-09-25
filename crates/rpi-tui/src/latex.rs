@@ -1890,17 +1890,11 @@ impl<'a> LatexParser<'a> {
 
         Self::parse_script_argument(self, initial_marker, &mut sub, &mut sup, &mut order);
         let mut next_position = self.position;
-        while next_position < self.source.len()
-            && self.source[next_position..]
-                .chars()
-                .next()
-                .is_some_and(is_ecma_space)
-        {
-            next_position += self.source[next_position..]
-                .chars()
-                .next()
-                .unwrap()
-                .len_utf8();
+        while let Some(c) = self.source[next_position..].chars().next() {
+            if !is_ecma_space(c) {
+                break;
+            }
+            next_position += c.len_utf8();
         }
         if let Some(next_marker) = self.source[next_position..].chars().next() {
             if (next_marker == '^' || next_marker == '_') && next_marker != initial_marker {
@@ -3056,7 +3050,9 @@ mod tests {
         );
     }
 
-    /// Port of the upstream `it("uses the middle brace for intermediate case rows")`.
+    /// Port of the upstream `it("centers even case rows around a middle
+    /// brace")` (renamed from "uses the middle brace for intermediate case
+    /// rows" by `fa0e1f48a`).
     #[test]
     fn centers_even_case_rows_around_a_middle_brace() {
         assert_eq!(
