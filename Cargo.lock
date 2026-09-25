@@ -3225,6 +3225,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpi-ext-todo"
+version = "0.1.4"
+dependencies = [
+ "abi_stable",
+ "rpi-ext-host",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "rpi-test-native-plugin"
 version = "0.1.4"
 dependencies = [

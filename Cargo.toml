@@ -13,6 +13,7 @@ members = [
     "crates/rpi-ext-subagents",
     "crates/rpi-ext-smart-fetch",
     "crates/rpi-ext-statusline",
+    "crates/rpi-ext-todo",
     "crates/rpi-test-native-plugin",
     "crates/rpi-test-support",
 ]
