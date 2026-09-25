@@ -137,7 +137,9 @@ impl AgentConfig {
 /// `memory: project:notes` (shorthand) are accepted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryConfig {
-    /// `project` → `<cwd>/.rpi/agent-memory/`, `user` → `<agentDir>/agent-memory/`.
+    /// `project` → `<projectRoot>/.rpi/agent-memory/` (nearest project root,
+    /// git-root fallback, linked-worktree-mapped — see [`MemoryConfig::resolve_dir`]),
+    /// `user` → `<agentDir>/agent-memory/`.
     pub scope: &'static str,
     pub path: String,
 }
