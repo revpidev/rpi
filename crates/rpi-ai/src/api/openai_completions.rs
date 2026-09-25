@@ -31,6 +31,7 @@
 //!   body JSON (upstream reads it off the SDK error object).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -1981,7 +1982,7 @@ impl<'a> CompletionsProcessor<'a> {
         self.text_block = Some(index);
         events.push(StreamEvent::TextStart {
             content_index: index,
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
         index
     }
@@ -2005,7 +2006,7 @@ impl<'a> CompletionsProcessor<'a> {
         self.thinking_block = Some(index);
         events.push(StreamEvent::ThinkingStart {
             content_index: index,
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
         index
     }
@@ -2099,7 +2100,7 @@ impl<'a> CompletionsProcessor<'a> {
             }
             events.push(StreamEvent::ToolCallStart {
                 content_index: index,
-                partial: self.output.clone(),
+                partial: Arc::new(self.output.clone()),
             });
             content_index = Some(index);
         }
@@ -2236,7 +2237,7 @@ impl<'a> CompletionsProcessor<'a> {
                 events.push(StreamEvent::TextDelta {
                     content_index,
                     delta: content.to_owned(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
         }
@@ -2271,7 +2272,7 @@ impl<'a> CompletionsProcessor<'a> {
             events.push(StreamEvent::ThinkingDelta {
                 content_index,
                 delta: value.to_owned(),
-                partial: self.output.clone(),
+                partial: Arc::new(self.output.clone()),
             });
         }
 
@@ -2356,7 +2357,7 @@ impl<'a> CompletionsProcessor<'a> {
                 events.push(StreamEvent::ToolCallDelta {
                     content_index,
                     delta: delta_text,
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
         }
@@ -2427,24 +2428,24 @@ impl<'a> CompletionsProcessor<'a> {
             events.push(StreamEvent::ToolCallDelta {
                 content_index,
                 delta,
-                partial: self.output.clone(),
+                partial: Arc::new(self.output.clone()),
             });
         }
         match end {
             Some(BlockEnd::Text(content)) => events.push(StreamEvent::TextEnd {
                 content_index,
                 content,
-                partial: self.output.clone(),
+                partial: Arc::new(self.output.clone()),
             }),
             Some(BlockEnd::Thinking(content)) => events.push(StreamEvent::ThinkingEnd {
                 content_index,
                 content,
-                partial: self.output.clone(),
+                partial: Arc::new(self.output.clone()),
             }),
             Some(BlockEnd::ToolCall(tool_call)) => events.push(StreamEvent::ToolCallEnd {
                 content_index,
                 tool_call,
-                partial: self.output.clone(),
+                partial: Arc::new(self.output.clone()),
             }),
             None => {}
         }
@@ -2691,7 +2692,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: output.clone(),
+        partial: Arc::new(output.clone()),
     });
 
     let mut processor = CompletionsProcessor::new(

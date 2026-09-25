@@ -55,6 +55,7 @@
 //! (`hasMistralHeaderOverride`).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -892,7 +893,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::TextEnd {
                     content_index: index,
                     content: text,
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             Some(CurrentBlock::Thinking(index)) => {
@@ -904,7 +905,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::ThinkingEnd {
                     content_index: index,
                     content: thinking,
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             None => {}
@@ -923,7 +924,7 @@ impl<'a> StreamProcessor<'a> {
         self.current_block = Some(CurrentBlock::Text(index));
         events.push(StreamEvent::TextStart {
             content_index: index,
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
         index
     }
@@ -940,7 +941,7 @@ impl<'a> StreamProcessor<'a> {
         self.current_block = Some(CurrentBlock::Thinking(index));
         events.push(StreamEvent::ThinkingStart {
             content_index: index,
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
         index
     }
@@ -953,7 +954,7 @@ impl<'a> StreamProcessor<'a> {
         events.push(StreamEvent::TextDelta {
             content_index: index,
             delta: delta.to_owned(),
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
     }
 
@@ -965,7 +966,7 @@ impl<'a> StreamProcessor<'a> {
         events.push(StreamEvent::ThinkingDelta {
             content_index: index,
             delta: delta.to_owned(),
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
     }
 
@@ -1132,7 +1133,7 @@ impl<'a> StreamProcessor<'a> {
                 self.tool_block_order.push(content_index);
                 events.push(StreamEvent::ToolCallStart {
                     content_index,
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
                 content_index
             }
@@ -1152,7 +1153,7 @@ impl<'a> StreamProcessor<'a> {
         events.push(StreamEvent::ToolCallDelta {
             content_index,
             delta: args_delta,
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
     }
 
@@ -1172,7 +1173,7 @@ impl<'a> StreamProcessor<'a> {
             events.push(StreamEvent::ToolCallEnd {
                 content_index: index,
                 tool_call: call.clone(),
-                partial: self.output.clone(),
+                partial: Arc::new(self.output.clone()),
             });
         }
     }
@@ -1373,7 +1374,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: output.clone(),
+        partial: Arc::new(output.clone()),
     });
 
     let mut processor = StreamProcessor::new(output, model);

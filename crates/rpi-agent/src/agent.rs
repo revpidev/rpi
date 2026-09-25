@@ -98,7 +98,11 @@ pub struct AgentState {
     /// true until awaited `agent_end` listeners settle.
     pub is_streaming: bool,
     /// Partial assistant message for the current streamed response, if any.
-    pub streaming_message: Option<AgentMessage>,
+    /// V15-13 (rpi#53): shared `Arc` — the per-delta reduction is a
+    /// refcount bump, not a deep copy. Only assistant partials are tracked
+    /// (`MessageUpdate` fires for assistant streams only); non-assistant
+    /// `MessageStart` events clear the slot.
+    pub streaming_message: Option<Arc<AssistantMessage>>,
     /// Tool call ids currently executing.
     pub pending_tool_calls: HashSet<String>,
     /// Error message from the most recent failed or aborted assistant turn.
@@ -1073,8 +1077,17 @@ async fn process_events(
     {
         let mut state = lock(state);
         match event {
-            AgentEvent::MessageStart { message } | AgentEvent::MessageUpdate { message, .. } => {
-                state.streaming_message = Some(message.clone());
+            AgentEvent::MessageStart { message } => {
+                // Once per message (not per delta) — an extraction clone is
+                // fine here; the streaming hot path is the update arm below.
+                state.streaming_message = match message {
+                    AgentMessage::Assistant(assistant) => Some(Arc::new(assistant.clone())),
+                    _ => None,
+                };
+            }
+            AgentEvent::MessageUpdate { message, .. } => {
+                // V15-13: refcount share (was a full message clone per delta).
+                state.streaming_message = Some(Arc::clone(message));
             }
             AgentEvent::MessageEnd { message } => {
                 state.streaming_message = None;

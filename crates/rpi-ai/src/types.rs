@@ -1429,7 +1429,9 @@ pub enum ErrorReason {
 /// appear before `start`.
 ///
 /// `partial` is the shared live response-so-far helper, not an event-time
-/// snapshot. Text and thinking blocks are empty when their `*_start` event
+/// snapshot. Since V15-13 (rpi#53) it is shared behind an `Arc` — the
+/// same accumulated message flows provider -> agent loop -> events ->
+/// UI queue without deep copies (serde shape unchanged). Text and thinking blocks are empty when their `*_start` event
 /// is emitted and grow only through their corresponding `*_delta` events
 /// until the authoritative `*_end`. Redacted thinking may be complete at
 /// start and emit no deltas. Tool-call arguments at `toolcall_start` are
@@ -1448,53 +1450,53 @@ pub enum ErrorReason {
 )]
 pub enum StreamEvent {
     Start {
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     TextStart {
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     TextDelta {
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     TextEnd {
         content_index: usize,
         content: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     ThinkingStart {
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     ThinkingDelta {
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     ThinkingEnd {
         content_index: usize,
         content: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_start")]
     ToolCallStart {
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_delta")]
     ToolCallDelta {
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_end")]
     ToolCallEnd {
         content_index: usize,
         #[serde(with = "tagged_tool_call")]
         tool_call: ToolCall,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     Done {
         reason: DoneReason,
@@ -2074,7 +2076,9 @@ mod tests {
 
     #[test]
     fn stream_event_start_shape() {
-        let ev = StreamEvent::Start { partial: partial() };
+        let ev = StreamEvent::Start {
+            partial: Arc::new(partial()),
+        };
         assert_eq!(
             to_json(&ev),
             format!(r#"{{"type":"start","partial":{PARTIAL_JSON}}}"#)
@@ -2088,7 +2092,7 @@ mod tests {
         let ev = StreamEvent::TextDelta {
             content_index: 1,
             delta: "hi".to_owned(),
-            partial: partial(),
+            partial: Arc::new(partial()),
         };
         assert_eq!(
             to_json(&ev),
@@ -2112,7 +2116,7 @@ mod tests {
         let ev = StreamEvent::ToolCallEnd {
             content_index: 2,
             tool_call,
-            partial: partial(),
+            partial: Arc::new(partial()),
         };
         // Upstream ToolCall objects always carry their `type: "toolCall"` tag,
         // also standalone inside toolcall_end.
@@ -2180,7 +2184,7 @@ mod tests {
         let ev = StreamEvent::ToolCallEnd {
             content_index: 0,
             tool_call: call,
-            partial: partial(),
+            partial: Arc::new(partial()),
         };
         let v: Value = serde_json::from_str(&to_json(&ev)).expect("parse");
         assert_eq!(v["toolCall"]["namespace"], json!("dynamic_tools"));
@@ -2218,11 +2222,16 @@ mod tests {
         // Every variant's `type` tag, checked against upstream types.ts.
         let p = || partial();
         let cases: Vec<(StreamEvent, &str)> = vec![
-            (StreamEvent::Start { partial: p() }, "start"),
+            (
+                StreamEvent::Start {
+                    partial: Arc::new(p()),
+                },
+                "start",
+            ),
             (
                 StreamEvent::TextStart {
                     content_index: 0,
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "text_start",
             ),
@@ -2230,7 +2239,7 @@ mod tests {
                 StreamEvent::TextDelta {
                     content_index: 0,
                     delta: String::new(),
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "text_delta",
             ),
@@ -2238,14 +2247,14 @@ mod tests {
                 StreamEvent::TextEnd {
                     content_index: 0,
                     content: String::new(),
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "text_end",
             ),
             (
                 StreamEvent::ThinkingStart {
                     content_index: 0,
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "thinking_start",
             ),
@@ -2253,7 +2262,7 @@ mod tests {
                 StreamEvent::ThinkingDelta {
                     content_index: 0,
                     delta: String::new(),
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "thinking_delta",
             ),
@@ -2261,14 +2270,14 @@ mod tests {
                 StreamEvent::ThinkingEnd {
                     content_index: 0,
                     content: String::new(),
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "thinking_end",
             ),
             (
                 StreamEvent::ToolCallStart {
                     content_index: 0,
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "toolcall_start",
             ),
@@ -2276,7 +2285,7 @@ mod tests {
                 StreamEvent::ToolCallDelta {
                     content_index: 0,
                     delta: String::new(),
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "toolcall_delta",
             ),
@@ -2284,7 +2293,7 @@ mod tests {
                 StreamEvent::ToolCallEnd {
                     content_index: 0,
                     tool_call: ToolCall::default(),
-                    partial: p(),
+                    partial: Arc::new(p()),
                 },
                 "toolcall_end",
             ),

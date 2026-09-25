@@ -765,7 +765,7 @@ async fn run_loop(
 // streamAssistantResponse (agent-loop.ts:281-372)
 // ---------------------------------------------------------------------------
 
-fn stream_event_partial(event: &StreamEvent) -> Option<&AssistantMessage> {
+fn stream_event_partial(event: &StreamEvent) -> Option<&std::sync::Arc<AssistantMessage>> {
     match event {
         StreamEvent::TextStart { partial, .. }
         | StreamEvent::TextDelta { partial, .. }
@@ -780,29 +780,27 @@ fn stream_event_partial(event: &StreamEvent) -> Option<&AssistantMessage> {
     }
 }
 
-fn replace_context_tail(context: &mut AgentContext, message: AssistantMessage) {
-    if let Some(last) = context.messages.last_mut() {
-        *last = AgentMessage::Assistant(message);
-    } else {
-        context.messages.push(AgentMessage::Assistant(message));
-    }
-}
-
 /// Shared tail of the upstream done/error branch and the post-loop block:
-/// replace the partial (or push), emit `message_start` when no partial was
-/// ever added, then emit `message_end`.
+/// append the final message, emit `message_start` when the stream never
+/// started (no partial was ever streamed), then emit `message_end`.
+///
+/// V15-13 (rpi#53 root cause 3): the streamed partial never enters
+/// `context.messages` — during streaming it is shared by `Arc` through the
+/// `MessageUpdate` events only, and the final message is appended exactly
+/// once here. (Pre-V15-13 the partial was pushed at `start` and the tail
+/// replaced with a full clone on every delta; the observable message list
+/// is identical — nothing reads `context.messages` between `start` and
+/// `done`/`error`.)
 async fn finalize_streamed_message(
     context: &mut AgentContext,
     final_message: AssistantMessage,
     added_partial: bool,
     emit: &AgentEventSink,
 ) -> AssistantMessage {
-    if added_partial {
-        replace_context_tail(context, final_message.clone());
-    } else {
-        context
-            .messages
-            .push(AgentMessage::Assistant(final_message.clone()));
+    context
+        .messages
+        .push(AgentMessage::Assistant(final_message.clone()));
+    if !added_partial {
         emit(AgentEvent::MessageStart {
             message: AgentMessage::Assistant(final_message.clone()),
         })
@@ -1024,18 +1022,21 @@ async fn stream_assistant_response(
     // only the "started" predicate is read, so a flag avoids re-cloning the
     // whole accumulating message on every delta.)
     let mut stream_started = false;
+    // Whether a partial was streamed (`Start` seen) — gates the
+    // `MessageStart` emission in `finalize_streamed_message`.
     let mut added_partial = false;
 
     while let Some(event) = response.next().await {
         match event {
             StreamEvent::Start { partial } => {
                 stream_started = true;
-                context
-                    .messages
-                    .push(AgentMessage::Assistant(partial.clone()));
+                // V15-13 (rpi#53 root cause 3): the partial no longer
+                // enters `context.messages` here; the final message is
+                // appended once at finalize. `MessageStart` fires once per
+                // stream, so one extraction clone per turn is fine.
                 added_partial = true;
                 emit(AgentEvent::MessageStart {
-                    message: AgentMessage::Assistant(partial),
+                    message: AgentMessage::Assistant((*partial).clone()),
                 })
                 .await;
             }
@@ -1048,11 +1049,15 @@ async fn stream_assistant_response(
             other => {
                 if stream_started {
                     if let Some(partial) = stream_event_partial(&other) {
-                        let partial = partial.clone();
-                        replace_context_tail(context, partial.clone());
+                        // V15-13 zero-copy delta path: the accumulated
+                        // partial is shared by `Arc` straight into the
+                        // event (and from there into the agent state, every
+                        // listener, and the UI queue); no deep copies per
+                        // delta, and `context.messages` stays untouched
+                        // until finalize.
                         emit(AgentEvent::MessageUpdate {
-                            message: AgentMessage::Assistant(partial),
-                            assistant_message_event: Box::new(other),
+                            message: std::sync::Arc::clone(partial),
+                            assistant_message_event: std::sync::Arc::new(other),
                         })
                         .await;
                     }

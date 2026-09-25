@@ -39,6 +39,7 @@
 //!   body stream; the `"response has no body"` branch is unreachable).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -405,14 +406,14 @@ impl EventConverter {
                 }
             }
             PiMessagesEvent::Start => StreamEvent::Start {
-                partial: self.partial.clone(),
+                partial: Arc::new(self.partial.clone()),
             },
             PiMessagesEvent::TextStart { content_index } => {
                 *content_slot(&mut self.partial.content, content_index) =
                     AssistantContent::Text(TextContent::default());
                 StreamEvent::TextStart {
                     content_index,
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
             PiMessagesEvent::TextDelta {
@@ -429,7 +430,7 @@ impl EventConverter {
                 StreamEvent::TextDelta {
                     content_index,
                     delta,
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
             PiMessagesEvent::TextEnd {
@@ -453,7 +454,7 @@ impl EventConverter {
                 StreamEvent::TextEnd {
                     content_index,
                     content,
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
             PiMessagesEvent::ThinkingStart { content_index } => {
@@ -461,7 +462,7 @@ impl EventConverter {
                     AssistantContent::Thinking(ThinkingContent::default());
                 StreamEvent::ThinkingStart {
                     content_index,
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
             PiMessagesEvent::ThinkingDelta {
@@ -476,7 +477,7 @@ impl EventConverter {
                 StreamEvent::ThinkingDelta {
                     content_index,
                     delta,
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
             PiMessagesEvent::ThinkingEnd {
@@ -503,7 +504,7 @@ impl EventConverter {
                 StreamEvent::ThinkingEnd {
                     content_index,
                     content,
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
             PiMessagesEvent::ToolCallStart {
@@ -522,7 +523,7 @@ impl EventConverter {
                 self.tool_json.insert(content_index, String::new());
                 StreamEvent::ToolCallStart {
                     content_index,
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
             PiMessagesEvent::ToolCallDelta {
@@ -545,7 +546,7 @@ impl EventConverter {
                 StreamEvent::ToolCallDelta {
                     content_index,
                     delta,
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
             PiMessagesEvent::ToolCallEnd {
@@ -573,7 +574,7 @@ impl EventConverter {
                 StreamEvent::ToolCallEnd {
                     content_index,
                     tool_call: final_call.clone(),
-                    partial: self.partial.clone(),
+                    partial: Arc::new(self.partial.clone()),
                 }
             }
         }

@@ -27,6 +27,7 @@
 //!   (ported from this file upstream).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 use serde_json::{json, Value};
@@ -1514,7 +1515,7 @@ impl<'a> StreamProcessor<'a> {
                         });
                         events.push(StreamEvent::TextStart {
                             content_index: self.output.content.len() - 1,
-                            partial: self.output.clone(),
+                            partial: Arc::new(self.output.clone()),
                         });
                     }
                     Some("thinking") => {
@@ -1543,7 +1544,7 @@ impl<'a> StreamProcessor<'a> {
                         });
                         events.push(StreamEvent::ThinkingStart {
                             content_index: self.output.content.len() - 1,
-                            partial: self.output.clone(),
+                            partial: Arc::new(self.output.clone()),
                         });
                     }
                     Some("redacted_thinking") => {
@@ -1563,7 +1564,7 @@ impl<'a> StreamProcessor<'a> {
                         });
                         events.push(StreamEvent::ThinkingStart {
                             content_index: self.output.content.len() - 1,
-                            partial: self.output.clone(),
+                            partial: Arc::new(self.output.clone()),
                         });
                     }
                     Some("tool_use") => {
@@ -1598,7 +1599,7 @@ impl<'a> StreamProcessor<'a> {
                         });
                         events.push(StreamEvent::ToolCallStart {
                             content_index: self.output.content.len() - 1,
-                            partial: self.output.clone(),
+                            partial: Arc::new(self.output.clone()),
                         });
                     }
                     _ => {}
@@ -1624,7 +1625,7 @@ impl<'a> StreamProcessor<'a> {
                             events.push(StreamEvent::TextDelta {
                                 content_index,
                                 delta: text.to_owned(),
-                                partial: self.output.clone(),
+                                partial: Arc::new(self.output.clone()),
                             });
                         }
                     }
@@ -1637,7 +1638,7 @@ impl<'a> StreamProcessor<'a> {
                             events.push(StreamEvent::ThinkingDelta {
                                 content_index,
                                 delta: thinking.to_owned(),
-                                partial: self.output.clone(),
+                                partial: Arc::new(self.output.clone()),
                             });
                         }
                     }
@@ -1658,7 +1659,7 @@ impl<'a> StreamProcessor<'a> {
                             events.push(StreamEvent::ToolCallDelta {
                                 content_index,
                                 delta: partial_json.to_owned(),
-                                partial: self.output.clone(),
+                                partial: Arc::new(self.output.clone()),
                             });
                         }
                     }
@@ -1691,14 +1692,14 @@ impl<'a> StreamProcessor<'a> {
                         events.push(StreamEvent::TextEnd {
                             content_index,
                             content: block.text.clone(),
-                            partial: self.output.clone(),
+                            partial: Arc::new(self.output.clone()),
                         });
                     }
                     Some(AssistantContent::Thinking(block)) => {
                         events.push(StreamEvent::ThinkingEnd {
                             content_index,
                             content: block.thinking.clone(),
-                            partial: self.output.clone(),
+                            partial: Arc::new(self.output.clone()),
                         });
                     }
                     Some(AssistantContent::ToolCall(block)) => {
@@ -1708,7 +1709,7 @@ impl<'a> StreamProcessor<'a> {
                         events.push(StreamEvent::ToolCallEnd {
                             content_index,
                             tool_call: block.clone(),
-                            partial: self.output.clone(),
+                            partial: Arc::new(self.output.clone()),
                         });
                     }
                     None => {}
@@ -1997,7 +1998,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: output.clone(),
+        partial: Arc::new(output.clone()),
     });
 
     let mut processor = StreamProcessor::new(

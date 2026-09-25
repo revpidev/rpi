@@ -29,6 +29,7 @@
 //!   (consistent with D-021..D-026).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
@@ -1076,7 +1077,7 @@ async fn process_websocket_stream(
                     if !*start_emitted {
                         *start_emitted = true;
                         events.push(StreamEvent::Start {
-                            partial: start_partial.clone(),
+                            partial: Arc::new(start_partial.clone()),
                         });
                     }
                 }
@@ -1441,7 +1442,7 @@ async fn run(
 
     if !start_emitted {
         events.push(StreamEvent::Start {
-            partial: output.clone(),
+            partial: Arc::new(output.clone()),
         });
     }
 

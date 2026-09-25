@@ -1075,8 +1075,11 @@ impl AgentSession {
                 assistant_message_event,
             } => {
                 if runner.has_handlers("message_update") {
+                    // V15-13: the event payloads are Arc-shared; the ext ABI
+                    // boundary materializes its owned copy only when an
+                    // extension actually subscribes to message_update.
                     let payload = serde_json::to_value(ext::MessageUpdateEvent {
-                        message: message.clone(),
+                        message: AgentMessage::Assistant(message.as_ref().clone()),
                         assistant_message_event: serde_json::to_value(
                             assistant_message_event.as_ref(),
                         )

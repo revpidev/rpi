@@ -359,7 +359,9 @@ pub(crate) enum UiCommand {
     TurnStart,
     TurnEnd,
     MessageStart(AgentMessage),
-    MessageUpdate(AgentMessage),
+    /// V15-13 (rpi#53): the streaming partial is shared by `Arc` from the
+    /// agent loop through the event and this queue — no deep copies per delta.
+    MessageUpdate(Arc<rpi_ai::types::AssistantMessage>),
     MessageEnd(AgentMessage),
     ToolExecutionStart {
         tool_call_id: String,
@@ -2048,8 +2050,9 @@ impl InteractiveUi {
                                 markdown_transformers,
                             );
                         // streaming component: `updateContent(message, true)`
-                        // (interactive-mode.ts:3140).
-                        component.update_content(assistant, true);
+                        // (interactive-mode.ts:3140). MessageStart fires once
+                        // per turn — the Arc wrap is a single move.
+                        component.update_content(&Arc::new(assistant.clone()), true);
                         let handle = Arc::new(Mutex::new(component));
                         let entry_address =
                             self.add_chat_child(Box::new(SharedChild(handle.clone())));
@@ -2063,12 +2066,16 @@ impl InteractiveUi {
                 }
             }
             UiCommand::MessageUpdate(message) => {
-                // message_update (interactive-mode.ts:2928-2961).
-                if let AgentMessage::Assistant(assistant) = &message {
+                // message_update (interactive-mode.ts:2928-2961). The payload
+                // is the shared streaming partial (V15-13: `Arc` end-to-end —
+                // the queue push is a refcount bump, never a deep copy).
+                {
+                    // interactive-mode.ts:3148: streaming updates pass
+                    // isStreaming = true. The Arc itself flows into the
+                    // component (V15-13 end-to-end sharing).
                     if let Some(track) = lock(&self.streaming).as_ref() {
-                        // interactive-mode.ts:3148: streaming updates pass
-                        // isStreaming = true.
-                        lock(&track.handle).update_content(assistant, true);
+                        lock(&track.handle).update_content(&message, true);
+                        let assistant: &rpi_ai::types::AssistantMessage = &message;
                         for content in &assistant.content {
                             if let AssistantContent::ToolCall(tool_call) = content {
                                 let mut pending_tools = lock(&self.pending_tools);
@@ -2129,8 +2136,10 @@ impl InteractiveUi {
                             self.maybe_show_cache_miss_notice(&assistant);
                         }
                         // interactive-mode.ts:3193: message_end updates with
-                        // isStreaming = false.
-                        component.update_content(&assistant, false);
+                        // isStreaming = false. (Once per turn — the Arc wrap
+                        // is a move; the error-message mutation above already
+                        // needed the owned clone.)
+                        component.update_content(&Arc::new(assistant.clone()), false);
                         drop(component);
 
                         if stop_is_error {
@@ -5916,6 +5925,18 @@ mod tests {
         }
     }
 
+    /// V15-13 L3: `MessageUpdate` payloads share the streaming partial by
+    /// `Arc` (test-side mirror of the production sharing).
+    fn assistant_partial(
+        content: Vec<AssistantContent>,
+        stop_reason: StopReason,
+    ) -> Arc<rpi_ai::types::AssistantMessage> {
+        Arc::new(match assistant_message(content, stop_reason) {
+            AgentMessage::Assistant(message) => message,
+            _ => unreachable!("assistant_message always wraps Assistant"),
+        })
+    }
+
     fn assistant_message(content: Vec<AssistantContent>, stop_reason: StopReason) -> AgentMessage {
         AgentMessage::Assistant(rpi_ai::types::AssistantMessage {
             role: rpi_ai::types::AssistantRole::Assistant,
@@ -6155,13 +6176,13 @@ mod tests {
             ),
             (
                 AgentSessionEvent::Agent(Box::new(AgentEvent::MessageUpdate {
-                    message: assistant_message(vec![text_content("x")], StopReason::Pending),
-                    assistant_message_event: Box::new(rpi_ai::types::StreamEvent::TextStart {
+                    message: assistant_partial(vec![text_content("x")], StopReason::Pending),
+                    assistant_message_event: Arc::new(rpi_ai::types::StreamEvent::TextStart {
                         content_index: 0,
-                        partial: assistant_message_raw(
+                        partial: Arc::new(assistant_message_raw(
                             vec![text_content("x")],
                             StopReason::Pending,
-                        ),
+                        )),
                     }),
                 })),
                 "message_update",
@@ -6402,7 +6423,7 @@ mod tests {
             vec![text_content("hi")],
             StopReason::Pending,
         )));
-        ui.push(UiCommand::MessageUpdate(assistant_message(
+        ui.push(UiCommand::MessageUpdate(assistant_partial(
             vec![text_content("hi"), tool_call_content("call_1", "read")],
             StopReason::Pending,
         )));
@@ -6414,7 +6435,7 @@ mod tests {
         // chat child).
         let mut args = serde_json::Map::new();
         args.insert("path".to_string(), serde_json::json!("a.txt"));
-        ui.push(UiCommand::MessageUpdate(assistant_message(
+        ui.push(UiCommand::MessageUpdate(assistant_partial(
             vec![
                 text_content("hi"),
                 AssistantContent::ToolCall(rpi_ai::types::ToolCall {
@@ -6446,7 +6467,7 @@ mod tests {
         let (mode, _terminal, _session) = mode_harness().await;
         let ui = &mode.ui_state;
         let mk = |text: &str, tool_id: &str| {
-            assistant_message(
+            assistant_partial(
                 vec![text_content(text), tool_call_content(tool_id, "read")],
                 StopReason::Pending,
             )
@@ -6493,7 +6514,7 @@ mod tests {
 
         const DELTAS: usize = 500;
         let delta_message = |i: usize| {
-            assistant_message(
+            assistant_partial(
                 vec![text_content(&format!("delta-{i:03}"))],
                 StopReason::Pending,
             )
@@ -6570,7 +6591,7 @@ mod tests {
         let (mode, _terminal, _session) = mode_harness().await;
         let ui = &mode.ui_state;
         let mk = |tool_id: &str| {
-            assistant_message(
+            assistant_partial(
                 vec![text_content("seg"), tool_call_content(tool_id, "read")],
                 StopReason::Pending,
             )
@@ -6604,7 +6625,7 @@ mod tests {
             vec![text_content("start")],
             StopReason::Pending,
         )));
-        ui.push(UiCommand::MessageUpdate(assistant_message(
+        ui.push(UiCommand::MessageUpdate(assistant_partial(
             vec![text_content("final text")],
             StopReason::Pending,
         )));
@@ -6644,7 +6665,7 @@ mod tests {
             vec![text_content("hi")],
             StopReason::Pending,
         )));
-        ui.push(UiCommand::MessageUpdate(assistant_message(
+        ui.push(UiCommand::MessageUpdate(assistant_partial(
             vec![
                 text_content("hi"),
                 AssistantContent::ToolCall(rpi_ai::types::ToolCall {
@@ -6696,7 +6717,7 @@ mod tests {
             vec![text_content("hi")],
             StopReason::Pending,
         )));
-        ui.push(UiCommand::MessageUpdate(assistant_message(
+        ui.push(UiCommand::MessageUpdate(assistant_partial(
             vec![text_content("hi"), tool_call_content("call_1", "read")],
             StopReason::Pending,
         )));

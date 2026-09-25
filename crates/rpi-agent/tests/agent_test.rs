@@ -116,7 +116,7 @@ fn abortable_stream_fn() -> StreamFn {
         tokio::spawn(async move {
             let partial = assistant_text("");
             let _ = tx.send(StreamEvent::Start {
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             });
             loop {
                 if options.signal.as_ref().is_some_and(|s| s.is_cancelled()) {

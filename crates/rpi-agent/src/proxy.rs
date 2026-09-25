@@ -50,6 +50,7 @@
 //!   (`AssistantContent` has no hole representation).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use rpi_ai::types::{
@@ -596,7 +597,7 @@ fn process_proxy_event(
 ) -> Result<Option<StreamEvent>, String> {
     match proxy_event {
         ProxyAssistantMessageEvent::Start => Ok(Some(StreamEvent::Start {
-            partial: partial.clone(),
+            partial: Arc::new(partial.clone()),
         })),
 
         ProxyAssistantMessageEvent::TextStart { content_index } => {
@@ -607,7 +608,7 @@ fn process_proxy_event(
             )?;
             Ok(Some(StreamEvent::TextStart {
                 content_index,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             }))
         }
 
@@ -624,7 +625,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::TextDelta {
                 content_index,
                 delta,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             }))
         }
 
@@ -640,7 +641,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::TextEnd {
                 content_index,
                 content,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             }))
         }
 
@@ -652,7 +653,7 @@ fn process_proxy_event(
             )?;
             Ok(Some(StreamEvent::ThinkingStart {
                 content_index,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             }))
         }
 
@@ -668,7 +669,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::ThinkingDelta {
                 content_index,
                 delta,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             }))
         }
 
@@ -685,7 +686,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::ThinkingEnd {
                 content_index,
                 content,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             }))
         }
 
@@ -710,7 +711,7 @@ fn process_proxy_event(
             partial_jsons.insert(content_index, String::new());
             Ok(Some(StreamEvent::ToolCallStart {
                 content_index,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             }))
         }
 
@@ -731,7 +732,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::ToolCallDelta {
                 content_index,
                 delta,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             }))
         }
 
@@ -753,7 +754,7 @@ fn process_proxy_event(
                     Ok(Some(StreamEvent::ToolCallEnd {
                         content_index,
                         tool_call: call.clone(),
-                        partial: partial.clone(),
+                        partial: Arc::new(partial.clone()),
                     }))
                 }
                 _ => Ok(None),

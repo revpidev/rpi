@@ -1816,7 +1816,7 @@ mod tests {
                 raw_stop_reason: None,
             };
             stream.push(StreamEvent::Start {
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             });
             // Surface the resolved api key in the final message so tests can
             // assert auth application happened.
@@ -3042,7 +3042,7 @@ mod tests {
             raw_stop_reason: None,
         };
         stream.push(StreamEvent::Start {
-            partial: partial.clone(),
+            partial: Arc::new(partial.clone()),
         });
         stream.push(StreamEvent::Done {
             reason: DoneReason::Stop,

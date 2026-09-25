@@ -48,7 +48,10 @@ pub struct AssistantMessageComponent {
     markdown_theme: Arc<MarkdownTheme>,
     hidden_thinking_label: String,
     output_pad: usize,
-    last_message: Option<AssistantMessage>,
+    /// V15-13 L3: the stored message is shared by `Arc` — the per-delta
+    /// skip path stores a refcount, not a deep copy of the accumulated
+    /// partial.
+    last_message: Option<std::sync::Arc<AssistantMessage>>,
     /// Fingerprint of everything the `updateContent` rebuild depends on;
     /// `None` until the first rebuild. Equal fingerprints skip the rebuild.
     last_signature: Option<VisibleSignature>,
@@ -206,7 +209,7 @@ impl AssistantMessageComponent {
             is_streaming: false,
         };
         if let Some(message) = message {
-            component.update_content(&message, false);
+            component.update_content(&std::sync::Arc::new(message), false);
         }
         component
     }
@@ -254,7 +257,11 @@ impl AssistantMessageComponent {
     /// `constructed` below feeds only the test-only rebuild counter
     /// (`REBUILD_COUNT`); non-test builds never read it.
     #[allow(unused_assignments, unused_variables)]
-    pub fn update_content(&mut self, message: &AssistantMessage, is_streaming: bool) {
+    pub fn update_content(
+        &mut self,
+        message: &std::sync::Arc<AssistantMessage>,
+        is_streaming: bool,
+    ) {
         self.is_streaming = is_streaming;
 
         let signature = (
@@ -289,11 +296,11 @@ impl AssistantMessageComponent {
         // FR-B R1 (V13-06): the message is borrowed — exactly one clone here
         // stores `last_message`; callers no longer clone before calling.
         if self.last_signature.as_ref() == Some(&signature) {
-            self.last_message = Some(message.clone());
+            self.last_message = Some(std::sync::Arc::clone(message));
             return;
         }
         self.last_signature = Some(signature);
-        self.last_message = Some(message.clone());
+        self.last_message = Some(std::sync::Arc::clone(message));
         let message = self.last_message.as_ref().expect("stored above");
 
         // V15-13 FR-L2 (rpi#53 root cause 2): instead of clearing the
@@ -681,6 +688,15 @@ mod tests {
         Arc::new(load_theme("dark", None).expect("builtin dark theme"))
     }
 
+    /// V15-13 L3: `update_content` takes the shared streaming partial.
+    fn arc_message(content: Vec<AssistantContent>) -> std::sync::Arc<AssistantMessage> {
+        std::sync::Arc::new(message(content))
+    }
+
+    fn arc_message_from(message: AssistantMessage) -> std::sync::Arc<AssistantMessage> {
+        std::sync::Arc::new(message)
+    }
+
     fn message(content: Vec<AssistantContent>) -> AssistantMessage {
         AssistantMessage {
             role: AssistantRole::Assistant,
@@ -766,7 +782,7 @@ mod tests {
         REBUILD_COUNT.with(|count| count.set(0));
         // Visible text first — rebuilds.
         component.update_content(
-            &message(vec![text("Writing the file:"), tool_call(10)]),
+            &arc_message(vec![text("Writing the file:"), tool_call(10)]),
             true,
         );
         assert_eq!(REBUILD_COUNT.with(|c| c.get()), 1);
@@ -774,7 +790,7 @@ mod tests {
         // 300 tool-args-only deltas: no further rebuilds.
         for len in 11..=310 {
             component.update_content(
-                &message(vec![text("Writing the file:"), tool_call(len)]),
+                &arc_message(vec![text("Writing the file:"), tool_call(len)]),
                 true,
             );
         }
@@ -790,14 +806,14 @@ mod tests {
 
         // isStreaming transition (message_end) rebuilds exactly once more.
         component.update_content(
-            &message(vec![text("Writing the file:"), tool_call(310)]),
+            &arc_message(vec![text("Writing the file:"), tool_call(310)]),
             false,
         );
         assert_eq!(REBUILD_COUNT.with(|c| c.get()), 2);
 
         // A text delta rebuilds.
         component.update_content(
-            &message(vec![text("Writing the file: done"), tool_call(310)]),
+            &arc_message(vec![text("Writing the file: done"), tool_call(310)]),
             false,
         );
         assert_eq!(REBUILD_COUNT.with(|c| c.get()), 3);
@@ -848,6 +864,15 @@ mod tests {
     #[test]
     fn block_diff_reuses_unchanged_markdown_components() {
         let thinking_text = "稳定的思考内容，跨 delta 不变。\n\nsecond paragraph";
+        let arc_mk = |grown: usize| {
+            std::sync::Arc::new(message(vec![
+                thinking(thinking_text),
+                text(&format!(
+                    "输出前缀，第 {grown} 轮：{}",
+                    "数据".repeat(grown)
+                )),
+            ]))
+        };
         let mk = |grown: usize| {
             message(vec![
                 thinking(thinking_text),
@@ -869,14 +894,14 @@ mod tests {
         );
         // Initial build: one Markdown for the thinking run + one for text.
         MARKDOWN_COUNT.with(|count| count.set(0));
-        component.update_content(&mk(1), true);
+        component.update_content(&arc_mk(1), true);
         assert_eq!(MARKDOWN_COUNT.with(|c| c.get()), 2);
 
         // 50 folded deltas growing only the text block: exactly one
         // Markdown (the text block) per delta; the thinking run is never
         // reconstructed.
         for grown in 2..=51 {
-            component.update_content(&mk(grown), true);
+            component.update_content(&arc_mk(grown), true);
             assert_eq!(
                 MARKDOWN_COUNT.with(|c| c.get()),
                 2 + (grown - 1),
@@ -898,7 +923,7 @@ mod tests {
         // The fresh component renders the same content non-streaming; flip
         // the streamed one to the same state first (is_streaming flips the
         // transform context, which is part of the frame).
-        component.update_content(&mk(51), false);
+        component.update_content(&arc_mk(51), false);
         assert_eq!(
             component.render(100),
             fresh.render(100),
@@ -936,7 +961,7 @@ mod tests {
                 accumulated.push_str(delta_line);
                 accumulated.push('\n');
             }
-            let message = message(vec![thinking(&accumulated)]);
+            let message = std::sync::Arc::new(message(vec![thinking(&accumulated)]));
             let start = std::time::Instant::now();
             component.update_content(&message, true);
             let lines = component.render(100);
@@ -983,7 +1008,7 @@ mod tests {
         // Initial: 4 Markdown children (2 thinking runs + 2 text blocks).
         MARKDOWN_COUNT.with(|count| count.set(0));
         component.update_content(
-            &message(vec![
+            &arc_message(vec![
                 thinking("第一段思考"),
                 text("first answer"),
                 thinking("第二段思考"),
@@ -996,7 +1021,7 @@ mod tests {
         // Same content, is_streaming flip → global change → all four
         // reconstruct (bounded by block count, trivially).
         component.update_content(
-            &message(vec![
+            &arc_message(vec![
                 thinking("第一段思考"),
                 text("first answer"),
                 thinking("第二段思考"),
@@ -1016,7 +1041,7 @@ mod tests {
         ]);
         aborted.stop_reason = StopReason::Aborted;
         aborted.error_message = Some("Request was aborted".to_string());
-        component.update_content(&aborted, false);
+        component.update_content(&arc_message_from(aborted), false);
         assert_eq!(
             MARKDOWN_COUNT.with(|c| c.get()),
             8,
@@ -1060,7 +1085,7 @@ mod tests {
 
         // Tool calls disable the OSC markers (rendered separately).
         component.update_content(
-            &message(vec![
+            &arc_message(vec![
                 text("hi"),
                 AssistantContent::ToolCall(Default::default()),
             ]),
@@ -1269,7 +1294,7 @@ mod tests {
                 md
             })],
         );
-        component.update_content(&message(vec![thinking("deep")]), true);
+        component.update_content(&arc_message(vec![thinking("deep")]), true);
         let _ = component.render(50);
         let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(calls.len(), 1);
@@ -1366,7 +1391,7 @@ mod tests {
 
         // A streaming update with identical content keeps the override.
         component.update_content(
-            &message(vec![
+            &arc_message(vec![
                 thinking("first secret"),
                 text("middle"),
                 thinking("second secret"),

@@ -17,6 +17,7 @@
 //!   request's, matching upstream when no hook is supplied.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
@@ -782,7 +783,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
             events.push(StreamEvent::ToolCallDelta {
                 content_index,
                 delta,
-                partial: self.output.clone(),
+                partial: Arc::new(self.output.clone()),
             });
         }
     }
@@ -810,7 +811,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 self.slots.insert(output_index, slot);
                 events.push(StreamEvent::ThinkingStart {
                     content_index: slot.content_index(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
                 Some(slot)
             }
@@ -828,7 +829,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 self.slots.insert(output_index, slot);
                 events.push(StreamEvent::TextStart {
                     content_index: slot.content_index(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
                 Some(slot)
             }
@@ -875,7 +876,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 self.slots.insert(output_index, slot);
                 events.push(StreamEvent::ToolCallStart {
                     content_index: slot.content_index(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
                 Some(slot)
             }
@@ -928,7 +929,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 self.slots.insert(output_index, slot);
                 events.push(StreamEvent::ToolCallStart {
                     content_index: slot.content_index(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
                 Some(slot)
             }
@@ -1105,7 +1106,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 events.push(StreamEvent::ThinkingDelta {
                     content_index,
                     delta: delta.to_owned(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             Some("response.reasoning_summary_part.done") => {
@@ -1122,7 +1123,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 events.push(StreamEvent::ThinkingDelta {
                     content_index,
                     delta: "\n\n".to_owned(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             Some("response.output_text.delta") | Some("response.refusal.delta") => {
@@ -1140,7 +1141,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 events.push(StreamEvent::TextDelta {
                     content_index,
                     delta: delta.to_owned(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             Some("response.function_call_arguments.delta") => {
@@ -1267,7 +1268,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             events.push(StreamEvent::ThinkingEnd {
                                 content_index,
                                 content: block.thinking.clone(),
-                                partial: self.output.clone(),
+                                partial: Arc::new(self.output.clone()),
                             });
                         }
                         self.slots.remove(&output_index);
@@ -1314,7 +1315,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             events.push(StreamEvent::TextEnd {
                                 content_index,
                                 content: block.text.clone(),
-                                partial: self.output.clone(),
+                                partial: Arc::new(self.output.clone()),
                             });
                         }
                         self.slots.remove(&output_index);
@@ -1362,7 +1363,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             events.push(StreamEvent::ToolCallEnd {
                                 content_index,
                                 tool_call: block.clone(),
-                                partial: self.output.clone(),
+                                partial: Arc::new(self.output.clone()),
                             });
                         }
                         self.scratch.remove(&content_index);
@@ -1403,7 +1404,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             events.push(StreamEvent::ToolCallEnd {
                                 content_index,
                                 tool_call: block.clone(),
-                                partial: self.output.clone(),
+                                partial: Arc::new(self.output.clone()),
                             });
                         }
                         self.scratch.remove(&content_index);

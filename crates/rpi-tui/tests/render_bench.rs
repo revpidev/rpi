@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use rpi_tui::components::markdown::{Markdown, MarkdownOptions, MarkdownTheme};
+use rpi_tui::components::markdown::{Markdown, MarkdownTheme};
 use rpi_tui::tui::Component;
 
 /// CJK line filler ("行{i} " + CJK padding) — worst-case short-line thinking

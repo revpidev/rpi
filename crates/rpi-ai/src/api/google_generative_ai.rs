@@ -31,6 +31,7 @@
 
 use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::google_shared::{
@@ -392,7 +393,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::TextEnd {
                     content_index,
                     content,
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             Some(CurrentBlock::Thinking(content_index)) => {
@@ -403,7 +404,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::ThinkingEnd {
                     content_index,
                     content,
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             None => {}
@@ -429,7 +430,7 @@ impl<'a> StreamProcessor<'a> {
                 self.current_block = Some(CurrentBlock::Thinking(self.block_index()));
                 events.push(StreamEvent::ThinkingStart {
                     content_index: self.block_index(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             } else {
                 self.output
@@ -441,7 +442,7 @@ impl<'a> StreamProcessor<'a> {
                 self.current_block = Some(CurrentBlock::Text(self.block_index()));
                 events.push(StreamEvent::TextStart {
                     content_index: self.block_index(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
         }
@@ -459,7 +460,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::ThinkingDelta {
                     content_index,
                     delta: text.to_owned(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             Some(AssistantContent::Text(block)) => {
@@ -469,7 +470,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::TextDelta {
                     content_index,
                     delta: text.to_owned(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             _ => {}
@@ -527,17 +528,17 @@ impl<'a> StreamProcessor<'a> {
         let content_index = self.block_index();
         events.push(StreamEvent::ToolCallStart {
             content_index,
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
         events.push(StreamEvent::ToolCallDelta {
             content_index,
             delta: serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_owned()),
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
         events.push(StreamEvent::ToolCallEnd {
             content_index,
             tool_call,
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
     }
 
@@ -810,7 +811,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: output.clone(),
+        partial: Arc::new(output.clone()),
     });
 
     let mut processor = StreamProcessor::new(output, model);

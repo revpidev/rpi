@@ -42,6 +42,7 @@
 //!   content blocks), so there is nothing to scrub.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 use serde_json::{json, Value};
@@ -592,7 +593,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: output.clone(),
+        partial: Arc::new(output.clone()),
     });
 
     let mut processor = ResponsesStreamProcessor::new(

@@ -183,7 +183,7 @@ mod tests {
     async fn test_push_iterate_result() {
         let stream = AssistantMessageEventStream::new();
         stream.push(StreamEvent::Start {
-            partial: message(StopReason::Pending),
+            partial: Arc::new(message(StopReason::Pending)),
         });
         stream.push(StreamEvent::Done {
             reason: DoneReason::Stop,
@@ -215,7 +215,7 @@ mod tests {
             message: message(StopReason::Stop),
         });
         stream.push(StreamEvent::Start {
-            partial: message(StopReason::Pending),
+            partial: Arc::new(message(StopReason::Pending)),
         });
         stream.end(None);
         let events: Vec<StreamEvent> = stream.collect().await;
@@ -226,7 +226,7 @@ mod tests {
     async fn test_end_result_fallback() {
         let stream = AssistantMessageEventStream::new();
         stream.push(StreamEvent::Start {
-            partial: message(StopReason::Pending),
+            partial: Arc::new(message(StopReason::Pending)),
         });
         stream.end(Some(message(StopReason::Aborted)));
         let result = stream.result().await.expect("resolved");
@@ -240,7 +240,7 @@ mod tests {
         let stream = AssistantMessageEventStream::new();
         let producer = stream.clone();
         producer.push(StreamEvent::Start {
-            partial: message(StopReason::Pending),
+            partial: Arc::new(message(StopReason::Pending)),
         });
         producer.end(None);
         let events: Vec<StreamEvent> = stream.collect().await;
@@ -269,16 +269,16 @@ mod tests {
     fn text_event(kind_index: usize, partial: &AssistantMessage) -> StreamEvent {
         match kind_index {
             0 => StreamEvent::Start {
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             },
             1 => StreamEvent::TextStart {
                 content_index: 0,
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             },
             _ => StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "x".to_owned(),
-                partial: partial.clone(),
+                partial: Arc::new(partial.clone()),
             },
         }
     }
@@ -389,7 +389,7 @@ mod tests {
             let partial = message(StopReason::Pending);
             for _ in 0..n {
                 stream.push(StreamEvent::Start {
-                    partial: partial.clone(),
+                    partial: Arc::new(partial.clone()),
                 });
             }
             stream.end(None);

@@ -1349,7 +1349,7 @@ impl<'a> StreamProcessor<'a> {
             );
         }
         events.push(StreamEvent::Start {
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
         Ok(())
     }
@@ -1389,7 +1389,7 @@ impl<'a> StreamProcessor<'a> {
         self.partial_json.insert(content_index, String::new());
         events.push(StreamEvent::ToolCallStart {
             content_index,
-            partial: self.output.clone(),
+            partial: Arc::new(self.output.clone()),
         });
     }
 
@@ -1422,7 +1422,7 @@ impl<'a> StreamProcessor<'a> {
                     self.blocks_by_bedrock_index.insert(bedrock_index, index);
                     events.push(StreamEvent::TextStart {
                         content_index: index,
-                        partial: self.output.clone(),
+                        partial: Arc::new(self.output.clone()),
                     });
                     Some(index)
                 }
@@ -1433,7 +1433,7 @@ impl<'a> StreamProcessor<'a> {
                     events.push(StreamEvent::TextDelta {
                         content_index: index,
                         delta: text.to_owned(),
-                        partial: self.output.clone(),
+                        partial: Arc::new(self.output.clone()),
                     });
                 }
             }
@@ -1453,7 +1453,7 @@ impl<'a> StreamProcessor<'a> {
                     events.push(StreamEvent::ToolCallDelta {
                         content_index: index,
                         delta: input.to_owned(),
-                        partial: self.output.clone(),
+                        partial: Arc::new(self.output.clone()),
                     });
                 }
             }
@@ -1473,7 +1473,7 @@ impl<'a> StreamProcessor<'a> {
                     self.blocks_by_bedrock_index.insert(bedrock_index, index);
                     events.push(StreamEvent::ThinkingStart {
                         content_index: index,
-                        partial: self.output.clone(),
+                        partial: Arc::new(self.output.clone()),
                     });
                     index
                 }
@@ -1491,7 +1491,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::ThinkingDelta {
                     content_index: index,
                     delta: text,
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             if let Some(signature) = reasoning
@@ -1540,7 +1540,7 @@ impl<'a> StreamProcessor<'a> {
                     events.push(StreamEvent::ThinkingDelta {
                         content_index: index,
                         delta: REDACTED_THINKING_PLACEHOLDER.to_owned(),
-                        partial: self.output.clone(),
+                        partial: Arc::new(self.output.clone()),
                     });
                 }
                 self.redacted_chunks
@@ -1570,14 +1570,14 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::TextEnd {
                     content_index: index,
                     content: text.text.clone(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             AssistantContent::Thinking(thinking) => {
                 events.push(StreamEvent::ThinkingEnd {
                     content_index: index,
                     content: thinking.thinking.clone(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
             AssistantContent::ToolCall(call) => {
@@ -1586,7 +1586,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::ToolCallEnd {
                     content_index: index,
                     tool_call: call.clone(),
-                    partial: self.output.clone(),
+                    partial: Arc::new(self.output.clone()),
                 });
             }
         }

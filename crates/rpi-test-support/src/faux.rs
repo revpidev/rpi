@@ -699,7 +699,7 @@ async fn stream_with_deltas(
 
     abort_if_cancelled!();
     let _ = tx.send(StreamEvent::Start {
-        partial: partial.clone(),
+        partial: Arc::new(partial.clone()),
     });
 
     for (index, block) in message.content.iter().enumerate() {
@@ -715,7 +715,7 @@ async fn stream_with_deltas(
                     }));
                 let _ = tx.send(StreamEvent::ThinkingStart {
                     content_index: index,
-                    partial: partial.clone(),
+                    partial: Arc::new(partial.clone()),
                 });
                 for chunk in split_string_by_token_size(&t.thinking, min_token_size, max_token_size)
                 {
@@ -727,13 +727,13 @@ async fn stream_with_deltas(
                     let _ = tx.send(StreamEvent::ThinkingDelta {
                         content_index: index,
                         delta: chunk,
-                        partial: partial.clone(),
+                        partial: Arc::new(partial.clone()),
                     });
                 }
                 let _ = tx.send(StreamEvent::ThinkingEnd {
                     content_index: index,
                     content: t.thinking.clone(),
-                    partial: partial.clone(),
+                    partial: Arc::new(partial.clone()),
                 });
             }
             AssistantContent::Text(t) => {
@@ -743,7 +743,7 @@ async fn stream_with_deltas(
                 }));
                 let _ = tx.send(StreamEvent::TextStart {
                     content_index: index,
-                    partial: partial.clone(),
+                    partial: Arc::new(partial.clone()),
                 });
                 for chunk in split_string_by_token_size(&t.text, min_token_size, max_token_size) {
                     schedule_chunk(&chunk, tokens_per_second).await;
@@ -754,13 +754,13 @@ async fn stream_with_deltas(
                     let _ = tx.send(StreamEvent::TextDelta {
                         content_index: index,
                         delta: chunk,
-                        partial: partial.clone(),
+                        partial: Arc::new(partial.clone()),
                     });
                 }
                 let _ = tx.send(StreamEvent::TextEnd {
                     content_index: index,
                     content: t.text.clone(),
-                    partial: partial.clone(),
+                    partial: Arc::new(partial.clone()),
                 });
             }
             AssistantContent::ToolCall(call) => {
@@ -773,7 +773,7 @@ async fn stream_with_deltas(
                 }));
                 let _ = tx.send(StreamEvent::ToolCallStart {
                     content_index: index,
-                    partial: partial.clone(),
+                    partial: Arc::new(partial.clone()),
                 });
                 let args_json =
                     serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
@@ -784,7 +784,7 @@ async fn stream_with_deltas(
                     let _ = tx.send(StreamEvent::ToolCallDelta {
                         content_index: index,
                         delta: chunk,
-                        partial: partial.clone(),
+                        partial: Arc::new(partial.clone()),
                     });
                 }
                 if let Some(AssistantContent::ToolCall(cur)) = partial.content.get_mut(index) {
@@ -793,7 +793,7 @@ async fn stream_with_deltas(
                 let _ = tx.send(StreamEvent::ToolCallEnd {
                     content_index: index,
                     tool_call: call.clone(),
-                    partial: partial.clone(),
+                    partial: Arc::new(partial.clone()),
                 });
             }
         }

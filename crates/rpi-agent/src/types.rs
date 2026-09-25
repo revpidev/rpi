@@ -184,11 +184,14 @@ pub enum AgentEvent {
     },
     /// Only emitted for assistant messages during streaming.
     ///
-    /// `assistant_message_event` is boxed to keep the enum small
-    /// (`clippy::large_enum_variant`); the serde shape is unchanged.
+    /// V15-13 (rpi#53): both payloads are shared behind `Arc` — the
+    /// accumulated partial and the delta event flow agent loop -> listeners
+    /// -> UI queue without deep copies (clone is refcount only; serde shape
+    /// unchanged). `assistant_message_event` is `Arc`-ed to keep the enum
+    /// small (`clippy::large_enum_variant`).
     MessageUpdate {
-        message: AgentMessage,
-        assistant_message_event: Box<StreamEvent>,
+        message: std::sync::Arc<rpi_ai::types::AssistantMessage>,
+        assistant_message_event: std::sync::Arc<StreamEvent>,
     },
     MessageEnd {
         message: AgentMessage,
@@ -292,8 +295,11 @@ mod tests {
             ),
             (
                 AgentEvent::MessageUpdate {
-                    message: assistant_msg(),
-                    assistant_message_event: Box::new(StreamEvent::Done {
+                    message: std::sync::Arc::new(match assistant_msg() {
+                        AgentMessage::Assistant(m) => m,
+                        _ => unreachable!("constructed above"),
+                    }),
+                    assistant_message_event: std::sync::Arc::new(StreamEvent::Done {
                         reason: rpi_ai::types::DoneReason::Stop,
                         message: match assistant_msg() {
                             AgentMessage::Assistant(m) => m,
@@ -358,14 +364,17 @@ mod tests {
         assert_eq!(v["toolResults"][0]["toolCallId"], json!("c1"));
 
         let update = AgentEvent::MessageUpdate {
-            message: assistant_msg(),
-            assistant_message_event: Box::new(StreamEvent::TextDelta {
+            message: std::sync::Arc::new(match assistant_msg() {
+                AgentMessage::Assistant(m) => m,
+                _ => unreachable!("constructed above"),
+            }),
+            assistant_message_event: std::sync::Arc::new(StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "d".to_owned(),
-                partial: match assistant_msg() {
+                partial: std::sync::Arc::new(match assistant_msg() {
                     AgentMessage::Assistant(m) => m,
                     _ => unreachable!("constructed above"),
-                },
+                }),
             }),
         };
         let v: Value = serde_json::from_str(&to_json(&update)).expect("parse");

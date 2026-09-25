@@ -57,9 +57,10 @@ pub fn to_json_event(event: &AgentSessionEvent) -> Result<Value, String> {
         return Ok(value);
     };
     // `message_update` is only emitted for assistant messages during
-    // streaming; upstream throws otherwise (json-event.ts:49-52). rpi's
-    // `AgentMessage` union cannot carry that guarantee at the type level,
-    // so the check is runtime, like upstream's.
+    // streaming; upstream throws otherwise (json-event.ts:49-52). Since
+    // V15-13 the payload is `Arc<AssistantMessage>` — non-assistant payloads
+    // are unrepresentable at the type level; the runtime check is retained
+    // as defense in depth for deserialized inputs.
     if object
         .get("message")
         .and_then(|message| message.get("role"))
@@ -186,8 +187,8 @@ mod tests {
 
     fn message_update(assistant_message_event: StreamEvent) -> AgentSessionEvent {
         AgentSessionEvent::Agent(Box::new(AgentEvent::MessageUpdate {
-            message: AgentMessage::Assistant(assistant_message("cumulative")),
-            assistant_message_event: Box::new(assistant_message_event),
+            message: std::sync::Arc::new(assistant_message("cumulative")),
+            assistant_message_event: std::sync::Arc::new(assistant_message_event),
         }))
     }
 
@@ -199,7 +200,7 @@ mod tests {
         let event = message_update(StreamEvent::TextDelta {
             content_index: 0,
             delta: "chunk".to_owned(),
-            partial: assistant_message("cum"),
+            partial: std::sync::Arc::new(assistant_message("cum")),
         });
         let wire = to_json_event(&event).expect("convert");
         assert_eq!(
@@ -240,11 +241,11 @@ mod tests {
             cost: Default::default(),
         };
         let event = AgentSessionEvent::Agent(Box::new(AgentEvent::MessageUpdate {
-            message: AgentMessage::Assistant(partial),
-            assistant_message_event: Box::new(StreamEvent::TextDelta {
+            message: std::sync::Arc::new(partial),
+            assistant_message_event: std::sync::Arc::new(StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "x".to_owned(),
-                partial: assistant_message("cum"),
+                partial: std::sync::Arc::new(assistant_message("cum")),
             }),
         }));
         let wire = to_json_event(&event).expect("convert");
@@ -270,7 +271,7 @@ mod tests {
         })];
         let event = message_update(StreamEvent::ToolCallStart {
             content_index: 0,
-            partial,
+            partial: std::sync::Arc::new(partial),
         });
         let wire = to_json_event(&event).expect("convert");
         // `{ ...deltaEvent, id, toolName }` (json-event.ts:28): remaining
@@ -294,7 +295,7 @@ mod tests {
         })];
         let event = message_update(StreamEvent::ToolCallStart {
             content_index: 0,
-            partial,
+            partial: std::sync::Arc::new(partial),
         });
         assert_eq!(
             to_json_event(&event),
@@ -305,7 +306,7 @@ mod tests {
         // `undefined` upstream).
         let event = message_update(StreamEvent::ToolCallStart {
             content_index: 7,
-            partial: assistant_message("cum"),
+            partial: std::sync::Arc::new(assistant_message("cum")),
         });
         assert_eq!(
             to_json_event(&event),
@@ -313,30 +314,12 @@ mod tests {
         );
     }
 
-    /// `message_update` for a non-assistant message fails conversion with
-    /// the upstream error message (json-event.ts:50-52). rpi's
-    /// `AgentEvent::MessageUpdate` is typed over the `AgentMessage` union,
-    /// so this is reachable in principle, unlike upstream's TS types.
-    #[test]
-    fn message_update_rejects_non_assistant_message() {
-        use rpi_ai::types::{UserContent, UserMessage, UserRole};
-        let event = AgentSessionEvent::Agent(Box::new(AgentEvent::MessageUpdate {
-            message: AgentMessage::User(UserMessage {
-                role: UserRole::User,
-                content: UserContent::Text("hi".to_owned()),
-                timestamp: 2,
-            }),
-            assistant_message_event: Box::new(StreamEvent::TextDelta {
-                content_index: 0,
-                delta: "x".to_owned(),
-                partial: assistant_message("cum"),
-            }),
-        }));
-        assert_eq!(
-            to_json_event(&event),
-            Err("message_update message is not an assistant message".to_owned())
-        );
-    }
+    // `message_update_rejects_non_assistant_message` (V13-era negative
+    // test) was removed by V15-13 L3: `MessageUpdate` payloads are
+    // `Arc<AssistantMessage>`, so a non-assistant message is unrepresentable
+    // at the type level — the invariant the test exercised is now enforced
+    // by construction (the runtime role check in `to_json_event` stays as
+    // defense in depth for deserialized inputs).
 
     /// V14-03 FR-F R1 / V14-04 FR-D linkage: the `AssistantMessage`
     /// `providerThinkingLevel` field rides message-bearing events verbatim —

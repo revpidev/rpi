@@ -2827,3 +2827,154 @@ async fn event_stream_buffered_drain_is_linear_9055() {
         "drain time ratio 100k/10k = {ratio:.1}x (linear ≈ 10x, quadratic ≈ 100x)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// V15-13 FR-L3 (rpi#53): per-delta clone elimination
+// ---------------------------------------------------------------------------
+
+/// Long-stream simulation: 64 folded thinking deltas, each carrying an
+/// accumulated partial built by incremental extension. The pipeline must
+/// deliver every partial to `MessageUpdate` with ZERO deep copies — the
+/// emitted `Arc` stays pointer-identical to the fixture's Arc from the
+/// stream fn through the loop into the event (per-delta allocation is the
+/// delta itself + refcount bumps, linear in the delta). The final message
+/// list contains the final assistant message exactly once (the streaming
+/// tail is materialized once at finalize, never rewritten per delta).
+#[tokio::test]
+async fn v1513_streaming_deltas_share_one_arc_end_to_end() {
+    use rpi_agent::agent_loop::{run_agent_loop, AgentEventSink};
+
+    const DELTAS: usize = 64;
+
+    // Fixture: incremental accumulation; each partial is a fresh message
+    // (no AssistantMessage clones inside the fixture).
+    let mut partials: Vec<Arc<AssistantMessage>> = Vec::with_capacity(DELTAS + 1);
+    let mut text = String::new();
+    for _ in 0..=DELTAS {
+        text.push_str("段落的思考内容，逐步累积。");
+        partials.push(Arc::new(pending_assistant(&text)));
+    }
+    let final_text = text.clone();
+    let final_message = {
+        let mut message = pending_assistant(&final_text);
+        message.stop_reason = StopReason::Stop;
+        message
+    };
+
+    let stream_fn: StreamFn = {
+        let partials = partials.clone();
+        let final_message = final_message.clone();
+        Arc::new(move |_model, _context, _options| {
+            let partials = partials.clone();
+            let final_message = final_message.clone();
+            let mut events = VecDeque::new();
+            events.push_back(StreamEvent::Start {
+                partial: partials[0].clone(),
+            });
+            for partial in partials.iter().skip(1) {
+                events.push_back(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "段落的思考内容，逐步累积。".to_owned(),
+                    partial: partial.clone(),
+                });
+            }
+            events.push_back(StreamEvent::Done {
+                reason: DoneReason::Stop,
+                message: final_message,
+            });
+            futures::stream::iter(events).boxed()
+        })
+    };
+
+    let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_target = collected.clone();
+    let emit: AgentEventSink = Arc::new(move |event| {
+        let target = sink_target.clone();
+        Box::pin(async move {
+            target.lock().unwrap().push(event);
+        })
+    });
+
+    let context = AgentContext {
+        messages: Vec::new(),
+        tools: None,
+    };
+    let messages = run_agent_loop(
+        vec![user_message("长思考请求")],
+        context,
+        test_config(),
+        emit,
+        None,
+        stream_fn,
+    )
+    .await;
+
+    // Every MessageUpdate partial is the SAME allocation the fixture built.
+    let events = collected.lock().unwrap().clone();
+    let updates: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::MessageUpdate { .. }))
+        .collect();
+    assert_eq!(updates.len(), DELTAS, "one MessageUpdate per delta");
+    for (index, event) in updates.iter().enumerate() {
+        let AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } = event
+        else {
+            unreachable!("filtered above")
+        };
+        assert!(
+            Arc::ptr_eq(message, &partials[index + 1]),
+            "delta {index}: event partial must be the fixture Arc (zero-copy)"
+        );
+        let StreamEvent::TextDelta { partial, .. } = assistant_message_event.as_ref() else {
+            panic!("delta {index}: expected a TextDelta assistant_message_event");
+        };
+        assert!(
+            Arc::ptr_eq(partial, &partials[index + 1]),
+            "delta {index}: boxed stream event shares the same partial Arc"
+        );
+    }
+
+    // The final message list: user prompt + the final assistant message
+    // exactly once (no per-delta tail rewrites, no duplicated partial).
+    assert_eq!(messages.len(), 2, "final: {:?}", message_kinds(&messages));
+    match &messages[1] {
+        AgentMessage::Assistant(assistant) => {
+            assert_eq!(assistant.stop_reason, StopReason::Stop);
+            match &assistant.content[0] {
+                AssistantContent::Text(content) => {
+                    assert_eq!(content.text, final_text);
+                }
+                other => panic!("expected text content, got {other:?}"),
+            }
+        }
+        other => panic!("expected assistant tail, got {other:?}"),
+    }
+}
+
+fn pending_assistant(text: &str) -> AssistantMessage {
+    assistant_message(
+        vec![AssistantContent::Text(TextContent {
+            text: text.to_owned(),
+            text_signature: None,
+        })],
+        StopReason::Pending,
+    )
+}
+
+fn message_kinds(messages: &[AgentMessage]) -> Vec<&'static str> {
+    messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::System(_) => "system",
+            AgentMessage::User(_) => "user",
+            AgentMessage::Assistant(_) => "assistant",
+            AgentMessage::ToolResult(_) => "tool_result",
+            AgentMessage::BashExecution(_) => "bash_execution",
+            AgentMessage::Custom(_) => "custom",
+            _ => "other",
+        })
+        .collect()
+}

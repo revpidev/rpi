@@ -36,7 +36,9 @@ rpi-ext-statusline = { path = "crates/rpi-ext-statusline" }
 rpi-test-support = { path = "crates/rpi-test-support" }
 
 # External baseline (coding-standards appendix A).
-serde = { version = "1", features = ["derive"] }
+# rc: Arc<T> serializes transparently as T (V15-13 L3 — shared streaming
+# partials in StreamEvent/AgentEvent keep the exact pre-Arc wire shape).
+serde = { version = "1", features = ["derive", "rc"] }
 # preserve_order: JSON object key order must survive round-trips (insertion order,
 # like JS objects) for byte-level wire-format parity with upstream.
 serde_json = { version = "1", features = ["preserve_order"] }
