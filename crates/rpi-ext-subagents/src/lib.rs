@@ -1454,6 +1454,7 @@ pub mod parity {
             thinking_ceiling: None,
             session_name: None,
             supervisor_channel: None,
+            descendant_allowed_agents: None,
         };
         let result = crate::launch::args::build_rpi_args(&internal)?;
         Ok(BuildArgsResultPublic {

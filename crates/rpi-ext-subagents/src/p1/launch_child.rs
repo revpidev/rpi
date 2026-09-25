@@ -365,7 +365,7 @@ pub struct ChildOutcome {
 /// usable fork branch, or the structured reason the run degraded to fresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForkOutcome {
-    Forked(PathBuf, Option<String>),
+    Forked(PathBuf),
     Degraded(String),
 }
 
@@ -388,10 +388,7 @@ pub fn try_fork_session(ctx: &RunCtx, branch_file: &Path, effective_cwd: &Path) 
         branch_file,
         effective_cwd,
     ) {
-        Ok(resolution) => ForkOutcome::Forked(
-            resolution.session_file,
-            resolution.thinking_override_off.then(|| "off".to_string()),
-        ),
+        Ok(resolution) => ForkOutcome::Forked(resolution.session_file),
         Err(error) => {
             ForkOutcome::Degraded(format!("failed to create forked subagent session: {error}"))
         }
@@ -465,6 +462,13 @@ pub async fn run_child_async(
     agent: &AgentConfig,
     ctx: &RunCtx,
 ) -> Result<ChildOutcome, String> {
+    // #2338 descendant agent allowlists: the ceiling this session runs under
+    // (inherited via env) gates every launch; it can only be narrowed.
+    if let Some(ceiling) = crate::launch::args::DescendantAllowlist::from_env() {
+        if !ceiling.allows(&agent.name) {
+            return Err(ceiling.restriction_message(&agent.name));
+        }
+    }
     // Timeout chain: child override > top-level call > agent frontmatter >
     // config > 30min.
     let timeout = spec
@@ -507,7 +511,7 @@ pub async fn run_child_async(
                 .join(format!("fork-{}.jsonl", spec.child_index))
         };
         match try_fork_session(ctx, &branch_file, &effective_cwd) {
-            ForkOutcome::Forked(file, thinking) => (Some(file), thinking),
+            ForkOutcome::Forked(file) => (Some(file), None),
             ForkOutcome::Degraded(reason) => {
                 tracing::warn!(
                     reason = %reason,
@@ -835,6 +839,7 @@ pub async fn run_child_async(
         agent_exclude_tools: agent.exclude_tools.clone(),
         agent_extensions: agent.extensions.clone(),
         agent_subagent_only_extensions: agent.subagent_only_extensions.clone(),
+        agent_allowed_agents: agent.allowed_agents.clone(),
         agent_inherit_project_context: agent.inherit_project_context,
         agent_inherit_skills: agent.inherit_skills,
         task: task_text,
@@ -1163,7 +1168,7 @@ mod te18_fork_tests {
             Some(parent),
         );
         match try_fork_session(&ctx, &dir.join("branch.jsonl"), Path::new("/tmp")) {
-            ForkOutcome::Forked(file, _) => assert!(file.ends_with("branch.jsonl")),
+            ForkOutcome::Forked(file) => assert!(file.ends_with("branch.jsonl")),
             other => panic!("expected a fork, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1257,6 +1262,7 @@ mod te18_gate_budget_tests {
             exclude_tools: Vec::new(),
             mcp_direct_tools: Vec::new(),
             model: None,
+            allowed_agents: None,
             thinking: crate::agents::discover::ThinkingSpec::Unset,
             system_prompt_mode: "replace",
             inherit_project_context: true,

@@ -10,10 +10,10 @@
 //! Intentional differences: the fork target directory is
 //! `<parentSessionDir>/<runId>/run-<index>/` (upstream `createBranchedSession`
 //! writes next to the parent; the branch file path is ours to choose since
-//! the child only consumes it via `--session`); the thinking-off entry is
-//! appended when Anthropic-signed thinking blocks were stripped (upstream
-//! `forkedChildRequiresThinkingOff` is conservative — unknown models too —
-//! and that conservativeness is kept).
+//! the child only consumes it via `--session`). Signed Anthropic thinking
+//! blocks are stripped from the branch (#2031 semantics at v0.70: the child
+//! keeps its requested thinking level — a signature cannot replay into a
+//! branch, so sanitizing is not a downgrade).
 
 use std::path::{Path, PathBuf};
 
@@ -251,56 +251,9 @@ fn write_session_entries(session_file: &Path, entries: &[Value]) -> Result<(), S
     })
 }
 
-/// Entry ids are 8 hex chars (rpi session format); a fresh id avoids
-/// colliding with the parent ids.
-fn create_entry_id(entries: &[Value]) -> String {
-    let existing: std::collections::BTreeSet<&str> = entries
-        .iter()
-        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
-        .collect();
-    for _ in 0..100 {
-        let id = crate::runner::budget::random_run_id();
-        if !existing.contains(id.as_str()) {
-            return id;
-        }
-    }
-    crate::runner::budget::random_run_id()
-}
-
-fn append_thinking_off_entry(entries: &mut Vec<Value>) {
-    if let Some(last) = entries.last() {
-        if last.get("type").and_then(Value::as_str) == Some("thinking_level_change")
-            && last.get("thinkingLevel").and_then(Value::as_str) == Some("off")
-        {
-            return;
-        }
-    }
-    let parent = entries
-        .iter()
-        .rev()
-        .find_map(|entry| entry.get("id").and_then(Value::as_str));
-    entries.push(serde_json::json!({
-        "type": "thinking_level_change",
-        "id": create_entry_id(entries),
-        "parentId": parent,
-        "timestamp": iso_now(),
-        "thinkingLevel": "off",
-    }));
-}
-
-fn iso_now() -> String {
-    // RFC3339 with second precision, matching rpi session timestamps.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    crate::artifacts::format_iso8601(now.as_millis() as u64)
-}
-
 #[derive(Debug)]
 pub struct ForkResolution {
     pub session_file: PathBuf,
-    /// Thinking must be forced off for this child (Anthropic signature strip).
-    pub thinking_override_off: bool,
 }
 
 /// Branch the parent session for a fork-context child
@@ -333,15 +286,15 @@ pub fn create_fork_session(
         }
         // Branch = copy of the parent entries up to the leaf (the file IS the
         // linear history; the leaf is its last entry), minus orchestration
-        // residue, plus the thinking-off marker when signatures were stripped.
+        // residue, with signed thinking blocks sanitized.
         let mut branched = entries;
         filter_orchestration_entries(&mut branched);
-        let stripped = sanitize_unsafe_thinking_blocks(&mut branched);
-        let mut thinking_off = false;
-        if stripped {
-            append_thinking_off_entry(&mut branched);
-            thinking_off = true;
-        }
+        // #2031 (v0.70): signed-thinking blocks are stripped from the forked
+        // transcript but the child KEEPS its requested thinking level — a
+        // thinking signature is bound to the producing session and cannot be
+        // replayed into a branch anyway, so sanitizing is not a downgrade and
+        // the pre-v0.70 thinking-off entry is gone (fork-context.ts:2-5).
+        sanitize_unsafe_thinking_blocks(&mut branched);
         if let Some(parent_dir) = branch_file.parent() {
             std::fs::create_dir_all(parent_dir)
                 .map_err(|error| format!("Failed to create forked session directory: {error}"))?;
@@ -350,7 +303,6 @@ pub fn create_fork_session(
         align_forked_session_cwd(branch_file, child_cwd)?;
         Ok(ForkResolution {
             session_file: branch_file.to_path_buf(),
-            thinking_override_off: thinking_off,
         })
     };
     inner().map_err(|error| format!("Failed to create forked subagent session: {error}"))

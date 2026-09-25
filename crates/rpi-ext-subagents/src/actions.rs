@@ -11,14 +11,23 @@ use crate::tool::{ToolOutcome, FOREGROUND_RUN_MEMORY};
 
 /// `handleList` text (agent-management.ts:753-788), P0 subset: no chains, no
 /// restricted section (capability ceiling is P1), sorted by name.
-pub fn format_agent_list(agents: &[AgentConfig]) -> String {
+/// List with a descendant-agent ceiling (#2338): non-allowlisted agents move
+/// to the "Restricted agents" section (upstream list output marks them the
+/// same way; `capability ceiling: <sources>` names the restricting source).
+pub fn format_agent_list_with_ceiling(
+    agents: &[AgentConfig],
+    ceiling: Option<&crate::launch::args::DescendantAllowlist>,
+) -> String {
     let mut sorted: Vec<&AgentConfig> = agents.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let (executable, restricted): (Vec<&AgentConfig>, Vec<&AgentConfig>) = sorted
+        .into_iter()
+        .partition(|agent| ceiling.is_none_or(|c| c.allows(&agent.name)));
     let mut lines = vec!["Executable agents:".to_string()];
-    if sorted.is_empty() {
+    if executable.is_empty() {
         lines.push("- (none)".to_string());
     } else {
-        for agent in sorted {
+        for agent in executable {
             let mut meta = agent.source_str().to_string();
             if let Some(context) = &agent.default_context {
                 meta.push_str(&format!(", context: {}", context.as_str()));
@@ -34,10 +43,34 @@ pub fn format_agent_list(agents: &[AgentConfig]) -> String {
             ));
         }
     }
+    if let Some(ceiling) = ceiling {
+        if !restricted.is_empty() {
+            let sources = if ceiling.sources.is_empty() {
+                "unknown source".to_string()
+            } else {
+                ceiling.sources.join(", ")
+            };
+            lines.push(String::new());
+            lines.push(format!(
+                "Restricted agents (not executable in this session; capability ceiling: {sources}):"
+            ));
+            for agent in restricted {
+                lines.push(format!(
+                    "- {} ({}): {}",
+                    agent.name,
+                    agent.source_str(),
+                    agent.description
+                ));
+            }
+        }
+    }
     lines.push(String::new());
     lines.push("Chains:".to_string());
     lines.push("- (none)".to_string());
-    lines.join("\n")
+    lines.join(
+        "
+",
+    )
 }
 
 /// `formatAgentDetail` (agent-management.ts:665-701) for the P0 field set.
@@ -63,6 +96,16 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
     }
     if let Some(model) = &agent.model {
         lines.push(format!("Model: {model}"));
+    }
+    if let Some(allowed) = &agent.allowed_agents {
+        lines.push(format!(
+            "Allowed agents: {}",
+            if allowed.is_empty() {
+                "(none)".to_string()
+            } else {
+                allowed.join(", ")
+            }
+        ));
     }
     if !tools.is_empty() {
         lines.push(format!("Tools: {}", tools.join(", ")));
@@ -235,6 +278,7 @@ pub fn agent_capabilities_snapshot(agents: &[AgentConfig]) -> Value {
                     },
                     "model": {
                         "value": agent.model,
+                        "allowedAgents": agent.allowed_agents,
                         "thinking": match &agent.thinking {
                             crate::agents::discover::ThinkingSpec::Level(level) => json!(level),
                             crate::agents::discover::ThinkingSpec::Disabled => json!("off"),
@@ -355,10 +399,11 @@ fn handle_management_action_inner(
             // records (agent-management.ts:972-995 + agentCapabilityRow @
             // 0fc0eebb); the default listing shape is unchanged.
             let capability_mode = raw_params.get("capabilities") == Some(&Value::Bool(true));
+            let session_ceiling = crate::launch::args::DescendantAllowlist::from_env();
             let mut text = if capability_mode {
                 format_agent_capabilities_list(&agents)
             } else {
-                format_agent_list(&agents)
+                format_agent_list_with_ceiling(&agents, session_ceiling.as_ref())
             };
             let diagnostic_lines = format_discovery_diagnostics(&diagnostics);
             if !diagnostic_lines.is_empty() {
@@ -1323,7 +1368,7 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
                 body = prompt.to_string();
             }
             "model" | "thinking" | "systemPromptMode" | "defaultContext" | "output" | "tools"
-            | "skills" | "aliases" | "extensions" => {
+            | "skills" | "aliases" | "allowedAgents" | "extensions" => {
                 let rendered = match value {
                     Value::String(s) => s.clone(),
                     Value::Bool(b) => b.to_string(),
@@ -1338,7 +1383,7 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "config.{other} is not a supported agent field (supported: description, systemPrompt, model, thinking, systemPromptMode, defaultContext, output, tools, skills, aliases, extensions)."
+                    "config.{other} is not a supported agent field (supported: description, systemPrompt, model, thinking, systemPromptMode, defaultContext, output, tools, skills, aliases, allowedAgents, extensions)."
                 ));
             }
         }
@@ -2190,7 +2235,7 @@ mod tests {
     #[test]
     fn list_and_detail_format() {
         let agents = crate::agents::builtin::load_builtin_agents(None);
-        let listing = format_agent_list(&agents);
+        let listing = format_agent_list_with_ceiling(&agents, None);
         assert!(listing.starts_with("Executable agents:"));
         assert!(
             listing.contains("- oracle (builtin, context: fork, aliases: advisor):"),

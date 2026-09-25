@@ -495,7 +495,8 @@ fn e2e_fixed_child_full_pipeline() {
     }));
     assert_eq!(result["isError"], Value::Bool(false), "{result}");
     // Branch file created and filtered: no subagent toolResult, no toolCall
-    // block, signed thinking stripped, thinking-off entry appended.
+    // block, signed thinking stripped (#2031 at v0.70: the requested thinking
+    // level is kept — no thinking-off entry is appended).
     let fork_root = sessions.join("forkruns");
     let branch = find_latest_jsonl(&fork_root).expect("branch file exists");
     let branch_text = std::fs::read_to_string(&branch).unwrap();
@@ -508,7 +509,7 @@ fn e2e_fixed_child_full_pipeline() {
         "{branch_text}"
     );
     assert!(!branch_text.contains("signature"), "{branch_text}");
-    assert!(branch_text.contains("thinking_level_change"));
+    assert!(!branch_text.contains("thinking_level_change"));
     let header: Value = serde_json::from_str(branch_text.lines().next().unwrap()).unwrap();
     assert_eq!(
         header["cwd"].as_str(),

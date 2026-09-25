@@ -369,6 +369,7 @@ mod tests {
             exclude_tools: Vec::new(),
             mcp_direct_tools: Vec::new(),
             model: None,
+            allowed_agents: None,
             thinking: crate::agents::discover::ThinkingSpec::Unset,
             system_prompt_mode: "replace",
             inherit_project_context: false,

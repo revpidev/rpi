@@ -59,6 +59,150 @@ pub const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV: &str = "RPI_SUBAGENT_ORCHESTRATO
 pub const REQUIRED_CHILD_TOOLS_ENV: &str = "RPI_SUBAGENT_REQUIRED_TOOLS";
 pub const CHILD_TOOL_DIAGNOSTIC_PATH_ENV: &str = "RPI_SUBAGENT_TOOL_DIAGNOSTIC_PATH";
 
+/// Descendant agent allowlist (#2338): JSON `{"allowedAgents":[..],"sources":[..]}`
+/// carried into fanout-authorized children; the child's own launches (and the
+/// list output) intersect against it and it can never be widened.
+pub const SUBAGENT_ALLOWED_AGENTS_ENV: &str = "RPI_SUBAGENT_ALLOWED_AGENTS";
+
+/// The inherited descendant-agent allowlist decoded from the environment
+/// (`None` = unrestricted; an empty `allowedAgents` list denies every
+/// descendant launch).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescendantAllowlist {
+    pub allowed_agents: Vec<String>,
+    pub sources: Vec<String>,
+}
+
+impl DescendantAllowlist {
+    /// Decode the env form. `Ok(None)` = unset (unrestricted); a malformed
+    /// value fails closed to deny-all (the ceiling must never widen on a
+    /// decode error).
+    pub fn from_env() -> Option<DescendantAllowlist> {
+        let raw = std::env::var(SUBAGENT_ALLOWED_AGENTS_ENV).ok()?;
+        if raw.trim().is_empty() {
+            // Explicitly set but empty: deny everything (upstream: an empty
+            // list denies every descendant launch).
+            return Some(DescendantAllowlist {
+                allowed_agents: Vec::new(),
+                sources: Vec::new(),
+            });
+        }
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => {
+                let allowed = value
+                    .get("allowedAgents")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let sources = value
+                    .get("sources")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Some(DescendantAllowlist {
+                    allowed_agents: allowed,
+                    sources,
+                })
+            }
+            Err(_) => Some(DescendantAllowlist {
+                allowed_agents: Vec::new(),
+                sources: Vec::new(),
+            }),
+        }
+    }
+
+    /// Encode for the child env.
+    pub fn to_env_value(&self) -> String {
+        serde_json::json!({
+            "allowedAgents": self.allowed_agents,
+            "sources": self.sources,
+        })
+        .to_string()
+    }
+
+    /// Intersect with an agent's own declared allowlist (#2338 semantics:
+    /// inherited lists are intersected and cannot be widened).
+    pub fn intersect(&self, own: DescendantAllowlist, agent_name: &str) -> DescendantAllowlist {
+        let inherited: std::collections::BTreeSet<&str> =
+            self.allowed_agents.iter().map(String::as_str).collect();
+        let mut next: Vec<String> = own
+            .allowed_agents
+            .iter()
+            .filter(|name| inherited.contains(name.as_str()))
+            .cloned()
+            .collect();
+        next.sort();
+        next.dedup();
+        let mut sources = self.sources.clone();
+        for source in own.sources {
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+        let source = format!("agent:{agent_name}");
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+        DescendantAllowlist {
+            allowed_agents: next,
+            sources,
+        }
+    }
+
+    /// `isAgentAllowedByCapabilityCeiling` (capability-ceiling.ts).
+    pub fn allows(&self, agent_name: &str) -> bool {
+        self.allowed_agents.iter().any(|name| name == agent_name)
+    }
+
+    /// `capabilityCeilingAgentRestrictionMessage` (capability-ceiling.ts:184-186):
+    /// `Capability ceiling from <sources> does not allow agent '<name>'.
+    /// Allowed agents: <list or (none)>.`
+    pub fn restriction_message(&self, agent_name: &str) -> String {
+        let sources = if self.sources.is_empty() {
+            "unknown source".to_string()
+        } else {
+            self.sources.join(", ")
+        };
+        let allowed = if self.allowed_agents.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.allowed_agents.join(", ")
+        };
+        format!("Capability ceiling from {sources} does not allow agent '{agent_name}'. Allowed agents: {allowed}.")
+    }
+}
+
+/// Resolve the allowlist a child runs under: the inherited env list
+/// (unrestricted when unset) intersected with the agent's own declared
+/// `allowedAgents` (upstream `descendantAllowedAgents` → child ceiling,
+/// child-launch.ts:187-196). `None` = unrestricted (no restriction on any
+/// side); an empty list denies every descendant launch.
+pub fn effective_descendant_allowlist(
+    agent_allowed: Option<&[String]>,
+    agent_name: &str,
+) -> Option<DescendantAllowlist> {
+    let agent_list = agent_allowed.map(|allowed| DescendantAllowlist {
+        allowed_agents: allowed.to_vec(),
+        sources: vec![format!("agent:{agent_name}")],
+    });
+    match (DescendantAllowlist::from_env(), agent_list) {
+        (Some(inherited), Some(own)) => Some(inherited.intersect(own, agent_name)),
+        (Some(inherited), None) => Some(inherited),
+        (None, Some(own)) => Some(own),
+        (None, None) => None,
+    }
+}
+
 /// THINKING_LEVELS (model-info.ts:1).
 pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -168,6 +312,9 @@ pub struct BuildArgsInput {
     /// Supervisor channel dir (FR-P1-10): activates the child-side
     /// `contact_supervisor` tool; `None` clears the env.
     pub supervisor_channel: Option<PathBuf>,
+    /// Effective descendant agent allowlist for the child (#2338); `None`
+    /// leaves the env unset (unrestricted).
+    pub descendant_allowed_agents: Option<DescendantAllowlist>,
     /// Effective thinking ceiling (#1397 `subagents.maxThinking` + inherited
     /// env intersection): propagated to the child so grandchildren stay
     /// under the tightest ancestor ceiling (launch-contract
@@ -596,6 +743,14 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     } else {
         cleared(&mut env, crate::p1::supervisor::SUPERVISOR_CHANNEL_DIR_ENV);
     }
+    if let Some(allowlist) = &input.descendant_allowed_agents {
+        env.insert(
+            SUBAGENT_ALLOWED_AGENTS_ENV.to_string(),
+            Some(allowlist.to_env_value()),
+        );
+    } else {
+        cleared(&mut env, SUBAGENT_ALLOWED_AGENTS_ENV);
+    }
     cleared(&mut env, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV);
     env.insert(
         SUBAGENT_PARENT_ROOT_RUN_ID_ENV.into(),
@@ -719,6 +874,106 @@ pub fn effective_thinking(agent: &AgentConfig, thinking_override: Option<&str>) 
     match &agent.thinking {
         ThinkingSpec::Level(level) => Some(level.clone()),
         ThinkingSpec::Disabled | ThinkingSpec::Unset => None,
+    }
+}
+
+#[cfg(test)]
+mod allowed_agents_tests {
+    use super::*;
+
+    /// Serializes the env-manipulating tests (TE34 TEST_LOCK convention).
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn list(names: &[&str], sources: &[&str]) -> DescendantAllowlist {
+        DescendantAllowlist {
+            allowed_agents: names.iter().map(|n| n.to_string()).collect(),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn intersection_cannot_widen() {
+        // #2338: parent {coordinator, scout} ∩ agent {scout, worker} = {scout}
+        // (upstream capability-ceiling-agent-allowlist.test.ts shape).
+        let inherited = list(&["coordinator", "scout"], &["parent"]);
+        let own = list(&["scout", "worker"], &["agent:coordinator"]);
+        let intersected = inherited.intersect(own, "coordinator");
+        assert_eq!(intersected.allowed_agents, vec!["scout".to_string()]);
+        assert!(intersected.sources.contains(&"parent".to_string()));
+        assert!(intersected
+            .sources
+            .contains(&"agent:coordinator".to_string()));
+    }
+
+    #[test]
+    fn empty_list_denies_everything() {
+        let ceiling = list(&[], &["agent:gate"]);
+        assert!(!ceiling.allows("worker"));
+        assert_eq!(
+            ceiling.restriction_message("worker"),
+            "Capability ceiling from agent:gate does not allow agent 'worker'. Allowed agents: (none)."
+        );
+    }
+
+    #[test]
+    fn restriction_message_matches_upstream_shape() {
+        let ceiling = list(&["reviewer"], &["plan-mode"]);
+        assert!(!ceiling.allows("worker"));
+        assert_eq!(
+            ceiling.restriction_message("worker"),
+            "Capability ceiling from plan-mode does not allow agent 'worker'. Allowed agents: reviewer."
+        );
+        assert!(ceiling.allows("reviewer"));
+    }
+
+    #[test]
+    fn env_decode_tri_state() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Unset → unrestricted.
+        std::env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
+        assert!(DescendantAllowlist::from_env().is_none());
+        // Set-empty → deny-all.
+        std::env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, "");
+        let ceiling = DescendantAllowlist::from_env().expect("deny-all");
+        assert!(ceiling.allowed_agents.is_empty());
+        // JSON value round-trips.
+        let encoded = list(&["scout"], &["agent:x"]).to_env_value();
+        std::env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, &encoded);
+        let decoded = DescendantAllowlist::from_env().expect("decoded");
+        assert_eq!(decoded.allowed_agents, vec!["scout".to_string()]);
+        assert_eq!(decoded.sources, vec!["agent:x".to_string()]);
+        // Malformed fails closed to deny-all (never widens).
+        std::env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, "{not json");
+        let failed = DescendantAllowlist::from_env().expect("fail-closed");
+        assert!(failed.allowed_agents.is_empty());
+        std::env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
+    }
+
+    #[test]
+    fn effective_allowlist_combines_env_and_agent() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
+        // Neither side declares → unrestricted.
+        assert!(effective_descendant_allowlist(None, "worker").is_none());
+        // Agent-only declaration restricts the child.
+        let own = effective_descendant_allowlist(Some(&["scout".to_string()]), "worker")
+            .expect("own list");
+        assert_eq!(own.allowed_agents, vec!["scout".to_string()]);
+        assert_eq!(own.sources, vec!["agent:worker".to_string()]);
+        // Inherited ∩ agent narrows further.
+        std::env::set_var(
+            SUBAGENT_ALLOWED_AGENTS_ENV,
+            list(&["scout", "reviewer"], &["agent:outer"]).to_env_value(),
+        );
+        let both = effective_descendant_allowlist(
+            Some(&["scout".to_string(), "worker".to_string()]),
+            "coordinator",
+        )
+        .expect("intersection");
+        assert_eq!(both.allowed_agents, vec!["scout".to_string()]);
+        assert!(both.sources.contains(&"agent:outer".to_string()));
+        assert!(both.sources.contains(&"agent:coordinator".to_string()));
+        std::env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
     }
 }
 

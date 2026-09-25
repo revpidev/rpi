@@ -100,6 +100,12 @@ pub struct AgentConfig {
     /// that does not require `subagent` in the tools allowlist (blocked when
     /// `excludeTools` names it).
     pub allow_nested_subagents: Option<bool>,
+    /// `allowedAgents` (#2338): descendant agent allowlist — canonical,
+    /// case-sensitive agent names this agent may launch when nested fanout
+    /// is separately authorized. `None` adds no restriction; an empty list
+    /// denies every descendant launch; inherited lists are intersected and
+    /// cannot be widened.
+    pub allowed_agents: Option<Vec<String>>,
     /// `defaultProvider` fill (#1393): preferred provider for model
     /// resolution — settings `subagents.defaultProvider` (fill-only) or the
     /// builtin `defaultProvider` override; outranks the parent's provider.
@@ -693,6 +699,14 @@ pub fn agent_from_content(
         Some(level) => ThinkingSpec::Level(level.to_string()),
         None => ThinkingSpec::Unset,
     };
+    let allowed_agents = fm.get("allowedAgents").map(|raw| {
+        super::frontmatter::parse_frontmatter_list(Some(raw))
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    });
     let max_subagent_depth = match fm.get("maxSubagentDepth").map(String::as_str) {
         // `Number.isInteger(parsed) && parsed >= 0` — invalid values are
         // ignored (undefined), not fatal (agents.ts:2102 @ v0.66.0).
@@ -764,6 +778,7 @@ pub fn agent_from_content(
         default_reads,
         default_progress: fm.get("defaultProgress").map(String::as_str) == Some("true"),
         max_subagent_depth,
+        allowed_agents,
         disabled: None,
         memory: MemoryConfig::parse(fm.get("memory").map(String::as_str)),
         acceptance_role: match fm.get("acceptanceRole").map(String::as_str) {
@@ -1489,6 +1504,9 @@ fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOve
     if let Some(allow_nested) = entry.allow_nested_subagents {
         agent.allow_nested_subagents = Some(allow_nested);
     }
+    if let Some(allowed) = &entry.allowed_agents {
+        agent.allowed_agents = allowed.clone();
+    }
     if let Some(output_mode) = &entry.output_mode {
         agent.output_mode = Some(output_mode.clone());
     }
@@ -1521,6 +1539,11 @@ fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::A
     if let Some(exclude) = &entry.exclude_tools {
         if !agent.has_frontmatter_field(&["excludeTools"]) {
             agent.exclude_tools = exclude.clone().unwrap_or_default();
+        }
+    }
+    if let Some(allowed) = &entry.allowed_agents {
+        if !agent.has_frontmatter_field(&["allowedAgents"]) {
+            agent.allowed_agents = allowed.clone();
         }
     }
     if let Some(thinking) = &entry.thinking {
@@ -2504,7 +2527,7 @@ mod discovery_robustness_tests {
     fn list_output_shape_is_unchanged_and_diagnostics_append() {
         let (root, tree) = materialize("t8");
         let (agents, diagnostics) = discover_fixture(&tree);
-        let base = crate::actions::format_agent_list(&agents);
+        let base = crate::actions::format_agent_list_with_ceiling(&agents, None);
         let block = crate::actions::format_discovery_diagnostics(&diagnostics);
         assert_eq!(block.len(), 3, "{block:?}");
         assert_eq!(block[0], "Invalid agent definitions:");
@@ -2633,6 +2656,27 @@ mod te18_tools_tests {
         assert_eq!(
             agent_with("name: a\ndescription: d\ntools:  inherit ").tools,
             None
+        );
+    }
+
+    #[test]
+    fn allowed_agents_frontmatter_tri_state() {
+        // #2338: comma form, block form, dedupe; omitted → None (no
+        // restriction); explicitly empty → Some([]) (deny every descendant).
+        let agent = agent_with("name: a\ndescription: d\nallowedAgents: scout, reviewer, scout");
+        assert_eq!(
+            agent.allowed_agents,
+            Some(vec!["reviewer".to_string(), "scout".to_string()])
+        );
+        let block = agent_with("name: a\ndescription: d\nallowedAgents:\n  - worker\n  - scout");
+        assert_eq!(
+            block.allowed_agents,
+            Some(vec!["scout".to_string(), "worker".to_string()])
+        );
+        assert_eq!(agent_with("name: a\ndescription: d").allowed_agents, None);
+        assert_eq!(
+            agent_with("name: a\ndescription: d\nallowedAgents:").allowed_agents,
+            Some(Vec::new())
         );
     }
 

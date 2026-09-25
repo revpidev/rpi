@@ -638,6 +638,9 @@ pub struct AgentOverride {
     pub default_provider: Option<Option<String>>,
     /// `allowNestedSubagents` override (#1587, agents.ts:1100-1102).
     pub allow_nested_subagents: Option<bool>,
+    /// `allowedAgents` override (#2338): descendant agent allowlist
+    /// (`Some(None)` clears back to unrestricted).
+    pub allowed_agents: Option<Option<Vec<String>>>,
     /// `outputMode` override (#1305, agents.ts:979-983): inline | file-only.
     pub output_mode: Option<String>,
     pub skills: Option<Option<Vec<String>>>,
@@ -926,6 +929,14 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                             path,
                             name,
                             "excludeTools",
+                        )?);
+                    }
+                    "allowedAgents" => {
+                        parsed_entry.allowed_agents = Some(parse_override_string_array_or_false(
+                            field,
+                            path,
+                            name,
+                            "allowedAgents",
                         )?);
                     }
                     "thinking" => {

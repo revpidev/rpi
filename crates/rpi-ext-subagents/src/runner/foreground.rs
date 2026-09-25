@@ -218,6 +218,10 @@ pub struct ForegroundRunInput {
     pub agent_exclude_tools: Vec<String>,
     pub agent_extensions: Option<Vec<String>>,
     pub agent_subagent_only_extensions: Option<Vec<String>>,
+    /// The agent's declared `allowedAgents` (#2338): the child's own
+    /// descendant launches run under its intersection with the inherited
+    /// session ceiling.
+    pub agent_allowed_agents: Option<Vec<String>>,
     pub agent_inherit_project_context: bool,
     pub agent_inherit_skills: bool,
     pub task: String,
@@ -342,6 +346,10 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         thinking_ceiling: input.thinking_ceiling.clone(),
         session_name: input.session_name.clone(),
         supervisor_channel: input.supervisor_channel.clone(),
+        descendant_allowed_agents: args::effective_descendant_allowlist(
+            input.agent_allowed_agents.as_deref(),
+            &input.agent_name,
+        ),
     });
 
     let launch = match launch {
@@ -1208,6 +1216,7 @@ mod terminal_classification_tests {
             agent_exclude_tools: Vec::new(),
             agent_extensions: None,
             agent_subagent_only_extensions: None,
+            agent_allowed_agents: None,
             agent_inherit_project_context: true,
             agent_inherit_skills: false,
             task: "replay".to_string(),
