@@ -1056,17 +1056,26 @@ pub async fn authenticate_with_store(
                 .is_some();
             let cimd_active = config.client_metadata_url.is_some()
                 && metadata.client_id_metadata_document_supported == Some(true);
+            let has_tokens = stored_entry
+                .as_ref()
+                .is_some_and(|entry| entry.tokens.is_some());
             let stored = stored_entry
                 .and_then(|entry| entry.client_info)
                 .filter(|info| {
-                    // #503 stale-redirect gate: reuse unless the stored
-                    // redirect_uris miss the current callback AND the stored
-                    // tokens are not refresh-capable.
-                    let stale_redirect = info
+                    // #503 gate (mcp-auth-flow.ts:556-573 @ 97435aab,
+                    // re-review Finding 2): a registration with NO stored
+                    // tokens is orphaned — dropped; with tokens, reuse only
+                    // when the stored redirect_uris CONTAIN the current
+                    // callback (an absent list does not match) or the pair
+                    // is refresh-capable.
+                    if !has_tokens {
+                        return false;
+                    }
+                    let redirect_matches = info
                         .redirect_uris
                         .as_ref()
-                        .is_some_and(|uris| !uris.contains(&redirect_uri));
-                    !(stale_redirect && !refresh_capable)
+                        .is_some_and(|uris| uris.contains(&redirect_uri));
+                    redirect_matches || refresh_capable
                 });
             if let Some(info) = &stored {
                 if refresh_capable {
@@ -1435,7 +1444,11 @@ fn parse_loopback_redirect_uri(
     } else {
         host
     };
-    Ok(Some((callback_host, url.port(), url.path().to_string())))
+    // Re-review Finding 1: a `{port}` URI parsed through the `:1` sentinel
+    // must NOT leak the sentinel into the bind target — dynamic-port URIs
+    // take an OS-assigned port (upstream `strictPort: !dynamicPort`).
+    let port = if dynamic_port { None } else { url.port() };
+    Ok(Some((callback_host, port, url.path().to_string())))
 }
 
 /// `ensureCallbackServer` (#483): bind the callback listener. With a
@@ -1868,8 +1881,13 @@ mod tests {
         use super::parse_loopback_redirect_uri as parse;
         // Valid local forms.
         assert!(parse("http://localhost:3118/callback").is_ok());
-        assert!(parse("http://127.0.0.1:{port}/callback").is_ok());
         assert!(parse("http://[::1]:4321/cb").is_ok());
+        // Re-review Finding 1: a {port} URI takes an OS-ASSIGNED port — the
+        // :1 sentinel never reaches the bind target.
+        let dynamic = parse("http://127.0.0.1:{port}/callback")
+            .expect("dynamic port parses")
+            .expect("local target");
+        assert_eq!(dynamic.1, None, "{{port}} must bind OS-assigned, not :1");
         // Manual mode.
         assert!(parse("https://client.example.com/client.json")
             .expect("manual")
@@ -1907,6 +1925,12 @@ mod tests {
             (
                 "ftp://localhost:8080/cb",
                 "OAuth redirectUri must be an https:// URI or an http:// localhost or loopback URI",
+            ),
+            // Re-review Finding 4: the generic parse-failure message (the
+            // 9th upstream throw site).
+            (
+                "not a url at all",
+                "Invalid OAuth redirectUri: not a url at all",
             ),
         ];
         for (uri, expected) in cases {
