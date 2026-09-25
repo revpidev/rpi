@@ -553,6 +553,28 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             if let Err(error) = register("on", json!({ "event": "session_start" })) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
+            // #2333 reviewer diff tool: register when the parent captured a
+            // launch baseline (gated by the agent's tools naming it).
+            if crate::p1::diff_tool::baseline_from_env().is_some() {
+                if let Err(error) = register(
+                    "registerTool",
+                    json!({
+                        "name": crate::p1::diff_tool::WATCHDOG_DIFF_TOOL_NAME,
+                        "label": "Watchdog diff",
+                        "description": crate::p1::diff_tool::tool_description(),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Restrict the diff to one file or directory, relative to the repo root." },
+                                "stat": { "type": "boolean", "description": "Return per-file change counts instead of the full diff." }
+                            },
+                            "additionalProperties": false
+                        }
+                    }),
+                ) {
+                    return json!({"error": {"kind": "init", "message": error.to_string()}});
+                }
+            }
             // #1615: the parent named this child at launch — surface it
             // through `setSessionName` so the child's session file is
             // identifiable in `--resume` and host session browsers (the
@@ -888,6 +910,9 @@ fn dispatch_message(message: &Value) -> Value {
                     "details": { "mode": "single", "results": [] },
                     "isError": true,
                 });
+            }
+            if tool_name == crate::p1::diff_tool::WATCHDOG_DIFF_TOOL_NAME {
+                return crate::p1::diff_tool::execute(&params);
             }
             if tool_name == "subagent_supervisor" {
                 let orchestrator_session_id =
@@ -1455,6 +1480,7 @@ pub mod parity {
             session_name: None,
             supervisor_channel: None,
             descendant_allowed_agents: None,
+            diff_baseline: None,
         };
         let result = crate::launch::args::build_rpi_args(&internal)?;
         Ok(BuildArgsResultPublic {

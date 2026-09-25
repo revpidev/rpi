@@ -321,6 +321,8 @@ pub struct BuildArgsInput {
     /// Effective descendant agent allowlist for the child (#2338); `None`
     /// leaves the env unset (unrestricted).
     pub descendant_allowed_agents: Option<DescendantAllowlist>,
+    /// Reviewer diff baseline env value (#2333); `None` leaves the env unset.
+    pub diff_baseline: Option<String>,
     /// Effective thinking ceiling (#1397 `subagents.maxThinking` + inherited
     /// env intersection): propagated to the child so grandchildren stay
     /// under the tightest ancestor ceiling (launch-contract
@@ -757,6 +759,14 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         if !retention.is_empty() {
             env.insert(ENV_CACHE_RETENTION.to_string(), Some(retention.to_string()));
         }
+    }
+    if let Some(baseline) = &input.diff_baseline {
+        env.insert(
+            crate::p1::diff_tool::DIFF_BASELINE_ENV.to_string(),
+            Some(baseline.clone()),
+        );
+    } else {
+        cleared(&mut env, crate::p1::diff_tool::DIFF_BASELINE_ENV);
     }
     if let Some(allowlist) = &input.descendant_allowed_agents {
         env.insert(

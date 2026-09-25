@@ -795,6 +795,21 @@ pub async fn run_child_async(
     let system_prompt = bridge_prompt_source;
     let agent_tools = child_tools;
 
+    // Reviewer diff baseline (#2333): `watchdog_diff` in the agent's tools
+    // gates the capture (upstream `requiredTools.includes`), HEAD at launch.
+    let diff_baseline = agent_tools
+        .as_ref()
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| t == crate::p1::diff_tool::WATCHDOG_DIFF_TOOL_NAME)
+        })
+        .then(|| {
+            crate::p1::diff_tool::DiffBaseline::capture(&effective_cwd)
+                .map(|baseline| baseline.to_env_value())
+        })
+        .flatten();
+
     // Pre-spawn tool-face gate (R7.1.4.3 / #2034, TE18 FR-C): the declared
     // builtin allowlist must be covered by the host's tool set before the
     // child starts — rpi fails closed (ADR-0017 wording) where upstream
@@ -840,6 +855,7 @@ pub async fn run_child_async(
         agent_extensions: agent.extensions.clone(),
         agent_subagent_only_extensions: agent.subagent_only_extensions.clone(),
         agent_allowed_agents: agent.allowed_agents.clone(),
+        diff_baseline,
         agent_inherit_project_context: agent.inherit_project_context,
         agent_inherit_skills: agent.inherit_skills,
         task: task_text,

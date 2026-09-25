@@ -222,6 +222,10 @@ pub struct ForegroundRunInput {
     /// descendant launches run under its intersection with the inherited
     /// session ceiling.
     pub agent_allowed_agents: Option<Vec<String>>,
+    /// Reviewer diff baseline (#2333): captured at launch when the agent's
+    /// tools include `watchdog_diff`; the child registers the bounded diff
+    /// tool only when present.
+    pub diff_baseline: Option<String>,
     pub agent_inherit_project_context: bool,
     pub agent_inherit_skills: bool,
     pub task: String,
@@ -350,6 +354,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             input.agent_allowed_agents.as_deref(),
             &input.agent_name,
         ),
+        diff_baseline: input.diff_baseline.clone(),
     });
 
     let launch = match launch {
@@ -1217,6 +1222,7 @@ mod terminal_classification_tests {
             agent_extensions: None,
             agent_subagent_only_extensions: None,
             agent_allowed_agents: None,
+            diff_baseline: None,
             agent_inherit_project_context: true,
             agent_inherit_skills: false,
             task: "replay".to_string(),

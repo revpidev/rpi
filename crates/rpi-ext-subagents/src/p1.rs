@@ -3,6 +3,7 @@
 
 pub mod acceptance;
 pub mod chain;
+pub mod diff_tool;
 pub mod launch_child;
 pub mod parallel;
 pub mod supervisor;

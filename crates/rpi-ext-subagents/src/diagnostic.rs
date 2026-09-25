@@ -65,7 +65,13 @@ pub fn check_host_tool_face(
         .collect();
     let is_path_shaped =
         |tool: &str| tool.contains('/') || tool.ends_with(".ts") || tool.ends_with(".js");
-    let is_coordination_name = |tool: &str| tool == "contact_supervisor" || tool == "intercom";
+    // Self-extension-provided tools (the subagents library registers them in
+    // the child; the host builtin face never lists them): the intercom
+    // coordination tool, and the reviewer `watchdog_diff` (#2333 — registered
+    // whenever the parent captured a launch baseline, best-effort like
+    // upstream's capture).
+    let is_coordination_name =
+        |tool: &str| tool == "contact_supervisor" || tool == "intercom" || tool == "watchdog_diff";
     let required: Vec<String> = allowlist
         .iter()
         .filter(|tool| !is_path_shaped(tool))
