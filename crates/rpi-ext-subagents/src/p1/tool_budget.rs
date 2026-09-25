@@ -59,14 +59,15 @@ pub fn normalize_tool_budget_block(block: Option<&Value>) -> BlockList {
     match block {
         Some(Value::String(raw)) if raw == "*" => BlockList::All,
         Some(Value::Array(items)) => {
-            let mut names: Vec<String> = items
+            // Upstream `[...new Set(...)]` — full dedup, not adjacent-only.
+            let mut seen = std::collections::BTreeSet::new();
+            let names: Vec<String> = items
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::trim)
-                .filter(|name| !name.is_empty())
+                .filter(|name| !name.is_empty() && seen.insert(name.to_string()))
                 .map(str::to_string)
                 .collect();
-            names.dedup();
             BlockList::Names(names)
         }
         _ => BlockList::Names(
@@ -369,6 +370,17 @@ mod tests {
         assert_eq!(valid.hard, 2);
         assert_eq!(valid.soft, Some(1));
         assert_eq!(valid.block, BlockList::All);
+        // Non-adjacent duplicates dedupe fully (upstream new Set()).
+        let dedup = validate_tool_budget_config(
+            Some(&json!({"hard": 2, "block": ["bash", "read", "bash"]})),
+            "toolBudget",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            dedup.block,
+            BlockList::Names(vec!["bash".to_string(), "read".to_string()])
+        );
         for (raw, message) in [
             (
                 json!("x"),

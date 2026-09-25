@@ -1,7 +1,9 @@
 //! Model / thinking override resolution, fuzzy matching, fallback candidate
 //! chains and model-scope enforcement (FR-P1-05).
 //!
-//! Port of pi-subagents `src/runs/shared/model-fallback.ts` and
+//! Port of pi-subagents `src/runs/shared/model-resolution.ts` (v0.70 @
+//! b72714de — the v0.66 `model-fallback.ts` home of these functions was
+//! deleted by #2270; the retained surface moved to model-resolution.ts) and
 //! `src/runs/shared/model-scope.ts` @ v0.48.0 (56f97234). All functions here
 //! are pure (no filesystem, no host calls) so the fuzzy/scope behaviors stay
 //! unit-testable and parity-checkable against the upstream sources.
@@ -12,7 +14,7 @@ use regex::Regex;
 use serde_json::Value;
 
 /// Sentinel model value requesting that a subagent inherit the parent
-/// session's model (`INHERIT_MODEL`, model-fallback.ts:35).
+/// session's model (`INHERIT_MODEL`, model-resolution.ts:37 (INHERIT_MODEL)).
 pub const INHERIT_MODEL: &str = "inherit";
 
 /// One registry entry for fuzzy resolution (`AvailableModelInfo`).
@@ -24,7 +26,7 @@ pub struct AvailableModel {
     pub id: String,
 }
 
-/// `splitThinkingSuffix` (model-fallback.ts:15-21): split at the *last* colon.
+/// `splitThinkingSuffix` (model-resolution.ts:11 (splitThinkingSuffix re-export)): split at the *last* colon.
 pub fn split_thinking_suffix(model: &str) -> (&str, &str) {
     match model.rfind(':') {
         None => (model, ""),
@@ -32,7 +34,7 @@ pub fn split_thinking_suffix(model: &str) -> (&str, &str) {
     }
 }
 
-/// `normalizeModelSegment` (model-fallback.ts:46): case-fold, dots/underscores
+/// `normalizeModelSegment` (model-resolution.ts:58): case-fold, dots/underscores
 /// → dashes (so `4.5` matches `4-5`), collapse repeats, trim edges.
 pub fn normalize_model_segment(segment: &str) -> String {
     let lower = segment.to_lowercase();
@@ -53,7 +55,7 @@ pub fn normalize_model_segment(segment: &str) -> String {
     trimmed.to_string()
 }
 
-/// `isPlausibleDateStamp` (model-fallback.ts:56-60).
+/// `isPlausibleDateStamp` (model-resolution.ts:66-73).
 fn is_plausible_date_stamp(year: &str, month: &str, day: &str) -> bool {
     let (Ok(yyyy), Ok(mm), Ok(dd)) = (
         year.parse::<u32>(),
@@ -65,7 +67,7 @@ fn is_plausible_date_stamp(year: &str, month: &str, day: &str) -> bool {
     (1900..=2099).contains(&yyyy) && (1..=12).contains(&mm) && (1..=31).contains(&dd)
 }
 
-/// `stripTrailingDateStamp` (model-fallback.ts:62): drop `-YYYY-MM-DD` or
+/// `stripTrailingDateStamp` (model-resolution.ts:74): drop `-YYYY-MM-DD` or
 /// `-YYYYMMDD` so dated and undated ids match. Operates on an already
 /// normalized (dash-separated) segment.
 fn strip_trailing_date_stamp(segment: &str) -> String {
@@ -145,7 +147,7 @@ fn strip_date_suffix_compact(segment: &str) -> Option<String> {
     Some(segment[..n - 9].to_string())
 }
 
-/// `fuzzyResolveModel` (model-fallback.ts:99-145): resolve a base model id
+/// `fuzzyResolveModel` (model-resolution.ts:157-187): resolve a base model id
 /// (thinking suffix already stripped) against the registry tolerating
 /// separator/case/date-stamp differences. A qualified `provider/id` query only
 /// matches within the named provider; ambiguous matches resolve to
@@ -216,7 +218,7 @@ pub fn fuzzy_resolve_model(
     None
 }
 
-/// `resolveBaseModelCandidate` (model-fallback.ts:70-96): exact match first
+/// `resolveBaseModelCandidate` (model-resolution.ts:129-155 (resolveBaseModelCandidate)): exact match first
 /// (qualified wins for `provider/id`; unqualified requires a unique id unless
 /// the preferred provider matches), then fuzzy.
 pub fn resolve_base_model_candidate(
@@ -251,7 +253,7 @@ pub fn resolve_base_model_candidate(
     fuzzy_resolve_model(base_model, available_models, preferred_provider)
 }
 
-/// `resolveModelCandidate` (model-fallback.ts:195-209): resolve a possibly
+/// `resolveModelCandidate` (model-resolution.ts:189-205): resolve a possibly
 /// loose model id to canonical `provider/id`; exact registry matches win,
 /// thinking suffix is retried on the base when the whole id misses. The
 /// lenient variant (miss → verbatim passthrough) — kept as the semantic
@@ -288,7 +290,7 @@ pub fn resolve_model_candidate(
     Some(trimmed.to_string())
 }
 
-/// `resolveSubagentModelCandidate` (model-fallback.ts:210-219 @ 0fc0eebb,
+/// `resolveSubagentModelCandidate` (model-resolution.ts:207-218 @ b72714de,
 /// #1093): the strict variant used for subagent launches — an empty/absent
 /// registry keeps the string verbatim (R7.1.4.4), but a non-empty registry
 /// that cannot match the id (whole or thinking-suffix base) yields `None`
@@ -316,7 +318,7 @@ pub fn resolve_subagent_model_candidate(
     None
 }
 
-/// `resolveRequiredSubagentModelCandidate` (model-fallback.ts:230-238
+/// `resolveRequiredSubagentModelCandidate` (model-resolution.ts:235-247
 /// @ 0fc0eebb, #1093 / R7.1.4.5): the strict resolution with a fail-closed
 /// error — a non-empty registry must match the requested model before the
 /// child spawns, instead of forwarding an invalid `--model` to the child.
@@ -662,10 +664,10 @@ pub fn parse_model_scope_config(value: Option<&Value>) -> Result<Option<ModelSco
 }
 
 // ---------------------------------------------------------------------------
-// Override resolution (model-fallback.ts:180+)
+// Override resolution (model-resolution.ts:305+)
 // ---------------------------------------------------------------------------
 
-/// `resolveSubagentModelOverride` (model-fallback.ts:362-391 @ 0fc0eebb):
+/// `resolveSubagentModelOverride` (model-resolution.ts:305-338 @ b72714de):
 /// resolve the `--model` override for a spawned child. Empty/`inherit` →
 /// parent session model. An explicit string is strict-resolved; when the
 /// request source is `explicit` the #1093 required check fail-closes on a
@@ -724,7 +726,7 @@ pub fn resolve_subagent_model_override(
     Ok(resolved)
 }
 
-/// `resolveEffectiveSubagentModel` (model-fallback.ts:260-281): explicit →
+/// `resolveEffectiveSubagentModel` (model-resolution.ts:338-362): explicit →
 /// agent → parent, with the explicit attempt falling back to the agent model
 /// when it resolves to nothing.
 #[allow(clippy::too_many_arguments)]
@@ -765,7 +767,7 @@ pub fn resolve_effective_subagent_model(
 }
 
 /// How the primary model of a launch was selected (upstream `ModelOrigin`,
-/// model-fallback.ts:422 @ 0fc0eebb): explicit call param, inherited from
+/// model-resolution.ts:375-389 @ b72714de): explicit call param, inherited from
 /// the parent session, or agent-configured. Decides where the #1093
 /// required (fail-closed) check applies in the candidate chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -775,7 +777,7 @@ pub enum ModelOrigin {
     Configured,
 }
 
-/// `resolveModelOrigin` (model-fallback.ts:437-450 @ 0fc0eebb).
+/// `resolveModelOrigin` (model-resolution.ts:375-389 @ b72714de).
 pub fn resolve_model_origin(
     explicit_model: Option<&str>,
     agent_model: Option<&str>,
@@ -1265,7 +1267,7 @@ mod te18_model_tests {
         let error =
             resolve_required_subagent_model_candidate("faux/primary", Some(&registry), None)
                 .unwrap_err();
-        // Upstream message (model-fallback.ts:235-237 @ 0fc0eebb): model
+        // Upstream message (model-resolution.ts:235-247 @ b72714de): model
         // name + active-registry pointer. (The cross-provider "Did you
         // mean" suggestion is not ported — in-process registry dependency.)
         assert_eq!(

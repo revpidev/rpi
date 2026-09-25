@@ -5,33 +5,25 @@
 //   node scripts/subagents-parity/run-parity.mjs --record-args-golden
 //
 // v0.1.5 rotation (TE37; until TE39 flips the submodule pin):
-//   - `regression` (DEFAULT) = the CURRENT-pin snapshot, pi-subagents
-//     v0.66.0 @ 0fc0eebb — the zero-regression baseline of the window.
-//     Extracted read-only by setup-target-source.sh into
-//     /tmp/rpi-subagents-parity-regression-v066 (the live worktree cannot
-//     serve as the upstream leg: v0.66's discovery chain imports `yaml`,
-//     unresolvable from a pristine external/). Runs the full mode set and
-//     writes fixtures/generated/subagents-parity-v066/ (the TE27-era
-//     baseline directory, kept comparable). At the v0.1.4 switch this role
-//     was named "target"; the name rotates each rebase cycle (TE13
-//     convention).
-//   - `target` = the NEW pin snapshot pi-subagents v0.70.0 @ b72714de
-//     (ADR-0029), extracted read-only by setup-target-source.sh into
+//   - `target` (DEFAULT since the TE39 pin switch, 2026-09-27) = the
+//     CURRENT-pin snapshot, pi-subagents v0.70.0 @ b72714de (ADR-0029),
+//     extracted read-only by setup-target-source.sh into
 //     /tmp/rpi-subagents-parity-target-v070. Writes
 //     fixtures/generated/subagents-parity-v070/. Diffs are attributed
 //     through expected-target-diffs-v070.json (`upstream-semantics` vs
-//     `rpi-deviation`, each with R + owner task); TE38/TE39 fill it as they
-//     triage. Non-zero exit = any UNATTRIBUTED diff.
+//     `rpi-deviation`, each with R + owner task); the manifest stays empty
+//     while every case MATCHes. Non-zero exit = any UNATTRIBUTED diff.
+//   - `regression` = the retired v0.66.0 snapshot @ 0fc0eebb (the window's
+//     zero-regression baseline; its mission ended with the TE39 switch).
+//     Archaeology only; writes fixtures/generated/subagents-parity-v066/.
 //   - Both tracks share the same fixture set (fixtures.json +
 //     fixtures-target.json) and the frozen argv/env golden
 //     (args-golden-v048.json, [RPI-OWN] per ADR-0025 §4 — upstream deleted
 //     pi-args.ts in v0.65 and it stayed deleted at v0.70).
 //   - Upstream v0.70 removed automatic model fallback entirely (#2270,
-//     f58dfcb5: src/runs/shared/model-fallback.ts deleted). The
-//     fallback/model upstream legs therefore freeze on the live-submodule
-//     (v0.66) face on both tracks during the window — see upstream-runner.mjs;
-//     TE39 must triage the removal (follow it or freeze a golden) before
-//     flipping the pin.
+//     f58dfcb5). TE39 followed the removal: the retryable/attempt fixtures
+//     retired, and the fallback/model legs re-anchored at v0.70
+//     model-resolution.ts on BOTH tracks (see upstream-runner.mjs).
 //
 // The Rust leg is built by this script and copied to a private path before
 // execution: both plugin crates ship an example named `subagents_parity_runner`, and
@@ -152,11 +144,8 @@ function runRust(mode, modeFile) {
 		encoding: "utf-8",
 		env: cleanSessionEnv({
 			...process.env,
-			// TE19 (#1318): isolate the model-exclusion store per harness run
-			// — recorded exclusions from fixtures (or an earlier e2e run on
-			// the default path) must not silently drop fixture candidates
-			// from the model legs.
-			RPI_MODEL_EXCLUSIONS_PATH: `${tmpdir()}/rpi-subagents-parity-exclusions-${process.pid}.json`,
+			// (The TE19-era RPI_MODEL_EXCLUSIONS_PATH isolation went away with
+			// the #2270 fallback removal / TE39 W-R1 — no exclusion store.)
 		}),
 	});
 	if (result.status !== 0) {

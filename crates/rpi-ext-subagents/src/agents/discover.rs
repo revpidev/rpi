@@ -1666,11 +1666,11 @@ pub fn resolve_agent_name<'a>(
     // name never shadows or blurs a canonical one.
     let canonical: Vec<&AgentConfig> = agents.iter().filter(|a| a.name == raw).collect();
     if !canonical.is_empty() {
-        return finish_agent_match(canonical, raw, "name");
+        return finish_agent_match(canonical, raw, "agent name");
     }
     let local: Vec<&AgentConfig> = agents.iter().filter(|a| a.local_name == raw).collect();
     if !local.is_empty() {
-        return finish_agent_match(local, raw, "local name");
+        return finish_agent_match(local, raw, "local agent name");
     }
     let by_alias: Vec<&AgentConfig> = agents
         .iter()
@@ -1681,7 +1681,7 @@ pub fn resolve_agent_name<'a>(
         })
         .collect();
     if !by_alias.is_empty() {
-        return finish_agent_match(by_alias, raw, "alias");
+        return finish_agent_match(by_alias, raw, "agent alias");
     }
     Ok(None)
 }
@@ -1703,10 +1703,7 @@ fn finish_agent_match<'a>(
         Ok(Some(best))
     } else {
         let names: Vec<&str> = distinct.into_iter().collect();
-        Err(format!(
-            "Ambiguous agent {kind} '{raw}': {}",
-            names.join(", ")
-        ))
+        Err(format!("Ambiguous {kind} '{raw}': {}", names.join(", ")))
     }
 }
 
@@ -2803,7 +2800,7 @@ mod te18_tools_tests {
         // The bare local name is ambiguous with its own wording.
         let error = resolve_agent_name(&agents, "worker").unwrap_err();
         assert!(
-            error.contains("Ambiguous agent local name 'worker'"),
+            error.contains("Ambiguous local agent name 'worker'"),
             "{error}"
         );
     }

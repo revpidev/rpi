@@ -14,12 +14,11 @@
 //   - argv/env (`args`): the frozen v0.48 golden on BOTH tracks
 //     ([RPI-OWN], ADR-0025 §4 — upstream deleted pi-args.ts in v0.65 and it
 //     stayed deleted at v0.70; there is no live upstream face to drive).
-//   - fallback / model: FROZEN on the live-submodule (v0.66) face on both
-//     tracks — upstream removed automatic model fallback entirely at v0.70
-//     (#2270 / f58dfcb5 deletes src/runs/shared/model-fallback.ts; no
-//     replacement module). TE39 must triage the removal (follow it or
-//     freeze a recorded golden) before flipping the pin; until then the
-//     v0.66 worktree at the submodule pin is the expectation source.
+//   - fallback / model: re-anchored at v0.70 on both tracks (TE39 followed
+//     the #2270 removal — src/runs/shared/model-fallback.ts deleted; the
+//     retained surface lives in model-resolution.ts: isContextOverflow +
+//     resolveSubagentModelOverride + resolveModelSelection for the surviving
+//     single-candidate vectors; the retryable/attempt fixtures retired).
 //
 // Prints normalized JSON lines that the orchestrator diffs against the Rust
 // parity_runner example.

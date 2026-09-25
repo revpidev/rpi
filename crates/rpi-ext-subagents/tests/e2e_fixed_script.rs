@@ -210,15 +210,9 @@ impl Sandbox {
     fn dump(&self, name: &str) -> PathBuf {
         let dir = self.dump_root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        // TE19 (#1318): each scenario gets a fresh model-exclusion store —
-        // synthetic retryable failures in one scenario must not exclude the
-        // fixture models for later scenarios (upstream isolates via
-        // PI_MODEL_EXCLUSIONS_PATH per test; the store reloads when the path
-        // is repointed).
-        std::env::set_var(
-            "RPI_MODEL_EXCLUSIONS_PATH",
-            dir.join("model-exclusions.json"),
-        );
+        // (The TE19-era RPI_MODEL_EXCLUSIONS_PATH per-scenario isolation went
+        // away with the #2270 fallback removal at v0.70 / TE39 W-R1 — there
+        // is no exclusion store to isolate.)
         dir
     }
 }
