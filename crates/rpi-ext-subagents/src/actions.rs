@@ -64,12 +64,6 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
     if let Some(model) = &agent.model {
         lines.push(format!("Model: {model}"));
     }
-    if !agent.fallback_models.is_empty() {
-        lines.push(format!(
-            "Fallback models: {}",
-            agent.fallback_models.join(", ")
-        ));
-    }
     if !tools.is_empty() {
         lines.push(format!("Tools: {}", tools.join(", ")));
     }
@@ -241,7 +235,6 @@ pub fn agent_capabilities_snapshot(agents: &[AgentConfig]) -> Value {
                     },
                     "model": {
                         "value": agent.model,
-                        "fallbackModels": agent.fallback_models,
                         "thinking": match &agent.thinking {
                             crate::agents::discover::ThinkingSpec::Level(level) => json!(level),
                             crate::agents::discover::ThinkingSpec::Disabled => json!("off"),
@@ -1330,7 +1323,7 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
                 body = prompt.to_string();
             }
             "model" | "thinking" | "systemPromptMode" | "defaultContext" | "output" | "tools"
-            | "skills" | "aliases" | "fallbackModels" | "extensions" => {
+            | "skills" | "aliases" | "extensions" => {
                 let rendered = match value {
                     Value::String(s) => s.clone(),
                     Value::Bool(b) => b.to_string(),
@@ -1345,7 +1338,7 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "config.{other} is not a supported agent field (supported: description, systemPrompt, model, thinking, systemPromptMode, defaultContext, output, tools, skills, aliases, fallbackModels, extensions)."
+                    "config.{other} is not a supported agent field (supported: description, systemPrompt, model, thinking, systemPromptMode, defaultContext, output, tools, skills, aliases, extensions)."
                 ));
             }
         }

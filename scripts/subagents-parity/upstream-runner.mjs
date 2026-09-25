@@ -97,15 +97,15 @@ async function loadUpstream() {
 	const root = trackRoot();
 	const frontmatter = await import(moduleUrl(root, "src/agents/frontmatter.ts"));
 	const utils = await import(moduleUrl(root, "src/shared/utils.ts"));
-	// fallback/model face: frozen on the regression (current-pin, v0.66)
-	// snapshot on both tracks — v0.70 removed automatic model fallback
-	// (#2270 / f58dfcb5 deleted src/runs/shared/model-fallback.ts). TE39
-	// triages the removal before the pin switch; this freeze is the TE37
-	// skeleton placeholder.
-	const modelFallback = await import(
-		moduleUrl(REGRESSION_ROOT, "src/runs/shared/model-fallback.ts"),
+	// fallback/model face: re-anchored at v0.70 by TE39 (#2270 deleted
+	// src/runs/shared/model-fallback.ts; model-resolution.ts keeps
+	// resolveSubagentModelOverride / isContextOverflow and the single-model
+	// launch path — buildModelCandidates is gone, so the candidates
+	// vectors run against resolveModelSelection on this side).
+	const modelResolution = await import(
+		moduleUrl(TARGET_ROOT, "src/runs/shared/model-resolution.ts"),
 	);
-	return { frontmatter, utils, modelFallback };
+	return { frontmatter, utils, modelResolution };
 }
 
 // The track's expectation root: the current-pin regression snapshot or the
@@ -185,20 +185,13 @@ function frontmatterCase(frontmatter, content) {
 	};
 }
 
-function fallbackCase(modelFallback, fixture) {
+// Post-#2270 (TE39): only the context-overflow classifier survives; the
+// retryable/attempt kinds went with the v0.70 fallback removal and their
+// fixtures were retired.
+function fallbackCase(modelResolution, fixture) {
 	switch (fixture.kind) {
-		case "retryable":
-			return { retryable: modelFallback.isRetryableModelFailure(fixture.error) };
 		case "context-overflow":
-			return { contextOverflow: modelFallback.isContextOverflow(fixture.error) };
-		case "attempt":
-			return {
-				attempt: modelFallback.isRetryableModelFailureAttempt({
-					error: fixture.error,
-					messages: fixture.messages,
-					toolCount: fixture.toolCount,
-				}),
-			};
+			return { contextOverflow: modelResolution.isContextOverflow(fixture.error) };
 		default:
 			throw new Error(`unknown fallback fixture kind: ${fixture.kind}`);
 	}
@@ -208,11 +201,14 @@ function fallbackCase(modelFallback, fixture) {
 // formatSingleCompletion / parseSubagentNotifyContent (both faces exist
 // unchanged at v0.70). The parse projection mirrors the Rust leg's
 // notify_projection (undefined-dropping serializer == null-stripping).
-// TE18 (R7.1.4.4/.5, #1093): model-resolution leg — drive the frozen v0.66
-// resolveSubagentModelOverride / buildModelCandidates with the shared
-// fixture registry. Throws surface as { error } so a fail-closed throw on
-// this side diffs against a value (or error) from the Rust leg.
-function modelCase(modelFallback, fixture) {
+// TE18 (R7.1.4.4/.5, #1093), re-anchored at v0.70 by TE39: override vectors
+// drive resolveSubagentModelOverride (unchanged for these inputs — the
+// v0.66 exclusion check never applied on a fresh process); the surviving
+// candidates vectors (no fallbacks) drive resolveModelSelection, the v0.70
+// single-model launch resolution matching the Rust single-candidate shape
+// post-#2270. Throws surface as { error } so a fail-closed throw on this
+// side diffs against a value (or error) from the Rust leg.
+function modelCase(modelResolution, fixture) {
 	const registry = fixture.registry === undefined || fixture.registry === null
 		? undefined
 		: fixture.registry.map((entry) => ({
@@ -228,7 +224,7 @@ function modelCase(modelFallback, fixture) {
 		: undefined;
 	if (fixture.kind === "override") {
 		try {
-			const resolved = modelFallback.resolveSubagentModelOverride(
+			const resolved = modelResolution.resolveSubagentModelOverride(
 				fixture.model ?? undefined,
 				parentModel,
 				registry,
@@ -242,13 +238,11 @@ function modelCase(modelFallback, fixture) {
 	}
 	if (fixture.kind === "candidates") {
 		try {
-			const candidates = modelFallback.buildModelCandidates(
-				fixture.primary ?? undefined,
-				fixture.fallbacks ?? [],
-				registry,
-				fixture.preferredProvider ?? undefined,
-				{ origin: fixture.origin },
-			);
+			const origin = ["explicit", "inherited", "configured"].includes(fixture.origin)
+				? fixture.origin
+				: "configured";
+			const selection = modelResolution.resolveModelSelection(fixture.primary ?? undefined, registry, fixture.preferredProvider ?? undefined, { origin });
+			const candidates = selection.model === undefined ? [] : [selection.model];
 			return { candidates };
 		} catch (error) {
 			return { error: String(error?.message ?? error) };
@@ -366,7 +360,7 @@ async function main() {
 		);
 		process.exit(2);
 	}
-	const { frontmatter, utils, modelFallback } = await loadUpstream();
+	const { frontmatter, utils, modelResolution } = await loadUpstream();
 	// TE17: the notify module exists on both pins (face unchanged at v0.70),
 	// loaded from the track root.
 	const notify = mode === "notify"
@@ -388,9 +382,9 @@ async function main() {
 		} else if (mode === "final-output") {
 			output = utils.getFinalOutput(fixture.messages ?? []);
 		} else if (mode === "fallback") {
-			output = fallbackCase(modelFallback, fixture);
+			output = fallbackCase(modelResolution, fixture);
 		} else if (mode === "model") {
-			output = modelCase(modelFallback, fixture);
+			output = modelCase(modelResolution, fixture);
 		} else if (mode === "discovery") {
 			output = await discoveryCase(fixture);
 		} else if (mode === "notify") {

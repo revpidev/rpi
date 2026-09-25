@@ -294,7 +294,6 @@ pub struct ForegroundRunResult {
     #[allow(dead_code)]
     pub messages: Vec<Value>,
     pub truncation: Option<Value>,
-    pub attempted_models: Vec<String>,
 }
 
 const PROMPT_REDACTED: &str = "[prompt redacted]";
@@ -312,10 +311,6 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             Some(input.child_index),
         )
     });
-    let mut attempted_models = Vec::new();
-    if let Some(model) = &input.model {
-        attempted_models.push(model.clone());
-    }
 
     let launch = args::build_rpi_args(&BuildArgsInput {
         base_args: vec!["--mode".into(), "json".into(), "-p".into()],
@@ -351,15 +346,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
 
     let launch = match launch {
         Ok(launch) => launch,
-        Err(error) => {
-            return failed_result(
-                input,
-                artifact_paths,
-                attempted_models,
-                start,
-                error.to_string(),
-            )
-        }
+        Err(error) => return failed_result(input, artifact_paths, start, error.to_string()),
     };
 
     // Depth env rides on top of the shared env (execution.ts:476).
@@ -402,7 +389,6 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             return failed_result(
                 input,
                 artifact_paths,
-                attempted_models,
                 start,
                 format!(
                     "Failed to spawn subagent process '{}': {}",
@@ -865,17 +851,10 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         persist_artifacts(input, paths, &result, &input.task);
     }
     result.artifact_paths = artifact_paths;
-    result.attempted_models = attempted_models;
     result.session_file = input.session_file.clone();
     result
 }
 
-/// Model attempt loop (execution.ts `modelAttemptsLoop` 1569-1695, FR-P1-05):
-/// run the primary model, and on a *retryable provider failure* re-run the
-/// whole child with the next candidate from `build_model_candidates`. Timeouts
-/// and tool failures inside the child never advance the chain. Artifacts of
-/// the last attempt win (same paths per child), with `attemptedModels`
-/// carrying the full chain for meta.json.
 /// V13-03 FR-A R1: event-path frame signature — the activity projection
 /// fields (currentTool/currentToolArgs/currentToolStartedAt/currentPath/
 /// turnCount/toolCount) plus the frame's content text. Deliberately
@@ -904,77 +883,6 @@ fn frame_signature(fields: Option<&Value>, text: &str) -> String {
     serde_json::to_string(&serde_json::Value::Object(key)).unwrap_or_default()
 }
 
-pub async fn run_foreground_with_fallback(
-    input: &ForegroundRunInput,
-    candidates: &[String],
-) -> ForegroundRunResult {
-    let Some(first) = candidates.first() else {
-        return run_foreground(input).await;
-    };
-    let mut attempted: Vec<String> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
-    let mut result = run_attempt(input, first).await;
-    attempted.extend(result.attempted_models.iter().cloned());
-    for candidate in &candidates[1..] {
-        if result.exit_code == 0 || result.timed_out {
-            break;
-        }
-        // Context overflow is terminal: it must not consume a fallback
-        // candidate (R7.1.2.2; model-fallback.ts:613-619 @ v0.66.0).
-        if crate::launch::model::is_context_overflow(result.error.as_deref()) {
-            notes.push(format!(
-                "[fallback] {} failed: context overflow — the input exceeds this model's context window. Reduce the task input or use a model with a larger context window.",
-                attempted.last().map(String::as_str).unwrap_or_default()
-            ));
-            break;
-        }
-        // Whole-task replay is only safe without tool activity (R7.1.2.3
-        // `isRetryableModelFailureAttempt`; model-fallback.ts:601-611).
-        let advance = crate::launch::model::is_retryable_model_failure_attempt(
-            result.error.as_deref(),
-            &result.messages,
-            result.tool_count,
-        );
-        // #1318: a retryable provider failure records a TTL exclusion for
-        // the failing model — later launches skip it for the window
-        // (`recordRetryableModelFailure`; request-shape and overflow errors
-        // never record).
-        if advance {
-            crate::launch::model_exclusions::record_retryable_model_failure(
-                attempted.last().map(String::as_str),
-                result.error.as_deref(),
-            );
-        }
-        if !advance {
-            break;
-        }
-        notes.push(crate::launch::model::format_model_attempt_note(
-            attempted.last().map(String::as_str).unwrap_or_default(),
-            result.error.as_deref(),
-            Some(result.exit_code),
-            Some(candidate),
-        ));
-        result = run_attempt(input, candidate).await;
-        attempted.extend(result.attempted_models.iter().cloned());
-    }
-    result.attempted_models = attempted;
-    if !notes.is_empty() {
-        // Attempt notes ride ahead of the final output (execution.ts 1590-1600).
-        let mut output = notes.join("\n");
-        output.push_str("\n\n");
-        output.push_str(&result.final_output);
-        result.final_output = output;
-    }
-    result
-}
-
-/// One child attempt under a specific model candidate.
-async fn run_attempt(input: &ForegroundRunInput, candidate: &str) -> ForegroundRunResult {
-    let mut attempt_input = input.clone();
-    attempt_input.model = Some(candidate.to_string());
-    run_foreground(&attempt_input).await
-}
-
 /// Persist artifacts for a finished run (`persistSingleResultMetadata` P0
 /// subset + output/input writes).
 fn persist_artifacts(
@@ -998,7 +906,6 @@ fn persist_artifacts(
         "processSignal": result.process_signal,
         "usage": result.usage,
         "model": result.model,
-        "attemptedModels": result.attempted_models,
         "durationMs": result.duration_ms,
         "toolCount": result.tool_count,
         "error": result.error,
@@ -1190,14 +1097,12 @@ fn synthesize_exit_from_parts(
         session_file: None,
         messages: state.messages,
         truncation: truncation_json,
-        attempted_models: Vec::new(),
     }
 }
 
 fn failed_result(
     input: &ForegroundRunInput,
     artifact_paths: Option<ArtifactPaths>,
-    attempted_models: Vec<String>,
     start: std::time::Instant,
     message: String,
 ) -> ForegroundRunResult {
@@ -1217,7 +1122,6 @@ fn failed_result(
         session_file: None,
         messages: Vec::new(),
         truncation: None,
-        attempted_models,
     }
 }
 

@@ -3,10 +3,11 @@
 //! Reads the shared fixture JSON (same file the upstream tsx runner reads),
 //! produces normalized outputs for `args` (build_rpi_args), `frontmatter`
 //! (parse_frontmatter + parse_frontmatter_list), `final-output`
-//! (get_final_output), `fallback` (is_retryable_model_failure; the
-//! context-overflow/attempt functions are TE14 and emit null for now),
-//! `model` (TE18 R7.1.4.4/.5: strict/required resolution + origin-aware
-//! candidate chain, diffed against the v0.66 `model-fallback.ts`),
+//! (get_final_output), `fallback` (post-#2270: only the context-overflow
+//! classifier survives — retryable/attempt went with the v0.70 fallback
+//! removal, TE39), `model` (TE18 R7.1.4.4/.5 re-anchored at v0.70
+//! `model-resolution.ts` by TE39: strict/required resolution +
+//! single-candidate chain),
 //! `discovery` (TE15) and `notify` (TE17 formatSingleCompletion /
 //! parseSubagentNotifyContent), prints one JSON document per line. Invoked
 //! by `scripts/subagents-parity/run-parity.mjs`; never part of `cargo test`.
@@ -151,26 +152,13 @@ fn run_final_output_case(messages: &Value) -> Value {
 fn run_fallback_case(case: &Value) -> Value {
     let kind = case.get("kind").and_then(Value::as_str).unwrap_or("");
     match kind {
-        "retryable" => json!({
-            "retryable": rpi_ext_subagents::parity::is_retryable_model_failure_public(
-                case.get("error").and_then(Value::as_str),
-            ),
-        }),
         "context-overflow" => json!({
             "contextOverflow": rpi_ext_subagents::parity::is_context_overflow_public(
                 case.get("error").and_then(Value::as_str),
             ),
         }),
-        "attempt" => json!({
-            "attempt": rpi_ext_subagents::parity::is_retryable_model_failure_attempt_public(
-                case.get("error").and_then(Value::as_str),
-                case.get("messages")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                case.get("toolCount").and_then(Value::as_u64).unwrap_or(0),
-            ),
-        }),
+        // `retryable`/`attempt` kinds were removed with the v0.70 fallback
+        // machinery (#2270); fixtures carrying them are retired by TE39.
         other => json!({ "error": format!("unknown fallback fixture kind: {other}") }),
     }
 }
@@ -233,17 +221,6 @@ fn run_model_case(case: &Value) -> Value {
             };
             match rpi_ext_subagents::parity::build_model_candidates_public(
                 case.get("primary").and_then(Value::as_str),
-                &case
-                    .get("fallbacks")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
                 registry_ref,
                 case.get("preferredProvider").and_then(Value::as_str),
                 origin,

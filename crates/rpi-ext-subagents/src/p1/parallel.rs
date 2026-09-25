@@ -826,9 +826,6 @@ pub fn child_details(entry: &TaskEntry, outcome: &ChildOutcome, run_id: &str) ->
     if let Some(thinking) = &result.thinking {
         single["thinking"] = json!(thinking);
     }
-    if result.attempted_models.len() > 1 {
-        single["attemptedModels"] = json!(result.attempted_models);
-    }
     if let Some(error) = &result.error {
         single["error"] = json!(error);
     }

@@ -1188,9 +1188,6 @@ fn record_step_result(
         if let Some(thinking) = &result.thinking {
             step["thinking"] = json!(thinking);
         }
-        if !result.attempted_models.is_empty() {
-            step["attemptedModels"] = json!(result.attempted_models);
-        }
         if let Some(error) = &result.error {
             step["error"] = json!(error);
         }
@@ -2940,7 +2937,6 @@ pub(crate) mod tests {
             session_file: None,
             messages: Vec::new(),
             truncation: None,
-            attempted_models: Vec::new(),
         }
     }
 

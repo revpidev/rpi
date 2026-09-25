@@ -543,10 +543,7 @@ pub async fn run_child_async(
     // resolution is explicitly skipped. The branch must stay visible in
     // diagnostics so a later regression to silent passthrough is caught.
     if let Some(diagnostic) = model::registry_unavailable_diagnostic(
-        spec.model.is_some()
-            || ctx.top_model.is_some()
-            || agent.model.is_some()
-            || !agent.fallback_models.is_empty(),
+        spec.model.is_some() || ctx.top_model.is_some() || agent.model.is_some(),
     ) {
         tracing::warn!(diagnostic, "subagent model resolution degraded");
     }
@@ -578,7 +575,6 @@ pub async fn run_child_async(
     )?;
     let candidates = model::build_model_candidates(
         resolved.as_deref(),
-        &agent.fallback_models,
         registry_ref,
         preferred_provider,
         scope,
@@ -874,7 +870,11 @@ pub async fn run_child_async(
         abort_probe: ctx.abort_probe.clone(),
     };
 
-    let mut result = foreground::run_foreground_with_fallback(&input, &candidates).await;
+    // #2270 (v0.70): same-launch model switching was removed upstream — the
+    // launch resolves exactly one model (`input.model`, set from the single
+    // candidate above); a provider failure fails the child and retrying
+    // another model requires a later explicit launch.
+    let mut result = foreground::run_foreground(&input).await;
 
     // Acceptance ledger (FR-P1-09): inferred level + parsed fenced report;
     // explicit gates run host-side and failing gates fail the run.
@@ -1257,7 +1257,6 @@ mod te18_gate_budget_tests {
             exclude_tools: Vec::new(),
             mcp_direct_tools: Vec::new(),
             model: None,
-            fallback_models: Vec::new(),
             thinking: crate::agents::discover::ThinkingSpec::Unset,
             system_prompt_mode: "replace",
             inherit_project_context: true,

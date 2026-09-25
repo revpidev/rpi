@@ -1,7 +1,8 @@
 # subagents parity harness (TE04 G3; dual-track rebase TE13)
 
 Drives the pinned upstream pi-subagents and this crate's `build_rpi_args` / frontmatter parser /
-`get_finalOutput` / fallback mode table / discovery entry points with the same fixture set, then diffs the normalized outputs item by item.
+`get_finalOutput` / context-overflow classifier / model-resolution vectors / discovery entry
+points with the same fixture set, then diffs the normalized outputs item by item.
 
 ## Dual tracks (v0.1.5 rotation, TE37 / ADR-0029)
 
@@ -125,11 +126,11 @@ track keeps the historical, emptied `expected-target-diffs.json`), or the report
 | File | Responsibility |
 |------|------|
 | `fixtures.json` | Shared baseline cases: 9 groups of argv/env inputs, 6 groups of frontmatter content, 5 groups of message arrays |
-| `fixtures-target.json` | Target-track additions: frontmatter (inherit/false, excludeTools, broken frontmatter, thinking), final-output, fallback vectors, discovery tree (TE15), notify (TE17), **inline argv [RPI-OWN] goldens (TE18: the excludeTools surface, no upstream recorder; expectations inline in the cases) and model-resolution vectors (TE18 R7.1.4.4/.5, diffed directly against v0.66 `model-fallback.ts`)** |
+| `fixtures-target.json` | Target-track additions: frontmatter (inherit/false, excludeTools, broken frontmatter, thinking), final-output, fallback vectors (post-#2270/TE39: context-overflow only), discovery tree (TE15), notify (TE17), **inline argv [RPI-OWN] goldens (TE18: the excludeTools surface, no upstream recorder; expectations inline in the cases) and model-resolution vectors (TE18 R7.1.4.4/.5, re-anchored by TE39 at v0.70 `model-resolution.ts`)** |
 | `args-golden-v048.json` | The frozen argv/env golden file ([RPI-OWN]; covers only the 9 cases of fixtures.json; `--record-args-golden` re-records only the non-inline cases) |
 | `expected-target-diffs.json` | The regression-track difference attribution list (historical, emptied by TE14) |
 | `expected-target-diffs-v070.json` | The v0.1.5 target-track attribution manifest (TE37 seed, empty by design; TE38/TE39 append) |
-| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (live submodule = regression; v0.70 snapshot = target); args via the golden file on both tracks; fallback/model frozen on the live-submodule v0.66 face (v0.70 removed model fallback, #2270) |
+| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (live submodule = regression; v0.70 snapshot = target); args via the golden file on both tracks; fallback/model re-anchored at v0.70 `model-resolution.ts` (TE39 followed the #2270 removal) |
 | `setup-target-source.sh` | Extracts the v0.70 snapshot out-of-repo + installs its prod dependencies (zero writes to external/) |
 | `examples/subagents_parity_runner.rs` | Drives this crate with the same fixtures (parity facade, `lib.rs::parity`); built by the orchestrator and executed from a private copy |
 | `run-parity.mjs` | Orchestration + normalized diff + attribution + report writing; fixture materialization and the Rust binary copy land in out-of-repo temp directories |
@@ -176,9 +177,10 @@ track keeps the historical, emptied `expected-target-diffs.json`), or the report
 
 - `src/runs/shared/model-fallback.ts` **deleted** (#2270 / f58dfcb5, "remove automatic model
   fallback") — no replacement module; `isRetryableModelFailure` has no src occurrence at v0.70.
-  The fallback/model upstream legs are therefore **frozen on the v0.66 submodule face** on both
-  tracks during the v0.1.5 window; TE39 must triage the removal (follow upstream and drop/replace
-  the rpi fallback surface, or freeze a recorded golden as [RPI-OWN]) before flipping the pin.
+  **TE39 ruling (2026-09-27, user-approved): follow the removal** — the rpi fallback surface
+  was deleted with it, the retryable/attempt fixtures retired, and the fallback/model legs
+  now drive v0.70 `model-resolution.ts` (`isContextOverflow`, `resolveSubagentModelOverride`,
+  and `resolveModelSelection` for the surviving single-candidate vectors).
 - `src/runs/shared/pi-args.ts` stays absent (deleted v0.65) — the argv/env face remains the frozen
   v0.48 golden ([RPI-OWN], ADR-0025 §4).
 - Unchanged faces at v0.70 (verified): `src/agents/frontmatter.ts` (`parseFrontmatter`),

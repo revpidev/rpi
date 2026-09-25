@@ -794,23 +794,18 @@ pub fn resolve_model_origin(
     ModelOrigin::Configured
 }
 
-/// `buildModelCandidates` (model-fallback.ts:461-541 @ 0fc0eebb): primary +
-/// fallbacks, deduped, resolved against the registry. The primary passes
-/// through when it was resolved by the caller (explicit/inherited origin); a
-/// configured primary and fallback entries go through the strict resolution,
-/// misses are skipped with a warn, and a chain left with no usable candidate
-/// re-runs the first skip through the required check so the launch fails
-/// closed (#1093).
-///
-/// v0.66 additions (TE19 FR-G): every resolved candidate then passes the
-/// active exclusion filter (#1318 — excluded candidates drop with a warn
-/// diagnostic; an all-excluded chain fails closed with per-exclusion
-/// evidence, #1439) and the resolved global + per-agent scope checks
-/// (#1328 — `resolveModelScopesForAgent`).
+/// Launch model resolution (#1093/#1328 semantics, post-#2270): the
+/// primary resolves against the registry; a configured primary goes
+/// through the strict resolution, a miss is skipped with a warn, and an
+/// empty result re-runs the skip through the required check so the launch
+/// fails closed (#1093). Explicit primaries fail closed immediately and
+/// pass the scope checks as "explicit". Returns 0 or 1 candidates — the
+/// v0.66 fallback chain and the #1318 exclusion filter were removed
+/// upstream at v0.70 (#2270 / f58dfcb5; `buildModelCandidates` has no
+/// successor — `model-resolution.ts` keeps only single-model resolution).
 #[allow(clippy::too_many_arguments)]
 pub fn build_model_candidates(
     primary_model: Option<&str>,
-    fallback_models: &[String],
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
     scope: Option<&ModelScopeConfig>,
@@ -854,7 +849,7 @@ pub fn build_model_candidates(
 
     if let ModelOrigin::Explicit = origin {
         // Explicit primaries fail closed immediately (upstream normalizes
-        // them via the required resolution before the chain) and pass the
+        // them via the required resolution before launch) and pass the
         // scope checks as "explicit" (hard error on violation).
         if let Some(primary) = primary_model.map(str::trim).filter(|m| !m.is_empty()) {
             let normalized = resolve_required_subagent_model_candidate(
@@ -862,113 +857,49 @@ pub fn build_model_candidates(
                 available_models,
                 preferred_provider,
             )?;
-            // An explicitly requested model under an active exclusion fails
-            // closed with the exclusion reason instead of silently swapping
-            // (`throwForExplicitModelExclusion`, model-fallback.ts:337-341 —
-            // the reason passes control-char normalization + secret
-            // redaction + the 240 cap).
-            if let Some(exclusion) =
-                crate::launch::model_exclusions::find_model_exclusion(&normalized)
-            {
-                let reason = crate::launch::model_exclusions::sanitize_diagnostic(
-                    &exclusion.reason,
-                    "runtime-failure",
-                );
-                return Err(format!(
-                    "Requested subagent model '{normalized}' is excluded and cannot be replaced by a fallback (reason: {reason}; expires: {}).",
-                    exclusion.expires_at
-                ));
-            }
+            // v0.66's `throwForExplicitModelExclusion` check (model-fallback.ts:337-341)
+            // was removed upstream at v0.70 (#2270) together with persistent
+            // exclusions; model-resolution.ts keeps no such check.
             if !resolved_scopes.is_empty() {
                 enforce_scopes(&normalized, ModelSource::Explicit, on_warn)?;
             }
         }
     }
-    let mut seen = std::collections::BTreeSet::new();
     let mut candidates: Vec<String> = Vec::new();
-    let raw: Vec<Option<&str>> = std::iter::once(primary_model)
-        .chain(fallback_models.iter().map(|s: &String| Some(s.as_str())))
-        .collect();
     let mut skipped_primary: Option<String> = None;
-    let mut skipped_fallback: Option<String> = None;
-    for (index, raw_entry) in raw.into_iter().enumerate() {
-        let Some(raw) = raw_entry else {
-            continue;
+    if let Some(raw) = primary_model.map(str::trim).filter(|m| !m.is_empty()) {
+        let normalized = if matches!(origin, ModelOrigin::Inherited | ModelOrigin::Explicit) {
+            // Already resolved by the caller (or the parent session itself).
+            raw.to_string()
+        } else {
+            match resolve_subagent_model_candidate(raw, available_models, preferred_provider) {
+                Some(normalized) => normalized,
+                None => {
+                    tracing::warn!(
+                        model = raw,
+                        "primary launch model unavailable in this environment"
+                    );
+                    skipped_primary = Some(raw.to_string());
+                    String::new()
+                }
+            }
         };
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
+        if skipped_primary.is_none() {
+            // Upstream `resolveSubagentModelOverride` enforces scopes when the
+            // model was resolved from the registry (`resolvedFromRegistry`):
+            // a configured primary goes through the registry, so scopes apply
+            // (warn for non-strict, error for strict); an inherited primary
+            // (the parent session's own model) is not registry-resolved and
+            // skips the check (model-resolution.ts @ b72714de).
+            if matches!(origin, ModelOrigin::Configured) {
+                enforce_scopes(&normalized, ModelSource::Inherited, on_warn)?;
+            }
+            candidates.push(normalized);
         }
-        let normalized =
-            if index == 0 && matches!(origin, ModelOrigin::Inherited | ModelOrigin::Explicit) {
-                // Already resolved by the caller (or the parent session itself).
-                raw.to_string()
-            } else {
-                match resolve_subagent_model_candidate(raw, available_models, preferred_provider) {
-                    Some(normalized) => normalized,
-                    None => {
-                        if index == 0 {
-                            skipped_primary = Some(raw.to_string());
-                        } else {
-                            if skipped_fallback.is_none() {
-                                skipped_fallback = Some(raw.to_string());
-                            }
-                            tracing::warn!(
-                                model = raw,
-                                "skipping fallback model unavailable in this environment"
-                            );
-                        }
-                        continue;
-                    }
-                }
-            };
-        if seen.contains(&normalized) {
-            continue;
-        }
-        if index > 0
-            || resolved_scopes
-                .iter()
-                .any(|(rule, _)| rule.enforced() && rule.strict == Some(true))
-        {
-            enforce_scopes(&normalized, ModelSource::Inherited, on_warn)?;
-        }
-        seen.insert(normalized.clone());
-        candidates.push(normalized);
-    }
-    // #1318 exclusion filter: excluded candidates drop with a diagnostic;
-    // the zero-usable case fails closed with evidence (#1439).
-    let mut excluded_evidence: Vec<String> = Vec::new();
-    let mut excluded_count = 0usize;
-    {
-        let mut on_excluded =
-            |candidate: &str, exclusion: &crate::launch::model_exclusions::ModelExclusion| {
-                excluded_count += 1;
-                let cap = crate::launch::model_exclusions::MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES;
-                if excluded_evidence.len() < cap {
-                    // `formatExcludedCandidateEvidence` (model-fallback.ts:309-316):
-                    // every field passes the diagnostic sanitizer (control-char
-                    // collapse + secret redaction + 240 cap).
-                    let sanitize = crate::launch::model_exclusions::sanitize_diagnostic;
-                    let display_candidate = sanitize(candidate, "unknown");
-                    let display_model =
-                        sanitize(exclusion.model_id.as_deref().unwrap_or(""), "unspecified");
-                    let display_provider =
-                        sanitize(exclusion.provider.as_deref().unwrap_or(""), "unspecified");
-                    let reason = sanitize(&exclusion.reason, "runtime-failure");
-                    excluded_evidence.push(format!(
-                        "{display_candidate} — model: {display_model}; provider: {display_provider}; reason: {reason}; expires: {}",
-                        exclusion.expires_at
-                    ));
-                }
-            };
-        candidates = crate::launch::model_exclusions::filter_fallback_candidates(
-            candidates,
-            Some(&mut on_excluded),
-        );
     }
     if candidates.is_empty() {
-        // A chain that skipped its only resolvable entry fails closed through
-        // the required check (upstream re-runs the first skip).
+        // A resolution that skipped its only entry fails closed through
+        // the required check (upstream re-runs the first skip, #1093).
         if let Some(primary) = skipped_primary {
             resolve_required_subagent_model_candidate(
                 &primary,
@@ -976,119 +907,12 @@ pub fn build_model_candidates(
                 preferred_provider,
             )?;
         }
-        if let Some(fallback) = skipped_fallback {
-            resolve_required_subagent_model_candidate(
-                &fallback,
-                available_models,
-                preferred_provider,
-            )?;
-        }
-        // #1439 zero-usable evidence: every resolvable candidate was
-        // excluded — fail closed naming them (`ZERO_USABLE_MODEL_CANDIDATES_ERROR`).
-        if excluded_count > 0 {
-            let evidence = if excluded_evidence.is_empty() {
-                String::new()
-            } else {
-                let omitted = excluded_count - excluded_evidence.len();
-                format!(
-                    " (excluded: {}{})",
-                    excluded_evidence.join("; "),
-                    if omitted > 0 {
-                        format!("; ... and {omitted} more")
-                    } else {
-                        String::new()
-                    }
-                )
-            };
-            return Err(format!(
-                "No usable subagent models remain after registry, scope, and cached-exclusion filtering.{evidence}"
-            ));
-        }
     }
     Ok(candidates)
 }
 
-// ---------------------------------------------------------------------------
-// Retry classification (model-fallback.ts:320-340)
-// ---------------------------------------------------------------------------
-
-/// `RETRYABLE_MODEL_FAILURE_PATTERNS` (model-fallback.ts:537-577 @ v0.66.0
-/// 0fc0eebb) — matched against the child error text. Every pattern carries
-/// its own flags; `REQUEST_LIMIT_EXCEEDED` is anchored and case-sensitive
-/// exactly like upstream.
-static RETRYABLE_MODEL_FAILURE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    [
-        r"^REQUEST_LIMIT_EXCEEDED$",
-        r"(?i)rate\s*limit",
-        r"(?i)usage\s*limit",
-        r"(?i)too many requests",
-        r"(?i)\b429\b",
-        r"(?i)quota",
-        r"(?i)billing",
-        r"(?i)credit",
-        r"(?i)auth(?:entication)?",
-        r"(?i)unauthori[sz]ed",
-        r"(?i)forbidden",
-        r"(?i)api key",
-        r"(?i)token expired",
-        r"(?i)invalid key",
-        r"(?i)provider.*unavailable",
-        r"(?i)model.*unavailable",
-        r"(?i)model.*disabled",
-        r"(?i)model.*not found",
-        r"(?i)unknown model",
-        r"(?i)overloaded",
-        r"(?i)service unavailable",
-        r"(?i)temporar(?:ily)? unavailable",
-        r"(?i)connection\s+(?:error|reset|closed|aborted)",
-        r"(?i)connection refused",
-        r"(?i)fetch failed",
-        r"(?i)network error",
-        r"(?i)socket hang up",
-        r"(?i)stream ended without finish_reason",
-        r"(?i)upstream",
-        r"(?i)timed? out",
-        r"(?i)timeout",
-        r"(?i)\b500\b",
-        r"(?i)\b502\b",
-        r"(?i)\b503\b",
-        r"(?i)\b504\b",
-        r"(?i)internal server error",
-        r"(?i)cold.?start",
-        r"(?i)empty response",
-        r"(?i)no output",
-        r"(?i)model.*(?:load|fail|error)",
-    ]
-    .iter()
-    .filter_map(|pattern| Regex::new(pattern).ok())
-    .collect()
-});
-
-/// `TOOL_FAILURE_PREFIX` (model-fallback.ts:327): `<tool> failed (exit N):` /
-/// `with exit code N` errors come from a tool inside the child task, not the
-/// provider — a model retry cannot fix them.
-static TOOL_FAILURE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)")
-        .expect("tool failure prefix regex")
-});
-
-/// `isRetryableModelFailure` (model-fallback.ts:579-584 @ v0.66.0).
-pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
-    let Some(error) = error else {
-        return false;
-    };
-    if TOOL_FAILURE_PREFIX.is_match(error.trim()) {
-        return false;
-    }
-    RETRYABLE_MODEL_FAILURE_PATTERNS
-        .iter()
-        .any(|pattern| pattern.is_match(error))
-}
-
-/// `CONTEXT_OVERFLOW_PATTERNS` (model-fallback.ts:625-637 @ v0.66.0).
-/// Deliberately disjoint from [`RETRYABLE_MODEL_FAILURE_PATTERNS`]: an overflow
-/// means the input exceeded the model's context window, so retrying the same
-/// input (same model or a fallback) cannot succeed.
+/// Context-overflow signals (kept at v0.70 in model-resolution.ts's
+/// `isContextOverflow`).
 static CONTEXT_OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         r"(?i)context(?: length| window| limit)? (?:exceed|overflow|too long)",
@@ -1108,9 +932,17 @@ static CONTEXT_OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .collect()
 });
 
-/// `isContextOverflow` (model-fallback.ts:643-647 @ v0.66.0): a terminal,
-/// non-retryable classification — callers must not advance the fallback chain
-/// (R7.1.2.2).
+/// `TOOL_FAILURE_PREFIX` (kept at v0.70 in model-resolution.ts's
+/// `isContextOverflow`): `<tool> failed (exit N):` / `with exit code N`
+/// errors come from a tool inside the child task, not the provider.
+static TOOL_FAILURE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)")
+        .expect("tool failure prefix regex")
+});
+
+/// `isContextOverflow` (model-resolution.ts @ b72714de, kept through the
+/// #2270 removal): a terminal, non-retryable classification for surfacing
+/// a clear input-too-large error.
 pub fn is_context_overflow(error: Option<&str>) -> bool {
     let Some(error) = error else {
         return false;
@@ -1121,76 +953,6 @@ pub fn is_context_overflow(error: Option<&str>) -> bool {
     CONTEXT_OVERFLOW_PATTERNS
         .iter()
         .any(|pattern| pattern.is_match(error))
-}
-
-/// `formatEmptyTerminalAssistantResponseError` cold-start text
-/// (utils.ts:481) — the empty-output attempt still advances the chain.
-const EMPTY_OUTPUT_COLD_START_ERROR: &str =
-    "Subagent produced no output (possible model cold-start or empty response).";
-
-/// `/^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$/`
-/// (model-fallback.ts:603).
-static EMPTY_OUTPUT_STOP_REASON_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$"#)
-        .expect("empty output stop reason regex")
-});
-
-/// `isRetryableModelFailureAttempt` (model-fallback.ts:601-611 @ v0.66.0,
-/// R7.1.2.3): a retryable *model* failure may only replay the whole task when
-/// the attempt produced **no tool activity** (`toolCount > 0` → false — a
-/// replay would re-run tools against the same cwd/worktree). `messages`
-/// carries the attempt transcript: the upstream tail only replays when the
-/// error text is an errorMessage of one of those messages (or the attempt had
-/// no messages at all).
-pub fn is_retryable_model_failure_attempt(
-    error: Option<&str>,
-    messages: &[Value],
-    tool_count: u64,
-) -> bool {
-    if !is_retryable_model_failure(error) {
-        return false;
-    }
-    if tool_count > 0 {
-        return false;
-    }
-    let Some(error_text) = error else {
-        return false;
-    };
-    if error_text == EMPTY_OUTPUT_COLD_START_ERROR
-        || EMPTY_OUTPUT_STOP_REASON_RE.is_match(error_text)
-    {
-        return true;
-    }
-    if messages.is_empty() {
-        return true;
-    }
-    let trimmed = error_text.trim();
-    !trimmed.is_empty()
-        && messages.iter().any(|message| {
-            message
-                .get("errorMessage")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                == Some(trimmed)
-        })
-}
-
-/// `formatModelAttemptNote` (model-fallback.ts:335-340).
-pub fn format_model_attempt_note(
-    model: &str,
-    error: Option<&str>,
-    exit_code: Option<i32>,
-    next_model: Option<&str>,
-) -> String {
-    let failure = error
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("exit {}", exit_code.unwrap_or(1)));
-    match next_model {
-        Some(next) => format!("[fallback] {model} failed: {failure}. Retrying with {next}."),
-        None => format!("[fallback] {model} failed: {failure}."),
-    }
 }
 
 #[cfg(test)]
@@ -1399,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_dedupe_and_scope_check_fallbacks() {
+    fn candidates_scope_check_warns_out_of_scope_primary() {
         let registry = models();
         let scope = ModelScopeConfig {
             agents: Default::default(),
@@ -1412,73 +1174,21 @@ mod tests {
             warnings.push(v.message.clone());
         };
         let candidates = build_model_candidates(
-            Some("claude-5"),
-            &[
-                "openai/gpt-4o".to_string(),
-                "anthropic/claude-5".to_string(),
-            ],
+            Some("openai/gpt-4o"),
             Some(&registry),
             None,
             Some(&scope),
-            // configured origin: the primary is strict-resolved like a
-            // fallback (the test's "claude-5" hits the registry).
             None,
             None,
             ModelOrigin::Configured,
             &mut sink,
         )
         .unwrap();
-        // primary + out-of-scope fallback (warned, kept) + duplicate dropped.
-        assert_eq!(candidates.len(), 2);
+        // Out-of-scope primary under an enforced (non-strict) scope is
+        // warned and kept — the pre-v0.70 fallback-chain behavior for
+        // entries, now applied to the single primary.
+        assert_eq!(candidates.len(), 1);
         assert_eq!(warnings.len(), 1);
-    }
-
-    #[test]
-    fn retryable_failure_classification() {
-        assert!(is_retryable_model_failure(Some("rate limit exceeded")));
-        assert!(is_retryable_model_failure(Some(
-            "Error 429: too many requests"
-        )));
-        assert!(is_retryable_model_failure(Some(
-            "model overloaded, try again"
-        )));
-        assert!(!is_retryable_model_failure(None));
-        // Tool failures inside the child are not model failures — but the
-        // upstream prefix only anchors to single-token tool names, so
-        // "cargo test failed …" (space in the name) is NOT classified as a
-        // tool failure and stays retryable. Document both sides.
-        assert!(!is_retryable_model_failure(Some(
-            "bash failed (exit 1): quota exceeded"
-        )));
-        assert!(!is_retryable_model_failure(Some(
-            "mcp.server/write failed with exit code 1 rate limit"
-        )));
-        // The "with exit code N" branch has no trailing colon in the upstream
-        // pattern, so "with exit code 1:" does not classify as a tool failure.
-        assert!(is_retryable_model_failure(Some(
-            "mcp.server/write failed with exit code 1: rate limit"
-        )));
-        assert!(is_retryable_model_failure(Some(
-            "cargo test failed (exit 101): upstream is down"
-        )));
-        assert!(!is_retryable_model_failure(Some(
-            "some unrelated compile note"
-        )));
-        // v0.66 additions (#1215/#1955/#1957, model-fallback.ts:537-577).
-        assert!(is_retryable_model_failure(Some("REQUEST_LIMIT_EXCEEDED")));
-        // Anchored + case-sensitive upstream (`/^REQUEST_LIMIT_EXCEEDED$/`).
-        assert!(!is_retryable_model_failure(Some("request_limit_exceeded")));
-        assert!(!is_retryable_model_failure(Some(
-            "REQUEST_LIMIT_EXCEEDED retry later"
-        )));
-        assert!(is_retryable_model_failure(Some(
-            "usage limit reached for this account"
-        )));
-        assert!(is_retryable_model_failure(Some("connection reset by peer")));
-        assert!(is_retryable_model_failure(Some(
-            "HTTP 500 Internal Server Error"
-        )));
-        assert!(is_retryable_model_failure(Some("Internal Server Error")));
     }
 
     #[test]
@@ -1496,82 +1206,10 @@ mod tests {
             "plain provider failure without overflow wording"
         )));
         // TOOL_FAILURE_PREFIX precedence: a tool's own "token limit" text is
-        // neither overflow nor a model failure.
+        // not an overflow signal.
         assert!(!is_context_overflow(Some(
             "write failed (exit 1): token limit exceeded"
         )));
-        assert!(!is_retryable_model_failure(Some(
-            "write failed (exit 1): token limit exceeded"
-        )));
-        // Overflow and retryable patterns stay mutually exclusive on the
-        // same error text (task §6 A3).
-        for error in [
-            "context_length_exceeded",
-            "maximum context length is 200000 tokens",
-            "prompt is too long for this model",
-        ] {
-            assert!(!is_retryable_model_failure(Some(error)), "{error}");
-        }
-    }
-
-    #[test]
-    fn retryable_attempt_guard_blocks_replay_after_tools() {
-        let retryable = Some("rate limit exceeded");
-        // toolCount > 0 → never replay the whole task (R7.1.2.3 A1).
-        assert!(!is_retryable_model_failure_attempt(retryable, &[], 1));
-        assert!(!is_retryable_model_failure_attempt(
-            retryable,
-            &[serde_json::json!({ "role": "assistant", "errorMessage": "rate limit exceeded" })],
-            3
-        ));
-        // toolCount == 0 + no messages → still replayable.
-        assert!(is_retryable_model_failure_attempt(retryable, &[], 0));
-        // Empty-output diagnostics replay even with messages present.
-        assert!(is_retryable_model_failure_attempt(
-            Some(EMPTY_OUTPUT_COLD_START_ERROR),
-            &[serde_json::json!({ "role": "assistant", "content": [] })],
-            0
-        ));
-        assert!(is_retryable_model_failure_attempt(
-            Some("Subagent produced no output after terminal assistant stopReason \"length\"."),
-            &[],
-            0
-        ));
-        // With a transcript, the error must come from one of its messages
-        // (model-fallback.ts:610 tail).
-        assert!(is_retryable_model_failure_attempt(
-            retryable,
-            &[serde_json::json!({ "role": "assistant", "errorMessage": "rate limit exceeded" })],
-            0
-        ));
-        assert!(!is_retryable_model_failure_attempt(
-            retryable,
-            &[serde_json::json!({ "role": "assistant", "errorMessage": "other failure" })],
-            0
-        ));
-        // Non-retryable and context-overflow texts never replay.
-        assert!(!is_retryable_model_failure_attempt(
-            Some("some unrelated compile note"),
-            &[],
-            0
-        ));
-        assert!(!is_retryable_model_failure_attempt(
-            Some("context_length_exceeded"),
-            &[],
-            0
-        ));
-    }
-
-    #[test]
-    fn attempt_note_format() {
-        assert_eq!(
-            format_model_attempt_note("openai/x", Some("boom "), None, Some("openai/y")),
-            "[fallback] openai/x failed: boom. Retrying with openai/y."
-        );
-        assert_eq!(
-            format_model_attempt_note("openai/x", None, Some(3), None),
-            "[fallback] openai/x failed: exit 3."
-        );
     }
 }
 
@@ -1718,7 +1356,6 @@ mod te18_model_tests {
         // Explicit primary missing from the registry → immediate Err.
         let error = build_model_candidates(
             Some("faux/primary"),
-            &[],
             Some(&registry),
             None,
             None,
@@ -1733,7 +1370,6 @@ mod te18_model_tests {
         // when nothing usable remains.
         let error = build_model_candidates(
             Some("faux/primary"),
-            &[],
             Some(&registry),
             None,
             None,
@@ -1744,61 +1380,11 @@ mod te18_model_tests {
         )
         .unwrap_err();
         assert!(error.contains("Unknown subagent model"), "{error}");
-        // Configured primary missing + usable fallback → primary skipped
-        // (warned), fallback survives.
-        let candidates = build_model_candidates(
-            Some("faux/primary"),
-            &["claude-5".to_string()],
-            Some(&registry),
-            None,
-            None,
-            None,
-            None,
-            ModelOrigin::Configured,
-            &mut sink,
-        )
-        .unwrap();
-        assert_eq!(candidates, vec!["anthropic/claude-5".to_string()]);
-        // Primary hit + fallback miss → fallback skipped with a warn, the
-        // chain stays usable (upstream only fail-closes when NOTHING
-        // remains).
-        let candidates = build_model_candidates(
-            Some("anthropic/claude-5"),
-            &["faux/secondary".to_string()],
-            Some(&registry),
-            None,
-            None,
-            None,
-            None,
-            ModelOrigin::Explicit,
-            &mut sink,
-        )
-        .unwrap();
-        assert_eq!(candidates, vec!["anthropic/claude-5".to_string()]);
-        // No primary + an unresolvable fallback → the chain is empty, the
-        // skipped fallback fails closed.
-        let error = build_model_candidates(
-            None,
-            &["faux/secondary".to_string()],
-            Some(&registry),
-            None,
-            None,
-            None,
-            None,
-            ModelOrigin::Configured,
-            &mut sink,
-        )
-        .unwrap_err();
-        assert!(
-            error.contains("Unknown subagent model 'faux/secondary'"),
-            "{error}"
-        );
         // Inherited primary passes through even when outside the registry
         // (parent session model is authoritative).
         let candidates = build_model_candidates(
             Some("faux/parent-model"),
-            &[],
-            Some(&registry),
+            None,
             None,
             None,
             None,
@@ -1824,7 +1410,7 @@ mod te18_model_tests {
         );
         assert!(registry_unavailable_diagnostic(false).is_none());
     }
-    // ---- TE19 (R7.1.10): thinking ceiling + scope agents + exclusions ----
+    // ---- TE19 (R7.1.10): thinking ceiling + scope agents ----
 
     #[test]
     fn thinking_ceiling_helpers_match_upstream_ranks() {
@@ -1859,13 +1445,6 @@ mod te18_model_tests {
 
     #[test]
     fn model_scope_agents_and_inherit_alias() {
-        // The exclusion store is process-global; isolate this test's
-        // explicit-candidate checks from any recorded exclusion.
-        std::env::set_var(
-            "RPI_MODEL_EXCLUSIONS_PATH",
-            std::env::temp_dir().join(format!("rpi-model-excl-scope-{}", std::process::id())),
-        );
-        crate::launch::model_exclusions::reset_for_test();
         let value: Value = serde_json::from_str(
             r#"{"enforce":true,"allow":["anthropic/*"],
                 "agents":{"researcher":{"allow":["openai/*","inherit"]}}}"#,
@@ -1894,7 +1473,6 @@ mod te18_model_tests {
         let mut sink = |_violation: &ModelScopeViolation| {};
         let error = build_model_candidates(
             Some("openai/gpt"),
-            &[],
             None,
             None,
             Some(&scope),
@@ -1907,7 +1485,6 @@ mod te18_model_tests {
         assert!(error.contains("modelScope"), "{error}");
         let candidates = build_model_candidates(
             Some("openai/gpt"),
-            &[],
             None,
             None,
             Some(&scope),

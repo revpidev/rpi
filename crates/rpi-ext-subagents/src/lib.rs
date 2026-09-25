@@ -629,12 +629,6 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         PluginMode::Parent => {
             let config = config::load_config();
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            // #1439: `modelExclusions.defaultTtlMs` overrides the TTL for
-            // newly recorded exclusions (extension init →
-            // `setDefaultTTL(resolveModelExclusionTTL(config))`).
-            if let Some(ttl) = config.model_exclusions_default_ttl_ms {
-                crate::launch::model_exclusions::set_default_ttl(ttl);
-            }
             if let Err(error) = register(
                 "registerTool",
                 json!({
@@ -1482,24 +1476,10 @@ pub mod parity {
         }
     }
 
-    /// `isRetryableModelFailure` parity facade (TE13 target-track fallback
-    /// leg; pattern table completed for R7.1.2.1 in TE14).
-    pub fn is_retryable_model_failure_public(error: Option<&str>) -> bool {
-        crate::launch::model::is_retryable_model_failure(error)
-    }
-
-    /// `isContextOverflow` parity facade (TE14, R7.1.2.2).
+    /// `isContextOverflow` parity facade (kept at v0.70 in
+    /// model-resolution.ts; TE39 re-anchored).
     pub fn is_context_overflow_public(error: Option<&str>) -> bool {
         crate::launch::model::is_context_overflow(error)
-    }
-
-    /// `isRetryableModelFailureAttempt` parity facade (TE14, R7.1.2.3).
-    pub fn is_retryable_model_failure_attempt_public(
-        error: Option<&str>,
-        messages: &[serde_json::Value],
-        tool_count: u64,
-    ) -> bool {
-        crate::launch::model::is_retryable_model_failure_attempt(error, messages, tool_count)
     }
 
     /// Model-resolution parity facade (TE18 target-track `model` mode,
@@ -1573,11 +1553,10 @@ pub mod parity {
         )
     }
 
-    /// Upstream `buildModelCandidates` shape (scope/exclusions omitted — the
-    /// harness passes neither).
+    /// Launch candidate shape (post-#2270: single-candidate resolution —
+    /// scope omitted, the harness passes none).
     pub fn build_model_candidates_public(
         primary_model: Option<&str>,
-        fallback_models: &[String],
         available_models: Option<&[AvailableModelPublic]>,
         preferred_provider: Option<&str>,
         origin: ModelOriginPublic,
@@ -1592,7 +1571,6 @@ pub mod parity {
         let mut sink = |_violation: &crate::launch::model::ModelScopeViolation| {};
         crate::launch::model::build_model_candidates(
             primary_model,
-            fallback_models,
             registry_ref,
             preferred_provider,
             None,

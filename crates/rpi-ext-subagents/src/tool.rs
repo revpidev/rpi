@@ -490,9 +490,6 @@ fn assemble_single_details(
     if let Some(thinking) = &result.thinking {
         single["thinking"] = json!(thinking);
     }
-    if result.attempted_models.len() > 1 {
-        single["attemptedModels"] = json!(result.attempted_models);
-    }
     if let Some(error) = &result.error {
         single["error"] = json!(error);
     }

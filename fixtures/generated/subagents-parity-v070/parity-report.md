@@ -45,22 +45,10 @@ generated: 2026-09-20T03:24:01.105Z
 
 ## fallback
 
-- retry-request-limit-exceeded: MATCH
-- retry-usage-limit: MATCH
-- retry-connection-reset: MATCH
-- retry-http-500: MATCH
-- retry-internal-server-error: MATCH
-- retry-rate-limit-control: MATCH
-- retry-quota-control: MATCH
-- retry-tool-failure-not-retryable: MATCH
 - overflow-context-length-exceeded: MATCH
 - overflow-maximum-context-length: MATCH
 - overflow-plain-error-control: MATCH
 - overflow-tool-failure-not-overflow: MATCH
-- attempt-tool-count-blocks-replay: MATCH
-- attempt-no-tools-empty-messages: MATCH
-- attempt-empty-output-cold-start: MATCH
-- attempt-matching-message-error: MATCH
 
 ## model
 
@@ -74,8 +62,6 @@ generated: 2026-09-20T03:24:01.105Z
 - empty-model-inherits-parent: MATCH
 - candidates-explicit-miss-throws: MATCH
 - candidates-configured-miss-deferred-throw: MATCH
-- candidates-configured-miss-fallback-survives: MATCH
-- candidates-fallback-miss-skipped: MATCH
 - candidates-empty-registry-passthrough: MATCH
 - candidates-inherited-passthrough: MATCH
 - candidates-empty-chain-no-throw: MATCH

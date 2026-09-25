@@ -92,9 +92,6 @@ pub struct ExtensionConfig {
     /// `RPI_SUBAGENT_WAIT_TOOL_DEFAULT_TIMEOUT_MS` overrides). None = the
     /// built-in 30-minute default.
     pub wait_tool_default_timeout_ms: Option<u64>,
-    /// `modelExclusions.defaultTtlMs` (#1439): TTL for newly recorded model
-    /// exclusions (finite positive ≤ 8e15; None = 24h default).
-    pub model_exclusions_default_ttl_ms: Option<u64>,
 }
 
 impl Default for ExtensionConfig {
@@ -128,7 +125,6 @@ impl ExtensionConfig {
             worktree_setup_hook: None,
             intercom_bridge: None,
             wait_tool_default_timeout_ms: None,
-            model_exclusions_default_ttl_ms: None,
         }
     }
 
@@ -483,24 +479,6 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
         }
         config.wait_tool = Some(wait_tool.clone());
     }
-    if let Some(exclusions) = object.get("modelExclusions") {
-        // #1439: `{defaultTtlMs?}` — finite positive ≤ 8e15
-        // (config.ts:105-107). Only `defaultTtlMs` is read.
-        if let Some(ttl) = exclusions.as_object().and_then(|o| o.get("defaultTtlMs")) {
-            match ttl
-                .as_u64()
-                .filter(|v| *v >= 1 && *v <= 8_000_000_000_000_000)
-            {
-                Some(v) => config.model_exclusions_default_ttl_ms = Some(v),
-                None => {
-                    return Err(
-                        "config.modelExclusions.defaultTtlMs must be a finite positive number no greater than 8000000000000000"
-                            .into(),
-                    )
-                }
-            }
-        }
-    }
     if let Some(fleet) = object.get("fleet") {
         // TE11 FR-C: boolean, or `{enabled?, expanded?}` with boolean values.
         let valid = fleet.is_boolean()
@@ -642,7 +620,6 @@ pub struct AgentOverride {
     /// #1776 (R7.1.4.2): deny-list (`false` clears back to undeclared).
     pub exclude_tools: Option<Option<Vec<String>>>,
     // —— P1 fields (TE05; requirements §3.2 全集) ——
-    pub fallback_models: Option<Option<Vec<String>>>,
     /// `thinking: false` clears the agent's thinking level.
     pub thinking: Option<Option<String>>,
     /// `append` | `replace`.
@@ -949,14 +926,6 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                             path,
                             name,
                             "excludeTools",
-                        )?);
-                    }
-                    "fallbackModels" => {
-                        parsed_entry.fallback_models = Some(parse_override_string_array_or_false(
-                            field,
-                            path,
-                            name,
-                            "fallbackModels",
                         )?);
                     }
                     "thinking" => {
@@ -1429,10 +1398,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1591/#1439: waitTool.defaultTimeoutMs + modelExclusions.defaultTtlMs
-    /// parse with validation, and resolve through env overrides.
+    /// #1591: waitTool.defaultTimeoutMs parses with validation, and
+    /// resolves through env overrides.
     #[test]
-    fn wait_window_and_exclusion_ttl_config() {
+    fn wait_window_config() {
         fn load_config_at(path: &std::path::Path) -> ExtensionConfig {
             let raw = read_json_file(path).expect("config file");
             parse_config(&raw, &path.to_string_lossy()).expect("config parses")
@@ -1443,20 +1412,15 @@ mod tests {
         let path = dir.join("rpi-extension.json");
         std::fs::write(
             &path,
-            r#"{"waitTool":{"enabled":true,"defaultTimeoutMs":120000},
-                "modelExclusions":{"defaultTtlMs":3600000}}"#,
+            r#"{"waitTool":{"enabled":true,"defaultTimeoutMs":120000}}"#,
         )
         .unwrap();
         let config = load_config_at(&path);
         assert_eq!(config.wait_tool_default_timeout_ms(), Some(120_000));
-        assert_eq!(config.model_exclusions_default_ttl_ms, Some(3_600_000));
         // Invalid shapes fail the config load.
         let bad = dir.join("bad.json");
         std::fs::write(&bad, r#"{"waitTool":{"defaultTimeoutMs":0}}"#).unwrap();
         assert!(parse_config(&read_json_file(&bad).unwrap(), "bad.json").is_err());
-        let bad_ttl = dir.join("bad-ttl.json");
-        std::fs::write(&bad_ttl, r#"{"modelExclusions":{"defaultTtlMs":-5}}"#).unwrap();
-        assert!(parse_config(&read_json_file(&bad_ttl).unwrap(), "bad-ttl.json").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1475,7 +1439,7 @@ mod tests {
                 "agentOverrides":{
                     "researcher":{"tools":["read","write"]},
                     "scout":{"model":false,"disabled":true},
-                    "worker":{"systemPromptMode":"append","fallbackModels":["m2","m3"],
+                    "worker":{"systemPromptMode":"append",
                               "thinking":false,"defaultContext":"fork","acceptanceRole":"writer",
                               "skills":["s1"],"systemPrompt":"custom","inheritSkills":false},
                     "reviewer":{"completionGuard":true}
@@ -1508,10 +1472,6 @@ mod tests {
         assert_eq!(settings.overrides.get("scout").unwrap().model, Some(None));
         let worker = settings.overrides.get("worker").unwrap();
         assert_eq!(worker.system_prompt_mode.as_deref(), Some("append"));
-        assert_eq!(
-            worker.fallback_models,
-            Some(Some(vec!["m2".to_string(), "m3".to_string()]))
-        );
         assert_eq!(worker.thinking, Some(None));
         assert_eq!(worker.default_context, Some(Some("fork".to_string())));
         assert_eq!(worker.acceptance_role, Some(Some("writer".to_string())));

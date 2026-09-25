@@ -76,7 +76,6 @@ pub struct AgentConfig {
     pub exclude_tools: Vec<String>,
     pub mcp_direct_tools: Vec<String>,
     pub model: Option<String>,
-    pub fallback_models: Vec<String>,
     pub thinking: ThinkingSpec,
     pub system_prompt_mode: &'static str,
     pub inherit_project_context: bool,
@@ -668,9 +667,6 @@ pub fn agent_from_content(
             .map(String::as_str),
     )
     .unwrap_or_default();
-    let fallback_models =
-        super::frontmatter::parse_frontmatter_list(fm.get("fallbackModels").map(String::as_str))
-            .unwrap_or_default();
 
     let system_prompt_mode = match fm.get("systemPromptMode").map(String::as_str) {
         Some("replace") => "replace",
@@ -723,7 +719,6 @@ pub fn agent_from_content(
         exclude_tools,
         mcp_direct_tools,
         model: fm.get("model").cloned(),
-        fallback_models,
         thinking,
         system_prompt_mode,
         inherit_project_context,
@@ -1451,9 +1446,6 @@ fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOve
     if let Some(exclude) = &entry.exclude_tools {
         agent.exclude_tools = exclude.clone().unwrap_or_default();
     }
-    if let Some(fallback_models) = &entry.fallback_models {
-        agent.fallback_models = fallback_models.clone().unwrap_or_default();
-    }
     if let Some(thinking) = &entry.thinking {
         agent.thinking = match thinking {
             Some(level) => ThinkingSpec::Level(level.clone()),
@@ -1529,11 +1521,6 @@ fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::A
     if let Some(exclude) = &entry.exclude_tools {
         if !agent.has_frontmatter_field(&["excludeTools"]) {
             agent.exclude_tools = exclude.clone().unwrap_or_default();
-        }
-    }
-    if let Some(fallback_models) = &entry.fallback_models {
-        if !agent.has_frontmatter_field(&["fallbackModels"]) {
-            agent.fallback_models = fallback_models.clone().unwrap_or_default();
         }
     }
     if let Some(thinking) = &entry.thinking {

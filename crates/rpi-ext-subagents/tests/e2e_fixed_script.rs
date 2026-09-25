@@ -176,7 +176,7 @@ impl Sandbox {
         std::fs::create_dir_all(agent_dir.join("agents")).unwrap();
         std::fs::write(
             agent_dir.join("agents").join("fallbacker.md"),
-            "---\nname: fallbacker\ndescription: TE14 fallback replay guard fixture\nmodel: faux/primary\nfallbackModels: faux/secondary\ntools: read\n---\n\nYou are a fallback fixture agent. Reply briefly.\n",
+            "---\nname: fallbacker\ndescription: TE14 fallback replay guard fixture\nmodel: faux/primary\ntools: read\n---\n\nYou are a fallback fixture agent. Reply briefly.\n",
         )
         .unwrap();
         // TE18 fixtures: excludeTools argv face (R7.1.4.2) and the pre-spawn
@@ -778,7 +778,9 @@ fn e2e_fixed_child_full_pipeline() {
         "after retry"
     );
 
-    // ---- Scenario 8b (TE14): fallback replay guard (R7.1.2.3) -----------
+    // ---- Scenario 8b (TE14, re-based at v0.70 #2270): provider failure
+    // fails the child after one spawn — same-launch model switching removed
+    // upstream; retrying another model requires a later explicit launch.
     {
         // Tool activity happened before the retryable failure: the guard must
         // keep the run to ONE child (no whole-task replay on the same cwd).
@@ -803,7 +805,8 @@ fn e2e_fixed_child_full_pipeline() {
         assert!(spawns[0].contains("faux/primary"), "{spawns:?}");
     }
     {
-        // No tool activity: the existing fallback chain still advances.
+        // No tool activity: same-launch switching is gone (v0.70 #2270) —
+        // the run fails after exactly one spawn, no retry note.
         let dump = sandbox.dump("fallback-chain-no-tools");
         std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
         std::env::set_var("RPI_E2E_MODE", "fallback-fail-no-tools");
@@ -817,13 +820,12 @@ fn e2e_fixed_child_full_pipeline() {
         let spawns = spawn_log(&dump);
         assert_eq!(
             spawns.len(),
-            2,
-            "zero-tool retryable failure replays once: {spawns:?}"
+            1,
+            "no same-launch replay at v0.70: {spawns:?}"
         );
         assert!(spawns[0].contains("faux/primary"), "{spawns:?}");
-        assert!(spawns[1].contains("faux/secondary"), "{spawns:?}");
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Retrying with faux/secondary"), "{text}");
+        assert!(!text.contains("Retrying with"), "{text}");
     }
     {
         // Context overflow is terminal: no fallback candidate is consumed and
@@ -845,7 +847,9 @@ fn e2e_fixed_child_full_pipeline() {
             "overflow must not consume a candidate: {spawns:?}"
         );
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("context overflow"), "{text}");
+        // The child error text surfaces (no parent chain note at v0.70).
+        assert!(text.contains("context_length_exceeded"), "{text}");
+        assert!(!text.contains("[fallback]"), "{text}");
     }
     // ---- Scenario 8c (TE14): background shares the same guard (A2) ------
     {
@@ -892,10 +896,10 @@ fn e2e_fixed_child_full_pipeline() {
         let spawns = spawn_log(&dump);
         assert_eq!(
             spawns.len(),
-            2,
-            "background zero-tool failure replays once: {spawns:?}"
+            1,
+            "background path: no same-launch replay at v0.70: {spawns:?}"
         );
-        assert!(spawns[1].contains("faux/secondary"), "{spawns:?}");
+        assert!(spawns[0].contains("faux/primary"), "{spawns:?}");
     }
 
     // ---- Scenario 9 (TE05): parallel tasks composition (FR-P1-01) ----
