@@ -1,6 +1,7 @@
 // Upstream leg of the renderCall parity (TE09 FR-E): runs the pinned
 // pi-mcp-adapter exported pure functions (tool-result-renderer.ts @
-// 10a45367 since the TE27 pin switch) over the shared fixtures and prints one
+// 97435aab since the TE40 pin switch; 10a45367 across TE27..TE40) over the shared
+// fixtures and prints one
 // JSON document per line
 // (case name → { lines } for the format functions, { rendered } for the
 // render wrappers with the plain-theme Text output).
