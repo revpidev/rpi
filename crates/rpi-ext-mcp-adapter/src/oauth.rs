@@ -167,23 +167,29 @@ impl OAuthFetch {
         &self,
         target: &str,
         specific: &[(&str, &str)],
-    ) -> reqwest::header::HeaderMap {
+    ) -> Result<reqwest::header::HeaderMap, AdapterError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        let mut put = |key: &str, value: &str| {
-            if let (Ok(name), Ok(value)) = (
-                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                reqwest::header::HeaderValue::from_str(value),
-            ) {
-                headers.insert(name, value);
-            }
+        let mut put = |key: &str, value: &str| -> Result<(), AdapterError> {
+            // Upstream `new Headers(...)` throws on malformed configured
+            // headers (`Failed to resolve OAuth HTTP headers`,
+            // mcp-auth-fetch.ts:62-72); dropping a security header silently
+            // would fail open.
+            let name = reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
+                AdapterError::InvalidConfigValue("Failed to resolve OAuth HTTP headers".to_string())
+            })?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                AdapterError::InvalidConfigValue("Failed to resolve OAuth HTTP headers".to_string())
+            })?;
+            headers.insert(name, value);
+            Ok(())
         };
         for (key, value) in self.service_headers(target) {
-            put(&key, &value);
+            put(&key, &value)?;
         }
         for (key, value) in specific {
-            put(key, value);
+            put(key, value)?;
         }
-        headers
+        Ok(headers)
     }
 
     /// `#535`: a failed protected request reports a generic cause.
@@ -367,7 +373,7 @@ async fn discover_auth_server_metadata_with_override(
     let client = fetch.client(&metadata_url)?;
     let request = client
         .get(&metadata_url)
-        .headers(fetch.request_headers(&metadata_url, &[("accept", "application/json")]));
+        .headers(fetch.request_headers(&metadata_url, &[("accept", "application/json")])?);
     let response = request
         .send()
         .await
@@ -695,7 +701,7 @@ async fn register_client(
             ("content-type", "application/json"),
             ("accept", "application/json"),
         ],
-    ));
+    )?);
     let response = request
         .json(&body)
         .send()
@@ -746,7 +752,10 @@ async fn authenticate_client_credentials(
     if config.client_id.is_none() {
         if let Some(entry) = store.get_for_url(server_name, server_url)? {
             if entry.client_info.is_some() && entry.tokens.is_none() {
-                let _ = store.clear_client_info(server_name);
+                // Upstream awaits `clearClientInfo` and propagates failures
+                // (mcp-auth-flow.ts:469-474): a silent failure would let the
+                // second read reuse the dead registration below.
+                store.clear_client_info(server_name)?;
             }
         }
     }
@@ -815,7 +824,7 @@ async fn authenticate_client_credentials(
                 ("content-type", "application/x-www-form-urlencoded"),
                 ("accept", "application/json"),
             ],
-        ));
+        )?);
     let response = request
         .form(&body)
         .send()
@@ -1298,7 +1307,7 @@ async fn exchange_code(
 
     let response = client
         .post(token_endpoint)
-        .headers(fetch.request_headers(token_endpoint, &[("accept", "application/json")]))
+        .headers(fetch.request_headers(token_endpoint, &[("accept", "application/json")])?)
         .form(&form)
         .send()
         .await
@@ -1368,7 +1377,7 @@ async fn refresh_token(
 
     let response = client
         .post(token_endpoint)
-        .headers(fetch.request_headers(token_endpoint, &[("accept", "application/json")]))
+        .headers(fetch.request_headers(token_endpoint, &[("accept", "application/json")])?)
         .form(&form)
         .send()
         .await
@@ -1830,6 +1839,36 @@ pub async fn resolve_access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review round-2 F6: a malformed configured service header fails the
+    /// request with the upstream message (mcp-auth-fetch.ts:62-72) instead
+    /// of being silently dropped (a dropped security header fails open).
+    #[test]
+    fn malformed_configured_header_fails_closed() {
+        let definition = ServerEntry(
+            json!({
+                "url": "https://test/mcp",
+                "auth": "oauth",
+                "headers": { "bad name": "x" },
+                "oauth": {}
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        let fetch = OAuthFetch::new(&definition, "https://test/mcp", "srv");
+        let error = fetch
+            .request_headers("https://test/mcp", &[("accept", "application/json")])
+            .expect_err("a malformed header must fail");
+        assert!(
+            matches!(
+                &error,
+                AdapterError::InvalidConfigValue(message)
+                    if message == "Failed to resolve OAuth HTTP headers"
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
 
     #[test]
     fn code_verifier_is_valid_length() {

@@ -842,6 +842,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn wsl_temp_file_is_created_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let path = std::env::temp_dir().join(format!("rpi-wsl-mode-test-{unique}.txt"));
+        let _ = std::fs::remove_file(&path);
+        write_private_temp_file(&path, b"secret").expect("write temp file");
+        let mode = std::fs::metadata(&path)
+            .expect("stat temp file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the WSL temp file must be 0600 from open");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn real_runner_query_returns_stdout_bytes() {
         // The `wslpath -w` leg depends on this: a query call (no stdin
         // input) must return the command's real stdout.
