@@ -358,10 +358,17 @@ impl InteractiveUi {
     /// terminal.
     fn copy_to_clipboard(&self, text: &str) -> Result<(), String> {
         let env = self.clipboard_env();
+        let mut runner_guard = lock(&self.clipboard_runner_override);
+        let runner = runner_guard.as_mut();
         self.ui.with_terminal(|terminal| {
-            crate::modes::interactive::clipboard::copy_to_clipboard(text, &env, &mut |payload| {
-                terminal.write(payload);
-            })
+            crate::modes::interactive::clipboard::copy_to_clipboard_with_runner(
+                text,
+                &env,
+                runner,
+                &mut |payload| {
+                    terminal.write(payload);
+                },
+            )
         })
     }
 
@@ -1006,6 +1013,13 @@ mod tests {
                 wsl: false,
                 windows_terminal: false,
             });
+        // Hermetic: a runner that fails every platform command, so the
+        // desktop guidance arm is reached regardless of what the host has
+        // installed (a real xclip would otherwise succeed and flip this to
+        // "Copied").
+        let failing: crate::modes::interactive::clipboard::ClipboardRunnerOverride =
+            Box::new(|_program, _args, _input, _timeout_ms| None);
+        *lock(&ui.clipboard_runner_override) = Some(failing);
         ui.session().agent().set_messages(vec![assistant_message(
             vec![text_content("hello")],
             StopReason::Stop,

@@ -6596,6 +6596,9 @@ mod tests {
         fn frame_output(wezterm: bool) -> String {
             let _caps = CapsGuard::kitty();
             let _wezterm_pane = EnvGuard::set("WEZTERM_PANE", wezterm.then_some("1"));
+            // Hermetic: a host running the suite inside WezTerm sets
+            // TERM_PROGRAM=WezTerm, which alone satisfies `is_wezterm_env()`.
+            let _term_program = EnvGuard::set("TERM_PROGRAM", None);
             let terminal = RecordingTerminal::new(20, 4);
             let tui = TuiAltScreen::new(Box::new(terminal.clone()));
             let image_id = 321u32;

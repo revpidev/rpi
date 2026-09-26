@@ -263,6 +263,12 @@ fn assert_no_rpi_subagent_children() -> bool {
 
 #[test]
 fn e2e_fixed_child_full_pipeline() {
+    // Hermetic against an ambient parent-session env (the suite itself may
+    // run inside a subagent): the launcher derives the child depth from
+    // `RPI_SUBAGENT_DEPTH`, so an inherited value would make the env dump
+    // below assert depth 2. Single-test binary — the process env is
+    // contained.
+    std::env::remove_var("RPI_SUBAGENT_DEPTH");
     let sandbox = Sandbox::new();
     let host = Arc::new(FakeHost {
         cwd: sandbox.project.clone(),

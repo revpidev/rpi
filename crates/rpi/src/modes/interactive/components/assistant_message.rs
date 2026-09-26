@@ -909,6 +909,30 @@ mod tests {
                 2 + (grown - 1),
                 "delta {grown}: only the changed text block rebuilds"
             );
+            if grown == 26 {
+                // Byte parity DURING the reuse path: the final comparison
+                // below flips `is_streaming`, which changes the global key
+                // and rebuilds every slot — so compare against a fresh
+                // STREAMING component while the reused slots are live.
+                let before = MARKDOWN_COUNT.with(|c| c.get());
+                let mut fresh_streaming = AssistantMessageComponent::new(
+                    None,
+                    false,
+                    theme(),
+                    markdown_theme(&load_theme("dark", None).unwrap()),
+                    "Thinking...",
+                    1,
+                    Vec::new(),
+                );
+                fresh_streaming.update_content(&arc_mk(26), true);
+                assert_eq!(MARKDOWN_COUNT.with(|c| c.get()), before + 2);
+                assert_eq!(
+                    component.render(100),
+                    fresh_streaming.render(100),
+                    "reused slots must render byte-identically mid-stream"
+                );
+                MARKDOWN_COUNT.with(|c| c.set(before));
+            }
         }
 
         // Frame parity: streamed component vs a fresh one with the final

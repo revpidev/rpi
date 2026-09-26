@@ -469,12 +469,22 @@ const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS: u64 = 20;
 /// Default autocomplete trigger characters (editor.ts:244).
 const DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS: [char; 2] = ['@', '#'];
 
-/// Separator class contents shared by the trigger/debounce patterns (#9746
-/// `bfa686240`): JS whitespace + CJK punctuation — `autocompleteSeparatorRegex`
-/// (utils.rs). Unquoted completion suffixes negate the same set. Kept in
-/// sync with [`crate::utils::CJK_PUNCTUATION_CLASS_CONTENT`] (editor tests
-/// assert the composition).
-const AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT: &str = r"\t\n\v\f\r \u{00a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}\u{00B7}\u{3001}-\u{3003}\u{3008}-\u{3011}\u{3014}-\u{301F}\u{3030}\u{303D}\u{30A0}\u{30FB}\u{FE45}-\u{FE46}\u{FF61}-\u{FF65}\u{16FE2}\u{FF0C}\u{FF0E}\u{FF1A}\u{FF1B}\u{FF01}\u{FF1F}\u{FF08}\u{FF09}\u{FF3B}\u{FF3D}\u{FF5B}\u{FF5D}\u{201C}\u{201D}\u{2018}\u{2019}\u{2026}\u{2014}";
+/// JS whitespace half of `autocompleteSeparatorRegex` (utils.ts:63); the CJK
+/// punctuation half is [`crate::utils::CJK_PUNCTUATION_CLASS_CONTENT`],
+/// composed at pattern-build time so the two tables can never drift
+/// (`autocomplete_separator_class_matches_the_utility_predicate` pins the
+/// composition against `utils::is_autocomplete_separator`). Unquoted
+/// completion suffixes negate the same set.
+const AUTOCOMPLETE_SEPARATOR_WHITESPACE_CLASS_CONTENT: &str =
+    r"\t\n\v\f\r \u{00a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}";
+
+/// The full separator class contents (whitespace + CJK punctuation).
+fn autocomplete_separator_class_content() -> String {
+    format!(
+        "{AUTOCOMPLETE_SEPARATOR_WHITESPACE_CLASS_CONTENT}{}",
+        crate::utils::CJK_PUNCTUATION_CLASS_CONTENT
+    )
+}
 
 /// `escapeCharacterClass` (editor.ts:246-248).
 fn escape_character_class(value: char) -> String {
@@ -494,8 +504,9 @@ fn build_trigger_pattern(trigger_characters: &[char]) -> Regex {
         .iter()
         .map(|c| escape_character_class(*c))
         .collect();
+    let separator = autocomplete_separator_class_content();
     Regex::new(&format!(
-        r#"(?:^|[{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}])(?:@\"[^\"]*|[{class}][^{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}]*)$"#
+        r#"(?:^|[{separator}])(?:@\"[^\"]*|[{class}][^{separator}]*)$"#
     ))
     .expect("static trigger pattern")
 }
@@ -507,8 +518,9 @@ fn build_debounce_pattern(trigger_characters: &[char]) -> Regex {
         .filter(|c| **c != '@')
         .map(|c| escape_character_class(*c))
         .collect();
+    let separator = autocomplete_separator_class_content();
     Regex::new(&format!(
-        r#"(?:^|[{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}])(?:@(?:\"[^\"]*|[^{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}]*)|[{escaped_without_at}][^{AUTOCOMPLETE_SEPARATOR_CLASS_CONTENT}]*)$"#
+        r#"(?:^|[{separator}])(?:@(?:\"[^\"]*|[^{separator}]*)|[{escaped_without_at}][^{separator}]*)$"#
     ))
     .expect("static debounce pattern")
 }
@@ -6688,6 +6700,28 @@ mod tests {
     // ---------------------------------------------------------------------
     // CJK punctuation boundaries (#9746, `bfa686240`)
     // ---------------------------------------------------------------------
+
+    /// Review follow-up: the editor's separator class (shared whitespace
+    /// constant + `utils::CJK_PUNCTUATION_CLASS_CONTENT`) and the utility
+    /// predicate `is_autocomplete_separator` must agree over the whole BMP
+    /// and the supplementary CJK ranges — before this pin the class was a
+    /// second literal copy that could drift silently.
+    #[test]
+    fn autocomplete_separator_class_matches_the_utility_predicate() {
+        let separator = autocomplete_separator_class_content();
+        let re = Regex::new(&format!("^[{separator}]$")).expect("separator class");
+        for code in 0u32..=0x2FFFF {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let in_class = re.is_match(&c.to_string());
+            let is_separator = crate::utils::is_autocomplete_separator(c);
+            assert_eq!(
+                in_class, is_separator,
+                "U+{code:04X} separator class / predicate drift"
+            );
+        }
+    }
 
     /// #9746: the trigger/debounce patterns treat CJK punctuation (and
     /// ideographic space) as boundaries; CJK letters are prose, and

@@ -1319,6 +1319,10 @@ pub(crate) struct InteractiveUi {
     /// live snapshot per call ([`Self::clipboard_env`]). Shared with the
     /// fullscreen `copySelection` closure so both doors see the same env.
     pub(crate) clipboard_env_override: Arc<Mutex<Option<clipboard::ClipboardEnv>>>,
+    /// Test-only injected clipboard command runner (`clipboard_env_override`
+    /// precedent): lets the UI copy paths run the full chain without
+    /// touching the host clipboard.
+    pub(crate) clipboard_runner_override: Arc<Mutex<Option<clipboard::ClipboardRunnerOverride>>>,
     /// The active selector entry, if any (T12-S5a).
     active_selector: Mutex<Option<SharedComponent>>,
     /// Weak self-reference for callbacks that need the `Arc<InteractiveUi>`
@@ -4546,6 +4550,8 @@ impl InteractiveMode {
         // owned by InteractiveUi afterwards.
         let clipboard_env_override: Arc<Mutex<Option<clipboard::ClipboardEnv>>> =
             Arc::new(Mutex::new(None));
+        let clipboard_runner_override: Arc<Mutex<Option<clipboard::ClipboardRunnerOverride>>> =
+            Arc::new(Mutex::new(None));
         let agent_dir = runtime.services().agent_dir.clone();
         let show_hardware_cursor =
             session.settings_manager(|settings| settings.get_show_hardware_cursor());
@@ -4686,6 +4692,7 @@ impl InteractiveMode {
             custom_header: Mutex::new(None),
             custom_footer: Mutex::new(None),
             clipboard_env_override,
+            clipboard_runner_override,
             active_selector: Mutex::new(None),
             self_arc: Mutex::new(None),
             extension_ui_bridge: Mutex::new(None),
@@ -8744,7 +8751,19 @@ mod tests {
         let (mut mode, terminal, session) = mode_harness().await;
         mode.init().await;
         let ui = &mode.ui_state;
-
+        // Hermetic headless-Linux env: the empty platform-command list makes
+        // OSC 52 the deterministic route on every host (a desktop with a
+        // real xclip would otherwise copy locally and emit none).
+        *lock(&ui.clipboard_env_override) =
+            Some(crate::modes::interactive::clipboard::ClipboardEnv {
+                platform: crate::modes::interactive::clipboard::ClipboardPlatform::Linux,
+                remote_session: false,
+                termux: false,
+                wayland: false,
+                x11: false,
+                wsl: false,
+                windows_terminal: false,
+            });
         // An assistant message on the agent backs the message-copy path; the
         // selection target is whatever the transcript renders (the header
         // row suffices).

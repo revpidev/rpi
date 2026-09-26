@@ -73,6 +73,21 @@ async fn each_native_plugin_gets_its_own_module_table() {
     // resolution; this binary runs a single test, so the process-wide env is
     // contained (TE37 hardening).
     std::env::set_var("MCP_DIRECT_TOOLS", "__none__");
+    // The subagents cdylib splits on `RPI_SUBAGENT_CHILD` at load time: a
+    // gate run from inside a subagent session (ambient RPI_SUBAGENT_CHILD=1)
+    // would load it in child mode and register only `contact_supervisor`.
+    // Scrub the inherited family before loading (single-test binary, so the
+    // process-wide env is contained).
+    for name in [
+        "RPI_SUBAGENT_CHILD",
+        "RPI_SUBAGENT_FANOUT_CHILD",
+        "RPI_SUBAGENT_DEPTH",
+        "RPI_SUBAGENT_MAX_DEPTH",
+        "RPI_SUBAGENT_CHILD_AGENT",
+        "RPI_SUBAGENT_CHILD_INDEX",
+    ] {
+        std::env::remove_var(name);
+    }
     let plugin_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");

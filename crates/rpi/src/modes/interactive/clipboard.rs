@@ -228,9 +228,7 @@ pub(crate) fn copy_to_clipboard_via(
 /// mangles non-ASCII UTF-8.
 fn copy_via_windows_clipboard(text: &str, run_command: RunClipboardCommand<'_>) -> bool {
     let tmp_file = std::env::temp_dir().join(format!("rpi-wsl-clip-{}.txt", wsl_clip_uuid()));
-    let write = std::fs::write(&tmp_file, text.as_bytes());
-    // chmod 0600 — best effort (Windows mount semantics differ).
-    let _ = set_private_mode(&tmp_file);
+    let write = write_private_temp_file(&tmp_file, text.as_bytes());
     let result = (|| {
         write.ok()?;
         let win_path = run_command(
@@ -272,15 +270,27 @@ fn wsl_clip_uuid() -> String {
     format!("{nanos:x}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-/// `writeFileSync(..., { mode: 0o600 })` — Unix-only.
-#[cfg(unix)]
-fn set_private_mode(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-#[cfg(not(unix))]
-fn set_private_mode(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
+/// Create the WSL clipboard temp file with mode 0600 ATOMICALLY on Unix
+/// (upstream `writeFileSync(tmpFile, text, { mode: 0o600 })`): the previous
+/// write-then-chmod left a umask-permission window (and a persistent 0644
+/// file if the process died in between). Windows mounts have no POSIX mode.
+fn write_private_temp_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
 }
 
 /// `runClipboardCommand` (clipboard-command.ts) for the write path.
@@ -373,6 +383,11 @@ pub(crate) fn run_clipboard_write_command(
     })
 }
 
+/// Test-injectable command runner (boxed for storage in the UI state;
+/// `clipboard_env_override` precedent). Production code leaves it `None`.
+pub(crate) type ClipboardRunnerOverride =
+    Box<dyn FnMut(&str, &[&str], Option<&str>, u64) -> Option<Vec<u8>> + Send>;
+
 /// The production entry: live environment snapshot, real command runner,
 /// OSC 52 delivered through `write_osc52` (the caller's terminal handle).
 pub(crate) fn copy_to_clipboard(
@@ -380,18 +395,30 @@ pub(crate) fn copy_to_clipboard(
     env: &ClipboardEnv,
     write_osc52: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
-    copy_to_clipboard_via(
-        text,
-        env,
-        &mut |program, args, input, timeout_ms| {
-            run_clipboard_write_command(program, args, input, timeout_ms)
-        },
-        &mut |_text| {
-            emit_osc52_with_cap(text)
-                .map(|payload| write_osc52(&payload))
-                .is_ok()
-        },
-    )
+    copy_to_clipboard_with_runner(text, env, None, write_osc52)
+}
+
+/// [`copy_to_clipboard`] with an injectable command runner (test seam):
+/// `None` runs the real platform commands; `Some` lets tests exercise the
+/// full chain deterministically without touching the host clipboard.
+pub(crate) fn copy_to_clipboard_with_runner(
+    text: &str,
+    env: &ClipboardEnv,
+    runner: Option<&mut ClipboardRunnerOverride>,
+    write_osc52: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let mut production = |program: &str, args: &[&str], input: Option<&str>, timeout_ms: u64| {
+        run_clipboard_write_command(program, args, input, timeout_ms)
+    };
+    let run: RunClipboardCommand<'_> = match runner {
+        Some(runner) => runner,
+        None => &mut production,
+    };
+    copy_to_clipboard_via(text, env, run, &mut |_text| {
+        emit_osc52_with_cap(text)
+            .map(|payload| write_osc52(&payload))
+            .is_ok()
+    })
 }
 
 #[cfg(test)]
@@ -853,7 +880,7 @@ mod tests {
         let cat = executable_script(
             &dir,
             "cat-writer",
-            "#!/bin/sh\ncat >/dev/null\n(sleep 20 >/dev/null 2>&1 &)\nexit 0\n",
+            "#!/bin/sh\ncat >/dev/null\n(sleep 20 &)\nexit 0\n",
         );
         let start = std::time::Instant::now();
         let out =
