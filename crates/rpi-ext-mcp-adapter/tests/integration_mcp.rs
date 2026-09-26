@@ -1073,6 +1073,55 @@ async fn direct_tools_resolve_execute_and_sync() {
         assert_eq!(guard["truncated"], json!(true));
         let _ = std::fs::remove_file(guard["fullOutputPath"].as_str().unwrap_or_default());
 
+        // #502: the connect-discovered direct tools ride the tool-result
+        // TOP LEVEL (upstream `{ ...result, addedToolNames }`), NOT under
+        // details — a revert to details nesting fails both asserts. The
+        // host supplies the names through the `on_connect_report` hook
+        // (each server's discovery names are consumed once, index.ts
+        // connectAndReport) — injected here the same way lib.rs wires it.
+        dispatcher.set_hooks(rpi_ext_mcp_adapter::proxy::DispatcherHooks {
+            on_connect_report: Some(Arc::new(|server: &str| {
+                if server == "fixture" {
+                    vec![
+                        "fixture_echo".to_string(),
+                        "fixture_fail".to_string(),
+                        "fixture_read_config".to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                }
+            })),
+            ..Default::default()
+        });
+        let connect = dispatcher
+            .execute(&json!({ "connect": "fixture" }), &[])
+            .await;
+        let mut added = connect["addedToolNames"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        added.sort();
+        assert_eq!(
+            added,
+            vec![
+                "fixture_echo".to_string(),
+                "fixture_fail".to_string(),
+                "fixture_read_config".to_string()
+            ],
+            "addedToolNames at the result top level; connect result: {connect}"
+        );
+        assert!(
+            connect
+                .get("details")
+                .and_then(|d| d.get("addedToolNames"))
+                .is_none(),
+            "the old details.addedToolNames position must stay gone"
+        );
+
         dispatcher.shutdown().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!pid_alive(&pid), "children reaped (G4)");

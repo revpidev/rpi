@@ -1105,7 +1105,7 @@ mod tests {
         );
     }
 
-    /// I-3 (复核): the dialog preview normalizes null/absent args to `{}` and
+    /// I-3 (re-verification): the dialog preview normalizes null/absent args to `{}` and
     /// caps the sanitized text at 500 chars + `...` (tool-approval.ts:160-165
     /// @ 928c30c).
     #[test]

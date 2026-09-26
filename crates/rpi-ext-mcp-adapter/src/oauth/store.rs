@@ -5,8 +5,10 @@
 //! fallback when the OS credential store is unavailable.
 //!
 //! Service name: `rpi-mcp-adapter.oauth` [VARIANT — upstream uses
-//! `pi-mcp-adapter.oauth`]; account naming and chunk format are byte-for-byte
-//! identical to the upstream to preserve format-level interoperability.
+//! `pi-mcp-adapter.oauth`]; account naming and the chunk format match the
+//! upstream for ASCII/BMP payloads (both count CHARACTERS — JS UTF-16
+//! units vs Rust chars — so astral-plane characters shift chunk
+//! boundaries; see the note on `should_chunk_auth_payload`).
 //!
 //! **Security**: resolved token values MUST NEVER reach tracing logs or spill
 //! files (G4 red line). The `AuthEntry` type deliberately has no `Debug`
@@ -1020,6 +1022,44 @@ mod tests {
             Some("refresh-456")
         );
         assert_eq!(read.server_url.as_deref(), Some("https://example.test/mcp"));
+    }
+
+    #[test]
+    fn get_for_url_hides_entries_stored_under_a_different_url() {
+        // getAuthForUrl scoping (#503/mcp-auth-flow.ts:556): a registration
+        // stored under server A's URL is invisible to server B — neither
+        // reused against the new authorization server nor destructively
+        // cleared when it looks dead.
+        let store = MemorySecretStore::new();
+        let cred_store =
+            OAuthCredentialStore::with_backend(Box::new(store), AuthStorageOptions::default());
+        let entry = AuthEntry {
+            client_info: Some(StoredClientInfo {
+                client_id: "old-client".to_string(),
+                ..Default::default()
+            }),
+            tokens: None,
+            server_url: Some("https://a.test/mcp".to_string()),
+            ..Default::default()
+        };
+        cred_store.save_entry("srv", entry, None).unwrap();
+
+        assert!(
+            cred_store
+                .get_for_url("srv", "https://a.test/mcp")
+                .unwrap()
+                .is_some(),
+            "the matching URL sees the entry"
+        );
+        assert!(
+            cred_store
+                .get_for_url("srv", "https://b.test/mcp")
+                .unwrap()
+                .is_none(),
+            "a different server URL must not see (or clear) the entry"
+        );
+        // The entry survives for the original URL.
+        assert!(cred_store.get_entry("srv").unwrap().is_some());
     }
 
     #[test]

@@ -585,11 +585,9 @@ fn validate_oauth_config(config: &OAuthConfig) -> Result<(), AdapterError> {
                 "OAuth clientMetadataUrl must not be empty".to_string(),
             ));
         }
-        if config.client_id.is_none() && config.client_secret.is_some() {
-            return Err(AdapterError::InvalidConfigValue(
-                "clientSecret requires an explicit clientId".to_string(),
-            ));
-        }
+        // Upstream validates the URL itself first (mcp-auth-flow.ts:219
+        // validateClientMetadataUrl), before the clientSecret combination
+        // rule from the provider constructor.
         let valid = url::Url::parse(metadata_url)
             .ok()
             .filter(|parsed| {
@@ -599,6 +597,11 @@ fn validate_oauth_config(config: &OAuthConfig) -> Result<(), AdapterError> {
         if !valid {
             return Err(AdapterError::InvalidConfigValue(
                 "clientMetadataUrl must be a valid HTTPS URL with a non-root pathname".to_string(),
+            ));
+        }
+        if config.client_id.is_none() && config.client_secret.is_some() {
+            return Err(AdapterError::InvalidConfigValue(
+                "clientSecret requires an explicit clientId".to_string(),
             ));
         }
     }
@@ -1080,7 +1083,12 @@ pub async fn authenticate_with_store(
     let client_id = match &config.client_id {
         Some(id) => id.clone(),
         None => {
-            let stored_entry = store.get_entry(server_name)?;
+            // `getAuthForUrl` scoping (mcp-auth-flow.ts:556 — the upstream
+            // interactive leg reads the stored auth through the URL-matched
+            // entry): a registration stored under a DIFFERENT server URL is
+            // invisible here — neither reused against the new authorization
+            // server nor destructively cleared when it looks dead.
+            let stored_entry = store.get_for_url(server_name, server_url)?;
             let refresh_capable = stored_entry
                 .as_ref()
                 .and_then(|entry| entry.tokens.as_ref())
@@ -1842,6 +1850,96 @@ mod tests {
         let config = parse_oauth_config(&entry);
         assert_eq!(config.grant_type, "authorization_code");
         assert!(config.client_id.is_none());
+    }
+
+    #[test]
+    fn client_metadata_url_interpolates_env_and_trims() {
+        // #571 (mcp-auth-flow.ts:213-219): the URL is env-interpolated and
+        // trimmed at parse; an interpolation that empties it is rejected
+        // at the auth boundary (an unset env var must not silently change
+        // the CIMD surface).
+        std::env::set_var("RPI_TEST_CIMD_HOST", "cimd.example.test");
+        let entry = ServerEntry(
+            json!({
+                "url": "https://test/mcp",
+                "oauth": {
+                    "clientMetadataUrl": "  https://${RPI_TEST_CIMD_HOST}/client.json \n"
+                }
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        let config = parse_oauth_config(&entry);
+        assert_eq!(
+            config.client_metadata_url.as_deref(),
+            Some("https://cimd.example.test/client.json")
+        );
+        std::env::remove_var("RPI_TEST_CIMD_HOST");
+
+        let unset = ServerEntry(
+            json!({
+                "url": "https://test/mcp",
+                "oauth": { "clientMetadataUrl": "${RPI_TEST_CIMD_UNSET_HOST}" }
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        let config = parse_oauth_config(&unset);
+        assert_eq!(config.client_metadata_url.as_deref(), Some(""));
+        assert!(
+            matches!(
+                validate_oauth_config(&config),
+                Err(AdapterError::InvalidConfigValue(message))
+                    if message.contains("must not be empty")
+            ),
+            "an env-interpolated empty URL is rejected"
+        );
+    }
+
+    #[test]
+    fn registration_reusable_gate_matches_the_503_semantics() {
+        // #503 (mcp-auth-flow.ts:556-573): orphaned registrations are dead;
+        // with tokens, reuse only when the stored redirect_uris contain the
+        // current callback or the pair is refresh-capable; an absent list
+        // never matches.
+        let info = |uris: Option<Vec<String>>| store::StoredClientInfo {
+            client_id: "client-1".to_string(),
+            redirect_uris: uris,
+            ..Default::default()
+        };
+        let callback = "http://127.0.0.1:19876/callback";
+        // Orphaned (no tokens): dead even with a matching redirect.
+        assert!(!registration_reusable(
+            &info(Some(vec![callback.to_string()])),
+            false,
+            true,
+            callback
+        ));
+        // Tokens + matching redirect: reusable.
+        assert!(registration_reusable(
+            &info(Some(vec![callback.to_string()])),
+            true,
+            false,
+            callback
+        ));
+        // Tokens + stale redirect but refresh-capable: reusable.
+        assert!(registration_reusable(
+            &info(Some(vec!["https://old.test/cb".to_string()])),
+            true,
+            true,
+            callback
+        ));
+        // Tokens + stale redirect + not refresh-capable: dead (cleared).
+        assert!(!registration_reusable(
+            &info(Some(vec!["https://old.test/cb".to_string()])),
+            true,
+            false,
+            callback
+        ));
+        // An absent redirect list never matches.
+        assert!(!registration_reusable(&info(None), true, false, callback));
     }
 
     #[test]

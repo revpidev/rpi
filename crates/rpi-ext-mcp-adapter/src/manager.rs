@@ -1651,9 +1651,10 @@ fn is_literal_local_address(server_url: &str) -> bool {
 fn local_network_failure_codes(message: &str) -> Vec<&'static str> {
     let lowered = message.to_ascii_lowercase();
     let mut codes = Vec::new();
-    // EHOSTUNREACH: strerror "No route to host"; ErrorKind Debug
-    // "HostUnreachable" (lowercased, no space) also covered by the
-    // errno-name form.
+    // EHOSTUNREACH: strerror "No route to host" (the ErrorKind Debug
+    // form "HostUnreachable" matches NONE of these needles — transports
+    // that surface Debug text would need their own needle; none does
+    // today).
     if lowered.contains("no route to host")
         || lowered.contains("ehostunreachable")
         || lowered.contains("host unreachable")
