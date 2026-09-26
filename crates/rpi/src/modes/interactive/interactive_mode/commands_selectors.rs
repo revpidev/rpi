@@ -2543,20 +2543,6 @@ impl InteractiveMode {
         // rebuild and the subscription.
         self.unsubscribe = Some(self.ui_state.subscribe_to_agent());
 
-        // `bindCurrentSessionExtensions` (interactive-mode.ts:1744).
-        session
-            .bind_extensions(ExtensionBindings {
-                mode: None,
-                on_error: None,
-                shutdown: Some({
-                    let shutdown_tx = self.ui_state.shutdown_tx.clone();
-                    std::sync::Arc::new(move || {
-                        let _ = shutdown_tx.send(true);
-                    })
-                }),
-            })
-            .await;
-
         // The rest of `bindCurrentSessionExtensions` (interactive-mode.ts
         // :1817-1892) re-attaches the extension UI context
         // (`bindExtensions({ uiContext, mode: "tui" })`, :1818-1821) and the
@@ -2567,6 +2553,13 @@ impl InteractiveMode {
         // status-bar entries (e.g. the mcp-adapter's "mcp" key) and widgets
         // silently no-op after `/new` / `/resume` / `/clone` / `/fork` /
         // `/import`.
+        //
+        // ORDERING (rc.2, upstream parity): the UI attach must run BEFORE
+        // the `bind_extensions` call — upstream binds the two atomically
+        // (`bindExtensions({ uiContext, mode: "tui" })`), and the
+        // `session_start` dispatched by `bind_extensions` must see the UI
+        // (same fix as `init`; the inverted order was found in v0.1.5-rc.1
+        // field verification via rpiv-todo's never-claimed overlay).
         {
             let runner = session.extension_runner();
             if let Some(host) = runner
@@ -2587,6 +2580,22 @@ impl InteractiveMode {
                 host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
             }
         }
+
+        // `bindCurrentSessionExtensions` (interactive-mode.ts:1744) — the
+        // extension bindings fire `session_start` with the UI attached.
+        session
+            .bind_extensions(ExtensionBindings {
+                mode: None,
+                on_error: None,
+                shutdown: Some({
+                    let shutdown_tx = self.ui_state.shutdown_tx.clone();
+                    std::sync::Arc::new(move || {
+                        let _ = shutdown_tx.send(true);
+                    })
+                }),
+            })
+            .await;
+
         // `setupExtensionShortcuts(extensionRunner)` (interactive-mode.ts:1889)
         // — the hook consults the CURRENT session's runner.
         crate::modes::interactive::extension_shortcuts::install_extension_shortcuts(

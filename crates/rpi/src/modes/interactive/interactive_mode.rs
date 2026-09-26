@@ -4791,8 +4791,39 @@ impl InteractiveMode {
         }
         self.is_initialized = true;
 
+        // `setUIContext(createExtensionUIContext(), "tui")` (T15 W4): the
+        // interactive bridge on the session's extension host. The bridge is
+        // also kept on the UI for the theme-replay callback (TE11 FR-E.3).
+        //
+        // ORDERING (rc.2, upstream parity): upstream binds extensions and
+        // the UI context ATOMICALLY (`bindExtensions({ uiContext, mode:
+        // "tui" })`, interactive-mode.ts:1818-1821) — every `session_start`
+        // handler dispatches with the UI already attached. The rpi T15 W4
+        // port split the two (host-level `set_ui` + separate
+        // `bind_extensions`) and originally ran `bind_extensions` FIRST:
+        // `session_start` then fired with no UI bridge, so extensions that
+        // claim UI work at session start (rpiv-todo's overlay foreground
+        // claim) silently never ran — found in v0.1.5-rc.1 field
+        // verification. Attach the bridge BEFORE binding so the dispatch
+        // order matches upstream.
+        {
+            let runner = self.session.extension_runner();
+            if let Some(host) = runner
+                .as_any()
+                .and_then(|any| {
+                    any.downcast_ref::<crate::core::extension_host_adapter::ExtensionHostAdapter>()
+                })
+                .map(|adapter| adapter.host().clone())
+            {
+                let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&self.ui_state));
+                *lock(&self.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
+                host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
+            }
+        }
+
         // Extension bindings (interactive-mode.ts binds via
         // bindCurrentSessionExtensions; no explicit mode for interactive).
+        // Fires `session_start` — dispatched after the UI attach above.
         self.session
             .bind_extensions(ExtensionBindings {
                 mode: None,
@@ -4814,24 +4845,6 @@ impl InteractiveMode {
             &self.ui_state,
             &self.session,
         );
-
-        // `setUIContext(createExtensionUIContext(), "tui")` (T15 W4): the
-        // interactive bridge on the session's extension host. The bridge is
-        // also kept on the UI for the theme-replay callback (TE11 FR-E.3).
-        {
-            let runner = self.session.extension_runner();
-            if let Some(host) = runner
-                .as_any()
-                .and_then(|any| {
-                    any.downcast_ref::<crate::core::extension_host_adapter::ExtensionHostAdapter>()
-                })
-                .map(|adapter| adapter.host().clone())
-            {
-                let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&self.ui_state));
-                *lock(&self.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
-                host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
-            }
-        }
 
         // Install telemetry (interactive-mode.ts:685 →
         // `getChangelogForDisplay` 991-1014 → `reportInstallTelemetry`

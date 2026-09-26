@@ -1125,3 +1125,244 @@ async fn install_path_local_rpix_loads_tool_command_and_overlay() {
         "{lines:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression (v0.1.5-rc.1 field finding): the REAL mode boot order —
+// `set_ui` must attach the UI bridge BEFORE `bind_extensions` fires
+// `session_start`, or the overlay's foreground claim never runs. This test
+// boots the actual `InteractiveMode` (whose `init` performs both steps in
+// the production order) and asserts the overlay lands on the screen.
+// ---------------------------------------------------------------------------
+
+struct ModeTerm {
+    writes: Arc<Mutex<String>>,
+    input_handler: Arc<Mutex<Option<rpi_tui::terminal::InputHandler>>>,
+}
+
+impl ModeTerm {
+    fn new() -> Self {
+        ModeTerm {
+            writes: Arc::new(Mutex::new(String::new())),
+            input_handler: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn screen(&self) -> String {
+        rpi_test_support::vt::strip_ansi(
+            &self
+                .writes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+        )
+    }
+}
+
+impl Clone for ModeTerm {
+    fn clone(&self) -> Self {
+        ModeTerm {
+            writes: Arc::clone(&self.writes),
+            input_handler: Arc::clone(&self.input_handler),
+        }
+    }
+}
+
+impl rpi_tui::terminal::Terminal for ModeTerm {
+    fn start(
+        &mut self,
+        on_input: rpi_tui::terminal::InputHandler,
+        _on_resize: rpi_tui::terminal::ResizeHandler,
+    ) {
+        *self
+            .input_handler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(on_input);
+    }
+
+    fn stop(&mut self) {
+        *self
+            .input_handler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    fn drain_input(
+        &mut self,
+        _max_ms: Option<u64>,
+        _idle_ms: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
+    fn write(&mut self, data: &str) {
+        self.writes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push_str(data);
+    }
+
+    fn columns(&self) -> u16 {
+        100
+    }
+
+    fn rows(&self) -> u16 {
+        30
+    }
+
+    fn kitty_protocol_active(&self) -> bool {
+        false
+    }
+
+    fn move_by(&mut self, _lines: i32) {}
+    fn hide_cursor(&mut self) {}
+    fn show_cursor(&mut self) {}
+    fn clear_line(&mut self) {}
+    fn clear_from_cursor(&mut self) {}
+    fn clear_screen(&mut self) {}
+    fn set_title(&mut self, _title: &str) {}
+    fn set_progress(&mut self, _active: bool) {}
+    fn pump(&mut self, _timeout: Option<Duration>) -> bool {
+        std::thread::sleep(Duration::from_millis(2));
+        false
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_mode_boot_order_shows_the_todo_overlay() {
+    if plugin_path().is_none() {
+        return;
+    }
+    let _env = EnvHome::new("mode");
+    let sandbox = Sandbox::new("mode");
+    let Some(plugin) = plugin_path() else {
+        return;
+    };
+    install_plugin_for_discovery(&sandbox, &plugin);
+
+    let host = Arc::new(NativeExtensionHost::new(&sandbox.cwd().to_string_lossy()));
+    let load_errors = host
+        .load_startup_final(
+            sandbox.agent_dir(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        )
+        .await;
+    assert!(
+        load_errors.is_empty(),
+        "plugin load errors: {load_errors:?}"
+    );
+
+    // Raw session: NO set_ui and NO bind_extensions here — the real mode's
+    // init() owns both, in the production order under test.
+    let (model_runtime, model) = build_model_runtime(
+        &sandbox.agent_dir(),
+        vec![
+            todo_step("create", json!({"subject": "Boot order task"})),
+            text_step("Tracked."),
+        ],
+    )
+    .await;
+    let services = rpi::core::agent_session_services::create_agent_session_services(
+        rpi::core::agent_session_services::CreateAgentSessionServicesOptions {
+            cwd: sandbox.cwd(),
+            agent_dir: Some(sandbox.agent_dir()),
+            settings_manager: None,
+            model_runtime: Some(model_runtime.clone()),
+            extension_flag_values: Vec::new(),
+            resource_loader_options: None,
+        },
+    )
+    .await
+    .expect("services");
+    let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+        cwd: Some(sandbox.cwd()),
+        agent_dir: Some(sandbox.agent_dir()),
+        model_runtime: None,
+        model: Some(model),
+        services: Some(services.clone()),
+        session_manager: Some(Arc::new(Mutex::new(
+            rpi::core::session_manager::SessionManager::create(
+                &sandbox.cwd(),
+                Some(&sandbox.sessions()),
+                rpi::core::session_manager::NewSessionOptions::default(),
+            )
+            .expect("file-backed session"),
+        ))),
+        extension_host: Some(host.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("create session");
+    rpi::core::extension_actions::bind_session_actions(&host, &created.session).await;
+
+    let factory: rpi::core::agent_session_runtime::CreateAgentSessionRuntimeFactory = Arc::new(
+        |_options: rpi::core::agent_session_runtime::CreateRuntimeOptions| {
+            Box::pin(async { unreachable!("session replacement is not exercised here") })
+        },
+    );
+    let runtime = rpi::core::agent_session_runtime::AgentSessionRuntime::new(
+        created.session,
+        services,
+        factory,
+        Vec::new(),
+        None,
+    );
+    let term = ModeTerm::new();
+    let mut mode = rpi::modes::interactive::interactive_mode::InteractiveMode::with_terminal(
+        runtime,
+        rpi::modes::interactive::interactive_mode::InteractiveModeOptions {
+            initial_message: Some("go".to_owned()),
+            ..Default::default()
+        },
+        Box::new(ModeTerm::clone(&term)),
+    );
+    let shutdown = mode.shutdown_sender();
+    // `InteractiveMode` is not `Send` (the unsubscribe `Box<dyn FnOnce()>`);
+    // run the real mode loop on a dedicated thread with its own
+    // current-thread runtime (ask_user_question_e2e precedent).
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let run_thread = std::thread::Builder::new()
+        .name("todo-e2e-mode".to_string())
+        .spawn(move || {
+            let thread_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("mode runtime");
+            thread_runtime.block_on(async move {
+                mode.run().await;
+            });
+            let _ = done_tx.send(());
+        })
+        .expect("spawn mode thread");
+
+    // The overlay must reach the screen: the mode's init() attaches the UI
+    // bridge and THEN fires session_start (the rc.1 bug inverted this, so
+    // the foreground claim — and with it every widget push — never ran).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let screen = term.screen();
+        if screen.contains("Todos (0/1)") && screen.contains("Boot order task") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "overlay never reached the screen; last screen:\n{}",
+            term.screen()
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = shutdown.send(true);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if done_rx.try_recv().is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "mode.run() did not exit");
+        sleep(Duration::from_millis(25)).await;
+    }
+    let _ = run_thread.join();
+}
