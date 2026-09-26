@@ -892,6 +892,147 @@ async fn oauth_service_headers_ride_token_exchange_and_refresh() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Review P2: the client_credentials grant reuses the URL-scoped stored
+/// registration and forwards its DCR-issued `client_secret` to the token
+/// endpoint (upstream mcp-oauth-provider.ts:774-784). A token-less stored
+/// registration is cleared as dead first (mcp-auth-flow.ts:469-474); an
+/// expired-but-tokened one is reused.
+#[tokio::test]
+async fn client_credentials_forwards_stored_registration_secret() {
+    let stub = spawn_oauth_stub().await;
+    let server_url = format!("{}/mcp", stub.base());
+
+    let dir = temp_dir("oauth-client-credentials");
+    let store = OAuthCredentialStore::with_backend(
+        Box::new(MemorySecretStore::new()),
+        AuthStorageOptions {
+            base_dir: Some(dir.clone()),
+            credential_store: None,
+        },
+    );
+    // Expired tokens (no refresh token → the flow falls through to the
+    // client_credentials grant) plus the stored registration.
+    store
+        .save_entry(
+            "demo",
+            AuthEntry {
+                tokens: Some(StoredTokens {
+                    access_token: "expired-access".to_string(),
+                    refresh_token: None,
+                    expires_at: Some(1.0),
+                    issuer: Some(stub.base()),
+                    ..Default::default()
+                }),
+                client_info: Some(StoredClientInfo {
+                    client_id: "stored-client".to_string(),
+                    client_secret: Some("stored-secret".to_string()),
+                    redirect_uris: Some(vec!["http://localhost:1/callback".to_string()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(&server_url),
+        )
+        .expect("seed expired credentials");
+
+    let definition = entry(json!({
+        "url": server_url,
+        "auth": "oauth",
+        "oauth": { "grantType": "client_credentials" },
+    }));
+    let status = authenticate_with_store(
+        &store,
+        "demo",
+        &server_url,
+        &definition,
+        &AuthenticateOptions::default(),
+    )
+    .await
+    .expect("client_credentials authenticate");
+    assert!(format!("{status:?}").contains("Authenticated"));
+
+    let requests = stub.requests();
+    let token = requests
+        .iter()
+        .find(|r| r["kind"] == "token")
+        .expect("token request recorded");
+    assert_eq!(token["params"]["grant_type"], json!("client_credentials"));
+    assert_eq!(token["params"]["client_id"], json!("stored-client"));
+    assert_eq!(
+        token["params"]["client_secret"],
+        json!("stored-secret"),
+        "the stored registration's secret must ride the token request: {token}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review P2: the client_credentials registration read is URL-scoped
+/// (`getAuthForUrl`, mcp-oauth-provider.ts:399) — a registration stored for
+/// another server URL is invisible, so the flow registers fresh.
+#[tokio::test]
+async fn client_credentials_ignores_registration_stored_under_another_url() {
+    let stub = spawn_oauth_stub().await;
+    let server_url = format!("{}/mcp", stub.base());
+
+    let dir = temp_dir("oauth-client-credentials-url-scope");
+    let store = OAuthCredentialStore::with_backend(
+        Box::new(MemorySecretStore::new()),
+        AuthStorageOptions {
+            base_dir: Some(dir.clone()),
+            credential_store: None,
+        },
+    );
+    store
+        .save_entry(
+            "demo",
+            AuthEntry {
+                client_info: Some(StoredClientInfo {
+                    client_id: "other-url-client".to_string(),
+                    client_secret: Some("other-url-secret".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some("https://other.test/mcp"),
+        )
+        .expect("seed other-url registration");
+
+    let definition = entry(json!({
+        "url": server_url,
+        "auth": "oauth",
+        "oauth": { "grantType": "client_credentials" },
+    }));
+    let status = authenticate_with_store(
+        &store,
+        "demo",
+        &server_url,
+        &definition,
+        &AuthenticateOptions::default(),
+    )
+    .await
+    .expect("client_credentials authenticate");
+    assert!(format!("{status:?}").contains("Authenticated"));
+
+    let requests = stub.requests();
+    assert!(
+        requests.iter().any(|r| r["kind"] == "register"),
+        "a different-URL registration must not be reused: {requests:?}"
+    );
+    let token = requests
+        .iter()
+        .find(|r| r["kind"] == "token")
+        .expect("token request recorded");
+    assert_eq!(token["params"]["client_id"], json!("new-dynamic-client"));
+    assert_eq!(
+        token["params"]["client_secret"],
+        json!("new-dynamic-secret"),
+        "the fresh DCR secret rides the token request: {token}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ============================================================================
 // A9 / R7.2.6.1（#446）：`tools/list` 的 ttlMs/cacheScope 写盘接线
 // ============================================================================

@@ -3136,6 +3136,37 @@ pub async fn execute_call(
         }
     }
 
+    // #602 (89c1b07, proxy-modes.ts proxyArgumentValidationError @
+    // 97435aab): validate the arguments against the advertised schema
+    // BEFORE approval and dispatch (`proxy-modes.ts:1411` precedes
+    // `ensureToolCallApproved` at :1423). A failure is a local call_failed
+    // with the "Expected parameters" guidance; dialects the validator cannot
+    // evaluate fall through to server-side validation. Resource tools take
+    // no arguments and are exempt.
+    if tool_meta.resource_uri.is_none() {
+        if let Some(schema) = tool_meta.input_schema.as_ref() {
+            if let Some(validation_error) = proxy_argument_validation_error(schema, &args) {
+                let guard_options =
+                    crate::guard::resolve_guard_options(state.config.settings.as_ref());
+                let schema_text =
+                    format!("\n\nExpected parameters:\n{}", format_schema(schema, "  "));
+                let guarded = crate::guard::guard_mcp_output(
+                    vec![json!({ "type": "text", "text": validation_error.clone() })],
+                    &crate::guard::GuardOptions {
+                        prefix: Some("Failed to call tool: ".to_string()),
+                        suffix: Some(schema_text),
+                        ..guard_options
+                    },
+                );
+                let mut details = json!({ "mode": "call", "error": "call_failed" });
+                merge_objects(&mut details, &call_identity);
+                details["message"] = json!(validation_error);
+                merge_objects(&mut details, &crate::guard::guarded_mcp_details(&guarded));
+                return json!({ "content": guarded.content, "details": details });
+            }
+        }
+    }
+
     // R7.2.2.1–.4 / FR-P1-07: approval gate (proxy-modes.ts:1262-1286 @
     // 10a45367). Argument/definition-scoped key, legacy-candidate exclusion
     // and session-branch persistence all live in `crate::approval`.
@@ -3180,36 +3211,6 @@ pub async fn execute_call(
             Some("call"),
         );
         return json!({ "content": content, "details": details });
-    }
-
-    // #602 (89c1b07, proxy-modes.ts proxyArgumentValidationError @
-    // 97435aab): validate the arguments against the advertised schema
-    // BEFORE dispatch. A failure is a local call_failed with the
-    // "Expected parameters" guidance; dialects the validator cannot
-    // evaluate fall through to server-side validation. Resource tools
-    // take no arguments and are exempt.
-    if tool_meta.resource_uri.is_none() {
-        if let Some(schema) = tool_meta.input_schema.as_ref() {
-            if let Some(validation_error) = proxy_argument_validation_error(schema, &args) {
-                let guard_options =
-                    crate::guard::resolve_guard_options(state.config.settings.as_ref());
-                let schema_text =
-                    format!("\n\nExpected parameters:\n{}", format_schema(schema, "  "));
-                let guarded = crate::guard::guard_mcp_output(
-                    vec![json!({ "type": "text", "text": validation_error.clone() })],
-                    &crate::guard::GuardOptions {
-                        prefix: Some("Failed to call tool: ".to_string()),
-                        suffix: Some(schema_text),
-                        ..guard_options
-                    },
-                );
-                let mut details = json!({ "mode": "call", "error": "call_failed" });
-                merge_objects(&mut details, &call_identity);
-                details["message"] = json!(validation_error);
-                merge_objects(&mut details, &crate::guard::guarded_mcp_details(&guarded));
-                return json!({ "content": guarded.content, "details": details });
-            }
-        }
     }
 
     let request_timeout = state

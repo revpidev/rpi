@@ -41,3 +41,20 @@ fn skill_docs_do_not_teach_the_removed_fallback_models_surface() {
         );
     }
 }
+
+/// The shipped `rpi-extension.json` is user-visible (plugin listings and the
+/// packed `.rpix`) and must not advertise the removed fallback surface
+/// either (TE39 review follow-up: the asset scan only walked `assets/`).
+#[test]
+fn extension_manifest_does_not_teach_the_removed_fallback_models_surface() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rpi-extension.json");
+    let text = std::fs::read_to_string(&path).expect("read manifest");
+    assert!(
+        !text.contains("fallbackModels"),
+        "manifest still teaches `fallbackModels`"
+    );
+    assert!(
+        !text.to_lowercase().contains("model fallback"),
+        "manifest still advertises the removed model fallback chains"
+    );
+}

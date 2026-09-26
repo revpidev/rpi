@@ -1311,6 +1311,65 @@ async fn proxy_call_approval_scopes_by_argument_payload() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #602 review follow-up: argument validation runs BEFORE the approval gate
+/// (proxy-modes.ts:1411 precedes ensureToolCallApproved at :1423). An
+/// invalid call must not prompt/deny first, must never cache a session grant
+/// for locally-rejected arguments, and must not reach the server.
+#[tokio::test]
+async fn proxy_call_validates_arguments_before_approval() {
+    let dir = temp_dir("validation-before-approval");
+    let stop = CancellationToken::new();
+    let (port, call_count) = spawn_approval_stub(stop.clone()).await;
+    let runtime = build_approval_runtime(&dir, port).await;
+
+    let approval_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    *runtime
+        .approval_ui
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(StubApprovalUi {
+        decision: ApprovalDecision::Deny,
+        calls: approval_calls.clone(),
+    }));
+
+    let invalid = json!({ "query": 42 }).as_object().cloned();
+    let result = proxy::execute_call(
+        &runtime,
+        "demo_echo",
+        invalid,
+        None,
+        proxy::no_native_tools(),
+    )
+    .await;
+    assert_eq!(
+        result["details"]["error"],
+        json!("call_failed"),
+        "local validation wins over approval: {result}"
+    );
+    assert!(
+        result["details"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("query"),
+        "the message names the offending parameter: {result}"
+    );
+    assert_eq!(
+        approval_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "approval must not be consulted for invalid arguments"
+    );
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing is dispatched to the server"
+    );
+    assert_eq!(runtime.approval.len(), 0, "no session grant recorded");
+
+    runtime.owner_cancel.cancel();
+    runtime.manager.close_all().await;
+    stop.cancel();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A10：headless（无 UI handler）匹配调用 fail-closed，且不触达服务器。
 #[tokio::test]
 async fn proxy_call_approval_headless_fails_closed_before_transport() {

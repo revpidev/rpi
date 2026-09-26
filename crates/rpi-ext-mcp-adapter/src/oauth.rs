@@ -626,7 +626,8 @@ fn validate_oauth_config(config: &OAuthConfig) -> Result<(), AdapterError> {
         }
         if config.client_id.is_none() && config.client_secret.is_some() {
             return Err(AdapterError::InvalidConfigValue(
-                "clientSecret requires an explicit clientId".to_string(),
+                "OAuth clientSecret requires an explicit clientId when clientMetadataUrl is configured"
+                    .to_string(),
             ));
         }
     }
@@ -739,6 +740,17 @@ async fn authenticate_client_credentials(
     config: &OAuthConfig,
     fetch: &OAuthFetch,
 ) -> Result<AuthStatus, AdapterError> {
+    // mcp-auth-flow.ts:469-474: a token-less stored registration is dead for
+    // client_credentials (no interactive grant can have produced it); clear
+    // it before resolving identity unless a clientId is configured.
+    if config.client_id.is_none() {
+        if let Some(entry) = store.get_for_url(server_name, server_url)? {
+            if entry.client_info.is_some() && entry.tokens.is_none() {
+                let _ = store.clear_client_info(server_name);
+            }
+        }
+    }
+    let mut stored_secret: Option<String> = None;
     let client_id = match &config.client_id {
         Some(id) => id.clone(),
         None => {
@@ -746,12 +758,18 @@ async fn authenticate_client_credentials(
             // stored (client_credentials has no callback listener;
             // redirect_uris are unused for this grant). Errors propagate —
             // an empty client_id must never silently reach the token
-            // endpoint (no block_on, no unwrap_or_default).
-            let stored_id = store
-                .get_entry(server_name)?
-                .and_then(|entry| entry.client_info.map(|c| c.client_id));
-            match stored_id {
-                Some(id) => id,
+            // endpoint (no block_on, no unwrap_or_default). The read is
+            // URL-scoped like `getAuthForUrl` (mcp-oauth-provider.ts:399).
+            let stored_info = store
+                .get_for_url(server_name, server_url)?
+                .and_then(|entry| entry.client_info);
+            match stored_info {
+                Some(info) => {
+                    // Upstream forwards the stored registration's secret to
+                    // the token endpoint (mcp-oauth-provider.ts:774-784).
+                    stored_secret = info.client_secret.clone();
+                    info.client_id.clone()
+                }
                 None => {
                     let default_redirect =
                         format!("http://localhost:0{DEFAULT_OAUTH_CALLBACK_PATH}");
@@ -764,11 +782,12 @@ async fn authenticate_client_credentials(
                         server_name,
                         store::StoredClientInfo {
                             client_id: id.clone(),
-                            client_secret: secret,
+                            client_secret: secret.clone(),
                             ..Default::default()
                         },
                         Some(server_url),
                     )?;
+                    stored_secret = secret;
                     id
                 }
             }
@@ -781,7 +800,7 @@ async fn authenticate_client_credentials(
         "grant_type": "client_credentials",
         "client_id": client_id,
     });
-    if let Some(secret) = &config.client_secret {
+    if let Some(secret) = config.client_secret.as_ref().or(stored_secret.as_ref()) {
         body["client_secret"] = json!(secret);
     }
     if let Some(scope) = &config.scope {
@@ -1877,6 +1896,34 @@ mod tests {
         let config = parse_oauth_config(&entry);
         assert_eq!(config.grant_type, "authorization_code");
         assert!(config.client_id.is_none());
+    }
+
+    #[test]
+    fn client_metadata_url_without_client_id_rejects_a_secret_with_upstream_text() {
+        // mcp-auth-flow.ts:222-223 (review round 2: the message is the
+        // upstream literal, not a paraphrase).
+        let entry = ServerEntry(
+            json!({
+                "url": "https://test/mcp",
+                "oauth": {
+                    "clientMetadataUrl": "https://cimd.example.test/client.json",
+                    "clientSecret": "secret"
+                }
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        let config = parse_oauth_config(&entry);
+        assert!(
+            matches!(
+                validate_oauth_config(&config),
+                Err(AdapterError::InvalidConfigValue(message))
+                    if message
+                        == "OAuth clientSecret requires an explicit clientId when clientMetadataUrl is configured"
+            ),
+            "the CIMD + secret combination uses the upstream message"
+        );
     }
 
     #[test]
