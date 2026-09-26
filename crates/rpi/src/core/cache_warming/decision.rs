@@ -1,4 +1,4 @@
-//! 决策器 — cost-aware pure functions of the cache warmer
+//! Decision — cost-aware pure functions of the cache warmer
 //! (cache-warmer.ts:16-107, 362-383, 387-437 @ c596d09d9, #9668).
 //!
 //! All functions are pure (time/state passed in) so the eligibility matrix

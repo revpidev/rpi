@@ -606,7 +606,8 @@ async fn aborts_replaced_requests_and_skips_failed_refreshes() {
 
 #[tokio::test(start_paused = true)]
 async fn default_off_mode_never_spawns_or_sends() {
-    // 红线: 默认关闭零请求（无请求发出、状态为 inactive）。
+    // Red line: default-off mode issues zero requests (no request sent,
+    //   state stays inactive).
     let runtime = FakeRuntime::new(
         CacheWarmingModeArg::Off,
         branch_with_prompt(100_000),

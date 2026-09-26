@@ -1,4 +1,4 @@
-//! 触发器 — the cache-warmer lifecycle state machine
+//! Trigger — the cache-warmer lifecycle state machine
 //! (cache-warmer.ts:141-385 @ c596d09d9, #9668).
 //!
 //! `start` replaces any previous run (aborting its in-flight refresh); the
@@ -395,7 +395,7 @@ fn lock_write<T>(rw: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     rw.write().unwrap_or_else(|e| e.into_inner())
 }
 
-// `schedule` and `refresh` (the 执行器 half of the cycle) are `CacheWarmer`
+// `schedule` and `refresh` (the executor half of the cycle) are `CacheWarmer`
 // methods in `executor.rs`; inherent impls resolve across sibling modules.
 
 #[cfg(test)]

@@ -1013,9 +1013,11 @@ impl ExtensionRunnerCore {
                         }
                     }
                     if let Some(system_prompt) = handler_result.get("systemPrompt") {
-                        // rpi 口径（V15-06 裁决 12）：`null` 视为未提供并跳过；
-                        // 上游 `!== undefined` 会把越约的 null 写成
-                        // `forceSystemPrompt = null`——不追随该越约行为。
+                        // rpi ruling (V15-06 ruling 12): a JSON `null` counts
+                        // as not-provided and is skipped; upstream's
+                        // `!== undefined` would write an out-of-contract null
+                        // as `forceSystemPrompt = null` — we do not follow
+                        // that out-of-contract behavior.
                         if !system_prompt.is_null() {
                             // Chained as `forceSystemPrompt` on the options
                             // (runner.ts:1208-1210 @ #9548); the render is

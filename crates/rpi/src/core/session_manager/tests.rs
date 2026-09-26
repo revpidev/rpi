@@ -970,7 +970,8 @@ fn list_with_progress_publishes_first_interval_and_final_snapshots() {
     assert_eq!(lens, vec![1, 10, 20, 25]);
 
     // Final result: activity-descending, identical to the eager listing
-    // (the「逐字节同选」red line — only ordering/timing of loading changed).
+    // (the "byte-identical selection" red line — only ordering/timing of
+    // loading changed).
     assert_eq!(
         sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
         (0..25)

@@ -6,11 +6,11 @@
 //!
 //! Module split (task file §3 four-file tree; the upstream single class is
 //! divided by responsibility):
-//! - [`decision`] — 决策器: cost-aware pure functions (eligibility, TTL,
+//! - [`decision`] — decision: cost-aware pure functions (eligibility, TTL,
 //!   delay, economics, formatters).
-//! - [`trigger`] — 触发器: lifecycle state machine (`start` on each session
+//! - [`trigger`] — trigger: lifecycle state machine (`start` on each session
 //!   request, agent-run phase transitions, mode reconcile, scheduling).
-//! - [`executor`] — 执行器: one refresh request (decision → extension
+//! - [`executor`] — executor: one refresh request (decision → extension
 //!   override → `stream_simple` with `maxTokens: 1` / `maxRetries: 0` →
 //!   `appendUsage` → `onWarmed` → reschedule).
 //!

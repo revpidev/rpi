@@ -1,4 +1,4 @@
-//! 执行器 — one refresh cycle of the cache warmer
+//! Executor — one refresh cycle of the cache warmer
 //! (cache-warmer.ts:279-345 @ c596d09d9, #9668).
 //!
 //! `schedule` arms the next refresh (aborting runs whose next refresh would

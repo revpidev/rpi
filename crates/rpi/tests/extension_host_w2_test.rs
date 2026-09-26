@@ -751,7 +751,7 @@ async fn w2_after_provider_response_skipped_without_handlers() {
 }
 
 // ---------------------------------------------------------------------------
-// user_bash（interactive-mode.ts:6509-6524；#9068 fail-closed）
+// user_bash (interactive-mode.ts:6509-6524; #9068 fail-closed)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -783,10 +783,11 @@ async fn w2_user_bash_full_result_replacement() {
     assert!(!result.truncated);
 }
 
-/// #9068（`509ee2bd0`）：handler 报错 → `Err`（中止命令，不回退本地执行）；
-/// 上游 operations（闭包束）跨 JSON 边界必然无效 → 同样 fail-closed
-/// （ADR-0007 缺口 1 的「丢弃并回退」随之退场）；无 handler → `Ok(None)`
-/// （调用方走默认本地执行）。
+/// #9068 (`509ee2bd0`): a handler error -> `Err` (abort the command, no
+/// local fallback); upstream `operations` (closure bundles) are always
+/// invalid across the JSON boundary -> same fail-closed treatment (the
+/// old "drop and fall back" of ADR-0007 gap 1 is gone); no handler ->
+/// `Ok(None)` (the caller runs default local execution).
 #[tokio::test]
 async fn w2_user_bash_fail_closed_and_no_handler_fall_back() {
     let runner = runner_with(vec![inline_ext(|api| {

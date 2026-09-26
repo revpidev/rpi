@@ -1,4 +1,5 @@
-//! Session-affinity header seam (#9102 / #9326 / #9629, B 簇 FR-C).
+//! Session-affinity header seam (#9102 / #9326 / #9629, upstream cluster
+//! B FR-C).
 //!
 //! Single request-assembly point for per-request derived session-affinity
 //! headers (design baseline §2.1: the three affinity providers share one

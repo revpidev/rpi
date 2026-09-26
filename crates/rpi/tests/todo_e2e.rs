@@ -2,14 +2,14 @@
 //! the real `NativeExtensionHost` bound to real `AgentSession`s (faux
 //! provider), covering the task file §2 FR-C scenario table:
 //!
-//! 1. `full_chain_…` — 建单/更新/完成 (faux tool calls through the real
-//!    agent loop → tool-result envelopes + overlay widget lines) → 折叠
-//!    (the registered `ctrl+shift+t` shortcut handler, the same surface the
-//!    interactive editor hook dispatches) → `/todos` (the real
-//!    `execute_extension_command` path) → compaction 存活 (real manual
-//!    `session.compact` → `session_compact` event → replay from the real
-//!    branch) → `/reload` 重放重建 (real `session.reload()` → shutdown +
-//!    host reload + `session_start` replay).
+//! 1. `full_chain_…` — create/update/complete (faux tool calls through the
+//!    real agent loop → tool-result envelopes + overlay widget lines) →
+//!    fold toggle (the registered `ctrl+shift+t` shortcut handler, the
+//!    same surface the interactive editor hook dispatches) → `/todos` (the
+//!    real `execute_extension_command` path) → compaction survival (real
+//!    manual `session.compact` → `session_compact` event → replay from the
+//!    real branch) → `/reload` replay rebuild (real `session.reload()` →
+//!    shutdown + host reload + `session_start` replay).
 //! 2. `dual_session_isolation_…` — two hosts + two file-backed sessions
 //!    (each sandbox carries its own copy of the cdylib, so the hosts get
 //!    independent library statics — exactly the production parent/child
@@ -638,7 +638,7 @@ async fn full_chain_create_update_complete_collapse_todos_compact_reload() {
     else {
         return;
     };
-    // --- 建单 -------------------------------------------------------------
+    // --- create ------------------------------------------------------------
     turn(&f.session, "track: design the API").await;
     let results = todo_tool_results(&f.session);
     assert_eq!(results.len(), 1, "one todo tool result: {results:?}");
@@ -662,7 +662,7 @@ async fn full_chain_create_update_complete_collapse_todos_compact_reload() {
     );
     assert_eq!(lines.last(), Some(&String::new()), "spacer: {lines:?}");
 
-    // --- 更新（in_progress + activeForm 括注）------------------------------
+    // --- update (in_progress + activeForm annotation) ---------------------
     turn(&f.session, "start designing").await;
     let lines = f
         .bridge
@@ -675,7 +675,7 @@ async fn full_chain_create_update_complete_collapse_todos_compact_reload() {
         "{lines:?}"
     );
 
-    // --- 第二条 + 完成 -----------------------------------------------------
+    // --- second task + complete --------------------------------------------
     turn(&f.session, "add the test task").await;
     turn(&f.session, "api is done").await;
     let lines = f
@@ -698,7 +698,8 @@ async fn full_chain_create_update_complete_collapse_todos_compact_reload() {
         "envelope snapshot carries the completed task"
     );
 
-    // --- 折叠（注册快捷键的真实 handler，编辑器 hook 同一入口）----------------
+    // --- fold toggle (the registered shortcut handler; same entry as the
+    //     editor hook) ----------------------------------------------------
     let shortcuts = f.host.get_shortcuts(&[]);
     let collapse = shortcuts
         .iter()
@@ -725,7 +726,7 @@ async fn full_chain_create_update_complete_collapse_todos_compact_reload() {
     let lines = f.bridge.widget_lines(WIDGET_KEY).expect("expanded again");
     assert!(lines.len() > 2, "expanded rows return: {lines:?}");
 
-    // --- /todos 命令（真实 execute_extension_command 路径）-------------------
+    // --- /todos command (the real execute_extension_command path) ---------
     let executed = f
         .session
         .extension_runner()
@@ -743,7 +744,8 @@ async fn full_chain_create_update_complete_collapse_todos_compact_reload() {
         "grouped rows: {message}"
     );
 
-    // --- compaction 存活（真实手动压缩 → session_compact → 重放）------------
+    // --- compaction survival (real manual compact -> session_compact ->
+    //     replay) ---------------------------------------------------------
     let before = f
         .bridge
         .widget_lines(WIDGET_KEY)
@@ -775,7 +777,8 @@ async fn full_chain_create_update_complete_collapse_todos_compact_reload() {
         "heading unchanged across compaction"
     );
 
-    // --- /reload 重放重建（真实 reload：shutdown → host reload → start）-----
+    // --- /reload replay rebuild (real reload: shutdown -> host reload ->
+    //     start) ----------------------------------------------------------
     f.session.reload().await;
     let rebuilt = f
         .bridge
@@ -790,7 +793,7 @@ async fn full_chain_create_update_complete_collapse_todos_compact_reload() {
         "pending task rebuilt after /reload: {rebuilt:?}"
     );
 
-    // --- 压缩后仍可继续用（list 动作走完整回路）------------------------------
+    // --- still usable after compaction (list action round-trips) ----------
     turn(&f.session, "list the tasks again").await;
     // Compaction summarized the earlier turns away — the branch keeps the
     // tail only, so exactly one todo result (this list call) remains,
@@ -1057,7 +1060,8 @@ async fn install_path_local_rpix_loads_tool_command_and_overlay() {
     );
 
     // Drive one real tool call through a session bound to this host; the
-    // overlay must register on the bridge (三面可用 end-to-end).
+    // overlay must register on the bridge (all three surfaces usable
+    // end-to-end).
     let bridge = Arc::new(RecordingBridge::default());
     host.set_ui(
         Some(bridge.clone()),
