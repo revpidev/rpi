@@ -12,6 +12,10 @@
 - **插件线（六插件 lockstep）**：**新第一方插件 `rpiv-todo`**（TE34–36：`todo` 工具/overlay/`/todos` 命令/会话分支重放——跨 compaction 与 `/reload` 存活；registry 键 `rpiv-todo`，首发随本 RC）；subagents 重定基 v0.70.0（**[BREAKING]** `fallbackModels` 移除——重试不再自动换模型；worktree 准入/预算/allowlist 治理族）；mcp-adapter 重定基 v2.34.0+（加密文件 OAuth 凭据仓、CIMD、`/mcp edit`、directTools search 等）；ask-user-question 转录渲染摘要行（rpi#52）+ 主题死锁修复；rpiv-mono pin `0fdf4f8`。
 - **rpi 自有修复**：#52（ask-user_question 转储渲染 + 宿主锁作用域）、#53（流式渲染效率，上述）、#54（SSE 空闲超时默认）。
 
+### RC verification fixes
+
+- **rc.2**: the rpiv-todo overlay never appeared in a real interactive session (the tool worked; the UI didn't) — the interactive mode attached the extension UI bridge after `bind_extensions`, so `session_start` fired with no UI and the plugin's overlay foreground claim never ran. Both boot and every session-switch rebind now attach the bridge first (upstream binds the two atomically); a real-mode boot e2e pins the ordering.
+
 ### Internal
 
 - workspace version bumped to 0.1.5-rc.1 + Cargo.lock synced; full gates zero failures (workspace 6843 cases at TE36 closeout).
