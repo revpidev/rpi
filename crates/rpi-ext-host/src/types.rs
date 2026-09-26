@@ -398,6 +398,25 @@ pub struct SessionCompactEvent {
     pub will_retry: bool,
 }
 
+/// `SessionCompactFailedEvent` (types.ts:619-631, exported from the package
+/// entry by #9642).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCompactFailedEvent {
+    pub reason: CompactionReason,
+    /// Error text when compaction failed for a non-abort reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// True when compaction was cancelled or aborted.
+    pub aborted: bool,
+    /// True when the aborted turn would have been retried after this
+    /// compaction (overflow recovery).
+    pub will_retry: bool,
+    /// True when the failing compaction content came from a
+    /// `session_before_compact` handler.
+    pub from_extension: bool,
+}
+
 /// `SessionShutdownEvent` (types.ts:610-615).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

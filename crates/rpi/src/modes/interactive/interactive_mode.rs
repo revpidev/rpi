@@ -5923,7 +5923,8 @@ mod tests {
 
     use super::*;
     use crate::modes::interactive::test_support::{
-        build_test_session, install_noop_product_transports, TempDir, TestSession, TestTerminal,
+        build_test_session, build_test_session_with, install_noop_product_transports, TempDir,
+        TestSession, TestTerminal,
     };
 
     // ---------------------------------------------------------------------
@@ -6026,6 +6027,122 @@ mod tests {
         // swap the production transports for no-op ones before `init()`.
         install_noop_product_transports(&mode);
         (mode, terminal, harness.session)
+    }
+
+    /// [`mode_harness`] with an inline-extension host (the interception
+    /// tests need a `user_bash` handler registered on the real session).
+    async fn mode_harness_with_host(
+        host: Arc<rpi_ext_host::host::NativeExtensionHost>,
+    ) -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
+        let TestSession {
+            _tmp,
+            runtime,
+            session,
+            cwd: _,
+        } = build_test_session_with(None, Some(host)).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        install_noop_product_transports(&mode);
+        (mode, terminal, session, _tmp)
+    }
+
+    /// V15-08 FR-D review follow-up: the interactive `!`/`!!` interception
+    /// (`handle_bash_command`) applies the same fail-closed contract as the
+    /// RPC path — a full replacement skips local execution and is recorded,
+    /// a handler error aborts without any local fallback. Without this pin,
+    /// reverting the interactive arm kept the whole suite green (only the
+    /// RPC leg had a harness).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bash_command_runs_user_bash_interception() {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+        use serde_json::{json, Value};
+
+        let factory: ExtensionFactory = Arc::new(|api: ExtensionApi| {
+            api.on(
+                "user_bash",
+                Arc::new(move |payload: Value, _ctx| {
+                    Box::pin(async move {
+                        let command = payload.get("command").and_then(Value::as_str).unwrap_or("");
+                        if command.contains("replace") {
+                            Ok(json!({
+                                "result": {
+                                    "output": "interactive-extension-output",
+                                    "exitCode": 5,
+                                    "cancelled": false,
+                                    "truncated": false,
+                                }
+                            }))
+                        } else if command.contains("fail") {
+                            Err("Routing failed".to_owned())
+                        } else {
+                            Ok(Value::Null)
+                        }
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<Value, String>> + Send>,
+                        >
+                }),
+            )
+            .expect("register user_bash handler");
+            Box::pin(async { Ok(()) })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new(
+            "/rpi-test-cwd",
+        ));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+
+        let (mode, _terminal, _session, _tmp) = mode_harness_with_host(host).await;
+        let ui = &mode.ui_state;
+
+        // 1) Replacement: output/exitCode come from the handler, the
+        //    nonexistent command is never executed locally, and the result
+        //    is recorded as a bashExecution message.
+        ui.handle_bash_command("replace: definitely-not-a-command", false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&ui.bash_component).is_some() {
+            assert!(Instant::now() < deadline, "replacement never completed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let recorded = ui
+            .session()
+            .messages()
+            .into_iter()
+            .filter_map(|message| match message {
+                AgentMessage::BashExecution(entry) => Some(entry),
+                _ => None,
+            })
+            .find(|entry| entry.command.contains("replace"))
+            .expect("replacement recorded");
+        assert_eq!(recorded.output, "interactive-extension-output");
+        assert_eq!(recorded.exit_code, Some(5));
+
+        // 2) Handler error: fail-closed — the component completes with no
+        //    result and nothing is recorded; there is never a local
+        //    fallback (the command is not executable).
+        // The command is locally executable (the temp cwd must stay alive),
+        // so a fail-open fallback would record it — while the trailing
+        // comment still trips the handler error branch.
+        ui.handle_bash_command("echo local-fallback # fail", false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&ui.bash_component).is_some() {
+            assert!(Instant::now() < deadline, "fail-closed arm never completed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !ui.session().messages().iter().any(|message| match message {
+                AgentMessage::BashExecution(entry) => entry.command.contains("fail"),
+                _ => false,
+            }),
+            "an aborted command must not be recorded"
+        );
     }
 
     fn chat_children(ui: &InteractiveUi) -> usize {

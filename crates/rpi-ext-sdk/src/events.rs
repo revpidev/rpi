@@ -15,9 +15,9 @@
 //! identical serde renames.
 //!
 //! Not represented (documented deltas, see V15-09 §7):
-//! - `session_compact_failed` / `ui_prompt_start` / `ui_prompt_end` /
-//!   `agent_start` / `agent_settled` payloads travel as raw JSON (no host
-//!   structs exist — pre-existing shape rule, unchanged by #9642);
+//! - `ui_prompt_start` / `ui_prompt_end` / `agent_start` / `agent_settled`
+//!   payloads travel as raw JSON (no host structs exist — pre-existing shape
+//!   rule, unchanged by #9642);
 //! - upstream's per-tool `ToolCallEvent` union (`ReadToolCallEvent`, …)
 //!   collapses to [`ToolCallEvent`] (`tool_name` discriminator) — the
 //!   TS-level narrowing has no runtime effect;
@@ -278,6 +278,19 @@ pub struct SessionCompactEvent {
     pub from_extension: bool,
     pub reason: CompactionReason,
     pub will_retry: bool,
+}
+
+/// `session_compact_failed` payload (`SessionCompactFailedEvent`, exported
+/// from the package entry by #9642).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCompactFailedEvent {
+    pub reason: CompactionReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub aborted: bool,
+    pub will_retry: bool,
+    pub from_extension: bool,
 }
 
 /// `session_shutdown` payload.
@@ -696,6 +709,7 @@ mod tests {
         exported::<SessionBeforeCompactResult>();
         exported::<CompactionReason>();
         exported::<SessionCompactEvent>();
+        exported::<SessionCompactFailedEvent>();
         exported::<SessionShutdownEvent>();
         exported::<SessionShutdownReason>();
         exported::<TreePreparation>();
@@ -781,6 +795,13 @@ mod tests {
             "fromExtension": false,
             "reason": "manual",
             "willRetry": false,
+        }));
+        round_trip::<SessionCompactFailedEvent>(serde_json::json!({
+            "reason": "threshold",
+            "errorMessage": "boom",
+            "aborted": false,
+            "willRetry": false,
+            "fromExtension": false,
         }));
         round_trip::<SessionShutdownEvent>(serde_json::json!({"reason": "quit"}));
         round_trip::<SessionBeforeTreeEvent>(serde_json::json!({

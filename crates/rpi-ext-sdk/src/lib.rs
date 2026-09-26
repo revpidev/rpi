@@ -529,22 +529,33 @@ pub fn route(message: Value) -> Option<Result<Value, String>> {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let params = message.get("params").cloned().unwrap_or(Value::Null);
-            let state = state();
-            state
-                .tools
-                .iter()
-                .find(|tool| tool.definition.get("name").and_then(Value::as_str) == Some(tool_name))
-                .map(|tool| match &tool.execute {
-                    ToolExecute::Simple(execute) => execute(params),
-                    ToolExecute::WithContext(execute) => execute(ToolContext {
-                        params,
-                        tool_call_id: message
-                            .get("toolCallId")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    }),
-                })
+            let tool_call_id = message
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            // Snapshot the handler under the lock and RELEASE it before
+            // invoking: a tool handler must be able to call `subscribe` /
+            // `unsubscribe` (which re-lock the same non-reentrant state
+            // mutex) without deadlocking — the event arm snapshots for the
+            // same reason.
+            let execute = {
+                let state = state();
+                let tool = state.tools.iter().find(|tool| {
+                    tool.definition.get("name").and_then(Value::as_str) == Some(tool_name)
+                })?;
+                match &tool.execute {
+                    ToolExecute::Simple(execute) => ToolExecute::Simple(execute.clone()),
+                    ToolExecute::WithContext(execute) => ToolExecute::WithContext(execute.clone()),
+                }
+            };
+            match execute {
+                ToolExecute::Simple(execute) => Some(execute(params)),
+                ToolExecute::WithContext(execute) => Some(execute(ToolContext {
+                    params,
+                    tool_call_id,
+                })),
+            }
         }
         _ => None,
     }
@@ -609,6 +620,45 @@ mod tests {
     #[test]
     fn unsubscribe_unknown_id_is_silent_noop() {
         unsubscribe(SubscriptionId(9_999_999));
+    }
+
+    /// Review P2: the `toolExecute` dispatch must release the SDK state lock
+    /// before running the handler — `subscribe`/`unsubscribe` re-lock it, so
+    /// a handler that subscribes used to deadlock the guest thread.
+    #[test]
+    fn tool_handler_can_subscribe_without_deadlocking() {
+        let event = unique_event("tool-sub");
+        let mut ext = Extension::new();
+        ext.tool_with_context(
+            json!({
+                "name": "echo",
+                "label": "Echo",
+                "description": "echo params",
+                "parameters": {"type": "object"}
+            }),
+            move |ctx| {
+                let subscription = subscribe(&event, |_| Ok(Value::Null));
+                unsubscribe(subscription);
+                Ok(ctx.params)
+            },
+        );
+        let message = json!({
+            "kind": "toolExecute",
+            "toolName": "echo",
+            "params": {"hello": "world"},
+            "toolCallId": "call-1"
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(route(message));
+        });
+        let reply = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("tool handler must not deadlock on the SDK state lock");
+        assert_eq!(
+            reply.expect("toolExecute routed").expect("handler ok"),
+            json!({"hello": "world"})
+        );
     }
 
     /// Snapshot semantics: removals during a dispatch keep the removed

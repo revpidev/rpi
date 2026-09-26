@@ -270,6 +270,16 @@ pub(crate) async fn build_test_session() -> TestSession {
 pub(crate) async fn build_test_session_with_manager(
     manager: Option<SessionManager>,
 ) -> TestSession {
+    build_test_session_with(manager, None).await
+}
+
+/// [`build_test_session_with_manager`] plus an optional extension host,
+/// used by the interception tests to load inline extensions (the RPC
+/// harness's `boot_runtime_with` precedent).
+pub(crate) async fn build_test_session_with(
+    manager: Option<SessionManager>,
+    extension_host: Option<Arc<rpi_ext_host::host::NativeExtensionHost>>,
+) -> TestSession {
     let tmp = TempDir::new();
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -319,6 +329,7 @@ pub(crate) async fn build_test_session_with_manager(
         no_tools: Some(NoTools::All),
         services: Some(services.clone()),
         session_manager: Some(session_manager),
+        extension_host,
         ..Default::default()
     })
     .await

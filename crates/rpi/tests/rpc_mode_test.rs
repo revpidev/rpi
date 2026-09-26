@@ -791,14 +791,18 @@ async fn bash_runs_user_bash_interception() {
     assert_eq!(bash_entry["command"], "replace: definitely-not-a-command");
     assert_eq!(bash_entry["output"], "extension output");
 
-    // 2) Handler error: fail-closed — an error response names the abort,
-    //    and nothing is recorded (no local execution of any kind).
+    // 2) Handler error: fail-closed — the response carries the handler's
+    //    own message (upstream rpc-mode.ts:792-800) and nothing is recorded
+    //    (no local execution of any kind).
     rpc.send(&json!({"id": "r3", "type": "bash", "command": "fail: definitely-not-a-command"}))
         .await;
     let response = rpc.next_response(Some("r3")).await;
     assert_eq!(response["success"], false);
     assert!(
-        response["error"].as_str().unwrap_or("").contains("aborted"),
+        response["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Routing failed"),
         "error was: {}",
         response["error"]
     );

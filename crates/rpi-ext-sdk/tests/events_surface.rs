@@ -2,7 +2,8 @@
 //! surface (V15-09 #9642): every type exported by `rpi_ext_sdk::events`
 //! must keep existing — a removal/rename breaks THIS test at compile time,
 //! instead of being discovered by review (the "Finding B" lesson: the
-//! 60-type re-export surface had no test pinning it).
+//! 60-type re-export surface had no test pinning it; review round 2 added
+//! `SessionCompactFailedEvent` → 61).
 
 #[allow(unused)]
 use rpi_ext_sdk::events;
@@ -10,7 +11,7 @@ use rpi_ext_sdk::events;
 #[test]
 fn all_hook_event_types_exist() {
     // Referencing each type forces the compiler to resolve it; deleting or
-    // renaming any of the 60 fails the build here.
+    // renaming any of the 61 fails the build here.
     let _: Option<events::ProjectTrustDecision> = None;
     let _: Option<events::ResourcesDiscoverReason> = None;
     let _: Option<events::SessionStartReason> = None;
@@ -35,6 +36,7 @@ fn all_hook_event_types_exist() {
     let _: Option<events::SessionBeforeCompactEvent> = None;
     let _: Option<events::SessionBeforeCompactResult> = None;
     let _: Option<events::SessionCompactEvent> = None;
+    let _: Option<events::SessionCompactFailedEvent> = None;
     let _: Option<events::SessionShutdownEvent> = None;
     let _: Option<events::TreePreparation> = None;
     let _: Option<events::SessionBeforeTreeEvent> = None;

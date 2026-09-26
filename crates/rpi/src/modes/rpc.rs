@@ -1038,10 +1038,14 @@ async fn dispatch(
                         )
                         .await
                         .map_err(|error| error_message(&error))?,
-                    Err(_) => {
-                        return Err("bash command aborted: the user_bash extension handler \
-                             failed or returned an invalid result (fail-closed, #9068)"
-                            .to_owned());
+                    Err(error) => {
+                        // Upstream lets the handler's throw reach the RPC
+                        // dispatch catch, so the response carries the
+                        // original message (rpc-mode.ts:564-589 →
+                        // :792-800; the #9068 regression asserts
+                        // stringContaining("Routing failed")). Fail closed:
+                        // never a silent local fallback.
+                        return Err(error);
                     }
                 }
             } else {
