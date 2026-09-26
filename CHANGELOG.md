@@ -16,7 +16,7 @@
 
 - **rc.2**: the rpiv-todo overlay never appeared in a real interactive session (the tool worked; the UI didn't) — the interactive mode attached the extension UI bridge after `bind_extensions`, so `session_start` fired with no UI and the plugin's overlay foreground claim never ran. Both boot and every session-switch rebind now attach the bridge first (upstream binds the two atomically); a real-mode boot e2e pins the ordering.
 
-### Pre-stable review fixes
+### Pre-stable review fixes (shipped in v0.1.5-rc.3)
 
 - The WSL clipboard write chain actually reaches `powershell.exe` now (the write-path runner dropped stdout; real WSL silently fell back to an unverified OSC 52 success) — query calls return real stdout bytes, writer calls get no output pipe at all (a daemonizing writer can no longer hang the drain); pinned by real-runner regressions including a fake-`wslpath` end-to-end chain.
 - Zero-TTL MCP servers keep their direct tools while connected (#566): the live-overlay cache entry stripped of the declared `ttlMs` (a `ttlMs == 0` entry is invalid by design and used to drop the connected server's tools); regression-tested.
@@ -26,7 +26,7 @@
 
 ### Internal
 
-- workspace version bumped through 0.1.5-rc.1 → rc.2 with Cargo.lock synced each time; full gates zero failures (workspace 6843 cases at TE36 closeout).
+- workspace version bumped through 0.1.5-rc.1 → rc.2 → rc.3 with Cargo.lock synced each time; full gates zero failures (6863 cases at rc.3, after the pre-stable review batch).
 - deviations D-101 (closed) / D-103 / D-104 / TE-D43 (promoted) all resolved; the rpi-pages registry six-plugin matrix and RC endpoints refreshed with this RC.
 
 ## [0.1.4] - 2026-09-18
