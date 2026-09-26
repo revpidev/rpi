@@ -1642,16 +1642,29 @@ fn is_literal_local_address(server_url: &str) -> bool {
 /// `localNetworkFailureCodes` (#544): the network-unreachability error
 /// signatures. Upstream matches Node errno codes (EHOSTUNREACH/
 /// ENETUNREACH/EACCES) over the cause chain; the Rust transport surfaces
-/// the io::Error text instead ("host unreachable"/"network unreachable"/
-/// "permission denied") — both spellings match, codes keep the upstream
-/// names for message parity.
+/// the io::Error Display text instead — the platform strerror spellings
+/// `"No route to host"` / `"Network is unreachable"` /
+/// `"Permission denied"` (verified against `io::Error::from_raw_os_error`
+/// on Linux/macOS) plus the lowercase errno-name and spaced forms for
+/// wrappers that embed either. All spellings match; the codes keep the
+/// upstream names for message parity.
 fn local_network_failure_codes(message: &str) -> Vec<&'static str> {
     let lowered = message.to_ascii_lowercase();
     let mut codes = Vec::new();
-    if lowered.contains("ehostunreachable") || lowered.contains("host unreachable") {
+    // EHOSTUNREACH: strerror "No route to host"; ErrorKind Debug
+    // "HostUnreachable" (lowercased, no space) also covered by the
+    // errno-name form.
+    if lowered.contains("no route to host")
+        || lowered.contains("ehostunreachable")
+        || lowered.contains("host unreachable")
+    {
         codes.push("EHOSTUNREACH");
     }
-    if lowered.contains("enetunreach") || lowered.contains("network unreachable") {
+    // ENETUNREACH: strerror "Network is unreachable" (note the "is").
+    if lowered.contains("network is unreachable")
+        || lowered.contains("enetunreach")
+        || lowered.contains("network unreachable")
+    {
         codes.push("ENETUNREACH");
     }
     if lowered.contains("eacces") || lowered.contains("permission denied") {
@@ -1693,6 +1706,50 @@ mod tests {
         assert!(!supports_oauth(&entry(
             json!({ "url": "https://a.test/mcp", "auth": "bearer" })
         )));
+    }
+
+    #[test]
+    fn local_network_failure_codes_match_rust_io_error_text() {
+        // #544 regression: the needles must match what the Rust transport
+        // actually surfaces — io::Error Display (platform strerror), e.g.
+        // EHOSTUNREACH -> "No route to host (os error 113)", ENETUNREACH
+        // -> "Network is unreachable (os error 101)". The old spaced-only
+        // needles ("host unreachable" / "network unreachable") matched
+        // NEITHER spelling, leaving the macOS LNP hint dead for everything
+        // except EACCES. Literal strings keep this platform-independent
+        // (the errno NUMBER differs between Linux and macOS; the strerror
+        // text does not).
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                local_network_failure_codes(&std::io::Error::from_raw_os_error(113).to_string()),
+                vec!["EHOSTUNREACH"]
+            );
+            assert_eq!(
+                local_network_failure_codes(&std::io::Error::from_raw_os_error(101).to_string()),
+                vec!["ENETUNREACH"]
+            );
+            assert_eq!(
+                local_network_failure_codes(&std::io::Error::from_raw_os_error(13).to_string()),
+                vec!["EACCES"]
+            );
+        }
+        // The strerror spellings themselves (verified live above on
+        // Linux; identical on macOS) must hit regardless of the number.
+        assert_eq!(
+            local_network_failure_codes("No route to host (os error 65)"),
+            vec!["EHOSTUNREACH"]
+        );
+        assert_eq!(
+            local_network_failure_codes("Network is unreachable (os error 51)"),
+            vec!["ENETUNREACH"]
+        );
+        assert_eq!(
+            local_network_failure_codes("Permission denied (os error 13)"),
+            vec!["EACCES"]
+        );
+        // Mixed/unrelated failures stay empty.
+        assert!(local_network_failure_codes("connection reset by peer").is_empty());
+        assert!(local_network_failure_codes("").is_empty());
     }
 
     #[test]

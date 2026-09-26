@@ -541,7 +541,9 @@ fn parse_oauth_config(definition: &ServerEntry) -> OAuthConfig {
         client_metadata_url: oauth
             .and_then(|o| o.get("clientMetadataUrl"))
             .and_then(Value::as_str)
-            .map(str::to_string),
+            // #571 (mcp-auth-flow.ts:215): the URL is env-interpolated and
+            // trimmed at parse, exactly like `authServerMetadataUrl`.
+            .map(|text| crate::utils::interpolate_env_vars(text).trim().to_string()),
     }
 }
 
@@ -551,8 +553,38 @@ fn parse_oauth_config(definition: &ServerEntry) -> OAuthConfig {
 /// (ambiguous which credential authorizes the request). An explicit
 /// `clientId` always wins (CIMD is then ignored, matching the provider's
 /// `clientMetadataUrl` getter).
+/// The #503 registration gate (mcp-auth-flow.ts:556-573 @ 97435aab,
+/// re-review Finding 2), shared by the reuse filter and the dead-
+/// registration cleanup: a registration with NO stored tokens is
+/// orphaned — dead; with tokens, it is reusable only when the stored
+/// redirect_uris CONTAIN the current callback (an absent list does not
+/// match) or the pair is refresh-capable.
+fn registration_reusable(
+    info: &store::StoredClientInfo,
+    has_tokens: bool,
+    refresh_capable: bool,
+    redirect_uri: &str,
+) -> bool {
+    if !has_tokens {
+        return false;
+    }
+    let redirect_matches = info
+        .redirect_uris
+        .as_ref()
+        .is_some_and(|uris| uris.contains(&redirect_uri.to_string()));
+    redirect_matches || refresh_capable
+}
+
 fn validate_oauth_config(config: &OAuthConfig) -> Result<(), AdapterError> {
     if let Some(metadata_url) = &config.client_metadata_url {
+        // #571 (mcp-auth-flow.ts:216-218): an env-interpolated URL that
+        // trims to empty is rejected (an unset env var must not silently
+        // disable/enable CIMD).
+        if metadata_url.is_empty() {
+            return Err(AdapterError::InvalidConfigValue(
+                "OAuth clientMetadataUrl must not be empty".to_string(),
+            ));
+        }
         if config.client_id.is_none() && config.client_secret.is_some() {
             return Err(AdapterError::InvalidConfigValue(
                 "clientSecret requires an explicit clientId".to_string(),
@@ -1060,23 +1092,26 @@ pub async fn authenticate_with_store(
                 .as_ref()
                 .is_some_and(|entry| entry.tokens.is_some());
             let stored = stored_entry
+                .clone()
                 .and_then(|entry| entry.client_info)
                 .filter(|info| {
-                    // #503 gate (mcp-auth-flow.ts:556-573 @ 97435aab,
-                    // re-review Finding 2): a registration with NO stored
-                    // tokens is orphaned — dropped; with tokens, reuse only
-                    // when the stored redirect_uris CONTAIN the current
-                    // callback (an absent list does not match) or the pair
-                    // is refresh-capable.
-                    if !has_tokens {
-                        return false;
-                    }
-                    let redirect_matches = info
-                        .redirect_uris
-                        .as_ref()
-                        .is_some_and(|uris| uris.contains(&redirect_uri));
-                    redirect_matches || refresh_capable
+                    registration_reusable(info, has_tokens, refresh_capable, &redirect_uri)
                 });
+            // #503 (mcp-auth-flow.ts:558-560/:568-571): a dead registration
+            // (orphaned, or stale redirect on a non-refreshable pair) is
+            // cleared from the STORE too, not just filtered out of this
+            // resolution — the upstream interactive leg clears it up front
+            // so the next registration starts clean. Without this the CIMD
+            // branch below would keep resurrecting the dead registration
+            // on every flow.
+            if let Some(info) = stored_entry
+                .as_ref()
+                .and_then(|entry| entry.client_info.as_ref())
+            {
+                if !registration_reusable(info, has_tokens, refresh_capable, &redirect_uri) {
+                    let _ = store.clear_client_info(server_name);
+                }
+            }
             if let Some(info) = &stored {
                 if refresh_capable {
                     // The stored DCR pair still refreshes — it wins over
@@ -1090,8 +1125,8 @@ pub async fn authenticate_with_store(
                 } else if cimd_active {
                     // CIMD (#571): the operator-supplied URL IS the
                     // client_id; no secret accompanies it and DCR is
-                    // skipped. The stored registration stays untouched in
-                    // the credential store.
+                    // skipped (any dead registration was already cleared
+                    // above).
                     config.client_metadata_url.clone().unwrap_or_default()
                 } else {
                     if client_secret.is_none() {

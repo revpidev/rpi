@@ -1009,6 +1009,68 @@ mod tests {
         assert_eq!(sink.0.lock().unwrap().len(), 1);
     }
 
+    /// #536 (45757f5): approval BROKERS are consulted BEFORE the
+    /// session-grant cache — a broker deny must win over an earlier
+    /// session grant. Reverting the order (cache fast path first, broker
+    /// second) turns this test red: the cached grant would return `Ok`
+    /// before the broker is ever asked.
+    #[test]
+    fn broker_deny_wins_over_an_existing_session_grant() {
+        let config = config_with_approval(Some(json!(true)));
+        let cache = ApprovalCache::new();
+        // Seed the session grant through the UI AllowForSession path.
+        let granting_ui = FixedHandler(ApprovalDecision::AllowForSession);
+        assert_eq!(
+            ensure_tool_call_approved(
+                &config,
+                &cache,
+                "demo",
+                &tool(),
+                &json!({"query": "x"}),
+                ApprovalOrigin::Proxy,
+                None,
+                Some(&granting_ui),
+                no_context,
+            ),
+            ToolCallApprovalResult::Ok
+        );
+        assert_eq!(cache.len(), 1, "session grant cached");
+        // A later broker deny overrides the cached grant.
+        let denying_broker = FixedHandler(ApprovalDecision::Deny);
+        assert_eq!(
+            ensure_tool_call_approved(
+                &config,
+                &cache,
+                "demo",
+                &tool(),
+                &json!({"query": "x"}),
+                ApprovalOrigin::Proxy,
+                Some(&denying_broker),
+                None,
+                no_context,
+            ),
+            ToolCallApprovalResult::Denied,
+            "the broker's deny must win over the earlier session grant"
+        );
+        // With the broker abstaining, the cached grant still applies.
+        let abstaining_broker = FixedHandler(ApprovalDecision::Abstain);
+        assert_eq!(
+            ensure_tool_call_approved(
+                &config,
+                &cache,
+                "demo",
+                &tool(),
+                &json!({"query": "x"}),
+                ApprovalOrigin::Proxy,
+                Some(&abstaining_broker),
+                None,
+                no_context,
+            ),
+            ToolCallApprovalResult::Ok,
+            "an abstaining broker falls through to the session grant"
+        );
+    }
+
     /// A8: rejection details carry names/hashes only, with the proxy `mode`
     /// key first (upstream ordered object).
     #[test]

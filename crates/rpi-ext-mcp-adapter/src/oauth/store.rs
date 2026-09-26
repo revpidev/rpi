@@ -399,6 +399,14 @@ fn get_auth_entry_chunk_digest(payload: &str) -> String {
 /// chunking is a Windows Credential Manager workaround — it only applies
 /// on Windows or when the backend forces it (the size-limited test store);
 /// the encrypted-file backend never chunks.
+///
+/// Size note (deliberate, upstream-shared): the threshold and the split
+/// count CHARACTERS (`payload.length` in JS = UTF-16 units upstream,
+/// `chars()` here), not bytes — a payload of CJK characters near the
+/// threshold can exceed the Windows byte limit at the margin. Matching
+/// the upstream unit keeps the chunk layout byte-identical for
+/// cross-implementation reads; do not switch to byte-based splitting
+/// without an upstream-format decision.
 fn should_chunk_auth_payload(store: &dyn SecretStore, payload: &str) -> bool {
     store.kind() != SecretStoreKind::EncryptedFile
         && payload.chars().count() > AUTH_SECRET_CHUNK_SIZE

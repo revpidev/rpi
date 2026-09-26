@@ -663,9 +663,12 @@ fn prompt_values_to_cached(prompts: &[Value]) -> Vec<crate::cache::CachedPrompt>
 /// `loadToolSurfaceCache` (#566, 464337b — index.ts @ 97435aab): overlay
 /// the live connection catalogs on the persistent metadata cache for a
 /// tool-surface sync. Live = connected + enabled + definition hash equal
-/// to the runtime config's. The overlaid entry is NEVER written back, so
-/// zero-TTL metadata stays unusable on reload. Resource discovery failures
-/// fall back to the persistent entry's (still valid) resources.
+/// to the runtime config's. The overlaid entry is NEVER written back
+/// and never carries the declared `ttlMs` (see [`overlay_cache_entry`]),
+/// so a LIVE zero-TTL server keeps its tools on the sync while a
+/// RELOADED one (no connection) retires to its persistent entry and
+/// stays unusable. Resource discovery failures fall back to the
+/// persistent entry's (still valid) resources.
 pub(crate) fn overlay_live_tool_surface_cache(
     persistent: Option<crate::cache::MetadataCache>,
     config: &McpConfig,
@@ -719,16 +722,14 @@ pub(crate) fn overlay_live_tool_surface_cache(
         let hints = connection.tool_list_hints_snapshot();
         servers.insert(
             name,
-            crate::cache::ServerCacheEntry {
+            overlay_cache_entry(
                 config_hash,
                 tools,
                 resources,
-                prompts: persistent_entry.and_then(|entry| entry.prompts.clone()),
-                instructions: connection.instructions.clone(),
-                ttl_ms: hints.as_ref().and_then(|h| h.ttl_ms),
-                cache_scope: hints.as_ref().and_then(|h| h.cache_scope.clone()),
-                cached_at: now_ms(),
-            },
+                persistent_entry.and_then(|entry| entry.prompts.clone()),
+                connection.instructions.clone(),
+                hints,
+            ),
         );
     }
     if !has_live {
@@ -738,6 +739,35 @@ pub(crate) fn overlay_live_tool_surface_cache(
         version: crate::cache::CACHE_VERSION,
         servers,
     })
+}
+
+/// The overlay cache entry for one live connection (#566, 464337b —
+/// index.ts loadToolSurfaceCache @ 97435aab). The overlaid entry NEVER
+/// carries the server's declared `ttlMs`: a zero-TTL declaration would
+/// make `is_server_cache_valid` reject the entry (`ttlMs == 0` always
+/// expires) and drop the LIVE server's tools from the tool surface,
+/// defeating the overlay's "zero-TTL servers keep their tools while
+/// connected" contract. Freshness comes from `cached_at: now` under the
+/// global max age instead (the upstream overlay strips `ttlMs` the same
+/// way); `cacheScope` is display-only and rides along.
+fn overlay_cache_entry(
+    config_hash: String,
+    tools: Vec<crate::cache::CachedTool>,
+    resources: Vec<crate::cache::CachedResource>,
+    prompts: Option<Vec<crate::cache::CachedPrompt>>,
+    instructions: Option<String>,
+    hints: Option<crate::protocol::ToolListHints>,
+) -> crate::cache::ServerCacheEntry {
+    crate::cache::ServerCacheEntry {
+        config_hash,
+        tools,
+        resources,
+        prompts,
+        instructions,
+        ttl_ms: None,
+        cache_scope: hints.and_then(|h| h.cache_scope.clone()),
+        cached_at: now_ms(),
+    }
 }
 
 /// `updateMetadataCache` (init.ts:454-495).
@@ -4115,8 +4145,11 @@ impl ProxyDispatcher {
             // #502: report the connect-discovered direct tools as the
             // result-scoped load-point signal.
             let added = self.connect_added_tool_names(connect);
-            if !added.is_empty() && result.get("details").is_some_and(Value::is_object) {
-                result["details"]["addedToolNames"] = json!(added);
+            if !added.is_empty() {
+                // #502 (index.ts:1492 `{ ...result, addedToolNames }`): the
+                // load-point signal rides the tool-result TOP LEVEL, not
+                // `details` — cross-implementation consumers read it there.
+                result["addedToolNames"] = json!(added);
             }
             return result;
         }
@@ -4176,9 +4209,12 @@ impl ProxyDispatcher {
                     ));
                 }
                 if result.get("details").is_some_and(Value::is_object) {
+                    // #525 (index.ts:1869): `activated` stays a details field.
                     result["details"]["activated"] = json!(added);
-                    result["details"]["addedToolNames"] = json!(added);
                 }
+                // #525/#502 (index.ts:1872): `addedToolNames` rides the
+                // tool-result TOP LEVEL.
+                result["addedToolNames"] = json!(added);
             }
             return result;
         }
@@ -4249,6 +4285,53 @@ mod tests {
             original_name: original.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn overlay_entry_never_carries_the_declared_ttl() {
+        // #566 regression: a zero-TTL declaration (`ttl_ms: Some(0)`) on a
+        // LIVE connection must not leak into the overlay entry —
+        // `is_server_cache_valid` rejects `ttl_ms == 0` outright, which
+        // dropped the connected server's tools from the tool surface
+        // (direct-tool specs skipped the server entirely).
+        let definition = ServerEntry(
+            serde_json::json!({ "url": "https://s.test/mcp" })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let hints = crate::protocol::ToolListHints {
+            ttl_ms: Some(0),
+            cache_scope: Some("private".to_string()),
+        };
+        let entry = overlay_cache_entry(
+            crate::cache::compute_server_hash(&definition).expect("hash"),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            Some(hints),
+        );
+        assert_eq!(entry.ttl_ms, None, "overlay entries strip the declared ttl");
+        assert_eq!(entry.cache_scope.as_deref(), Some("private"));
+        // The stripped entry must validate for the live window (this is
+        // exactly what `direct` specs consult).
+        assert!(crate::cache::is_server_cache_valid(
+            &entry,
+            &definition,
+            crate::cache::CACHE_MAX_AGE_MS,
+            now_ms(),
+        ));
+        // Sanity: the SAME declaration on a persistent entry is invalid —
+        // the strip (not a validity change) is what keeps live tools.
+        let mut persistent_shape = entry.clone();
+        persistent_shape.ttl_ms = Some(0);
+        assert!(!crate::cache::is_server_cache_valid(
+            &persistent_shape,
+            &definition,
+            crate::cache::CACHE_MAX_AGE_MS,
+            now_ms(),
+        ));
     }
 
     #[test]

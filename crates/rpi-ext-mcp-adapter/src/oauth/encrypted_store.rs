@@ -73,10 +73,13 @@ fn decode_canonical_base64_str(
         return Err(invalid());
     }
     // Canonical form: standard alphabet, length a multiple of 4, and padding
-    // only as `xx==` / `xxx=`.
-    let body_ok = !text[..text.len().saturating_sub(4)]
-        .bytes()
-        .any(|b| !(b.is_ascii_alphanumeric() || b == b'+' || b == b'/'))
+    // only as `xx==` / `xxx=`. Byte-level check (a `&str` byte slice never
+    // panics on multi-byte UTF-8, unlike `&str[..n]` — a non-ASCII key like
+    // `éAAA` must fail closed with InvalidConfigValue, not panic).
+    let bytes = text.as_bytes();
+    let body_ok = !bytes[..bytes.len().saturating_sub(4)]
+        .iter()
+        .any(|b| !(b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/'))
         && text.len().is_multiple_of(4);
     if !body_ok {
         return Err(invalid());
@@ -520,6 +523,19 @@ mod tests {
         // Valid base64 of 4 bytes but non-canonical alphabet form is fine;
         // a 4-byte decode asked to be 32 must fail:
         assert!(decode_canonical_base64_str("AAAAAAAA", Some(32)).is_err());
+    }
+
+    #[test]
+    fn canonical_base64_fails_closed_on_multibyte_utf8() {
+        // Regression: the body window used to be sliced as `text[..len-4]`
+        // (a `&str` byte range), which PANICKED on multi-byte UTF-8 keys
+        // instead of failing closed with InvalidConfigValue.
+        for key in ["éAAA", "AéAA", "中中中中", "AAAA😀"] {
+            assert!(
+                decode_canonical_base64_str(key, None).is_err(),
+                "{key:?} must be rejected, not panic"
+            );
+        }
     }
 
     #[test]
