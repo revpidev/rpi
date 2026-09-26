@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.5] - 2026-09-27
+
+### 主线
+
+- **上游追平 v0.86.1**（V15-01…15，ADR-0029 + ADR-0031 就地重钉）：行为金标准从 `9841914`（v0.85.0+）升级到 `19451accd`（v0.86.1+1；首轮 174 commits + 增量 11 commits），15 个宿主任务恢复行为对拍绿，渲染面首次执行**字节等价门**（G14——快照零重录）。分域摘要见 `changes/v0.1.5.md`（发布 changelog 单一事实源），关键用户可观测面：
+  - **协议与会话**：**[BREAKING]** mid-conversation system messages——prompt/工具声明改由 transcript 承载（`TranscriptContext` 品牌收窄；deferred-tools 机制随上游退场）；per-model compaction 预算（`compaction.modelOverrides`）；尾部工具结果超限不再放弃压缩（#9740）；`--resume`/`--continue`/`--session` 渐进发现与精确解析；prompt cache warming（`cacheWarming` 设置 + `usage` 会话条目 + `cache_warming_decision` 扩展事件）；`ctx.sessionToolResults` additive ABI（ADR-0030）。
+  - **Providers**：Meta provider + Muse 订阅 OAuth（`/login meta`）；内建目录重生成 @ v0.86.1（41 目录 / 1443 模型，Radius 公共目录 + per-tier prompt-cache 生命期）；SSE 空闲超时默认**不限**（rpi#54，D-103——`httpIdleTimeoutMs: 300000` 可恢复旧默认）。
+  - **工具 / CLI / 扩展**：内建工具默认 strict-prefer JSON-schema 采样；bash 时长可读渲染（`1h 3m 4s`）与信号退出码（`128+N`）；**[BREAKING]** `user_bash` handler 失败即中止 `!` 命令（不再回落本地 shell）；`pi.on()` 返回退订句柄；`ctx.modelRegistry.stream()/streamSimple()`；RPC steer/follow_up 走扩展 input handler；修复扩展 render hook 在主题互斥锁上的死锁（rpi#52 e2e 发现）。
+  - **TUI**：剪贴板验证写入链（平台命令 → WSL interop → #9618/#9688 门控 OSC 52，100 KB 上限；无头/远程会话回退）——D-104；LaTeX `cases`/嵌套 script、WezTerm Kitty 图像、CJK 标点补全边界、Alt 滚轮加速等修复族；**流式渲染 O(lines²) → 线性**（rpi#53：sourcepos 查表化 + 块级组件复用 + Arc 端到端共享，200 KB folded delta ~227ms → ~8ms，字节等价）。
+- **插件线（六插件 lockstep）**：**新第一方插件 `rpiv-todo`**（TE34–36：`todo` 工具/overlay/`/todos` 命令/会话分支重放——跨 compaction 与 `/reload` 存活；registry 键 `rpiv-todo`，首发随本 RC）；subagents 重定基 v0.70.0（**[BREAKING]** `fallbackModels` 移除——重试不再自动换模型；worktree 准入/预算/allowlist 治理族）；mcp-adapter 重定基 v2.34.0+（加密文件 OAuth 凭据仓、CIMD、`/mcp edit`、directTools search 等）；ask-user-question 转录渲染摘要行（rpi#52）+ 主题死锁修复；rpiv-mono pin `0fdf4f8`。
+- **rpi 自有修复**：#52（ask-user_question 转储渲染 + 宿主锁作用域）、#53（流式渲染效率，上述）、#54（SSE 空闲超时默认）。
+
+### Internal
+
+- workspace version bumped to 0.1.5-rc.1 + Cargo.lock synced; full gates zero failures (workspace 6843 cases at TE36 closeout).
+- deviations D-101（核销）/D-103/D-104/TE-D43（转正）全闭环；rpi-pages registry 六插件矩阵与 RC 端点随本 RC 发布刷新。
+
 ## [0.1.4] - 2026-09-18
 
 ### Main line
