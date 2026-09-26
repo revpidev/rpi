@@ -2,24 +2,32 @@
 
 ## [0.1.5] - 2026-09-27
 
-### 主线
+### Main line
 
-- **上游追平 v0.86.1**（V15-01…15，ADR-0029 + ADR-0031 就地重钉）：行为金标准从 `9841914`（v0.85.0+）升级到 `19451accd`（v0.86.1+1；首轮 174 commits + 增量 11 commits），15 个宿主任务恢复行为对拍绿，渲染面首次执行**字节等价门**（G14——快照零重录）。分域摘要见 `changes/v0.1.5.md`（发布 changelog 单一事实源），关键用户可观测面：
-  - **协议与会话**：**[BREAKING]** mid-conversation system messages——prompt/工具声明改由 transcript 承载（`TranscriptContext` 品牌收窄；deferred-tools 机制随上游退场）；per-model compaction 预算（`compaction.modelOverrides`）；尾部工具结果超限不再放弃压缩（#9740）；`--resume`/`--continue`/`--session` 渐进发现与精确解析；prompt cache warming（`cacheWarming` 设置 + `usage` 会话条目 + `cache_warming_decision` 扩展事件）；`ctx.sessionToolResults` additive ABI（ADR-0030）。
-  - **Providers**：Meta provider + Muse 订阅 OAuth（`/login meta`）；内建目录重生成 @ v0.86.1（41 目录 / 1443 模型，Radius 公共目录 + per-tier prompt-cache 生命期）；SSE 空闲超时默认**不限**（rpi#54，D-103——`httpIdleTimeoutMs: 300000` 可恢复旧默认）。
-  - **工具 / CLI / 扩展**：内建工具默认 strict-prefer JSON-schema 采样；bash 时长可读渲染（`1h 3m 4s`）与信号退出码（`128+N`）；**[BREAKING]** `user_bash` handler 失败即中止 `!` 命令（不再回落本地 shell）；`pi.on()` 返回退订句柄；`ctx.modelRegistry.stream()/streamSimple()`；RPC steer/follow_up 走扩展 input handler；修复扩展 render hook 在主题互斥锁上的死锁（rpi#52 e2e 发现）。
-  - **TUI**：剪贴板验证写入链（平台命令 → WSL interop → #9618/#9688 门控 OSC 52，100 KB 上限；无头/远程会话回退）——D-104；LaTeX `cases`/嵌套 script、WezTerm Kitty 图像、CJK 标点补全边界、Alt 滚轮加速等修复族；**流式渲染 O(lines²) → 线性**（rpi#53：sourcepos 查表化 + 块级组件复用 + Arc 端到端共享，200 KB folded delta ~227ms → ~8ms，字节等价）。
-- **插件线（六插件 lockstep）**：**新第一方插件 `rpiv-todo`**（TE34–36：`todo` 工具/overlay/`/todos` 命令/会话分支重放——跨 compaction 与 `/reload` 存活；registry 键 `rpiv-todo`，首发随本 RC）；subagents 重定基 v0.70.0（**[BREAKING]** `fallbackModels` 移除——重试不再自动换模型；worktree 准入/预算/allowlist 治理族）；mcp-adapter 重定基 v2.34.0+（加密文件 OAuth 凭据仓、CIMD、`/mcp edit`、directTools search 等）；ask-user-question 转录渲染摘要行（rpi#52）+ 主题死锁修复；rpiv-mono pin `0fdf4f8`。
-- **rpi 自有修复**：#52（ask-user_question 转储渲染 + 宿主锁作用域）、#53（流式渲染效率，上述）、#54（SSE 空闲超时默认）。
+- **Upstream parity to v0.86.1** (V15-01…15, ADR-0029 + ADR-0031 re-pinned in place): the behavioral gold standard moves from `9841914` (v0.85.0+) to `19451accd` (v0.86.1+1; 174 commits first pass + 11 incremental), fifteen host tasks restored behavioral-parity green, and the render plane ran the byte-equality gate for the first time (G14 — zero snapshot re-records). Per-domain summaries live in `changes/v0.1.5.md` (the release changelog single source of truth); key user-observable surfaces:
+  - **Protocol & sessions**: **[BREAKING]** mid-conversation system messages — the prompt and tool declarations ride the transcript (`TranscriptContext` brand narrows the provider trait surface; the deferred-tools mechanism retires with upstream); per-model compaction budgets (`compaction.modelOverrides`); trailing oversized tool results no longer abort compaction (#9740); progressive `--resume`/`--continue`/`--session` discovery with exact resolution; prompt cache warming (`cacheWarming` setting + `usage` session entries + the `cache_warming_decision` extension event); the `ctx.sessionToolResults` additive ABI (ADR-0030); agent retry backoff capped by the new `retry.maxAgentDelayMs` setting (default 60 s) and compaction cancellation races closed (#8826/#9340/#9777, V15-10).
+  - **Providers**: the Meta provider + Muse subscription OAuth (`/login meta`); built-in catalog regenerated @ v0.86.1 (41 catalogs / 1443 models; Radius public catalog + per-tier prompt-cache lifetimes); SSE idle timeout now defaults to unlimited (rpi#54, D-103 — set `httpIdleTimeoutMs: 300000` to restore the old default).
+  - **Tools / CLI / extensions**: built-in tools default to strict-prefer JSON-schema sampling; bash durations render readably (`1h 3m 4s`) with signal exit codes (`128+N`); **[BREAKING]** a failing `user_bash` handler aborts the `!` command (no local-shell fallback), and RPC-mode `bash` now runs the same interception; `pi.on()` returns an unsubscribe handle; `ctx.modelRegistry.stream()/streamSimple()`; RPC steer/follow_up run extension input handlers; the extension render-hook theme-mutex deadlock fixed (found by the rpi#52 e2e).
+  - **TUI**: verified clipboard writes (platform commands → WSL interop → #9618/#9688-gated OSC 52, 100 KB cap; headless/remote fallbacks) — D-104, with the WSL PowerShell chain actually reaching `powershell.exe` (pre-stable review fix); the LaTeX `cases`/nested-script, WezTerm Kitty image, CJK-punctuation completion, Alt-wheel acceleration fix family; **streaming renders O(lines²) → linear** (rpi#53: sourcepos lookup table + per-block component reuse + end-to-end `Arc` sharing; 200 KB folded delta ~227 ms → ~8 ms, byte-identical).
+- **Plugin line (six-plugin lockstep)**: **the new first-party plugin `rpiv-todo`** (TE34–36: the `todo` tool / overlay / `/todos` command / session-branch replay — survives compaction and `/reload`; registry key `rpiv-todo`, debuting with this release); subagents rebased to v0.70.0 (**[BREAKING]** `fallbackModels` removed — retries never switch models; the worktree-admission / budget / allowlist governance family; budgets honored at the call level — top-level and per-task `toolBudget`); mcp-adapter rebased to v2.34.0+ (encrypted-file OAuth credential store, CIMD, `/mcp edit`, directTools search, top-level `addedToolNames`); ask-user-question transcript render summary line (rpi#52) + the theme-mutex fix; the rpiv-mono pin `0fdf4f8`.
+- **rpi-native fixes**: #52 (ask_user_question dump rendering + host lock scoping), #53 (streaming render efficiency, above), #54 (SSE idle timeout default).
 
 ### RC verification fixes
 
 - **rc.2**: the rpiv-todo overlay never appeared in a real interactive session (the tool worked; the UI didn't) — the interactive mode attached the extension UI bridge after `bind_extensions`, so `session_start` fired with no UI and the plugin's overlay foreground claim never ran. Both boot and every session-switch rebind now attach the bridge first (upstream binds the two atomically); a real-mode boot e2e pins the ordering.
 
+### Pre-stable review fixes
+
+- The WSL clipboard write chain actually reaches `powershell.exe` now (the write-path runner dropped stdout; real WSL silently fell back to an unverified OSC 52 success) — query calls return real stdout bytes, writer calls get no output pipe at all (a daemonizing writer can no longer hang the drain); pinned by real-runner regressions including a fake-`wslpath` end-to-end chain.
+- Zero-TTL MCP servers keep their direct tools while connected (#566): the live-overlay cache entry stripped of the declared `ttlMs` (a `ttlMs == 0` entry is invalid by design and used to drop the connected server's tools); regression-tested.
+- RPC `bash` runs the `user_bash` extension interception with the same fail-closed contract as the interactive `!` path.
+- `mcp({ connect })` / `mcp({ search })` report `addedToolNames` at the tool-result top level (upstream shape; was nested under `details`).
+- Assorted repairs, each with a regression test: the encrypted-file OAuth key decoder fails closed on multi-byte UTF-8 (no panic); macOS Local Network Privacy diagnostics match the real Rust io error texts; the #536 broker-before-grant order is pinned; dead DCR registrations are cleared from the store; `oauth.clientMetadataUrl` interpolates env vars; ask_user_question multi-select answers strip control characters; post-login default models match the regenerated catalog (zai/zai-coding-cn/cerebras/xai) and a test now pins every default against the catalog; the todo reducer compares JSON numbers numerically (`1` vs `1.0` is a no-op); `agent_capabilities` reports real `executable`/`restrictedCount`/`restrictionSources` under a capability ceiling; the Anthropic beta set rides the header only; the wasm SDK `unsubscribe` releases the state lock before the `off` host call; the subagents skill docs no longer teach the removed `fallbackModels`.
+
 ### Internal
 
 - workspace version bumped to 0.1.5-rc.1 + Cargo.lock synced; full gates zero failures (workspace 6843 cases at TE36 closeout).
-- deviations D-101（核销）/D-103/D-104/TE-D43（转正）全闭环；rpi-pages registry 六插件矩阵与 RC 端点随本 RC 发布刷新。
+- deviations D-101 (closed) / D-103 / D-104 / TE-D43 (promoted) all resolved; the rpi-pages registry six-plugin matrix and RC endpoints refreshed with this RC.
 
 ## [0.1.4] - 2026-09-18
 
