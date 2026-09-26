@@ -4626,6 +4626,15 @@ mod tests {
             error_message.contains("No API provider registered for api: rpi-messages"),
             "foreign api must fail with the upstream message: {error_message:?}"
         );
+        // The simple branch fails symmetrically.
+        let simple_error = match provider.stream_simple(&foreign, &context, None) {
+            Ok(_) => panic!("foreign api must fail closed for stream_simple"),
+            Err(error) => error,
+        };
+        assert!(
+            simple_error.contains("No API provider registered for api: rpi-messages"),
+            "unexpected stream_simple error: {simple_error}"
+        );
     }
 
     fn model_7027() -> Model {
