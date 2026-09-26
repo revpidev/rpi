@@ -18,14 +18,16 @@ fixtures/
     └── subagents-parity-v070/  # subagents parity reports (the active track since the TE39 pin switch; v066 reports retired, kept for history)
 ```
 
-> **The v0.1.5 window (TE37, 2026-09-20; ADR-0029 adopted)**: `external/pi` switched to `d1230ea`
-> (v0.86.0+2); the plugin pins stay at their v0.1.4 baselines until their atomic switch tasks —
+> **The v0.1.5 window (TE37, 2026-09-20; ADR-0029 adopted; re-pinned in place to `19451accd`
+> by ADR-0031, v0.86.1+1)**: `external/pi` switched to `d1230ea` (v0.86.0+2) and then to
+> **`19451accd`** on the same day (ADR-0031); the plugin pins stayed at their v0.1.4
+> baselines until their atomic switch tasks —
 > `external/pi-subagents` **switched to `b72714de` (v0.70.0) with TE39 (2026-09-27)**, `external/pi-mcp-adapter`
 > **switched to `97435aab` (v2.34.0+9) with TE40 (2026-09-27)**, `external/rpiv-mono` **switched to `0fdf4f8` (v2.10.1+1) with TE41 (2026-09-26)**; `external/agent-smart-fetch` @
 > `b0111612` unchanged (upstream HEAD, zero-diff re-verified). The committed goldens above remain
 > recorded against `9841914` except the five `generated/` scenarios, re-recorded @ `19451accd`
 > with V15-06 (#9548); the pi submodule
-> at `d1230ea` is the read source for those tasks. New **target tracks** (expectation source = new
+> at `19451accd` is the read source for those tasks. New **target tracks** (expectation source = new
 > pins, read-only snapshots): `fixtures/generated/subagents-parity-v070/` (v0.70.0 @ `b72714de`)
 > and the mcp v2.34.0+9 snapshot via `scripts/mcp-parity/TARGET-TRACK.md` — both start as skeleton
 > (TE37); the current-pin regression tracks (`subagents-parity-v066/`, default driver = submodule)
@@ -34,7 +36,7 @@ fixtures/
 > **Plugin rebases**: `external/pi-subagents` @ **`b72714de` (v0.70.0)** — switched atomically with TE39
 > (2026-09-27; ADR-0029 five-pin table; the fallback/model parity legs re-anchored at v0.70
 > `model-resolution.ts`, argv/env stays the frozen v0.48 golden) — and `external/pi-mcp-adapter` @
-> `10a45367` (v2.32.1, TE27/ADR-0025); `external/pi` @ `19451accd` and `external/agent-smart-fetch` @
+> **`97435aab` (v2.34.0+9, switched with TE40)**; `external/pi` @ `19451accd` and `external/agent-smart-fetch` @
 > `b0111612` are unchanged. `fixtures/generated/subagents-parity-v070/` is the current parity anchor;
 > the v0.66 snapshot reports under `subagents-parity-v066/` are retired (kept for history).
 > **The old-tag regression tracks (subagents v0.48.0 / mcp v2.24.0) reached end-of-life with the pin switch**:
