@@ -249,7 +249,11 @@ impl HuggingFaceSearch {
         let search_fn = self.search_fn.clone();
         let shared = Arc::clone(&self.shared);
         let render_handle = self.render_handle.clone();
-        tokio::spawn(async move {
+        // `handle_input` dispatches on the TUI driver thread, which has no
+        // Tokio runtime — a bare `tokio::spawn` panics with "there is no
+        // reactor running". Route through the `spawn_async` fallback
+        // (commands_selectors.rs:296), matching the module doc's intent.
+        crate::modes::interactive::interactive_mode::commands_selectors::spawn_async(async move {
             let debounce = tokio::time::sleep(std::time::Duration::from_millis(500));
             tokio::select! {
                 () = token.cancelled() => {}
@@ -882,5 +886,51 @@ mod tests {
             output_modalities: Vec::new(),
         });
         assert!(arch.is_loaded());
+    }
+
+    /// Regression: `handle_input` dispatches on the TUI driver thread, which
+    /// has no Tokio runtime — `schedule_search` used a bare `tokio::spawn`
+    /// for the debounce and panicked with "there is no reactor running" as
+    /// soon as the query reached 2 characters. Drive it from a plain thread
+    /// (the `spawn_async` fallback context) to pin the fix.
+    #[test]
+    fn schedule_search_spawns_without_a_runtime_context() {
+        // Resolves immediately so the detached debounce task on the fallback
+        // runtime finishes (no hung threads at test-exit).
+        let search_fn: HuggingFaceSearchFn =
+            Arc::new(|_query, _token| Box::pin(async move { Ok(Vec::new()) }));
+        let shared = Arc::new(Mutex::new(LlamaViewState {
+            content: LlamaContent::Loading,
+            progress_waiters: Vec::new(),
+        }));
+        let render_handle = RenderHandle::new(|| {});
+        let resolution: Arc<Mutex<Option<oneshot::Sender<Option<String>>>>> =
+            Arc::new(Mutex::new(None));
+        let search = HuggingFaceSearch::new(
+            search_fn,
+            Arc::clone(&shared),
+            render_handle,
+            HashMap::new(),
+            resolution,
+        );
+        lock(&shared).content = LlamaContent::Search(Box::new(search));
+        if let LlamaContent::Search(search) = &mut lock(&shared).content {
+            search.query = "tinyllama".to_owned();
+        }
+        let thread_shared = Arc::clone(&shared);
+        let spawned = std::thread::spawn(move || {
+            if let LlamaContent::Search(search) = &mut lock(&thread_shared).content {
+                search.schedule_search();
+            }
+        });
+        spawned
+            .join()
+            .expect("schedule_search must not panic off-runtime");
+        // The search was scheduled (status flipped synchronously; the
+        // debounce fires 500ms later on the fallback runtime).
+        if let LlamaContent::Search(search) = &lock(&shared).content {
+            assert_eq!(search.status, "Searching Hugging Face…");
+            assert!(search.request_token.is_some(), "in-flight token set");
+        };
     }
 }

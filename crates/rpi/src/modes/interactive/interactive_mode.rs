@@ -4224,7 +4224,11 @@ impl InteractiveUi {
             self.update_pending_messages_display();
             if abort {
                 let session = self.session();
-                tokio::spawn(async move {
+                // The drain runs on the TUI driver thread (no Tokio runtime);
+                // a bare `tokio::spawn` there panics with "there is no
+                // reactor running" — route through the `spawn_async`
+                // fallback (commands_selectors.rs:296).
+                commands_selectors::spawn_async(async move {
                     session.abort().await;
                 });
             }
@@ -4241,7 +4245,9 @@ impl InteractiveUi {
         self.update_pending_messages_display();
         if abort {
             let session = self.session();
-            tokio::spawn(async move {
+            // Same driver-thread context as above — use `spawn_async`, not
+            // a bare `tokio::spawn`.
+            commands_selectors::spawn_async(async move {
                 session.abort().await;
             });
         }
@@ -8009,6 +8015,50 @@ mod tests {
         );
         // Pending display cleared.
         assert!(lock(&ui.pending_messages_container).render(60).is_empty());
+    }
+
+    /// Regression: the TUI driver thread (and any key-dispatch callback) has
+    /// no Tokio runtime — `restore_queued_messages_to_editor` used a bare
+    /// `tokio::spawn` for the abort and panicked with "there is no reactor
+    /// running" when Escape was pressed during streaming. Drive both abort
+    /// branches from a plain thread to pin the `spawn_async` fallback.
+    #[test]
+    fn restore_queued_messages_aborts_without_a_runtime_context() {
+        // Build the harness on a scoped runtime, then leave `block_on` so
+        // this thread has no ambient runtime either (mirrors the driver
+        // thread, where `Handle::try_current()` fails).
+        let ui = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async move {
+                let (mut mode, _terminal, _session) = mode_harness().await;
+                mode.init().await;
+                Arc::clone(&mode.ui_state)
+            })
+        };
+        let empty_ui = Arc::clone(&ui);
+        // Empty queues: the early-return abort branch (the exact path from
+        // the reported panic).
+        let empty = std::thread::spawn(move || {
+            empty_ui.restore_queued_messages_to_editor(true);
+        });
+        empty
+            .join()
+            .expect("empty-queue abort must not panic off-runtime");
+
+        // Non-empty queues: the tail abort branch.
+        ui.queue_compaction_message("queued".to_string(), StreamingBehavior::Steer);
+        let queued_ui = Arc::clone(&ui);
+        let queued = std::thread::spawn(move || {
+            let restored = queued_ui.restore_queued_messages_to_editor(true);
+            assert_eq!(restored, 1);
+        });
+        queued
+            .join()
+            .expect("queued abort must not panic off-runtime");
+        assert!(lock(&ui.compaction_queue).is_empty());
     }
 
     #[tokio::test]
