@@ -1,0 +1,10 @@
+{
+  "name": "rpiv-todo",
+  "repository": "revpidev/rpi",
+  "description": "Task-list todo tool: a live overlay panel above the editor the model keeps current with one tool call (six actions, four-state machine, dependency tracking), rebuilt from the session branch so it survives compaction and /reload, plus a /todos command and a collapse shortcut.",
+  "author": "revpidev",
+  "license": "MIT",
+  "official": true,
+  "lockstepHost": true,
+  "descriptionZh": "任务清单工具:编辑器上方常驻 overlay 面板,模型经 todo 工具(六动作/四态状态机/依赖追踪)单次调用即可保持清单最新,从会话分支重放重建,跨 compaction 与 /reload 存活,附 /todos 命令与折叠快捷键。"
+}
