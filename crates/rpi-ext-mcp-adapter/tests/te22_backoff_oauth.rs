@@ -43,6 +43,9 @@ struct StubRequest {
     method: String,
     path: String,
     body: String,
+    /// Lower-cased request header names with their raw values (service-header
+    /// assertions need the wire headers, not just the parsed bodies).
+    headers: Vec<(String, String)>,
 }
 
 type StubHandler = Arc<dyn Fn(&StubRequest) -> (u16, Vec<(String, String)>, String) + Send + Sync>;
@@ -77,11 +80,15 @@ async fn run_stub(listener: TcpListener, handler: StubHandler, stop: Cancellatio
             let method = parts.next().unwrap_or_default().to_string();
             let path = parts.next().unwrap_or_default().to_string();
             let mut content_length = 0usize;
+            let mut headers = Vec::new();
             for line in lines {
                 if let Some((name, value)) = line.split_once(':') {
-                    if name.trim().eq_ignore_ascii_case("content-length") {
-                        content_length = value.trim().parse().unwrap_or(0);
+                    let name = name.trim().to_ascii_lowercase();
+                    let value = value.trim().to_string();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.parse().unwrap_or(0);
                     }
+                    headers.push((name, value));
                 }
             }
             let mut body = buf[header_end + 4..].to_vec();
@@ -95,6 +102,7 @@ async fn run_stub(listener: TcpListener, handler: StubHandler, stop: Cancellatio
                 method,
                 path,
                 body: String::from_utf8_lossy(&body).to_string(),
+                headers,
             };
             let (status, headers, response_body) = handler(&request);
             let mut response = format!(
@@ -602,7 +610,7 @@ async fn spawn_oauth_stub() -> OAuthStub {
                 recorded
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .push(json!({ "kind": "token", "params": form }));
+                    .push(json!({ "kind": "token", "params": form, "headers": request.headers }));
                 if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
                     return (
                         400,
@@ -627,7 +635,7 @@ async fn spawn_oauth_stub() -> OAuthStub {
                 recorded
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .push(json!({ "kind": "register", "body": body }));
+                    .push(json!({ "kind": "register", "body": body, "headers": request.headers }));
                 let redirect_uris = body
                     .get("redirect_uris")
                     .cloned()
@@ -777,6 +785,108 @@ async fn oauth_invalid_grant_reregisters_stale_dynamic_client() {
     assert_eq!(
         entry.tokens.as_ref().map(|t| t.access_token.as_str()),
         Some("fresh-access-token")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review P1 (#535): `createOAuthFetch` attaches the same-origin service
+/// headers to EVERY OAuth request — token exchange and refresh included.
+/// The two token legs used to send only `accept`, so an OAuth server (or a
+/// gateway in front of it) requiring a configured header on its token
+/// endpoint failed there while discovery/DCR/client_credentials succeeded.
+#[tokio::test]
+async fn oauth_service_headers_ride_token_exchange_and_refresh() {
+    let stub = spawn_oauth_stub().await;
+    let server_url = format!("{}/mcp", stub.base());
+
+    let dir = temp_dir("oauth-service-headers");
+    let store = OAuthCredentialStore::with_backend(
+        Box::new(MemorySecretStore::new()),
+        AuthStorageOptions {
+            base_dir: Some(dir.clone()),
+            credential_store: None,
+        },
+    );
+    // Expired token + refresh token forces the refresh leg first; the stub
+    // answers invalid_grant, so the flow then re-registers and exchanges.
+    store
+        .save_entry(
+            "demo",
+            AuthEntry {
+                tokens: Some(StoredTokens {
+                    access_token: "expired-access".to_string(),
+                    refresh_token: Some("old-refresh".to_string()),
+                    expires_at: Some(1.0),
+                    issuer: Some(stub.base()),
+                    ..Default::default()
+                }),
+                client_info: Some(StoredClientInfo {
+                    client_id: "stale-dynamic-client".to_string(),
+                    redirect_uris: Some(vec!["http://localhost:1/callback".to_string()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(&server_url),
+        )
+        .expect("seed expired credentials");
+
+    // Service headers only ride OAuth requests when `auth: "oauth"` is
+    // explicit (OAuthFetch::new), so spell it out.
+    let definition = entry(json!({
+        "url": server_url,
+        "auth": "oauth",
+        "headers": { "x-api-key": "service-secret" },
+        "oauth": {},
+    }));
+    let options = AuthenticateOptions {
+        on_authorization_url: Some(Arc::new(|url: &str| {
+            let url = url.to_string();
+            tokio::spawn(async move {
+                let _ = reqwest::get(&url).await;
+            });
+        })),
+        auth_storage_options: AuthStorageOptions {
+            base_dir: Some(dir.clone()),
+            credential_store: None,
+        },
+        ..Default::default()
+    };
+    let status = authenticate_with_store(&store, "demo", &server_url, &definition, &options)
+        .await
+        .expect("authenticate completes");
+    assert!(format!("{status:?}").contains("Authenticated"));
+
+    let header_value = |request: &Value| -> Option<String> {
+        request["headers"].as_array().and_then(|headers| {
+            headers.iter().find_map(|pair| {
+                let name = pair.get(0)?.as_str()?;
+                if name != "x-api-key" {
+                    return None;
+                }
+                Some(pair.get(1)?.as_str()?.to_owned())
+            })
+        })
+    };
+    let requests = stub.requests();
+    let refresh = requests
+        .iter()
+        .find(|r| r["kind"] == "token" && r["params"]["grant_type"] == "refresh_token")
+        .expect("refresh attempt recorded");
+    assert_eq!(
+        header_value(refresh),
+        Some("service-secret".to_string()),
+        "refresh request must carry the service header: {refresh}"
+    );
+    let exchange = requests
+        .iter()
+        .find(|r| r["kind"] == "token" && r["params"]["grant_type"] == "authorization_code")
+        .expect("token exchange recorded");
+    assert_eq!(
+        header_value(exchange),
+        Some("service-secret".to_string()),
+        "token exchange must carry the service header: {exchange}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

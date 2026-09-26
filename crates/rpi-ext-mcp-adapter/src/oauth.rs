@@ -158,6 +158,34 @@ impl OAuthFetch {
             .map_err(|e| AdapterError::InvalidConfigValue(format!("HTTP client: {e}")))
     }
 
+    /// `#535` / `createOAuthFetch` (mcp-auth-fetch.ts:69-80): every request
+    /// through this fetch carries the same-origin service headers, and
+    /// request-specific headers WIN over them (upstream builds
+    /// `new Headers(serviceHeaders)` then `set`s the request headers —
+    /// reqwest's `header()` would append instead).
+    fn request_headers(
+        &self,
+        target: &str,
+        specific: &[(&str, &str)],
+    ) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut put = |key: &str, value: &str| {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
+        };
+        for (key, value) in self.service_headers(target) {
+            put(&key, &value);
+        }
+        for (key, value) in specific {
+            put(key, value);
+        }
+        headers
+    }
+
     /// `#535`: a failed protected request reports a generic cause.
     fn map_send_error(&self, target: &str, context: &str, error: reqwest::Error) -> AdapterError {
         if self.protected(target) {
@@ -337,12 +365,9 @@ async fn discover_auth_server_metadata_with_override(
         }
     };
     let client = fetch.client(&metadata_url)?;
-    let mut request = client
+    let request = client
         .get(&metadata_url)
-        .header("accept", "application/json");
-    for (key, value) in fetch.service_headers(&metadata_url) {
-        request = request.header(&key, &value);
-    }
+        .headers(fetch.request_headers(&metadata_url, &[("accept", "application/json")]));
     let response = request
         .send()
         .await
@@ -663,13 +688,13 @@ async fn register_client(
         "application_type": "native",
     });
 
-    let mut request = client
-        .post(endpoint)
-        .header("content-type", "application/json")
-        .header("accept", "application/json");
-    for (key, value) in fetch.service_headers(endpoint) {
-        request = request.header(&key, &value);
-    }
+    let request = client.post(endpoint).headers(fetch.request_headers(
+        endpoint,
+        &[
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+    ));
     let response = request
         .json(&body)
         .send()
@@ -763,13 +788,15 @@ async fn authenticate_client_credentials(
         body["scope"] = json!(scope);
     }
 
-    let mut request = client
+    let request = client
         .post(&metadata.token_endpoint)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header("accept", "application/json");
-    for (key, value) in fetch.service_headers(&metadata.token_endpoint) {
-        request = request.header(&key, &value);
-    }
+        .headers(fetch.request_headers(
+            &metadata.token_endpoint,
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("accept", "application/json"),
+            ],
+        ));
     let response = request
         .form(&body)
         .send()
@@ -1252,11 +1279,11 @@ async fn exchange_code(
 
     let response = client
         .post(token_endpoint)
-        .header("accept", "application/json")
+        .headers(fetch.request_headers(token_endpoint, &[("accept", "application/json")]))
         .form(&form)
         .send()
         .await
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("token exchange: {e}")))?;
+        .map_err(|e| fetch.map_send_error(token_endpoint, "token exchange", e))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1322,11 +1349,11 @@ async fn refresh_token(
 
     let response = client
         .post(token_endpoint)
-        .header("accept", "application/json")
+        .headers(fetch.request_headers(token_endpoint, &[("accept", "application/json")]))
         .form(&form)
         .send()
         .await
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("token refresh: {e}")))?;
+        .map_err(|e| fetch.map_send_error(token_endpoint, "token refresh", e))?;
 
     if !response.status().is_success() {
         let status = response.status();
