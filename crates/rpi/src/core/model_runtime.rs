@@ -754,7 +754,12 @@ impl ApiKeyAuth for ConfigApiKeyAuth {
 /// 492-494).
 struct ModelOverridingProvider {
     base: Arc<dyn Provider>,
-    models: Vec<Model>,
+    /// `modelOverrides` are re-applied over `base.get_models()` on every call
+    /// (provider-composer.ts `getModels()` closure re-reads `base?.getModels()`
+    /// per invocation). Keeping a frozen snapshot here would pin dynamic
+    /// catalogs (`RemoteCatalogProvider`, Radius' baseline+gateway merge) to
+    /// the composition-time list and lose every refresh.
+    overrides: Option<Arc<OrderedMap<ModelsJsonModelOverride>>>,
     auth: Option<ProviderAuth>,
 }
 
@@ -780,7 +785,17 @@ impl Provider for ModelOverridingProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        self.models.clone()
+        let models = self.base.get_models();
+        let Some(overrides) = self.overrides.as_ref() else {
+            return models;
+        };
+        models
+            .into_iter()
+            .map(|model| match overrides.get(&model.id) {
+                Some(override_) => apply_model_override(model, override_),
+                None => model,
+            })
+            .collect()
     }
 
     /// `filterModels` forwards to the base (provider-composer.ts:493-494).
@@ -1301,7 +1316,10 @@ impl ModelRuntime {
                 });
                 return Ok(Arc::new(ModelOverridingProvider {
                     base: base.clone(),
-                    models,
+                    overrides: config
+                        .and_then(|c| c.model_overrides.as_ref())
+                        .filter(|overrides| !overrides.is_empty())
+                        .map(|overrides| Arc::new(overrides.clone())),
                     auth,
                 }));
             }
@@ -3893,6 +3911,131 @@ mod tests {
 
     /// Minimal model fixture for the 7027 regression test (same shape as the
     /// upstream `dynamicModel`).
+    /// Review P1 (V15-01 FR-E): the no-api overlay must re-apply
+    /// `modelOverrides` over `base.get_models()` on every call
+    /// (provider-composer.ts `getModels()` closure re-reads the base). A
+    /// frozen snapshot silently pinned dynamic catalogs
+    /// (`RemoteCatalogProvider`, the Radius baseline+gateway merge) to the
+    /// composition-time list.
+    #[tokio::test]
+    async fn model_override_provider_re_reads_a_dynamic_base_catalog() {
+        fn dynamic_model(id: &str, name: &str) -> Model {
+            Model {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                api: ApiKind::from("openai-completions"),
+                provider: "dyn".to_owned(),
+                base_url: "https://example.test/v1".to_owned(),
+                reasoning: false,
+                thinking_level_map: None,
+                input: vec![rpi_ai::types::InputModality::Text],
+                cost: ModelCost {
+                    rates: ModelCostRates {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    tiers: None,
+                },
+                prompt_cache: None,
+                context_window: 1000,
+                max_tokens: 100,
+                headers: None,
+                compat: None,
+                sampling_params: None,
+            }
+        }
+
+        struct DynamicProvider {
+            id: String,
+            auth: ProviderAuth,
+            models: Arc<std::sync::Mutex<Vec<Model>>>,
+        }
+        impl Provider for DynamicProvider {
+            fn id(&self) -> &str {
+                &self.id
+            }
+            fn name(&self) -> &str {
+                &self.id
+            }
+            fn base_url(&self) -> Option<&str> {
+                None
+            }
+            fn headers(&self) -> Option<&ProviderHeaders> {
+                None
+            }
+            fn auth(&self) -> &ProviderAuth {
+                &self.auth
+            }
+            fn get_models(&self) -> Vec<Model> {
+                self.models
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            }
+            fn stream(
+                &self,
+                _model: &Model,
+                _context: &TranscriptContext,
+                _options: Option<StreamOptions>,
+            ) -> AssistantMessageEventStream {
+                unreachable!("not used in catalog composition tests")
+            }
+            fn stream_simple(
+                &self,
+                _model: &Model,
+                _context: &TranscriptContext,
+                _options: Option<SimpleStreamOptions>,
+            ) -> Result<AssistantMessageEventStream, String> {
+                unreachable!("not used in catalog composition tests")
+            }
+        }
+
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"dyn": {"modelOverrides": {"m1": {"name": "Overridden"}}}}}"#,
+        )
+        .await;
+
+        // The base is a stand-in for a provider whose catalog can change after
+        // composition (RemoteCatalogProvider fetch, Radius gateway overlay).
+        const ENV_KEY: &str = "RPI_TEST_MODEL_OVERRIDING_PROVIDER_KEY";
+        let base_models = Arc::new(std::sync::Mutex::new(vec![dynamic_model("m1", "Base One")]));
+        runtime
+            .register_native_provider(Arc::new(DynamicProvider {
+                id: "dyn".to_owned(),
+                auth: ProviderAuth {
+                    api_key: Some(Arc::new(env_api_key_auth(
+                        "Dynamic provider test API key",
+                        &[ENV_KEY],
+                    ))),
+                    oauth: None,
+                },
+                models: base_models.clone(),
+            }))
+            .await
+            .expect("register dynamic provider");
+
+        let composed = runtime.get_provider("dyn").expect("composed provider");
+        let initial = composed.get_models();
+        assert_eq!(initial.len(), 1, "base catalog seen through the overlay");
+        assert_eq!(initial[0].name, "Overridden", "overrides still apply");
+
+        // Dynamic refresh changes the base catalog; the composed getter must
+        // observe it without a recomposition.
+        base_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dynamic_model("m2", "Base Two"));
+        let refreshed = composed.get_models();
+        assert_eq!(
+            refreshed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2"],
+            "the overlay must re-read base.get_models() per call (provider-composer.ts)"
+        );
+        assert_eq!(refreshed[0].name, "Overridden", "overrides still apply");
+    }
+
     fn model_7027() -> Model {
         use rpi_ai::types::{InputModality, ModelCost, ModelCostRates};
         Model {
