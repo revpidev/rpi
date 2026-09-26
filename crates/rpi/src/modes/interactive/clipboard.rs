@@ -283,10 +283,14 @@ fn set_private_mode(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `runClipboardCommand` (clipboard-command.ts) for the write path: spawn
-/// with piped stdin (`clipboard writers can daemonize — do not give them
-/// output pipes to retain`), write the input, kill on timeout. `None` =
-/// spawn failure / timeout / non-zero exit.
+/// `runClipboardCommand` (clipboard-command.ts) for the write path.
+/// Stdio policy (upstream): a call WITHOUT stdin input is a query —
+/// stdout is piped and the bytes are returned; a call WITH input is a
+/// writer (`clipboard writers can daemonize — do not give them output
+/// pipes to retain`) — stdout is ignored entirely, so a daemonized
+/// writer's inherited handle can never hang the drain, and the success
+/// return is empty bytes. `None` = spawn failure / timeout / non-zero
+/// exit.
 pub(crate) fn run_clipboard_write_command(
     program: &str,
     args: &[&str],
@@ -295,10 +299,19 @@ pub(crate) fn run_clipboard_write_command(
 ) -> Option<Vec<u8>> {
     use std::io::Write;
 
+    let is_query = input.is_none();
     let mut child = std::process::Command::new(program)
         .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdin(if is_query {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::piped()
+        })
+        .stdout(if is_query {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
@@ -309,18 +322,22 @@ pub(crate) fn run_clipboard_write_command(
             let _ = stdin.write_all(text.as_bytes());
             let _ = stdin.flush();
         }
-    } else {
-        drop(child.stdin.take());
     }
-    let mut stdout = child.stdout.take()?;
-    // Drain stdout on a reader thread so a chatty writer cannot deadlock
-    // against the pipe buffer (same shape as the read-path precedent).
-    let reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
-    });
+    // Query path: drain stdout on a reader thread (the read-side
+    // precedent in commands_selectors.rs). The command has already
+    // exited by the time we join, and queries never daemonize, so the
+    // join cannot outlive the timeout loop.
+    let reader = if is_query {
+        let mut stdout = child.stdout.take()?;
+        Some(std::thread::spawn(move || {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        }))
+    } else {
+        None
+    };
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let status = loop {
@@ -336,8 +353,11 @@ pub(crate) fn run_clipboard_write_command(
             }
         }
     };
-    let _ = reader.join();
-    status.filter(|status| status.success()).map(|_| Vec::new())
+    status.filter(|status| status.success()).map(|_| {
+        reader
+            .map(|reader| reader.join().unwrap_or_default())
+            .unwrap_or_default()
+    })
 }
 
 /// The production entry: live environment snapshot, real command runner,
@@ -762,5 +782,134 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(osc52, 1, "emits exactly once");
         assert!(recorder.calls.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Real-runner regressions (V15-11 review): the mock `Recorder` answers
+    // from a table and can never catch a broken production runner — these
+    // run `run_clipboard_write_command` against real executables.
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn executable_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_query_returns_stdout_bytes() {
+        // The `wslpath -w` leg depends on this: a query call (no stdin
+        // input) must return the command's real stdout.
+        let dir = std::env::temp_dir().join(format!("rpi-clip-query-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let printf = executable_script(
+            &dir,
+            "printf-path",
+            "#!/bin/sh\nprintf '\\\\wsl.localhost\\\\Ubuntu\\\\tmp\\\\clip.txt'\n",
+        );
+        let out = run_clipboard_write_command(
+            printf.to_str().unwrap(),
+            &["-w", "/tmp/clip.txt"],
+            None,
+            5_000,
+        )
+        .expect("query succeeds");
+        assert_eq!(
+            String::from_utf8(out).unwrap().trim(),
+            "\\wsl.localhost\\Ubuntu\\tmp\\clip.txt",
+            "the query path must surface the real stdout bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_write_path_ignores_stdout_and_succeeds() {
+        // A writer call (stdin input present) must not retain an output
+        // pipe (daemonizing writers) and returns empty bytes on success.
+        let dir = std::env::temp_dir().join(format!("rpi-clip-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let cat = executable_script(&dir, "cat-writer", "#!/bin/sh\ncat >/dev/null\n");
+        let out =
+            run_clipboard_write_command(cat.to_str().unwrap(), &[], Some("hello clipboard"), 5_000)
+                .expect("write succeeds");
+        assert!(out.is_empty(), "the write path returns no stdout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_timeout_returns_none() {
+        let dir = std::env::temp_dir().join(format!("rpi-clip-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sleep = executable_script(&dir, "sleep-forever", "#!/bin/sh\nsleep 30\n");
+        let out = run_clipboard_write_command(sleep.to_str().unwrap(), &[], None, 150);
+        assert!(out.is_none(), "timeout kills the command and returns None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wsl_interop_runs_the_real_powershell_chain() {
+        // End-to-end P0 regression: fake `wslpath` + recording
+        // `powershell.exe` executed through the REAL production runner —
+        // when the runner drops stdout, `win_path` comes back empty, the
+        // PowerShell leg never runs, and this test goes red.
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = std::env::temp_dir().join(format!("rpi-clip-wsl-{unique}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let args_file = dir.join("powershell-args.txt");
+        let wslpath = executable_script(
+            &dir,
+            "wslpath",
+            "#!/bin/sh\nprintf '\\\\wsl.localhost\\\\Ubuntu\\\\tmp\\\\clip.txt'\n",
+        );
+        let powershell = executable_script(
+            &dir,
+            "powershell.exe",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\\
+' \"$*\" > '{}'\nexit 0\n",
+                args_file.display()
+            ),
+        );
+        let mut env = env(ClipboardPlatform::Linux);
+        env.wsl = true;
+        let mut osc52 = 0;
+        let result = copy_to_clipboard_via(
+            "héllo",
+            &env,
+            &mut |program, args, input, timeout_ms| {
+                let resolved = match program {
+                    "wslpath" => wslpath.clone(),
+                    "powershell.exe" => powershell.clone(),
+                    other => std::path::PathBuf::from(other),
+                };
+                run_clipboard_write_command(resolved.to_str().unwrap(), args, input, timeout_ms)
+            },
+            &mut |_| {
+                osc52 += 1;
+                true
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(osc52, 0, "the PowerShell chain succeeded — no OSC 52");
+        let recorded = std::fs::read_to_string(&args_file)
+            .expect("powershell.exe ran (empty wslpath stdout would skip it)");
+        assert!(recorded.contains("Set-Clipboard"));
+        assert!(recorded.contains("'\\wsl.localhost\\Ubuntu\\tmp\\clip.txt'"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
