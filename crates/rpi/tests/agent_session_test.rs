@@ -997,6 +997,103 @@ async fn abort_prevents_post_run_auto_compaction_9340() {
     );
 }
 
+/// #9340 second gate (agent-session.ts:1239-1241): an abort that lands while
+/// `_prepareRetry` is sleeping (the default 2 s backoff, 3 s here) must also
+/// stop the post-run continuation before `_checkCompaction`. The first gate
+/// already ran before the sleep; `_prepareRetry` returning false used to fall
+/// through straight into compaction, running a billable summarization after
+/// the user aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_during_retry_backoff_prevents_post_run_compaction_9340() {
+    let settings = r#"{
+        "compaction": { "enabled": true, "reserveTokens": 50, "keepRecentTokens": 1 },
+        "retry": { "enabled": true, "maxRetries": 3, "baseDelayMs": 3000 }
+    }"#;
+    let provider_options = FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(200),
+            max_tokens: Some(50),
+        }]),
+        ..Default::default()
+    };
+    let fixture = session_fixture(
+        vec![error_step("overloaded_error")],
+        provider_options,
+        Some(settings),
+    )
+    .await;
+
+    // Seed compactable history with real usage (upstream 9340 fixture:
+    // user + assistant with usage.input=100): the threshold estimate must
+    // actually cross `contextWindow - reserveTokens`, otherwise the assertion
+    // below would be vacuous.
+    let model = fixture.provider.get_model(None).expect("faux model");
+    {
+        let manager = fixture.session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        manager
+            .append_message(AgentMessage::User(rpi_ai::types::UserMessage {
+                role: rpi_ai::types::UserRole::User,
+                content: rpi_ai::types::UserContent::Text("x".repeat(500)),
+                timestamp: 1,
+            }))
+            .expect("seed user message");
+        let seeded = rpi_ai::types::AssistantMessage {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            timestamp: 2,
+            usage: rpi_ai::types::Usage {
+                input: 100,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                cache_write1h: None,
+                reasoning: None,
+                total_tokens: 100,
+                cost: rpi_ai::types::UsageCost::default(),
+            },
+            ..faux_assistant_message("y".repeat(200), FauxAssistantOptions::default())
+        };
+        manager
+            .append_message(AgentMessage::Assistant(seeded))
+            .expect("seed assistant message");
+        let context = manager.build_session_context();
+        fixture.session.agent().set_messages(context.messages);
+    }
+
+    let session = fixture.session.clone();
+    let aborter = tokio::spawn(async move {
+        // Land inside the 3 s backoff sleep, i.e. after the top gate ran.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        session.request_abort();
+    });
+
+    fixture
+        .session
+        .prompt(&"z".repeat(1000), PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+    aborter.await.expect("abort task");
+
+    let types = flattened_event_types(&fixture);
+    assert!(
+        !types.iter().any(|t| t == "compaction:compaction_start"),
+        "no compaction may start when the abort landed during the retry backoff: {types:?}"
+    );
+    assert_eq!(
+        fixture.provider.call_count(),
+        1,
+        "the retry must not start after the abort"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // bash: staged as pending during streaming, flushed before the next prompt
 // (agent-session.ts:2851)

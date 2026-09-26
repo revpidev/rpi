@@ -1951,6 +1951,12 @@ impl AgentSession {
                 .await
                 .map_err(agent_error_to_rpi)?;
             while self.handle_post_agent_run().await {
+                // `if (this._agentRunAbortRequested) break`
+                // (agent-session.ts:1216) — an abort that lands after the
+                // continuation decision must not start another run.
+                if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
+                    break;
+                }
                 self.inner
                     .agent
                     .continue_run()
@@ -1990,7 +1996,11 @@ impl AgentSession {
     }
 
     /// `_handlePostAgentRun` (agent-session.ts:1075-1103 @ de2de549b: every
-    /// continuation decision is gated on `_agentRunAbortRequested`).
+    /// continuation decision is gated on `_agentRunAbortRequested`; the
+    /// post-retry gate below matches agent-session.ts:1239-1241 — an abort
+    /// that cancelled the backoff inside `_prepareRetry` must stop the
+    /// continuation BEFORE `_checkCompaction`, or a billable summarization /
+    /// compaction entry can still run after the user aborted).
     async fn handle_post_agent_run(&self) -> bool {
         let msg = lock(&self.inner.last_assistant_message).take();
         if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
@@ -2008,6 +2018,15 @@ impl AgentSession {
                 self.finish_cancelled_retry();
             }
             return !self.inner.agent_run_abort_requested.load(Ordering::SeqCst);
+        }
+
+        // Second gate (agent-session.ts:1239-1241): `_prepareRetry` returns
+        // false when an abort cancelled its backoff sleep, and the top gate
+        // above was evaluated before that. Without this check the fall-through
+        // reaches `_checkCompaction` and can start a post-abort compaction.
+        if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
+            self.finish_cancelled_retry();
+            return false;
         }
 
         if msg.stop_reason == StopReason::Error && self.retry_attempt() > 0 {
