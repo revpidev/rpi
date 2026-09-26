@@ -1079,17 +1079,17 @@ fn build_params(
     } else {
         converted.messages
     };
-    let beta_features =
-        get_beta_features(model, context, is_oauth_token, native_tool_changes, options);
     let mut params = json!({
         "model": model.id,
         "messages": messages,
         "max_tokens": options.stream.max_tokens.unwrap_or(model.max_tokens),
         "stream": true,
     });
-    if !beta_features.is_empty() {
-        params["betas"] = json!(beta_features);
-    }
+    // The beta set rides the `anthropic-beta` HEADER only
+    // (build_request_headers) — the upstream SDK moves its `betas` body
+    // parameter into that header, so the wire body never carries a
+    // top-level `betas` array; a strict gateway would reject the unknown
+    // body field. Do not re-add `params["betas"]`.
 
     // For OAuth tokens, we MUST include the Claude Code identity.
     if is_oauth_token {
@@ -4601,12 +4601,32 @@ mod transcript_tool_changes_tests {
     async fn sends_updates_and_tool_changes_in_native_system_messages() {
         let payload = capture(&native_model(), &base_context()).await;
 
-        let betas = payload["betas"].as_array().expect("betas");
+        // The beta set rides the `anthropic-beta` header, NEVER the body
+        // (the SDK moves `betas` into the header; a body-level array is
+        // an unknown field a strict gateway may reject).
+        assert!(
+            payload.get("betas").is_none(),
+            "body must not carry a top-level betas array: {}",
+            payload["betas"]
+        );
+        let (headers, _) = build_request_headers(
+            &native_model(),
+            &base_context(),
+            true,
+            Some("sk-key"),
+            &AnthropicOptions::default(),
+            None,
+            None,
+        );
+        let betas = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.as_deref())
+            .unwrap_or_default();
         assert!(
             betas
-                .iter()
+                .split(',')
                 .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
-            "native tool changes beta present: {betas:?}"
+            "native tool changes beta present in the header: {betas:?}"
         );
         assert_eq!(
             payload["system"][0]["text"],
@@ -4740,12 +4760,9 @@ mod transcript_tool_changes_tests {
         ];
         for fallback in fallback_contexts {
             let payload = capture(&native_model(), &fallback).await;
-            let betas = payload["betas"].as_array().cloned().unwrap_or_default();
             assert!(
-                !betas
-                    .iter()
-                    .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
-                "no native beta on the fallback: {betas:?}"
+                payload.get("betas").is_none(),
+                "the body never carries a betas array (header-only transport)"
             );
             let tools = payload["tools"].as_array().expect("tools");
             assert_eq!(tools.len(), 1);
@@ -4776,12 +4793,9 @@ mod transcript_tool_changes_tests {
         model.base_url = "http://127.0.0.1:9".to_owned();
         let payload = capture(&model, &base_context()).await;
 
-        let betas = payload["betas"].as_array().cloned().unwrap_or_default();
         assert!(
-            !betas
-                .iter()
-                .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
-            "no native beta without support: {betas:?}"
+            payload.get("betas").is_none(),
+            "the body never carries a betas array (header-only transport)"
         );
         assert_eq!(
             payload["system"][0]["text"],
@@ -4818,12 +4832,9 @@ mod transcript_tool_changes_tests {
         model.base_url = "http://127.0.0.1:9".to_owned();
         let payload = capture(&model, &base_context()).await;
 
-        let betas = payload["betas"].as_array().cloned().unwrap_or_default();
         assert!(
-            !betas
-                .iter()
-                .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
-            "no native beta with one capability: {betas:?}"
+            payload.get("betas").is_none(),
+            "the body never carries a betas array (header-only transport)"
         );
         let tools = payload["tools"].as_array().expect("tools");
         assert_eq!(

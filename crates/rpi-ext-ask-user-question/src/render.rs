@@ -420,11 +420,17 @@ fn answer_scalar(answer: &Value) -> String {
             .and_then(Value::as_array)
             .filter(|selected| !selected.is_empty())
             .map(|selected| {
-                selected
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                // Module invariant: EVERY rendered string passes through
+                // sanitize_inline — the joined selection included (a
+                // replayed/hand-built envelope can carry raw control
+                // characters in any answer field).
+                sanitize_inline(
+                    &selected
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
             })
             .unwrap_or_else(|| crate::tool::envelope::NO_INPUT_PLACEHOLDER.to_owned()),
         Some("custom") => answer
@@ -932,6 +938,23 @@ mod tests {
             strip_ansi(text_of(&tree)),
             "ask_user_question 3 questions (Scope, Priority, Framework)"
         );
+    }
+
+    #[test]
+    fn multi_selected_control_characters_are_sanitized() {
+        // Regression: the multi arm's joined `selected` used to bypass
+        // `sanitize_inline` (the module invariant) — a replayed/hand-built
+        // envelope could fragment the rendered line with raw `\r`/`\n`.
+        let scalar = answer_scalar(&json!({
+            "questionIndex": 0,
+            "question": "Q?",
+            "kind": "multi",
+            "selected": ["a\rb", "c\nd\te"]
+        }));
+        assert_eq!(scalar, "a b, c d e");
+        assert!(!scalar.contains('\r'));
+        assert!(!scalar.contains('\n'));
+        assert!(!scalar.contains('\t'));
     }
 
     // ===== FR-C: renderResult states =====

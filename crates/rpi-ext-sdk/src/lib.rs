@@ -239,7 +239,16 @@ pub fn unsubscribe(id: SubscriptionId) {
         (!still_has).then_some(event)
     };
     if let Some(event) = orphaned_event {
-        if let Some(subscription_id) = state().host_subscriptions.0.remove(&event) {
+        // The state lock is RELEASED before the host call (the if-let
+        // scrutinee's temporary guard would otherwise live through the
+        // body — the same-thread re-lock invariant `host_on` documents
+        // applies to `off` identically; a host that re-enters the guest
+        // while answering must not deadlock on this lock).
+        let subscription_id = {
+            let mut state = state();
+            state.host_subscriptions.0.remove(&event)
+        };
+        if let Some(subscription_id) = subscription_id {
             let _ = host_call("off", json!({ "subscriptionId": subscription_id }));
         }
     }

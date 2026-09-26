@@ -958,6 +958,14 @@ mod tests {
         let mut next_checkpoint = 0usize;
         let checkpoints_kb: [usize; 4] = [10, 50, 100, 200];
         let mut checkpoint_idx = 0usize;
+        // Regression guard (V15-13): per-delta cost must stay LINEAR in
+        // content size. The quadratic pre-fix measured ~3.8ms @10KB vs
+        // ~227ms @200KB (~60x); the linear target is ~0.45ms vs ~8ms (~18x).
+        // 25x is a generous ceiling that still fails loudly on a
+        // quadratic regression. Manual-run only (this bench is
+        // `#[ignore]`d; run with --release --ignored --nocapture).
+        let mut first_checkpoint_elapsed: Option<std::time::Duration> = None;
+        let mut last_checkpoint_elapsed: Option<std::time::Duration> = None;
         loop {
             for _ in 0..24 {
                 accumulated.push_str(delta_line);
@@ -979,12 +987,27 @@ mod tests {
                     lines.len(),
                     elapsed
                 );
+                if checkpoint_idx == 0 {
+                    first_checkpoint_elapsed = Some(elapsed);
+                }
+                if checkpoint_idx == checkpoints_kb.len() - 1 {
+                    last_checkpoint_elapsed = Some(elapsed);
+                }
                 checkpoint_idx += 1;
             }
             if checkpoint_idx >= checkpoints_kb.len() {
                 break;
             }
             let _ = next_checkpoint;
+        }
+        if let (Some(first), Some(last)) = (first_checkpoint_elapsed, last_checkpoint_elapsed) {
+            assert!(
+                last <= first * 25,
+                "per-delta cost regressed towards quadratic: 10KB {first:?} vs 200KB {last:?} \
+                 (linear target is ~18x; the pre-fix quadratic measured ~60x)"
+            );
+        } else {
+            panic!("bench did not reach all checkpoints");
         }
     }
 

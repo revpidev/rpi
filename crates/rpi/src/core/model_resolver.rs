@@ -36,11 +36,11 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 39] = [
     ("github-copilot", "gpt-5.4"),
     ("openrouter", "moonshotai/kimi-k2.6"),
     ("vercel-ai-gateway", "zai/glm-5.1"),
-    ("xai", "grok-4.5"),
+    ("xai", "grok-4.6"),
     ("groq", "openai/gpt-oss-120b"),
-    ("cerebras", "zai-glm-4.7"),
-    ("zai", "glm-5.1"),
-    ("zai-coding-cn", "glm-5.1"),
+    ("cerebras", "gpt-oss-120b"),
+    ("zai", "glm-5.3"),
+    ("zai-coding-cn", "glm-5.3"),
     ("mistral", "devstral-medium-latest"),
     ("minimax", "MiniMax-M2.7"),
     ("minimax-cn", "MiniMax-M2.7"),
@@ -1306,6 +1306,33 @@ mod tests {
             Some("kimi-for-coding")
         );
         assert_eq!(default_model_for_provider("does-not-exist"), None);
+    }
+
+    #[test]
+    fn default_models_exist_in_the_builtin_catalog() {
+        // Catalog-regen regression (V15-14): a default that the current
+        // builtin catalog no longer carries silently falls through to
+        // `provider_models[0]` after login (`unwrap_or(provider_models[0])`
+        // above) — this pin caught exactly that in review (zai/zai-coding-cn
+        // → glm-5.1, cerebras → zai-glm-4.7, xai → grok-4.5 after the
+        // v0.86.1 regen retired them). Every default MUST resolve in the
+        // catalog; the fallback must stay a never-taken safety net.
+        let catalog = rpi_ai::generated::builtin_catalog().expect("builtin catalog");
+        for (provider, default_id) in DEFAULT_MODEL_PER_PROVIDER {
+            let Some(models) = catalog
+                .providers()
+                .iter()
+                .find(|p| **p == provider)
+                .map(|_| catalog.models(provider))
+            else {
+                panic!("default-model provider {provider:?} missing from the builtin catalog");
+            };
+            assert!(
+                models.iter().any(|m| m.id == default_id),
+                "default model {default_id:?} for provider {provider:?} not in the builtin \
+                 catalog (regen retired it? update DEFAULT_MODEL_PER_PROVIDER)"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

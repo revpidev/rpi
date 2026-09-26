@@ -173,14 +173,51 @@ fn same_number_list(a: Option<&Vec<i64>>, b: Option<&Vec<i64>>) -> bool {
 }
 
 /// `sameRecord`: JSON-equality of the metadata maps (absent ↔ absent).
+/// Numbers compare NUMERICALLY (`1 == 1.0`) — upstream compares
+/// `JSON.stringify`, and JS numbers have no int/float split, so `1` and
+/// `1.0` stringify identically and a re-sent `1.0` against a stored `1`
+/// is a no-op upstream. serde_json's `Value` equality is representation-
+/// sensitive (`PosInt(1) != Float(1.0)`), so the comparison walks the
+/// values with an f64 rule instead. Key order never differs (the merge
+/// inherits the current row's order — see `task_changed`).
 fn same_record(
     a: Option<&serde_json::Map<String, Value>>,
     b: Option<&serde_json::Map<String, Value>>,
 ) -> bool {
     match (a, b) {
-        (Some(x), Some(y)) => x == y,
+        (Some(x), Some(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(key, left)| {
+                    y.get(key)
+                        .is_some_and(|right| json_values_equal(left, right))
+                })
+        }
         (None, None) => true,
         _ => false,
+    }
+}
+
+/// JSON value equality with the JS `JSON.stringify` number rule: two
+/// numbers are equal when their f64 forms are equal (JS parses `1` and
+/// `1.0` to the same number; integers beyond 2^53 are already f64s in
+/// JS, so the f64 rule is the faithful port).
+fn json_values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => x == y,
+            _ => x == y,
+        },
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(l, r)| json_values_equal(l, r))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(key, left)| {
+                    y.get(key)
+                        .is_some_and(|right| json_values_equal(left, right))
+                })
+        }
+        _ => a == b,
     }
 }
 
@@ -773,6 +810,41 @@ mod tests {
             &params(json!({"id": 1, "subject": "x", "description": "d"})),
         );
         assert!(matches!(result.op, Op::Update { changed: false, .. }));
+    }
+
+    #[test]
+    fn update_metadata_number_forms_compare_numerically() {
+        // Regression: serde_json `Value` equality is representation-
+        // sensitive (`PosInt(1) != Float(1.0)`), so re-sending `1.0`
+        // against a stored `1` used to report "Updated #1" where upstream
+        // (JSON.stringify comparison, `1 === 1.0` in JS) says no change.
+        let state = state_with(vec![Task {
+            metadata: Some(
+                serde_json::from_value(json!({"priority": 1, "tags": [1, 2.5]}))
+                    .expect("metadata map"),
+            ),
+            ..task(1, "x")
+        }]);
+        let result = apply_task_mutation(
+            state,
+            TaskAction::Update,
+            &params(json!({"id": 1, "metadata": {"priority": 1.0, "tags": [1.0, 2.5]}})),
+        );
+        assert!(
+            matches!(result.op, Op::Update { changed: false, .. }),
+            "int/float respellings of the same JSON number are a no-op"
+        );
+        // A genuinely different value still counts as changed.
+        let state = state_with(vec![Task {
+            metadata: Some(serde_json::from_value(json!({"priority": 1})).expect("metadata map")),
+            ..task(1, "x")
+        }]);
+        let result = apply_task_mutation(
+            state,
+            TaskAction::Update,
+            &params(json!({"id": 1, "metadata": {"priority": 2}})),
+        );
+        assert!(matches!(result.op, Op::Update { changed: true, .. }));
     }
 
     #[test]

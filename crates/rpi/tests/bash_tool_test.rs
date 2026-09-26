@@ -651,7 +651,7 @@ mod bash_executor_tests {
         });
 
         let result = execute_bash(
-            "sleep 30",
+            "sleep 31415",
             std::path::Path::new("."),
             ops.as_ref(),
             BashExecutorOptions {
@@ -705,7 +705,7 @@ mod process_group_tests {
 
         let _ = ops
             .exec(
-                "sleep 30",
+                "sleep 31415",
                 std::path::Path::new("."),
                 BashExecOptions {
                     signal: token,
@@ -716,22 +716,27 @@ mod process_group_tests {
             )
             .await;
 
-        // Give a moment for signal propagation.
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        // Check that no "sleep 30" processes remain. The bracket pattern
+        // Check that no "sleep 31415" processes remain. The bracket pattern
         // `[s]leep 30` avoids matching this probe's own `sh -c` command line,
-        // which literally contains the search string.
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("pgrep -f '[s]leep 30' || true")
-            .output()
-            .unwrap();
-        let remaining = String::from_utf8_lossy(&output.stdout);
-        let count = remaining.lines().filter(|l| !l.is_empty()).count();
-        assert_eq!(
-            count, 0,
-            "no sleep 30 processes should remain, found: {remaining}"
-        );
+        // which literally contains the search string. Poll up to ~5s —
+        // under full parallel test load, signal propagation and process
+        // reap can outrun a fixed sleep window (this flaked the gate).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("pgrep -f '[s]leep 31415' || true")
+                .output()
+                .unwrap();
+            let remaining = String::from_utf8_lossy(&output.stdout);
+            if remaining.lines().filter(|l| !l.is_empty()).count() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no sleep 31415 processes should remain, found: {remaining}"
+            );
+        }
     }
 }
