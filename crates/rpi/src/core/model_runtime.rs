@@ -42,6 +42,7 @@ use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use rpi_ai::api::anthropic_messages::AnthropicMessages;
+use rpi_ai::api::lazy::create_setup_error_message_for_model;
 use rpi_ai::api::openai_completions::OpenAiCompletions;
 use rpi_ai::api::openai_responses::OpenAiResponses;
 use rpi_ai::auth::config_value::{
@@ -67,8 +68,9 @@ use rpi_ai::models_json::{
 };
 use rpi_ai::models_store::{InMemoryModelsStore, JsonFileModelsStore, ModelsStore};
 use rpi_ai::types::{
-    ApiKind, AssistantMessage, Context, Model, ModelCompat, ModelCost, ModelCostRates, ProviderEnv,
-    ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
+    ApiKind, AssistantMessage, Context, ErrorReason, Model, ModelCompat, ModelCost, ModelCostRates,
+    ProviderEnv, ProviderHeaders, SimpleStreamOptions, StreamEvent, StreamOptions,
+    TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 
@@ -747,20 +749,26 @@ impl ApiKeyAuth for ConfigApiKeyAuth {
     }
 }
 
-/// Overlay without its own api that still changes the composed model list
-/// (`modelOverrides`, provider-composer.ts:434-437) and optionally wraps
-/// auth resolution (`composeApiKeyAuth`). Streaming, model filtering, and
-/// dynamic refresh delegate to the base (provider-composer.ts:475-478,
-/// 492-494).
+/// Overlay without its own api. Models are composed live per call
+/// ([`ComposedModels`]); auth resolution is optionally wrapped
+/// (`composeApiKeyAuth`); streaming follows upstream `streamWith` — the base
+/// serves every model whose api it declares, otherwise the api provider does
+/// (provider-composer.ts:462-494).
 struct ModelOverridingProvider {
     base: Arc<dyn Provider>,
-    /// `modelOverrides` are re-applied over `base.get_models()` on every call
-    /// (provider-composer.ts `getModels()` closure re-reads `base?.getModels()`
-    /// per invocation). Keeping a frozen snapshot here would pin dynamic
-    /// catalogs (`RemoteCatalogProvider`, Radius' baseline+gateway merge) to
-    /// the composition-time list and lose every refresh.
-    overrides: Option<Arc<OrderedMap<ModelsJsonModelOverride>>>,
+    composed: ComposedModels,
+    name: String,
+    base_url: Option<String>,
     auth: Option<ProviderAuth>,
+}
+
+impl ModelOverridingProvider {
+    fn base_supports(&self, model: &Model) -> bool {
+        self.base
+            .get_models()
+            .iter()
+            .any(|entry| entry.api == model.api)
+    }
 }
 
 impl Provider for ModelOverridingProvider {
@@ -769,11 +777,11 @@ impl Provider for ModelOverridingProvider {
     }
 
     fn name(&self) -> &str {
-        self.base.name()
+        &self.name
     }
 
     fn base_url(&self) -> Option<&str> {
-        self.base.base_url()
+        self.base_url.as_deref().or_else(|| self.base.base_url())
     }
 
     fn headers(&self) -> Option<&ProviderHeaders> {
@@ -785,17 +793,7 @@ impl Provider for ModelOverridingProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        let models = self.base.get_models();
-        let Some(overrides) = self.overrides.as_ref() else {
-            return models;
-        };
-        models
-            .into_iter()
-            .map(|model| match overrides.get(&model.id) {
-                Some(override_) => apply_model_override(model, override_),
-                None => model,
-            })
-            .collect()
+        self.composed.get_models()
     }
 
     /// `filterModels` forwards to the base (provider-composer.ts:493-494).
@@ -818,7 +816,13 @@ impl Provider for ModelOverridingProvider {
         context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
-        self.base.stream(model, context, options)
+        if self.base_supports(model) {
+            return self.base.stream(model, context, options);
+        }
+        match api_streams(model.api.as_str()) {
+            Some(streams) => streams.stream(model, context, options),
+            None => unsupported_api_stream(model),
+        }
     }
 
     fn stream_simple(
@@ -827,17 +831,28 @@ impl Provider for ModelOverridingProvider {
         context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
-        self.base.stream_simple(model, context, options)
+        if self.base_supports(model) {
+            return self.base.stream_simple(model, context, options);
+        }
+        match api_streams(model.api.as_str()) {
+            Some(streams) => streams.stream_simple(model, context, options),
+            None => Err(format!(
+                "No API provider registered for api: {}",
+                model.api.as_str()
+            )),
+        }
     }
 }
 
 /// Composed provider delegating `refreshModels` to its base
 /// (provider-composer.ts:475-478 `refreshModels: base?.refreshModels …`), so
 /// an overlay built by [`ModelRuntime::compose_provider`] keeps the base's
-/// dynamic catalog refresh.
+/// dynamic catalog refresh; the model list is the live
+/// [`ComposedModels`] composition.
 struct RefreshDelegatingProvider {
     base: Arc<dyn Provider>,
     inner: Arc<dyn Provider>,
+    composed: ComposedModels,
 }
 
 impl Provider for RefreshDelegatingProvider {
@@ -862,7 +877,7 @@ impl Provider for RefreshDelegatingProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        self.inner.get_models()
+        self.composed.get_models()
     }
 
     /// `filterModels` comes from the native base provider only
@@ -1013,6 +1028,270 @@ fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -
         model.headers = Some(headers);
     }
     model
+}
+
+/// Does the models.json entry change anything at all? (A `Some` entry whose
+/// fields are all unset is rejected by the upstream "must specify" rule
+/// inside [`apply_models_json`], not treated as a no-op.)
+fn config_overlay_changes(config: Option<&ModelsJsonProvider>) -> bool {
+    config.is_some_and(|config| {
+        config.name.is_some()
+            || config.base_url.is_some()
+            || config.api_key.is_some()
+            || config.api.is_some()
+            || config.oauth.is_some()
+            || config.headers.is_some()
+            || config.compat.is_some()
+            || config.auth_header.is_some()
+            || config
+                .models
+                .as_ref()
+                .is_some_and(|models| !models.is_empty())
+            || config
+                .model_overrides
+                .as_ref()
+                .is_some_and(|overrides| !overrides.is_empty())
+    })
+}
+
+/// [`config_overlay_changes`] for an extension-registered provider.
+fn extension_overlay_changes(extension: Option<&ProviderConfigInput>) -> bool {
+    extension.is_some_and(|extension| {
+        extension.name.is_some()
+            || extension.base_url.is_some()
+            || extension.api_key.is_some()
+            || extension.api.is_some()
+            || extension.headers.is_some()
+            || extension.auth_header.is_some()
+            || extension
+                .models
+                .as_ref()
+                .is_some_and(|models| !models.is_empty())
+    })
+}
+
+/// `findModelDefaults` (provider-composer.ts:171-179): the model a custom
+/// definition inherits an omitted `api`/`baseUrl` from — same id first, then
+/// the requested api, then openai-completions, then the first model.
+fn find_model_defaults<'a>(
+    models: &'a [Model],
+    model_id: &str,
+    api: Option<&str>,
+) -> Option<&'a Model> {
+    if let Some(model) = models.iter().find(|model| model.id == model_id) {
+        return Some(model);
+    }
+    if let Some(api) = api.filter(|api| !api.is_empty()) {
+        let kind = ApiKind::from(api);
+        if let Some(model) = models.iter().find(|model| model.api == kind) {
+            return Some(model);
+        }
+    }
+    models
+        .iter()
+        .find(|model| model.api == ApiKind::from(ApiKind::OPENAI_COMPLETIONS))
+        .or_else(|| models.first())
+}
+
+/// `applyModelsJson` (provider-composer.ts:184-216): base-model
+/// `baseUrl`/`compat` mapping plus the `config.models` upsert (replace by
+/// id, append otherwise; an omitted `api`/`baseUrl` inherits through
+/// [`find_model_defaults`]). The structural validations throw upstream;
+/// they return `Err` here.
+fn apply_models_json(
+    provider_id: &str,
+    base_models: Vec<Model>,
+    config: Option<&ModelsJsonProvider>,
+) -> Result<Vec<Model>, String> {
+    let Some(config) = config else {
+        return Ok(base_models);
+    };
+    if config.oauth.is_some() && config.base_url.is_none() {
+        return Err(format!(
+            "Provider {provider_id}: \"baseUrl\" is required when \"oauth\" is set."
+        ));
+    }
+    let has_overrides = config
+        .model_overrides
+        .as_ref()
+        .is_some_and(|overrides| !overrides.is_empty());
+    let has_models = config
+        .models
+        .as_ref()
+        .is_some_and(|models| !models.is_empty());
+    if !has_models
+        && config.base_url.is_none()
+        && config.headers.is_none()
+        && config.compat.is_none()
+        && !has_overrides
+        && config.api_key.is_none()
+        && config.oauth.is_none()
+        && config.auth_header.is_none()
+    {
+        return Err(format!(
+            "Provider {provider_id}: must specify \"baseUrl\", \"headers\", \"compat\", \"modelOverrides\", or \"models\"."
+        ));
+    }
+    // `config.oauth === "radius"` keeps every base model's own gateway URL
+    // (provider-composer.ts:210).
+    let radius_oauth = config.oauth.as_deref() == Some("radius");
+    let mut models: Vec<Model> = base_models
+        .into_iter()
+        .map(|mut model| {
+            if !radius_oauth {
+                if let Some(base_url) = config.base_url.as_ref().filter(|url| !url.is_empty()) {
+                    model.base_url = base_url.clone();
+                }
+            }
+            if let Some(compat) = config.compat.as_ref() {
+                model.compat = Some(merge_compat(model.compat.as_ref(), compat));
+            }
+            model
+        })
+        .collect();
+    for definition in config.models.iter().flatten() {
+        let api = definition.api.clone().or_else(|| config.api.clone());
+        let defaults = find_model_defaults(&models, &definition.id, api.as_deref());
+        let model = json_model_to_model(
+            provider_id,
+            &config.api,
+            config.base_url.as_deref(),
+            config.compat.as_ref(),
+            definition.clone(),
+            defaults,
+        )?;
+        match models.iter().position(|model| model.id == definition.id) {
+            Some(index) => models[index] = model,
+            None => models.push(model),
+        }
+    }
+    Ok(models)
+}
+
+/// `applyExtension` (provider-composer.ts:218-243): a provided model list
+/// replaces the set; a bare `baseUrl` rewrites every model's baseUrl.
+fn apply_extension_models(
+    provider_id: &str,
+    models: Vec<Model>,
+    extension: Option<&ProviderConfigInput>,
+) -> Result<Vec<Model>, String> {
+    let Some(extension) = extension else {
+        return Ok(models);
+    };
+    let Some(definitions) = extension.models.as_ref() else {
+        if let Some(base_url) = extension.base_url.as_ref().filter(|url| !url.is_empty()) {
+            return Ok(models
+                .into_iter()
+                .map(|mut model| {
+                    model.base_url = base_url.clone();
+                    model
+                })
+                .collect());
+        }
+        return Ok(models);
+    };
+    definitions
+        .iter()
+        .map(|definition| {
+            let api = definition.api.clone().or_else(|| extension.api.clone());
+            let defaults = find_model_defaults(&models, &definition.id, api.as_deref());
+            config_model_to_model(
+                provider_id,
+                &extension.api,
+                extension.base_url.as_deref(),
+                definition.clone(),
+                defaults,
+            )
+        })
+        .collect()
+}
+
+/// `modelOverrides` are the topmost user-config layer
+/// (provider-composer.ts:452-459).
+fn apply_model_overrides(models: Vec<Model>, config: Option<&ModelsJsonProvider>) -> Vec<Model> {
+    let Some(overrides) = config.and_then(|config| config.model_overrides.as_ref()) else {
+        return models;
+    };
+    models
+        .into_iter()
+        .map(|model| match overrides.get(&model.id) {
+            Some(override_) => apply_model_override(model, override_),
+            None => model,
+        })
+        .collect()
+}
+
+/// The `getModels` closure composition (provider-composer.ts:444-461):
+/// applyModelsJson → applyExtension → modelOverrides, recomputed per call so
+/// dynamic base catalogs (`RemoteCatalogProvider`, the Radius gateway merge)
+/// stay live. `Provider::get_models` cannot fail, so a later recompute error
+/// falls back to the last valid list; the eager composition in
+/// [`ModelRuntime::compose_provider`] surfaces structural errors at
+/// registration/reload time.
+struct ComposedModels {
+    provider_id: String,
+    base: Option<Arc<dyn Provider>>,
+    config: Option<ModelsJsonProvider>,
+    extension: Option<ProviderConfigInput>,
+    last_valid: std::sync::Mutex<Vec<Model>>,
+}
+
+impl ComposedModels {
+    fn new(
+        provider_id: &str,
+        base: Option<Arc<dyn Provider>>,
+        config: Option<ModelsJsonProvider>,
+        extension: Option<ProviderConfigInput>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.to_owned(),
+            base,
+            config,
+            extension,
+            last_valid: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn compose(&self) -> Result<Vec<Model>, String> {
+        let base_models = self
+            .base
+            .as_ref()
+            .map(|base| base.get_models())
+            .unwrap_or_default();
+        let models = apply_models_json(&self.provider_id, base_models, self.config.as_ref())?;
+        let models = apply_extension_models(&self.provider_id, models, self.extension.as_ref())?;
+        Ok(apply_model_overrides(models, self.config.as_ref()))
+    }
+
+    /// Eager composition (upstream calls `getModels()` at composition time).
+    fn compose_eager(&self) -> Result<Vec<Model>, String> {
+        let models = self.compose()?;
+        *lock(&self.last_valid) = models.clone();
+        Ok(models)
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        match self.compose_eager() {
+            Ok(models) => models,
+            Err(_) => lock(&self.last_valid).clone(),
+        }
+    }
+}
+
+/// Upstream `lazyStream`'s missing-api error surface: a terminal error event
+/// carrying a zero-usage error message (provider-composer.ts:481-483).
+fn unsupported_api_stream(model: &Model) -> AssistantMessageEventStream {
+    let stream = AssistantMessageEventStream::new();
+    let message = create_setup_error_message_for_model(
+        model,
+        &format!("No API provider registered for api: {}", model.api.as_str()),
+    );
+    stream.push(StreamEvent::Error {
+        reason: ErrorReason::Error,
+        error: message.clone(),
+    });
+    stream.end(Some(message));
+    stream
 }
 
 /// A cancellation token for the post-login/logout refresh: the resolved
@@ -1250,76 +1529,38 @@ impl ModelRuntime {
             .and_then(|e| e.api.clone())
             .or_else(|| config.and_then(|c| c.api.clone()));
 
-        // Models are built (and validated) before stream dispatch so a
-        // model-level problem surfaces the upstream per-model composition
-        // error (provider-composer.ts validates `getModels()` first).
-        // The base-passthrough branch skips construction entirely.
-        let mut models = match (&api, base) {
-            // No api of its own: the overlay composes over the base catalog
-            // (custom model definitions need an api somewhere and stay
-            // unsupported here, as before); `modelOverrides` still apply
-            // below (provider-composer.ts:444-461, #9294).
-            (None, Some(_)) => base.map(|b| b.get_models()).unwrap_or_default(),
-            _ => match extension.and_then(|e| e.models.clone()) {
-                Some(models) => models
-                    .into_iter()
-                    .map(|m| config_model_to_model(provider_id, &api, base_url.as_deref(), m))
-                    .collect::<Result<Vec<_>, _>>()?,
-                None => match config.and_then(|c| c.models.clone()) {
-                    Some(models) => models
-                        .into_iter()
-                        .map(|m| {
-                            json_model_to_model(
-                                provider_id,
-                                &api,
-                                base_url.as_deref(),
-                                config.and_then(|c| c.compat.as_ref()),
-                                m,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    None => base.map(|b| b.get_models()).unwrap_or_default(),
-                },
-            },
-        };
-        // models.json `modelOverrides` are the topmost user-config layer:
-        // applied once, after model construction (provider-composer.ts:444-461).
-        if let Some(overrides) = config.and_then(|c| c.model_overrides.as_ref()) {
-            models = models
-                .into_iter()
-                .map(|model| match overrides.get(&model.id) {
-                    Some(override_) => apply_model_override(model, override_),
-                    None => model,
-                })
-                .collect();
-        }
+        // Upstream composes `getModels()` eagerly, so structural errors
+        // (missing api/baseUrl, non-positive windows, empty overlay) surface
+        // at registration/reload time (provider-composer.ts:441-443).
+        let composed = ComposedModels::new(
+            provider_id,
+            base.cloned(),
+            config.cloned(),
+            extension.cloned(),
+        );
+        let models = composed.compose_eager()?;
 
         let streams = match (&api, base) {
             (Some(api), _) => api_streams(api)
                 .ok_or_else(|| format!("No API provider registered for api: {api}"))?,
             (None, Some(base)) => {
-                // Overlay without its own api: stream through the base
-                // provider; configured headers/authHeader still wrap auth
-                // resolution (`composeApiKeyAuth`, provider-composer.ts:293),
-                // and `modelOverrides` still compose over the base catalog
-                // (provider-composer.ts:444-461 — upstream builds the model
-                // list unconditionally; #9294 configures built-in providers
-                // via modelOverrides alone).
-                let has_model_overrides = config
-                    .and_then(|c| c.model_overrides.as_ref())
-                    .is_some_and(|overrides| !overrides.is_empty());
-                if !has_model_overrides && configured_headers.is_none() && !auth_header {
+                // Overlay without its own api: streaming/filtering/refresh
+                // delegate to the base; the model list is the live
+                // composition, and `streamWith` falls back to the model's
+                // api provider for models the base does not serve
+                // (provider-composer.ts:462-494).
+                let overlay_changes =
+                    config_overlay_changes(config) || extension_overlay_changes(extension);
+                if !overlay_changes {
                     return Ok(base.clone());
                 }
-                let auth = (configured_headers.is_some() || auth_header).then(|| {
-                    wrap_provider_auth(base.auth().clone(), &configured_headers, auth_header)
-                });
+                let auth = (api_key_value.is_some() || configured_headers.is_some() || auth_header)
+                    .then(|| auth.clone());
                 return Ok(Arc::new(ModelOverridingProvider {
                     base: base.clone(),
-                    overrides: config
-                        .and_then(|c| c.model_overrides.as_ref())
-                        .filter(|overrides| !overrides.is_empty())
-                        .map(|overrides| Arc::new(overrides.clone())),
+                    composed,
+                    name: name.clone(),
+                    base_url: base_url.clone(),
                     auth,
                 }));
             }
@@ -1330,7 +1571,7 @@ impl ModelRuntime {
 
         let headers = base.and_then(|b| b.headers().cloned());
 
-        let composed = create_provider(CreateProviderOptions {
+        let composed_provider = create_provider(CreateProviderOptions {
             id: provider_id.to_owned(),
             name: Some(name),
             base_url,
@@ -1345,9 +1586,10 @@ impl ModelRuntime {
         Ok(match base {
             Some(base) => Arc::new(RefreshDelegatingProvider {
                 base: base.clone(),
-                inner: composed,
+                inner: composed_provider,
+                composed,
             }),
-            None => composed,
+            None => composed_provider,
         })
     }
 
@@ -2282,12 +2524,14 @@ fn json_model_to_model(
     provider_base_url: Option<&str>,
     provider_compat: Option<&ModelCompat>,
     model: ModelsJsonModel,
+    defaults: Option<&Model>,
 ) -> Result<Model, String> {
     // JS `if (!api)` — empty strings are falsy too.
     let api = model
         .api
         .clone()
         .or_else(|| provider_api.clone())
+        .or_else(|| defaults.map(|defaults| defaults.api.as_str().to_owned()))
         .filter(|api| !api.is_empty());
     let Some(api) = api else {
         return Err(format!(
@@ -2299,6 +2543,7 @@ fn json_model_to_model(
         .base_url
         .clone()
         .or_else(|| provider_base_url.map(str::to_owned))
+        .or_else(|| defaults.map(|defaults| defaults.base_url.clone()))
         .filter(|url| !url.is_empty());
     let Some(base_url) = base_url else {
         return Err(format!(
@@ -2358,11 +2603,13 @@ fn config_model_to_model(
     provider_api: &Option<String>,
     provider_base_url: Option<&str>,
     model: ProviderConfigModel,
+    defaults: Option<&Model>,
 ) -> Result<Model, String> {
     let api = model
         .api
         .clone()
         .or_else(|| provider_api.clone())
+        .or_else(|| defaults.map(|defaults| defaults.api.as_str().to_owned()))
         .filter(|api| !api.is_empty());
     let Some(api) = api else {
         return Err(format!(
@@ -2374,6 +2621,7 @@ fn config_model_to_model(
         .base_url
         .clone()
         .or_else(|| provider_base_url.map(str::to_owned))
+        .or_else(|| defaults.map(|defaults| defaults.base_url.clone()))
         .filter(|url| !url.is_empty());
     let Some(base_url) = base_url else {
         return Err(format!(
@@ -2600,9 +2848,11 @@ mod tests {
     }
 
     /// models.json with a built-in provider id composes over the seeded base
-    /// (provider-composer): users only write overrides for official
-    /// providers — the login selectors and the model resolver pick up the
-    /// composed provider.
+    /// (provider-composer): the base catalog stays, every base model's
+    /// `baseUrl` is rewritten by `applyModelsJson`, and `config.models`
+    /// UPSERT by id — it does not replace the catalog
+    /// (provider-composer.ts:199-216; G2 expectation change: the T10 port
+    /// used to replace the base list).
     #[tokio::test]
     async fn models_json_overlay_composes_over_builtin_base() {
         let (_tmp, runtime) = runtime_with_models_json(
@@ -2614,13 +2864,152 @@ mod tests {
             }}}"#,
         )
         .await;
+        // The un-overlaid built-in catalog for the same provider id.
+        let (_tmp2, plain) = runtime_with_models_json(r#"{"providers": {}}"#).await;
+        let base_len = plain
+            .get_provider("deepseek")
+            .expect("plain deepseek")
+            .get_models()
+            .len();
+
         let provider = runtime.get_provider("deepseek").expect("deepseek composed");
         assert_eq!(provider.base_url(), Some("https://proxy.example.com/v1"));
         assert!(provider.auth().api_key.is_some());
+        let base_ids: Vec<String> = plain
+            .get_provider("deepseek")
+            .expect("plain deepseek")
+            .get_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
         let models = provider.get_models();
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "deepseek-v4-flash");
+        assert_eq!(
+            models.len(),
+            base_len + 1,
+            "base catalog stays and the unknown id is appended"
+        );
+        for id in &base_ids {
+            assert!(
+                models.iter().any(|model| &model.id == id),
+                "base model {id} survives the overlay"
+            );
+        }
+        assert!(
+            models
+                .iter()
+                .all(|model| model.base_url == "https://proxy.example.com/v1"),
+            "applyModelsJson rewrites every base model's baseUrl"
+        );
+        let upserted = models
+            .iter()
+            .find(|model| model.id == "deepseek-v4-flash")
+            .expect("upserted model");
+        assert_eq!(upserted.context_window, 64000);
         assert!(runtime.get_error().is_none());
+    }
+
+    /// The no-api overlay composes `config.models` with omitted
+    /// `api`/`baseUrl` inherited from the base catalog through
+    /// `findModelDefaults` (provider-composer.ts:171-179, 199-216), and a
+    /// configured `apiKey` is honored instead of falling back to the base
+    /// provider (the early-return no-op shortcut must not swallow it).
+    #[tokio::test]
+    async fn no_api_overlay_upserts_models_and_keeps_api_key() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"anthropic": {
+                "apiKey": "sk-no-api-overlay",
+                "models": [{"id": "custom-claude", "contextWindow": 123456}]
+            }}}"#,
+        )
+        .await;
+        let provider = runtime.get_provider("anthropic").expect("composed");
+        let models = provider.get_models();
+        let custom = models
+            .iter()
+            .find(|model| model.id == "custom-claude")
+            .expect("config model upserted without an explicit api/baseUrl");
+        assert_eq!(custom.context_window, 123456);
+        assert_eq!(custom.api.as_str(), ApiKind::ANTHROPIC_MESSAGES);
+        assert!(
+            !custom.base_url.is_empty(),
+            "baseUrl inherited via defaults"
+        );
+        // apiKey from models.json reaches auth resolution.
+        let check = runtime
+            .check_provider_auth(&provider)
+            .await
+            .expect("check runs")
+            .expect("configured key is usable");
+        assert_eq!(check.source.as_deref(), Some("configured API key"));
+        assert!(runtime.get_error().is_none());
+    }
+
+    /// Provider-level `compat` merges onto every base model
+    /// (`applyModelsJson`, provider-composer.ts:210-212), next to the
+    /// `modelOverrides` layer.
+    #[tokio::test]
+    async fn provider_compat_merges_onto_base_models() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"zai": {
+                "compat": {"supportsMidConvoSystemMessages": true}
+            }}}"#,
+        )
+        .await;
+        let provider = runtime.get_provider("zai").expect("composed");
+        let models = provider.get_models();
+        assert!(!models.is_empty());
+        assert!(
+            models.iter().all(|model| model
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.supports_mid_convo_system_messages)
+                .unwrap_or(false)),
+            "provider compat applies to every base model"
+        );
+        assert!(runtime.get_error().is_none());
+    }
+
+    /// `config.oauth = "radius"` keeps every base model's own gateway
+    /// `baseUrl` (provider-composer.ts:210).
+    #[tokio::test]
+    async fn radius_oauth_overlay_keeps_model_base_urls() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"radius": {
+                "baseUrl": "https://ignored.example.com/v1",
+                "oauth": "radius"
+            }}}"#,
+        )
+        .await;
+        let provider = runtime.get_provider("radius").expect("composed");
+        let models = provider.get_models();
+        assert!(!models.is_empty());
+        assert!(
+            models
+                .iter()
+                .all(|model| model.base_url != "https://ignored.example.com/v1"),
+            "radius oauth keeps the model-level gateway URLs"
+        );
+        assert!(runtime.get_error().is_none());
+    }
+
+    /// Structural validation parity (provider-composer.ts:187-197): an
+    /// `oauth` overlay needs `baseUrl`, and an overlay with every field unset
+    /// is rejected.
+    #[tokio::test]
+    async fn overlay_validation_matches_upstream() {
+        let (_tmp, runtime) =
+            runtime_with_models_json(r#"{"providers": {"radius": {"oauth": "radius"}}}"#).await;
+        let error = runtime.get_error().expect("oauth without baseUrl");
+        assert!(
+            error.contains("\"baseUrl\" is required when \"oauth\" is set"),
+            "unexpected error: {error}"
+        );
+
+        let (_tmp2, empty) =
+            runtime_with_models_json(r#"{"providers": {"anthropic": {"name": "Only A Name"}}}"#)
+                .await;
+        let error = empty.get_error().expect("empty overlay");
+        assert!(error.contains("must specify"), "unexpected error: {error}");
     }
 
     /// models.json `apiKey` is a *config value* (provider-composer.ts
@@ -3911,94 +4300,90 @@ mod tests {
 
     /// Minimal model fixture for the 7027 regression test (same shape as the
     /// upstream `dynamicModel`).
-    /// Review P1 (V15-01 FR-E): the no-api overlay must re-apply
-    /// `modelOverrides` over `base.get_models()` on every call
-    /// (provider-composer.ts `getModels()` closure re-reads the base). A
-    /// frozen snapshot silently pinned dynamic catalogs
-    /// (`RemoteCatalogProvider`, the Radius baseline+gateway merge) to the
-    /// composition-time list.
-    #[tokio::test]
-    async fn model_override_provider_re_reads_a_dynamic_base_catalog() {
-        fn dynamic_model(id: &str, name: &str) -> Model {
-            Model {
-                id: id.to_owned(),
-                name: name.to_owned(),
-                api: ApiKind::from("openai-completions"),
-                provider: "dyn".to_owned(),
-                base_url: "https://example.test/v1".to_owned(),
-                reasoning: false,
-                thinking_level_map: None,
-                input: vec![rpi_ai::types::InputModality::Text],
-                cost: ModelCost {
-                    rates: ModelCostRates {
-                        input: 0.0,
-                        output: 0.0,
-                        cache_read: 0.0,
-                        cache_write: 0.0,
-                    },
-                    tiers: None,
+    fn dynamic_model(id: &str, name: &str) -> Model {
+        Model {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            api: ApiKind::from("openai-completions"),
+            provider: "dyn".to_owned(),
+            base_url: "https://example.test/v1".to_owned(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![rpi_ai::types::InputModality::Text],
+            cost: ModelCost {
+                rates: ModelCostRates {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
                 },
-                prompt_cache: None,
-                context_window: 1000,
-                max_tokens: 100,
-                headers: None,
-                compat: None,
-                sampling_params: None,
-            }
+                tiers: None,
+            },
+            prompt_cache: None,
+            context_window: 1000,
+            max_tokens: 100,
+            headers: None,
+            compat: None,
+            sampling_params: None,
         }
+    }
 
-        struct DynamicProvider {
-            id: String,
-            auth: ProviderAuth,
-            models: Arc<std::sync::Mutex<Vec<Model>>>,
+    /// A base provider whose catalog can change after composition
+    /// (stand-in for `RemoteCatalogProvider` / the Radius gateway overlay).
+    struct DynamicProvider {
+        id: String,
+        auth: ProviderAuth,
+        models: Arc<std::sync::Mutex<Vec<Model>>>,
+    }
+
+    impl Provider for DynamicProvider {
+        fn id(&self) -> &str {
+            &self.id
         }
-        impl Provider for DynamicProvider {
-            fn id(&self) -> &str {
-                &self.id
-            }
-            fn name(&self) -> &str {
-                &self.id
-            }
-            fn base_url(&self) -> Option<&str> {
-                None
-            }
-            fn headers(&self) -> Option<&ProviderHeaders> {
-                None
-            }
-            fn auth(&self) -> &ProviderAuth {
-                &self.auth
-            }
-            fn get_models(&self) -> Vec<Model> {
-                self.models
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-            }
-            fn stream(
-                &self,
-                _model: &Model,
-                _context: &TranscriptContext,
-                _options: Option<StreamOptions>,
-            ) -> AssistantMessageEventStream {
-                unreachable!("not used in catalog composition tests")
-            }
-            fn stream_simple(
-                &self,
-                _model: &Model,
-                _context: &TranscriptContext,
-                _options: Option<SimpleStreamOptions>,
-            ) -> Result<AssistantMessageEventStream, String> {
-                unreachable!("not used in catalog composition tests")
-            }
+        fn name(&self) -> &str {
+            &self.id
         }
+        fn base_url(&self) -> Option<&str> {
+            None
+        }
+        fn headers(&self) -> Option<&ProviderHeaders> {
+            None
+        }
+        fn auth(&self) -> &ProviderAuth {
+            &self.auth
+        }
+        fn get_models(&self) -> Vec<Model> {
+            self.models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &TranscriptContext,
+            _options: Option<StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            unreachable!("not used in catalog composition tests")
+        }
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &TranscriptContext,
+            _options: Option<SimpleStreamOptions>,
+        ) -> Result<AssistantMessageEventStream, String> {
+            unreachable!("not used in catalog composition tests")
+        }
+    }
 
-        let (_tmp, runtime) = runtime_with_models_json(
-            r#"{"providers": {"dyn": {"modelOverrides": {"m1": {"name": "Overridden"}}}}}"#,
-        )
-        .await;
-
-        // The base is a stand-in for a provider whose catalog can change after
-        // composition (RemoteCatalogProvider fetch, Radius gateway overlay).
+    async fn composed_dynamic_provider(
+        models_json: &str,
+    ) -> (
+        TempDir,
+        Arc<dyn Provider>,
+        Arc<std::sync::Mutex<Vec<Model>>>,
+    ) {
+        let (tmp, runtime) = runtime_with_models_json(models_json).await;
         const ENV_KEY: &str = "RPI_TEST_MODEL_OVERRIDING_PROVIDER_KEY";
         let base_models = Arc::new(std::sync::Mutex::new(vec![dynamic_model("m1", "Base One")]));
         runtime
@@ -4015,8 +4400,12 @@ mod tests {
             }))
             .await
             .expect("register dynamic provider");
-
         let composed = runtime.get_provider("dyn").expect("composed provider");
+        (tmp, composed, base_models)
+    }
+
+    async fn assert_live_dynamic_catalog(models_json: &str) {
+        let (_tmp, composed, base_models) = composed_dynamic_provider(models_json).await;
         let initial = composed.get_models();
         assert_eq!(initial.len(), 1, "base catalog seen through the overlay");
         assert_eq!(initial[0].name, "Overridden", "overrides still apply");
@@ -4034,6 +4423,31 @@ mod tests {
             "the overlay must re-read base.get_models() per call (provider-composer.ts)"
         );
         assert_eq!(refreshed[0].name, "Overridden", "overrides still apply");
+    }
+
+    /// Review P1 (V15-01 FR-E): the no-api overlay
+    /// (`ModelOverridingProvider`) must re-apply `modelOverrides` over
+    /// `base.get_models()` on every call (provider-composer.ts `getModels()`
+    /// closure re-reads the base). A frozen snapshot silently pinned dynamic
+    /// catalogs (`RemoteCatalogProvider`, the Radius baseline+gateway merge)
+    /// to the composition-time list.
+    #[tokio::test]
+    async fn model_override_provider_re_reads_a_dynamic_base_catalog() {
+        assert_live_dynamic_catalog(
+            r#"{"providers": {"dyn": {"modelOverrides": {"m1": {"name": "Overridden"}}}}}"#,
+        )
+        .await;
+    }
+
+    /// The same guarantee for the api-overlay wrapper
+    /// (`RefreshDelegatingProvider`, used when the entry declares its own
+    /// `api`).
+    #[tokio::test]
+    async fn api_overlay_provider_re_reads_a_dynamic_base_catalog() {
+        assert_live_dynamic_catalog(
+            r#"{"providers": {"dyn": {"api": "openai-completions", "modelOverrides": {"m1": {"name": "Overridden"}}}}}"#,
+        )
+        .await;
     }
 
     fn model_7027() -> Model {
