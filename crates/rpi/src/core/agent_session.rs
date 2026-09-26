@@ -718,6 +718,10 @@ impl AgentSession {
                     let session = AgentSession { inner };
 
                     // 1. Threshold compaction (agent-session.ts:543-553).
+                    // Settings resolve before the runner lock
+                    // (`getCompactionSettings(model)` inside
+                    // `_compactBeforeNextAssistantResponse`, agent-session.ts:563).
+                    session.sync_compaction_model().await;
                     let messages = session
                         .inner
                         .compaction
@@ -2704,7 +2708,7 @@ impl AgentSession {
         let thinking_level = self.thinking_level_for_model_switch(Some(&model), None);
         let previous_model = self.model();
         self.inner.agent.set_model(model.clone());
-        self.sync_compaction_model();
+        self.sync_compaction_model().await;
         self.sync_session_env();
         let result =
             lock(&self.inner.session_manager).append_model_change(&model.provider, &model.id);
@@ -2767,7 +2771,11 @@ impl AgentSession {
             .set_enabled_models(Some(updated));
     }
 
-    fn sync_compaction_model(&self) {
+    /// Sync the runner's model + resolved settings before a compaction
+    /// trigger. Async lock (not `try_lock`): under contention a silent no-op
+    /// would leave a stale per-model budget for the trigger the caller is
+    /// about to run.
+    async fn sync_compaction_model(&self) {
         let model = self.model();
         let (compaction, retry) = {
             let mut loader = lock(&self.inner.resource_loader);
@@ -2782,16 +2790,15 @@ impl AgentSession {
             )
         };
         let thinking_level = self.thinking_level();
-        if let Ok(mut runner) = self.inner.compaction.try_lock() {
-            runner.set_model(model);
-            runner.set_settings(rpi_agent::compaction::CompactionSettings {
-                enabled: compaction.enabled,
-                reserve_tokens: compaction.reserve_tokens,
-                keep_recent_tokens: compaction.keep_recent_tokens,
-            });
-            runner.set_retry(retry);
-            runner.set_thinking_level(thinking_level);
-        }
+        let mut runner = self.inner.compaction.lock().await;
+        runner.set_model(model);
+        runner.set_settings(rpi_agent::compaction::CompactionSettings {
+            enabled: compaction.enabled,
+            reserve_tokens: compaction.reserve_tokens,
+            keep_recent_tokens: compaction.keep_recent_tokens,
+        });
+        runner.set_retry(retry);
+        runner.set_thinking_level(thinking_level);
     }
 
     /// `cycleModel` (agent-session.ts:1700-1712 @ 2ff8ba622): session-only by
@@ -2855,7 +2862,7 @@ impl AgentSession {
         let previous_model = self.model();
 
         self.inner.agent.set_model(next.model.clone());
-        self.sync_compaction_model();
+        self.sync_compaction_model().await;
         self.sync_session_env();
         let result = lock(&self.inner.session_manager)
             .append_model_change(&next.model.provider, &next.model.id);
@@ -2911,7 +2918,7 @@ impl AgentSession {
         let previous_model = self.model();
 
         self.inner.agent.set_model(next_model.clone());
-        self.sync_compaction_model();
+        self.sync_compaction_model().await;
         self.sync_session_env();
         let result = lock(&self.inner.session_manager)
             .append_model_change(&next_model.provider, &next_model.id);
@@ -3125,7 +3132,7 @@ impl AgentSession {
         custom_instructions: Option<&str>,
     ) -> Result<CompactionResult, RpiError> {
         self.abort().await;
-        self.sync_compaction_model();
+        self.sync_compaction_model().await;
         let result = {
             let mut runner = self.inner.compaction.lock().await;
             runner.compact(custom_instructions).await
@@ -3147,7 +3154,7 @@ impl AgentSession {
         assistant_message: &AssistantMessage,
         skip_aborted_check: bool,
     ) -> bool {
-        self.sync_compaction_model();
+        self.sync_compaction_model().await;
         let mut runner = self.inner.compaction.lock().await;
         let outcome = runner
             .check_compaction(assistant_message, skip_aborted_check)

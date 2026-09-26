@@ -1077,6 +1077,11 @@ async fn complete_provider_authentication(
     previous_model: Option<Model>,
 ) -> Result<(), ModelsError> {
     let runtime = ui.session().model_runtime().clone();
+    // Upstream guards the deferred re-selection with BOTH the session
+    // identity and the model (`this.session === session && session.model ===
+    // previousModel`, interactive-mode.ts:5889-5892); a session switch during
+    // the 15 s refresh window must not select a model on the new session.
+    let session_id = ui.session().session_id();
     let _ = runtime.get_available(None).await?;
     let action_label = match auth_type {
         AuthType::Oauth => format!("Logged in to {provider_name}"),
@@ -1116,6 +1121,7 @@ async fn complete_provider_authentication(
     let refresh_provider_id = provider_id.to_owned();
     let refresh_action_label = action_label.clone();
     let refresh_previous_model = previous_model.clone();
+    let refresh_session_id = session_id.clone();
     tokio::spawn(async move {
         let token = CancellationToken::new();
         let abort = token.clone();
@@ -1140,8 +1146,11 @@ async fn complete_provider_authentication(
             ));
         }
         // Do not replace a model or session selected while the refresh was
-        // running (interactive-mode.ts:5720-5722).
-        if defer_selection && refresh_ui.session().model() == refresh_previous_model {
+        // running (interactive-mode.ts:5720-5722, 5889-5892).
+        if defer_selection
+            && refresh_ui.session().session_id() == refresh_session_id
+            && refresh_ui.session().model() == refresh_previous_model
+        {
             let _ = finish_authentication(
                 &refresh_ui,
                 &refresh_runtime,

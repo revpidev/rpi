@@ -732,6 +732,7 @@ pub async fn complete_summarization(
                 // `biased` + stream first: a terminal event that already
                 // arrived (adapter-aborted request) wins over a token that
                 // fired in the same wakeup.
+                biased;
                 message = stream_final_message(stream, model) => message,
                 () = signal.cancelled() => aborted_summary_message(model),
             },

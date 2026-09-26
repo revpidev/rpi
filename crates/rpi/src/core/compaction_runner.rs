@@ -902,8 +902,12 @@ impl CompactionRunner {
         match outcome {
             Ok(should_continue) => should_continue,
             Err(error) => {
+                // Upstream's catch classifies an error that raced a
+                // cancellation as aborted and omits the failure message
+                // (agent-session.ts:2537-2546).
+                let aborted = token.is_cancelled();
                 if started {
-                    let message = match reason {
+                    let message = (!aborted).then(|| match reason {
                         CompactionReason::Overflow => {
                             format!(
                                 "Context overflow recovery failed: {}",
@@ -911,18 +915,18 @@ impl CompactionRunner {
                             )
                         }
                         _ => format!("Auto-compaction failed: {}", raw_error_message(&error)),
-                    };
+                    });
                     self.emit(CompactionEvent::CompactionEnd {
                         reason,
                         result: None,
-                        aborted: false,
+                        aborted,
                         will_retry: false,
-                        error_message: Some(message.clone()),
+                        error_message: message.clone(),
                     });
                     self.emit_session_compact_failed(
                         reason,
-                        Some(message),
-                        false,
+                        message,
+                        aborted,
                         false,
                         from_extension,
                     )

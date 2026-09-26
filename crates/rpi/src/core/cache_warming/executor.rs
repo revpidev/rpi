@@ -28,7 +28,7 @@ impl CacheWarmer {
     /// `schedule` (cache-warmer.ts:279-289). `self: &Arc<Self>` because the
     /// timer task outlives the caller.
     pub(super) fn schedule(self: &Arc<Self>, generation: u64) {
-        let (beyond_deadline, sleep_until, phase_now) = {
+        let (beyond_deadline, sleep_until, phase_now, token) = {
             let mut state = lock(&self.state);
             let Some(run) = &mut state.run else {
                 return;
@@ -43,7 +43,12 @@ impl CacheWarmer {
             run.next_warm_at = wall_epoch_ms().saturating_add(run.delay_ms);
             run.refreshing = false;
             let deadline = run.deadline();
-            (next > deadline || now >= deadline, next, run.phase)
+            (
+                next > deadline || now >= deadline,
+                next,
+                run.phase,
+                run.token.clone(),
+            )
         };
         if beyond_deadline {
             // Warm requests never extend the fixed safety windows
@@ -57,8 +62,13 @@ impl CacheWarmer {
         }
         let warmer = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep_until(sleep_until).await;
-            warmer.refresh(generation).await;
+            // `clearTimeout(run.timer)` (cache-warmer.ts:266-271):
+            // `clear_run` cancels the run token, so the sleeping timer task
+            // exits immediately instead of parking until its TTL deadline.
+            tokio::select! {
+                () = tokio::time::sleep_until(sleep_until) => warmer.refresh(generation).await,
+                () = token.cancelled() => {}
+            }
         });
     }
 
