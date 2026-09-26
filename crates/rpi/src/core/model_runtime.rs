@@ -855,6 +855,16 @@ struct RefreshDelegatingProvider {
     composed: ComposedModels,
 }
 
+impl RefreshDelegatingProvider {
+    /// `supportsBaseApi` (provider-composer.ts:462-464).
+    fn base_supports(&self, model: &Model) -> bool {
+        self.base
+            .get_models()
+            .iter()
+            .any(|entry| entry.api == model.api)
+    }
+}
+
 impl Provider for RefreshDelegatingProvider {
     fn id(&self) -> &str {
         self.inner.id()
@@ -899,6 +909,12 @@ impl Provider for RefreshDelegatingProvider {
         context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
+        // `streamWith` (provider-composer.ts:469-494): the base serves every
+        // model whose api it declares; the overlay's api only handles the
+        // rest (config-defined models with a different api).
+        if self.base_supports(model) {
+            return self.base.stream(model, context, options);
+        }
         self.inner.stream(model, context, options)
     }
 
@@ -908,6 +924,9 @@ impl Provider for RefreshDelegatingProvider {
         context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
+        if self.base_supports(model) {
+            return self.base.stream_simple(model, context, options);
+        }
         self.inner.stream_simple(model, context, options)
     }
 }
@@ -1515,7 +1534,12 @@ impl ModelRuntime {
                     &configured_headers,
                     auth_header,
                 )),
-                oauth: None,
+                // Upstream composes apiKey and oauth independently and keeps
+                // BOTH on the provider (provider-composer.ts:497): a
+                // configured apiKey must not erase the base OAuth method,
+                // or stored OAuth credentials stop resolving
+                // (`resolve` matches on `auth.oauth`).
+                oauth: base.and_then(|b| b.auth().oauth.clone()),
             },
             None => {
                 let base_auth = base.map(|b| b.auth().clone()).ok_or_else(|| {
@@ -2942,6 +2966,65 @@ mod tests {
             .expect("configured key is usable");
         assert_eq!(check.source.as_deref(), Some("configured API key"));
         assert!(runtime.get_error().is_none());
+    }
+
+    /// Review round-2 F1: a models.json `apiKey` overlay must keep the base
+    /// provider's OAuth method — upstream composes apiKey and oauth
+    /// independently and keeps BOTH on the provider
+    /// (provider-composer.ts:497), so stored OAuth credentials still
+    /// resolve through `get_auth` for an apiKey-overlaid provider.
+    #[tokio::test]
+    async fn api_key_overlay_keeps_the_base_oauth_method() {
+        let tmp = TempDir::new();
+        let agent_dir = tmp.0.join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::write(
+            agent_dir.join("models.json"),
+            r#"{"providers": {"anthropic": {"apiKey": "sk-api-key-overlay"}}}"#,
+        )
+        .expect("write models.json");
+        let store = Arc::new(rpi_ai::auth::credential_store::InMemoryCredentialStore::new());
+        let credential = Credential::OAuth(rpi_ai::auth::types::OAuthCredential {
+            refresh: "refresh-token".to_owned(),
+            access: "access-token".to_owned(),
+            expires: i64::MAX,
+            extra: serde_json::Map::new(),
+        });
+        store
+            .modify(
+                "anthropic",
+                Arc::new(move |_| {
+                    let credential = credential.clone();
+                    Box::pin(async move { Ok(Some(credential)) })
+                }),
+                None,
+            )
+            .await
+            .expect("seed oauth credential");
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(store),
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+            ..Default::default()
+        })
+        .await;
+        assert!(runtime.get_error().is_none(), "{:?}", runtime.get_error());
+        let model = runtime
+            .get_models(Some("anthropic"))
+            .into_iter()
+            .next()
+            .expect("anthropic catalog");
+        let auth = runtime
+            .get_auth(&model, None)
+            .await
+            .expect("get_auth runs")
+            .expect("stored OAuth resolves through the apiKey overlay");
+        assert_eq!(
+            auth.auth.api_key.as_deref(),
+            Some("access-token"),
+            "the OAuth access token must resolve (source: {:?})",
+            auth.source
+        );
     }
 
     /// Provider-level `compat` merges onto every base model
