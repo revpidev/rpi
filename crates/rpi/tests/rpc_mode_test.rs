@@ -218,7 +218,18 @@ async fn boot(
     provider_options: FauxProviderOptions,
     responses: Vec<FauxResponseStep>,
 ) -> RpcSession {
-    let (runtime, provider, cwd) = boot_runtime(&tmp, provider_options, responses).await;
+    boot_with(tmp, provider_options, responses, None).await
+}
+
+/// [`boot`] with an injectable extension host (see [`boot_runtime_with`]).
+async fn boot_with(
+    tmp: TempDir,
+    provider_options: FauxProviderOptions,
+    responses: Vec<FauxResponseStep>,
+    extension_host: Option<Arc<rpi_ext_host::host::NativeExtensionHost>>,
+) -> RpcSession {
+    let (runtime, provider, cwd) =
+        boot_runtime_with(&tmp, provider_options, responses, extension_host).await;
 
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let (_read_half, stdin) = tokio::io::split(client_io);
@@ -250,6 +261,22 @@ async fn boot_runtime(
     Arc<FauxProvider>,
     PathBuf,
 ) {
+    boot_runtime_with(tmp, provider_options, responses, None).await
+}
+
+/// [`boot_runtime`] with an injectable extension host: the host is bound
+/// into every session the runtime's factory creates, so inline extensions
+/// (e.g. a `user_bash` handler) participate in the real RPC dispatch.
+async fn boot_runtime_with(
+    tmp: &TempDir,
+    provider_options: FauxProviderOptions,
+    responses: Vec<FauxResponseStep>,
+    extension_host: Option<Arc<rpi_ext_host::host::NativeExtensionHost>>,
+) -> (
+    rpi::core::agent_session_runtime::AgentSessionRuntime,
+    Arc<FauxProvider>,
+    PathBuf,
+) {
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).expect("cwd");
@@ -276,6 +303,7 @@ async fn boot_runtime(
         Arc::new(move |options: CreateRuntimeOptions| {
             let model_runtime = model_runtime.clone();
             let model = model.clone();
+            let extension_host = extension_host.clone();
             Box::pin(async move {
                 let services = create_agent_session_services(CreateAgentSessionServicesOptions {
                     cwd: options.cwd.clone(),
@@ -294,6 +322,7 @@ async fn boot_runtime(
                     services: Some(services),
                     session_manager: Some(options.session_manager),
                     session_start_event: options.session_start_event,
+                    extension_host: extension_host.clone(),
                     ..Default::default()
                 })
                 .await?;
@@ -341,6 +370,20 @@ async fn start_rpc_with(
         options.models = Some(default_models());
     }
     boot(TempDir::new(), options, responses).await
+}
+
+/// [`start_rpc_with`] bound to an extension host carrying inline handlers
+/// (exercises the extension-intercepting RPC arms end to end).
+async fn start_rpc_with_host(
+    provider_options: FauxProviderOptions,
+    responses: Vec<FauxResponseStep>,
+    extension_host: Arc<rpi_ext_host::host::NativeExtensionHost>,
+) -> RpcSession {
+    let mut options = provider_options;
+    if options.models.is_none() {
+        options.models = Some(default_models());
+    }
+    boot_with(TempDir::new(), options, responses, Some(extension_host)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +706,132 @@ async fn bash_commands() {
     rpc.send(&json!({"id": "b3", "type": "abort_bash"})).await;
     assert_eq!(rpc.next_response(Some("b3")).await["success"], true);
 
+    assert_eq!(rpc.close_and_wait().await, 0);
+}
+
+/// Review fix regression: the RPC `bash` command runs the extension
+/// `user_bash` interception with the SAME contract as the interactive
+/// `!`/`!!` path — a full-replacement result skips local execution (and is
+/// recorded), a handler error ABORTS the command (fail-closed, never a
+/// silent local fallback), and only an abstention runs locally. Reverting
+/// the interception (back to bare `execute_bash`) turns this red: the
+/// replacement arm would run the (nonexistent) command locally, the error
+/// arm would succeed, and the handler would never see any command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_runs_user_bash_interception() {
+    use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let register = {
+        let seen = seen.clone();
+        move |api: &rpi_ext_host::api::ExtensionApi| {
+            let seen = seen.clone();
+            api.on(
+                "user_bash",
+                Arc::new(move |payload: Value, _ctx| {
+                    let seen = seen.clone();
+                    Box::pin(async move {
+                        let command = payload.get("command").and_then(Value::as_str).unwrap_or("");
+                        seen.lock().unwrap().push(command.to_string());
+                        if command.contains("replace") {
+                            Ok(json!({
+                                "result": {
+                                    "output": "extension output",
+                                    "exitCode": 7,
+                                    "cancelled": false,
+                                    "truncated": false,
+                                }
+                            }))
+                        } else if command.contains("fail") {
+                            Err("Routing failed".to_owned())
+                        } else {
+                            // Abstain: JSON null continues to local execution.
+                            Ok(Value::Null)
+                        }
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<Value, String>> + Send>,
+                        >
+                }),
+            )
+            .expect("register user_bash handler");
+        }
+    };
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        register(&api);
+        Box::pin(async { Ok(()) })
+    });
+    let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new(
+        "/nonexistent-rpc-cwd",
+    ));
+    let errors = host
+        .load_inline(&[InlineExtension::Anonymous(factory)])
+        .await;
+    assert!(errors.is_empty(), "load errors: {errors:?}");
+
+    let mut rpc = start_rpc_with_host(FauxProviderOptions::default(), vec![], host).await;
+
+    // 1) Full replacement: the command is not even executable, so a bare
+    //    local-execution revert would fail with a nonzero exit — the
+    //    replacement output/exit code must win and be recorded.
+    rpc.send(&json!({"id": "r1", "type": "bash", "command": "replace: definitely-not-a-command"}))
+        .await;
+    let response = rpc.next_response(Some("r1")).await;
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["output"], "extension output");
+    assert_eq!(response["data"]["exitCode"], 7);
+
+    rpc.send(&json!({"id": "r2", "type": "get_messages"})).await;
+    let response = rpc.next_response(Some("r2")).await;
+    let messages = response["data"]["messages"].as_array().expect("messages");
+    let bash_entry = messages
+        .iter()
+        .find(|m| m["role"] == "bashExecution")
+        .expect("the replacement is recorded as a bashExecution message");
+    assert_eq!(bash_entry["command"], "replace: definitely-not-a-command");
+    assert_eq!(bash_entry["output"], "extension output");
+
+    // 2) Handler error: fail-closed — an error response names the abort,
+    //    and nothing is recorded (no local execution of any kind).
+    rpc.send(&json!({"id": "r3", "type": "bash", "command": "fail: definitely-not-a-command"}))
+        .await;
+    let response = rpc.next_response(Some("r3")).await;
+    assert_eq!(response["success"], false);
+    assert!(
+        response["error"].as_str().unwrap_or("").contains("aborted"),
+        "error was: {}",
+        response["error"]
+    );
+
+    rpc.send(&json!({"id": "r4", "type": "get_messages"})).await;
+    let response = rpc.next_response(Some("r4")).await;
+    let messages = response["data"]["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["role"] == "bashExecution")
+            .count(),
+        1,
+        "the aborted command records nothing"
+    );
+
+    // 3) Abstention: local execution runs the real command.
+    rpc.send(&json!({"id": "r5", "type": "bash", "command": "printf local-ok"}))
+        .await;
+    let response = rpc.next_response(Some("r5")).await;
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["output"], "local-ok");
+    assert_eq!(response["data"]["exitCode"], 0);
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            "replace: definitely-not-a-command".to_string(),
+            "fail: definitely-not-a-command".to_string(),
+            "printf local-ok".to_string(),
+        ],
+        "the handler saw every command exactly once"
+    );
     assert_eq!(rpc.close_and_wait().await, 0);
 }
 

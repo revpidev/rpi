@@ -758,7 +758,7 @@ async fn rebind_session(
         // slow consumer stalls the event source (rpc-mode.ts:361-363).
         // A conversion failure (invariant violation) is rejected here —
         // stderr diagnostic, no wire line — instead of upstream's
-        // unguarded-throw process crash (V14-03 §5 实现取舍).
+        // unguarded-throw process crash (a deliberate V14-03 §5 trade-off).
         match to_json_event(&event) {
             Ok(wire) => {
                 if let Ok(mut line) = serde_json::to_string(&wire) {
