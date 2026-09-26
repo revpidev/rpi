@@ -297,8 +297,6 @@ pub(crate) fn run_clipboard_write_command(
     input: Option<&str>,
     timeout_ms: u64,
 ) -> Option<Vec<u8>> {
-    use std::io::Write;
-
     let is_query = input.is_none();
     let mut child = std::process::Command::new(program)
         .args(args)
@@ -316,12 +314,22 @@ pub(crate) fn run_clipboard_write_command(
         .spawn()
         .ok()?;
     // The writer may exit before consuming all input (stdin errors are
-    // ignored, upstream: `child.stdin?.on("error", () => {})`).
+    // ignored, upstream: `child.stdin?.on("error", () => {})`). The
+    // write runs on its own thread so the timeout loop stays in charge:
+    // a wedged writer that stops reading stdin cannot park the UI thread
+    // on a full pipe — after the kill, the broken pipe fails the write
+    // and the thread exits (the join is skipped on the timeout path).
     if let Some(text) = input {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-            let _ = stdin.flush();
-        }
+        let mut stdin = child.stdin.take();
+        let bytes = text.as_bytes().to_vec();
+        // Detached on purpose (upstream never awaits the write).
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Some(mut stdin) = stdin.take() {
+                let _ = stdin.write_all(&bytes);
+                let _ = stdin.flush();
+            }
+        });
     }
     // Query path: drain stdout on a reader thread (the read-side
     // precedent in commands_selectors.rs). The command has already
@@ -353,6 +361,11 @@ pub(crate) fn run_clipboard_write_command(
             }
         }
     };
+    // The stdin writer stays DETACHED (upstream never awaits it): after
+    // the child exits the write either completes or fails on the broken
+    // pipe — its outcome is irrelevant to the caller either way. Only the
+    // QUERY reader is joined, and only on the success path (the child has
+    // exited, so the pipe closes promptly).
     status.filter(|status| status.success()).map(|_| {
         reader
             .map(|reader| reader.join().unwrap_or_default())
@@ -832,13 +845,26 @@ mod tests {
     fn real_runner_write_path_ignores_stdout_and_succeeds() {
         // A writer call (stdin input present) must not retain an output
         // pipe (daemonizing writers) and returns empty bytes on success.
+        // The grandchild `sleep` INHERITS any retained stdout pipe: if the
+        // runner regressed to piping + draining writer stdout, the read
+        // would hang on the grandchild's handle and blow the time budget.
         let dir = std::env::temp_dir().join(format!("rpi-clip-write-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let cat = executable_script(&dir, "cat-writer", "#!/bin/sh\ncat >/dev/null\n");
+        let cat = executable_script(
+            &dir,
+            "cat-writer",
+            "#!/bin/sh\ncat >/dev/null\n(sleep 20 >/dev/null 2>&1 &)\nexit 0\n",
+        );
+        let start = std::time::Instant::now();
         let out =
             run_clipboard_write_command(cat.to_str().unwrap(), &[], Some("hello clipboard"), 5_000)
                 .expect("write succeeds");
         assert!(out.is_empty(), "the write path returns no stdout");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(4),
+            "a retained stdout pipe would hang on the grandchild's handle (elapsed {:?})",
+            start.elapsed()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
