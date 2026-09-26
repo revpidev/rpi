@@ -177,8 +177,9 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
 
 /// `appendRestrictedAgentLines` (agent-management.ts:857-864): the
 /// restricted section shared by BOTH list modes (default lines and
-/// capability lines) — `; capability ceiling: <sources>` names the
-/// restricting source.
+/// capability lines) — the `; capability ceiling: <sources>` clause only
+/// appears when the ceiling names its sources (upstream omits the clause
+/// for an empty source list).
 fn append_restricted_agent_lines(
     lines: &mut Vec<String>,
     restricted: &[&AgentConfig],
@@ -187,18 +188,15 @@ fn append_restricted_agent_lines(
     if restricted.is_empty() {
         return;
     }
-    let sources = ceiling
-        .map(|c| {
-            if c.sources.is_empty() {
-                "unknown source".to_string()
-            } else {
-                c.sources.join(", ")
-            }
-        })
-        .unwrap_or_else(|| "unknown source".to_string());
+    let sources = ceiling.map(|c| c.sources.join(", ")).unwrap_or_default();
+    let clause = if sources.is_empty() {
+        String::new()
+    } else {
+        format!("; capability ceiling: {sources}")
+    };
     lines.push(String::new());
     lines.push(format!(
-        "Restricted agents (not executable in this session; capability ceiling: {sources}):"
+        "Restricted agents (not executable in this session{clause}):"
     ));
     for agent in restricted {
         lines.push(format!(
@@ -310,13 +308,6 @@ pub fn agent_capabilities_snapshot(
             "description": truncate_chars(&agent.description, 1000),
             "source": agent.source_str(),
             "executable": is_executable,
-            // `restrictionSources` rides RESTRICTED rows only (upstream
-            // `agentCapabilityRow`: `executable ? undefined : sources ?? []`).
-            "restrictionSources": if is_executable {
-                Value::Null
-            } else {
-                json!(ceiling.map(|c| c.sources.clone()).unwrap_or_default())
-            },
             "tools": {
                 "tools": agent.tools,
                 "mcpDirectTools": agent.mcp_direct_tools,
@@ -333,6 +324,11 @@ pub fn agent_capabilities_snapshot(
                     crate::agents::discover::ThinkingSpec::Unset => Value::Null,
                 },
             },
+            // `acceptance` mirrors the prose row's role fact (upstream
+            // `presentDetails({ policy, role })`; rpi carries the role).
+            "acceptance": {
+                "role": agent.acceptance_role,
+            },
             "execution": {
                 "defaultAsync": agent.default_async,
                 "timeoutMs": agent.default_timeout_ms,
@@ -347,6 +343,13 @@ pub fn agent_capabilities_snapshot(
                 "skills": agent.skills,
             },
         });
+        // `restrictionSources` rides RESTRICTED rows ONLY (upstream
+        // `agentCapabilityRow`: `executable ? undefined : sources ?? []` —
+        // the key is OMITTED on executable rows, not null).
+        if !is_executable {
+            record["restrictionSources"] =
+                json!(ceiling.map(|c| c.sources.clone()).unwrap_or_default());
+        }
         if let Some(aliases) = &agent.aliases {
             record["aliases"] = json!(aliases);
         }
@@ -2295,14 +2298,30 @@ mod tests {
             assert!(record["extensions"].is_object());
         }
         assert_eq!(snapshot["restrictedCount"], json!(0));
-        // Acceptance wording: an acceptance ROLE reads `Acceptance role:`
-        // (upstream formatAcceptanceSummary).
-        if listing.contains("Acceptance") {
-            assert!(
-                listing.contains("Acceptance role:"),
-                "acceptance in capability rows must read `Acceptance role:`, got: {listing}"
-            );
-        }
+    }
+
+    #[test]
+    fn capability_rows_report_the_acceptance_role() {
+        // #2213 wording pin (upstream formatAcceptanceSummary): an
+        // acceptance ROLE reads `Acceptance role: <role>` in the prose row
+        // and rides `acceptance.role` in the structured record. Seeded on
+        // a builtin because none declares a role (the old builtin-only
+        // assertion was vacuous).
+        let mut agents = crate::agents::builtin::load_builtin_agents(None);
+        agents[0].acceptance_role = Some("read-only".to_string());
+        let listing = format_agent_capabilities_list(&agents, None);
+        assert!(
+            listing.contains("; Acceptance role: read-only"),
+            "listing was: {listing}"
+        );
+        let snapshot = agent_capabilities_snapshot(&agents, None);
+        let seeded = &snapshot["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == json!(agents[0].name))
+            .unwrap();
+        assert_eq!(seeded["acceptance"]["role"], json!("read-only"));
     }
 
     #[test]
@@ -2344,14 +2363,18 @@ mod tests {
                 "restricted rows carry the ceiling sources"
             );
         }
-        // The survivor stays executable with no restriction sources.
+        // The survivor stays executable; upstream OMITS the
+        // restrictionSources key on executable rows (no null).
         let executable: Vec<&Value> = records
             .iter()
             .filter(|r| r["executable"].as_bool() == Some(true))
             .collect();
         assert_eq!(executable.len(), 1);
         assert_eq!(executable[0]["name"], json!(survivor));
-        assert!(executable[0]["restrictionSources"].is_null());
+        assert!(
+            executable[0].get("restrictionSources").is_none(),
+            "executable rows omit restrictionSources entirely"
+        );
     }
 
     #[test]

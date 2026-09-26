@@ -18,7 +18,7 @@ pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 
 /// `defaultModelPerProvider` (model-resolver.ts:14-53) — ids pinned to the
 /// upstream commit; unknown providers fall through to "first available".
-pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 39] = [
+pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
     ("ant-ling", "Ring-2.6-1T"),
     ("anthropic", "claude-opus-4-8"),
@@ -48,6 +48,7 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 39] = [
     ("moonshotai-cn", "kimi-k2.6"),
     ("huggingface", "moonshotai/Kimi-K2.6"),
     ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
+    ("baseten", "zai-org/GLM-5.2"),
     ("together", "moonshotai/Kimi-K2.6"),
     ("opencode", "kimi-k2.6"),
     ("opencode-go", "kimi-k2.6"),
@@ -60,6 +61,7 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 39] = [
     ),
     ("qwen-token-plan", "qwen3.7-max"),
     ("qwen-token-plan-cn", "qwen3.7-max"),
+    ("qwen-token-plan-individual", "qwen3.8-max"),
     ("xiaomi", "mimo-v2.5-pro"),
     ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
     ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
@@ -1306,6 +1308,19 @@ mod tests {
             Some("kimi-for-coding")
         );
         assert_eq!(default_model_for_provider("does-not-exist"), None);
+        // Upstream-pin spot checks for defaults whose RETIRED predecessor
+        // still exists in the catalog (so the catalog-existence test below
+        // alone cannot catch a revert) — e.g. xai still lists grok-4.5
+        // alongside the pinned grok-4.6.
+        assert_eq!(default_model_for_provider("xai"), Some("grok-4.6"));
+        assert_eq!(
+            default_model_for_provider("baseten"),
+            Some("zai-org/GLM-5.2")
+        );
+        assert_eq!(
+            default_model_for_provider("qwen-token-plan-individual"),
+            Some("qwen3.8-max")
+        );
     }
 
     #[test]
