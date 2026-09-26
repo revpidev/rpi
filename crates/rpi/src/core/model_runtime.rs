@@ -910,12 +910,15 @@ impl Provider for RefreshDelegatingProvider {
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
         // `streamWith` (provider-composer.ts:469-494): the base serves every
-        // model whose api it declares; the overlay's api only handles the
-        // rest (config-defined models with a different api).
+        // model whose api it declares; otherwise the api provider for the
+        // MODEL's api handles it (not the entry's declared api default).
         if self.base_supports(model) {
             return self.base.stream(model, context, options);
         }
-        self.inner.stream(model, context, options)
+        match api_streams(model.api.as_str()) {
+            Some(streams) => streams.stream(model, context, options),
+            None => unsupported_api_stream(model),
+        }
     }
 
     fn stream_simple(
@@ -927,7 +930,13 @@ impl Provider for RefreshDelegatingProvider {
         if self.base_supports(model) {
             return self.base.stream_simple(model, context, options);
         }
-        self.inner.stream_simple(model, context, options)
+        match api_streams(model.api.as_str()) {
+            Some(streams) => streams.stream_simple(model, context, options),
+            None => Err(format!(
+                "No API provider registered for api: {}",
+                model.api.as_str()
+            )),
+        }
     }
 }
 
@@ -4531,6 +4540,92 @@ mod tests {
             r#"{"providers": {"dyn": {"api": "openai-completions", "modelOverrides": {"m1": {"name": "Overridden"}}}}}"#,
         )
         .await;
+    }
+
+    /// Review F3 follow-up: an api-overlay provider routes a model whose api
+    /// the base does not serve to the MODEL's api provider (upstream
+    /// `streamWith`, provider-composer.ts:488-492) — not to the overlay's
+    /// declared api default. An api no rpi adapter serves terminates with
+    /// the upstream error instead.
+    #[tokio::test]
+    async fn api_overlay_routes_a_foreign_model_api_by_model() {
+        struct BaseProvider {
+            models: Vec<Model>,
+            auth: ProviderAuth,
+        }
+        impl Provider for BaseProvider {
+            fn id(&self) -> &str {
+                "dyn"
+            }
+            fn name(&self) -> &str {
+                "dyn"
+            }
+            fn base_url(&self) -> Option<&str> {
+                None
+            }
+            fn headers(&self) -> Option<&ProviderHeaders> {
+                None
+            }
+            fn auth(&self) -> &ProviderAuth {
+                &self.auth
+            }
+            fn get_models(&self) -> Vec<Model> {
+                self.models.clone()
+            }
+            fn stream(
+                &self,
+                _model: &Model,
+                _context: &TranscriptContext,
+                _options: Option<StreamOptions>,
+            ) -> AssistantMessageEventStream {
+                unreachable!("the base must not serve a foreign api")
+            }
+            fn stream_simple(
+                &self,
+                _model: &Model,
+                _context: &TranscriptContext,
+                _options: Option<SimpleStreamOptions>,
+            ) -> Result<AssistantMessageEventStream, String> {
+                unreachable!("the base must not serve a foreign api")
+            }
+        }
+
+        let base: Arc<dyn Provider> = Arc::new(BaseProvider {
+            models: vec![dynamic_model("m1", "Base One")],
+            auth: ProviderAuth {
+                api_key: None,
+                oauth: None,
+            },
+        });
+        let inner = create_provider(CreateProviderOptions {
+            id: "dyn".to_owned(),
+            auth: ProviderAuth {
+                api_key: None,
+                oauth: None,
+            },
+            api: ProviderApi::Single(
+                api_streams(ApiKind::OPENAI_COMPLETIONS).expect("declared api streams"),
+            ),
+            ..Default::default()
+        });
+        let provider = RefreshDelegatingProvider {
+            base: base.clone(),
+            inner,
+            composed: ComposedModels::new("dyn", Some(base), None, None),
+        };
+        let mut foreign = dynamic_model("m-foreign", "Foreign");
+        foreign.api = ApiKind::from("rpi-messages");
+        let context = rpi_ai::utils::transcript::normalize_context(&Context::default());
+        let message = provider
+            .stream(&foreign, &context, None)
+            .result()
+            .await
+            .expect("terminal event");
+        let error_message = message.error_message.clone().unwrap_or_default();
+        assert!(
+            error_message.contains("No API provider registered for api: rpi-messages"),
+            "foreign api must fail with the upstream message: {error_message:?}"
+        );
     }
 
     fn model_7027() -> Model {
