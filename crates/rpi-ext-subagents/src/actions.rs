@@ -43,27 +43,7 @@ pub fn format_agent_list_with_ceiling(
             ));
         }
     }
-    if let Some(ceiling) = ceiling {
-        if !restricted.is_empty() {
-            let sources = if ceiling.sources.is_empty() {
-                "unknown source".to_string()
-            } else {
-                ceiling.sources.join(", ")
-            };
-            lines.push(String::new());
-            lines.push(format!(
-                "Restricted agents (not executable in this session; capability ceiling: {sources}):"
-            ));
-            for agent in restricted {
-                lines.push(format!(
-                    "- {} ({}): {}",
-                    agent.name,
-                    agent.source_str(),
-                    agent.description
-                ));
-            }
-        }
-    }
+    append_restricted_agent_lines(&mut lines, &restricted, ceiling);
     lines.push(String::new());
     lines.push("Chains:".to_string());
     lines.push("- (none)".to_string());
@@ -195,13 +175,56 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
     lines.join("\n")
 }
 
+/// `appendRestrictedAgentLines` (agent-management.ts:857-864): the
+/// restricted section shared by BOTH list modes (default lines and
+/// capability lines) — `; capability ceiling: <sources>` names the
+/// restricting source.
+fn append_restricted_agent_lines(
+    lines: &mut Vec<String>,
+    restricted: &[&AgentConfig],
+    ceiling: Option<&crate::launch::args::DescendantAllowlist>,
+) {
+    if restricted.is_empty() {
+        return;
+    }
+    let sources = ceiling
+        .map(|c| {
+            if c.sources.is_empty() {
+                "unknown source".to_string()
+            } else {
+                c.sources.join(", ")
+            }
+        })
+        .unwrap_or_else(|| "unknown source".to_string());
+    lines.push(String::new());
+    lines.push(format!(
+        "Restricted agents (not executable in this session; capability ceiling: {sources}):"
+    ));
+    for agent in restricted {
+        lines.push(format!(
+            "- {} ({}): {}",
+            agent.name,
+            agent.source_str(),
+            agent.description
+        ));
+    }
+}
+
 /// `formatAgentCapabilitiesLine` (#1717, agent-management.ts:751-771 @
 /// 0fc0eebb): one line per agent carrying the selection-relevant facts —
 /// description preview, tool surface, model, thinking. The header reads
-/// `Executable agents (capabilities):`.
-pub fn format_agent_capabilities_list(agents: &[AgentConfig]) -> String {
+/// `Executable agents (capabilities):`. #2338: the session's capability
+/// ceiling partitions non-allowlisted agents into their own restricted
+/// section (both list modes share `appendRestrictedAgentLines` upstream).
+pub fn format_agent_capabilities_list(
+    agents: &[AgentConfig],
+    ceiling: Option<&crate::launch::args::DescendantAllowlist>,
+) -> String {
     let mut sorted: Vec<&AgentConfig> = agents.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let (sorted, restricted): (Vec<&AgentConfig>, Vec<&AgentConfig>) = sorted
+        .into_iter()
+        .partition(|agent| ceiling.is_none_or(|c| c.allows(&agent.name)));
     let mut lines = vec!["Executable agents (capabilities):".to_string()];
     if sorted.is_empty() {
         lines.push("- (none)".to_string());
@@ -227,11 +250,13 @@ pub fn format_agent_capabilities_list(agents: &[AgentConfig]) -> String {
                 crate::agents::discover::ThinkingSpec::Disabled => "off".to_string(),
                 crate::agents::discover::ThinkingSpec::Unset => "default".to_string(),
             };
-            // #2213: report the acceptance policy in capability rows.
+            // #2213: report the acceptance policy in capability rows
+            // (upstream `formatAcceptanceSummary`: an acceptance ROLE
+            // reads `Acceptance role: <role>`).
             let acceptance = agent
                 .acceptance_role
                 .as_deref()
-                .map(|role| format!("; Acceptance: {role}"))
+                .map(|role| format!("; Acceptance role: {role}"))
                 .unwrap_or_default();
             lines.push(format!(
                 "- {} ({}): Description: {}; Tools: {}; Model: {}; Thinking: {}{acceptance}",
@@ -244,6 +269,7 @@ pub fn format_agent_capabilities_list(agents: &[AgentConfig]) -> String {
             ));
         }
     }
+    append_restricted_agent_lines(&mut lines, &restricted, ceiling);
     lines.join("\n")
 }
 
@@ -262,57 +288,85 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// `agentCapabilitiesSnapshot` (#1720, agent-management.ts:860-870 +
+/// `agentCapabilitiesSnapshot` (#1720, agent-management.ts:842-851 +
 /// `agentCapabilityRow` @ 0fc0eebb): structured per-agent records so callers
-/// can select agents without parsing prose rows.
-pub fn agent_capabilities_snapshot(agents: &[AgentConfig]) -> Value {
+/// can select agents without parsing prose rows. #2338: the session's
+/// capability ceiling partitions restricted agents into the tail of the
+/// array with `executable: false` + `restrictionSources`, carries the real
+/// `restrictedCount`, and names the ceiling's sources in
+/// `capabilityCeilingSources` when present.
+pub fn agent_capabilities_snapshot(
+    agents: &[AgentConfig],
+    ceiling: Option<&crate::launch::args::DescendantAllowlist>,
+) -> Value {
     let mut sorted: Vec<&AgentConfig> = agents.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
-    json!({
-        "agents": sorted
-            .iter()
-            .map(|agent| {
-                let mut record = json!({
-                    "name": agent.name,
-                    "description": truncate_chars(&agent.description, 1000),
-                    "source": agent.source_str(),
-                    "executable": true,
-                    "tools": {
-                        "tools": agent.tools,
-                        "mcpDirectTools": agent.mcp_direct_tools,
-                        "excludes": agent.exclude_tools,
-                    },
-                    "model": {
-                        "value": agent.model,
-                        "allowedAgents": agent.allowed_agents,
-                        "thinking": match &agent.thinking {
-                            crate::agents::discover::ThinkingSpec::Level(level) => json!(level),
-                            crate::agents::discover::ThinkingSpec::Disabled => json!("off"),
-                            crate::agents::discover::ThinkingSpec::Unset => Value::Null,
-                        },
-                    },
-                    "execution": {
-                        "defaultAsync": agent.default_async,
-                        "timeoutMs": agent.default_timeout_ms,
-                    },
-                    "output": {
-                        "path": agent.output,
-                        "mode": agent.output_mode,
-                    },
-                    "extensions": {
-                        "names": agent.extensions,
-                        "subagentOnly": agent.subagent_only_extensions,
-                        "skills": agent.skills,
-                    },
-                });
-                if let Some(aliases) = &agent.aliases {
-                    record["aliases"] = json!(aliases);
-                }
-                record
-            })
-            .collect::<Vec<_>>(),
-        "restrictedCount": 0,
-    })
+    let (executable, restricted): (Vec<&AgentConfig>, Vec<&AgentConfig>) = sorted
+        .into_iter()
+        .partition(|agent| ceiling.is_none_or(|c| c.allows(&agent.name)));
+    let capability_row = |agent: &AgentConfig, is_executable: bool| {
+        let mut record = json!({
+            "name": agent.name,
+            "description": truncate_chars(&agent.description, 1000),
+            "source": agent.source_str(),
+            "executable": is_executable,
+            // `restrictionSources` rides RESTRICTED rows only (upstream
+            // `agentCapabilityRow`: `executable ? undefined : sources ?? []`).
+            "restrictionSources": if is_executable {
+                Value::Null
+            } else {
+                json!(ceiling.map(|c| c.sources.clone()).unwrap_or_default())
+            },
+            "tools": {
+                "tools": agent.tools,
+                "mcpDirectTools": agent.mcp_direct_tools,
+                "excludes": agent.exclude_tools,
+            },
+            // Upstream row shape: `model` carries value/thinking ONLY
+            // (the #2338 `allowedAgents` field is not part of the
+            // capability row — upstream destructures it away).
+            "model": {
+                "value": agent.model,
+                "thinking": match &agent.thinking {
+                    crate::agents::discover::ThinkingSpec::Level(level) => json!(level),
+                    crate::agents::discover::ThinkingSpec::Disabled => json!("off"),
+                    crate::agents::discover::ThinkingSpec::Unset => Value::Null,
+                },
+            },
+            "execution": {
+                "defaultAsync": agent.default_async,
+                "timeoutMs": agent.default_timeout_ms,
+            },
+            "output": {
+                "path": agent.output,
+                "mode": agent.output_mode,
+            },
+            "extensions": {
+                "names": agent.extensions,
+                "subagentOnly": agent.subagent_only_extensions,
+                "skills": agent.skills,
+            },
+        });
+        if let Some(aliases) = &agent.aliases {
+            record["aliases"] = json!(aliases);
+        }
+        record
+    };
+    let mut rows: Vec<Value> = executable
+        .iter()
+        .map(|agent| capability_row(agent, true))
+        .collect();
+    rows.extend(restricted.iter().map(|agent| capability_row(agent, false)));
+    let mut snapshot = json!({
+        "agents": rows,
+        "restrictedCount": restricted.len(),
+    });
+    if let Some(sources) = ceiling.map(|c| c.sources.clone()) {
+        if !sources.is_empty() {
+            snapshot["capabilityCeilingSources"] = json!(sources);
+        }
+    }
+    snapshot
 }
 
 /// Extra dependencies the P1 control actions need (async registry access).
@@ -407,7 +461,7 @@ fn handle_management_action_inner(
             let capability_mode = raw_params.get("capabilities") == Some(&Value::Bool(true));
             let session_ceiling = crate::launch::args::DescendantAllowlist::from_env();
             let mut text = if capability_mode {
-                format_agent_capabilities_list(&agents)
+                format_agent_capabilities_list(&agents, session_ceiling.as_ref())
             } else {
                 format_agent_list_with_ceiling(&agents, session_ceiling.as_ref())
             };
@@ -421,7 +475,7 @@ fn handle_management_action_inner(
                 details = json!({
                     "mode": "management",
                     "results": [],
-                    "agentCapabilities": agent_capabilities_snapshot(&agents),
+                    "agentCapabilities": agent_capabilities_snapshot(&agents, session_ceiling.as_ref()),
                 });
             }
             ToolOutcome {
@@ -2204,7 +2258,7 @@ mod tests {
     #[test]
     fn list_capabilities_mode_shapes() {
         let agents = crate::agents::builtin::load_builtin_agents(None);
-        let listing = format_agent_capabilities_list(&agents);
+        let listing = format_agent_capabilities_list(&agents, None);
         assert!(
             listing.starts_with("Executable agents (capabilities):"),
             "{}",
@@ -2223,19 +2277,81 @@ mod tests {
             listing
         );
         // Structured records: every builtin appears once with the stable fields.
-        let snapshot = agent_capabilities_snapshot(&agents);
+        let snapshot = agent_capabilities_snapshot(&agents, None);
         let records = snapshot["agents"].as_array().unwrap();
         assert_eq!(records.len(), agents.len());
         for record in records {
             assert!(record["name"].is_string());
             assert!(record["executable"].as_bool() == Some(true));
             assert!(record["tools"].is_object());
-            assert!(record["model"].is_object());
+            // Upstream row shape: `model` carries value/thinking ONLY.
+            assert!(record["model"].as_object().unwrap().contains_key("value"));
+            assert!(!record["model"]
+                .as_object()
+                .unwrap()
+                .contains_key("allowedAgents"));
             assert!(record["execution"].is_object());
             assert!(record["output"].is_object());
             assert!(record["extensions"].is_object());
         }
         assert_eq!(snapshot["restrictedCount"], json!(0));
+        // Acceptance wording: an acceptance ROLE reads `Acceptance role:`
+        // (upstream formatAcceptanceSummary).
+        if listing.contains("Acceptance") {
+            assert!(
+                listing.contains("Acceptance role:"),
+                "acceptance in capability rows must read `Acceptance role:`, got: {listing}"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_surface_partitions_the_ceiling() {
+        // #2338 regression: BOTH capability surfaces (text + snapshot)
+        // must partition non-allowlisted agents instead of reporting every
+        // agent as executable (the old snapshot hardcoded
+        // `executable: true` / `restrictedCount: 0`).
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        let survivor = names[0];
+        let ceiling = crate::launch::args::DescendantAllowlist {
+            allowed_agents: vec![survivor.to_string()],
+            sources: vec!["project .agents/agents.yaml".to_string()],
+        };
+        let listing = format_agent_capabilities_list(&agents, Some(&ceiling));
+        assert!(
+            listing.contains("Restricted agents (not executable in this session; capability ceiling: project .agents/agents.yaml):"),
+            "{}",
+            listing
+        );
+        let snapshot = agent_capabilities_snapshot(&agents, Some(&ceiling));
+        let records = snapshot["agents"].as_array().unwrap();
+        assert_eq!(records.len(), agents.len());
+        let restricted: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["executable"].as_bool() == Some(false))
+            .collect();
+        assert_eq!(restricted.len(), agents.len() - 1);
+        assert_eq!(snapshot["restrictedCount"], json!(agents.len() - 1));
+        assert_eq!(
+            snapshot["capabilityCeilingSources"],
+            json!(["project .agents/agents.yaml"])
+        );
+        for record in &restricted {
+            assert_eq!(
+                record["restrictionSources"],
+                json!(["project .agents/agents.yaml"]),
+                "restricted rows carry the ceiling sources"
+            );
+        }
+        // The survivor stays executable with no restriction sources.
+        let executable: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["executable"].as_bool() == Some(true))
+            .collect();
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0]["name"], json!(survivor));
+        assert!(executable[0]["restrictionSources"].is_null());
     }
 
     #[test]

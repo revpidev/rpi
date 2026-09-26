@@ -201,7 +201,6 @@ Direct settings example:
       "reviewer": {
         "model": "anthropic/claude-sonnet-4",
         "thinking": "high",
-        "fallbackModels": ["openai/gpt-5-mini"],
         "acceptanceRole": "read-only"
       }
     }
@@ -209,7 +208,7 @@ Direct settings example:
 }
 ```
 
-Useful override fields: `description`, `model`, `fallbackModels`, `thinking`,
+Useful override fields: `description`, `model`, `thinking`,
 `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`,
 `acceptanceRole`, `disabled`, `skills`, `tools`, `extensions`, and `systemPrompt`.
 `description` replaces the discovered description for builtin and custom agents
@@ -219,14 +218,11 @@ agent with the same name only when you want a substantially different agent.
 
 ### Recommended model tiering (optional)
 
-When several providers are available, route agents by task shape instead of one model for everything:
+Keep the parent/orchestrator on the ordinary strong default model because omission failures are cheaper than unnecessary commissions. Route workers and scouts to a fast, capable worker tier, and keep serious reviews on the strong reviewer tier at high thinking. Do not use `oracle` or a top-reasoning model as the routine fresh-review default. Use that tier only for bounded, read-only critic/oracle/root-cause audits after ordinary review, CI, bot, or source evidence is insufficient; critic-tier high thinking is escalation-only and never an autonomous root. Explicit parent/user model policy wins over these recommendations.
 
-1. **Fast workhorse** — cheapest capable model at low thinking for recon, lookups, and mechanical edits (for example on `scout`).
-2. **Standard well-scoped** — mid-tier model at medium thinking for most delegations: routine multi-file edits, focused reviews, straightforward implementation (for example on `worker`, `reviewer`, `delegate`).
-3. **Deep but bounded** — top reasoning model at high thinking only for hard tasks that arrive with explicit goals and completion criteria; these models loop on vague goals (for example on oracle-style agents).
-4. **Taste and intent** — a model that reads human intent well for ambiguous work: UX/design judgment, product tradeoffs, planning from vague requirements, writing quality.
+Examples are illustrative, not requirements. Map these tiers to concrete models in user/project settings or a profile. A non-OpenAI setup should choose comparable available models by capability.
 
-Routing rule: use tiers 1–3 when the task is well-scoped; use tier 4 when scoping or judging is the task itself. Give tier-4 agents cross-provider `fallbackModels` so subscription usage limits degrade gracefully; fallback triggers automatically on rate-limit and overload errors. Note that forked context over an Anthropic parent transcript with signed thinking blocks forces the child's thinking off, so intent-tier agents work best with fresh context.
+Each child launch uses one resolved model exactly once. If quota or availability fails, surface that failure and let the parent or operator explicitly launch a later attempt with another model. Forked children keep their requested thinking level even when provider-specific reasoning blocks are stripped from the inherited transcript.
 
 If a provider rejects model IDs with thinking suffixes, use
 `subagents.disableThinking: true` in user or project settings to clear bundled

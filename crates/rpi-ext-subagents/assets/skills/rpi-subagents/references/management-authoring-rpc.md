@@ -52,7 +52,6 @@ That is only a starting point. Omit `package` for the traditional unqualified ru
 - `defaultReads`
 - `output`
 - `aliases`
-- `fallbackModels`
 - `subagentOnlyExtensions`
 - `skills`
 - `skillPath`

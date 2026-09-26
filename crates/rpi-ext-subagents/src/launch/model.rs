@@ -1,5 +1,5 @@
-//! Model / thinking override resolution, fuzzy matching, fallback candidate
-//! chains and model-scope enforcement (FR-P1-05).
+//! Model / thinking override resolution, fuzzy matching, single-model
+//! candidate selection and model-scope enforcement (FR-P1-05).
 //!
 //! Port of pi-subagents `src/runs/shared/model-resolution.ts` (v0.70 @
 //! b72714de — the v0.66 `model-fallback.ts` home of these functions was
@@ -256,10 +256,10 @@ pub fn resolve_base_model_candidate(
 /// `resolveModelCandidate` (model-resolution.ts:189-205): resolve a possibly
 /// loose model id to canonical `provider/id`; exact registry matches win,
 /// thinking suffix is retried on the base when the whole id misses. The
-/// lenient variant (miss → verbatim passthrough) — kept as the semantic
-/// reference for the M3/TE19 model face (R7.1.10.2, modelExclusions);
-/// subagent launches use the strict/required variants above (#1093), and
-/// this function currently has no production caller (unit tests only).
+/// lenient variant (miss → verbatim passthrough) — retained for parity with
+/// the upstream lenient helper (unit tests only; subagent launches use the
+/// strict/required variants above, #1093) and currently has no production
+/// caller.
 #[allow(dead_code)]
 pub fn resolve_model_candidate(
     model: Option<&str>,
@@ -1187,8 +1187,8 @@ mod tests {
         )
         .unwrap();
         // Out-of-scope primary under an enforced (non-strict) scope is
-        // warned and kept — the pre-v0.70 fallback-chain behavior for
-        // entries, now applied to the single primary.
+        // warned and kept — the non-strict scope policy for entries,
+        // applied to the single primary.
         assert_eq!(candidates.len(), 1);
         assert_eq!(warnings.len(), 1);
     }

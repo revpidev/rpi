@@ -3053,7 +3053,7 @@ pub(crate) mod tests {
     #[test]
     fn record_step_result_persists_terminal_and_thinking() {
         // T-9 (R7.1.6.2): the effective thinking lands in the same batched
-        // write as status/exitCode/model/attemptedModels/error.
+        // write as status/exitCode/model/error.
         let handle = gate_test_handle("thinking");
         record_step_result(&handle, 0, &foreground_result(0, Some("high")));
         let status = status_snapshot(&handle);
