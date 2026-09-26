@@ -15,6 +15,7 @@
 ### RC verification fixes
 
 - **rc.2**: the rpiv-todo overlay never appeared in a real interactive session (the tool worked; the UI didn't) — the interactive mode attached the extension UI bridge after `bind_extensions`, so `session_start` fired with no UI and the plugin's overlay foreground claim never ran. Both boot and every session-switch rebind now attach the bridge first (upstream binds the two atomically); a real-mode boot e2e pins the ordering.
+- **rc.4**: Escape during streaming no longer crashes the `rpi-tui-driver` thread — the escape handler spawned the session abort with a bare `tokio::spawn` on the driver thread, which has no Tokio runtime (`there is no reactor running…`); both abort branches (and the same latent `/llama` search-debounce spawn) now route through the `spawn_async` fallback, pinned by runtime-less-thread regression tests.
 
 ### Pre-stable review fixes (shipped in v0.1.5-rc.3)
 
@@ -24,16 +25,16 @@
 - `mcp({ connect })` / `mcp({ search })` report `addedToolNames` at the tool-result top level (upstream shape; was nested under `details`; e2e-pinned).
 - Assorted repairs, each with a regression test unless noted: the encrypted-file OAuth key decoder fails closed on multi-byte UTF-8 (no panic); macOS Local Network Privacy diagnostics match the real Rust io error texts; the #536 broker-before-grant order is pinned; dead DCR registrations are cleared from the store (#503 gate + URL scoping unit-tested); `oauth.clientMetadataUrl` interpolates env vars (pinned); ask_user_question multi-select answers strip control characters; post-login default models match the regenerated catalog (zai/zai-coding-cn/cerebras/xai) and a test now pins every default against the catalog; the todo reducer compares JSON numbers numerically (`1` vs `1.0` is a no-op); `agent_capabilities` reports real `executable`/`restrictedCount`/`restrictionSources` under a capability ceiling; the Anthropic beta set rides the header only; the wasm SDK `unsubscribe` releases the state lock before the `off` host call (review-verified; no re-entrant-host harness yet); the subagents skill docs no longer teach the removed `fallbackModels` (asset-scan-pinned).
 
-### Pre-stable review fixes (round 2)
+### Pre-stable review fixes (round 2, shipped in v0.1.5-rc.4)
 
-- Overlay composition matches `applyModelsJson`: base-model `baseUrl`/`compat` mapping (radius oauth keeps the model gateway URLs), `config.models` upserts into the base catalog with `findModelDefaults` inheritance (the T10 subset replaced the base list), `modelOverrides` last, extension lists with the same defaults, and both overlay wrappers recompute per call so dynamic catalogs stay live; a configured `apiKey` is no longer dropped and the upstream structural validations apply.
+- Overlay composition matches `applyModelsJson`: base-model `baseUrl`/`compat` mapping (radius oauth keeps the model gateway URLs), `config.models` upserts into the base catalog with `findModelDefaults` inheritance (the T10 subset replaced the base list), `modelOverrides` last, extension lists with the same defaults, and both overlay wrappers recompute per call so dynamic catalogs stay live; a configured `apiKey` is no longer dropped, no longer erases the base OAuth method (stored OAuth credentials keep resolving), and the upstream structural validations apply; streaming follows `streamWith` (the base serves the apis it declares; every other model streams through that model's own api provider, unserved apis terminate with the upstream `No API provider registered` error).
 - The post-retry abort gate (`agent-session.ts:1239-1241`) and the in-loop abort break close the abort-during-backoff path that could still start a post-abort compaction.
 - MCP OAuth token exchange and refresh carry the origin-scoped service headers; `client_credentials` reads its stored registration URL-scoped, clears a token-less dead one, and forwards a live registration's DCR-issued secret; proxy argument validation runs before the approval gate; the CIMD + secret error uses the upstream literal.
 - Extension/RPC/TUI repairs: the SDK `toolExecute` route releases the state lock before running a tool handler (`subscribe`/`unsubscribe` no longer deadlock); the RPC fail-closed response carries the handler's message; the interactive `!` interception gains its regression harness; `SessionCompactFailedEvent` joins the exported hook types; `complete_summarization` uses `biased`; the auto-compaction catch classifies cancel races as aborted; cache-warming timers exit on `clear_run`; `sync_compaction_model` no longer silently no-ops under contention; deferred post-login re-selection checks the session identity; the WSL clipboard temp file is 0600 atomically; the editor CJK separator class is composed from the shared table; and the clipboard/WezTerm/subagents tests are hermetic against hostile host environments.
 
 ### Internal
 
-- workspace version bumped through 0.1.5-rc.1 → rc.2 → rc.3 with Cargo.lock synced each time; full gates zero failures (6863 cases at rc.3, after the pre-stable review batch).
+- workspace version bumped through 0.1.5-rc.1 → rc.2 → rc.3 → rc.4 with Cargo.lock synced each time; full gates zero failures (6863 cases at rc.3, after the pre-stable review batch; rc.4 re-ran the full gate after the round-2 batch and the driver-thread fix).
 - deviations D-101 (closed) / D-103 / D-104 / TE-D43 (promoted) all resolved; the rpi-pages registry six-plugin matrix and RC endpoints refreshed with this RC.
 
 ## [0.1.4] - 2026-09-18
