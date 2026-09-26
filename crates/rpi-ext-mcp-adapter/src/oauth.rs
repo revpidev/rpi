@@ -752,9 +752,10 @@ async fn authenticate_client_credentials(
     if config.client_id.is_none() {
         if let Some(entry) = store.get_for_url(server_name, server_url)? {
             if entry.client_info.is_some() && entry.tokens.is_none() {
-                // Upstream awaits `clearClientInfo` and propagates failures
-                // (mcp-auth-flow.ts:469-474): a silent failure would let the
-                // second read reuse the dead registration below.
+                // Upstream clears synchronously and lets store write
+                // failures propagate (mcp-auth-flow.ts:469-474): a silent
+                // failure would let the second read reuse the dead
+                // registration below.
                 store.clear_client_info(server_name)?;
             }
         }

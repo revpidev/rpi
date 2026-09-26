@@ -44,8 +44,9 @@ fixtures/
 > zero-regression red-line mission complete) and the pre-tag archived versions of
 > `fixtures/generated/mcp-parity/`, not deleted; driving the old tracks requires an old-pin worktree
 > (`git -C external/pi-subagents checkout 56f97234`, reset afterwards).
-> The mcp-side target-track record is `scripts/mcp-parity/TARGET-TRACK.md` (the re-record was completed by
-> TE23/TE24, with goldens snapshotted against v2.32.1/`7a7b01b`).
+> The mcp-side target-track record is `scripts/mcp-parity/TARGET-TRACK.md` (the v0.1.4-era re-record was completed by
+> TE23/TE24, with goldens snapshotted against v2.32.1/`7a7b01b`; the v0.1.5 target track was re-recorded @
+> `97435aab` with TE40 — see the same file).
 
 ## 2. Runbook (repeatable generation)
 
