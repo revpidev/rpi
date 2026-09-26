@@ -1009,18 +1009,54 @@ async fn dispatch(
             command: bash_command,
             exclude_from_context,
         } => {
-            let result = state
-                .session()
-                .execute_bash(
-                    &bash_command,
-                    crate::core::agent_session::ExecuteBashOptions {
-                        exclude_from_context: exclude_from_context.unwrap_or(false),
-                        id,
-                        on_chunk: None,
-                    },
-                )
-                .await
-                .map_err(|error| error_message(&error))?;
+            let exclude = exclude_from_context.unwrap_or(false);
+            let session = state.session();
+            // `user_bash` interception (interactive-mode.ts:6509-6524) —
+            // RPC parity with the interactive `!`/`!!` path: a full
+            // replacement result skips local execution entirely, and a
+            // handler error/invalid result **fails closed** (#9068,
+            // `509ee2bd0`) — the command is aborted and NEVER falls back to
+            // the local shell (the runner already reported the error through
+            // the extension error surface). Only `Ok(None)` continues to
+            // local execution.
+            let runner = session.extension_runner();
+            let result = if runner.has_handlers("user_bash") {
+                let cwd = session.cwd().to_owned();
+                match runner.emit_user_bash(&bash_command, exclude, &cwd).await {
+                    Ok(Some(replacement)) => {
+                        session.record_bash_result(&bash_command, &replacement, exclude);
+                        replacement
+                    }
+                    Ok(None) => session
+                        .execute_bash(
+                            &bash_command,
+                            crate::core::agent_session::ExecuteBashOptions {
+                                exclude_from_context: exclude,
+                                id,
+                                on_chunk: None,
+                            },
+                        )
+                        .await
+                        .map_err(|error| error_message(&error))?,
+                    Err(_) => {
+                        return Err("bash command aborted: the user_bash extension handler \
+                             failed or returned an invalid result (fail-closed, #9068)"
+                            .to_owned());
+                    }
+                }
+            } else {
+                session
+                    .execute_bash(
+                        &bash_command,
+                        crate::core::agent_session::ExecuteBashOptions {
+                            exclude_from_context: exclude,
+                            id,
+                            on_chunk: None,
+                        },
+                    )
+                    .await
+                    .map_err(|error| error_message(&error))?
+            };
             Ok(Some(bash_result_json(&result)))
         }
         RpcCommand::AbortBash { .. } => {
