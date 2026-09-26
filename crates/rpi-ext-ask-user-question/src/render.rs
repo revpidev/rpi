@@ -47,7 +47,7 @@
 //! All string inputs are model-authored and may arrive mid-stream, so
 //! every rendered string passes through [`sanitize_inline`]: line
 //! terminators and tabs collapse to spaces and the remaining C0 controls
-//! are dropped (single-line integrity for the summary line; the execute
+//! are replaced with a space (single-line integrity for the summary line; the execute
 //! path's full #192 normalization is unrelated and runs later).
 
 use serde_json::{json, Value};
@@ -228,8 +228,9 @@ fn parse_questions(args: &Value) -> Option<Vec<ParsedQuestion>> {
     )
 }
 
-/// Collapse line terminators/tabs to spaces and drop the remaining C0
-/// controls so a mid-stream `\r` can never fragment the rendered line
+/// Collapse line terminators/tabs to spaces and replace the remaining
+/// C0 controls with a space so a mid-stream `\r` can never fragment the
+/// rendered line
 /// (render runs before the execute path's #192 normalization).
 fn sanitize_inline(text: &str) -> String {
     text.chars()

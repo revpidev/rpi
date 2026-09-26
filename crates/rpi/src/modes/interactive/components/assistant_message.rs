@@ -951,7 +951,7 @@ mod tests {
             1,
             Vec::new(),
         );
-        // ~1 KB CJK per delta (24 lines x ~14 chars).
+        // ~600 B CJK per delta (24 lines x 8 chars + newlines).
         let delta_line = "思考推理内容测试行";
 
         let mut accumulated = String::new();

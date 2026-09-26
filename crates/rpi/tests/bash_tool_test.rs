@@ -651,7 +651,7 @@ mod bash_executor_tests {
         });
 
         let result = execute_bash(
-            "sleep 31415",
+            "sleep 30",
             std::path::Path::new("."),
             ops.as_ref(),
             BashExecutorOptions {
@@ -705,7 +705,7 @@ mod process_group_tests {
 
         let _ = ops
             .exec(
-                "sleep 31415",
+                "sleep 31416",
                 std::path::Path::new("."),
                 BashExecOptions {
                     signal: token,
@@ -716,7 +716,7 @@ mod process_group_tests {
             )
             .await;
 
-        // Check that no "sleep 31415" processes remain. The bracket pattern
+        // Check that no "sleep 31416" processes remain. The bracket pattern
         // `[s]leep 30` avoids matching this probe's own `sh -c` command line,
         // which literally contains the search string. Poll up to ~5s —
         // under full parallel test load, signal propagation and process
@@ -726,7 +726,7 @@ mod process_group_tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             let output = std::process::Command::new("sh")
                 .arg("-c")
-                .arg("pgrep -f '[s]leep 31415' || true")
+                .arg("pgrep -f '[s]leep 31416' || true")
                 .output()
                 .unwrap();
             let remaining = String::from_utf8_lossy(&output.stdout);
@@ -735,7 +735,7 @@ mod process_group_tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "no sleep 31415 processes should remain, found: {remaining}"
+                "no sleep 31416 processes should remain, found: {remaining}"
             );
         }
     }
