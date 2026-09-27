@@ -198,12 +198,26 @@ impl InteractiveUiBridge {
             WidgetContent::Lines(lines) => {
                 let mut column = rpi_tui::components::r#box::Box::new(0, 0, None);
                 for line in lines {
-                    column.add_child(Box::new(rpi_tui::components::text::Text::new(
-                        line.clone(),
-                        0,
-                        0,
-                        None,
-                    )));
+                    // A blank widget line must still occupy a row: `Text`
+                    // renders whitespace-only input as zero lines
+                    // ("Don't render anything if there's no actual text"),
+                    // which silently drops the row. Most visibly, the todo
+                    // overlay's trailing spacer (`withTrailingSpacer`)
+                    // exists to keep the panel off the editor's top
+                    // border; mounting it as `Text` glued the last "└─"
+                    // row straight onto the input box. Blank lines mount
+                    // as `Spacer(1)` so every array entry renders exactly
+                    // one row.
+                    if line.trim().is_empty() {
+                        column.add_child(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
+                    } else {
+                        column.add_child(Box::new(rpi_tui::components::text::Text::new(
+                            line.clone(),
+                            0,
+                            0,
+                            None,
+                        )));
+                    }
                 }
                 Box::new(column)
             }

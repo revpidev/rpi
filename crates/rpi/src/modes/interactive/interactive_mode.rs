@@ -9350,6 +9350,38 @@ mod tests {
         mode.shutdown().await;
     }
 
+    /// A blank line in a widget's line set must render as a blank row.
+    /// Extensions deliberately end their line sets with an empty string
+    /// (rpi-ext-todo's `withTrailingSpacer`) to keep the panel off the
+    /// editor's top border; `Text` renders whitespace-only input as zero
+    /// lines, so mounting blank lines as `Text` silently dropped the row
+    /// and glued the widget onto the input box.
+    #[tokio::test]
+    async fn w4_blank_widget_lines_render_as_rows() {
+        use rpi_ext_host::api::{UiBridge, WidgetContent};
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        let ui = &mode.ui_state;
+
+        bridge.set_widget(
+            "w1",
+            Some(WidgetContent::Lines(vec![
+                "ROW-A".to_owned(),
+                String::new(),
+            ])),
+            None,
+        );
+        let rendered = lock(&ui.widgets_above).render(80);
+        assert_eq!(rendered.len(), 3, "leading spacer + row + blank row");
+        assert!(
+            rpi_test_support::vt::strip_ansi(&rendered[1]).contains("ROW-A"),
+            "widget rendered: {rendered:?}"
+        );
+        assert_eq!(rendered[2].trim(), "", "trailing spacer row: {rendered:?}");
+        mode.shutdown().await;
+    }
+
     /// rpi#27: a same-key widget re-mount must keep the widget's slot among
     /// the container's children — upstream `Map.set` on an existing key
     /// keeps its insertion position, while the port's remove+append sank
