@@ -182,7 +182,7 @@ fn test_catalog_field_by_field_roundtrip() {
             total += 1;
         }
     }
-    assert_eq!(total, 1443);
+    assert_eq!(total, 1502);
 }
 
 /// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
@@ -229,10 +229,10 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-09-20T13:19:54.379Z); update on catalog refresh.
+    // (2026-09-23T13:54:06.091Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_789_910_394_379)
+        Some(1_790_171_646_091)
     );
 }
 

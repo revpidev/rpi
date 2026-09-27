@@ -111,7 +111,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://router.huggingface.co/v1",
         "Hugging Face token",
         "HF_TOKEN",
-        75, // rc.13 catalog refresh
+        76, // 19451accd rules regen (models.dev snapshot 2026-09-23)
     ),
     spec(
         nvidia_provider,
@@ -120,7 +120,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://integrate.api.nvidia.com/v1",
         "NVIDIA API key",
         "NVIDIA_API_KEY",
-        20,
+        19, // 19451accd rules regen (models.dev snapshot 2026-09-23)
     ),
     spec(
         together_provider,
@@ -138,7 +138,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.x.ai/v1",
         "xAI API key",
         "XAI_API_KEY",
-        3,
+        4, // 19451accd rules regen: +grok-4.7 (models.dev snapshot 2026-09-23)
     ),
     spec(
         xiaomi_provider,
@@ -147,7 +147,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.xiaomimimo.com/v1",
         "Xiaomi API key",
         "XIAOMI_API_KEY",
-        3,
+        6, // 19451accd rules regen: +mimo-v2.6 family (snapshot 2026-09-23)
     ),
     spec(
         xiaomi_token_plan_ams_provider,
@@ -156,7 +156,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-ams.xiaomimimo.com/v1",
         "Xiaomi Token Plan AMS API key",
         "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
-        2,
+        4, // 19451accd rules regen: +mimo-v2.6 family (snapshot 2026-09-23)
     ),
     spec(
         xiaomi_token_plan_cn_provider,
@@ -165,7 +165,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-cn.xiaomimimo.com/v1",
         "Xiaomi Token Plan CN API key",
         "XIAOMI_TOKEN_PLAN_CN_API_KEY",
-        2,
+        4, // 19451accd rules regen: +mimo-v2.6 family (snapshot 2026-09-23)
     ),
     spec(
         xiaomi_token_plan_sgp_provider,
@@ -174,7 +174,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-sgp.xiaomimimo.com/v1",
         "Xiaomi Token Plan SGP API key",
         "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
-        2,
+        4, // 19451accd rules regen: +mimo-v2.6 family (snapshot 2026-09-23)
     ),
 ];
 

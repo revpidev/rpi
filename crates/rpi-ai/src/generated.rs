@@ -203,8 +203,8 @@ mod tests {
             .map(|provider| catalog.models(provider).len())
             .sum();
         // Pin-aligned regen @ 19451accd rules (models.dev + Radius public
-        // catalog snapshot 2026-09-20; +radius +meta vs the rc.13 snapshot).
-        assert_eq!(total, 1443);
+        // catalog snapshot 2026-09-23; +radius +meta vs the rc.13 snapshot).
+        assert_eq!(total, 1502);
         // Radius ships its static public catalog since 4d38031fb; the
         // gateway overlay lives in `providers::radius`.
         assert!(catalog.providers().contains(&"radius"));
