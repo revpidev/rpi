@@ -31,10 +31,14 @@ PROVIDERS = [
     ("openai.json", "openai", "OpenAI", "OPENAI_API_KEY", None),
     ("deepseek.json", "deepseek", "DeepSeek", "DEEPSEEK_API_KEY", None),
     # xai.json carries both openai-completions (grok-4.3, grok-build) and
-    # openai-responses (grok-4.5) groups; models.json composes a single
-    # stream kind, so pick the responses group (flagship grok-4.5).
+    # openai-responses (grok-4.5+) groups; models.json composes a single
+    # stream kind, so pick the responses group (flagship grok line).
     ("xai.json", "xai", "xAI", "XAI_API_KEY", "openai-responses"),
-    ("openrouter.json", "openrouter", "OpenRouter", "OPENROUTER_API_KEY", None),
+    # openrouter.json split into openai-completions (the flagship general
+    # catalog, /v1 endpoint) and an anthropic-messages group that only
+    # routes the Claude line; models.json composes a single stream kind,
+    # so pick the general openai-completions group.
+    ("openrouter.json", "openrouter", "OpenRouter", "OPENROUTER_API_KEY", "openai-completions"),
     ("groq.json", "groq", "Groq", "GROQ_API_KEY", None),
     ("cerebras.json", "cerebras", "Cerebras", "CEREBRAS_API_KEY", None),
     ("moonshotai.json", "moonshotai", "Moonshot AI", "MOONSHOT_API_KEY", None),
