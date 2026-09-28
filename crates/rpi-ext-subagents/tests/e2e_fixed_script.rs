@@ -1749,6 +1749,141 @@ fn e2e_fixed_child_full_pipeline() {
         );
     }
 
+    // ---- #55 Scenario: intercom coordination detach on a supervisor ask
+    // ---- (issue #55: the blocking foreground run must detach, surface
+    // ---- the ask as a triggerTurn message, and deliver the completion
+    // ---- from the background continuation) ----------------------------
+    {
+        let dump = sandbox.dump("detach");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "slow");
+        std::env::set_var("RPI_E2E_SLOW_MS", "4000");
+        SENT_MESSAGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        SENT_MESSAGE_CALLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+
+        // Watcher: snapshot the existing scout channels, then wait for THIS
+        // run's NEW channel and drop a blocking need_decision ask into its
+        // requests inbox (mtime heuristics misfire when an earlier scenario's
+        // channel is still fresh — identity, not freshness).
+        let root = rpi_ext_subagents::test_support::supervisor_channels_root();
+        let existing: std::collections::HashSet<String> = std::fs::read_dir(&root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|name| name.ends_with("-scout-0"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ask_writer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                let Ok(entries) = std::fs::read_dir(&root) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if !name.ends_with("-scout-0") || existing.contains(&name) {
+                        continue;
+                    }
+                    let requests = entry.path().join("requests");
+                    if !requests.is_dir() {
+                        continue;
+                    }
+                    let _ = std::fs::write(
+                        requests.join("req-e2e.json"),
+                        json!({
+                            "type": "subagent.supervisor.request",
+                            "id": "req-e2e",
+                            "createdAt": "2026-09-29T00:00:01.000Z",
+                            "reason": "need_decision",
+                            "message": "Subagent needs a decision\nRun: e2e\nAgent: scout\nChild index: 0\n\nShip or hold?",
+                            "orchestratorSessionId": "",
+                            "runId": "e2e",
+                            "agent": "scout",
+                            "childIndex": 0,
+                        })
+                        .to_string(),
+                    );
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        });
+
+        let started = std::time::Instant::now();
+        let result = execute(json!({
+            "agent": "scout",
+            "task": "slow run that asks",
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        let elapsed = started.elapsed();
+        assert!(ask_writer.join().unwrap(), "watcher found the channel");
+        // Detached receipt — the dispatch returned BEFORE the 4s slow child
+        // finished (the wait loop's ask poll broke it out).
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Detached for intercom coordination"),
+            "{text}"
+        );
+        assert!(
+            elapsed.as_secs() < 4,
+            "dispatch returned before the child finished: {elapsed:?}"
+        );
+
+        // The ask surfaced as a triggerTurn session message with the reply
+        // hint naming the request id.
+        let calls_seen = SENT_MESSAGE_CALLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let ask_call = calls_seen
+            .iter()
+            .find(|args| args["message"]["customType"] == json!("subagent_supervisor_request"))
+            .expect("the ask surfaced as a session message");
+        assert_eq!(ask_call["options"]["triggerTurn"], json!(true));
+        let content = ask_call["message"]["content"].as_str().unwrap();
+        assert!(content.contains("Ship or hold?"), "{content}");
+        assert!(
+            content.contains(
+                "Reply with: subagent_supervisor({ action: \"reply\", replyTo: \"req-e2e\""
+            ),
+            "{content}"
+        );
+
+        // The detached continuation drives the child to completion: the
+        // subagent-notify session message lands after the 4s slow window.
+        let notify_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let messages = SENT_MESSAGES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if messages
+                .iter()
+                .any(|m| m["customType"] == json!("subagent-notify"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < notify_deadline,
+                "completion notify arrived from the detached continuation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        std::env::remove_var("RPI_E2E_SLOW_MS");
+        std::env::set_var("RPI_E2E_MODE", "ok");
+    }
+
     // Final sweep: nothing left running.
     assert!(
         assert_no_rpi_subagent_children(),

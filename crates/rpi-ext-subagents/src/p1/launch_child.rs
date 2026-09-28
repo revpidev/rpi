@@ -224,6 +224,12 @@ pub struct RunCtx {
     /// [`crate::runner::foreground::AbortProbe`]); `None` when there is no
     /// host channel or the context outlives its dispatch (async runs).
     pub abort_probe: Option<crate::runner::foreground::AbortProbe>,
+    /// #55 intercom detach context: Some only on the sync single dispatch
+    /// (the blocking face) — a child's blocking `contact_supervisor` ask
+    /// detaches the run instead of deadlocking the dispatch. Async paths
+    /// clear it (`clone_ctx_for_async`) — their idle parent wakes through
+    /// the fleet-loop ask delivery instead.
+    pub detach_ctx: Option<crate::runner::foreground::IntercomDetachContext>,
 }
 
 impl RunCtx {
@@ -315,6 +321,7 @@ impl RunCtx {
             frame_sink: None,
             step_status: None,
             abort_probe: None,
+            detach_ctx: None,
         }
     }
 
@@ -864,6 +871,9 @@ pub async fn run_child_async(
         .as_ref()
         .map(crate::p1::tool_budget::budget_to_env_value);
 
+    // #55: capture bridge activity before `supervisor_channel` moves into
+    // the input literal (the detach gate below only reads the flag).
+    let bridge_active = supervisor_channel.is_some();
     let input = ForegroundRunInput {
         agent_name: agent.name.clone(),
         agent_system_prompt: system_prompt,
@@ -905,6 +915,10 @@ pub async fn run_child_async(
         thinking_ceiling: thinking_ceiling.map(str::to_string),
         session_name: session_name.clone(),
         supervisor_channel,
+        // #55: detach only when the intercom bridge is active for this
+        // child (a channel exists — upstream `allowIntercomDetach` = the
+        // bridge marker in the child prompt) AND the dispatch asked for it.
+        intercom_detach: ctx.detach_ctx.clone().filter(|_| bridge_active),
         stream_sink: ctx.frame_sink.clone(),
         step_status: ctx.step_status.clone(),
         abort_probe: ctx.abort_probe.clone(),
@@ -1157,6 +1171,7 @@ mod te18_fork_tests {
             frame_sink: None,
             step_status: None,
             abort_probe: None,
+            detach_ctx: None,
         }
     }
 
@@ -1329,6 +1344,7 @@ mod te18_gate_budget_tests {
             frame_sink: None,
             step_status: None,
             abort_probe: None,
+            detach_ctx: None,
         };
         let agent = AgentConfig {
             name: "gater".to_string(),

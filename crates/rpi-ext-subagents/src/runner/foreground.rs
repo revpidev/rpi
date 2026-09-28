@@ -208,6 +208,19 @@ fn signal_pid(pid: u32, signal: Signal) {
     }
 }
 
+/// #55 intercom coordination detach context: host channel + orchestrator
+/// session identity for a foreground single run whose child may block on
+/// `contact_supervisor`. Present only on the sync single dispatch (async
+/// runs wake the idle parent through the fleet-loop ask delivery instead —
+/// `fleet::deliver_supervisor_asks`; composite sync paths do not detach,
+/// matching the observed upstream surface where the blocking face is the
+/// single delegation).
+#[derive(Clone)]
+pub struct IntercomDetachContext {
+    pub calls: crate::AsyncHostCalls,
+    pub session_id: String,
+}
+
 #[derive(Clone, Default)]
 pub struct ForegroundRunInput {
     pub agent_name: String,
@@ -269,6 +282,10 @@ pub struct ForegroundRunInput {
     pub session_name: Option<String>,
     /// Supervisor channel dir (FR-P1-10); None clears the env.
     pub supervisor_channel: Option<PathBuf>,
+    /// #55: when Some (sync single dispatch + active supervisor channel —
+    /// upstream `allowIntercomDetach` = the intercom bridge marker), a
+    /// blocking ask detaches this run instead of deadlocking the dispatch.
+    pub intercom_detach: Option<IntercomDetachContext>,
     /// Streaming frame sink (TE09 FR-A): every progress-bearing child event
     /// and each 1s activity tick pushes a `{mode:"single", ...}` snapshot
     /// (execution.ts fireUpdate). None = non-streaming run (no dispatch id).
@@ -299,6 +316,12 @@ pub struct ForegroundRunResult {
     pub duration_ms: u64,
     pub artifact_paths: Option<ArtifactPaths>,
     pub session_file: Option<PathBuf>,
+    /// #55: the dispatch returned early for intercom coordination — the
+    /// child keeps running under a background continuation and its result
+    /// arrives as a completion session message (upstream "detached"
+    /// receipt family).
+    pub detached: bool,
+    pub detach_reason: Option<String>,
     /// Raw assistant/toolResult messages from the child; P0 consumers are
     /// tests (details compact them away upstream).
     #[allow(dead_code)]
@@ -758,7 +781,23 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             signal_pid(child_pid, Signal::Kill);
         }
     };
-    let exit_status = if input.stream_sink.is_some() {
+    // #55: the intercom detach gate — only a bridged sync single dispatch
+    // scans for blocking asks while waiting (async children surface asks
+    // through the fleet loop; test fakes and detached continuations have
+    // no channel or host calls).
+    let ask_ready = input.supervisor_channel.is_some() && input.intercom_detach.is_some();
+    let pending_ask = |input: &ForegroundRunInput| {
+        if !ask_ready {
+            return None;
+        }
+        let channel = input.supervisor_channel.as_ref()?;
+        crate::p1::supervisor::first_blocking_ask_in(channel)
+    };
+    enum WaitOutcome {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Detached(Value),
+    }
+    let wait_outcome = if input.stream_sink.is_some() {
         let ticker_state = state.clone();
         let ticker_sink = input
             .stream_sink
@@ -774,12 +813,19 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         let mut child_guard = child_handle.lock().await;
         loop {
             tokio::select! {
-                status = child_guard.wait() => break status,
+                status = child_guard.wait() => break WaitOutcome::Exited(status),
                 _ = tick.tick() => {
                     if let Some(probe) = &input.abort_probe {
                         if probe() {
                             kill_child(&mut user_aborted);
                         }
+                    }
+                    // #55 intercom coordination (upstream execution.ts
+                    // :1054 arms detach on the contact_supervisor tool
+                    // start; rpi detects the persisted ask on the activity
+                    // tick — same 1s worst-case latency as the poller).
+                    if let Some(ask) = pending_ask(input) {
+                        break WaitOutcome::Detached(ask);
                     }
                     let now_ms = artifacts::now_millis();
                     // Build under the lock, push outside it (same discipline
@@ -807,12 +853,103 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                     kill_child(&mut user_aborted);
                 }
             }
+            if let Some(ask) = pending_ask(input) {
+                break WaitOutcome::Detached(ask);
+            }
             tokio::select! {
-                status = child_guard.wait() => break status,
+                status = child_guard.wait() => break WaitOutcome::Exited(status),
                 _ = tokio::time::sleep(Duration::from_millis(ABORT_POLL_MS)) => {
                     continue;
                 }
             }
+        }
+    };
+    let exit_status = match wait_outcome {
+        WaitOutcome::Exited(status) => status,
+        WaitOutcome::Detached(ask) => {
+            // #55 intercom coordination detach (upstream
+            // INTERCOM_DETACH_REQUEST_EVENT → detachForeground("intercom
+            // coordination"), execution.ts:614-660/750-770): free the
+            // blocked dispatch, keep the child alive under a background
+            // continuation, surface the ask to the parent session, and
+            // return a detached receipt. The queued `sendMessage` lands as
+            // the parent's next turn once this tool call returns.
+            let detach_ctx = input.intercom_detach.clone().expect("ask gated on detach");
+            send_supervisor_ask_message(&detach_ctx.calls, &ask);
+            let handle = crate::runner::background::register_detached_run(
+                &input.run_id,
+                Some(&detach_ctx.session_id),
+                &input.agent_name,
+            );
+            // Capacity: a best-effort slot so `maxActiveAsyncRunsPerSession`
+            // keeps counting the detached child — a full ledger must not
+            // veto the recovery detach (warning only, run unregistered in
+            // the ledger but visible in ASYNC_RUNS).
+            let ledger_session = if detach_ctx.session_id.is_empty() {
+                "no-session".to_string()
+            } else {
+                detach_ctx.session_id.clone()
+            };
+            let capacity = crate::runner::background::ActiveAsyncCapacity::open(&ledger_session);
+            let limit = crate::config::load_config()
+                .max_active_async_runs_per_session()
+                .unwrap_or(u64::MAX);
+            let slot = capacity.acquire(&input.run_id, limit).ok();
+            if slot.is_none() {
+                tracing::warn!(
+                    run = %input.run_id,
+                    "detached run skipped the active-async capacity slot (ledger full)"
+                );
+            }
+            let mut continuation_input = input.clone();
+            continuation_input.stream_sink = None;
+            continuation_input.step_status = None;
+            continuation_input.abort_probe = None;
+            let notify = crate::runner::background::AsyncNotify {
+                calls: Some(detach_ctx.calls),
+            };
+            let diagnostic_path = launch.tool_diagnostic_path.clone();
+            let temp_dir = launch.temp_dir.clone();
+            let continuation_start = start;
+            let stdout_task = stdout_task;
+            let stderr_task = stderr_task;
+            tokio::spawn(async move {
+                finish_detached_child(
+                    continuation_input,
+                    child_handle,
+                    state,
+                    raw_tail,
+                    stdout_task,
+                    stderr_task,
+                    timeout_task,
+                    drain_task,
+                    timed_out,
+                    stream_error,
+                    artifact_paths,
+                    diagnostic_path,
+                    temp_dir,
+                    child_id,
+                    child_pid,
+                    continuation_start,
+                    handle,
+                    notify,
+                    slot,
+                    ledger_session,
+                )
+                .await;
+            });
+            return ForegroundRunResult {
+                detached: true,
+                detach_reason: Some("intercom coordination".to_string()),
+                exit_code: 0,
+                error: None,
+                final_output: format!(
+                    "Detached for intercom coordination: the subagent asked for a supervisor decision (run {}). The run continues in the background; answer the supervisor request — the completion arrives as a session message.",
+                    input.run_id
+                ),
+                duration_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            };
         }
     };
     let mut stdout_task = Some(stdout_task);
@@ -869,6 +1006,149 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     result.artifact_paths = artifact_paths;
     result.session_file = input.session_file.clone();
     result
+}
+
+/// #55: surface one blocking ask to the parent session — the same
+/// `sendMessage` + `triggerTurn: true` shape the fleet-loop delivery uses
+/// (upstream `poll()` → `pi.sendMessage`, native-supervisor-channel.ts
+/// :745-764). Fired at detach time, the message queues behind the current
+/// (blocked) tool dispatch and triggers the parent's next turn as soon as
+/// the detached receipt returns.
+fn send_supervisor_ask_message(calls: &crate::AsyncHostCalls, ask: &Value) {
+    let request_id = ask["id"].as_str().unwrap_or("?");
+    let message = json!({
+        "customType": "subagent_supervisor_request",
+        "content": crate::p1::supervisor::request_visible_text(ask),
+        "display": true,
+        "details": {
+            "id": request_id,
+            "requestId": request_id,
+            "reason": ask["reason"].clone(),
+            "expectsReply": true,
+            "runId": ask["runId"].clone(),
+            "agent": ask["agent"].clone(),
+            "childIndex": ask["childIndex"].clone(),
+            "replyHint": crate::p1::supervisor::reply_hint(request_id),
+        },
+    });
+    let response = crate::host_call_static(
+        calls,
+        "sendMessage",
+        json!({ "message": message, "options": { "triggerTurn": true } }),
+    );
+    if response.get("error").is_some() {
+        // Upstream: a sendMessage failure must not lose the ask — the
+        // request file stays and `subagent_supervisor({action:"pending"})`
+        // still lists it.
+        tracing::warn!(
+            request = request_id,
+            "supervisor ask sendMessage rejected at detach"
+        );
+    }
+}
+
+/// #55: the detached-run continuation — the tail of `run_foreground` moved
+/// onto a background task (upstream's detached attempt keeps driving in the
+/// executor). Waits for the child (honoring the registered handle's stop
+/// flag), drains the pipes, synthesizes and persists the result, finishes
+/// the ASYNC_RUNS registration (completion `sendMessage`), and releases the
+/// capacity slot.
+#[allow(clippy::too_many_arguments)]
+async fn finish_detached_child(
+    input: ForegroundRunInput,
+    child_handle: Arc<tokio::sync::Mutex<Child>>,
+    state: Arc<Mutex<ChildRunState>>,
+    raw_tail: Arc<Mutex<BoundedByteTail>>,
+    stdout_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    timeout_task: tokio::task::JoinHandle<()>,
+    drain_task: tokio::task::JoinHandle<()>,
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
+    stream_error: Arc<Mutex<Option<String>>>,
+    artifact_paths: Option<ArtifactPaths>,
+    diagnostic_path: Option<PathBuf>,
+    temp_dir: PathBuf,
+    child_id: u64,
+    child_pid: u32,
+    started: std::time::Instant,
+    handle: Arc<crate::runner::background::AsyncRunHandle>,
+    notify: crate::runner::background::AsyncNotify,
+    slot: Option<PathBuf>,
+    ledger_session: String,
+) {
+    // Cooperative stop through `subagent({action:"stop"})`: the registered
+    // handle's control flag, drained on the abort-poll cadence (TERM →
+    // grace → KILL, the shutdown ladder shape).
+    let exit_status = {
+        let mut child_guard = child_handle.lock().await;
+        loop {
+            if handle.control.stop_requested() {
+                signal_pid(child_pid, Signal::Term);
+                tokio::time::sleep(Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS)).await;
+                signal_pid(child_pid, Signal::Kill);
+            }
+            tokio::select! {
+                status = child_guard.wait() => break status,
+                _ = tokio::time::sleep(Duration::from_millis(ABORT_POLL_MS)) => {
+                    continue;
+                }
+            }
+        }
+    };
+    // Post-exit drain (same shape as the foreground tail).
+    let mut stdout_task = Some(stdout_task);
+    let mut stderr_task = Some(stderr_task);
+    let drained = tokio::time::timeout(Duration::from_millis(POST_EXIT_DRAIN_HARD_MS), async {
+        if let Some(task) = stdout_task.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = stderr_task.take() {
+            let _ = task.await;
+        }
+    })
+    .await;
+    if drained.is_err() {
+        if let Some(task) = stdout_task.take() {
+            task.abort();
+        }
+        if let Some(task) = stderr_task.take() {
+            task.abort();
+        }
+    }
+    timeout_task.abort();
+    drain_task.abort();
+    unregister_child(child_id);
+    args::cleanup_temp_dir(&temp_dir);
+
+    let child_state = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let stream_error_text = stream_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let tool_diagnostic_error =
+        crate::diagnostic::read_child_tool_diagnostic_error(diagnostic_path.as_deref());
+    let raw_tail_text = raw_tail.lock().unwrap_or_else(|e| e.into_inner()).text();
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let mut result = synthesize_exit(
+        &input,
+        child_state,
+        exit_status,
+        timed_out.load(Ordering::SeqCst),
+        false,
+        stream_error_text.as_deref(),
+        tool_diagnostic_error.as_deref(),
+        raw_tail_text,
+        duration_ms,
+    );
+    if let Some(paths) = &artifact_paths {
+        persist_artifacts(&input, paths, &result, &input.task);
+    }
+    result.artifact_paths = artifact_paths;
+    result.session_file = input.session_file.clone();
+    crate::runner::background::finish_detached_with_result(&handle, &result, &notify).await;
+    if let Some(slot) = slot {
+        crate::runner::background::ActiveAsyncCapacity::open(&ledger_session).release(&slot);
+    }
 }
 
 /// V13-03 FR-A R1: event-path frame signature — the activity projection
@@ -1100,6 +1380,8 @@ fn synthesize_exit_from_parts(
     ForegroundRunResult {
         exit_code,
         error,
+        detached: false,
+        detach_reason: None,
         final_output: truncation.text,
         usage: state.usage_json(),
         model: state.model,
@@ -1125,6 +1407,8 @@ fn failed_result(
     ForegroundRunResult {
         exit_code: 1,
         error: Some(message),
+        detached: false,
+        detach_reason: None,
         final_output: String::new(),
         usage: events::json_usage(0, 0, 0, 0, 0.0, 0),
         model: None,
@@ -1217,6 +1501,7 @@ mod terminal_classification_tests {
 
     fn test_input() -> ForegroundRunInput {
         ForegroundRunInput {
+            intercom_detach: None,
             agent_name: "scout".to_string(),
             agent_system_prompt: String::new(),
             agent_system_prompt_mode: "replace",

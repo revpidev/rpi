@@ -1375,6 +1375,12 @@ pub mod test_support {
     /// (ADR-0021).
     pub use crate::prompts::install_orchestration_skill_at;
 
+    /// #55: the supervisor-channel root (intercom detach e2e — the watcher
+    /// thread drops a need_decision request into the child's channel).
+    pub fn supervisor_channels_root() -> std::path::PathBuf {
+        crate::p1::supervisor::channels_root()
+    }
+
     /// Thin wrapper over the session spawn-budget ledger.
     pub struct SpawnBudgetLedgerProbe {
         ledger: crate::runner::background::SpawnBudgetLedger,

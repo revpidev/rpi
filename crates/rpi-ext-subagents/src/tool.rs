@@ -358,6 +358,17 @@ fn execute_subagent_tool_inner(
     // Async paths clear it (clone_ctx_for_async) — background runs outlive
     // the dispatch that spawned them and must not die with its turn.
     ctx.abort_probe = tool_call_id.and_then(|id| host.abort_probe(id));
+    // #55: the sync single delegation is the blocking face — arm the
+    // intercom detach so a child's blocking `contact_supervisor` ask
+    // detaches the run instead of deadlocking the dispatch (async paths
+    // clear this in `clone_ctx_for_async`; composite sync paths do not
+    // arm it).
+    if let Some(calls) = host.async_calls() {
+        ctx.detach_ctx = Some(crate::runner::foreground::IntercomDetachContext {
+            calls,
+            session_id: ctx.parent_session_id.clone().unwrap_or_default(),
+        });
+    }
     let agents = match ctx.discover(scope) {
         Ok(agents) => agents,
         Err(error) => return ToolOutcome::error(error),
@@ -396,6 +407,25 @@ fn execute_subagent_tool_inner(
         Err(error) => return ToolOutcome::error(error),
     };
     let result = &outcome.result;
+
+    // #55: an intercom-coordination detach is not a terminal outcome — the
+    // child keeps running under the ASYNC_RUNS registration (status/wait/
+    // stop see it) and the completion arrives as a session message. The
+    // ask itself was already surfaced as a `triggerTurn` message at detach
+    // time, so the receipt only points at it.
+    if result.detached {
+        let details = assemble_single_details(&ctx, &spec, &agent, &outcome);
+        let reason = result.detach_reason.as_deref().unwrap_or("user request");
+        let text = format!(
+            "Detached for {reason} (run {}): the subagent asked for a supervisor decision and the run continues in the background. Answer the supervisor request (it arrived as a session message; `subagent_supervisor({{action:\"pending\"}})` re-lists it) — the completion arrives as a session message.",
+            ctx.run_id
+        );
+        return ToolOutcome {
+            text,
+            details,
+            is_error: false,
+        };
+    }
 
     let details = assemble_single_details(&ctx, &spec, &agent, &outcome);
 
@@ -927,7 +957,7 @@ fn dispatch_async(
     // refresh loop right after the first run registers (no-op while one is
     // alive; it exits on the empty snapshot and respawns here).
     if let Some(calls) = host.async_calls() {
-        crate::fleet::ensure_refresh_loop(runtime, calls);
+        crate::fleet::ensure_refresh_loop(runtime, calls, session_id.clone());
     }
     let notify = crate::runner::background::AsyncNotify {
         calls: host.async_calls(),
@@ -962,6 +992,9 @@ fn clone_ctx_for_async(ctx: &crate::p1::launch_child::RunCtx) -> crate::p1::laun
     let mut clone = ctx.clone();
     clone.frame_sink = None;
     clone.abort_probe = None;
+    // #55: async children never detach on asks — their parent is idle
+    // between turns and wakes through the fleet-loop ask delivery.
+    clone.detach_ctx = None;
     clone
 }
 
@@ -1072,6 +1105,7 @@ mod tests {
             .output()
             .expect("git");
         let ctx = crate::p1::launch_child::RunCtx {
+            detach_ctx: None,
             settings: Default::default(),
             config: Default::default(),
             base_cwd: repo.clone(),

@@ -1,1 +1,1 @@
-Fixed child result: analysis complete
+Detached for intercom coordination: the subagent asked for a supervisor decision (run 6a68080e). The run continues in the background; answer the supervisor request — the completion arrives as a session message.

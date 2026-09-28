@@ -816,6 +816,74 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
     handle
 }
 
+/// #55 foreground detach registration: a blocking supervisor ask detached
+/// a foreground single run — register it in `ASYNC_RUNS` so `status`,
+/// `wait`, the fleet strip, and `stop` see the still-running child (upstream
+/// detaches the blocking attempt into a background job; the rpi
+/// continuation task in `runner/foreground.rs` drives it to a terminal
+/// state through the normal `finish` path). Mirrors `start_run`'s layout:
+/// private run dir, 0700, `run.detached` event, single running step.
+pub fn register_detached_run(
+    run_id: &str,
+    session_id: Option<&str>,
+    agent_name: &str,
+) -> Arc<AsyncRunHandle> {
+    let run_dir = async_runs_dir().join(run_id);
+    let _ = crate::paths::create_private_dir_all(&run_dir);
+    let _ = std::fs::create_dir_all(run_dir.join("control"));
+    let status = Arc::new(RwLock::new(json!({
+        "runId": run_id,
+        "sessionId": session_id,
+        "mode": "single",
+        "state": STATE_RUNNING,
+        "detached": true,
+        "detachReason": "intercom coordination",
+        "createdAt": iso8601(now_millis()),
+        "updatedAt": iso8601(now_millis()),
+        "ownerPid": std::process::id(),
+        "ownerBootId": process_boot_id(std::process::id() as u64),
+        "steps": [json!({ "agent": agent_name, "status": "running" })],
+    })));
+    let handle = Arc::new(AsyncRunHandle {
+        run_id: run_id.to_string(),
+        status,
+        control: Arc::new(AsyncControl::default()),
+        run_dir,
+        started_ms: now_millis(),
+        status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+        pending_status_write_failure: std::sync::Mutex::new(None),
+    });
+    append_event(
+        handle.run_dir.as_path(),
+        "run.detached",
+        json!({
+            "runId": run_id,
+            "reason": "intercom coordination",
+        }),
+    );
+    register_run(handle.clone());
+    handle
+}
+
+/// #55: terminal projection for a detached foreground run — the
+/// continuation task's single seam (step terminal via `record_step_result`,
+/// then the shared `finish`: run state transition, result file,
+/// completion `sendMessage`, prune). Mirrors the async single path's
+/// `record_step_result` + `finish` pair.
+pub(crate) async fn finish_detached_with_result(
+    handle: &Arc<AsyncRunHandle>,
+    result: &crate::runner::foreground::ForegroundRunResult,
+    notify: &AsyncNotify,
+) {
+    record_step_result(handle, 0, result);
+    let state = if result.exit_code == 0 {
+        STATE_COMPLETE
+    } else {
+        STATE_FAILED
+    };
+    finish(handle, state, &result.final_output, notify).await;
+}
+
 /// Drive one async run to a terminal state. Called as a spawned runtime
 /// task; performs the composite body, updates the status document, writes the
 /// result file, notifies the parent session via `sendMessage`, and emits the
@@ -3034,6 +3102,8 @@ pub(crate) mod tests {
         crate::runner::foreground::ForegroundRunResult {
             exit_code,
             error: (exit_code != 0).then(|| "boom".to_string()),
+            detached: false,
+            detach_reason: None,
             final_output: "out".to_string(),
             usage: json!({}),
             model: Some("faux/1".to_string()),

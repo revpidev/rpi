@@ -200,9 +200,13 @@ impl ChildSupervisorContext {
         });
         // progress_update (L265-270 + 3d78e6ec at v0.70): non-blocking note —
         // upstream writes then deletes it on the watcher read so it never
-        // reaches the parent; rpi has no watcher, so the write is skipped
-        // outright (identical net semantics: no parent turn, no pending
-        // entry, no channel litter).
+        // reaches the parent; rpi's parent-side ask delivery (fleet loop +
+        // foreground detach) only surfaces reply-expecting requests, so the
+        // write is skipped outright (identical net semantics for progress
+        // notes: no parent turn, no pending entry, no channel litter).
+        // need_decision / interview_request DO reach the parent — see
+        // `blocking_requests_for_session` (async wake) and the foreground
+        // detach path in `runner/foreground.rs` (issue #55).
         if reason == "progress_update" {
             return ok_result("Progress update delivered.");
         }
@@ -357,6 +361,64 @@ pub fn has_pending_blocking_requests(orchestrator_session_id: &str) -> bool {
         }
     }
     false
+}
+
+/// Blocking asks owned by this orchestrator session across every channel
+/// (upstream `refreshPendingRequests` + `requestMatchesOwner` projection
+/// for delivery): reply-expecting requests only, oldest first. This is
+/// the async-run wake seam — the fleet refresh loop scans it every tick
+/// and `sendMessage`s each new ask into the parent session with
+/// `triggerTurn: true` (native-supervisor-channel.ts `poll()`, L706-757;
+/// issue #55: the port originally dropped this entire delivery face, so
+/// an idle parent never learned about a blocked child).
+pub fn blocking_requests_for_session(session_id: &str) -> Vec<Value> {
+    let root = channels_root();
+    let mut asks = Vec::new();
+    let Ok(channel_entries) = std::fs::read_dir(&root) else {
+        return asks;
+    };
+    for channel in channel_entries.flatten() {
+        for request in read_requests(&channel.path()) {
+            let blocking = request["reason"].as_str() == Some("need_decision")
+                || request["reason"].as_str() == Some("interview_request");
+            if blocking && request_matches_session(&request, session_id) {
+                asks.push(request);
+            }
+        }
+    }
+    asks.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
+    asks
+}
+
+/// The first unanswered blocking ask in one child's channel (the
+/// foreground detach watcher's scan — the channel is per-child, so no
+/// session or run filtering applies; the reply path still enforces
+/// session ownership).
+pub fn first_blocking_ask_in(channel_dir: &Path) -> Option<Value> {
+    let mut requests = read_requests(channel_dir);
+    requests.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
+    requests.into_iter().find(|request| {
+        request["reason"].as_str() == Some("need_decision")
+            || request["reason"].as_str() == Some("interview_request")
+    })
+}
+
+/// `supervisorReplyHint` (supervisor-ui.ts:50-52): the exact call shape the
+/// parent should make to answer.
+pub fn reply_hint(request_id: &str) -> String {
+    format!(
+        "subagent_supervisor({{ action: \"reply\", replyTo: \"{request_id}\", message: \"...\" }})"
+    )
+}
+
+/// `requestVisibleText` (supervisor-ui.ts:493-510): the child's formatted
+/// message (title + run/agent/child context + body — the child wrote it
+/// via `format_child_message`) plus the reply instruction. This is the
+/// `sendMessage` content the parent model reads.
+pub fn request_visible_text(request: &Value) -> String {
+    let body = request["message"].as_str().unwrap_or("");
+    let request_id = request["id"].as_str().unwrap_or("?");
+    format!("{body}\n\nReply with: {}", reply_hint(request_id))
 }
 
 /// Parent-side `subagent_supervisor` ({action: pending|reply}) —
@@ -585,6 +647,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&channel);
         assert!(!has_pending_blocking_requests("session-mid"));
         assert!(pending_asks("runz", 0).is_empty());
+        let _ = std::fs::remove_dir_all(&channel);
+    }
+
+    /// Best-effort sweep of same-prefix test channels (self-cleaning
+    /// tests: the projection reads the whole root).
+    fn sweep_channel_prefix(prefix: &str) {
+        let root = channels_root();
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(prefix) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    /// #55 delivery seam: `blocking_requests_for_session` projects only
+    /// reply-expecting requests owned by the session, oldest first;
+    /// `request_visible_text` carries the reply hint with the request id.
+    /// Channels sit directly under the global root (the scan is one level
+    /// deep, matching production layout).
+    #[test]
+    fn session_ask_projection_and_visible_text() {
+        // Random suffix + prefix sweep: the scan reads every channel
+        // under the root, so a failed earlier run must not leave a twin
+        // channel behind (the global root also accumulates unrelated
+        // leftovers — upstream's stale-channel cleanup is not ported).
+        let suffix = crate::runner::budget::random_run_id();
+        sweep_channel_prefix("runq-worker-0-askproj-");
+        let channel = channels_root().join(format!("runq-worker-0-askproj-{suffix}"));
+        let _ = std::fs::remove_dir_all(&channel);
+        ensure_channel(&channel);
+        let base = |id: &str, reason: &str, created: &str, session: &str| {
+            json!({
+                "type": "subagent.supervisor.request",
+                "id": id,
+                "createdAt": created,
+                "reason": reason,
+                "message": format!("Subagent needs a decision\nRun: runq\nAgent: worker\nChild index: 0\n\nShip or hold? ({id})"),
+                "orchestratorSessionId": session,
+                "runId": "runq",
+                "agent": "worker",
+                "childIndex": 0,
+            })
+        };
+        for (name, reason, created, session) in [
+            (
+                "late",
+                "need_decision",
+                "2026-09-29T00:00:02.000Z",
+                "session-a",
+            ),
+            (
+                "early",
+                "need_decision",
+                "2026-09-29T00:00:01.000Z",
+                "session-a",
+            ),
+            (
+                "note",
+                "progress_update",
+                "2026-09-29T00:00:00.000Z",
+                "session-a",
+            ),
+            (
+                "foreign",
+                "need_decision",
+                "2026-09-29T00:00:00.500Z",
+                "session-b",
+            ),
+        ] {
+            std::fs::write(
+                channel.join("requests").join(format!("{name}.json")),
+                base(name, reason, created, session).to_string(),
+            )
+            .unwrap();
+        }
+
+        // Blocking-only + session-owned + oldest-first ordering.
+        let asks = blocking_requests_for_session("session-a");
+        let ids: Vec<&str> = asks.iter().filter_map(|a| a["id"].as_str()).collect();
+        assert_eq!(ids, vec!["early", "late"], "{ids:?}");
+        // Cross-session isolation: session-b sees only its own ask.
+        let foreign = blocking_requests_for_session("session-b");
+        let foreign_ids: Vec<&str> = foreign.iter().filter_map(|a| a["id"].as_str()).collect();
+        assert_eq!(foreign_ids, vec!["foreign"], "{foreign_ids:?}");
+
+        // Visible text: child-formatted body + the reply hint naming the id.
+        let text = request_visible_text(&asks[0]);
+        assert!(text.contains("Subagent needs a decision"), "{text}");
+        assert!(text.contains("Ship or hold? (early)"), "{text}");
+        assert!(
+            text.contains(
+                "Reply with: subagent_supervisor({ action: \"reply\", replyTo: \"early\""
+            ),
+            "{text}"
+        );
+
+        // Single-channel watcher scan: the earliest blocking ask in the
+        // channel regardless of owning session (per-child channel; the
+        // reply path enforces session ownership) — 00:00:00.500 "foreign"
+        // precedes "early"; the progress note is never a candidate.
+        let first = first_blocking_ask_in(&channel).unwrap();
+        assert_eq!(first["id"], json!("foreign"));
         let _ = std::fs::remove_dir_all(&channel);
     }
 

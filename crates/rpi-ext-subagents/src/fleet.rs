@@ -357,24 +357,44 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
 
 /// Spawn the singleton refresh task if none is alive (the async-run 0→1
 /// boundary; `dispatch_async` calls this right after `start_run`).
-pub fn ensure_refresh_loop(runtime: &PluginRuntime, calls: AsyncHostCalls) {
+/// Spawn the singleton refresh task if none is alive (the async-run 0→1
+/// boundary; `dispatch_async` calls this right after `start_run`).
+/// `session_id` scopes the #55 supervisor-ask delivery: only asks owned by
+/// this orchestrator session are surfaced (upstream `requestMatchesOwner`).
+pub fn ensure_refresh_loop(
+    runtime: &PluginRuntime,
+    calls: AsyncHostCalls,
+    session_id: Option<String>,
+) {
     if FLEET_LOOP_RUNNING.swap(true, Ordering::SeqCst) {
         return; // already ticking
     }
     runtime.spawn(async move {
-        fleet_refresh_loop(calls).await;
+        fleet_refresh_loop(calls, session_id).await;
     });
 }
 
-async fn fleet_refresh_loop(calls: AsyncHostCalls) {
+async fn fleet_refresh_loop(calls: AsyncHostCalls, session_id: Option<String>) {
     let mut linger: HashMap<String, (u64, u64)> = HashMap::new();
     let mut last_key = String::new();
     let mut mounted = false;
+    let mut delivered_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
     let fleet_enabled = config::load_config().fleet_enabled();
     let fleet_expanded = config::load_config().fleet_expanded();
     loop {
         tokio::time::sleep(Duration::from_millis(REFRESH_MS)).await;
         let now = now_millis();
+        // #55 supervisor-ask delivery (upstream `poll()` — the wake face the
+        // port originally dropped): every tick, surface session-owned
+        // blocking asks the parent has not seen yet as a `triggerTurn`
+        // message. Runs BEFORE the empty-snapshot break — the fleet strip
+        // and the ask scan share the same transport-demand window (asks
+        // exist only while children run, and children register here).
+        deliver_supervisor_asks(
+            &calls,
+            session_id.as_deref().unwrap_or(""),
+            &mut delivered_asks,
+        );
         let snapshot = capture_fleet(now, &mut linger);
         if snapshot.is_empty() {
             if mounted {
@@ -401,6 +421,61 @@ async fn fleet_refresh_loop(calls: AsyncHostCalls) {
         }
     }
     FLEET_LOOP_RUNNING.store(false, Ordering::SeqCst);
+}
+
+/// #55 (issue #55 / upstream native-supervisor-channel.ts `poll()`
+/// L706-757, the reply-expecting branch): one new session-owned blocking
+/// ask → one `sendMessage` with `triggerTurn: true`. Dedup keeps the 500 ms
+/// tick from re-sending; a request stays redeliverable until the parent
+/// replies (the reply removes the request file) or the child times out —
+/// on a host error the id is NOT marked delivered, so the next tick
+/// retries (upstream: a sendMessage failure must not lose the ask — the
+/// pending map keeps it and `subagent_supervisor({action:"pending"})`
+/// still lists it).
+pub fn deliver_supervisor_asks(
+    calls: &AsyncHostCalls,
+    session_id: &str,
+    delivered: &mut std::collections::HashSet<String>,
+) {
+    if session_id.is_empty() {
+        return;
+    }
+    for ask in crate::p1::supervisor::blocking_requests_for_session(session_id) {
+        let Some(request_id) = ask["id"].as_str() else {
+            continue;
+        };
+        if delivered.contains(request_id) {
+            continue;
+        }
+        let message = json!({
+            "customType": "subagent_supervisor_request",
+            "content": crate::p1::supervisor::request_visible_text(&ask),
+            "display": true,
+            "details": {
+                "id": request_id,
+                "requestId": request_id,
+                "reason": ask["reason"].clone(),
+                "expectsReply": true,
+                "runId": ask["runId"].clone(),
+                "agent": ask["agent"].clone(),
+                "childIndex": ask["childIndex"].clone(),
+                "replyHint": crate::p1::supervisor::reply_hint(request_id),
+            },
+        });
+        let response = host_call_static(
+            calls,
+            "sendMessage",
+            json!({ "message": message, "options": { "triggerTurn": true } }),
+        );
+        if response.get("error").is_some() {
+            tracing::warn!(
+                request = request_id,
+                "supervisor ask delivery rejected; retrying next tick"
+            );
+            continue;
+        }
+        delivered.insert(request_id.to_string());
+    }
 }
 
 /// `ui.setWidget` push (Component form) or removal (`Value::Null`).
@@ -672,6 +747,91 @@ mod tests {
     /// End-to-end probe of the refresh loop itself: a stub host channel
     /// records `ui.setWidget` calls; a running run pushes the strip, its
     /// terminal transition (linger 0) removes it and exits the loop.
+    fn sweep_fleet_ask_channels() {
+        let root = crate::p1::supervisor::channels_root();
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("runf-worker-0-fleetask-") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    /// #55: the refresh loop's ask-delivery seam sends exactly one
+    /// `triggerTurn` message per new session-owned blocking ask and
+    /// dedupes across ticks; a foreign-session ask never surfaces.
+    #[test]
+    fn ask_delivery_sends_once_and_dedupes() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::Mutex;
+        static SENT: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+        extern "C" fn stub_call(
+            _cookie: rpi_ext_host::native::PluginCookie,
+            request: abi_stable::std_types::RVec<u8>,
+        ) -> abi_stable::std_types::RVec<u8> {
+            let parsed: Value = serde_json::from_slice(&request[..]).unwrap_or(Value::Null);
+            if parsed["call"] == json!("sendMessage") {
+                SENT.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(parsed["args"].clone());
+            }
+            abi_stable::std_types::RVec::from(
+                serde_json::to_vec(&json!({"ok": true})).unwrap_or_default(),
+            )
+        }
+
+        let suffix = std::process::id();
+        sweep_fleet_ask_channels();
+        let channel =
+            crate::p1::supervisor::channels_root().join(format!("runf-worker-0-fleetask-{suffix}"));
+        let _ = std::fs::remove_dir_all(&channel);
+        crate::p1::supervisor::ensure_channel(&channel);
+        let request = json!({
+            "type": "subagent.supervisor.request",
+            "id": "req-fleet",
+            "createdAt": "2026-09-29T00:00:01.000Z",
+            "reason": "need_decision",
+            "message": "Subagent needs a decision\nRun: runf\nAgent: worker\nChild index: 0\n\nShip or hold?",
+            "orchestratorSessionId": "session-fleet",
+            "runId": "runf",
+            "agent": "worker",
+            "childIndex": 0,
+        });
+        std::fs::write(
+            channel.join("requests").join("req-fleet.json"),
+            request.to_string(),
+        )
+        .unwrap();
+
+        let calls = crate::AsyncHostCalls {
+            call: stub_call,
+            cookie: 0,
+        };
+        let mut delivered = std::collections::HashSet::new();
+        deliver_supervisor_asks(&calls, "session-fleet", &mut delivered);
+        deliver_supervisor_asks(&calls, "session-fleet", &mut delivered);
+        deliver_supervisor_asks(&calls, "session-other", &mut delivered);
+
+        let sent = SENT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(sent.len(), 1, "one message despite repeated ticks");
+        let args = &sent[0];
+        assert_eq!(args["options"]["triggerTurn"], json!(true));
+        let message = &args["message"];
+        assert_eq!(message["customType"], json!("subagent_supervisor_request"));
+        assert_eq!(message["display"], json!(true));
+        let content = message["content"].as_str().unwrap();
+        assert!(content.contains("Subagent needs a decision"));
+        assert!(content.contains(
+            "Reply with: subagent_supervisor({ action: \"reply\", replyTo: \"req-fleet\""
+        ));
+        assert_eq!(message["details"]["requestId"], json!("req-fleet"));
+        assert_eq!(message["details"]["runId"], json!("runf"));
+        let _ = std::fs::remove_dir_all(&channel);
+    }
+
     #[test]
     fn refresh_loop_pushes_then_removes_on_empty() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -709,7 +869,7 @@ mod tests {
             "steps": [{"agent": "researcher", "status": "running"}],
         });
         let handle = spawn_test_handle("fleet-loop-t1", running_status, now_millis());
-        ensure_refresh_loop(&runtime, calls);
+        ensure_refresh_loop(&runtime, calls, None);
 
         // Within a few ticks the strip pushes with content.
         let mut pushed = false;
