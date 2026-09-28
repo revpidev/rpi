@@ -17,6 +17,7 @@
 - **rc.2**: the rpiv-todo overlay never appeared in a real interactive session (the tool worked; the UI didn't) — the interactive mode attached the extension UI bridge after `bind_extensions`, so `session_start` fired with no UI and the plugin's overlay foreground claim never ran. Both boot and every session-switch rebind now attach the bridge first (upstream binds the two atomically); a real-mode boot e2e pins the ordering.
 - **rc.4**: Escape during streaming no longer crashes the `rpi-tui-driver` thread — the escape handler spawned the session abort with a bare `tokio::spawn` on the driver thread, which has no Tokio runtime (`there is no reactor running…`); both abort branches (and the same latent `/llama` search-debounce spawn) now route through the `spawn_async` fallback, pinned by runtime-less-thread regression tests.
 - **rc.5**: blank widget lines render as spacer rows — the widget dock mounted every `setWidget` line as `Text`, which renders whitespace-only input as zero lines, silently swallowing `rpiv-todo`'s deliberate trailing spacer (`withTrailingSpacer`) and gluing the panel onto the editor's top border; blank lines now mount as `Spacer(1)` (every array entry renders exactly one row), pinned by `w4_blank_widget_lines_render_as_rows`.
+- **rc.6**: supervisor asks reach the parent again (issue #55) — `contact_supervisor({reason: "need_decision"})` never surfaced to the parent session because the port dropped upstream's channel-poller delivery face; async children burned the 10-minute reply timeout unseen and foreground single runs deadlocked the dispatch. The fleet refresh loop now delivers one `triggerTurn` message per new session-owned blocking ask (with the `Reply with:` hint), and the foreground wait loop detaches on an ask — receipt returned, run registered in the async registry, completion delivered by a background continuation through the shared finish path.
 
 ### Pre-stable review fixes (shipped in v0.1.5-rc.3)
 
@@ -35,7 +36,7 @@
 
 ### Internal
 
-- workspace version bumped through 0.1.5-rc.1 → rc.2 → rc.3 → rc.4 → rc.5 with Cargo.lock synced each time; full gates zero failures (6863 cases at rc.3, after the pre-stable review batch; rc.4 re-ran the full gate after the round-2 batch and the driver-thread fix; rc.5 re-ran the workspace gate after the widget-spacer fix, the 2026-09-23 catalog re-vendor, and the template-generator repair).
+- workspace version bumped through 0.1.5-rc.1 → rc.2 → rc.3 → rc.4 → rc.5 → rc.6 with Cargo.lock synced each time; full gates zero failures (6863 cases at rc.3, after the pre-stable review batch; rc.4 re-ran the full gate after the round-2 batch and the driver-thread fix; rc.5 re-ran the workspace gate after the widget-spacer fix, the 2026-09-23 catalog re-vendor, and the template-generator repair; rc.6 re-ran the subagents gate after the supervisor-ask delivery fix, issue #55).
 - deviations D-101 (closed) / D-103 / D-104 / TE-D43 (promoted) all resolved; the rpi-pages registry six-plugin matrix and RC endpoints refreshed with this RC.
 
 ## [0.1.4] - 2026-09-18
