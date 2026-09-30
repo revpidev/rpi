@@ -978,6 +978,50 @@ fn merge_compat(base: Option<&ModelCompat>, override_: &ModelCompat) -> ModelCom
     serde_json::from_value(serde_json::Value::Object(merged)).unwrap_or_else(|_| override_.clone())
 }
 
+/// `mergeInputLimits` (provider-composer.ts:110-130, #9631): override wins
+/// at the top level, `images` merges structurally, and `resize` merges
+/// key-wise — absent override keys keep the catalog value.
+fn merge_input_limits(
+    base: Option<&rpi_ai::types::ModelInputLimits>,
+    override_: &rpi_ai::types::ModelInputLimits,
+) -> rpi_ai::types::ModelInputLimits {
+    let images = match &override_.images {
+        Some(override_images) => {
+            let base_images = base.and_then(|limits| limits.images);
+            let resize = match &override_images.resize {
+                Some(override_resize) => match base_images.and_then(|images| images.resize) {
+                    Some(base_resize) => Some(rpi_ai::types::ModelImageResizeOptions {
+                        max_width: override_resize.max_width.or(base_resize.max_width),
+                        max_height: override_resize.max_height.or(base_resize.max_height),
+                        max_bytes: override_resize.max_bytes.or(base_resize.max_bytes),
+                        jpeg_quality: override_resize.jpeg_quality.or(base_resize.jpeg_quality),
+                    }),
+                    None => Some(*override_resize),
+                },
+                // No override resize: keep the catalog resize untouched.
+                None => base_images.and_then(|images| images.resize),
+            };
+            Some(rpi_ai::types::ModelImageInputLimits {
+                max_per_message: override_images
+                    .max_per_message
+                    .or(base_images.and_then(|images| images.max_per_message)),
+                max_per_request: override_images
+                    .max_per_request
+                    .or(base_images.and_then(|images| images.max_per_request)),
+                resize,
+            })
+        }
+        // No override images: keep the catalog images untouched.
+        None => base.and_then(|limits| limits.images),
+    };
+    rpi_ai::types::ModelInputLimits {
+        max_request_bytes: override_
+            .max_request_bytes
+            .or(base.and_then(|limits| limits.max_request_bytes)),
+        images,
+    }
+}
+
 /// `applyModelOverride` (provider-composer.ts:100-122) plus the
 /// `modelOverrides` entry of `rawModelHeaders` (provider-composer.ts:384-397,
 /// merged *under* definition/extension headers).
@@ -999,6 +1043,14 @@ fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -
     }
     if let Some(input) = &override_.input {
         model.input = input.clone();
+    }
+    // `inputLimits: mergeInputLimits(model.inputLimits, override.inputLimits)`
+    // (provider-composer.ts:138, #9631).
+    if let Some(override_limits) = &override_.input_limits {
+        model.input_limits = Some(merge_input_limits(
+            model.input_limits.as_ref(),
+            override_limits,
+        ));
     }
     if let Some(cost) = &override_.cost {
         model.cost = ModelCost {
@@ -2607,6 +2659,9 @@ fn json_model_to_model(
         reasoning: model.reasoning.unwrap_or(false),
         thinking_level_map: model.thinking_level_map.clone(),
         input: model.input.clone().unwrap_or_else(default_input),
+        // `inputLimits: definition.inputLimits` (provider-composer.ts:163,
+        // #9631) — carried verbatim; `None` keeps the historical defaults.
+        input_limits: model.input_limits,
         cost: model.cost.clone().unwrap_or_default(),
         prompt_cache: model
             .prompt_cache
@@ -2673,6 +2728,9 @@ fn config_model_to_model(
         } else {
             model.input.clone()
         },
+        // applyExtension (provider-composer.ts:201-228) carries no
+        // inputLimits face (#9631 did not extend it).
+        input_limits: None,
         cost: model.cost.clone().unwrap_or_default(),
         prompt_cache: None,
         context_window: model.context_window,
@@ -3300,6 +3358,144 @@ mod tests {
         assert!(model.reasoning);
         assert_eq!(model.context_window, 64000);
         assert_eq!(model.max_tokens, 4096);
+    }
+
+    /// #9631 (model-registry.test.ts:818-860, @ f5c946480): "model override
+    /// deep-merges image resize limits" — the definition passes through
+    /// verbatim; the override wins per key with `images.resize` merged
+    /// key-wise (mergeInputLimits, provider-composer.ts:110-130).
+    #[tokio::test]
+    async fn model_override_deep_merges_image_resize_limits() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {
+                "test": {
+                    "baseUrl": "https://example.com",
+                    "apiKey": "test-key",
+                    "api": "openai-completions",
+                    "models": [
+                        {
+                            "id": "vision-model",
+                            "input": ["text", "image"],
+                            "inputLimits": {
+                                "maxRequestBytes": 33554432,
+                                "images": {
+                                    "maxPerRequest": 100,
+                                    "resize": {
+                                        "maxWidth": 2000,
+                                        "maxHeight": 2000,
+                                        "maxBytes": 4718592,
+                                        "jpegQuality": 80
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                    "modelOverrides": {
+                        "vision-model": {
+                            "inputLimits": {
+                                "images": {"resize": {"maxWidth": 1568, "maxBytes": 524288, "jpegQuality": 75}}
+                            }
+                        }
+                    }
+                }
+            }}"#,
+        )
+        .await;
+        assert!(runtime.get_error().is_none(), "no composition error");
+
+        let model = runtime.get_model("test", "vision-model").expect("model");
+        assert_eq!(
+            model.input_limits,
+            Some(rpi_ai::types::ModelInputLimits {
+                max_request_bytes: Some(32 * 1024 * 1024),
+                images: Some(rpi_ai::types::ModelImageInputLimits {
+                    max_per_request: Some(100),
+                    max_per_message: None,
+                    resize: Some(rpi_ai::types::ModelImageResizeOptions {
+                        max_width: Some(1568),
+                        max_height: Some(2000),
+                        max_bytes: Some(524288),
+                        jpeg_quality: Some(75),
+                    }),
+                }),
+            })
+        );
+    }
+
+    /// #9631 merge negatives: an override without `images` (or without
+    /// `resize`) keeps the catalog/definition value untouched, and no
+    /// override leaves the definition value as-is (zero-regression default).
+    #[tokio::test]
+    async fn model_override_keeps_unset_input_limit_sections() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {
+                "test": {
+                    "baseUrl": "https://example.com",
+                    "apiKey": "test-key",
+                    "api": "openai-completions",
+                    "models": [
+                        {
+                            "id": "a",
+                            "inputLimits": {
+                                "maxRequestBytes": 1048576,
+                                "images": {"resize": {"maxWidth": 1024, "maxHeight": 768}}
+                            }
+                        },
+                        {"id": "b", "inputLimits": {"images": {"maxPerMessage": 4}}},
+                        {"id": "c"}
+                    ],
+                    "modelOverrides": {
+                        "a": {"inputLimits": {"maxRequestBytes": 2097152}},
+                        "b": {"inputLimits": {"images": {"resize": {"jpegQuality": 60}}}}
+                    }
+                }
+            }}"#,
+        )
+        .await;
+        assert!(runtime.get_error().is_none(), "no composition error");
+
+        // Top-level override without images keeps the images section
+        // (provider-composer spread semantics).
+        let a = runtime.get_model("test", "a").expect("a");
+        assert_eq!(
+            a.input_limits,
+            Some(rpi_ai::types::ModelInputLimits {
+                max_request_bytes: Some(2 * 1024 * 1024),
+                images: Some(rpi_ai::types::ModelImageInputLimits {
+                    max_per_message: None,
+                    max_per_request: None,
+                    resize: Some(rpi_ai::types::ModelImageResizeOptions {
+                        max_width: Some(1024),
+                        max_height: Some(768),
+                        max_bytes: None,
+                        jpeg_quality: None,
+                    }),
+                }),
+            })
+        );
+
+        // Override resize without maxWidth/maxHeight keeps those keys.
+        let b = runtime.get_model("test", "b").expect("b");
+        assert_eq!(
+            b.input_limits,
+            Some(rpi_ai::types::ModelInputLimits {
+                max_request_bytes: None,
+                images: Some(rpi_ai::types::ModelImageInputLimits {
+                    max_per_message: Some(4),
+                    max_per_request: None,
+                    resize: Some(rpi_ai::types::ModelImageResizeOptions {
+                        max_width: None,
+                        max_height: None,
+                        max_bytes: None,
+                        jpeg_quality: Some(60),
+                    }),
+                }),
+            })
+        );
+
+        // No override and no definition: None (historical defaults apply).
+        let c = runtime.get_model("test", "c").expect("c");
+        assert_eq!(c.input_limits, None);
     }
 
     /// #9668 (model-registry.test.ts:790-816, @ c596d09d9): "custom model
@@ -4039,6 +4235,7 @@ mod tests {
                 reasoning: false,
                 thinking_level_map: None,
                 input: vec![rpi_ai::types::InputModality::Text],
+                input_limits: None,
                 cost: rpi_ai::types::ModelCost::default(),
                 prompt_cache: None,
                 context_window: 1000,
@@ -4261,6 +4458,7 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![],
+            input_limits: None,
             cost: Default::default(),
             prompt_cache: None,
             context_window: 1000,
@@ -4348,6 +4546,7 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![],
+            input_limits: None,
             cost: Default::default(),
             prompt_cache: None,
             context_window: 1000,
@@ -4380,6 +4579,7 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![],
+            input_limits: None,
             cost: Default::default(),
             prompt_cache: None,
             context_window: 1000,
@@ -4406,6 +4606,7 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![rpi_ai::types::InputModality::Text],
+            input_limits: None,
             cost: ModelCost {
                 rates: ModelCostRates {
                     input: 0.0,
@@ -4652,6 +4853,7 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![InputModality::Text],
+            input_limits: None,
             cost: ModelCost {
                 rates: ModelCostRates {
                     input: 0.0,

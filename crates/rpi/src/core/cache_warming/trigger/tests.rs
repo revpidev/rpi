@@ -36,6 +36,7 @@ fn test_model(id: &str) -> Model {
         reasoning: true,
         thinking_level_map: None,
         input: vec![],
+        input_limits: None,
         // claude-opus-4-6 catalog rates (drives the upstream number
         // assertions: warmCost ≈ $0.050025 / missCost ≈ $0.575 at 100k).
         cost: rpi_ai::types::ModelCost {

@@ -2914,6 +2914,7 @@ mod tests {
             reasoning,
             thinking_level_map: None,
             input: vec![InputModality::Text],
+            input_limits: None,
             cost: ModelCost {
                 rates: ModelCostRates::default(),
                 tiers: None,

@@ -221,6 +221,10 @@ pub struct ModelsJsonModelOverride {
     pub reasoning: Option<bool>,
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Option<Vec<InputModality>>,
+    /// `ModelOverrideSchema.inputLimits` (#9631): merged over the catalog
+    /// value (`mergeInputLimits`, provider-composer.ts:110-130). Same wire
+    /// shape as the catalog type (model-config.ts:143-158).
+    pub input_limits: Option<crate::types::ModelInputLimits>,
     pub cost: Option<ModelsJsonModelOverrideCost>,
     /// `ModelOverrideSchema.promptCache` (#9668): merged per tier with the
     /// catalog value.
@@ -244,6 +248,9 @@ pub struct ModelsJsonModel {
     pub reasoning: Option<bool>,
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Option<Vec<InputModality>>,
+    /// `ModelDefinitionSchema.inputLimits` (#9631): carried verbatim onto
+    /// the runtime model (`modelFromJson`, provider-composer.ts:163).
+    pub input_limits: Option<crate::types::ModelInputLimits>,
     pub cost: Option<ModelCost>,
     /// `ModelDefinitionSchema.promptCache` (#9668): unset disables cache
     /// warming for the model.

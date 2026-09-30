@@ -84,6 +84,7 @@ async fn fixture() -> Fixture {
                         name: None,
                         reasoning: None,
                         input: None,
+                        input_limits: None,
                         cost: None,
                         context_window: Some(200_000),
                         max_tokens: Some(8192),

@@ -1029,6 +1029,7 @@ mod tests {
             reasoning,
             thinking_level_map: None,
             input: vec![InputModality::Text],
+            input_limits: None,
             cost: Default::default(),
             prompt_cache: None,
             context_window: 200000,

@@ -161,6 +161,7 @@ fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaE
         reasoning: false,
         thinking_level_map: None,
         input,
+        input_limits: None,
         cost: rpi_ai::types::ModelCost::default(),
         prompt_cache: None,
         context_window,

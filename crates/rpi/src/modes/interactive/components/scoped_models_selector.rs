@@ -699,6 +699,7 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: Vec::new(),
+            input_limits: None,
             cost: Default::default(),
             prompt_cache: None,
             context_window: 128000,

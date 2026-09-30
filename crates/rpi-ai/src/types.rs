@@ -1569,6 +1569,53 @@ pub struct ModelPromptCache {
     pub long: Option<u32>,
 }
 
+/// `ModelImageResizeOptions` (types.ts:958-964, #9631 / f5c946480):
+/// cache-safe resize profile applied before a new image enters conversation
+/// history. Every key is optional — unset keys keep the caller's defaults
+/// (rpi's historical global limits in `rpi::tools::image_process`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelImageResizeOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u32>,
+    /// Maximum base64-encoded payload size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jpeg_quality: Option<u32>,
+}
+
+/// `ModelImageInputLimits` (types.ts:966-972).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelImageInputLimits {
+    /// Cache-safe resize profile applied before a new image enters history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resize: Option<ModelImageResizeOptions>,
+    /// Maximum images accepted in one provider message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_per_message: Option<u32>,
+    /// Maximum images accepted across one provider request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_per_request: Option<u32>,
+}
+
+/// `ModelInputLimits` (types.ts:974-978): provider input limits and
+/// cache-safe preprocessing metadata (#9631). Parsing is additive — unknown
+/// fields are ignored and a missing `inputLimits` yields `None` (models keep
+/// their historical behavior; zero-regression red line).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInputLimits {
+    /// Maximum serialized provider request size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<ModelImageInputLimits>,
+}
+
 /// `Model` — unified model system entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1584,6 +1631,10 @@ pub struct Model {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Vec<InputModality>,
+    /// Provider input limits and cache-safe preprocessing metadata
+    /// (types.ts:994-995, #9631). Unset when the provider is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
     pub cost: ModelCost,
     /// Prompt cache lifetimes per retention tier (#9668, c596d09d9).
     /// Unset when the provider's cache behavior is unknown. Consumed by
@@ -2823,5 +2874,71 @@ mod tests {
             to_json(&diag),
             r#"{"type":"rewrite","timestamp":1,"error":{"name":"Error","message":"m","code":"E"},"details":{"a":1}}"#
         );
+    }
+
+    /// #9631 (f5c946480, types.ts:957-996): `inputLimits` parses additively —
+    /// camelCase wire names, unknown fields ignored, absent → `None`, and
+    /// `None` never serializes (wire format unchanged for models without a
+    /// profile).
+    #[test]
+    fn test_model_input_limits_parse_additive() {
+        let model: Model = serde_json::from_value(json!({
+            "id": "m", "name": "m", "api": "openai-completions", "provider": "p",
+            "baseUrl": "https://example.com", "reasoning": false, "input": ["text", "image"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000, "maxTokens": 100,
+            "inputLimits": {
+                "maxRequestBytes": 33554432,
+                "futureField": true,
+                "images": {
+                    "maxPerMessage": 20,
+                    "futureNested": 1,
+                    "resize": {
+                        "maxWidth": 2000,
+                        "maxHeight": 1568,
+                        "maxBytes": 4718592,
+                        "jpegQuality": 80
+                    }
+                }
+            }
+        }))
+        .expect("model");
+        assert_eq!(
+            model.input_limits,
+            Some(ModelInputLimits {
+                max_request_bytes: Some(32 * 1024 * 1024),
+                images: Some(ModelImageInputLimits {
+                    resize: Some(ModelImageResizeOptions {
+                        max_width: Some(2000),
+                        max_height: Some(1568),
+                        max_bytes: Some(4_718_592),
+                        jpeg_quality: Some(80),
+                    }),
+                    max_per_message: Some(20),
+                    max_per_request: None,
+                }),
+            })
+        );
+
+        // Absent field → None; None does not serialize (additive wire).
+        let plain: Model = serde_json::from_value(json!({
+            "id": "m", "name": "m", "api": "openai-completions", "provider": "p",
+            "baseUrl": "https://example.com", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000, "maxTokens": 100
+        }))
+        .expect("model");
+        assert_eq!(plain.input_limits, None);
+        let wire = serde_json::to_value(&plain).expect("json");
+        assert!(wire.get("inputLimits").is_none());
+
+        // Round-trip keeps the profile and the camelCase names.
+        let wire = serde_json::to_value(&model).expect("json");
+        assert_eq!(
+            wire["inputLimits"]["images"]["resize"]["maxWidth"],
+            json!(2000)
+        );
+        let back: Model = serde_json::from_value(wire).expect("model");
+        assert_eq!(back.input_limits, model.input_limits);
     }
 }

@@ -204,6 +204,8 @@ pub struct FauxModelDefinition {
     pub name: Option<String>,
     pub reasoning: Option<bool>,
     pub input: Option<Vec<InputModality>>,
+    /// #9631 (f5c946480, faux.ts:46): per-model input limits passthrough.
+    pub input_limits: Option<rpi_ai::types::ModelInputLimits>,
     pub cost: Option<ModelCostRates>,
     pub context_window: Option<u32>,
     pub max_tokens: Option<u32>,
@@ -266,6 +268,7 @@ impl FauxProvider {
                 name: Some(DEFAULT_MODEL_NAME.to_owned()),
                 reasoning: Some(false),
                 input: Some(vec![InputModality::Text, InputModality::Image]),
+                input_limits: None,
                 cost: Some(ModelCostRates::default()),
                 context_window: Some(DEFAULT_CONTEXT_WINDOW),
                 max_tokens: Some(DEFAULT_MAX_TOKENS),
@@ -284,6 +287,7 @@ impl FauxProvider {
                 input: d
                     .input
                     .unwrap_or_else(|| vec![InputModality::Text, InputModality::Image]),
+                input_limits: d.input_limits,
                 cost: ModelCost {
                     rates: d.cost.unwrap_or_default(),
                     tiers: None,

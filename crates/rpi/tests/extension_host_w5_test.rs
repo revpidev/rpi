@@ -109,6 +109,7 @@ async fn runtime_fixture(event_log: Arc<Mutex<Vec<String>>>) -> RuntimeFixture {
                         name: None,
                         reasoning: None,
                         input: None,
+                        input_limits: None,
                         cost: None,
                         context_window: Some(200_000),
                         max_tokens: Some(8192),

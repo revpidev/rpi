@@ -122,6 +122,7 @@ fn default_model() -> Model {
         reasoning: false,
         thinking_level_map: None,
         input: Vec::new(),
+        input_limits: None,
         cost: ModelCost::default(),
         prompt_cache: None,
         context_window: 0,

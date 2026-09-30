@@ -389,6 +389,27 @@ fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-model resize profile (#9631 seam, V16-01 FR-D)
+// ---------------------------------------------------------------------------
+
+/// Per-model image resize profile from catalog / `models.json` metadata
+/// (#9631, f5c946480 — upstream reads `model.inputLimits?.images?.resize`
+/// at every image entrance). `None` keeps the historical global defaults
+/// above (`MAX_WIDTH`/`MAX_HEIGHT`/`MAX_BYTES`/`JPEG_QUALITY`) — the
+/// zero-regression red line for models without a profile.
+/// Single resolution seam shared by the three image entrances (file
+/// attachments / `read` images / tool results); the callers wire it through
+/// `process_image` with V16-04 (design §1.3 ruling 3).
+pub fn resolved_image_resize_options(
+    model: &rpi_ai::types::Model,
+) -> Option<rpi_ai::types::ModelImageResizeOptions> {
+    model
+        .input_limits
+        .and_then(|limits| limits.images)
+        .and_then(|images| images.resize)
+}
+
+// ---------------------------------------------------------------------------
 // processImage (image-process.ts:72-118)
 // ---------------------------------------------------------------------------
 
@@ -694,5 +715,51 @@ mod tests {
         let decoded = image::load_from_memory(&with_both).unwrap();
         let rotated = apply_exif_orientation(decoded, &with_both);
         assert_eq!((rotated.width(), rotated.height()), (1, 2));
+    }
+
+    /// #9631 (V16-01 FR-D): the shared resolution seam maps a model's
+    /// `inputLimits.images.resize` metadata to the resize profile; models
+    /// without a profile resolve to `None` (historical global defaults).
+    #[test]
+    fn test_resolved_image_resize_options_seam() {
+        fn model_with(limits: Option<rpi_ai::types::ModelInputLimits>) -> rpi_ai::types::Model {
+            serde_json::from_value(serde_json::json!({
+                "id": "m", "name": "m", "api": "openai-completions", "provider": "p",
+                "baseUrl": "https://example.com", "reasoning": false,
+                "input": ["text", "image"],
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                "contextWindow": 1000, "maxTokens": 100,
+                "inputLimits": limits
+            }))
+            .expect("model")
+        }
+
+        let profile = rpi_ai::types::ModelImageResizeOptions {
+            max_width: Some(1568),
+            max_height: None,
+            max_bytes: Some(524288),
+            jpeg_quality: Some(75),
+        };
+        let model = model_with(Some(rpi_ai::types::ModelInputLimits {
+            max_request_bytes: Some(32 * 1024 * 1024),
+            images: Some(rpi_ai::types::ModelImageInputLimits {
+                resize: Some(profile),
+                max_per_message: None,
+                max_per_request: Some(100),
+            }),
+        }));
+        assert_eq!(resolved_image_resize_options(&model), Some(profile));
+
+        // Limits without images/resize resolve to None.
+        let no_resize = model_with(Some(rpi_ai::types::ModelInputLimits {
+            max_request_bytes: Some(1024),
+            images: None,
+        }));
+        assert_eq!(resolved_image_resize_options(&no_resize), None);
+
+        // No profile at all: None — the zero-regression default shared by
+        // every model of the current vendored catalog until the V16-02
+        // regen lands generator-injected profiles.
+        assert_eq!(resolved_image_resize_options(&model_with(None)), None);
     }
 }

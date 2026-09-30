@@ -364,6 +364,7 @@ async fn fixture(
             name: None,
             reasoning: None,
             input: None,
+            input_limits: None,
             cost: None,
             context_window: Some(context_window),
             max_tokens: Some(8192),

@@ -312,6 +312,7 @@ mod tests {
             reasoning: true,
             thinking_level_map: None,
             input: vec![],
+            input_limits: None,
             cost: Default::default(),
             prompt_cache,
             context_window: 200_000,

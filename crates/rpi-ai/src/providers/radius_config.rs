@@ -124,6 +124,7 @@ pub fn get_radius_models_from_config(
             reasoning: model.reasoning,
             thinking_level_map: model.thinking_level_map.clone(),
             input: model.input.clone(),
+            input_limits: None,
             cost: model.cost.clone(),
             prompt_cache: None,
             context_window: model.context_window,

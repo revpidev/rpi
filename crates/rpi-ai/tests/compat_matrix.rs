@@ -566,7 +566,8 @@ fn metadata_derived_levels(model: &Model) -> Vec<ModelThinkingLevel> {
         return vec![ModelThinkingLevel::Off];
     }
     ladder
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|level| {
             match model
                 .thinking_level_map
@@ -575,10 +576,7 @@ fn metadata_derived_levels(model: &Model) -> Vec<ModelThinkingLevel> {
             {
                 Some(None) => false,
                 Some(Some(_)) => true,
-                None => !matches!(
-                    level,
-                    ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max
-                ),
+                None => !matches!(level, ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max),
             }
         })
         .collect()
@@ -611,7 +609,10 @@ fn test_access_face_levels_follow_catalog_metadata() {
 #[test]
 fn test_three_access_faces_share_capability_metadata() {
     let faces: [Vec<&str>; 3] = [
-        get_builtin_models("openai").iter().map(|m| m.id.as_str()).collect(),
+        get_builtin_models("openai")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect(),
         get_builtin_models("openai-codex")
             .iter()
             .map(|m| m.id.as_str())
@@ -626,7 +627,10 @@ fn test_three_access_faces_share_capability_metadata() {
         .filter(|id| faces[1].contains(id) && faces[2].contains(id))
         .copied()
         .collect();
-    assert!(!shared.is_empty(), "three-face intersection must not be empty");
+    assert!(
+        !shared.is_empty(),
+        "three-face intersection must not be empty"
+    );
 
     for id in shared {
         for provider in ["openai", "openai-codex", "github-copilot"] {
@@ -654,10 +658,13 @@ fn test_copilot_claude_capabilities_follow_catalog_metadata() {
         .map(|m| m.id.clone())
         .collect();
     let copilot_models: Vec<&Model> = get_builtin_models("github-copilot")
-        .into_iter()
+        .iter()
         .filter(|m| m.api.as_str() == "anthropic-messages")
         .collect();
-    assert!(!copilot_models.is_empty(), "copilot anthropic face is empty");
+    assert!(
+        !copilot_models.is_empty(),
+        "copilot anthropic face is empty"
+    );
 
     for model in copilot_models {
         assert_eq!(

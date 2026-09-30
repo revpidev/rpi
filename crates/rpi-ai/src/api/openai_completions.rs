@@ -3356,14 +3356,16 @@ pub(crate) mod tests {
 
         // Image-only: no empty text part (the #9797 regression).
         let ctx = context(
-            vec![serde_json::from_value(json!({
-                "role": "user", "timestamp": 0,
-                "content": [
-                    {"type": "text", "text": ""},
-                    {"type": "image", "data": "ZmFrZQ==", "mimeType": "image/png"}
-                ]
-            }))
-            .expect("user")],
+            vec![
+                serde_json::from_value(json!({
+                    "role": "user", "timestamp": 0,
+                    "content": [
+                        {"type": "text", "text": ""},
+                        {"type": "image", "data": "ZmFrZQ==", "mimeType": "image/png"}
+                    ]
+                }))
+                .expect("user"),
+            ],
             None,
         );
         let params = convert(&model, &ctx, &compat);
@@ -3380,16 +3382,18 @@ pub(crate) mod tests {
         // Empty text between images is dropped; whitespace-only text stays
         // (upstream filters `length > 0`, no trim).
         let ctx = context(
-            vec![serde_json::from_value(json!({
-                "role": "user", "timestamp": 0,
-                "content": [
-                    {"type": "image", "data": "AAAA", "mimeType": "image/png"},
-                    {"type": "text", "text": ""},
-                    {"type": "text", "text": "  "},
-                    {"type": "image", "data": "BBBB", "mimeType": "image/png"}
-                ]
-            }))
-            .expect("user")],
+            vec![
+                serde_json::from_value(json!({
+                    "role": "user", "timestamp": 0,
+                    "content": [
+                        {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": "  "},
+                        {"type": "image", "data": "BBBB", "mimeType": "image/png"}
+                    ]
+                }))
+                .expect("user"),
+            ],
             None,
         );
         let params = convert(&model, &ctx, &compat);
@@ -4085,7 +4089,7 @@ mod build_and_stream_tests {
         // Data-driven anchor: the first baseten catalog model whose vendored
         // metadata pins `supportsStrictMode: true` (all 21 entries do today).
         let model = crate::generated::get_builtin_models("baseten")
-            .into_iter()
+            .iter()
             .find(|m| {
                 m.compat
                     .as_ref()
@@ -4093,7 +4097,10 @@ mod build_and_stream_tests {
             })
             .expect("baseten catalog model with strict metadata");
         let compat = get_compat(model);
-        assert_eq!(model.compat.as_ref().expect("compat").supports_strict_mode, Some(true));
+        assert_eq!(
+            model.compat.as_ref().expect("compat").supports_strict_mode,
+            Some(true)
+        );
         assert!(compat.supports_strict_mode);
 
         let strict_tool: Tool = serde_json::from_value(json!({
