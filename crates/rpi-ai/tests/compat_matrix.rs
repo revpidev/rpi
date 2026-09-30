@@ -10,7 +10,8 @@
 
 use rpi_ai::api::anthropic_messages::get_anthropic_compat;
 use rpi_ai::api::openai_completions::{ResolvedOpenAICompletionsCompat, detect_compat, get_compat};
-use rpi_ai::generated::get_builtin_model;
+use rpi_ai::generated::{get_builtin_model, get_builtin_models};
+use rpi_ai::models::get_supported_thinking_levels;
 use rpi_ai::types::{
     CacheControlFormat, MaxTokensField, Model, ModelThinkingLevel, SessionAffinityFormat,
     ThinkingFormat,
@@ -526,4 +527,147 @@ fn test_grammar_tool_variants_lark_and_regex() {
     let config: rpi_ai::types::ConstrainedSamplingConfig =
         serde_json::from_value(value.clone()).expect("config");
     assert_eq!(serde_json::to_value(&config).expect("json"), value);
+}
+
+// ---------------------------------------------------------------------------
+// R2.1.1/R2.1.2 (V16-01 FR-A): capability follows catalog metadata across the
+// model-cluster access faces — upstream b7f4b05c7 (Opus effort levels) /
+// db91e0331 (GPT-6 Sol·Luna) / 27c072e98 (Copilot family). rpi adds no
+// hardcoded family table; these tests pin the metadata derivation over the
+// whole access-face matrix (V15-02 FR-G "capability follows metadata" form).
+// Data entries for the new families land with the V16-02 catalog regen and
+// are covered automatically — model ids here are computed, never literal.
+// ---------------------------------------------------------------------------
+
+/// Spec mirror of `getSupportedThinkingLevels` (models.ts / models.rs):
+/// non-reasoning models expose `off` only; a level is available iff its
+/// `thinkingLevelMap` entry maps to a value; JSON `null` disables it; absent
+/// entries keep the default ladder except xhigh/max, which always require an
+/// explicit mapping. Mirrored independently so that any hardcoded family
+/// table added to level resolution breaks the equality below.
+fn metadata_derived_levels(model: &Model) -> Vec<ModelThinkingLevel> {
+    let ladder = [
+        ModelThinkingLevel::Off,
+        ModelThinkingLevel::Minimal,
+        ModelThinkingLevel::Low,
+        ModelThinkingLevel::Medium,
+        ModelThinkingLevel::High,
+        ModelThinkingLevel::Xhigh,
+        ModelThinkingLevel::Max,
+    ];
+    if !model.reasoning {
+        return vec![ModelThinkingLevel::Off];
+    }
+    ladder
+        .into_iter()
+        .filter(|level| {
+            match model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(level))
+            {
+                Some(None) => false,
+                Some(Some(_)) => true,
+                None => !matches!(
+                    level,
+                    ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max
+                ),
+            }
+        })
+        .collect()
+}
+
+/// R2.1.2 inheritance matrix, leg 1: every model exposed through the three
+/// GPT access faces (OpenAI API key / Codex subscription / GitHub Copilot)
+/// resolves its thinking levels purely from its own catalog metadata.
+#[test]
+fn test_access_face_levels_follow_catalog_metadata() {
+    for provider in ["openai", "openai-codex", "github-copilot"] {
+        let models = get_builtin_models(provider);
+        assert!(!models.is_empty(), "{provider} catalog face is empty");
+        for model in models {
+            assert_eq!(
+                get_supported_thinking_levels(model),
+                metadata_derived_levels(model),
+                "{provider}/{}: supported levels diverge from thinkingLevelMap",
+                model.id
+            );
+        }
+    }
+}
+
+/// R2.1.2 inheritance matrix, leg 2: model ids shared by the three GPT
+/// access faces resolve on every face as reasoning models with metadata-
+/// derived levels (db91e0331 "includes official metadata for OpenAI and
+/// Codex" / 27c072e98 Copilot counterparts — the shared set grows with the
+/// V16-02 regen without touching this test).
+#[test]
+fn test_three_access_faces_share_capability_metadata() {
+    let faces: [Vec<&str>; 3] = [
+        get_builtin_models("openai").iter().map(|m| m.id.as_str()).collect(),
+        get_builtin_models("openai-codex")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect(),
+        get_builtin_models("github-copilot")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect(),
+    ];
+    let shared: Vec<&str> = faces[0]
+        .iter()
+        .filter(|id| faces[1].contains(id) && faces[2].contains(id))
+        .copied()
+        .collect();
+    assert!(!shared.is_empty(), "three-face intersection must not be empty");
+
+    for id in shared {
+        for provider in ["openai", "openai-codex", "github-copilot"] {
+            let model = get_builtin_model(provider, id)
+                .unwrap_or_else(|| panic!("{provider}/{id} missing from catalog"));
+            assert!(model.reasoning, "{provider}/{id} must be a reasoning model");
+            assert_eq!(
+                get_supported_thinking_levels(model),
+                metadata_derived_levels(model),
+                "{provider}/{id}: levels diverge from thinkingLevelMap"
+            );
+        }
+    }
+}
+
+/// R2.1.1/R2.1.2 inheritance matrix, leg 3: Claude models shared between
+/// direct Anthropic and the GitHub Copilot face (upstream
+/// github-copilot-anthropic.test.ts walks the same pair) — capabilities come
+/// from each face's own metadata; the Copilot effort ladder for the Opus 5.5
+/// generation arrives with the V16-02 regen (b7f4b05c7's five-level map).
+#[test]
+fn test_copilot_claude_capabilities_follow_catalog_metadata() {
+    let anthropic_ids: Vec<String> = get_builtin_models("anthropic")
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    let copilot_models: Vec<&Model> = get_builtin_models("github-copilot")
+        .into_iter()
+        .filter(|m| m.api.as_str() == "anthropic-messages")
+        .collect();
+    assert!(!copilot_models.is_empty(), "copilot anthropic face is empty");
+
+    for model in copilot_models {
+        assert_eq!(
+            get_supported_thinking_levels(model),
+            metadata_derived_levels(model),
+            "github-copilot/{}: levels diverge from thinkingLevelMap",
+            model.id
+        );
+        if anthropic_ids.contains(&model.id) {
+            let direct = get_builtin_model("anthropic", &model.id)
+                .unwrap_or_else(|| panic!("anthropic/{} missing", model.id));
+            assert_eq!(
+                get_supported_thinking_levels(direct),
+                metadata_derived_levels(direct),
+                "anthropic/{}: levels diverge from thinkingLevelMap",
+                model.id
+            );
+        }
+    }
 }

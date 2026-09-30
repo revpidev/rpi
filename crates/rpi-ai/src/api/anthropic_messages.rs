@@ -208,8 +208,9 @@ fn get_beta_features(
 }
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Stealth mode: mimic Claude Code's version in the OAuth user agent.
-pub const CLAUDE_CODE_VERSION: &str = "2.1.251";
+/// Stealth mode: mimic Claude Code's version in the OAuth user agent
+/// (3a624b82d: `2.1.251` → `2.1.280`, anthropic-messages.ts:87).
+pub const CLAUDE_CODE_VERSION: &str = "2.1.280";
 
 /// Claude Code 2.x tool names (canonical casing).
 /// Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -2511,7 +2512,9 @@ pub(crate) mod tests {
         );
         assert_eq!(
             headers.get("user-agent").and_then(|v| v.as_deref()),
-            Some("claude-cli/2.1.251")
+            // 3a624b82d: the reported version follows upstream
+            // `claudeCodeVersion` (`2.1.280`, anthropic-messages.ts:87).
+            Some("claude-cli/2.1.280")
         );
         assert_eq!(headers.get("x-app").and_then(|v| v.as_deref()), Some("cli"));
         let beta = headers

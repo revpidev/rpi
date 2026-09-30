@@ -36,7 +36,7 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("github-copilot", "gpt-5.4"),
     ("openrouter", "moonshotai/kimi-k2.6"),
     ("vercel-ai-gateway", "zai/glm-5.1"),
-    ("xai", "grok-4.6"),
+    ("xai", "grok-4.7"),
     ("groq", "openai/gpt-oss-120b"),
     ("cerebras", "gpt-oss-120b"),
     ("zai", "glm-5.3"),
@@ -1311,9 +1311,10 @@ mod tests {
         assert_eq!(default_model_for_provider("does-not-exist"), None);
         // Upstream-pin spot checks for defaults whose RETIRED predecessor
         // still exists in the catalog (so the catalog-existence test below
-        // alone cannot catch a revert) — e.g. xai still lists grok-4.5
-        // alongside the pinned grok-4.6.
-        assert_eq!(default_model_for_provider("xai"), Some("grok-4.6"));
+        // alone cannot catch a revert) — e.g. xai still lists grok-4.6
+        // alongside the pinned grok-4.7 (1a584a7a5, upstream
+        // model-resolver.test.ts "xai default tracks current model").
+        assert_eq!(default_model_for_provider("xai"), Some("grok-4.7"));
         assert_eq!(
             default_model_for_provider("baseten"),
             Some("zai-org/GLM-5.2")
