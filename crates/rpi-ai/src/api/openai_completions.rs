@@ -229,8 +229,11 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
     let is_nvidia = provider == "nvidia" || base_url.contains("integrate.api.nvidia.com");
     let is_ant_ling = provider == "ant-ling" || base_url.contains("api.ant-ling.com");
     // #9804 (af7359b90): Cerebras rejects mixed strict/non-strict tools with
-    // a 400, so it never declares strict support (shared by the non-standard
-    // gate and `supports_strict_mode` below).
+    // a 400, so it never declares strict support — since #9816 the runtime
+    // default below is false for everyone and Cerebras/Moonshot/Together/
+    // Cloudflare/NVIDIA keep their explicit `supportsStrictMode: false`
+    // catalog metadata (baked by the generator's
+    // detectOpenAICompletionsCompat).
     let is_cerebras = provider == "cerebras" || base_url.contains("cerebras.ai");
 
     let is_non_standard = is_nvidia
@@ -315,13 +318,12 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         supports_thinking_token_budget: false,
         thinking_token_budget_field: None,
         vllm_priority: None,
-        // #9804 (af7359b90): mixed strict/unstrict tool usage 400s on
-        // Cerebras — never declare strict support.
-        supports_strict_mode: !is_moonshot
-            && !is_together
-            && !is_cloudflare_ai_gateway
-            && !is_nvidia
-            && !is_cerebras,
+        // #9816 (890f92088, openai-completions.ts:1667-1668): OpenAI
+        // compatibility alone does not imply strict JSON-schema tool
+        // support — the runtime fallback defaults to non-strict. Known
+        // capable models carry explicit `supportsStrictMode` catalog
+        // metadata that overrides this via [`get_compat`].
+        supports_strict_mode: false,
         supports_open_ai_grammar_tools: false,
         cache_control_format,
         // #9102 (bbb61e34a): OpenRouter endpoints derive session affinity
@@ -3007,7 +3009,11 @@ pub(crate) mod tests {
         assert!(!compat.requires_thinking_as_text);
         assert!(!compat.requires_reasoning_content_on_assistant_messages);
         assert_eq!(compat.thinking_format, ThinkingFormat::Openai);
-        assert!(compat.supports_strict_mode);
+        // #9816 (890f92088): OpenAI compatibility alone does not imply strict
+        // support; the runtime default is non-strict for every endpoint and
+        // capable models carry explicit catalog metadata instead. G2: was
+        // `assert!(compat.supports_strict_mode)` before the flip.
+        assert!(!compat.supports_strict_mode);
         assert!(!compat.supports_open_ai_grammar_tools);
         assert_eq!(compat.cache_control_format, None);
         assert!(!compat.send_session_affinity_headers);
@@ -3894,8 +3900,12 @@ mod build_and_stream_tests {
 
     #[test]
     fn test_convert_tools_function_strict_and_grammar() {
-        let model = make_model(json!({}));
+        // #9816 (890f92088): strict comes from explicit metadata (the way
+        // the generator pins capable built-ins), not from the runtime
+        // default — `make_model(json!({}))` no longer declares strict.
+        let model = make_model(json!({"compat": {"supportsStrictMode": true}}));
         let compat = get_compat(&model);
+        assert!(compat.supports_strict_mode);
 
         let function_tool = tool("bash");
         let converted = convert_tools(&[function_tool], &compat).expect("tools");
@@ -3912,11 +3922,10 @@ mod build_and_stream_tests {
             })
         );
 
-        // strict omitted when the provider doesn't support it.
-        let no_strict = ResolvedOpenAICompletionsCompat {
-            supports_strict_mode: false,
-            ..compat.clone()
-        };
+        // strict omitted when the provider doesn't support it (#9816: the
+        // runtime default for unknown endpoints).
+        let no_strict = get_compat(&make_model(json!({})));
+        assert!(!no_strict.supports_strict_mode);
         let converted = convert_tools(&[tool("bash")], &no_strict).expect("tools");
         assert!(converted[0]["function"].get("strict").is_none());
 
@@ -3945,8 +3954,83 @@ mod build_and_stream_tests {
 
     // -- chat template kwargs ------------------------------------------------------
 
+    /// #9816 (890f92088) port of "defaults unknown OpenAI-compatible
+    /// endpoints to non-strict tools": an endpoint with no catalog metadata
+    /// sends neither the `strict` field nor the all-args `required` massage.
+    #[test]
+    fn test_convert_tools_unknown_endpoint_defaults_non_strict() {
+        let model = make_model(json!({
+            "id": "local-model", "name": "Local Model",
+            "provider": "local", "baseUrl": "https://localhost:8000/v1"
+        }));
+        let compat = get_compat(&model);
+        assert!(!compat.supports_strict_mode);
+
+        let strict_tool: Tool = serde_json::from_value(json!({
+            "name": "ping", "description": "Ping tool",
+            "parameters": {
+                "type": "object",
+                "properties": {"required": {"type": "string"}, "optional": {"type": "string"}},
+                "required": ["required"]
+            },
+            "constrainedSampling": {"type": "json_schema", "strict": "prefer"}
+        }))
+        .expect("tool");
+        let converted = convert_tools(&[strict_tool], &compat).expect("tools");
+        let function_tool = &converted[0]["function"];
+        assert!(function_tool.get("strict").is_none());
+        // Without strict the schema stays as authored (optional stays
+        // optional); upstream asserts `required` equals `["required"]`.
+        assert_eq!(function_tool["parameters"]["required"], json!(["required"]));
+    }
+
+    /// #9816 (890f92088) port of "preserves strict tools for capable
+    /// built-in Chat Completions models": the generator pins explicit
+    /// `supportsStrictMode` metadata for known-capable providers, which
+    /// overrides the non-strict runtime default via [`get_compat`]. Upstream
+    /// anchors on groq `openai/gpt-oss-20b`; its metadata lands in rpi with
+    /// the V16-02 catalog regen, so the port uses baseten — a provider whose
+    /// vendored snapshot already pins the flag — proving the same mechanism.
+    #[test]
+    fn test_convert_tools_builtin_metadata_preserves_strict() {
+        // Data-driven anchor: the first baseten catalog model whose vendored
+        // metadata pins `supportsStrictMode: true` (all 21 entries do today).
+        let model = crate::generated::get_builtin_models("baseten")
+            .into_iter()
+            .find(|m| {
+                m.compat
+                    .as_ref()
+                    .is_some_and(|c| c.supports_strict_mode == Some(true))
+            })
+            .expect("baseten catalog model with strict metadata");
+        let compat = get_compat(model);
+        assert_eq!(model.compat.as_ref().expect("compat").supports_strict_mode, Some(true));
+        assert!(compat.supports_strict_mode);
+
+        let strict_tool: Tool = serde_json::from_value(json!({
+            "name": "ping", "description": "Ping tool",
+            "parameters": {
+                "type": "object",
+                "properties": {"required": {"type": "string"}, "optional": {"type": "string"}},
+                "required": ["required"]
+            },
+            "constrainedSampling": {"type": "json_schema", "strict": "prefer"}
+        }))
+        .expect("tool");
+        let converted = convert_tools(&[strict_tool], &compat).expect("tools");
+        let function_tool = &converted[0]["function"];
+        assert_eq!(function_tool["strict"], json!(true));
+        // Strict massaging marks every property required, upstream asserts
+        // `required` equals `["required", "optional"]`.
+        assert_eq!(
+            function_tool["parameters"]["required"],
+            json!(["required", "optional"])
+        );
+    }
+
     /// #9804 (af7359b90, FR-J): mixed strict/non-strict tool usage 400s on
-    /// Cerebras — the runtime detection never declares strict support, so
+    /// Cerebras — it pins explicit `supportsStrictMode: false` catalog
+    /// metadata (and the #9816 runtime default is non-strict anyway), so
     /// `strict` is omitted from every tool (upstream
     /// `cache-retention.test.ts` "should omit strict field on tools for
     /// cerebras/$id").

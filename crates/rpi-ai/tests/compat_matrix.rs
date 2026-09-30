@@ -51,7 +51,11 @@ fn test_detect_compat_standard_openai_baseline() {
     assert!(!compat.requires_reasoning_content_on_assistant_messages);
     assert_eq!(compat.thinking_format, ThinkingFormat::Openai);
     assert!(!compat.zai_tool_stream);
-    assert!(compat.supports_strict_mode);
+    // #9816 (890f92088): OpenAI compatibility alone does not imply strict
+    // support — even the first-party detection defaults to non-strict;
+    // capable models carry explicit catalog metadata instead. G2: was
+    // `assert!(compat.supports_strict_mode)` before the #9816 flip.
+    assert!(!compat.supports_strict_mode);
     assert!(!compat.supports_open_ai_grammar_tools);
     assert_eq!(compat.cache_control_format, None);
     assert!(!compat.send_session_affinity_headers);
@@ -167,7 +171,8 @@ fn test_detect_compat_openrouter_hits() {
 #[test]
 fn test_detect_compat_cloudflare_hits() {
     // Workers AI: store/developer off, long cache retention off; reasoning
-    // effort, strict mode and max_completion_tokens stay standard.
+    // effort and max_completion_tokens stay standard (strict follows the
+    // #9816 non-strict runtime default like every endpoint).
     let mut workers = standard();
     workers.supports_store = false;
     workers.supports_developer_role = false;
@@ -211,7 +216,9 @@ fn test_detect_compat_nvidia_ant_ling_hits() {
     assert_eq!(detect_compat(&model), nvidia);
 
     let mut ant_ling = nvidia.clone();
-    ant_ling.supports_strict_mode = true;
+    // G2 (#9816): ant-ling strict was a runtime `= true` grant before the
+    // flip; like every openai-completions endpoint it now defaults to
+    // non-strict at detection time (upstream pins it via catalog metadata).
     ant_ling.thinking_format = ThinkingFormat::AntLing;
     let model = make_model("ant-ling", "https://api.ant-ling.com/v1", "ring-1");
     assert_eq!(detect_compat(&model), ant_ling);
@@ -232,27 +239,27 @@ fn test_detect_compat_cerebras_xai_chutes_deepseek_opencode_hits() {
     let model = make_model("custom", "https://api.cerebras.ai/v1", "llama-4");
     assert_eq!(detect_compat(&model), cerebras);
 
-    // xAI (Grok): additionally no reasoning effort.
+    // xAI (Grok): additionally no reasoning effort. G2 (#9816): strict was
+    // a runtime `= true` grant before the flip (metadata carries it now).
     let mut xai = cerebras.clone();
     xai.supports_reasoning_effort = false;
-    xai.supports_strict_mode = true;
     let model = make_model("xai", "https://api.x.ai/v1", "grok-4");
     assert_eq!(detect_compat(&model), xai);
     let model = make_model("custom", "https://api.x.ai/v1", "grok-4");
     assert_eq!(detect_compat(&model), xai);
 
     // Chutes (baseUrl-only hit): max_tokens instead of max_completion_tokens.
+    // G2 (#9816): strict was a runtime `= true` grant before the flip.
     let mut chutes = cerebras.clone();
     chutes.max_tokens_field = MaxTokensField::MaxTokens;
-    chutes.supports_strict_mode = true;
     let model = make_model("custom", "https://llm.chutes.ai/v1", "deepseek-x");
     assert_eq!(detect_compat(&model), chutes);
 
     // DeepSeek: deepseek thinking format + reasoning_content replay.
+    // G2 (#9816): strict was a runtime `= true` grant before the flip.
     let mut deepseek = cerebras.clone();
     deepseek.thinking_format = ThinkingFormat::Deepseek;
     deepseek.requires_reasoning_content_on_assistant_messages = true;
-    deepseek.supports_strict_mode = true;
     // c185d4123: DeepSeek APIs take `max_tokens` (T20 Wave C; was
     // MaxCompletionTokens).
     deepseek.max_tokens_field = MaxTokensField::MaxTokens;
@@ -262,8 +269,8 @@ fn test_detect_compat_cerebras_xai_chutes_deepseek_opencode_hits() {
     assert_eq!(detect_compat(&model), deepseek);
 
     // opencode provider id, and opencode-go via its opencode.ai baseUrl.
-    let mut opencode = cerebras.clone();
-    opencode.supports_strict_mode = true;
+    // G2 (#9816): strict was a runtime `= true` grant before the flip.
+    let opencode = cerebras.clone();
     let model = make_model("opencode", "https://opencode.ai/zen/v1", "grok-build-0.1");
     assert_eq!(detect_compat(&model), opencode);
     let model = make_model("opencode-go", "https://opencode.ai/go/v1", "glm-5.2");
