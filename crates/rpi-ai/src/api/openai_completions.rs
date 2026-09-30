@@ -636,8 +636,17 @@ pub fn convert_messages(
                     }));
                 }
                 UserContent::Blocks(blocks) => {
+                    // #9797 (1b6ddca87, openai-completions.ts:1261): omit
+                    // empty text parts from multimodal user messages — some
+                    // OpenAI-compatible providers reject image-only prompts
+                    // that carry an empty text segment. Whitespace-only
+                    // parts are kept (upstream filters `length > 0` only).
                     let content: Vec<Value> = blocks
                         .iter()
+                        .filter(|item| match item {
+                            UserContentBlock::Text(text) => !text.text.is_empty(),
+                            UserContentBlock::Image(_) => true,
+                        })
                         .map(|item| match item {
                             UserContentBlock::Text(text) => json!({
                                 "type": "text",
@@ -3333,6 +3342,86 @@ pub(crate) mod tests {
                 ]
             })]
         );
+    }
+
+    /// #9797 (1b6ddca87) port of "omits empty text parts from user messages
+    /// with images" (openai-completions-tool-result-images.test.ts:72-95):
+    /// image-only user messages no longer carry an empty text part, an empty
+    /// part between images is dropped, whitespace-only parts survive, and a
+    /// fully empty message is skipped.
+    #[test]
+    fn test_convert_messages_omits_empty_text_parts() {
+        let model = make_model(json!({"input": ["text", "image"]}));
+        let compat = get_compat(&model);
+
+        // Image-only: no empty text part (the #9797 regression).
+        let ctx = context(
+            vec![serde_json::from_value(json!({
+                "role": "user", "timestamp": 0,
+                "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "image", "data": "ZmFrZQ==", "mimeType": "image/png"}
+                ]
+            }))
+            .expect("user")],
+            None,
+        );
+        let params = convert(&model, &ctx, &compat);
+        assert_eq!(
+            params,
+            vec![json!({
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZmFrZQ=="}}
+                ]
+            })]
+        );
+
+        // Empty text between images is dropped; whitespace-only text stays
+        // (upstream filters `length > 0`, no trim).
+        let ctx = context(
+            vec![serde_json::from_value(json!({
+                "role": "user", "timestamp": 0,
+                "content": [
+                    {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "  "},
+                    {"type": "image", "data": "BBBB", "mimeType": "image/png"}
+                ]
+            }))
+            .expect("user")],
+            None,
+        );
+        let params = convert(&model, &ctx, &compat);
+        assert_eq!(
+            params,
+            vec![json!({
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {"type": "text", "text": "  "},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}
+                ]
+            })]
+        );
+
+        // All-empty message is skipped entirely (upstream `continue`).
+        let ctx = context(
+            vec![
+                serde_json::from_value(json!({
+                    "role": "user", "timestamp": 0,
+                    "content": [{"type": "text", "text": ""}]
+                }))
+                .expect("user"),
+                serde_json::from_value(json!({
+                    "role": "user", "timestamp": 1, "content": "keep"
+                }))
+                .expect("user2"),
+            ],
+            None,
+        );
+        let params = convert(&model, &ctx, &compat);
+        assert_eq!(params, vec![json!({"role": "user", "content": "keep"})]);
     }
 
     #[test]
