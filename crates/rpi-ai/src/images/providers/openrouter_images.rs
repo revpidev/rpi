@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use crate::api::openrouter_images::openrouter_images_api;
 use crate::auth::oauth::openrouter_oauth;
-use crate::auth::{env_api_key_auth, ProviderAuth};
+use crate::auth::{ProviderAuth, env_api_key_auth};
 use crate::images::image_models::get_image_models;
 use crate::images::images_models::{
-    create_images_provider, CreateImagesProviderOptions, ImagesProvider,
+    CreateImagesProviderOptions, ImagesProvider, create_images_provider,
 };
 
 /// `openrouterImagesProvider()`.

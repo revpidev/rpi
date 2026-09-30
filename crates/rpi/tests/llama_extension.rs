@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rpi::extensions::llama::client::{LlamaClient, LlamaModelInfo, LlamaProgress};
-use rpi::extensions::llama::huggingface::{find_hugging_face_token, HuggingFaceClient};
-use rpi::extensions::llama::provider::{create_llama_provider, LLAMA_PROVIDER_ID};
+use rpi::extensions::llama::huggingface::{HuggingFaceClient, find_hugging_face_token};
+use rpi::extensions::llama::provider::{LLAMA_PROVIDER_ID, create_llama_provider};
 use rpi::extensions::llama::{
     ConnectionErrorChoice, HuggingFaceSearchFn, LlamaHost, LlamaManagerAction, LlamaUi,
     NotifyLevel, ProgressState,

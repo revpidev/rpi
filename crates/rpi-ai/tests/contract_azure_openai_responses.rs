@@ -17,18 +17,18 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rpi_ai::api::azure_openai_responses::{
-    self, normalize_azure_base_url, resolve_azure_config, AzureOpenAIResponsesOptions,
-    AzureOpenAiResponses, AZURE_TOOL_CALL_PROVIDERS,
+    self, AZURE_TOOL_CALL_PROVIDERS, AzureOpenAIResponsesOptions, AzureOpenAiResponses,
+    normalize_azure_base_url, resolve_azure_config,
 };
 use rpi_ai::api::openai_responses_shared::{
-    convert_responses_messages, ConvertResponsesMessagesOptions,
+    ConvertResponsesMessagesOptions, convert_responses_messages,
 };
 use rpi_ai::models::ProviderStreams;
 use rpi_ai::types::{
     ApiKind, Context, Message, Model, ProviderEnv, SimpleStreamOptions, StopReason, StreamEvent,
     StreamOptions, ThinkingLevel,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;

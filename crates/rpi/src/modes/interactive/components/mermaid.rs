@@ -30,9 +30,9 @@
 use std::sync::Arc;
 
 use comrak::nodes::NodeValue;
-use comrak::{parse_document, Arena, Options};
+use comrak::{Arena, Options, parse_document};
 use rpi_ext_host::types::{MarkdownTransformContext, MarkdownTransformerFn};
-use rpi_tui::mermaid::{render, Color, MermaidArt, MermaidStyles, Style};
+use rpi_tui::mermaid::{Color, MermaidArt, MermaidStyles, Style, render};
 use rpi_tui::utils::visible_width;
 
 use crate::core::settings_manager::MermaidRenderingMode;

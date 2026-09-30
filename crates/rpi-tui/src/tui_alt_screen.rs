@@ -54,8 +54,8 @@ use base64::Engine;
 use tokio::sync::oneshot;
 
 use crate::alt_screen_search::{
-    get_alt_screen_search_match_key, AltScreenSearchComponent, AltScreenSearchIndex,
-    AltScreenSearchMatch, NavigationButtonStyleFn,
+    AltScreenSearchComponent, AltScreenSearchIndex, AltScreenSearchMatch, NavigationButtonStyleFn,
+    get_alt_screen_search_match_key,
 };
 use crate::components::alt_screen_flash::{AltScreenFlashContainer, DEFAULT_DURATION_MS};
 /// `COPY_ERROR_FLASH_DURATION_MS` (tui-alt-screen.ts:80, #9618
@@ -65,38 +65,38 @@ const COPY_ERROR_FLASH_DURATION_MS: u64 = 5000;
 use crate::components::scroll_view::{
     Follow, Overscroll, ScrollView, ScrollViewOptions, ScrollViewScrollToOptions, ScrollbarMode,
 };
-use crate::keybindings::{get_keybindings, Keybinding};
+use crate::keybindings::{Keybinding, get_keybindings};
 use crate::keys::is_key_release;
 use crate::kitty_registry::{
     clear_kitty_image_cache, kitty_image_cache_has_entries, prepare_kitty_screen,
 };
 use crate::layout::{
-    get_layout_boxes_at, get_scroll_view_box, get_scroll_views_at, render_layout_frame, LayoutBox,
-    LayoutFrame, ScrollbarGeometry,
+    LayoutBox, LayoutFrame, ScrollbarGeometry, get_layout_boxes_at, get_scroll_view_box,
+    get_scroll_views_at, render_layout_frame,
 };
 use crate::mouse::{
-    is_mouse_sequence, is_multiplexer_env, parse_sgr_mouse_event, parse_wheel_event, SgrMouseEvent,
-    WheelEvent, DISABLE_MOUSE, ENABLE_ALL_MOTION_MOUSE, ENABLE_BUTTON_MOTION_MOUSE, FOCUS_IN,
-    FOCUS_OUT,
+    DISABLE_MOUSE, ENABLE_ALL_MOTION_MOUSE, ENABLE_BUTTON_MOTION_MOUSE, FOCUS_IN, FOCUS_OUT,
+    SgrMouseEvent, WheelEvent, is_mouse_sequence, is_multiplexer_env, parse_sgr_mouse_event,
+    parse_wheel_event,
 };
 use crate::terminal::{InputHandler, ResizeHandler, Terminal};
 use crate::terminal_colors::{RgbColor, TerminalColorScheme};
 use crate::terminal_image::{
-    delete_all_kitty_images, delete_all_kitty_placements, get_capabilities, is_image_line,
-    set_capabilities, ImageProtocol, TerminalCapabilities,
+    ImageProtocol, TerminalCapabilities, delete_all_kitty_images, delete_all_kitty_placements,
+    get_capabilities, is_image_line, set_capabilities,
 };
 use crate::tui::{
-    composite_tui_line, dispatch_mouse_event, lock_component, lock_shared, retarget_mouse_event,
-    same_component, shared_component, Component, OverlayAnchor, OverlayBounds, OverlayHandle,
-    OverlayHandleOps, OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, RenderHandle,
-    SharedComponent, SharedTerminal, SizeValue, TerminalColorSchemeListener, Tui, TuiInputListener,
+    CURSOR_MARKER, Component, OverlayAnchor, OverlayBounds, OverlayHandle, OverlayHandleOps,
+    OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, RenderHandle, SharedComponent,
+    SharedTerminal, SizeValue, TerminalColorSchemeListener, Tui, TuiInputListener,
     TuiInputListenerResult, TuiMode, TuiMouseButton, TuiMouseDispatchResult,
     TuiMouseDispatchTarget, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult,
-    TuiStopOptions, ViewportTui, CURSOR_MARKER,
+    TuiStopOptions, ViewportTui, composite_tui_line, dispatch_mouse_event, lock_component,
+    lock_shared, retarget_mouse_event, same_component, shared_component,
 };
 use crate::tui_base::{
-    schedule_render, PendingOsc11BackgroundQuery, PendingTerminalColorSchemeQuery, RenderSchedule,
-    TerminalSizeCache, TuiBase,
+    PendingOsc11BackgroundQuery, PendingTerminalColorSchemeQuery, RenderSchedule,
+    TerminalSizeCache, TuiBase, schedule_render,
 };
 use crate::utils::{
     extract_ansi_code, get_grapheme_cell_range, get_osc8_link_at_column, get_word_segmenter,
@@ -1845,8 +1845,10 @@ impl TuiAltScreenInner {
         };
         if direct {
             drain_pending_into(&inner, pending);
-        } else if let Some(op) = op.take() {
-            lock_shared(pending).push(op);
+        } else {
+            if let Some(op) = op.take() {
+                lock_shared(pending).push(op);
+            }
         }
     }
 
@@ -2180,10 +2182,10 @@ impl TuiAltScreenInner {
         if self.consume_terminal_color_scheme_report(data) {
             return;
         }
-        if let Some(result) = self.handle_viewport_input(data) {
-            if result.consume {
-                return;
-            }
+        if let Some(result) = self.handle_viewport_input(data)
+            && result.consume
+        {
+            return;
         }
         self.handle_input_dispatch(data);
     }
@@ -2669,11 +2671,11 @@ impl TuiAltScreenInner {
             .clone()
             .or_else(|| self.mouse_press_target.clone())
         {
-            if let Some((press_x, press_y)) = self.mouse_press_point {
-                if raw.x != press_x || raw.y != press_y {
-                    self.mouse_press_moved = true;
-                    self.last_component_click = None;
-                }
+            if let Some((press_x, press_y)) = self.mouse_press_point
+                && (raw.x != press_x || raw.y != press_y)
+            {
+                self.mouse_press_moved = true;
+                self.last_component_click = None;
             }
             let mut render = false;
             if let Some(target_result) = self.dispatch_mouse_to_target(&event, &target) {
@@ -2874,16 +2876,15 @@ impl TuiAltScreenInner {
         for scroll_view in get_scroll_views_at(layout, x, y) {
             let geometry = get_scroll_view_box(layout, &scroll_view)
                 .and_then(|box_| crate::layout::get_scrollbar_geometry(box_, include_hidden_auto));
-            if let Some(geometry) = geometry {
-                if x == geometry.column
-                    && y >= geometry.track_top
-                    && y < geometry.track_top + geometry.track_height as isize
-                {
-                    return Some(ScrollbarTarget {
-                        scroll_view,
-                        geometry,
-                    });
-                }
+            if let Some(geometry) = geometry
+                && x == geometry.column
+                && y >= geometry.track_top
+                && y < geometry.track_top + geometry.track_height as isize
+            {
+                return Some(ScrollbarTarget {
+                    scroll_view,
+                    geometry,
+                });
             }
         }
         None
@@ -3065,10 +3066,10 @@ impl TuiAltScreenInner {
         event: SgrMouseEvent,
         scroll_view: Option<&SharedComponent>,
     ) -> SelectionPoint {
-        if let Some(scroll_view) = scroll_view {
-            if let Some(point) = self.get_scroll_selection_point(scroll_view, event.x, event.y) {
-                return point;
-            }
+        if let Some(scroll_view) = scroll_view
+            && let Some(point) = self.get_scroll_selection_point(scroll_view, event.x, event.y)
+        {
+            return point;
         }
         // Separate statements: each `terminal()` guard must drop before the
         // next acquisition (std::sync::Mutex is not reentrant).
@@ -3085,12 +3086,11 @@ impl TuiAltScreenInner {
     /// `getSelectionSourceLine` (tui-alt-screen.ts:636-642): the raw content
     /// line a selection point refers to.
     fn get_selection_source_line(&self, point: &SelectionPoint) -> String {
-        if let (Some(scroll_view), Some(layout)) = (&point.scroll_view, &self.current_layout) {
-            if let Some(lines) = get_scroll_view_box(layout, scroll_view)
+        if let (Some(scroll_view), Some(layout)) = (&point.scroll_view, &self.current_layout)
+            && let Some(lines) = get_scroll_view_box(layout, scroll_view)
                 .and_then(|layout_box| layout_box.scroll_content_lines.as_ref())
-            {
-                return lines.get(point.row).cloned().unwrap_or_default();
-            }
+        {
+            return lines.get(point.row).cloned().unwrap_or_default();
         }
         self.previous_screen
             .get(point.row)
@@ -3580,11 +3580,7 @@ impl TuiAltScreenInner {
             );
         }
         let text = lines.join("\n");
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 
     /// `copySelectionToClipboard` (tui-alt-screen.ts:1437-1440): the
@@ -3960,13 +3956,12 @@ impl TuiAltScreenInner {
     /// All scroll views in the current layout (dedup by identity).
     fn layout_scroll_views(&self) -> Vec<SharedComponent> {
         fn collect(layout_box: &LayoutBox, out: &mut Vec<SharedComponent>) {
-            if let Some(scroll_view) = &layout_box.scroll_view {
-                if !out
+            if let Some(scroll_view) = &layout_box.scroll_view
+                && !out
                     .iter()
                     .any(|existing| same_component(existing, scroll_view))
-                {
-                    out.push(scroll_view.clone());
-                }
+            {
+                out.push(scroll_view.clone());
             }
             for child in &layout_box.children {
                 collect(child, out);
@@ -4164,14 +4159,14 @@ impl TuiAltScreenInner {
     /// [`TuiMainScreenInner::tick`]).
     fn tick(&mut self, now: Instant) {
         self.flashes.tick(now);
-        if let Some(next) = self.selection_auto_scroll_next {
-            if now >= next {
-                self.auto_scroll_selection();
-                // `setInterval` re-arm: fire again one period after the fired
-                // instant, unless the scroll stopped (which clears it).
-                if self.selection_auto_scroll_next.is_some() {
-                    self.selection_auto_scroll_next = Some(next + AUTO_SCROLL_INTERVAL);
-                }
+        if let Some(next) = self.selection_auto_scroll_next
+            && now >= next
+        {
+            self.auto_scroll_selection();
+            // `setInterval` re-arm: fire again one period after the fired
+            // instant, unless the scroll stopped (which clears it).
+            if self.selection_auto_scroll_next.is_some() {
+                self.selection_auto_scroll_next = Some(next + AUTO_SCROLL_INTERVAL);
             }
         }
         self.tick_scroll_views(now);
@@ -4452,16 +4447,16 @@ mod tests {
     use crate::components::v_stack::VStack;
     use crate::layout_node::Basis;
     use crate::terminal_image::{
-        encode_kitty, hyperlink, register_kitty_image_metadata, reset_capabilities_cache,
-        ImageDimensions, KittyEncodeOptions, KittyImageMetadata,
+        ImageDimensions, KittyEncodeOptions, KittyImageMetadata, encode_kitty, hyperlink,
+        register_kitty_image_metadata, reset_capabilities_cache,
     };
     use crate::test_vt::{
-        osc52_sequence, send_input, settle, state_lock, EnvGuard, RecordingTerminal, TestTui,
-        VirtualTerminal, VtEvent,
+        EnvGuard, RecordingTerminal, TestTui, VirtualTerminal, VtEvent, osc52_sequence, send_input,
+        settle, state_lock,
     };
-    use crate::tui::{shared_component, Focusable, SizeValue, TuiMouseEventResult};
-    use std::sync::atomic::AtomicBool;
+    use crate::tui::{Focusable, SizeValue, TuiMouseEventResult, shared_component};
     use std::sync::MutexGuard;
+    use std::sync::atomic::AtomicBool;
 
     /// `TestTui` drive impl backing the shared settle/render helpers.
     impl TestTui for TuiAltScreen {
@@ -5690,10 +5685,12 @@ mod tests {
         settle(&tui);
         assert!(!with_sv(&scroll_view, ScrollView::is_scrollbar_visible));
 
-        assert!(terminal
-            .events()
-            .iter()
-            .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]52;c;"))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]52;c;")))
+        );
         stop(&tui);
     }
 
@@ -5732,10 +5729,12 @@ mod tests {
         settle(&tui);
 
         let expected = osc52_sequence("A\nabcdefghij");
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&expected))),);
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&expected))),
+        );
         stop(&tui);
     }
 
@@ -5771,10 +5770,12 @@ mod tests {
         settle(&tui);
         assert!(with_sv(&scroll_view, ScrollView::is_scrollbar_visible));
         assert!(with_sv(&scroll_view, ScrollView::is_scrollbar_active));
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains(['│', '█'])));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains(['│', '█']))
+        );
 
         // Leaving the track arms the hide deadline; after it fires the
         // scrollbar is hidden again.
@@ -5826,10 +5827,12 @@ mod tests {
         // Track drags/presses never touch the clipboard.
         send_input(&terminal, &tui, "\x1b[<0;10;10m");
         settle(&tui);
-        assert!(terminal
-            .events()
-            .iter()
-            .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]52;c;"))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]52;c;")))
+        );
         stop(&tui);
     }
 
@@ -5924,10 +5927,12 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&expected_clipboard_sequence))),
         );
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[7m"))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[7m")))
+        );
         assert!(
             terminal
                 .events()
@@ -5935,10 +5940,12 @@ mod tests {
                 .any(|event| matches!(event, VtEvent::Write(data) if data.contains("al\x1b[0m\x1b[7mpha"))),
             "selection inverse must be reapplied after a reset inside the selection"
         );
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("Copied!")));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("Copied!"))
+        );
 
         stop(&tui);
     }
@@ -5984,10 +5991,12 @@ mod tests {
                 .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]52;c;"))),
             "must not emit OSC 52 when a copySelection handler is provided"
         );
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("Copied!")));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("Copied!"))
+        );
 
         stop(&tui);
     }
@@ -6028,14 +6037,18 @@ mod tests {
 
         assert!(lock_shared(&copied).is_empty());
         assert!(tui.has_active_selection());
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[7m"))));
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .all(|line| !line.contains("Copied!")));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[7m")))
+        );
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .all(|line| !line.contains("Copied!"))
+        );
 
         stop(&tui);
     }
@@ -6084,10 +6097,12 @@ mod tests {
         settle(&tui);
 
         assert_eq!(lock_shared(&copied).as_slice(), ["alpha\nbeta".to_string()]);
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("Copied!")));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("Copied!"))
+        );
 
         stop(&tui);
     }
@@ -6120,10 +6135,12 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<0;4;2m");
         settle(&tui);
 
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("Copy failed")));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("Copy failed"))
+        );
         assert!(
             terminal
                 .events()
@@ -6155,10 +6172,12 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<0;3;1M");
         settle(&tui);
 
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("foo\x1b[27m"))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("foo\x1b[27m")))
+        );
         stop(&tui);
     }
 
@@ -6183,10 +6202,11 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<32;4;1M");
         settle(&tui);
 
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("foo  \x1b[27m"))));
+        assert!(
+            terminal.events().iter().any(
+                |event| matches!(event, VtEvent::Write(data) if data.contains("foo  \x1b[27m"))
+            )
+        );
         stop(&tui);
     }
 
@@ -6210,10 +6230,12 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<0;10;1m");
         settle(&tui);
         let alpha = osc52_sequence("alpha");
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&alpha))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&alpha)))
+        );
 
         // A double-click drag includes each word touched, rather than partial words.
         send_input(&terminal, &tui, "\x1b[<0;12;1M");
@@ -6223,10 +6245,12 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<0;3;2m");
         settle(&tui);
         let words = osc52_sequence("beta\ngamma");
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&words))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&words)))
+        );
 
         send_input(&terminal, &tui, "\x1b[<0;7;2M");
         send_input(&terminal, &tui, "\x1b[<0;7;2m");
@@ -6236,10 +6260,12 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<0;11;2m");
         settle(&tui);
         let line = osc52_sequence("gamma delta");
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&line))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&line)))
+        );
 
         stop(&tui);
     }
@@ -6286,16 +6312,20 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<0;4;2m");
         settle(&tui);
         assert_eq!(clipboard_write_count(), 0);
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[?1004h"))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[?1004h")))
+        );
 
         stop(&tui);
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[?1004l"))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[?1004l")))
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -6487,18 +6517,24 @@ mod tests {
         stop(&tui);
 
         let events = terminal.events();
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b_G"))));
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]133;"))));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b_G")))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]133;")))
+        );
         assert!(events.iter().all(
             |event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]1337;File="))
         ));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("[Image:"))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("[Image:")))
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -6528,9 +6564,11 @@ mod tests {
 
         tui.scroll_by(1);
         settle(&tui);
-        assert!(terminal.events()[event_count..]
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[2J"))));
+        assert!(
+            terminal.events()[event_count..]
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[2J")))
+        );
         stop(&tui);
     }
 
@@ -6734,10 +6772,12 @@ mod tests {
         ))));
         tui.start();
         settle(&tui);
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b_Ga=T"))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b_Ga=T")))
+        );
 
         let event_count = terminal.events().len();
         set_lines(&label_handle, &["changed".to_string()]);
@@ -6772,10 +6812,12 @@ mod tests {
             "expected placement-only redraw, got {} bytes",
             redraw_writes.len()
         );
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.trim_end() == "changed"));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.trim_end() == "changed")
+        );
         stop(&tui);
     }
 
@@ -6815,10 +6857,12 @@ mod tests {
         ))));
         tui.start();
         settle(&tui);
-        assert!(terminal
-            .events()
-            .iter()
-            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b_Ga=T"))));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b_Ga=T")))
+        );
 
         let event_count = terminal.events().len();
         tui.scroll_by(1);
@@ -7052,12 +7096,11 @@ mod tests {
                 let data: String = data.clone();
                 if let Some(start) = data.find("\x1b]52;c;") {
                     let payload = &data[start + 7..];
-                    if let Some(end) = payload.find('\x07') {
-                        if let Ok(bytes) =
+                    if let Some(end) = payload.find('\x07')
+                        && let Ok(bytes) =
                             base64::engine::general_purpose::STANDARD.decode(&payload[..end])
-                        {
-                            last = Some(String::from_utf8(bytes).unwrap_or_default());
-                        }
+                    {
+                        last = Some(String::from_utf8(bytes).unwrap_or_default());
                     }
                 }
             }
@@ -7911,12 +7954,16 @@ mod tests {
         assert!(!with_sv(&transcript, ScrollView::is_following_end));
         let viewport = terminal.get_viewport();
         assert!(viewport.iter().any(|line| line.contains("2/2")));
-        assert!(viewport
-            .iter()
-            .any(|line| line.contains("↑ Shift+Enter · ↓ Enter")));
-        assert!(viewport
-            .iter()
-            .any(|line| line.contains("line 10 needle two")));
+        assert!(
+            viewport
+                .iter()
+                .any(|line| line.contains("↑ Shift+Enter · ↓ Enter"))
+        );
+        assert!(
+            viewport
+                .iter()
+                .any(|line| line.contains("line 10 needle two"))
+        );
         assert!(lock_shared(&editor_inputs).is_empty());
         // Default current-match style (tui-alt-screen.ts:266).
         assert!(terminal.writes().contains("\x1b[1;7mneedle\x1b[22;27m"));
@@ -7929,36 +7976,44 @@ mod tests {
         settle(&tui);
         assert_eq!(with_sv(&transcript, ScrollView::scroll_top), 0);
         let viewport = terminal.get_viewport();
-        assert!(viewport
-            .iter()
-            .any(|line| line.contains("needle") && line.contains("2/2")));
+        assert!(
+            viewport
+                .iter()
+                .any(|line| line.contains("needle") && line.contains("2/2"))
+        );
 
         // ctrl+g → next match.
         send_input(&terminal, &tui, "\x07");
         settle(&tui);
         let viewport = terminal.get_viewport();
         assert!(viewport.iter().any(|line| line.contains("1/2")));
-        assert!(viewport
-            .iter()
-            .any(|line| line.contains("line 5 needle one")));
+        assert!(
+            viewport
+                .iter()
+                .any(|line| line.contains("line 5 needle one"))
+        );
 
         // ctrl+shift+g → previous match.
         send_input(&terminal, &tui, "\x1b[103;6u");
         settle(&tui);
         let viewport = terminal.get_viewport();
         assert!(viewport.iter().any(|line| line.contains("2/2")));
-        assert!(viewport
-            .iter()
-            .any(|line| line.contains("line 10 needle two")));
+        assert!(
+            viewport
+                .iter()
+                .any(|line| line.contains("line 10 needle two"))
+        );
 
         // escape closes; plain keys flow back to the editor.
         send_input(&terminal, &tui, "\x1b");
         send_input(&terminal, &tui, "x");
         settle(&tui);
-        assert!(!terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("↑ Shift+Enter · ↓ Enter")));
+        assert!(
+            !terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("↑ Shift+Enter · ↓ Enter"))
+        );
         assert_eq!(lock_shared(&editor_inputs).as_slice(), ["x"]);
 
         stop(&tui);
@@ -7993,9 +8048,11 @@ mod tests {
         settle(&tui);
         let viewport = terminal.get_viewport();
         assert!(viewport.iter().any(|line| line.contains("1/2")));
-        assert!(viewport
-            .iter()
-            .any(|line| line.contains("↑ Shift+Enter · ↓ Enter")));
+        assert!(
+            viewport
+                .iter()
+                .any(|line| line.contains("↑ Shift+Enter · ↓ Enter"))
+        );
 
         let arrow_row = viewport
             .iter()
@@ -8028,18 +8085,22 @@ mod tests {
             &format!("\x1b[<0;{arrow_column};{}M", arrow_row as u32 + 1),
         );
         settle(&tui);
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("1/2")));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("1/2"))
+        );
 
         // Toggle with ctrl+shift+f again closes the overlay.
         send_input(&terminal, &tui, "\x1b[102;6u");
         settle(&tui);
-        assert!(!terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("↑ Shift+Enter · ↓ Enter")));
+        assert!(
+            !terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("↑ Shift+Enter · ↓ Enter"))
+        );
         stop(&tui);
     }
 
@@ -8140,10 +8201,12 @@ mod tests {
 
         send_input(&terminal, &tui, "\x1b[102;6u");
         settle(&tui);
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("↑ ↓")));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("↑ ↓"))
+        );
 
         // PageUp and wheel still scroll the transcript (the focused search
         // overlay only consumes its own keys).
@@ -8151,10 +8214,12 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<64;1;4M");
         settle(&tui);
         assert!(tui.viewport_top() < top_before);
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("↑ ↓")));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("↑ ↓"))
+        );
         stop(&tui);
     }
 
@@ -8282,10 +8347,12 @@ mod tests {
         );
         tui.start();
         settle(&tui);
-        assert!(!terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("Jump to end")));
+        assert!(
+            !terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("Jump to end"))
+        );
 
         send_input(&terminal, &tui, "\x1b[<64;1;1M");
         settle(&tui);
@@ -8422,10 +8489,12 @@ mod tests {
         settle(&tui);
 
         assert!(!with_sv(&transcript, ScrollView::is_following_end));
-        assert!(!terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("Jump to end")));
+        assert!(
+            !terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("Jump to end"))
+        );
         stop(&tui);
     }
 

@@ -126,11 +126,7 @@ pub fn parse_terminal_color_scheme_report(data: &str) -> Option<TerminalColorSch
         }
     }
     // `+` requires at least one report and the whole input must match (`$`).
-    if rest.is_empty() {
-        last
-    } else {
-        None
-    }
+    if rest.is_empty() { last } else { None }
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::i18n::I18n;
 use crate::state::reducer::QuestionnaireState;
-use crate::tool::envelope::{format_answer_scalar, FormatAnswerVariant};
+use crate::tool::envelope::{FormatAnswerVariant, format_answer_scalar};
 use crate::tool::types::{QuestionAnswer, QuestionData};
 use crate::view::option_list::BodyRender;
 use crate::view::theme::Theme;
@@ -58,20 +58,20 @@ pub fn render_answers(
         .notes_by_tab
         .get(&questions.len())
         .filter(|note| !note.is_empty());
-    if let Some(note) = global_note {
-        if !state.notes_visible {
-            lines.push(truncate_line(
-                &format!(
-                    " ● {}",
-                    theme.muted(i18n.t("review.note_label", REVIEW_NOTE_LABEL))
-                ),
-                width,
-            ));
-            lines.push(truncate_line(
-                &format!("   → {}", theme.fg(theme.text, note)),
-                width,
-            ));
-        }
+    if let Some(note) = global_note
+        && !state.notes_visible
+    {
+        lines.push(truncate_line(
+            &format!(
+                " ● {}",
+                theme.muted(i18n.t("review.note_label", REVIEW_NOTE_LABEL))
+            ),
+            width,
+        ));
+        lines.push(truncate_line(
+            &format!("   → {}", theme.fg(theme.text, note)),
+            width,
+        ));
     }
     lines
 }

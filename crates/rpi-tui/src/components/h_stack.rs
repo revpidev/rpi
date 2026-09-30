@@ -10,10 +10,10 @@
 //! Intentional differences: none beyond those of `stack.rs` (which see).
 
 use crate::components::stack::{
-    allocate_stack_sizes, visible_stack_entries, Stack, StackChild, StackEntryOptions, StackOptions,
+    Stack, StackChild, StackEntryOptions, StackOptions, allocate_stack_sizes, visible_stack_entries,
 };
 use crate::layout_node::{LayoutNode, LayoutViewport, StackAlign, StackKind};
-use crate::tui::{composite_tui_line, lock_component, Component, SharedComponent};
+use crate::tui::{Component, SharedComponent, composite_tui_line, lock_component};
 use crate::utils::visible_width;
 
 /// `HStack.render` (h-stack.ts:12-43), shared by `Stack::render` dispatch.

@@ -30,7 +30,7 @@ use rpi_agent::harness::types::{
     FileSystem, ReadTextLinesOptions, RemoveOptions, Shell, ShellExecOptions,
 };
 use rpi_agent::harness::utils::shell_output::{
-    execute_shell_with_capture, sanitize_binary_output, ShellCaptureOptions,
+    ShellCaptureOptions, execute_shell_with_capture, sanitize_binary_output,
 };
 use rpi_ai::utils::uuid::uuidv7_now;
 use tokio_util::sync::CancellationToken;
@@ -99,7 +99,7 @@ impl ProcessEnvGuard {
         if let Some(path) = &original_path {
             new_path.push(path);
         }
-        std::env::set_var("PATH", new_path);
+        rpi_test_env::set_var("PATH", new_path);
         ProcessEnvGuard {
             original_cwd,
             original_path,
@@ -110,8 +110,8 @@ impl ProcessEnvGuard {
 impl Drop for ProcessEnvGuard {
     fn drop(&mut self) {
         match &self.original_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
+            Some(path) => rpi_test_env::set_var("PATH", path),
+            None => rpi_test_env::remove_var("PATH"),
         }
         let _ = std::env::set_current_dir(&self.original_cwd);
     }

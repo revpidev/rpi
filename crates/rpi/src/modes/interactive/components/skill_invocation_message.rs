@@ -8,8 +8,8 @@
 use std::boxed::Box as StdBox;
 use std::sync::Arc;
 
-use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use rpi_tui::components::r#box::Box as TuiBox;
+use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use rpi_tui::components::text::Text;
 use rpi_tui::tui::Component;
 

@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use rpi_ext_mcp_adapter::manager::{ConnectionStatus, McpServerManager};
 use rpi_ext_mcp_adapter::metadata::ServerEntry;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn temp_workdir() -> String {
     let nanos = std::time::SystemTime::now()

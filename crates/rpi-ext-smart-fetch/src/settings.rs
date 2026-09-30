@@ -192,10 +192,10 @@ impl FingerprintOs<'_> {
 /// method exists (design §1.3 #4); the unit test pins the rule against
 /// drift with the host's derivation.
 pub fn agent_dir() -> PathBuf {
-    if let Some(env_dir) = std::env::var_os("RPI_CODING_AGENT_DIR") {
-        if !env_dir.is_empty() {
-            return PathBuf::from(env_dir);
-        }
+    if let Some(env_dir) = std::env::var_os("RPI_CODING_AGENT_DIR")
+        && !env_dir.is_empty()
+    {
+        return PathBuf::from(env_dir);
     }
     home_dir()
         .map(|home| home.join(".rpi").join("agent"))
@@ -205,10 +205,10 @@ pub fn agent_dir() -> PathBuf {
 /// `HOME` / `USERPROFILE` (same helper shape as the sibling plugins).
 fn home_dir() -> Option<PathBuf> {
     for key in ["HOME", "USERPROFILE"] {
-        if let Some(value) = std::env::var_os(key) {
-            if !value.is_empty() {
-                return Some(PathBuf::from(value));
-            }
+        if let Some(value) = std::env::var_os(key)
+            && !value.is_empty()
+        {
+            return Some(PathBuf::from(value));
         }
     }
     None
@@ -273,11 +273,13 @@ mod tests {
         assert_eq!(resolved.config.max_chars, Some(2000));
         assert_eq!(resolved.config.browser.as_deref(), Some("chrome_145"));
         // [VARIANT] temp dir default carries the rpi name.
-        assert!(resolved
-            .config
-            .temp_dir
-            .as_deref()
-            .is_some_and(|dir| dir.ends_with(DEFAULT_TEMP_DIR_NAME)));
+        assert!(
+            resolved
+                .config
+                .temp_dir
+                .as_deref()
+                .is_some_and(|dir| dir.ends_with(DEFAULT_TEMP_DIR_NAME))
+        );
     }
 
     #[test]
@@ -310,13 +312,13 @@ mod tests {
         struct Guard;
         impl Guard {
             fn new() -> Self {
-                std::env::remove_var("RPI_CODING_AGENT_DIR");
+                rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
                 Guard
             }
         }
         impl Drop for Guard {
             fn drop(&mut self) {
-                std::env::remove_var("RPI_CODING_AGENT_DIR");
+                rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
             }
         }
         let _guard = Guard::new();
@@ -328,7 +330,7 @@ mod tests {
                 "default derivation must mirror the host's getAgentDir"
             );
         }
-        std::env::set_var("RPI_CODING_AGENT_DIR", "/tmp/rpi-agent-override");
+        rpi_test_env::set_var("RPI_CODING_AGENT_DIR", "/tmp/rpi-agent-override");
         assert_eq!(agent_dir(), PathBuf::from("/tmp/rpi-agent-override"));
     }
 

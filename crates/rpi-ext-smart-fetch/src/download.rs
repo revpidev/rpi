@@ -12,7 +12,7 @@ use regex::Regex;
 
 use crate::constants::DEFAULT_TEMP_DIR_NAME;
 use crate::http::ResponseBody;
-use crate::pipeline::{map_fetch_failure, FetchErrorContext, FetchExecutionHooks};
+use crate::pipeline::{FetchErrorContext, FetchExecutionHooks, map_fetch_failure};
 use crate::types::{FetchError, FetchOutcome, FetchResult};
 
 /// `deburr` (lodash): Latin-1/Latin Extended-A diacritics fold to ASCII.
@@ -363,10 +363,10 @@ pub async fn stream_response_to_file_with_progress(
         last_push = Some((std::time::Instant::now(), downloaded));
     };
 
-    if let Some(parent) = file_path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            return Err((body, DownloadFailure::io(&error, 0)));
-        }
+    if let Some(parent) = file_path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return Err((body, DownloadFailure::io(&error, 0)));
     }
 
     let mut downloaded_bytes = 0u64;
@@ -795,8 +795,8 @@ fn progress_gate_resets_after_push() {
 #[tokio::test]
 async fn m7_multichunk_download_body_progress_frames_are_gated() {
     use crate::pipeline::FetchExecutionHooks;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const CHUNKS: usize = 625;
     const CHUNK_LEN: usize = 16 * 1024;

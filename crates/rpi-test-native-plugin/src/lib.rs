@@ -10,11 +10,11 @@
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::interactive_ui::{
-    run_component, AnsiColor, AnsiStyle, Component, ComponentCursor, DisposeReason,
-    InteractiveUiError, LineBuilder, MountOptions, NativeHostCall, CURSOR_MARKER,
+    AnsiColor, AnsiStyle, CURSOR_MARKER, Component, ComponentCursor, DisposeReason,
+    InteractiveUiError, LineBuilder, MountOptions, NativeHostCall, run_component,
 };
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The host-call handle stashed at init so dispatch handlers can call back
 /// (TE01 probe). `extern "C" fn` pointers are Send + Sync.

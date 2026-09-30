@@ -18,7 +18,7 @@ use std::time::Duration;
 use rpi_ext_mcp_adapter::manager::{ConnectionStatus, McpServerManager};
 use rpi_ext_mcp_adapter::metadata::ServerEntry;
 use rpi_ext_mcp_adapter::proxy;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -1006,20 +1006,20 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
     )
     .expect("config");
 
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
     // HOME 指向空目录：全局配置源（~/.config/mcp/... 等）全部不存在，
     // 隔离开发者机器上的真实全局配置。install 后台驱动与后续每次
     // surface sync 都按这两个变量解析缓存/配置路径——整个用例期间保持，
     // 末尾恢复。本用例是本测试二进制内唯一 install_for_test 调用者，
     // 其余用例不读这两个变量。
     let saved_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &dir);
+    rpi_test_env::set_var("HOME", &dir);
     // MCP_DIRECT_TOOLS 隔离（对齐上游 `__tests__/index-lifecycle.test.ts:159-192`）：
     // pi 的 subagents 扩展给子代理注入 `MCP_DIRECT_TOOLS=__none__`
     //（pi-subagents child-launch.ts:159），会按设计关闭 direct 工具面；本用例
     // 断言 direct 工具来自 metadata cache，必须清空该变量后恢复。
     let saved_direct_tools = std::env::var_os("MCP_DIRECT_TOOLS");
-    std::env::remove_var("MCP_DIRECT_TOOLS");
+    rpi_test_env::remove_var("MCP_DIRECT_TOOLS");
     let host_ptr = Arc::into_raw(host.clone()) as PluginCookie;
     let calls = RpiHostCalls {
         call: fake_host_call,
@@ -1107,14 +1107,14 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
     );
 
     // 环境恢复（后续用例回到默认 HOME / agent dir）。
-    std::env::remove_var("RPI_CODING_AGENT_DIR");
+    rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
     match saved_home {
-        Some(home) => std::env::set_var("HOME", home),
-        None => std::env::remove_var("HOME"),
+        Some(home) => rpi_test_env::set_var("HOME", home),
+        None => rpi_test_env::remove_var("HOME"),
     }
     match saved_direct_tools {
-        Some(value) => std::env::set_var("MCP_DIRECT_TOOLS", value),
-        None => std::env::remove_var("MCP_DIRECT_TOOLS"),
+        Some(value) => rpi_test_env::set_var("MCP_DIRECT_TOOLS", value),
+        None => rpi_test_env::remove_var("MCP_DIRECT_TOOLS"),
     }
     stop.cancel();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1433,10 +1433,12 @@ async fn proxy_call_approval_denied_returns_denial_details() {
     )
     .await;
     assert_eq!(result["details"]["error"], json!("approval_denied"));
-    assert!(result["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("declined approval"));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("declined approval")
+    );
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     runtime.owner_cancel.cancel();

@@ -75,10 +75,8 @@ async fn l0_load_capability_denied_and_full_surface() {
     std::fs::create_dir_all(sandbox.join("agent")).unwrap();
     // Isolate the loaded plugin's discovery from the developer's real ~/.rpi.
     // Safety of set_var in tests: this is the only test in this binary.
-    unsafe {
-        std::env::set_var("RPI_CODING_AGENT_DIR", sandbox.join("agent"));
-        std::env::set_var("RPI_SUBAGENT_RPI_BINARY", "/nonexistent-rpi");
-    }
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", sandbox.join("agent"));
+    rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", "/nonexistent-rpi");
 
     // 1. Without the `tools` capability the registerTool host call is denied
     //    and init fails the load with capabilityDenied.

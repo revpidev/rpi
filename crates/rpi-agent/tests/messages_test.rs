@@ -6,10 +6,10 @@
 //! so prefixes/suffixes are part of the parity contract.
 
 use rpi_agent::messages::{
-    bash_execution_to_text, convert_to_llm, AgentMessage, BashExecutionMessage, BashExecutionRole,
-    BranchSummaryMessage, BranchSummaryRole, CompactionSummaryMessage, CompactionSummaryRole,
-    CustomMessage, CustomRole, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
+    AgentMessage, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, BashExecutionMessage,
+    BashExecutionRole, BranchSummaryMessage, BranchSummaryRole, COMPACTION_SUMMARY_PREFIX,
+    COMPACTION_SUMMARY_SUFFIX, CompactionSummaryMessage, CompactionSummaryRole, CustomMessage,
+    CustomRole, bash_execution_to_text, convert_to_llm,
 };
 use rpi_ai::types::{
     AssistantMessage, AssistantRole, Message, StopReason, TextContent, ToolResultContent,

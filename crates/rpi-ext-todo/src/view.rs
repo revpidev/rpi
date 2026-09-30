@@ -14,11 +14,11 @@
 //! Unknown tokens render unstyled (the host's lenient fallback), never
 //! panic.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::i18n::I18n;
-use crate::state::selectors;
 use crate::state::TaskState;
+use crate::state::selectors;
 use crate::tool::sanitize::sanitize_terminal_text;
 use crate::tool::types::{Task, TaskAction, TaskStatus};
 
@@ -102,14 +102,14 @@ impl AnsiTheme {
 
 /// `#rrggbb` → truecolor SGR prefix (host `fg_ansi` truecolor arm).
 fn hex_prefix(hex: &str) -> String {
-    if hex.len() == 6 {
-        if let (Some(r), Some(g), Some(b)) = (
+    if hex.len() == 6
+        && let (Some(r), Some(g), Some(b)) = (
             u8::from_str_radix(&hex[0..2], 16).ok(),
             u8::from_str_radix(&hex[2..4], 16).ok(),
             u8::from_str_radix(&hex[4..6], 16).ok(),
-        ) {
-            return format!("\x1b[38;2;{r};{g};{b}m");
-        }
+        )
+    {
+        return format!("\x1b[38;2;{r};{g};{b}m");
     }
     String::new()
 }
@@ -201,14 +201,14 @@ pub fn format_overlay_task_line(task: &Task, theme: &dyn TodoTheme, show_id: boo
     }
     line.push(' ');
     line.push_str(&subject);
-    if task.status == TaskStatus::InProgress {
-        if let Some(active_form) = task.active_form.as_deref().filter(|form| !form.is_empty()) {
-            line.push(' ');
-            line.push_str(&theme.fg(
-                "muted",
-                &format!("({})", sanitize_terminal_text(active_form)),
-            ));
-        }
+    if task.status == TaskStatus::InProgress
+        && let Some(active_form) = task.active_form.as_deref().filter(|form| !form.is_empty())
+    {
+        line.push(' ');
+        line.push_str(&theme.fg(
+            "muted",
+            &format!("({})", sanitize_terminal_text(active_form)),
+        ));
     }
     if let Some(deps) = task.blocked_by.as_ref().filter(|deps| !deps.is_empty()) {
         let chain = deps
@@ -326,15 +326,14 @@ pub fn render_todo_call(
             text.push(' ');
             text.push_str(&theme.fg("accent", &label));
         }
-    } else if action == Some(TaskAction::List) {
-        if let Some(status) = args
+    } else if action == Some(TaskAction::List)
+        && let Some(status) = args
             .get("status")
             .and_then(Value::as_str)
             .and_then(TaskStatus::parse)
-        {
-            text.push(' ');
-            text.push_str(&theme.fg("muted", i18n.format_status_label(status)));
-        }
+    {
+        text.push(' ');
+        text.push_str(&theme.fg("muted", i18n.format_status_label(status)));
     }
     json!({ "type": "text", "props": { "text": text } })
 }

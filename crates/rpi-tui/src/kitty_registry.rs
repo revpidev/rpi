@@ -259,8 +259,8 @@ mod tests {
 
     use super::*;
     use crate::terminal_image::{
-        allocate_image_id, encode_kitty, register_kitty_image_metadata, reset_kitty_image_metadata,
-        KittyEncodeOptions, KittyImageMetadata, TEST_STATE_LOCK,
+        KittyEncodeOptions, KittyImageMetadata, TEST_STATE_LOCK, allocate_image_id, encode_kitty,
+        register_kitty_image_metadata, reset_kitty_image_metadata,
     };
 
     fn lock() -> MutexGuard<'static, ()> {
@@ -356,9 +356,11 @@ mod tests {
         let reentry = prepare_kitty_screen(&screen);
         assert!(reentry.screen[0].contains("\x1b_Ga=p,q=2"));
         assert!(!reentry.screen[0].contains("\x1b_Ga=T"));
-        assert!(!reentry
-            .evicted_image_deletion
-            .contains(&format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")));
+        assert!(
+            !reentry
+                .evicted_image_deletion
+                .contains(&format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\"))
+        );
     }
 
     #[test]

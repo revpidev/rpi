@@ -298,10 +298,12 @@ mod tests {
             .expect("request captured");
         assert_eq!(request.method, "POST");
         assert_eq!(request.url, "http://upstream.test/v1/chat?api-version=1");
-        assert!(request
-            .headers
-            .iter()
-            .any(|(name, value)| name == "authorization" && value == "Bearer k"));
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "Bearer k")
+        );
         let body: serde_json::Value =
             serde_json::from_slice(&request.body.expect("json body")).expect("body json");
         assert_eq!(body, serde_json::json!({"a": 1}));

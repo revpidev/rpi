@@ -270,12 +270,12 @@ fn apply_replacements_preserving_unchanged_lines(
     let mut groups: Vec<(usize, usize, Vec<TextReplacement>)> = Vec::new(); // (startLine, endLine, replacements)
     for replacement in sorted_replacements {
         let range = get_replacement_line_range(&base_lines, replacement)?;
-        if let Some((_, end_line, group_replacements)) = groups.last_mut() {
-            if range.0 < *end_line {
-                *end_line = (*end_line).max(range.1);
-                group_replacements.push(replacement.clone());
-                continue;
-            }
+        if let Some((_, end_line, group_replacements)) = groups.last_mut()
+            && range.0 < *end_line
+        {
+            *end_line = (*end_line).max(range.1);
+            group_replacements.push(replacement.clone());
+            continue;
         }
         groups.push((range.0, range.1, vec![replacement.clone()]));
     }
@@ -781,11 +781,7 @@ fn myers_backtrack_solve(
             } else {
                 let vk_minus_1 = vp[(k - 1 + t_i) as usize];
                 let vk_plus_1 = vp[(k + 1 + t_i) as usize];
-                if vk_minus_1 < vk_plus_1 {
-                    k + 1
-                } else {
-                    k - 1
-                }
+                if vk_minus_1 < vk_plus_1 { k + 1 } else { k - 1 }
             };
 
             let prev_x = vp[(prev_k + t_i) as usize] as usize;
@@ -832,11 +828,12 @@ fn group_diff_parts(entries: &[DiffEntry]) -> Vec<DiffPart> {
             DiffEntry::Removed(l) => (false, true, l),
             DiffEntry::Added(l) => (true, false, l),
         };
-        if let Some(last) = parts.last_mut() {
-            if last.added == added && last.removed == removed {
-                last.lines.push(line.clone());
-                continue;
-            }
+        if let Some(last) = parts.last_mut()
+            && last.added == added
+            && last.removed == removed
+        {
+            last.lines.push(line.clone());
+            continue;
         }
         parts.push(DiffPart {
             added,
@@ -1420,11 +1417,7 @@ mod tests {
             } else {
                 let vk_minus_1 = vp[((k - 1) + offset as isize) as usize];
                 let vk_plus_1 = vp[((k + 1) + offset as isize) as usize];
-                if vk_minus_1 < vk_plus_1 {
-                    k + 1
-                } else {
-                    k - 1
-                }
+                if vk_minus_1 < vk_plus_1 { k + 1 } else { k - 1 }
             };
 
             let prev_x = vp[(prev_k + offset as isize) as usize];
@@ -1554,8 +1547,9 @@ mod tests {
         assert!(patch.starts_with("--- big.txt\n+++ big.txt\n@@ -1,4000 +1,4000 @@\n-"));
         let diff = generate_diff_string(&old_text, &new_text, 4);
         assert_eq!(diff.first_changed_line, Some(1));
-        assert!(diff
-            .diff
-            .starts_with("-   1 old line 0\n-   2 old line 1\n"));
+        assert!(
+            diff.diff
+                .starts_with("-   1 old line 0\n-   2 old line 1\n")
+        );
     }
 }

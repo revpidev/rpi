@@ -4,11 +4,11 @@
 //! `0fdf4f8`. Pure formatter over `(op, state)`; the strings on each
 //! branch are byte-equivalent to the upstream switch output.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::state::TaskState;
 use crate::state::reducer::Op;
 use crate::state::task_graph::derive_blocks;
-use crate::state::TaskState;
 use crate::tool::sanitize::sanitize_terminal_text;
 use crate::tool::types::{Task, TaskAction, TaskDetails};
 

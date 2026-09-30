@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use rpi::core::extension_host_adapter::ExtensionHostAdapter;
 use rpi::core::extensions::{
-    extension_on_response_callback, new_extension_runner_ref, ExtensionRunner,
+    ExtensionRunner, extension_on_response_callback, new_extension_runner_ref,
 };
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
@@ -23,10 +23,10 @@ use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
 use rpi_ext_host::types as ext;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_tool_call,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Shared fixture helpers
@@ -321,10 +321,12 @@ async fn w2_tool_call_block_short_circuits_execution() {
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("policy denies recorder"), "content: {text}");
     // No handler error → no extension error.
-    assert!(ext_errors
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty());
+    assert!(
+        ext_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -582,9 +584,11 @@ async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
         on_json(api, ext::EVENT_SESSION_BEFORE_COMPACT, |event| {
             // Payload-completeness check: preparation/branchEntries/reason/willRetry.
             assert!(event["preparation"].is_object());
-            assert!(event["branchEntries"]
-                .as_array()
-                .is_some_and(|e| !e.is_empty()));
+            assert!(
+                event["branchEntries"]
+                    .as_array()
+                    .is_some_and(|e| !e.is_empty())
+            );
             assert_eq!(event["reason"], "manual");
             assert_eq!(event["willRetry"], false);
             Ok(json!({"cancel": true}))
@@ -820,11 +824,13 @@ async fn w2_user_bash_fail_closed_and_no_handler_fall_back() {
 
     // No handler → Ok(None): the caller runs default bash execution.
     let empty = runner_with(Vec::new()).await;
-    assert!(empty
-        .emit_user_bash("x", false, "/w2-cwd")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        empty
+            .emit_user_bash("x", false, "/w2-cwd")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -987,9 +993,11 @@ async fn w2_before_agent_start_chains_system_prompt_and_injects_messages() {
         inline_ext(|api| {
             on_json(api, ext::EVENT_BEFORE_AGENT_START, |event| {
                 // The real base system prompt is passed in by the caller (non-empty).
-                assert!(event["systemPrompt"]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty()));
+                assert!(
+                    event["systemPrompt"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                );
                 Ok(json!({
                     "message": {"customType": "injected-note", "display": false},
                     "systemPrompt": "prompt-A",

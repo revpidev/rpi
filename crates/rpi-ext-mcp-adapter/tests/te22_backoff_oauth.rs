@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rpi_ext_mcp_adapter::cache::{compute_server_hash, load_metadata_cache};
-use rpi_ext_mcp_adapter::direct::{resolve_direct_tools, DirectToolSpec};
+use rpi_ext_mcp_adapter::direct::{DirectToolSpec, resolve_direct_tools};
 use rpi_ext_mcp_adapter::manager::{ConnectionStatus, McpServerManager};
 use rpi_ext_mcp_adapter::metadata::{ServerEntry, ToolPrefix};
 use rpi_ext_mcp_adapter::oauth::store::{
@@ -26,11 +26,11 @@ use rpi_ext_mcp_adapter::oauth::store::{
     StoredTokens,
 };
 use rpi_ext_mcp_adapter::oauth::{
-    authenticate_with_store, remove_auth_if_token_matches, AuthenticateOptions,
+    AuthenticateOptions, authenticate_with_store, remove_auth_if_token_matches,
 };
 use rpi_ext_mcp_adapter::proxy;
 use rpi_ext_mcp_adapter::status;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -292,10 +292,12 @@ async fn backoff_hides_failed_server_from_every_tool_surface() {
     // A2: describe 不可达。
     let describe = proxy::execute_describe(&runtime, "demo_echo", None);
     assert_eq!(describe["details"]["error"], json!("server_backoff"));
-    assert!(describe["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("not available (last failed"));
+    assert!(
+        describe["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not available (last failed")
+    );
 
     // list / instructions 同样以退避结果短路。
     let list = proxy::execute_list(&runtime, "demo");
@@ -346,10 +348,12 @@ async fn backoff_hides_failed_server_from_every_tool_surface() {
     let restored_describe = proxy::execute_describe(&runtime, "demo_echo", None);
     assert_eq!(restored_describe["details"]["mode"], json!("describe"));
     let restored_list = proxy::execute_list(&runtime, "demo");
-    assert!(restored_list["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("lazy: tools from cache"));
+    assert!(
+        restored_list["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lazy: tools from cache")
+    );
     let restored_specs = direct_specs(&runtime, &cache_path);
     assert_eq!(restored_specs.len(), 1, "specs: {restored_specs:?}");
     let restored_snapshot = status::create_mcp_status_snapshot(
@@ -1093,11 +1097,11 @@ async fn runtime_persists_tools_list_cache_hints() {
 
     let mut entry_value = None;
     for _ in 0..500 {
-        if let Some(cache) = load_metadata_cache(&cache_path) {
-            if let Some(entry) = cache.servers.get("demo") {
-                entry_value = Some(entry.clone());
-                break;
-            }
+        if let Some(cache) = load_metadata_cache(&cache_path)
+            && let Some(entry) = cache.servers.get("demo")
+        {
+            entry_value = Some(entry.clone());
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1128,11 +1132,11 @@ async fn runtime_persists_tools_list_cache_hints() {
     .await;
     let mut zero_entry = None;
     for _ in 0..500 {
-        if let Some(cache) = load_metadata_cache(&zero_cache) {
-            if let Some(entry) = cache.servers.get("demo") {
-                zero_entry = Some(entry.clone());
-                break;
-            }
+        if let Some(cache) = load_metadata_cache(&zero_cache)
+            && let Some(entry) = cache.servers.get("demo")
+        {
+            zero_entry = Some(entry.clone());
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

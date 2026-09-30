@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::layout_node::{LayoutNode, ScrollLayoutNode, ScrollLayoutState};
-use crate::tui::{lock_component, Component, RenderHandle, SharedComponent};
+use crate::tui::{Component, RenderHandle, SharedComponent, lock_component};
 
 /// `ScrollViewScrollbar` (scroll-view.ts:4): `"hidden" | "auto" | "always"`.
 ///

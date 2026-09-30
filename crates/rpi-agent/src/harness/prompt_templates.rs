@@ -268,14 +268,14 @@ async fn load_template_from_file(
     // (prompt-templates.ts:151).
     let first_line = body.lines().find(|line| !line.trim().is_empty());
     let mut description = frontmatter.description;
-    if description.is_empty() {
-        if let Some(first_line) = first_line {
-            // JS `slice(0, 60)` counts UTF-16 units; chars are equivalent
-            // for BMP text (see module header).
-            description = first_line.chars().take(60).collect();
-            if first_line.chars().count() > 60 {
-                description.push_str("...");
-            }
+    if description.is_empty()
+        && let Some(first_line) = first_line
+    {
+        // JS `slice(0, 60)` counts UTF-16 units; chars are equivalent
+        // for BMP text (see module header).
+        description = first_line.chars().take(60).collect();
+        if first_line.chars().count() > 60 {
+            description.push_str("...");
         }
     }
 

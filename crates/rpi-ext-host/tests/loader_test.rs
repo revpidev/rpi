@@ -4,12 +4,12 @@
 //! `resource-loader.ts` @ 2efa728.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi_ext_host::api::ExtensionRuntime;
 use rpi_ext_host::loader::{
-    discover_extensions_in_dir, ExtensionFactory, ExtensionLoader, FactoryCache, InlineExtension,
+    ExtensionFactory, ExtensionLoader, FactoryCache, InlineExtension, discover_extensions_in_dir,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);

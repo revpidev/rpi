@@ -40,45 +40,45 @@ pub use agent::{
     ShouldStopAfterTurnAgentFn,
 };
 pub use agent_loop::{
-    agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue, AfterToolCallContext,
-    AfterToolCallFn, AfterToolCallResult, AgentContext, AgentEventSink, AgentEventStream,
-    AgentLoopConfig, AgentLoopTurnUpdate, BeforeToolCallContext, BeforeToolCallFn,
-    BeforeToolCallResult, ConvertToLlmFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext,
-    PrepareNextTurnFn, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn,
+    AfterToolCallContext, AfterToolCallFn, AfterToolCallResult, AgentContext, AgentEventSink,
+    AgentEventStream, AgentLoopConfig, AgentLoopTurnUpdate, BeforeToolCallContext,
+    BeforeToolCallFn, BeforeToolCallResult, ConvertToLlmFn, GetApiKeyFn, GetQueuedMessagesFn,
+    PrepareNextTurnContext, PrepareNextTurnFn, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn,
+    TransformContextFn, agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue,
 };
 pub use compaction::{
-    compact, estimate_context_tokens, estimate_messages_tokens, estimate_tokens, find_cut_point,
-    find_turn_start_index, generate_summary, generate_summary_with_usage, get_last_assistant_usage,
-    prepare_compaction, should_compact, CompactionDetails, CompactionPreparation, CompactionResult,
-    CompactionSettings, CutPointResult, SummarizationArgs, DEFAULT_COMPACTION_SETTINGS,
+    CompactionDetails, CompactionPreparation, CompactionResult, CompactionSettings, CutPointResult,
+    DEFAULT_COMPACTION_SETTINGS, SummarizationArgs, compact, estimate_context_tokens,
+    estimate_messages_tokens, estimate_tokens, find_cut_point, find_turn_start_index,
+    generate_summary, generate_summary_with_usage, get_last_assistant_usage, prepare_compaction,
+    should_compact,
 };
 pub use error::AgentError;
 pub use harness::{
-    apply_stream_options_patch, AbortResult, AgentHarness, AgentHarnessError,
-    AgentHarnessErrorCode, AgentHarnessEvent, AgentHarnessHook, AgentHarnessListener,
-    AgentHarnessOptions, AgentHarnessOwnEvent, AgentHarnessPhase, AgentHarnessPromptOptions,
-    AgentHarnessResources, AgentHarnessStreamOptions, AgentHarnessStreamOptionsPatch,
-    AgentHarnessSystemPrompt, AgentHarnessTool, AgentHarnessToolContextSource,
-    BeforeAgentStartResult, BranchSummaryError, BranchSummaryErrorCode, BranchSummaryResult,
-    ChunkCallback, CompactResult, CompactionError, CompactionErrorCode, ContextResult,
-    CreateDirOptions, CreateTempFileOptions, ExecutionEnv, ExecutionError, ExecutionErrorCode,
-    FileError, FileErrorCode, FileInfo, FileKind, FileOperations, FileSystem, ForkPosition,
-    GenerateBranchSummaryOptions, HarnessHookResult, JsonlSessionCreateOptions,
-    JsonlSessionListOptions, JsonlSessionMetadata, JsonlSessionRepoApi, NavigateTreeOptions,
-    NavigateTreeResult, PatchMap, PendingSessionWrite, PromptTemplate, ReadTextLinesOptions,
-    RemoveOptions, RetryOperation, Session, SessionBeforeCompactResult, SessionBeforeTreeResult,
-    SessionContext, SessionCreateOptions, SessionEntryCursorOptions, SessionError,
-    SessionErrorCode, SessionForkOptions, SessionMetadata, SessionModelRef, SessionRepo,
-    SessionStats, SessionStorage, Shell, ShellExecOptions, ShellExecResult, Skill,
+    AbortResult, AgentHarness, AgentHarnessError, AgentHarnessErrorCode, AgentHarnessEvent,
+    AgentHarnessHook, AgentHarnessListener, AgentHarnessOptions, AgentHarnessOwnEvent,
+    AgentHarnessPhase, AgentHarnessPromptOptions, AgentHarnessResources, AgentHarnessStreamOptions,
+    AgentHarnessStreamOptionsPatch, AgentHarnessSystemPrompt, AgentHarnessTool,
+    AgentHarnessToolContextSource, BeforeAgentStartResult, BranchSummaryError,
+    BranchSummaryErrorCode, BranchSummaryResult, ChunkCallback, CompactResult, CompactionError,
+    CompactionErrorCode, ContextResult, CreateDirOptions, CreateTempFileOptions, ExecutionEnv,
+    ExecutionError, ExecutionErrorCode, FileError, FileErrorCode, FileInfo, FileKind,
+    FileOperations, FileSystem, ForkPosition, GenerateBranchSummaryOptions, HarnessHookResult,
+    JsonlSessionCreateOptions, JsonlSessionListOptions, JsonlSessionMetadata, JsonlSessionRepoApi,
+    NavigateTreeOptions, NavigateTreeResult, PatchMap, PendingSessionWrite, PromptTemplate,
+    ReadTextLinesOptions, RemoveOptions, RetryOperation, Session, SessionBeforeCompactResult,
+    SessionBeforeTreeResult, SessionContext, SessionCreateOptions, SessionEntryCursorOptions,
+    SessionError, SessionErrorCode, SessionForkOptions, SessionMetadata, SessionModelRef,
+    SessionRepo, SessionStats, SessionStorage, Shell, ShellExecOptions, ShellExecResult, Skill,
     SystemPromptContext, ToolCallResult, ToolResultPatch, TreePreparation, TreeSummary, TurnState,
-    UpdateSource,
+    UpdateSource, apply_stream_options_patch,
 };
 pub use messages::{
-    bash_execution_to_text, convert_to_llm, AgentMessage, BashExecutionMessage,
-    BranchSummaryMessage, CompactionSummaryMessage, CustomMessage, BRANCH_SUMMARY_PREFIX,
-    BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
+    AgentMessage, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, BashExecutionMessage,
+    BranchSummaryMessage, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
+    CompactionSummaryMessage, CustomMessage, bash_execution_to_text, convert_to_llm,
 };
-pub use proxy::{stream_proxy, ProxyAssistantMessageEvent, ProxyStreamOptions};
+pub use proxy::{ProxyAssistantMessageEvent, ProxyStreamOptions, stream_proxy};
 pub use stream_fn::{BoxStream, StreamFn};
 pub use types::{
     AgentEvent, AgentTool, AgentToolResult, AgentToolUpdateCallback, QueueMode, ToolExecutionMode,

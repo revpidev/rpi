@@ -21,8 +21,8 @@
 use std::fs;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fuzzy::fuzzy_filter;
 use crate::utils::is_autocomplete_separator;
@@ -762,10 +762,10 @@ impl CombinedAutocompleteProvider {
     /// Extract @ prefix for fuzzy file suggestions
     /// (`extractAtPrefix`, autocomplete.ts:463-477).
     fn extract_at_prefix(&self, text: &str) -> Option<String> {
-        if let Some(quoted_prefix) = extract_quoted_prefix(text) {
-            if quoted_prefix.starts_with("@\"") {
-                return Some(quoted_prefix);
-            }
+        if let Some(quoted_prefix) = extract_quoted_prefix(text)
+            && quoted_prefix.starts_with("@\"")
+        {
+            return Some(quoted_prefix);
         }
 
         let last_delimiter_index = find_last_delimiter(text);
@@ -1646,12 +1646,16 @@ mod tests {
         );
 
         let values = item_values(&result);
-        assert!(values
-            .iter()
-            .any(|value| value == "@packages/tui/src/autocomplete.ts"));
-        assert!(!values
-            .iter()
-            .any(|value| value == "@packages/ai/src/autocomplete.ts"));
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "@packages/tui/src/autocomplete.ts")
+        );
+        assert!(
+            !values
+                .iter()
+                .any(|value| value == "@packages/ai/src/autocomplete.ts")
+        );
     }
 
     #[test]
@@ -1685,9 +1689,11 @@ mod tests {
         );
 
         let values = item_values(&result);
-        assert!(values
-            .iter()
-            .any(|value| value == "@src/components/Button.tsx"));
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "@src/components/Button.tsx")
+        );
         assert!(!values.iter().any(|value| value == "@src/utils/helpers.ts"));
     }
 
@@ -1725,15 +1731,21 @@ mod tests {
         );
 
         let values = item_values(&result);
-        assert!(values
-            .iter()
-            .any(|value| value == "@../outside/nested/alpha.ts"));
-        assert!(values
-            .iter()
-            .any(|value| value == "@../outside/nested/deeper/also-alpha.ts"));
-        assert!(!values
-            .iter()
-            .any(|value| value == "@../outside/nested/deeper/zzz.ts"));
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "@../outside/nested/alpha.ts")
+        );
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "@../outside/nested/deeper/also-alpha.ts")
+        );
+        assert!(
+            !values
+                .iter()
+                .any(|value| value == "@../outside/nested/deeper/zzz.ts")
+        );
     }
 
     /// Port of the upstream `it("ranks shallower same-score @ matches
@@ -1882,9 +1894,11 @@ mod tests {
         let values = item_values(&result);
         assert!(values.iter().any(|value| value == "@.pi/"));
         assert!(values.iter().any(|value| value == "@.github/"));
-        assert!(!values
-            .iter()
-            .any(|value| value == "@.git" || value.starts_with("@.git/")));
+        assert!(
+            !values
+                .iter()
+                .any(|value| value == "@.git" || value.starts_with("@.git/"))
+        );
     }
 
     #[cfg(unix)]
@@ -1921,9 +1935,11 @@ mod tests {
 
         let values = item_values(&result);
         assert!(values.iter().any(|value| value == "@dir/some_file.txt"));
-        assert!(values
-            .iter()
-            .any(|value| value == "@symlinked_dir/some_file.txt"));
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "@symlinked_dir/some_file.txt")
+        );
     }
 
     #[cfg(unix)]
@@ -2061,13 +2077,15 @@ mod tests {
 
         assert_eq!(normalize(&query_in_path_result), normalize(&normal_result));
         let normal_entries = normalize(&normal_result);
-        assert!(normal_entries
-            .iter()
-            .any(|entry| entry
-                == "plan-mode/ :: packages/coding-agent/examples/extensions/plan-mode"));
-        assert!(normal_entries
-            .iter()
-            .any(|entry| entry == "plan.md :: packages/tui/docs/plan.md"));
+        assert!(
+            normal_entries.iter().any(|entry| entry
+                == "plan-mode/ :: packages/coding-agent/examples/extensions/plan-mode")
+        );
+        assert!(
+            normal_entries
+                .iter()
+                .any(|entry| entry == "plan.md :: packages/tui/docs/plan.md")
+        );
     }
 
     #[test]
@@ -2105,12 +2123,16 @@ mod tests {
             "Should return suggestions for quoted folder path"
         );
         let values = item_values(&result);
-        assert!(values
-            .iter()
-            .any(|value| value == "@\"my folder/test.txt\""));
-        assert!(values
-            .iter()
-            .any(|value| value == "@\"my folder/other.txt\""));
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "@\"my folder/test.txt\"")
+        );
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "@\"my folder/other.txt\"")
+        );
     }
 
     #[test]
@@ -2282,9 +2304,11 @@ mod tests {
         );
         let values = item_values(&result);
         assert!(values.iter().any(|value| value == "\"my folder/test.txt\""));
-        assert!(values
-            .iter()
-            .any(|value| value == "\"my folder/other.txt\""));
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "\"my folder/other.txt\"")
+        );
     }
 
     #[test]
@@ -2557,14 +2581,16 @@ mod tests {
                 format!("查看，\"{directory}/说明.md\"后文")
             );
             let missing = format!("查看，\"不存在{separator}归档/说");
-            assert!(get_suggestions(
-                &provider,
-                std::slice::from_ref(&missing),
-                0,
-                missing.chars().count(),
-                true
-            )
-            .is_none());
+            assert!(
+                get_suggestions(
+                    &provider,
+                    std::slice::from_ref(&missing),
+                    0,
+                    missing.chars().count(),
+                    true
+                )
+                .is_none()
+            );
         }
     }
 

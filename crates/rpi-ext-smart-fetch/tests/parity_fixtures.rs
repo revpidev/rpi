@@ -18,7 +18,7 @@ use rpi_ext_smart_fetch::extract::{ExtractOptions, Extractor};
 use rpi_ext_smart_fetch::format;
 use rpi_ext_smart_fetch::http::{FetchFailure, HttpRequest, HttpResponse};
 use rpi_ext_smart_fetch::pipeline::{
-    futures_boxed, FetchExecutionHooks, FetchPipeline, TransportFn,
+    FetchExecutionHooks, FetchPipeline, TransportFn, futures_boxed,
 };
 use rpi_ext_smart_fetch::settings;
 use rpi_ext_smart_fetch::types::FetchToolConfig;
@@ -26,7 +26,7 @@ use rpi_ext_smart_fetch::types::{
     ExtractedContent, FetchError, FetchOptions, FetchOutcome, FetchResult, IncludeReplies,
     OutputFormat,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -385,11 +385,11 @@ fn parity_resolve_settings() {
         // host-specific — normalize both sides to the shared stem form
         // "<TMPDIR>/smart-fetch-<NAME>".
         let normalize_temp_dir = |mut value: Value| {
-            if let Some(dir) = value.get("tempDir").and_then(Value::as_str) {
-                if let Some((_, tail)) = dir.rsplit_once("/smart-fetch-") {
-                    let _ = tail; // -pi vs -rpi is the declared variant
-                    value["tempDir"] = json!("<TMPDIR>/smart-fetch-<NAME>");
-                }
+            if let Some(dir) = value.get("tempDir").and_then(Value::as_str)
+                && let Some((_, tail)) = dir.rsplit_once("/smart-fetch-")
+            {
+                let _ = tail; // -pi vs -rpi is the declared variant
+                value["tempDir"] = json!("<TMPDIR>/smart-fetch-<NAME>");
             }
             value
         };

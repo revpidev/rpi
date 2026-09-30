@@ -232,10 +232,10 @@ fn parse_load_progress(data: Option<&Value>) -> Option<LlamaProgress> {
         .and_then(Value::as_f64)
         .map(|value| value.clamp(0.0, 1.0));
     let mut ratio = stage_ratio;
-    if let (Some(stage), false) = (stage, stages.is_empty()) {
-        if let Some(index) = stages.iter().position(|entry| *entry == stage) {
-            ratio = Some((index as f64 + stage_ratio.unwrap_or(0.0)) / stages.len() as f64);
-        }
+    if let (Some(stage), false) = (stage, stages.is_empty())
+        && let Some(index) = stages.iter().position(|entry| *entry == stage)
+    {
+        ratio = Some((index as f64 + stage_ratio.unwrap_or(0.0)) / stages.len() as f64);
     }
     Some(LlamaProgress {
         message: match stage {
@@ -539,7 +539,7 @@ impl LlamaClient {
             match entry {
                 None => return Ok(()),
                 Some(entry) if entry.status.value == LlamaModelStatusValue::UNLOADED => {
-                    return Ok(())
+                    return Ok(());
                 }
                 _ => sleep_or_cancelled(100, signal).await?,
             }
@@ -737,10 +737,10 @@ impl LlamaClient {
                 .await?
                 .into_iter()
                 .find(|candidate| candidate.id == model);
-            if let Some(entry) = &entry {
-                if entry.status.value == LlamaModelStatusValue::LOADED {
-                    return Ok(entry.clone());
-                }
+            if let Some(entry) = &entry
+                && entry.status.value == LlamaModelStatusValue::LOADED
+            {
+                return Ok(entry.clone());
             }
             let (event_loaded, event_error) = {
                 let state = state.lock().unwrap_or_else(|e| e.into_inner());

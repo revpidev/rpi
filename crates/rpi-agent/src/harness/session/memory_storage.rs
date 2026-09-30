@@ -68,13 +68,13 @@ impl InMemorySessionStorage {
             update_label_cache(&mut labels_by_id, entry);
             leaf_id = leaf_id_after_entry(entry);
         }
-        if let Some(id) = &leaf_id {
-            if !by_id.contains_key(id) {
-                return Err(SessionError::new(
-                    SessionErrorCode::InvalidSession,
-                    format!("Entry {id} not found"),
-                ));
-            }
+        if let Some(id) = &leaf_id
+            && !by_id.contains_key(id)
+        {
+            return Err(SessionError::new(
+                SessionErrorCode::InvalidSession,
+                format!("Entry {id} not found"),
+            ));
         }
         let metadata = options.metadata.unwrap_or(SessionMetadata {
             id: uuidv7_now(),
@@ -104,13 +104,13 @@ impl SessionStorage for InMemorySessionStorage {
     /// `getLeafId` (memory-storage.ts:68-73) — validates the leaf against `byId`.
     async fn get_leaf_id(&self) -> Result<Option<String>, SessionError> {
         let state = self.state.lock().await;
-        if let Some(id) = &state.leaf_id {
-            if !state.by_id.contains_key(id) {
-                return Err(SessionError::new(
-                    SessionErrorCode::InvalidSession,
-                    format!("Entry {id} not found"),
-                ));
-            }
+        if let Some(id) = &state.leaf_id
+            && !state.by_id.contains_key(id)
+        {
+            return Err(SessionError::new(
+                SessionErrorCode::InvalidSession,
+                format!("Entry {id} not found"),
+            ));
         }
         Ok(state.leaf_id.clone())
     }
@@ -119,13 +119,13 @@ impl SessionStorage for InMemorySessionStorage {
     /// `leaf` entry (parentId = old leaf, targetId = new leaf).
     async fn set_leaf_id(&self, leaf_id: Option<String>) -> Result<(), SessionError> {
         let mut state = self.state.lock().await;
-        if let Some(id) = &leaf_id {
-            if !state.by_id.contains_key(id) {
-                return Err(SessionError::new(
-                    SessionErrorCode::NotFound,
-                    format!("Entry {id} not found"),
-                ));
-            }
+        if let Some(id) = &leaf_id
+            && !state.by_id.contains_key(id)
+        {
+            return Err(SessionError::new(
+                SessionErrorCode::NotFound,
+                format!("Entry {id} not found"),
+            ));
         }
         let entry = SessionEntry::Leaf(LeafEntry {
             id: generate_entry_id(&state.by_id),
@@ -417,11 +417,13 @@ mod tests {
         let found = storage.find_entries("message").await.expect("find");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id(), "entry-1");
-        assert!(storage
-            .find_entries("session_info")
-            .await
-            .expect("find")
-            .is_empty());
+        assert!(
+            storage
+                .find_entries("session_info")
+                .await
+                .expect("find")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -575,11 +577,13 @@ mod tests {
             ),
             ["compaction", "after-compaction"]
         );
-        assert!(storage
-            .get_path_to_root_or_compaction(None)
-            .await
-            .expect("path")
-            .is_empty());
+        assert!(
+            storage
+                .get_path_to_root_or_compaction(None)
+                .await
+                .expect("path")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

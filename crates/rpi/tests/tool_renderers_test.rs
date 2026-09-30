@@ -8,8 +8,8 @@
 //! Upstream anchors: tool-execution.ts:57 (built-in definitions),
 //! bash.ts:231-237/462-496, write.ts:136-167/232-266.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rpi::core::themes::load_theme;

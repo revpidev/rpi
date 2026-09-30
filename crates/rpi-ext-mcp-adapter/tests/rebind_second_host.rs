@@ -15,14 +15,14 @@
 //!    session_start 在 B 上重新初始化，UI 接上后重试循环把状态行
 //!    推回 B —— 且旧宿主 A 不再收到任何推送（无 stale 通道）。
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::Ordering;
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
-use rpi_ext_mcp_adapter::{dispatch, install_for_test, BRIDGE_RETRY_MS_TEST};
-use serde_json::{json, Value};
+use rpi_ext_mcp_adapter::{BRIDGE_RETRY_MS_TEST, dispatch, install_for_test};
+use serde_json::{Value, json};
 
 const KEY: &str = "mcp";
 
@@ -185,9 +185,9 @@ async fn resume_rebinds_second_host_and_republishes_status() {
     )
     .expect("config");
 
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
     let saved_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &dir);
+    rpi_test_env::set_var("HOME", &dir);
 
     // ── 宿主 A：进程启动 ─────────────────────────────────────────────
     let host_a = FakeHost::new(&dir.to_string_lossy(), true);
@@ -316,10 +316,10 @@ async fn resume_rebinds_second_host_and_republishes_status() {
     );
 
     // 环境恢复。
-    std::env::remove_var("RPI_CODING_AGENT_DIR");
+    rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
     match saved_home {
-        Some(home) => std::env::set_var("HOME", home),
-        None => std::env::remove_var("HOME"),
+        Some(home) => rpi_test_env::set_var("HOME", home),
+        None => rpi_test_env::remove_var("HOME"),
     }
     let _ = std::fs::remove_dir_all(&dir);
     let _ = a_status_len;

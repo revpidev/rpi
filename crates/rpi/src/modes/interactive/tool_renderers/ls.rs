@@ -17,10 +17,10 @@ use super::render_utils::{js_value_text, render_tool_path, str_value};
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
 use crate::modes::interactive::components::tool_execution::{
-    get_text_output, RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext,
-    ToolResultState,
+    RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
+    get_text_output,
 };
-use crate::tools::truncate::{format_size, DEFAULT_MAX_BYTES};
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
 
 /// `maxLines` for the collapsed result preview (ls.ts:80).
 const LS_PREVIEW_LINES: usize = 20;

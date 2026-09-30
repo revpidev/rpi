@@ -37,8 +37,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use rpi_ai::api::anthropic_messages::AnthropicMessages;
@@ -51,7 +51,7 @@ use rpi_ai::auth::config_value::{
 use rpi_ai::auth::file_store::FileCredentialStore;
 use rpi_ai::auth::interaction::{AuthInteraction, AuthPrompt};
 use rpi_ai::auth::resolve::{
-    resolve_provider_auth, AuthResolutionOverrides, ModelsError, ModelsErrorCode,
+    AuthResolutionOverrides, ModelsError, ModelsErrorCode, resolve_provider_auth,
 };
 use rpi_ai::auth::types::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthOperationOptions, AuthResult,
@@ -59,9 +59,9 @@ use rpi_ai::auth::types::{
     ModelAuth, ModifyFn, ProviderAuth,
 };
 use rpi_ai::models::{
-    create_provider, CreateModelsOptions, CreateProviderOptions, Models, ModelsRefreshOptions,
-    ModelsRefreshResult, ModelsSimpleStreamOptions, ModelsStreamOptions, Provider, ProviderApi,
-    ProviderStreams, RefreshModelsContext,
+    CreateModelsOptions, CreateProviderOptions, Models, ModelsRefreshOptions, ModelsRefreshResult,
+    ModelsSimpleStreamOptions, ModelsStreamOptions, Provider, ProviderApi, ProviderStreams,
+    RefreshModelsContext, create_provider,
 };
 use rpi_ai::models_json::{
     ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider, OrderedMap,
@@ -74,7 +74,7 @@ use rpi_ai::types::{
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 
-use crate::config::{get_agent_dir, ENV_OFFLINE};
+use crate::config::{ENV_OFFLINE, get_agent_dir};
 use crate::core::remote_catalog_provider::{model_catalog_endpoint, with_remote_catalog};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -644,10 +644,10 @@ impl ApiKeyAuth for ConfigApiKeyAuth {
         &self,
         interaction: &dyn AuthInteraction,
     ) -> Result<ApiKeyCredential, ModelsError> {
-        if let Some(inherited) = &self.inherited {
-            if inherited.supports_login() {
-                return inherited.login(interaction).await;
-            }
+        if let Some(inherited) = &self.inherited
+            && inherited.supports_login()
+        {
+            return inherited.login(interaction).await;
         }
         let key = interaction
             .prompt(AuthPrompt::secret("Enter API key".to_owned()))
@@ -1166,10 +1166,10 @@ fn apply_models_json(
     let mut models: Vec<Model> = base_models
         .into_iter()
         .map(|mut model| {
-            if !radius_oauth {
-                if let Some(base_url) = config.base_url.as_ref().filter(|url| !url.is_empty()) {
-                    model.base_url = base_url.clone();
-                }
+            if !radius_oauth
+                && let Some(base_url) = config.base_url.as_ref().filter(|url| !url.is_empty())
+            {
+                model.base_url = base_url.clone();
             }
             if let Some(compat) = config.compat.as_ref() {
                 model.compat = Some(merge_compat(model.compat.as_ref(), compat));
@@ -2583,21 +2583,21 @@ fn json_model_to_model(
             "Provider {provider_id}: \"baseUrl\" is required when defining custom models."
         ));
     };
-    if let Some(context_window) = model.context_window {
-        if context_window <= 0.0 {
-            return Err(format!(
-                "Provider {provider_id}, model {}: invalid contextWindow",
-                model.id
-            ));
-        }
+    if let Some(context_window) = model.context_window
+        && context_window <= 0.0
+    {
+        return Err(format!(
+            "Provider {provider_id}, model {}: invalid contextWindow",
+            model.id
+        ));
     }
-    if let Some(max_tokens) = model.max_tokens {
-        if max_tokens <= 0.0 {
-            return Err(format!(
-                "Provider {provider_id}, model {}: invalid maxTokens",
-                model.id
-            ));
-        }
+    if let Some(max_tokens) = model.max_tokens
+        && max_tokens <= 0.0
+    {
+        return Err(format!(
+            "Provider {provider_id}, model {}: invalid maxTokens",
+            model.id
+        ));
     }
     Ok(Model {
         name: model.name.clone().unwrap_or_else(|| model.id.clone()),
@@ -2875,9 +2875,11 @@ mod tests {
         // the provider, not in the remote-catalog overlay).
         let radius = runtime.get_provider("radius").expect("radius");
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        assert!(radius
-            .refresh_models(make_probe_context(store, "radius").await)
-            .is_some());
+        assert!(
+            radius
+                .refresh_models(make_probe_context(store, "radius").await)
+                .is_some()
+        );
     }
 
     /// models.json with a built-in provider id composes over the seeded base
@@ -3588,7 +3590,7 @@ mod tests {
     #[tokio::test]
     async fn provider_headers_and_auth_header_reach_resolved_auth() {
         const ENV_KEY: &str = "RPI_TEST_COMPOSE_HEADERS_KEY";
-        std::env::set_var(ENV_KEY, "test-api-key");
+        rpi_test_env::set_var(ENV_KEY, "test-api-key");
         let (_tmp, runtime) = runtime_with_models_json(
             r#"{"providers": {"custom": {
                 "baseUrl": "https://api.example.com/v1",
@@ -3615,7 +3617,7 @@ mod tests {
             headers.get("Authorization").and_then(|v| v.as_deref()),
             Some("Bearer test-api-key")
         );
-        std::env::remove_var(ENV_KEY);
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// Provider enumeration order is the models.json insertion order
@@ -3698,7 +3700,7 @@ mod tests {
     #[tokio::test]
     async fn login_interaction_cancel_aborts_hanging_post_login_refresh() {
         const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_LOGIN_KEY";
-        std::env::set_var(ENV_KEY, "test-key");
+        rpi_test_env::set_var(ENV_KEY, "test-key");
         let url = hung_catalog_server().await;
         let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
             credentials: None,
@@ -3771,7 +3773,7 @@ mod tests {
             .expect("login commits the credential");
         signal.cancel();
         assert!(matches!(credential, Credential::ApiKey(_)));
-        std::env::remove_var(ENV_KEY);
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// The bounded signal's timeout is the resolved `model_refresh_timeout_ms`
@@ -3780,7 +3782,7 @@ mod tests {
     #[tokio::test]
     async fn login_hung_refresh_aborts_via_configured_timeout() {
         const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_LOGIN_TIMEOUT_KEY";
-        std::env::set_var(ENV_KEY, "test-key");
+        rpi_test_env::set_var(ENV_KEY, "test-key");
         let url = hung_catalog_server().await;
         let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
             credentials: None,
@@ -3844,7 +3846,7 @@ mod tests {
             "200ms configured timeout, not the 15s default; elapsed: {:?}",
             started.elapsed()
         );
-        std::env::remove_var(ENV_KEY);
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// The shared refresh signal aborts a hanging catalog fetch
@@ -3853,7 +3855,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_aborts_hanging_catalog_fetch_via_signal() {
         const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_REFRESH_KEY";
-        std::env::set_var(ENV_KEY, "test-key");
+        rpi_test_env::set_var(ENV_KEY, "test-key");
         let url = hung_catalog_server().await;
         let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
             credentials: None,
@@ -3901,7 +3903,7 @@ mod tests {
         timeout.await.expect("timeout task");
         assert!(result.aborted);
         assert!(result.errors.is_empty());
-        std::env::remove_var(ENV_KEY);
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// Runtime-path coverage for `filterModels` (models.ts:394-408 via
@@ -3927,11 +3929,13 @@ mod tests {
             .expect("register");
 
         // No credential → provider not configured → nothing available.
-        assert!(runtime
-            .get_available(None)
-            .await
-            .expect("get_available")
-            .is_empty());
+        assert!(
+            runtime
+                .get_available(None)
+                .await
+                .expect("get_available")
+                .is_empty()
+        );
 
         // A credential exactly as `GitHubCopilotOAuth::login`/`refresh`
         // produces it (extras: `enterpriseUrl`, `availableModelIds`).
@@ -4130,7 +4134,7 @@ mod tests {
     #[tokio::test]
     async fn set_runtime_api_key_completes_despite_stalled_network_refresh() {
         const ENV_KEY: &str = "RPI_TEST_7027_KEY";
-        std::env::set_var(ENV_KEY, "initial-key");
+        rpi_test_env::set_var(ENV_KEY, "initial-key");
         let url = hung_catalog_server().await;
         let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
             credentials: None,
@@ -4175,7 +4179,7 @@ mod tests {
         // The sync may fail (CredentialSynchronizationError) since the
         // catalog fetch was aborted — that's acceptable; the credential is
         // committed. Either Ok or Err is fine, as long as it doesn't hang.
-        std::env::remove_var(ENV_KEY);
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// Concurrent credential operations on the same provider are serialized
@@ -4183,7 +4187,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_credential_ops_serialize_without_lost_updates() {
         const ENV_KEY: &str = "RPI_TEST_CONCURRENT_CRED_KEY";
-        std::env::set_var(ENV_KEY, "initial-key");
+        rpi_test_env::set_var(ENV_KEY, "initial-key");
         let credentials: Arc<dyn rpi_ai::auth::types::CredentialStore> =
             Arc::new(rpi_ai::auth::credential_store::InMemoryCredentialStore::new());
         let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
@@ -4238,7 +4242,7 @@ mod tests {
             runtime.has_runtime_api_key("concurrent-test"),
             "runtime API key should be set after concurrent operations"
         );
-        std::env::remove_var(ENV_KEY);
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// get_compatibility_request_config reads auth_header from extension /
@@ -4672,7 +4676,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_catalog_refreshes_share_one_inflight_fetch() {
         const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_SHARED_KEY";
-        std::env::set_var(ENV_KEY, "test-key");
+        rpi_test_env::set_var(ENV_KEY, "test-key");
         // A slow-but-completing catalog server (100 ms per response) with a
         // hit counter.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4766,7 +4770,7 @@ mod tests {
             lock(&runtime.catalog_refresh_inflight).is_none(),
             "a later run also clears its slot"
         );
-        std::env::remove_var(ENV_KEY);
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// V14-13 FR-H（docs/sdk.md :373-378 核对）：`ModelRuntime::create` 默认
@@ -4774,7 +4778,7 @@ mod tests {
     #[tokio::test]
     async fn create_default_does_not_touch_the_network() {
         const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_CREATE_KEY";
-        std::env::set_var(ENV_KEY, "test-key");
+        rpi_test_env::set_var(ENV_KEY, "test-key");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -4807,7 +4811,7 @@ mod tests {
             0,
             "default create never refreshes catalogs over the network"
         );
-        std::env::remove_var(ENV_KEY);
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// PR#42 复审（rpi#36 follow-up）：`ModelRuntime::refresh` 必须把调用方的
@@ -4816,7 +4820,7 @@ mod tests {
     /// `allow_network: true` 扩散到全部动态 provider（RPI_OFFLINE 下尤甚）。
     #[tokio::test]
     async fn refresh_passes_provider_filter_through_to_models() {
-        std::env::set_var("RPI_TEST_MODEL_RUNTIME_PROVIDERS_FILTER_KEY", "test-key");
+        rpi_test_env::set_var("RPI_TEST_MODEL_RUNTIME_PROVIDERS_FILTER_KEY", "test-key");
         use futures::future::BoxFuture;
         use rpi_ai::auth::{ModelsError, ProviderAuth};
         use rpi_ai::models::{Provider, RefreshModelsContext};
@@ -4963,6 +4967,6 @@ mod tests {
             0,
             "providers filter must drop unselected providers at the Models layer"
         );
-        std::env::remove_var("RPI_TEST_MODEL_RUNTIME_PROVIDERS_FILTER_KEY");
+        rpi_test_env::remove_var("RPI_TEST_MODEL_RUNTIME_PROVIDERS_FILTER_KEY");
     }
 }

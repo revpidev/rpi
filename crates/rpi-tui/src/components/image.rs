@@ -12,8 +12,8 @@
 use std::cell::RefCell;
 
 use crate::terminal_image::{
-    allocate_image_id, get_capabilities, get_cell_dimensions, get_image_dimensions, image_fallback,
-    render_image, ImageDimensions, ImageProtocol, ImageRenderOptions,
+    ImageDimensions, ImageProtocol, ImageRenderOptions, allocate_image_id, get_capabilities,
+    get_cell_dimensions, get_image_dimensions, image_fallback, render_image,
 };
 use crate::tui::Component;
 
@@ -91,10 +91,10 @@ impl Image {
 
 impl Component for Image {
     fn render(&self, width: usize) -> Vec<String> {
-        if let Some(cache) = self.cache.borrow().as_ref() {
-            if cache.width == width {
-                return cache.lines.clone();
-            }
+        if let Some(cache) = self.cache.borrow().as_ref()
+            && cache.width == width
+        {
+            return cache.lines.clone();
         }
 
         // `Math.max(1, Math.min(width - 2, this.options.maxWidthCells ?? 60))`
@@ -202,7 +202,7 @@ mod tests {
     //! iTerm2 layout, fallback text, caching).
 
     use super::*;
-    use crate::terminal_image::{reset_capabilities_cache, set_capabilities, TerminalCapabilities};
+    use crate::terminal_image::{TerminalCapabilities, reset_capabilities_cache, set_capabilities};
 
     /// Serializes tests that mutate the global capabilities cache.
     static TEST_CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

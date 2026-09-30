@@ -556,13 +556,13 @@ impl<TMetadata: Send + Sync + 'static> SessionTrait for Session<TMetadata> {
         summary: Option<MoveToSummary>,
     ) -> Result<Option<String>, SessionError> {
         self.with_append_lock(async move {
-            if let Some(entry_id) = entry_id {
-                if self.storage.get_entry(entry_id).await?.is_none() {
-                    return Err(SessionError::new(
-                        SessionErrorCode::NotFound,
-                        format!("Entry {entry_id} not found"),
-                    ));
-                }
+            if let Some(entry_id) = entry_id
+                && self.storage.get_entry(entry_id).await?.is_none()
+            {
+                return Err(SessionError::new(
+                    SessionErrorCode::NotFound,
+                    format!("Entry {entry_id} not found"),
+                ));
             }
             self.storage
                 .set_leaf_id(entry_id.map(str::to_owned))
@@ -622,7 +622,7 @@ mod tests {
     use std::sync::Arc;
 
     use rpi_ai::types::{Usage, UsageCost, UserContent};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use crate::harness::session::jsonl_storage::{
         JsonlSessionStorage, JsonlSessionStorageCreateOptions,
@@ -631,7 +631,7 @@ mod tests {
         InMemorySessionStorage, InMemorySessionStorageOptions,
     };
     use crate::harness::session::repo_utils::test_support::{
-        assistant_message, user_message, TestFs,
+        TestFs, assistant_message, user_message,
     };
     use crate::harness::types::{
         AppendCompactionOptions, ContextEntryTransform, CustomEntryContextMessageProjector,
@@ -1139,12 +1139,16 @@ mod tests {
             .get_entries(SessionEntryCursorOptions::default())
             .await
             .expect("entries");
-        assert!(entries
-            .iter()
-            .any(|entry| matches!(entry, SessionEntry::Label(_))));
-        assert!(entries
-            .iter()
-            .any(|entry| matches!(entry, SessionEntry::SessionInfo(_))));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::Label(_)))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::SessionInfo(_)))
+        );
         assert_eq!(
             session.get_label(&user1).await.expect("label").as_deref(),
             Some("checkpoint")

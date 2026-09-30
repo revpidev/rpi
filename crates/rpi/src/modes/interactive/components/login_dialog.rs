@@ -611,10 +611,10 @@ impl Component for LoginDialogComponent {
                     }) => options.get(*selected).map(|option| option.id.clone()),
                     _ => None,
                 };
-                if let Some(id) = id {
-                    if let Some(on_select) = self.on_select.as_mut() {
-                        on_select(&id);
-                    }
+                if let Some(id) = id
+                    && let Some(on_select) = self.on_select.as_mut()
+                {
+                    on_select(&id);
                 }
             }
             return;
@@ -910,17 +910,21 @@ mod tests {
                 );
             }
         }
-        assert!(component
-            .render(40)
-            .join("\n")
-            .contains("Login to Anthropic"));
+        assert!(
+            component
+                .render(40)
+                .join("\n")
+                .contains("Login to Anthropic")
+        );
 
         // Progress and Details modes.
         component.show_progress("Waiting for browser...");
-        assert!(component
-            .render(40)
-            .join("\n")
-            .contains("Waiting for browser..."));
+        assert!(
+            component
+                .render(40)
+                .join("\n")
+                .contains("Waiting for browser...")
+        );
         component.show_details(vec!["line one".to_string(), "line two".to_string()]);
         let rendered = component.render(40).join("\n");
         assert!(rendered.contains("line one"));

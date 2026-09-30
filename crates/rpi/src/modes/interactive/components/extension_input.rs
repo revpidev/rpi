@@ -78,10 +78,10 @@ impl ExtensionInputComponent {
             countdown: None,
             focused: false,
         };
-        if let (Some(render_handle), Some(timeout_ms)) = (opts.render_handle, opts.timeout_ms) {
-            if timeout_ms > 0 {
-                component.countdown = Some(component.start_countdown(timeout_ms, render_handle));
-            }
+        if let (Some(render_handle), Some(timeout_ms)) = (opts.render_handle, opts.timeout_ms)
+            && timeout_ms > 0
+        {
+            component.countdown = Some(component.start_countdown(timeout_ms, render_handle));
         }
         component
     }
@@ -171,7 +171,7 @@ impl Component for ExtensionInputComponent {
         lines.extend(self.input.render(width));
 
         lines.push(String::new()); // Spacer(1)
-                                   // Key hints (extension-input.ts:66-68).
+        // Key hints (extension-input.ts:66-68).
         let hint = format!(
             "{}  {}",
             key_hint(&self.theme, "tui.select.confirm", "submit"),

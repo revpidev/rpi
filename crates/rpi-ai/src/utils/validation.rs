@@ -60,10 +60,12 @@ fn get_sub_schema_validator(schema: &Value) -> Option<jsonschema::Validator> {
 
 /// JS `String(number)`: integral floats render without a trailing `.0`.
 fn js_number_to_string(number: &serde_json::Number) -> String {
-    if let Some(f) = number.as_f64() {
-        if f.fract() == 0.0 && f.is_finite() && f.abs() < 1e15 {
-            return format!("{f:.0}");
-        }
+    if let Some(f) = number.as_f64()
+        && f.fract() == 0.0
+        && f.is_finite()
+        && f.abs() < 1e15
+    {
+        return format!("{f:.0}");
     }
     number.to_string()
 }
@@ -85,14 +87,12 @@ fn coerce_primitive_by_type(value: &Value, kind: &str) -> Value {
             if value.is_null() {
                 return Value::from(0);
             }
-            if let Value::String(text) = value {
-                if !text.trim().is_empty() {
-                    if let Ok(parsed) = text.trim().parse::<f64>() {
-                        if parsed.is_finite() {
-                            return f64_to_value(parsed);
-                        }
-                    }
-                }
+            if let Value::String(text) = value
+                && !text.trim().is_empty()
+                && let Ok(parsed) = text.trim().parse::<f64>()
+                && parsed.is_finite()
+            {
+                return f64_to_value(parsed);
             }
             if let Value::Bool(b) = value {
                 return Value::from(if *b { 1 } else { 0 });
@@ -103,14 +103,13 @@ fn coerce_primitive_by_type(value: &Value, kind: &str) -> Value {
             if value.is_null() {
                 return Value::from(0);
             }
-            if let Value::String(text) = value {
-                if !text.trim().is_empty() {
-                    if let Ok(parsed) = text.trim().parse::<f64>() {
-                        if parsed.fract() == 0.0 && parsed.is_finite() {
-                            return f64_to_value(parsed);
-                        }
-                    }
-                }
+            if let Value::String(text) = value
+                && !text.trim().is_empty()
+                && let Ok(parsed) = text.trim().parse::<f64>()
+                && parsed.fract() == 0.0
+                && parsed.is_finite()
+            {
+                return f64_to_value(parsed);
             }
             if let Value::Bool(b) = value {
                 return Value::from(if *b { 1 } else { 0 });
@@ -170,20 +169,20 @@ fn apply_schema_object_coercion(value: &mut Map<String, Value>, schema: &Value) 
         }
     }
 
-    if let Some(additional) = schema.get("additionalProperties") {
-        if additional.is_object() {
-            let defined_keys: Vec<String> = properties
-                .map(|p| p.keys().cloned().collect())
-                .unwrap_or_default();
-            let keys: Vec<String> = value.keys().cloned().collect();
-            for key in keys {
-                if defined_keys.contains(&key) {
-                    continue;
-                }
-                if let Some(entry) = value.get_mut(&key) {
-                    let coerced = coerce_with_json_schema(entry.clone(), additional);
-                    *entry = coerced;
-                }
+    if let Some(additional) = schema.get("additionalProperties")
+        && additional.is_object()
+    {
+        let defined_keys: Vec<String> = properties
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default();
+        let keys: Vec<String> = value.keys().cloned().collect();
+        for key in keys {
+            if defined_keys.contains(&key) {
+                continue;
+            }
+            if let Some(entry) = value.get_mut(&key) {
+                let coerced = coerce_with_json_schema(entry.clone(), additional);
+                *entry = coerced;
             }
         }
     }
@@ -215,20 +214,20 @@ fn coerce_with_union_schema(value: &Value, schemas: &[Value]) -> Value {
     // before any coercion is attempted (nullable unions must not convert
     // `null` into another primitive).
     for schema in schemas {
-        if let Some(validator) = get_sub_schema_validator(schema) {
-            if validator.is_valid(value) {
-                return value.clone();
-            }
+        if let Some(validator) = get_sub_schema_validator(schema)
+            && validator.is_valid(value)
+        {
+            return value.clone();
         }
     }
 
     for schema in schemas {
         let candidate = value.clone();
         let coerced = coerce_with_json_schema(candidate, schema);
-        if let Some(validator) = get_sub_schema_validator(schema) {
-            if validator.is_valid(&coerced) {
-                return coerced;
-            }
+        if let Some(validator) = get_sub_schema_validator(schema)
+            && validator.is_valid(&coerced)
+        {
+            return coerced;
         }
     }
     value.clone()
@@ -266,16 +265,16 @@ fn coerce_with_json_schema(value: Value, schema: &Value) -> Value {
         }
     }
 
-    if schema_types.contains(&"object") {
-        if let Value::Object(map) = &mut next_value {
-            apply_schema_object_coercion(map, schema);
-        }
+    if schema_types.contains(&"object")
+        && let Value::Object(map) = &mut next_value
+    {
+        apply_schema_object_coercion(map, schema);
     }
 
-    if schema_types.contains(&"array") {
-        if let Value::Array(items) = &mut next_value {
-            apply_schema_array_coercion(items, schema);
-        }
+    if schema_types.contains(&"array")
+        && let Value::Array(items) = &mut next_value
+    {
+        apply_schema_array_coercion(items, schema);
     }
 
     next_value

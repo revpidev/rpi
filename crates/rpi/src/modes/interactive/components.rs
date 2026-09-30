@@ -50,7 +50,7 @@ pub use branch_summary_message::BranchSummaryMessageComponent;
 pub use compaction_summary_message::CompactionSummaryMessageComponent;
 pub use custom_entry::CustomEntryComponent;
 pub use custom_message::CustomMessageComponent;
-pub use diff::{render_diff, RenderDiffOptions};
+pub use diff::{RenderDiffOptions, render_diff};
 pub use dynamic_border::DynamicBorder;
 pub use keybinding_hints::{key_display_text, key_hint, key_text, raw_key_hint};
 pub use skill_invocation_message::SkillInvocationMessageComponent;
@@ -63,7 +63,7 @@ pub use tool_execution::{
     ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, ToolResultState,
 };
 pub use user_message::UserMessageComponent;
-pub use visual_truncate::{truncate_to_visual_lines, VisualTruncateResult};
+pub use visual_truncate::{VisualTruncateResult, truncate_to_visual_lines};
 
 /// Component helpers shared by the interactive components.
 pub(crate) mod util {

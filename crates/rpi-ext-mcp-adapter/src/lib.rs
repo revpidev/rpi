@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::direct::ToolSurface as _;
 use crate::proxy::ProxyDispatcher;
@@ -308,10 +308,10 @@ fn sync_tool_surface(state: &PluginState) {
                 .iter_mut()
                 .find(|(_, names)| names.contains(name))
                 .map(|(server, _)| server.clone());
-            if let Some(server) = server {
-                if let Some(names) = surface.reported_connect_names.get_mut(&server) {
-                    names.remove(name);
-                }
+            if let Some(server) = server
+                && let Some(names) = surface.reported_connect_names.get_mut(&server)
+            {
+                names.remove(name);
             }
         }
         surface.direct_tool_counts = direct_tool_counts.clone();
@@ -458,23 +458,18 @@ fn host_call_ok(calls: &RpiHostCalls, cookie: usize, method: &str, args: Value) 
         return None;
     }
     let ok = response.get("ok").cloned().unwrap_or(Value::Null);
-    if ok.is_null() {
-        None
-    } else {
-        Some(ok)
-    }
+    if ok.is_null() { None } else { Some(ok) }
 }
 
 /// The session cwd via the host (`ctx.cwd`), falling back to the process
 /// cwd (identical for the native in-process plugin in practice).
 fn session_cwd(state: &PluginState) -> std::path::PathBuf {
     let channel = state.channel();
-    if let Some(cwd) = host_call_ok(&channel.calls(), channel.cookie, "ctx.cwd", json!({})) {
-        if let Some(cwd) = cwd.as_str() {
-            if !cwd.is_empty() {
-                return std::path::PathBuf::from(cwd);
-            }
-        }
+    if let Some(cwd) = host_call_ok(&channel.calls(), channel.cookie, "ctx.cwd", json!({}))
+        && let Some(cwd) = cwd.as_str()
+        && !cwd.is_empty()
+    {
+        return std::path::PathBuf::from(cwd);
     }
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }

@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::state::row_intent::{meta, RowKind};
+use crate::state::row_intent::{RowKind, meta};
 
 /// Locales embedded in the binary (alphabetical, upstream `SUPPORTED_LOCALES`).
 pub const SUPPORTED_LOCALES: [&str; 9] = ["de", "en", "es", "fr", "pt", "pt-BR", "ru", "uk", "zh"];
@@ -207,10 +207,10 @@ impl I18n {
                 .map(|(_, raw)| *raw)
                 .unwrap_or("{}"),
         );
-        if resolved != DEFAULT_LOCALE {
-            if let Some((_, raw)) = EMBEDDED.iter().find(|(code, _)| *code == resolved) {
-                strings.extend(parse_table(raw));
-            }
+        if resolved != DEFAULT_LOCALE
+            && let Some((_, raw)) = EMBEDDED.iter().find(|(code, _)| *code == resolved)
+        {
+            strings.extend(parse_table(raw));
         }
         merge_render_strings(&mut strings, resolved);
         Self {

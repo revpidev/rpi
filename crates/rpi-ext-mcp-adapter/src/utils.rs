@@ -341,10 +341,10 @@ pub fn truncate_at_word(text: &str, target: usize) -> String {
         }
         units += ch.len_utf16();
     }
-    if let Some(pos) = last_space_units {
-        if (pos as f64) > target as f64 * 0.6 {
-            return format!("{}...", truncate_utf16(truncated, pos));
-        }
+    if let Some(pos) = last_space_units
+        && (pos as f64) > target as f64 * 0.6
+    {
+        return format!("{}...", truncate_utf16(truncated, pos));
     }
     format!("{truncated}...")
 }
@@ -410,10 +410,10 @@ pub fn sanitize_terminal_text(text: &str) -> String {
                         break;
                     }
                 }
-                if let Some(&next) = chars.peek() {
-                    if ('\u{40}'..='\u{7e}').contains(&next) {
-                        chars.next();
-                    }
+                if let Some(&next) = chars.peek()
+                    && ('\u{40}'..='\u{7e}').contains(&next)
+                {
+                    chars.next();
                 }
             }
             Some(&next) if ('\u{40}'..='\u{5f}').contains(&next) => {
@@ -623,14 +623,14 @@ mod tests {
 
     #[test]
     fn interpolate_all_three_forms_and_unset_expands_empty() {
-        std::env::set_var("RPI_MCP_TEST_SET", "yes");
+        rpi_test_env::set_var("RPI_MCP_TEST_SET", "yes");
         assert_eq!(
             interpolate_env_vars(
                 "${RPI_MCP_TEST_SET}-$env:RPI_MCP_TEST_SET-{env:RPI_MCP_TEST_SET}-${RPI_MCP_TEST_UNSET}"
             ),
             "yes-yes-yes-"
         );
-        std::env::remove_var("RPI_MCP_TEST_SET");
+        rpi_test_env::remove_var("RPI_MCP_TEST_SET");
     }
 
     #[test]
@@ -716,7 +716,7 @@ mod tests {
         );
 
         // bearerTokenEnv reads the env var raw (no interpolation).
-        std::env::set_var("RPI_MCP_TEST_BEARER_SET", "env-token-raw");
+        rpi_test_env::set_var("RPI_MCP_TEST_BEARER_SET", "env-token-raw");
         let map = json!({ "bearerTokenEnv": "RPI_MCP_TEST_BEARER_SET" })
             .as_object()
             .cloned()
@@ -725,7 +725,7 @@ mod tests {
             resolve_bearer_token(&map).unwrap(),
             Some("env-token-raw".to_string())
         );
-        std::env::remove_var("RPI_MCP_TEST_BEARER_SET");
+        rpi_test_env::remove_var("RPI_MCP_TEST_BEARER_SET");
 
         // Unset env var → None (no error).
         let map = json!({ "bearerTokenEnv": "RPI_MCP_TEST_BEARER_UNSET2" })
@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(resolve_bearer_token(&map).unwrap(), None);
 
         // bearerToken with interpolation.
-        std::env::set_var("RPI_MCP_TEST_TOKEN", "tok-123");
+        rpi_test_env::set_var("RPI_MCP_TEST_TOKEN", "tok-123");
         let map = json!({ "bearerToken": "key-${RPI_MCP_TEST_TOKEN}" })
             .as_object()
             .cloned()
@@ -751,7 +751,7 @@ mod tests {
             resolve_bearer_token(&map).unwrap(),
             Some("key-tok-123".to_string())
         );
-        std::env::remove_var("RPI_MCP_TEST_TOKEN");
+        rpi_test_env::remove_var("RPI_MCP_TEST_TOKEN");
 
         // Non-string bearerToken is an error.
         let map = json!({ "bearerToken": 42 })

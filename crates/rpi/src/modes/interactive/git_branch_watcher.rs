@@ -28,12 +28,12 @@
 //!   logic driven by the debounce timer upstream.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::core::git_paths::find_git_paths;
 use crate::core::git_paths::GitPaths;
+use crate::core::git_paths::find_git_paths;
 use crate::modes::interactive::interactive_mode::{InteractiveUi, UiCommand};
 
 /// Poll interval for the git branch watcher. Upstream debounces `fs.watch`
@@ -143,7 +143,7 @@ pub(crate) fn spawn_git_branch_watcher(
 mod tests {
     use super::*;
     use crate::modes::interactive::interactive_mode::{InteractiveMode, InteractiveModeOptions};
-    use crate::modes::interactive::test_support::{build_test_session, TempDir, TestTerminal};
+    use crate::modes::interactive::test_support::{TempDir, TestTerminal, build_test_session};
 
     /// A fake repository: `<dir>/.git/HEAD` with the given HEAD content.
     fn fake_repo(parent: &Path, name: &str, head: &str) -> PathBuf {

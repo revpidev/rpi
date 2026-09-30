@@ -14,8 +14,8 @@
 //! mint, refresh re-mint, 401/403 → `/login meta`) is covered by the
 //! file-internal unit tests in `auth/oauth/meta.rs`.
 
-use rpi_ai::auth::oauth::load::load_oauth_flow;
 use rpi_ai::auth::OAuthCredential;
+use rpi_ai::auth::oauth::load::load_oauth_flow;
 use rpi_ai::providers::meta::meta_provider;
 use serde_json::Map;
 

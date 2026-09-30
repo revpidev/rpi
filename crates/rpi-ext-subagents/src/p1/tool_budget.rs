@@ -17,7 +17,7 @@
 //!   [`tool_budget_state`] renders the `ToolBudgetState` shape
 //!   (`outcome: within-budget | soft-reached | hard-blocked`).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `RPI_SUBAGENT_TOOL_BUDGET` — the resolved budget carried into the child:
 /// `{"hard":N,"soft":M?,"block":"*"|[names]}`.
@@ -113,24 +113,24 @@ pub fn validate_tool_budget_config(
             return Err(format!("{label}.soft must be <= {label}.hard."));
         }
     }
-    if let Some(block) = object.get("block") {
-        if block.as_str() != Some("*") {
-            let Some(items) = block.as_array() else {
-                return Err(format!(
-                    "{label}.block must be \"*\" or an array of tool names."
-                ));
-            };
-            if items.is_empty() {
-                return Err(format!(
-                    "{label}.block must contain at least one tool name."
-                ));
-            }
-            for item in items {
-                match item.as_str().map(str::trim) {
-                    Some(name) if !name.is_empty() => {}
-                    _ => {
-                        return Err(format!("{label}.block must contain non-empty tool names."));
-                    }
+    if let Some(block) = object.get("block")
+        && block.as_str() != Some("*")
+    {
+        let Some(items) = block.as_array() else {
+            return Err(format!(
+                "{label}.block must be \"*\" or an array of tool names."
+            ));
+        };
+        if items.is_empty() {
+            return Err(format!(
+                "{label}.block must contain at least one tool name."
+            ));
+        }
+        for item in items {
+            match item.as_str().map(str::trim) {
+                Some(name) if !name.is_empty() => {}
+                _ => {
+                    return Err(format!("{label}.block must contain non-empty tool names."));
                 }
             }
         }
@@ -326,11 +326,12 @@ pub fn handle_tool_call_event(event: &Value, send_user_message: &dyn Fn(&str)) -
         .filter(|name| !name.is_empty())
         .unwrap_or("tool");
     let count = TOOL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    if let Some(_soft) = budget.soft {
-        if count >= _soft && !SOFT_NUDGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            // Budget nudges are advisory; blocking below stays authoritative.
-            send_user_message(&tool_budget_soft_nudge(&budget, count));
-        }
+    if let Some(_soft) = budget.soft
+        && count >= _soft
+        && !SOFT_NUDGED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        // Budget nudges are advisory; blocking below stays authoritative.
+        send_user_message(&tool_budget_soft_nudge(&budget, count));
     }
     if !should_block_tool_for_budget(&budget, tool_name, count) {
         return Value::Null;
@@ -358,9 +359,11 @@ mod tests {
 
     #[test]
     fn validation_matches_upstream_texts() {
-        assert!(validate_tool_budget_config(None, "toolBudget")
-            .unwrap()
-            .is_none());
+        assert!(
+            validate_tool_budget_config(None, "toolBudget")
+                .unwrap()
+                .is_none()
+        );
         let valid = validate_tool_budget_config(
             Some(&json!({"hard": 2, "soft": 1, "block": "*"})),
             "toolBudget",
@@ -490,18 +493,18 @@ mod tests {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let b = budget();
         let encoded = budget_to_env_value(&b);
-        std::env::set_var(TOOL_BUDGET_ENV, &encoded);
+        rpi_test_env::set_var(TOOL_BUDGET_ENV, &encoded);
         assert_eq!(budget_from_env(), Some(b));
-        std::env::set_var(TOOL_BUDGET_ENV, "{broken");
+        rpi_test_env::set_var(TOOL_BUDGET_ENV, "{broken");
         assert_eq!(budget_from_env(), None);
-        std::env::remove_var(TOOL_BUDGET_ENV);
+        rpi_test_env::remove_var(TOOL_BUDGET_ENV);
     }
 
     #[test]
     fn child_event_counts_nudges_and_blocks() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_runtime_for_test();
-        std::env::set_var(
+        rpi_test_env::set_var(
             TOOL_BUDGET_ENV,
             budget_to_env_value(&ResolvedToolBudget {
                 hard: 1,
@@ -516,12 +519,12 @@ mod tests {
             }
         };
         // Unset env → inert handler.
-        std::env::remove_var(TOOL_BUDGET_ENV);
+        rpi_test_env::remove_var(TOOL_BUDGET_ENV);
         assert_eq!(
             handle_tool_call_event(&json!({"toolName": "bash"}), &send),
             Value::Null
         );
-        std::env::set_var(
+        rpi_test_env::set_var(
             TOOL_BUDGET_ENV,
             budget_to_env_value(&ResolvedToolBudget {
                 hard: 1,
@@ -539,11 +542,13 @@ mod tests {
         assert_eq!(blocked["block"], json!(true));
         assert_eq!(
             blocked["reason"],
-            json!("Tool budget hard limit reached after 2 tool calls (hard 1). The 'bash' tool is blocked so you can finalize from the context you already have.")
+            json!(
+                "Tool budget hard limit reached after 2 tool calls (hard 1). The 'bash' tool is blocked so you can finalize from the context you already have."
+            )
         );
         // The nudge fired exactly once (soft-nudged latch).
         assert_eq!(nudges.lock().unwrap().len(), 1);
-        std::env::remove_var(TOOL_BUDGET_ENV);
+        rpi_test_env::remove_var(TOOL_BUDGET_ENV);
         reset_runtime_for_test();
     }
 }

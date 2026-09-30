@@ -18,8 +18,8 @@
 //!   following (upstream only understands slash pairs, theme.ts:648-662).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use rpi_tui::terminal_colors::{RgbColor, TerminalColorScheme};
@@ -207,11 +207,11 @@ fn poll_theme_change(
         .ok();
     match last_seen {
         Some((last_path, last_mtime)) if *last_path == path => {
-            if let Some(mtime) = mtime {
-                if mtime != *last_mtime {
-                    *last_mtime = mtime;
-                    return true;
-                }
+            if let Some(mtime) = mtime
+                && mtime != *last_mtime
+            {
+                *last_mtime = mtime;
+                return true;
             }
             false
         }

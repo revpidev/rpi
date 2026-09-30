@@ -612,14 +612,14 @@ pub fn resolve_cli_model(options: ResolveCliModelOptions) -> ResolveCliModelResu
     let mut pattern = cli_model.to_owned();
     let mut inferred_provider = false;
 
-    if provider.is_none() {
-        if let Some(slash_index) = cli_model.find('/') {
-            let maybe_provider = &cli_model[..slash_index];
-            if let Some(canonical) = lookup(maybe_provider) {
-                provider = Some(canonical);
-                pattern = cli_model[slash_index + 1..].to_owned();
-                inferred_provider = true;
-            }
+    if provider.is_none()
+        && let Some(slash_index) = cli_model.find('/')
+    {
+        let maybe_provider = &cli_model[..slash_index];
+        if let Some(canonical) = lookup(maybe_provider) {
+            provider = Some(canonical);
+            pattern = cli_model[slash_index + 1..].to_owned();
+            inferred_provider = true;
         }
     }
 
@@ -761,13 +761,13 @@ pub fn resolve_cli_model(options: ResolveCliModelOptions) -> ResolveCliModelResu
         // but only when --thinking is not explicitly provided.
         let mut fallback_pattern = pattern.as_str();
         let mut fallback_thinking: Option<ThinkingLevel> = None;
-        if cli_thinking.is_none() {
-            if let Some(last_colon) = pattern.rfind(':') {
-                let suffix = &pattern[last_colon + 1..];
-                if let Some(level) = parse_thinking_level(suffix) {
-                    fallback_pattern = &pattern[..last_colon];
-                    fallback_thinking = Some(level);
-                }
+        if cli_thinking.is_none()
+            && let Some(last_colon) = pattern.rfind(':')
+        {
+            let suffix = &pattern[last_colon + 1..];
+            if let Some(level) = parse_thinking_level(suffix) {
+                fallback_pattern = &pattern[..last_colon];
+                fallback_thinking = Some(level);
             }
         }
 
@@ -883,16 +883,15 @@ pub async fn find_initial_model(
     }
 
     // 3. Try saved default from settings if auth is configured.
-    if let (Some(default_provider), Some(default_model_id)) = (default_provider, default_model_id) {
-        if let Some(found) = model_runtime.get_model(default_provider, default_model_id) {
-            if model_runtime.has_configured_auth(&found.provider) {
-                return Ok(InitialModelResult {
-                    model: Some(found),
-                    thinking_level: default_thinking_level.unwrap_or(DEFAULT_THINKING_LEVEL),
-                    fallback_message: None,
-                });
-            }
-        }
+    if let (Some(default_provider), Some(default_model_id)) = (default_provider, default_model_id)
+        && let Some(found) = model_runtime.get_model(default_provider, default_model_id)
+        && model_runtime.has_configured_auth(&found.provider)
+    {
+        return Ok(InitialModelResult {
+            model: Some(found),
+            thinking_level: default_thinking_level.unwrap_or(DEFAULT_THINKING_LEVEL),
+            fallback_message: None,
+        });
     }
 
     // 4. Try first available model with valid API key.
@@ -1014,7 +1013,7 @@ mod tests {
     use rpi_ai::auth::credential_store::InMemoryCredentialStore;
     use rpi_ai::auth::helpers::env_api_key_auth;
     use rpi_ai::auth::types::ProviderAuth;
-    use rpi_ai::models::{create_provider, CreateProviderOptions, ProviderApi};
+    use rpi_ai::models::{CreateProviderOptions, ProviderApi, create_provider};
     use rpi_ai::types::{ApiKind, InputModality, Model};
 
     use super::*;
@@ -1145,7 +1144,9 @@ mod tests {
         assert_eq!(result.thinking_level, None);
         assert_eq!(
             result.warning.as_deref(),
-            Some("Invalid thinking level \"random\" in pattern \"sonnet:random\". Using default instead.")
+            Some(
+                "Invalid thinking level \"random\" in pattern \"sonnet:random\". Using default instead."
+            )
         );
     }
 
@@ -1357,7 +1358,7 @@ mod tests {
     const TEST_ENV_KEY: &str = "RPI_TEST_MODEL_RESOLVER_KEY";
 
     async fn runtime_with_models(models: Vec<Model>) -> Arc<ModelRuntime> {
-        std::env::set_var(TEST_ENV_KEY, "test-key");
+        rpi_test_env::set_var(TEST_ENV_KEY, "test-key");
         let credentials: Arc<dyn rpi_ai::auth::types::CredentialStore> =
             Arc::new(InMemoryCredentialStore::new());
         let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
@@ -1431,10 +1432,12 @@ mod tests {
             resolve_model_scope_with_diagnostics(&["test-provider/*:high".to_owned()], &runtime)
                 .await;
         assert_eq!(result.scoped_models.len(), 2);
-        assert!(result
-            .scoped_models
-            .iter()
-            .all(|sm| sm.thinking_level == Some(ThinkingLevel::High)));
+        assert!(
+            result
+                .scoped_models
+                .iter()
+                .all(|sm| sm.thinking_level == Some(ThinkingLevel::High))
+        );
     }
 
     #[tokio::test]
@@ -1522,7 +1525,9 @@ mod tests {
         assert_eq!(result.thinking_level, Some(ThinkingLevel::High));
         assert_eq!(
             result.warning.as_deref(),
-            Some("Model \"custom-model\" not found for provider \"test-provider\". Using custom model id.")
+            Some(
+                "Model \"custom-model\" not found for provider \"test-provider\". Using custom model id."
+            )
         );
     }
 
@@ -1640,7 +1645,7 @@ mod tests {
         // A dedicated never-set env var keeps this test race-free against the
         // parallel tests that set TEST_ENV_KEY.
         const UNSET_ENV_KEY: &str = "RPI_TEST_MODEL_RESOLVER_KEY_UNSET";
-        std::env::remove_var(UNSET_ENV_KEY);
+        rpi_test_env::remove_var(UNSET_ENV_KEY);
         let credentials: Arc<dyn rpi_ai::auth::types::CredentialStore> =
             Arc::new(InMemoryCredentialStore::new());
         let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
@@ -1725,14 +1730,14 @@ mod tests {
         static AMBIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _guard = AMBIG_LOCK.lock().await;
         if let Some(val) = env_a {
-            std::env::set_var("RPI_TEST_AMBIG_A_KEY", val);
+            rpi_test_env::set_var("RPI_TEST_AMBIG_A_KEY", val);
         } else {
-            std::env::remove_var("RPI_TEST_AMBIG_A_KEY");
+            rpi_test_env::remove_var("RPI_TEST_AMBIG_A_KEY");
         }
         if let Some(val) = env_b {
-            std::env::set_var("RPI_TEST_AMBIG_B_KEY", val);
+            rpi_test_env::set_var("RPI_TEST_AMBIG_B_KEY", val);
         } else {
-            std::env::remove_var("RPI_TEST_AMBIG_B_KEY");
+            rpi_test_env::remove_var("RPI_TEST_AMBIG_B_KEY");
         }
         let credentials: Arc<dyn rpi_ai::auth::types::CredentialStore> =
             Arc::new(InMemoryCredentialStore::new());

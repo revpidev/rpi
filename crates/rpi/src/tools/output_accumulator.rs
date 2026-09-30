@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::tools::truncate::{
-    self, TruncateOptions, TruncatedBy, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
+    self, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncateOptions, TruncatedBy, TruncationResult,
 };
 
 /// Options for [`OutputAccumulator`].

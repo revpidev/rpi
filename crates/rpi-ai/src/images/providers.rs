@@ -9,8 +9,8 @@ pub mod register_builtins;
 
 use std::sync::Arc;
 
-use crate::images::images_models::{create_images_models, ImagesModels};
 use crate::images::ImagesProvider;
+use crate::images::images_models::{ImagesModels, create_images_models};
 use crate::models::CreateModelsOptions;
 
 /// `builtinImagesProviders()` — every built-in image-generation provider,

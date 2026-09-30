@@ -7,14 +7,14 @@
 //! injection against a real filesystem.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi::core::resource_loader::no_global_context;
 use rpi::core::system_prompt::{
-    build_system_prompt, discover_append_system_prompt_file, discover_system_prompt_file,
-    load_context_file_from_dir, load_project_context_files, resolve_prompt_input,
-    BuildSystemPromptOptions,
+    BuildSystemPromptOptions, build_system_prompt, discover_append_system_prompt_file,
+    discover_system_prompt_file, load_context_file_from_dir, load_project_context_files,
+    resolve_prompt_input,
 };
 
 /// Env-var tests mutate process state; serialize them (contract-test
@@ -481,20 +481,20 @@ fn include_global_false_skips_only_the_global_segment() {
 fn no_global_context_env_gate_matches_only_truthy_values() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for value in ["1", "true", "TRUE", " 1 "] {
-        std::env::set_var("RPI_NO_GLOBAL_CONTEXT", value);
+        rpi_test_env::set_var("RPI_NO_GLOBAL_CONTEXT", value);
         assert!(
             no_global_context(),
             "value {value:?} should enable the gate"
         );
     }
     for value in ["0", "false", "", "no", "off"] {
-        std::env::set_var("RPI_NO_GLOBAL_CONTEXT", value);
+        rpi_test_env::set_var("RPI_NO_GLOBAL_CONTEXT", value);
         assert!(
             !no_global_context(),
             "value {value:?} should not enable the gate"
         );
     }
-    std::env::remove_var("RPI_NO_GLOBAL_CONTEXT");
+    rpi_test_env::remove_var("RPI_NO_GLOBAL_CONTEXT");
     assert!(!no_global_context(), "unset env keeps default inheritance");
 }
 
@@ -508,9 +508,9 @@ fn no_global_context_env_skips_global_segment_end_to_end() {
     tmp.write("agent/AGENTS.md", "global");
     tmp.write("repo/AGENTS.md", "repo");
 
-    std::env::set_var("RPI_NO_GLOBAL_CONTEXT", "1");
+    rpi_test_env::set_var("RPI_NO_GLOBAL_CONTEXT", "1");
     let files = load_project_context_files(&cwd, &agent_dir, !no_global_context());
-    std::env::remove_var("RPI_NO_GLOBAL_CONTEXT");
+    rpi_test_env::remove_var("RPI_NO_GLOBAL_CONTEXT");
     let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
     assert_eq!(contents, ["repo"], "env gate skips only the global segment");
 }

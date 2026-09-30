@@ -38,8 +38,7 @@ use crate::{HostCall, HostError};
 
 /// `MULTI_SELECT_INSTRUCTIONS` (canonical-English fallback of the
 /// `rpc.multi_instructions` locale key).
-pub const MULTI_SELECT_INSTRUCTIONS: &str =
-	"Enter the numbers of all that apply, comma-separated (e.g. \"1,3\"), or type a custom answer as plain text.";
+pub const MULTI_SELECT_INSTRUCTIONS: &str = "Enter the numbers of all that apply, comma-separated (e.g. \"1,3\"), or type a custom answer as plain text.";
 
 /// `CUSTOM_ANSWER_TITLE` (canonical-English fallback of the
 /// `rpc.custom_answer_title` locale key).
@@ -777,9 +776,9 @@ mod tests {
         let _ = run_rpc_questionnaire(&mut ui, &params, &english()).expect("run");
         let (_, title, _, placeholder) = &ui.calls[0];
         assert_eq!(
-			title,
-			"[Colors] Pick colors?\n\n1. red — r\n2. green — g\n3. blue — b\n\nEnter the numbers of all that apply, comma-separated (e.g. \"1,3\"), or type a custom answer as plain text."
-		);
+            title,
+            "[Colors] Pick colors?\n\n1. red — r\n2. green — g\n3. blue — b\n\nEnter the numbers of all that apply, comma-separated (e.g. \"1,3\"), or type a custom answer as plain text."
+        );
         assert_eq!(placeholder.as_deref(), Some("1,3"));
     }
 

@@ -28,7 +28,7 @@ use rpi_ext_host::interactive_ui::{
     InteractiveUiError, InteractiveUiErrorKind, MountOptions,
 };
 use rpi_ext_host::types::ComponentTree;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// One recorded `renderComponent` submission.
 #[derive(Clone, Debug, PartialEq)]

@@ -25,30 +25,30 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::StreamExt;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use indexmap::IndexMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::cache::{
-    compute_server_hash, create_cached_tool_selector_candidate_index, get_metadata_cache_path,
-    is_server_cache_valid, load_metadata_cache, reconstruct_prompt_metadata,
-    reconstruct_tool_metadata, save_metadata_cache, serialize_resources, serialize_tools,
-    MetadataCache, PromptMetadata, ServerCacheEntry,
+    MetadataCache, PromptMetadata, ServerCacheEntry, compute_server_hash,
+    create_cached_tool_selector_candidate_index, get_metadata_cache_path, is_server_cache_valid,
+    load_metadata_cache, reconstruct_prompt_metadata, reconstruct_tool_metadata,
+    save_metadata_cache, serialize_resources, serialize_tools,
 };
 use crate::config::load_mcp_config;
 use crate::lifecycle::{
-    FailureTracker, LifecycleManager, LifecycleMode, DEFAULT_IDLE_TIMEOUT_MINUTES,
+    DEFAULT_IDLE_TIMEOUT_MINUTES, FailureTracker, LifecycleManager, LifecycleMode,
 };
 use crate::manager::{ConnectionStatus, McpServerManager, ServerConnection};
 use crate::metadata::{
-    build_tool_metadata, find_tool_by_name, format_schema, get_server_prefix, has_tool_filters,
     McpConfig, McpResource, McpTool, ServerEntry, ToolMetadata, ToolSelectorCandidateIndex,
+    build_tool_metadata, find_tool_by_name, format_schema, get_server_prefix, has_tool_filters,
 };
 use crate::search::{
-    paginate, rank_suggestions, rank_tool_matches, resolve_search_keywords, SearchState,
+    SearchState, paginate, rank_suggestions, rank_tool_matches, resolve_search_keywords,
 };
 use crate::session_recovery;
 use crate::tsshape::render_ts_shape;
@@ -311,15 +311,16 @@ pub async fn initialize_mcp(
                 is_server_cache_valid(entry, definition, crate::cache::CACHE_MAX_AGE_MS, now_ms())
             });
         if let Some(cached) = cached {
-            if has_tool_filters(definition) && cached_selector_candidate_index.is_none() {
-                if let Some(cache_ref) = cache.as_ref() {
-                    cached_selector_candidate_index =
-                        Some(create_cached_tool_selector_candidate_index(
-                            &config.mcp_servers,
-                            cache_ref,
-                            prefix,
-                        ));
-                }
+            if has_tool_filters(definition)
+                && cached_selector_candidate_index.is_none()
+                && let Some(cache_ref) = cache.as_ref()
+            {
+                cached_selector_candidate_index =
+                    Some(create_cached_tool_selector_candidate_index(
+                        &config.mcp_servers,
+                        cache_ref,
+                        prefix,
+                    ));
             }
             let metadata = reconstruct_tool_metadata(
                 name,
@@ -340,16 +341,16 @@ pub async fn initialize_mcp(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert((*name).clone(), cached.resources.len());
-            if let Some(prompts) = &cached.prompts {
-                if !prompts.is_empty() {
-                    let reconstructed =
-                        reconstruct_prompt_metadata(name, prompts, prefix, Some(definition));
-                    state
-                        .prompt_metadata
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert((*name).clone(), reconstructed);
-                }
+            if let Some(prompts) = &cached.prompts
+                && !prompts.is_empty()
+            {
+                let reconstructed =
+                    reconstruct_prompt_metadata(name, prompts, prefix, Some(definition));
+                state
+                    .prompt_metadata
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((*name).clone(), reconstructed);
             }
             if let Some(instructions) = &cached.instructions {
                 state
@@ -1051,20 +1052,20 @@ pub fn resolve_mcp_result_content(result: &Value) -> Vec<Value> {
         .and_then(Value::as_array)
         .map(|a| transform_mcp_content(a))
         .unwrap_or_default();
-    if let Some(structured) = result.get("structuredContent") {
-        if !structured.is_null() {
-            let text =
-                serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string());
-            if !blocks.is_empty() {
-                let mut combined = blocks;
-                combined.push(json!({
-                    "type": "text",
-                    "text": format!("structuredContent:\n{text}"),
-                }));
-                return combined;
-            }
-            return vec![json!({ "type": "text", "text": text })];
+    if let Some(structured) = result.get("structuredContent")
+        && !structured.is_null()
+    {
+        let text =
+            serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string());
+        if !blocks.is_empty() {
+            let mut combined = blocks;
+            combined.push(json!({
+                "type": "text",
+                "text": format!("structuredContent:\n{text}"),
+            }));
+            return combined;
         }
+        return vec![json!({ "type": "text", "text": text })];
     }
     blocks
 }
@@ -1539,10 +1540,10 @@ pub fn execute_search(
             if unavailable.contains(server_name) {
                 continue;
             }
-            if let Some(server) = server {
-                if server_name != server {
-                    continue;
-                }
+            if let Some(server) = server
+                && server_name != server
+            {
+                continue;
             }
             for tool in metadata {
                 let matched = pattern.is_match(&tool.name)
@@ -2475,23 +2476,23 @@ pub async fn execute_connect(state: &McpRuntime, server_name: &str) -> Value {
     };
     // TE-D09 (proxy-modes.ts:716-734): one auto-auth attempt on
     // needs-auth, then a fresh connect.
-    if let Ok(connection) = &outcome {
-        if connection.status() == ConnectionStatus::NeedsAuth {
-            match attempt_auto_auth(state, server_name).await {
-                Err(message) => {
-                    return text_result(
-                        message.clone(),
-                        json!({
-                            "mode": "connect", "error": "auth_required",
-                            "server": server_name, "message": message,
-                        }),
-                    );
-                }
-                Ok(true) => {
-                    outcome = state.manager.connect(server_name, &definition).await;
-                }
-                Ok(false) => {}
+    if let Ok(connection) = &outcome
+        && connection.status() == ConnectionStatus::NeedsAuth
+    {
+        match attempt_auto_auth(state, server_name).await {
+            Err(message) => {
+                return text_result(
+                    message.clone(),
+                    json!({
+                        "mode": "connect", "error": "auth_required",
+                        "server": server_name, "message": message,
+                    }),
+                );
             }
+            Ok(true) => {
+                outcome = state.manager.connect(server_name, &definition).await;
+            }
+            Ok(false) => {}
         }
     }
     match outcome {
@@ -2693,10 +2694,10 @@ pub async fn execute_call(
             }
         }
         drop(metadata);
-        if tool_meta.is_none() {
-            if let Some((server, meta)) = disabled_match {
-                return disabled_call_result(&server, Some(&meta));
-            }
+        if tool_meta.is_none()
+            && let Some((server, meta)) = disabled_match
+        {
+            return disabled_call_result(&server, Some(&meta));
         }
     }
 
@@ -2800,18 +2801,16 @@ pub async fn execute_call(
                     }),
                 );
             }
-            if tool_meta.is_none() {
-                if let Some(failed_ago) = state.failures.failure_age_seconds(&server) {
-                    return text_result(
-                        format!(
-                            "Server \"{server}\" not available (last failed {failed_ago}s ago)"
-                        ),
-                        json!({
-                            "mode": "call", "error": "server_backoff",
-                            "server": server, "requestedTool": tool_name,
-                        }),
-                    );
-                }
+            if tool_meta.is_none()
+                && let Some(failed_ago) = state.failures.failure_age_seconds(&server)
+            {
+                return text_result(
+                    format!("Server \"{server}\" not available (last failed {failed_ago}s ago)"),
+                    json!({
+                        "mode": "call", "error": "server_backoff",
+                        "server": server, "requestedTool": tool_name,
+                    }),
+                );
             }
         }
     }
@@ -3116,7 +3115,7 @@ pub async fn execute_call(
                             &server_name,
                             tool_name,
                             true,
-                        )
+                        );
                     }
                 }
             }
@@ -3143,28 +3142,25 @@ pub async fn execute_call(
     // with the "Expected parameters" guidance; dialects the validator cannot
     // evaluate fall through to server-side validation. Resource tools take
     // no arguments and are exempt.
-    if tool_meta.resource_uri.is_none() {
-        if let Some(schema) = tool_meta.input_schema.as_ref() {
-            if let Some(validation_error) = proxy_argument_validation_error(schema, &args) {
-                let guard_options =
-                    crate::guard::resolve_guard_options(state.config.settings.as_ref());
-                let schema_text =
-                    format!("\n\nExpected parameters:\n{}", format_schema(schema, "  "));
-                let guarded = crate::guard::guard_mcp_output(
-                    vec![json!({ "type": "text", "text": validation_error.clone() })],
-                    &crate::guard::GuardOptions {
-                        prefix: Some("Failed to call tool: ".to_string()),
-                        suffix: Some(schema_text),
-                        ..guard_options
-                    },
-                );
-                let mut details = json!({ "mode": "call", "error": "call_failed" });
-                merge_objects(&mut details, &call_identity);
-                details["message"] = json!(validation_error);
-                merge_objects(&mut details, &crate::guard::guarded_mcp_details(&guarded));
-                return json!({ "content": guarded.content, "details": details });
-            }
-        }
+    if tool_meta.resource_uri.is_none()
+        && let Some(schema) = tool_meta.input_schema.as_ref()
+        && let Some(validation_error) = proxy_argument_validation_error(schema, &args)
+    {
+        let guard_options = crate::guard::resolve_guard_options(state.config.settings.as_ref());
+        let schema_text = format!("\n\nExpected parameters:\n{}", format_schema(schema, "  "));
+        let guarded = crate::guard::guard_mcp_output(
+            vec![json!({ "type": "text", "text": validation_error.clone() })],
+            &crate::guard::GuardOptions {
+                prefix: Some("Failed to call tool: ".to_string()),
+                suffix: Some(schema_text),
+                ..guard_options
+            },
+        );
+        let mut details = json!({ "mode": "call", "error": "call_failed" });
+        merge_objects(&mut details, &call_identity);
+        details["message"] = json!(validation_error);
+        merge_objects(&mut details, &crate::guard::guarded_mcp_details(&guarded));
+        return json!({ "content": guarded.content, "details": details });
     }
 
     // R7.2.2.1–.4 / FR-P1-07: approval gate (proxy-modes.ts:1262-1286 @
@@ -4015,42 +4011,42 @@ impl ProxyDispatcher {
         // args parsing (index.ts:735-756) — upstream throws; the ABI has no
         // throw channel, so the same message rides a normal result (TE-D04).
         let mut parsed_args: Option<serde_json::Map<String, Value>> = None;
-        if let Some(args) = params.get("args") {
-            if args.as_str() != Some("") {
-                let parsed = if let Some(text) = args.as_str() {
-                    match serde_json::from_str::<Value>(text) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            let message = format!("Invalid args JSON: {error}");
-                            return text_result(
-                                message.clone(),
-                                json!({ "error": "invalid_args", "message": message }),
-                            );
-                        }
-                    }
-                } else {
-                    args.clone()
-                };
-                match parsed.as_object() {
-                    Some(map) => parsed_args = Some(map.clone()),
-                    None => {
-                        let got = if parsed.is_array() {
-                            "array"
-                        } else if parsed.is_null() {
-                            "null"
-                        } else if parsed.is_boolean() {
-                            "boolean"
-                        } else if parsed.is_number() {
-                            "number"
-                        } else {
-                            "string"
-                        };
-                        let message = format!("Invalid args: expected a JSON object, got {got}");
+        if let Some(args) = params.get("args")
+            && args.as_str() != Some("")
+        {
+            let parsed = if let Some(text) = args.as_str() {
+                match serde_json::from_str::<Value>(text) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let message = format!("Invalid args JSON: {error}");
                         return text_result(
                             message.clone(),
                             json!({ "error": "invalid_args", "message": message }),
                         );
                     }
+                }
+            } else {
+                args.clone()
+            };
+            match parsed.as_object() {
+                Some(map) => parsed_args = Some(map.clone()),
+                None => {
+                    let got = if parsed.is_array() {
+                        "array"
+                    } else if parsed.is_null() {
+                        "null"
+                    } else if parsed.is_boolean() {
+                        "boolean"
+                    } else if parsed.is_number() {
+                        "number"
+                    } else {
+                        "string"
+                    };
+                    let message = format!("Invalid args: expected a JSON object, got {got}");
+                    return text_result(
+                        message.clone(),
+                        json!({ "error": "invalid_args", "message": message }),
+                    );
                 }
             }
         }
@@ -4432,10 +4428,12 @@ mod tests {
         });
         let blocks = resolve_mcp_result_content(&structured_only);
         assert_eq!(blocks.len(), 1);
-        assert!(blocks[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("\"result\": \"table\""));
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"result\": \"table\"")
+        );
     }
 
     #[test]
@@ -4492,24 +4490,30 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .insert("ghost".to_string(), 1);
         update_server_metadata(&runtime, "ghost");
-        assert!(runtime
-            .tool_metadata
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get("ghost")
-            .is_none());
-        assert!(runtime
-            .resource_counts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get("ghost")
-            .is_none());
-        assert!(runtime
-            .direct_tool_counts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get("ghost")
-            .is_none());
+        assert!(
+            runtime
+                .tool_metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("ghost")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .resource_counts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("ghost")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .direct_tool_counts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("ghost")
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

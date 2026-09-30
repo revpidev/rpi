@@ -9,9 +9,9 @@
 use std::sync::Arc;
 
 use crate::api::openai_completions::OpenAiCompletions;
-use crate::auth::{env_api_key_auth, ProviderAuth};
+use crate::auth::{ProviderAuth, env_api_key_auth};
 use crate::generated::get_builtin_models;
-use crate::models::{create_provider, CreateProviderOptions, Provider, ProviderApi};
+use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `moonshotaiCnProvider()`.
 pub fn moonshotai_cn_provider() -> Arc<dyn Provider> {

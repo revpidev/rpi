@@ -19,12 +19,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::api::constrained_sampling::{
-    append_grammar_tool_input_json_delta, get_grammar_tool_input, get_json_schema_tool_parameters,
-    resolve_grammar_constrained_sampling, resolve_json_schema_strict_sampling,
-    GrammarToolInputJsonBuffer,
+    GrammarToolInputJsonBuffer, append_grammar_tool_input_json_delta, get_grammar_tool_input,
+    get_json_schema_tool_parameters, resolve_grammar_constrained_sampling,
+    resolve_json_schema_strict_sampling,
 };
 use crate::types::StreamEvent;
 use crate::types::{
@@ -64,24 +64,22 @@ pub struct ParsedTextSignature {
 /// legacy plain id string. `None` only when no signature was given.
 pub fn parse_text_signature(signature: Option<&str>) -> Option<ParsedTextSignature> {
     let signature = signature?;
-    if signature.starts_with('{') {
-        if let Ok(parsed) = serde_json::from_str::<Value>(signature) {
-            if parsed.get("v").and_then(Value::as_u64) == Some(1) {
-                if let Some(id) = parsed.get("id").and_then(Value::as_str) {
-                    let phase = match parsed.get("phase").and_then(Value::as_str) {
-                        Some("commentary") => Some(TextSignaturePhase::Commentary),
-                        Some("final_answer") => Some(TextSignaturePhase::FinalAnswer),
-                        _ => None,
-                    };
-                    return Some(ParsedTextSignature {
-                        id: id.to_owned(),
-                        phase,
-                    });
-                }
-            }
-        }
-        // Fall through to legacy plain-string handling.
+    if signature.starts_with('{')
+        && let Ok(parsed) = serde_json::from_str::<Value>(signature)
+        && parsed.get("v").and_then(Value::as_u64) == Some(1)
+        && let Some(id) = parsed.get("id").and_then(Value::as_str)
+    {
+        let phase = match parsed.get("phase").and_then(Value::as_str) {
+            Some("commentary") => Some(TextSignaturePhase::Commentary),
+            Some("final_answer") => Some(TextSignaturePhase::FinalAnswer),
+            _ => None,
+        };
+        return Some(ParsedTextSignature {
+            id: id.to_owned(),
+            phase,
+        });
     }
+    // Fall through to legacy plain-string handling.
     Some(ParsedTextSignature {
         id: signature.to_owned(),
         phase: None,
@@ -480,10 +478,10 @@ pub fn convert_responses_messages(
                                 if let Some(item_id) = item_id {
                                     item["id"] = json!(item_id);
                                 }
-                                if can_replay_namespace {
-                                    if let Some(namespace) = &tool_call.namespace {
-                                        item["namespace"] = json!(namespace);
-                                    }
+                                if can_replay_namespace
+                                    && let Some(namespace) = &tool_call.namespace
+                                {
+                                    item["namespace"] = json!(namespace);
                                 }
                                 output.push(item);
                             } else {
@@ -497,10 +495,10 @@ pub fn convert_responses_messages(
                                 if let Some(item_id) = item_id {
                                     item["id"] = json!(item_id);
                                 }
-                                if can_replay_namespace {
-                                    if let Some(namespace) = &tool_call.namespace {
-                                        item["namespace"] = json!(namespace);
-                                    }
+                                if can_replay_namespace
+                                    && let Some(namespace) = &tool_call.namespace
+                                {
+                                    item["namespace"] = json!(namespace);
                                 }
                                 output.push(item);
                             }
@@ -1191,10 +1189,10 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 {
                     block.arguments = parse_streaming_json(Some(&arguments));
                 }
-                if let Some(delta) = arguments.strip_prefix(&previous_partial_json) {
-                    if !delta.is_empty() {
-                        self.push_tool_call_delta(content_index, Some(delta.to_owned()), events);
-                    }
+                if let Some(delta) = arguments.strip_prefix(&previous_partial_json)
+                    && !delta.is_empty()
+                {
+                    self.push_tool_call_delta(content_index, Some(delta.to_owned()), events);
                 }
             }
             Some("response.custom_tool_call_input.delta") => {
@@ -1511,7 +1509,7 @@ fn join_text_parts(parts: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::api::openai_completions::tests as common;
@@ -1795,9 +1793,11 @@ mod tests {
         let call_id = out[0]["call_id"].as_str().expect("call_id");
         assert!(call_id.chars().count() <= 64);
         assert!(!call_id.ends_with('_'));
-        assert!(call_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert!(
+            call_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
         // Tool result id is normalized identically (pairing preserved).
         assert_eq!(out[1]["call_id"], json!(call_id));
     }
@@ -2014,12 +2014,14 @@ mod tests {
             .filter_map(|item| item["content"].as_str())
             .collect();
         assert_eq!(developer_texts, vec!["base prompt\n\nupdated guidance"]);
-        assert!(out
-            .iter()
-            .all(|item| item["type"] != json!("additional_tools")));
-        assert!(out
-            .iter()
-            .all(|item| item["type"] != json!("tool_search_call")));
+        assert!(
+            out.iter()
+                .all(|item| item["type"] != json!("additional_tools"))
+        );
+        assert!(
+            out.iter()
+                .all(|item| item["type"] != json!("tool_search_call"))
+        );
     }
 
     // -- namespace replay (02bd2d1c6 @ 4181f66, #7709) -------------------------

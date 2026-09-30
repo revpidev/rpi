@@ -30,8 +30,8 @@
 //!   keeps JS falsy semantics (empty strings and `expires_in: 0` count as
 //!   missing).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -43,7 +43,7 @@ use super::super::resolve::{ModelsError, ModelsErrorCode};
 use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
 use super::callback_page::{oauth_error_html, oauth_success_html};
 use super::device_code::{
-    poll_oauth_device_code_flow, DeviceCodePollOptions, DeviceCodePollResult,
+    DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
 use super::pkce::generate_pkce;
 use crate::providers::radius_config::normalize_radius_gateway_url;
@@ -1208,11 +1208,13 @@ mod tests {
         .await
         .expect("callback response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .text()
-            .await
-            .expect("body")
-            .contains("Signed in to Radius. You may now close this page."));
+        assert!(
+            response
+                .text()
+                .await
+                .expect("body")
+                .contains("Signed in to Radius. You may now close this page.")
+        );
 
         let credential = login.await.expect("join").expect("login");
         assert_eq!(credential.access, "browser-access");
@@ -1274,11 +1276,13 @@ mod tests {
         .await
         .expect("callback response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response
-            .text()
-            .await
-            .expect("body")
-            .contains("OAuth state mismatch."));
+        assert!(
+            response
+                .text()
+                .await
+                .expect("body")
+                .contains("OAuth state mismatch.")
+        );
 
         let response = reqwest::get(format!(
             "http://127.0.0.1:{callback_port}{CALLBACK_PATH}?code=the-code&state={state}"

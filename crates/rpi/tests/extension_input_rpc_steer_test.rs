@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct TempDir(PathBuf);
 

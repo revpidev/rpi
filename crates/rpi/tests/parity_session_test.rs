@@ -23,7 +23,7 @@ use rpi::core::session_manager::SessionManager;
 use rpi_agent::messages::AgentMessage;
 use rpi_ai::types::{UserContent, UserMessage, UserRole};
 use rpi_test_support::diff::diff_jsonl;
-use rpi_test_support::faux::{faux_assistant_message, FauxAssistantOptions};
+use rpi_test_support::faux::{FauxAssistantOptions, faux_assistant_message};
 use serde_json::Value;
 
 const SCENARIOS: &[&str] = &[
@@ -215,10 +215,10 @@ fn parity_fixture_sessions_continue_after_load() {
 async fn parity_fixture_session_prompt_continue_with_faux_provider() {
     use rpi::core::agent_session::PromptOptions;
     use rpi::core::agent_session_services::{
-        create_agent_session_services, CreateAgentSessionServicesOptions,
+        CreateAgentSessionServicesOptions, create_agent_session_services,
     };
     use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
-    use rpi::sdk::{create_agent_session, CreateAgentSessionOptions};
+    use rpi::sdk::{CreateAgentSessionOptions, create_agent_session};
     use rpi_test_support::faux::{FauxAiProvider, FauxProvider, FauxProviderOptions};
     use std::sync::{Arc, Mutex};
 
@@ -229,11 +229,9 @@ async fn parity_fixture_session_prompt_continue_with_faux_provider() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
 
     let provider = FauxProvider::new(FauxProviderOptions::default());
-    provider.set_responses(vec![faux_assistant_message(
-        "continued answer",
-        FauxAssistantOptions::default(),
-    )
-    .into()]);
+    provider.set_responses(vec![
+        faux_assistant_message("continued answer", FauxAssistantOptions::default()).into(),
+    ]);
     let model = provider.get_model(None).expect("faux model");
 
     let model_runtime = rpi::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {

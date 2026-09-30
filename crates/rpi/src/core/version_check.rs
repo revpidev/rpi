@@ -459,11 +459,13 @@ mod tests {
         .await
         .expect("offline result");
         assert_eq!(release, None);
-        assert!(transport
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        assert!(
+            transport
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -719,14 +721,18 @@ mod tests {
         // Zero-network anchor: a disabled endpoint never touches the transport.
         let transport =
             ScriptedTransport::responds(Ok(Some(r#"{"version": "9.9.9"}"#.to_string())));
-        assert!(check_for_new_rpi_release("1.0.0", &transport, None)
-            .await
-            .is_none());
-        assert!(transport
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        assert!(
+            check_for_new_rpi_release("1.0.0", &transport, None)
+                .await
+                .is_none()
+        );
+        assert!(
+            transport
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
     }
 
     /// T23.4: the startup probe never retries (upstream `checkForNewPiVersion`

@@ -84,7 +84,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::keys::set_kitty_protocol_active;
-use crate::native_modifiers::{is_native_modifier_pressed, ModifierKey};
+use crate::native_modifiers::{ModifierKey, is_native_modifier_pressed};
 use crate::stdin_buffer::{StdinBuffer, StdinBufferEvent, StdinBufferOptions};
 
 /// `TERMINAL_PROGRESS_KEEPALIVE_MS` (terminal.ts:11).
@@ -130,20 +130,19 @@ pub fn parse_keyboard_protocol_negotiation_sequence(
     if let Some(digits) = sequence
         .strip_prefix("\x1b[?")
         .and_then(|rest| rest.strip_suffix('u'))
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
     {
-        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-            let flags = digits.parse::<u32>().unwrap_or(u32::MAX);
-            return Some(KeyboardProtocolNegotiationSequence::KittyFlags { flags });
-        }
+        let flags = digits.parse::<u32>().unwrap_or(u32::MAX);
+        return Some(KeyboardProtocolNegotiationSequence::KittyFlags { flags });
     }
     // /^\x1b\[\?[\d;]*c$/
     if let Some(middle) = sequence
         .strip_prefix("\x1b[?")
         .and_then(|rest| rest.strip_suffix('c'))
+        && middle.bytes().all(|b| b.is_ascii_digit() || b == b';')
     {
-        if middle.bytes().all(|b| b.is_ascii_digit() || b == b';') {
-            return Some(KeyboardProtocolNegotiationSequence::DeviceAttributes);
-        }
+        return Some(KeyboardProtocolNegotiationSequence::DeviceAttributes);
     }
     None
 }
@@ -184,14 +183,15 @@ const DEFAULT_SSH_ESCAPE_TIMEOUT: Duration = Duration::from_millis(100);
 pub fn resolve_escape_timeout_ms_with(getenv: impl Fn(&str) -> Option<String>) -> Duration {
     let configured =
         getenv("RPI_TUI_ESC_TIMEOUT").and_then(|value| value.trim().parse::<f64>().ok());
-    if let Some(configured) = configured {
-        if configured.is_finite() && configured > 0.0 {
-            // Fractional milliseconds round-trip through `Duration`
-            // (`Number("12.5")` stays 12.5 upstream); absurd magnitudes
-            // saturate instead of panicking (a JS `setTimeout` of 1e30 simply
-            // never fires).
-            return Duration::try_from_secs_f64(configured / 1000.0).unwrap_or(Duration::MAX);
-        }
+    if let Some(configured) = configured
+        && configured.is_finite()
+        && configured > 0.0
+    {
+        // Fractional milliseconds round-trip through `Duration`
+        // (`Number("12.5")` stays 12.5 upstream); absurd magnitudes
+        // saturate instead of panicking (a JS `setTimeout` of 1e30 simply
+        // never fires).
+        return Duration::try_from_secs_f64(configured / 1000.0).unwrap_or(Duration::MAX);
     }
     if getenv("SSH_CONNECTION").is_some() || getenv("SSH_TTY").is_some() {
         return DEFAULT_SSH_ESCAPE_TIMEOUT;
@@ -1568,8 +1568,8 @@ mod tests {
     fn falls_back_to_columns_and_lines_env_before_default_dimensions() {
         let previous_columns = std::env::var("COLUMNS").ok();
         let previous_lines = std::env::var("LINES").ok();
-        std::env::set_var("COLUMNS", "123");
-        std::env::set_var("LINES", "45");
+        rpi_test_env::set_var("COLUMNS", "123");
+        rpi_test_env::set_var("LINES", "45");
 
         // Upstream sets `process.stdout.columns/rows` to undefined; here the
         // size query is injected to fail ("not a tty").
@@ -1580,12 +1580,12 @@ mod tests {
         assert_eq!(terminal.rows(), 45);
 
         match previous_columns {
-            Some(value) => std::env::set_var("COLUMNS", value),
-            None => std::env::remove_var("COLUMNS"),
+            Some(value) => rpi_test_env::set_var("COLUMNS", value),
+            None => rpi_test_env::remove_var("COLUMNS"),
         }
         match previous_lines {
-            Some(value) => std::env::set_var("LINES", value),
-            None => std::env::remove_var("LINES"),
+            Some(value) => rpi_test_env::set_var("LINES", value),
+            None => rpi_test_env::remove_var("LINES"),
         }
     }
 

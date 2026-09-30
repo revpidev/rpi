@@ -119,8 +119,8 @@ fn config_merge_matches_upstream_load_mcp_config() {
                 }
             }
 
-            std::env::set_var("HOME", &home);
-            std::env::remove_var("RPI_CODING_AGENT_DIR");
+            rpi_test_env::set_var("HOME", &home);
+            rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
 
             let merged = load_mcp_config(None, &project);
             let actual = config_to_value(&merged);
@@ -145,12 +145,12 @@ fn config_merge_matches_upstream_load_mcp_config() {
     }));
 
     match saved_home {
-        Some(home) => std::env::set_var("HOME", home),
-        None => std::env::remove_var("HOME"),
+        Some(home) => rpi_test_env::set_var("HOME", home),
+        None => rpi_test_env::remove_var("HOME"),
     }
     match saved_agent_dir {
-        Some(dir) => std::env::set_var("RPI_CODING_AGENT_DIR", dir),
-        None => std::env::remove_var("RPI_CODING_AGENT_DIR"),
+        Some(dir) => rpi_test_env::set_var("RPI_CODING_AGENT_DIR", dir),
+        None => rpi_test_env::remove_var("RPI_CODING_AGENT_DIR"),
     }
     run.expect("config merge comparison panicked");
 }

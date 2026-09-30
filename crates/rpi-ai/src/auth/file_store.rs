@@ -766,7 +766,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
 
     use super::*;
     use crate::types::ProviderEnv;
@@ -814,14 +814,14 @@ mod tests {
 
     impl EnvGuard {
         fn set(name: &'static str, value: &str) -> Self {
-            std::env::set_var(name, value);
+            rpi_test_env::set_var(name, value);
             Self(name)
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            std::env::remove_var(self.0);
+            rpi_test_env::remove_var(self.0);
         }
     }
 
@@ -1115,9 +1115,11 @@ mod tests {
             )
             .await
             .expect_err("lock unavailable");
-        assert!(error
-            .message
-            .contains("Failed to acquire auth storage lock"));
+        assert!(
+            error
+                .message
+                .contains("Failed to acquire auth storage lock")
+        );
         assert_eq!(
             read_file_json(&auth_path),
             json!({ "anthropic": { "type": "api_key", "key": "stored" } })
@@ -1464,11 +1466,13 @@ mod tests {
             .await
             .expect_err("modify must reject");
         assert_eq!(error.code, ModelsErrorCode::Aborted);
-        assert!(storage
-            .read("anthropic", None)
-            .await
-            .expect("read")
-            .is_none());
+        assert!(
+            storage
+                .read("anthropic", None)
+                .await
+                .expect("read")
+                .is_none()
+        );
         assert_eq!(read_file_json(&auth_path), json!({}));
         let _ = std::fs::remove_dir_all(&dir);
     }

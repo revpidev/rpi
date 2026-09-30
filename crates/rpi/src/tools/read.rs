@@ -11,14 +11,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rpi_agent::{AgentError, AgentTool, AgentToolResult, AgentToolUpdateCallback};
 use rpi_ai::types::{ImageContent, TextContent, ToolResultContent};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::image_process::process_image;
-use crate::tools::mime::{detect_supported_image_mime_type, IMAGE_TYPE_SNIFF_BYTES};
-use crate::tools::path_utils::resolve_read_path;
-use crate::tools::truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES};
 use crate::tools::ToolContext;
+use crate::tools::image_process::process_image;
+use crate::tools::mime::{IMAGE_TYPE_SNIFF_BYTES, detect_supported_image_mime_type};
+use crate::tools::path_utils::resolve_read_path;
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
 
 // ---------------------------------------------------------------------------
 // ReadOperations (read.ts:43-50)
@@ -38,7 +38,7 @@ pub trait ReadOperations: Send + Sync {
     /// Detect image MIME type from file magic bytes.
     /// Return `Ok(None)` for non-image files.
     async fn detect_image_mime_type(&self, absolute_path: &Path)
-        -> std::io::Result<Option<String>>;
+    -> std::io::Result<Option<String>>;
 }
 
 /// Default local-filesystem implementation of [`ReadOperations`] (read.ts:52-56).
@@ -751,9 +751,10 @@ mod tests {
         assert_eq!(result.content.len(), 2);
         match &result.content[0] {
             ToolResultContent::Text(t) => {
-                assert!(t
-                    .text
-                    .contains("[Image converted from image/bmp to image/png.]"));
+                assert!(
+                    t.text
+                        .contains("[Image converted from image/bmp to image/png.]")
+                );
             }
             _ => panic!("expected text block"),
         }

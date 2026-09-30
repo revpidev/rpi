@@ -18,7 +18,7 @@ use std::path::Path;
 use abi_stable::library::RootModule;
 use abi_stable::sabi_types::VersionStrings;
 use abi_stable::std_types::RVec;
-use abi_stable::{package_version_strings, StableAbi};
+use abi_stable::{StableAbi, package_version_strings};
 use serde_json::Value;
 
 use crate::api::ExtensionApi;
@@ -128,7 +128,7 @@ pub struct NativePlugin {
 /// `lib_header_from_raw_library` (documented) — the module refs it hands
 /// out are `'static`.
 fn load_native_module_at(path: &Path) -> Result<RpiNativeModule_Ref, String> {
-    use abi_stable::library::{lib_header_from_raw_library, RawLibrary};
+    use abi_stable::library::{RawLibrary, lib_header_from_raw_library};
     let raw = RawLibrary::load_at(path).map_err(|e| format!("open: {e}"))?;
     // `lib_header_from_raw_library` does NOT leak — dropping `raw` would
     // dlclose the library and dangle every 'static ref handed out (the

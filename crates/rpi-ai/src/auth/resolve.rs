@@ -139,20 +139,20 @@ pub async fn resolve_provider_auth(
         None => auth_context.as_ref(),
     };
 
-    if let Some(api_key) = overrides.and_then(|o| o.api_key.clone()) {
-        if let Some(api_key_auth) = &auth.api_key {
-            let credential = ApiKeyCredential {
-                key: Some(api_key),
-                env: overrides.and_then(|o| o.env.clone()),
-            };
-            return resolve_api_key(
-                request_auth_context,
-                api_key_auth.as_ref(),
-                provider_id,
-                Some(&credential),
-            )
-            .await;
-        }
+    if let Some(api_key) = overrides.and_then(|o| o.api_key.clone())
+        && let Some(api_key_auth) = &auth.api_key
+    {
+        let credential = ApiKeyCredential {
+            key: Some(api_key),
+            env: overrides.and_then(|o| o.env.clone()),
+        };
+        return resolve_api_key(
+            request_auth_context,
+            api_key_auth.as_ref(),
+            provider_id,
+            Some(&credential),
+        )
+        .await;
     }
 
     let stored = read_credential(credentials, provider_id).await?;
@@ -382,8 +382,8 @@ mod tests {
     //! env。
 
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use serde_json::Map;
     use tokio_util::sync::CancellationToken;
@@ -476,18 +476,18 @@ mod tests {
                 .lock()
                 .expect("received")
                 .push(credential.is_some());
-            if let Some(credential) = credential {
-                if let Some(key) = credential.key.clone().filter(|key| !key.is_empty()) {
-                    return Ok(Some(AuthResult {
-                        auth: ModelAuth {
-                            api_key: Some(key),
-                            headers: None,
-                            base_url: None,
-                        },
-                        env: credential.env.clone(),
-                        source: Some("stored credential".to_owned()),
-                    }));
-                }
+            if let Some(credential) = credential
+                && let Some(key) = credential.key.clone().filter(|key| !key.is_empty())
+            {
+                return Ok(Some(AuthResult {
+                    auth: ModelAuth {
+                        api_key: Some(key),
+                        headers: None,
+                        base_url: None,
+                    },
+                    env: credential.env.clone(),
+                    source: Some("stored credential".to_owned()),
+                }));
             }
             if let Some(value) = ctx.env(ENV_VAR).await.filter(|value| !value.is_empty()) {
                 return Ok(Some(AuthResult {
@@ -1323,8 +1323,8 @@ mod tests {
 mod tests_credential_queue {
     //! T21b test 10 & 11: credential store queue cancellation + login started.
 
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tokio_util::sync::CancellationToken;
 
@@ -1439,8 +1439,8 @@ mod tests_credential_queue {
 #[cfg(test)]
 mod tests_file_queue {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tokio_util::sync::CancellationToken;
 

@@ -14,7 +14,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::keybindings::{get_keybindings, Keybinding};
+use crate::keybindings::{Keybinding, get_keybindings};
 use crate::tui::{Component, RenderHandle};
 
 use super::loader::{Loader, LoaderIndicatorOptions};

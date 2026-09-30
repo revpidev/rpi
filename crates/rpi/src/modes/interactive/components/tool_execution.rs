@@ -44,17 +44,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::image::{Image, ImageOptions, ImageTheme};
 use rpi_tui::components::mouse_region::MouseRegion;
-use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
 use rpi_tui::terminal_image::{
-    get_capabilities, get_image_dimensions, image_fallback, ImageProtocol,
+    ImageProtocol, get_capabilities, get_image_dimensions, image_fallback,
 };
 use rpi_tui::tui::{
-    shared_component_from_boxed, Component, Container, RenderHandle, TuiMouseButton, TuiMouseEvent,
-    TuiMouseEventResult, TuiMouseEventType, TuiMouseHandlerResult,
+    Component, Container, RenderHandle, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult,
+    TuiMouseEventType, TuiMouseHandlerResult, shared_component_from_boxed,
 };
 use serde_json::Value;
 
@@ -488,11 +488,11 @@ impl ToolExecutionComponent {
             // the source bytes at this index are unchanged — a newer
             // partial result must re-convert instead of reusing (and later
             // rendering) the stale entry.
-            if let Some(cached) = self.converted_images.get(&index) {
-                if cached.source_data == source_data && cached.source_mime_type == source_mime_type
-                {
-                    continue;
-                }
+            if let Some(cached) = self.converted_images.get(&index)
+                && cached.source_data == source_data
+                && cached.source_mime_type == source_mime_type
+            {
+                continue;
             }
             if let Some((data, mime_type)) = convert_to_png(&source_data, &source_mime_type) {
                 self.converted_images.insert(
@@ -554,15 +554,15 @@ impl ToolExecutionComponent {
     /// to the bold-tool-title fallback.
     fn render_call_component(&self) -> StdBox<dyn Component> {
         let context = self.get_render_context();
-        if let Some(def) = &self.tool_definition {
-            if let Some(component) = def.render_call(&self.args, &self.theme, &context) {
-                return component;
-            }
+        if let Some(def) = &self.tool_definition
+            && let Some(component) = def.render_call(&self.args, &self.theme, &context)
+        {
+            return component;
         }
-        if let Some(def) = &self.built_in_tool_definition {
-            if let Some(component) = def.render_call(&self.args, &self.theme, &context) {
-                return component;
-            }
+        if let Some(def) = &self.built_in_tool_definition
+            && let Some(component) = def.render_call(&self.args, &self.theme, &context)
+        {
+            return component;
         }
         StdBox::new(self.create_call_fallback())
     }
@@ -579,15 +579,15 @@ impl ToolExecutionComponent {
             expanded: self.expanded,
             is_partial: self.is_partial,
         };
-        if let Some(def) = &self.tool_definition {
-            if let Some(component) = def.render_result(&result, options, &self.theme, &context) {
-                return Some(component);
-            }
+        if let Some(def) = &self.tool_definition
+            && let Some(component) = def.render_result(&result, options, &self.theme, &context)
+        {
+            return Some(component);
         }
-        if let Some(def) = &self.built_in_tool_definition {
-            if let Some(component) = def.render_result(&result, options, &self.theme, &context) {
-                return Some(component);
-            }
+        if let Some(def) = &self.built_in_tool_definition
+            && let Some(component) = def.render_result(&result, options, &self.theme, &context)
+        {
+            return Some(component);
         }
         self.create_result_fallback()
             .map(|text| StdBox::new(text) as StdBox<dyn Component>)

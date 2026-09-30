@@ -21,3 +21,6 @@ serde_json.workspace = true
 # child-process execution (subagents runner/foreground.rs precedent).
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rpi-test-env.workspace = true

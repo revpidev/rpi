@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use crate::models::{create_models, CreateModelsOptions, Models, Provider};
+use crate::models::{CreateModelsOptions, Models, Provider, create_models};
 
 pub mod amazon_bedrock;
 pub mod ant_ling;

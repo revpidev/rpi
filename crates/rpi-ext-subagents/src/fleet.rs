@@ -23,12 +23,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::runner::background::{
-    AsyncRunHandle, ASYNC_RUNS, STATE_PAUSED, STATE_QUEUED, STATE_RUNNING,
+    ASYNC_RUNS, AsyncRunHandle, STATE_PAUSED, STATE_QUEUED, STATE_RUNNING,
 };
-use crate::{config, host_call_static, AsyncHostCalls, PluginRuntime};
+use crate::{AsyncHostCalls, PluginRuntime, config, host_call_static};
 
 /// The widget key (upstream `FLEET_STATUS_WIDGET_KEY`; the host namespaces
 /// it per-extension — TE11 FR-E.1).
@@ -581,10 +581,12 @@ mod tests {
         let tree = fleet_tree(&snapshot, true);
         let children = tree["children"].as_array().unwrap();
         assert_eq!(children.len(), 6 + 1 + 1); // cap + "+N more" + footer
-        assert!(children[6]["props"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("+2 more"));
+        assert!(
+            children[6]["props"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("+2 more")
+        );
     }
 
     #[test]

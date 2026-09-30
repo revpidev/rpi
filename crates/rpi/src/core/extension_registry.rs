@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::config;
 use crate::core::self_update::sha256_hex;
-use crate::core::version_check::{rpi_user_agent, UpdateChannel};
+use crate::core::version_check::{UpdateChannel, rpi_user_agent};
 
 /// Registry index / metadata requests (design §7.2 step 1).
 pub const REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -318,7 +318,7 @@ pub fn select_registry_version<'a>(
                 return Err(format!(
                     "Invalid version range \"{range}\" for \"{}\"",
                     index.name
-                ))
+                ));
             }
         },
     };
@@ -339,10 +339,10 @@ pub fn select_registry_version<'a>(
                 _ => {}
             }
         }
-        if let Some(req) = &req {
-            if !req.matches(&version) {
-                continue;
-            }
+        if let Some(req) = &req
+            && !req.matches(&version)
+        {
+            continue;
         }
         if best.as_ref().is_none_or(|(_, current)| version > *current) {
             best = Some((entry, version));
@@ -382,26 +382,25 @@ pub fn precheck_version_compatibility(
     host_abi: u32,
     host_version: &str,
 ) -> Result<(), String> {
-    if let Some(required) = entry.rpi_abi {
-        if required != host_abi {
-            return Err(format!(
-                "Version {} requires rpiAbi {required}, but this rpi supports ABI {host_abi}",
-                entry.version
-            ));
-        }
+    if let Some(required) = entry.rpi_abi
+        && required != host_abi
+    {
+        return Err(format!(
+            "Version {} requires rpiAbi {required}, but this rpi supports ABI {host_abi}",
+            entry.version
+        ));
     }
-    if let Some(min) = &entry.min_host_version {
-        if let (Ok(min), Ok(host)) = (
+    if let Some(min) = &entry.min_host_version
+        && let (Ok(min), Ok(host)) = (
             semver::Version::parse(min),
             semver::Version::parse(host_version),
-        ) {
-            if min > host {
-                return Err(format!(
-                    "Version {} requires rpi ≥ {min} (current: {host})",
-                    entry.version
-                ));
-            }
-        }
+        )
+        && min > host
+    {
+        return Err(format!(
+            "Version {} requires rpi ≥ {min} (current: {host})",
+            entry.version
+        ));
     }
     Ok(())
 }
@@ -423,7 +422,7 @@ pub fn select_artifact<'a>(
                     "Version {} is a native extension, but this build does not know its \
                      target triple, so the correct artifact cannot be determined",
                     entry.version
-                ))
+                ));
             }
         },
     };

@@ -13,14 +13,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use rpi_ai::api::pi_messages::{stream, PiMessages, PiMessagesOptions};
+use rpi_ai::api::pi_messages::{PiMessages, PiMessagesOptions, stream};
 use rpi_ai::models::ProviderStreams;
 use rpi_ai::types::{
     ApiKind, AssistantContent, Context, Model, ProviderResponse, StopReason, StreamEvent,
     StreamOptions,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -209,10 +209,10 @@ fn create_model(base_url: &str) -> Model {
 fn context() -> rpi_ai::types::TranscriptContext {
     rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: None,
-        messages: vec![serde_json::from_value(
-            json!({"role": "user", "content": "Hello", "timestamp": 0}),
-        )
-        .expect("user message")],
+        messages: vec![
+            serde_json::from_value(json!({"role": "user", "content": "Hello", "timestamp": 0}))
+                .expect("user message"),
+        ],
         tools: None,
     })
 }
@@ -344,9 +344,11 @@ async fn test_streams_text_and_tool_calls_and_resolves_the_terminal_message() {
     assert_eq!(tool_call.name, "read");
     assert_eq!(tool_call.arguments["path"], json!("a.txt"));
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, StreamEvent::TextDelta { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta { .. }))
+    );
     assert_eq!(
         events
             .iter()
@@ -428,10 +430,12 @@ async fn test_streams_thinking_blocks_with_signature_and_redacted_flag() {
 /// directly with `PiMessagesOptions::debug`.
 #[tokio::test]
 async fn test_appends_debug_1_and_reports_response_headers_via_on_response() {
-    let (base_url, mut captured) = serve(vec![ScriptResponse::sse(vec![
-        json!({"type": "done", "reason": "stop", "usage": usage_json()}),
+    let (base_url, mut captured) = serve(vec![
+        ScriptResponse::sse(vec![
+            json!({"type": "done", "reason": "stop", "usage": usage_json()}),
+        ])
+        .with_headers(&[("x-pi-gateway-upstream-provider", "anthropic")]),
     ])
-    .with_headers(&[("x-pi-gateway-upstream-provider", "anthropic")])])
     .await;
     let model = create_model(&format!("{base_url}/v1"));
 
@@ -649,9 +653,11 @@ async fn test_is_a_known_api_usable_on_models() {
     let message = result(&event_stream).await;
     collect(event_stream).await;
     assert_eq!(message.stop_reason, StopReason::Error);
-    assert!(message
-        .error_message
-        .as_deref()
-        .expect("error message")
-        .contains("No API key provided"));
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .expect("error message")
+            .contains("No API key provided")
+    );
 }

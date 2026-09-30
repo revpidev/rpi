@@ -72,7 +72,7 @@ use rpi_agent::messages::{
     AgentMessage, BranchSummaryMessage, BranchSummaryRole, CompactionSummaryMessage,
     CompactionSummaryRole, CustomMessage, CustomRole,
 };
-use rpi_agent::session::{parse_iso8601_ms, SessionEntry};
+use rpi_agent::session::{SessionEntry, parse_iso8601_ms};
 use rpi_agent::types::{AgentEvent, ThinkingLevel};
 use rpi_ai::types::{
     AssistantContent, ImageContent, ModelThinkingLevel, StopReason, ToolResultContent,
@@ -86,12 +86,12 @@ use rpi_tui::components::text::Text;
 use rpi_tui::components::truncated_text::TruncatedText;
 use rpi_tui::keybindings as tui_keybindings;
 use rpi_tui::tui::{
-    shared_component_from_boxed, Component, Container, Focusable, OverlayHandle, RenderHandle,
-    SharedComponent, TuiMode, TuiMouseEvent, TuiMouseHandlerResult, TuiStopOptions,
+    Component, Container, Focusable, OverlayHandle, RenderHandle, SharedComponent, TuiMode,
+    TuiMouseEvent, TuiMouseHandlerResult, TuiStopOptions, shared_component_from_boxed,
 };
 use rpi_tui::tui_handle::{Renderer, TuiHandle};
 use rpi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenRenderState};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 
 use crate::config::{APP_NAME, VERSION};
@@ -102,7 +102,7 @@ use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::compaction_runner::{CompactionEvent, CompactionReason, RetrySource};
 use crate::core::extensions::{ExtensionRunner, InputSource, StreamingBehavior};
 use crate::core::settings_manager::DoubleEscapeAction;
-use crate::core::themes::{load_theme, TerminalTheme, Theme};
+use crate::core::themes::{TerminalTheme, Theme, load_theme};
 use crate::core::trust_manager::has_trust_requiring_project_resources;
 use crate::error::RpiError;
 use crate::modes::interactive::clipboard;
@@ -116,14 +116,15 @@ use crate::modes::interactive::components::status_indicator::{
 use crate::modes::interactive::components::tree_selector::TreeSelectorComponent;
 use crate::modes::interactive::components::user_message_selector::UserMessageSelectorComponent;
 use crate::modes::interactive::components::{
-    dynamic_border::DynamicBorder, tool_execution::ToolResultState, BashExecutionComponent,
-    BranchSummaryMessageComponent, CompactionSummaryMessageComponent, CustomEntryComponent,
-    CustomMessageComponent, SharedStatusIndicator, SkillInvocationMessageComponent,
-    ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, UserMessageComponent,
+    BashExecutionComponent, BranchSummaryMessageComponent, CompactionSummaryMessageComponent,
+    CustomEntryComponent, CustomMessageComponent, SharedStatusIndicator,
+    SkillInvocationMessageComponent, ToolExecutionComponent, ToolExecutionOptions,
+    ToolResultContentLoose, UserMessageComponent, dynamic_border::DynamicBorder,
+    tool_execution::ToolResultState,
 };
 use crate::modes::interactive::custom_editor::{CustomEditor, CustomEditorRegion, EscapeHandler};
 use crate::modes::interactive::footer::{FooterComponent, FooterDataProvider};
-use crate::modes::interactive::header::{build_builtin_header, ExpandableText};
+use crate::modes::interactive::header::{ExpandableText, build_builtin_header};
 use crate::modes::interactive::theme::markdown_theme;
 use crate::tools::truncate::TruncationResult;
 
@@ -289,7 +290,7 @@ fn format_resume_command(session: &AgentSession) -> Option<String> {
 fn register_signal_handlers(shutdown_tx: watch::Sender<bool>) {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         for kind in [SignalKind::terminate(), SignalKind::hangup()] {
             let shutdown_tx = shutdown_tx.clone();
             if let Ok(mut stream) = signal(kind) {
@@ -2555,14 +2556,14 @@ impl InteractiveUi {
                         TuiMode::Regular => "regular",
                         TuiMode::Fullscreen => "fullscreen",
                     };
-                    if let Some(weak) = lock(&self.settings_selector_weak).as_ref() {
-                        if let Some(selector) = weak.upgrade() {
-                            selector
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get_settings_list()
-                                .update_value("tui-mode", mode_str);
-                        }
+                    if let Some(weak) = lock(&self.settings_selector_weak).as_ref()
+                        && let Some(selector) = weak.upgrade()
+                    {
+                        selector
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_settings_list()
+                            .update_value("tui-mode", mode_str);
                     }
                     self.show_status("Close active overlays before changing TUI mode");
                 } else {
@@ -2866,10 +2867,10 @@ impl InteractiveUi {
                             // Update UI (interactive-mode.ts:4712-4717).
                             lock(&ui.chat_container).clear();
                             ui.render_initial_messages();
-                            if let Some(editor_text) = result.editor_text {
-                                if lock(&ui.editor).get_text().trim().is_empty() {
-                                    lock(&ui.editor).set_text(&editor_text);
-                                }
+                            if let Some(editor_text) = result.editor_text
+                                && lock(&ui.editor).get_text().trim().is_empty()
+                            {
+                                lock(&ui.editor).set_text(&editor_text);
                             }
                             ui.show_status("Navigated to selected point");
                             // TODO(unassigned): flushCompactionQueue({ willRetry: false })
@@ -2969,10 +2970,10 @@ impl InteractiveUi {
     /// status-row height; see the v0.1 baseline).
     fn clear_status_indicator(&self, kind: Option<StatusIndicatorKind>) {
         let mut status = lock(&self.status);
-        if let Some(kind) = kind {
-            if status.kind() != Some(kind) {
-                return;
-            }
+        if let Some(kind) = kind
+            && status.kind() != Some(kind)
+        {
+            return;
         }
         status.dispose();
         *status = ActiveStatus::Idle;
@@ -3667,15 +3668,14 @@ impl InteractiveUi {
         // Insert before the streaming component if present
         // (interactive-mode.ts:3225-3231).
         let mut chat = lock(&self.chat_container);
-        if let Some(track) = lock(&self.streaming).as_ref() {
-            if let Some(index) = chat
+        if let Some(track) = lock(&self.streaming).as_ref()
+            && let Some(index) = chat
                 .children
                 .iter()
                 .position(|child| child_address(&**child) == track.entry_address)
-            {
-                chat.children.insert(index, Box::new(component));
-                return;
-            }
+        {
+            chat.children.insert(index, Box::new(component));
+            return;
         }
         chat.children.push(Box::new(component));
     }
@@ -3968,10 +3968,8 @@ impl InteractiveUi {
                     self.add_message_to_chat(message.clone(), options.populate_history);
                 }
             }
-            if has_messages {
-                if let Some((kind, usage)) = summary_cost {
-                    self.add_compaction_cost_notice(kind, &usage);
-                }
+            if has_messages && let Some((kind, usage)) = summary_cost {
+                self.add_compaction_cost_notice(kind, &usage);
             }
         }
 
@@ -5936,8 +5934,8 @@ mod tests {
 
     use super::*;
     use crate::modes::interactive::test_support::{
-        build_test_session, build_test_session_with, install_noop_product_transports, TempDir,
-        TestSession, TestTerminal,
+        TempDir, TestSession, TestTerminal, build_test_session, build_test_session_with,
+        install_noop_product_transports,
     };
 
     // ---------------------------------------------------------------------
@@ -6073,7 +6071,7 @@ mod tests {
     async fn bash_command_runs_user_bash_interception() {
         use rpi_ext_host::api::ExtensionApi;
         use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
-        use serde_json::{json, Value};
+        use serde_json::{Value, json};
 
         let factory: ExtensionFactory = Arc::new(|api: ExtensionApi| {
             api.on(
@@ -6694,10 +6692,10 @@ mod tests {
         let folded_rebuilds = rebuild_counter::get();
         let folded_frame = {
             let streaming = lock(&ui.streaming);
-            let frame = lock(&streaming.as_ref().unwrap().handle)
+
+            lock(&streaming.as_ref().unwrap().handle)
                 .render(100)
-                .to_vec();
-            frame
+                .to_vec()
         };
         assert_eq!(
             folded_rebuilds, 2,
@@ -6721,10 +6719,10 @@ mod tests {
         let unfolded_rebuilds = rebuild_counter::get();
         let unfolded_frame = {
             let streaming = lock(&ui.streaming);
-            let frame = lock(&streaming.as_ref().unwrap().handle)
+
+            lock(&streaming.as_ref().unwrap().handle)
                 .render(100)
-                .to_vec();
-            frame
+                .to_vec()
         };
         assert_eq!(
             unfolded_rebuilds, DELTAS,
@@ -8407,8 +8405,8 @@ mod tests {
         fn with(name: &'static str, value: Option<&str>) -> Self {
             let original = std::env::var_os(name);
             match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
+                Some(value) => rpi_test_env::set_var(name, value),
+                None => rpi_test_env::remove_var(name),
             }
             EnvGuard { name, original }
         }
@@ -8417,8 +8415,8 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.original {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
+                Some(value) => rpi_test_env::set_var(self.name, value),
+                None => rpi_test_env::remove_var(self.name),
             }
         }
     }

@@ -5,11 +5,11 @@
 //! `edit-tool-legacy-input.test.ts` (legacy shim + JSON string).
 
 use async_trait::async_trait;
-use rpi::tools::edit::{create_edit_tool, EditOperations, EditToolOptions};
-use rpi::tools::edit_diff::EditReplacement;
 use rpi::tools::ToolContext;
+use rpi::tools::edit::{EditOperations, EditToolOptions, create_edit_tool};
+use rpi::tools::edit_diff::EditReplacement;
 use rpi_agent::error::AgentError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
@@ -1226,9 +1226,10 @@ async fn test_edit_metadata() {
     assert_eq!(tool.name(), "edit");
     assert_eq!(tool.label(), "edit");
     assert!(tool.description().contains("Edit a single file"));
-    assert!(tool
-        .description()
-        .contains("edits[].oldText must match a unique"));
+    assert!(
+        tool.description()
+            .contains("edits[].oldText must match a unique")
+    );
 
     let params = tool.parameters();
     assert!(params.get("properties").unwrap().get("path").is_some());

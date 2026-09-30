@@ -156,21 +156,20 @@ fn test_catalog_field_by_field_roundtrip() {
             );
             assert_eq!(model.provider, provider);
             let mut expected_value = (*expected_value).clone();
-            if provider == "radius" {
-                if let serde_json::Value::Object(map) = &mut expected_value {
-                    for key in RADIUS_PASSTHROUGH_KEYS {
-                        map.remove(key);
-                    }
-                    // `pi-messages` reads back as `rpi-messages` (the de-pi
-                    // brand rename, `normalize_api_kind`; radius is the only
-                    // catalog provider on that API).
-                    if map.get("api") == Some(&serde_json::Value::String("pi-messages".to_owned()))
-                    {
-                        map.insert(
-                            "api".to_owned(),
-                            serde_json::Value::String("rpi-messages".to_owned()),
-                        );
-                    }
+            if provider == "radius"
+                && let serde_json::Value::Object(map) = &mut expected_value
+            {
+                for key in RADIUS_PASSTHROUGH_KEYS {
+                    map.remove(key);
+                }
+                // `pi-messages` reads back as `rpi-messages` (the de-pi
+                // brand rename, `normalize_api_kind`; radius is the only
+                // catalog provider on that API).
+                if map.get("api") == Some(&serde_json::Value::String("pi-messages".to_owned())) {
+                    map.insert(
+                        "api".to_owned(),
+                        serde_json::Value::String("rpi-messages".to_owned()),
+                    );
                 }
             }
             let actual = normalize_numbers(&serde_json::to_value(model).expect("serialize model"));

@@ -2,12 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::agents::discover::{self, AgentConfig};
 use crate::config::SettingsPair;
 use crate::paths;
-use crate::tool::{ToolOutcome, FOREGROUND_RUN_MEMORY};
+use crate::tool::{FOREGROUND_RUN_MEMORY, ToolOutcome};
 
 /// `handleList` text (agent-management.ts:753-788), P0 subset: no chains, no
 /// restricted section (capability ceiling is P1), sorted by name.
@@ -32,10 +32,10 @@ pub fn format_agent_list_with_ceiling(
             if let Some(context) = &agent.default_context {
                 meta.push_str(&format!(", context: {}", context.as_str()));
             }
-            if let Some(aliases) = &agent.aliases {
-                if !aliases.is_empty() {
-                    meta.push_str(&format!(", aliases: {}", aliases.join(", ")));
-                }
+            if let Some(aliases) = &agent.aliases
+                && !aliases.is_empty()
+            {
+                meta.push_str(&format!(", aliases: {}", aliases.join(", ")));
             }
             lines.push(format!(
                 "- {} ({}): {}",
@@ -69,10 +69,10 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
             agent.package_name.clone().unwrap_or_default()
         ));
     }
-    if let Some(aliases) = &agent.aliases {
-        if !aliases.is_empty() {
-            lines.push(format!("Aliases: {}", aliases.join(", ")));
-        }
+    if let Some(aliases) = &agent.aliases
+        && !aliases.is_empty()
+    {
+        lines.push(format!("Aliases: {}", aliases.join(", ")));
     }
     if let Some(model) = &agent.model {
         lines.push(format!("Model: {model}"));
@@ -364,10 +364,10 @@ pub fn agent_capabilities_snapshot(
         "agents": rows,
         "restrictedCount": restricted.len(),
     });
-    if let Some(sources) = ceiling.map(|c| c.sources.clone()) {
-        if !sources.is_empty() {
-            snapshot["capabilityCeilingSources"] = json!(sources);
-        }
+    if let Some(sources) = ceiling.map(|c| c.sources.clone())
+        && !sources.is_empty()
+    {
+        snapshot["capabilityCeilingSources"] = json!(sources);
     }
     snapshot
 }
@@ -448,10 +448,10 @@ fn handle_management_action_inner(
     let raw_params = deps.params.clone().unwrap_or(Value::Null);
     // Model-controlled names reach filesystem joins (agent files, settings
     // keys) — reject path-shaped input up front (C1, upstream sanitizeName).
-    if let Some(name) = agent_name {
-        if let Err(message) = crate::paths::ensure_safe_component(name, "Agent name") {
-            return ToolOutcome::error(message);
-        }
+    if let Some(name) = agent_name
+        && let Err(message) = crate::paths::ensure_safe_component(name, "Agent name")
+    {
+        return ToolOutcome::error(message);
     }
     match action {
         "list" => {
@@ -512,8 +512,7 @@ fn handle_management_action_inner(
                 }
                 let Some(id) = id_param(&raw_params) else {
                     return ToolOutcome::error(
-                        "status view \"transcript\" requires the run id (use { id })."
-                            .to_string(),
+                        "status view \"transcript\" requires the run id (use { id }).".to_string(),
                     );
                 };
                 let lines = raw_params
@@ -628,18 +627,14 @@ fn handle_management_action_inner(
                         // runtime dependency: the rejections are pure status
                         // decisions, and the child stop itself only signals
                         // (no bounded wait).
-                        let steps: Vec<Value> = snapshot["steps"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default();
+                        let steps: Vec<Value> =
+                            snapshot["steps"].as_array().cloned().unwrap_or_default();
                         if let Some(child_id) = &child_id {
                             let mut matches: Vec<usize> = Vec::new();
                             for (index, step) in steps.iter().enumerate() {
                                 let step_marker = format!("step:{index}");
-                                let candidates = [
-                                    step["runId"].as_str(),
-                                    Some(step_marker.as_str()),
-                                ];
+                                let candidates =
+                                    [step["runId"].as_str(), Some(step_marker.as_str())];
                                 if candidates.contains(&Some(child_id.as_str())) {
                                     matches.push(index);
                                 }
@@ -768,13 +763,12 @@ fn handle_management_action_inner(
         "resume" => {
             // Revive from the persisted child session (async-resume.ts):
             // requires a terminal/paused run and a continuation task.
-            let (Some(id), Some(host), Some(runtime)) = (
-                id_param(&raw_params),
-                deps.host,
-                deps.runtime,
-            ) else {
+            let (Some(id), Some(host), Some(runtime)) =
+                (id_param(&raw_params), deps.host, deps.runtime)
+            else {
                 return ToolOutcome::error(
-                    "action \"resume\" requires the run id and an active session context.".to_string(),
+                    "action \"resume\" requires the run id and an active session context."
+                        .to_string(),
                 );
             };
             let task = raw_params
@@ -796,14 +790,14 @@ fn handle_management_action_inner(
             // to revive — resume must not resurrect it (`resolveAsyncResumeTarget`
             // rejects `status == "stopped" || stopped == true` for the selected
             // step; rpi resumes the last step, so the gate lands there).
-            if let Some(last) = steps.last() {
-                if last["status"].as_str() == Some("stopped") || last["stopped"].as_bool() == Some(true)
-                {
-                    return ToolOutcome::error(format!(
-                        "Async run '{id}' child {} was stopped and cannot be resumed. Start a new run instead.",
-                        steps.len().saturating_sub(1)
-                    ));
-                }
+            if let Some(last) = steps.last()
+                && (last["status"].as_str() == Some("stopped")
+                    || last["stopped"].as_bool() == Some(true))
+            {
+                return ToolOutcome::error(format!(
+                    "Async run '{id}' child {} was stopped and cannot be resumed. Start a new run instead.",
+                    steps.len().saturating_sub(1)
+                ));
             }
             let session_file = steps
                 .last()
@@ -819,9 +813,8 @@ fn handle_management_action_inner(
                 .and_then(|step| step["agent"].as_str())
                 .unwrap_or("worker")
                 .to_string();
-            let task = task.unwrap_or_else(|| {
-                "Continue the interrupted task from this session.".to_string()
-            });
+            let task = task
+                .unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
             // New async run reviving the old session file.
             let params = serde_json::json!({
                 "agent": agent_name,
@@ -832,7 +825,9 @@ fn handle_management_action_inner(
             let host_cwd = host.cwd();
             let settings = crate::config::read_settings_pair(&host_cwd);
             let config = crate::config::load_config();
-            let result = crate::tool::execute_subagent_tool(&params, host, &settings, &config, runtime, None);
+            let result = crate::tool::execute_subagent_tool(
+                &params, host, &settings, &config, runtime, None,
+            );
             ToolOutcome {
                 text: result["content"][0]["text"]
                     .as_str()
@@ -887,9 +882,7 @@ fn handle_management_action_inner(
         // Mutating management set (agent-management.ts:908-1240).
         "create" | "update" => {
             let Some(name) = agent_name else {
-                return ToolOutcome::error(format!(
-                    "action \"{action}\" requires an agent name."
-                ));
+                return ToolOutcome::error(format!("action \"{action}\" requires an agent name."));
             };
             let scope = action_scope(&raw_params);
             let config_body = raw_params.get("config").cloned().unwrap_or(Value::Null);
@@ -911,9 +904,7 @@ fn handle_management_action_inner(
         }
         "disable" | "enable" => {
             let Some(name) = agent_name else {
-                return ToolOutcome::error(format!(
-                    "action \"{action}\" requires an agent name."
-                ));
+                return ToolOutcome::error(format!("action \"{action}\" requires an agent name."));
             };
             let scope = action_scope(&raw_params);
             manage_disable_enable(action == "disable", name, cwd, settings, scope)
@@ -928,9 +919,7 @@ fn handle_management_action_inner(
         // Refinement overlay (agent-refinements.ts, FR-P1-08).
         "refine" | "refine.show" | "refine.rollback" => {
             let Some(name) = agent_name else {
-                return ToolOutcome::error(format!(
-                    "action \"{action}\" requires an agent name."
-                ));
+                return ToolOutcome::error(format!("action \"{action}\" requires an agent name."));
             };
             manage_refine(action, name, &raw_params, cwd, settings)
         }
@@ -1021,38 +1010,35 @@ pub fn format_status_transcript(
             }
         }
     }
-    if body.is_empty() {
-        if let Some(path) = output_path
+    if body.is_empty()
+        && let Some(path) = output_path
             .as_deref()
             .filter(|p| std::path::Path::new(p).is_file())
-        {
-            if let Ok(raw) = std::fs::read_to_string(path) {
-                let all: Vec<&str> = raw.lines().collect();
-                let start = all.len().saturating_sub(line_limit);
-                body = all[start..]
-                    .iter()
-                    .map(|line| bounded_transcript_line(line))
-                    .collect();
-                source = if start > 0 {
-                    format!("Output tail from {path} (tail truncated)")
-                } else {
-                    format!("Output tail from {path}")
-                };
-            }
-        }
+        && let Ok(raw) = std::fs::read_to_string(path)
+    {
+        let all: Vec<&str> = raw.lines().collect();
+        let start = all.len().saturating_sub(line_limit);
+        body = all[start..]
+            .iter()
+            .map(|line| bounded_transcript_line(line))
+            .collect();
+        source = if start > 0 {
+            format!("Output tail from {path} (tail truncated)")
+        } else {
+            format!("Output tail from {path}")
+        };
     }
-    if body.is_empty() {
-        if let Some(path) = session_file
+    if body.is_empty()
+        && let Some(path) = session_file
             .as_deref()
             .filter(|p| std::path::Path::new(p).is_file())
-        {
-            match read_session_transcript_tail(path, line_limit) {
-                Ok(tail) => {
-                    source = format!("Session transcript tail from {path}");
-                    body = tail;
-                }
-                Err(error) => lines.push(format!("Session warning: {error}")),
+    {
+        match read_session_transcript_tail(path, line_limit) {
+            Ok(tail) => {
+                source = format!("Session transcript tail from {path}");
+                body = tail;
             }
+            Err(error) => lines.push(format!("Session warning: {error}")),
         }
     }
     // #2017 body byte budget (TE38 W6): applies to whichever source won.
@@ -1638,34 +1624,33 @@ fn manage_reset(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) ->
     } else {
         Some(crate::paths::get_agent_dir().join("settings.json"))
     };
-    if let Some(settings_path) = settings_path.filter(|p| p.exists()) {
-        if let Ok(raw) = std::fs::read_to_string(&settings_path) {
-            if let Ok(mut root) = serde_json::from_str::<Value>(&raw) {
-                let mut changed = false;
-                if let Some(entry) = root
-                    .get_mut("subagents")
+    if let Some(settings_path) = settings_path.filter(|p| p.exists())
+        && let Ok(raw) = std::fs::read_to_string(&settings_path)
+        && let Ok(mut root) = serde_json::from_str::<Value>(&raw)
+    {
+        let mut changed = false;
+        if let Some(entry) = root
+            .get_mut("subagents")
+            .and_then(|s| s.get_mut("agentOverrides"))
+            .and_then(|o| o.get_mut(name))
+            .and_then(Value::as_object_mut)
+        {
+            changed = entry.remove("disabled").is_some();
+            if entry.is_empty() {
+                // Empty entries are pruned.
+                root.get_mut("subagents")
+                    .and_then(|s| s.as_object_mut())
                     .and_then(|s| s.get_mut("agentOverrides"))
-                    .and_then(|o| o.get_mut(name))
-                    .and_then(Value::as_object_mut)
-                {
-                    changed = entry.remove("disabled").is_some();
-                    if entry.is_empty() {
-                        // Empty entries are pruned.
-                        root.get_mut("subagents")
-                            .and_then(|s| s.as_object_mut())
-                            .and_then(|s| s.get_mut("agentOverrides"))
-                            .and_then(|o| o.as_object_mut())
-                            .map(|o| o.remove(name));
-                    }
-                }
-                if changed {
-                    let _ = std::fs::write(
-                        &settings_path,
-                        serde_json::to_string_pretty(&root).unwrap_or_default(),
-                    );
-                    notes.push("removed the settings override".to_string());
-                }
+                    .and_then(|o| o.as_object_mut())
+                    .map(|o| o.remove(name));
             }
+        }
+        if changed {
+            let _ = std::fs::write(
+                &settings_path,
+                serde_json::to_string_pretty(&root).unwrap_or_default(),
+            );
+            notes.push("removed the settings override".to_string());
         }
     }
     if notes.is_empty() {
@@ -1868,7 +1853,7 @@ mod tests {
 
     /// Registry scratch handle for the action-path tests.
     fn action_test_run(run_id: &str, state: &str, steps: Value) {
-        use crate::runner::background::{AsyncRunHandle, ASYNC_RUNS};
+        use crate::runner::background::{ASYNC_RUNS, AsyncRunHandle};
         let run_dir = std::env::temp_dir().join(run_id);
         let _ = std::fs::remove_dir_all(&run_dir);
         let _ = std::fs::create_dir_all(&run_dir);
@@ -1960,7 +1945,9 @@ mod tests {
         assert!(outcome.is_error, "{}", outcome.text);
         assert_eq!(
             outcome.text,
-            format!("Async run '{run_id}' child 0 was stopped and cannot be resumed. Start a new run instead.")
+            format!(
+                "Async run '{run_id}' child 0 was stopped and cannot be resumed. Start a new run instead."
+            )
         );
         cleanup_run(&run_id);
         // `stopped: true` boolean form (upstream accepts either spelling).
@@ -2289,10 +2276,12 @@ mod tests {
             assert!(record["tools"].is_object());
             // Upstream row shape: `model` carries value/thinking ONLY.
             assert!(record["model"].as_object().unwrap().contains_key("value"));
-            assert!(!record["model"]
-                .as_object()
-                .unwrap()
-                .contains_key("allowedAgents"));
+            assert!(
+                !record["model"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("allowedAgents")
+            );
             assert!(record["execution"].is_object());
             assert!(record["output"].is_object());
             assert!(record["extensions"].is_object());

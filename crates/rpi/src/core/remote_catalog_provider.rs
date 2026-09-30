@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::models::{
-    merge_models, now_millis, InflightRefresh, ModelsPublication, Provider, RefreshModelsContext,
+    InflightRefresh, ModelsPublication, Provider, RefreshModelsContext, merge_models, now_millis,
 };
 use rpi_ai::models_store::ModelsStoreEntry;
 use rpi_ai::types::{
@@ -66,10 +66,10 @@ fn remote_models(entry: Option<&ModelsStoreEntry>, local_generated_at: Option<i6
     let Some(entry) = entry else {
         return Vec::new();
     };
-    if let Some(local) = local_generated_at {
-        if entry.last_modified.is_none_or(|last| last <= local) {
-            return Vec::new();
-        }
+    if let Some(local) = local_generated_at
+        && entry.last_modified.is_none_or(|last| last <= local)
+    {
+        return Vec::new();
     }
     entry.models.clone()
 }

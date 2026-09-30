@@ -481,13 +481,13 @@ fn process_data_line(
     // :199-203 — `JSON.parse` failures abort the stream.
     let value: Value = serde_json::from_str(data).map_err(|error| error.to_string())?;
     // Unknown event types parse to `None` (already warned).
-    if let Some(proxy_event) = parse_proxy_event(value).map_err(|error| error.to_string())? {
-        if let Some(event) = process_proxy_event(proxy_event, partial, partial_jsons)? {
-            if matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. }) {
-                *saw_terminal_event = true;
-            }
-            stream.push(event);
+    if let Some(proxy_event) = parse_proxy_event(value).map_err(|error| error.to_string())?
+        && let Some(event) = process_proxy_event(proxy_event, partial, partial_jsons)?
+    {
+        if matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. }) {
+            *saw_terminal_event = true;
         }
+        stream.push(event);
     }
     Ok(())
 }
@@ -995,9 +995,11 @@ mod tests {
 
     #[test]
     fn test_parse_unknown_missing_and_non_string_types_are_skipped() {
-        assert!(parse(r#"{"type":"bogus","x":1}"#)
-            .expect("parses")
-            .is_none());
+        assert!(
+            parse(r#"{"type":"bogus","x":1}"#)
+                .expect("parses")
+                .is_none()
+        );
         assert!(parse(r#"{"x":1}"#).expect("parses").is_none());
         assert!(parse(r#"{"type":5}"#).expect("parses").is_none());
         assert!(parse(r#"{"type":null}"#).expect("parses").is_none());

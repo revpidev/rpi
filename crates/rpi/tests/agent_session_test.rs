@@ -15,14 +15,14 @@ use serde_json::Value;
 
 use rpi::core::agent_session::{AgentSession, AgentSessionEvent, PromptOptions};
 use rpi::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
 use rpi_agent::messages::AgentMessage;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
 };
 
 // ---------------------------------------------------------------------------
@@ -608,10 +608,12 @@ async fn old_session_without_system_entries_backfills_on_first_request() {
             .collect::<Vec<_>>(),
         ["preamble", "tools", "rules", "cwd"]
     );
-    assert!(declaration
-        .tools_added
-        .as_ref()
-        .is_some_and(|tools| tools.len() == 4));
+    assert!(
+        declaration
+            .tools_added
+            .as_ref()
+            .is_some_and(|tools| tools.len() == 4)
+    );
 }
 
 /// #9548 (agent-session.ts:421-424): constructed without an explicit initial
@@ -824,10 +826,12 @@ async fn auto_retry_recovers_from_transient_error() {
     assert_eq!(start["attempt"], 1);
     assert_eq!(start["maxAttempts"], 3);
     assert!(start["delayMs"].as_u64().is_some());
-    assert!(start["errorMessage"]
-        .as_str()
-        .expect("errorMessage")
-        .contains("429"));
+    assert!(
+        start["errorMessage"]
+            .as_str()
+            .expect("errorMessage")
+            .contains("429")
+    );
 
     let retry_end = fixture.events_of_type("auto_retry_end");
     assert_eq!(retry_end.len(), 1);
@@ -869,10 +873,12 @@ async fn auto_retry_exhausted_reports_final_error() {
     let end = serde_json::to_value(&retry_end[0]).expect("serialize");
     assert_eq!(end["success"], false);
     assert_eq!(end["attempt"], 3);
-    assert!(end["finalError"]
-        .as_str()
-        .expect("finalError")
-        .contains("429"));
+    assert!(
+        end["finalError"]
+            .as_str()
+            .expect("finalError")
+            .contains("429")
+    );
     assert_eq!(fixture.provider.call_count(), 4);
 }
 
@@ -896,20 +902,19 @@ async fn abort_after_retry_attempt_finalizes_retry_state_9777() {
     let error_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let counter = error_count.clone();
     let _unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
-        if let AgentSessionEvent::Agent(agent_event) = &event {
-            if let rpi_agent::types::AgentEvent::MessageEnd { message } = agent_event.as_ref() {
-                match message {
-                    AgentMessage::Assistant(a)
-                        if a.stop_reason == rpi_ai::types::StopReason::Error
-                            && counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
-                                == 2 =>
-                    {
-                        // Sync prefix of `abort()` so the flag lands before
-                        // the next `handle_post_agent_run` decision.
-                        session.request_abort();
-                    }
-                    _ => {}
+        if let AgentSessionEvent::Agent(agent_event) = &event
+            && let rpi_agent::types::AgentEvent::MessageEnd { message } = agent_event.as_ref()
+        {
+            match message {
+                AgentMessage::Assistant(a)
+                    if a.stop_reason == rpi_ai::types::StopReason::Error
+                        && counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == 2 =>
+                {
+                    // Sync prefix of `abort()` so the flag lands before
+                    // the next `handle_post_agent_run` decision.
+                    session.request_abort();
                 }
+                _ => {}
             }
         }
     }));
@@ -969,16 +974,14 @@ async fn abort_prevents_post_run_auto_compaction_9340() {
 
     let session = fixture.session.clone();
     let _unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
-        if let AgentSessionEvent::Agent(agent_event) = &event {
-            if let rpi_agent::types::AgentEvent::MessageEnd { message } = agent_event.as_ref() {
-                match message {
-                    AgentMessage::Assistant(a)
-                        if a.stop_reason == rpi_ai::types::StopReason::Error =>
-                    {
-                        session.request_abort();
-                    }
-                    _ => {}
+        if let AgentSessionEvent::Agent(agent_event) = &event
+            && let rpi_agent::types::AgentEvent::MessageEnd { message } = agent_event.as_ref()
+        {
+            match message {
+                AgentMessage::Assistant(a) if a.stop_reason == rpi_ai::types::StopReason::Error => {
+                    session.request_abort();
                 }
+                _ => {}
             }
         }
     }));
@@ -1429,11 +1432,9 @@ async fn abort_cancels_in_flight_manual_compaction() {
             .append_message(user_msg(&format!("q2 {}", "x".repeat(200))))
             .expect("append");
     }
-    fixture.provider.set_responses(vec![faux_assistant_message(
-        "SUMMARY",
-        FauxAssistantOptions::default(),
-    )
-    .into()]);
+    fixture.provider.set_responses(vec![
+        faux_assistant_message("SUMMARY", FauxAssistantOptions::default()).into(),
+    ]);
 
     // Cancel through the exact channel abort() uses, the moment the
     // compaction starts (deterministic: CompactionStart fires inside
@@ -1442,16 +1443,16 @@ async fn abort_cancels_in_flight_manual_compaction() {
     let saw_abortable_state = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = saw_abortable_state.clone();
     let unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
-        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event {
-            if matches!(*inner, CompactionEvent::CompactionStart { .. }) {
-                // In flight: not idle (FR-F R3 — compaction included).
-                assert!(
-                    !session_for_listener.is_idle(),
-                    "is_idle must be false during manual compaction"
-                );
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                session_for_listener.abort_compaction();
-            }
+        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event
+            && matches!(*inner, CompactionEvent::CompactionStart { .. })
+        {
+            // In flight: not idle (FR-F R3 — compaction included).
+            assert!(
+                !session_for_listener.is_idle(),
+                "is_idle must be false during manual compaction"
+            );
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            session_for_listener.abort_compaction();
         }
     }));
 
@@ -1532,11 +1533,9 @@ async fn abort_concurrent_with_inflight_compaction_returns_after_settle() {
             .append_message(user_msg(&format!("q2 {}", "x".repeat(200))))
             .expect("append");
     }
-    fixture.provider.set_responses(vec![faux_assistant_message(
-        "SUMMARY",
-        FauxAssistantOptions::default(),
-    )
-    .into()]);
+    fixture.provider.set_responses(vec![
+        faux_assistant_message("SUMMARY", FauxAssistantOptions::default()).into(),
+    ]);
 
     // Fire the RPC Abort the instant the compaction is observably in
     // flight — CompactionStart fires inside compact() before the
@@ -1547,17 +1546,16 @@ async fn abort_concurrent_with_inflight_compaction_returns_after_settle() {
     let abort_session = fixture.session.clone();
     let slot = abort_outcome.clone();
     let unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
-        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event {
-            if matches!(*inner, CompactionEvent::CompactionStart { .. }) {
-                let session = abort_session.clone();
-                let slot = slot.clone();
-                tokio::spawn(async move {
-                    let outcome =
-                        tokio::time::timeout(std::time::Duration::from_secs(10), session.abort())
-                            .await;
-                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
-                });
-            }
+        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event
+            && matches!(*inner, CompactionEvent::CompactionStart { .. })
+        {
+            let session = abort_session.clone();
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                let outcome =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), session.abort()).await;
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+            });
         }
     }));
 
@@ -2178,36 +2176,36 @@ async fn navigate_tree_during_manual_compaction_is_rejected_9179() {
     let nav_target = target.clone();
     let outcome_slot = navigation_outcome.clone();
     let unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
-        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event {
-            if matches!(*inner, CompactionEvent::CompactionStart { .. }) {
-                assert!(
-                    !nav_session.is_idle(),
-                    "compaction must be in flight at CompactionStart"
-                );
-                let session = nav_session.clone();
-                let target = nav_target.clone();
-                let slot = outcome_slot.clone();
-                tokio::spawn(async move {
-                    let outcome = session
-                        .navigate_tree(
-                            &target,
-                            rpi::core::agent_session::NavigateTreeOptions {
-                                summarize: false,
-                                custom_instructions: None,
-                                replace_instructions: false,
-                                label: None,
-                            },
-                        )
-                        .await;
-                    let leaf_after_reject = {
-                        let manager = session.session_manager();
-                        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
-                        manager.get_leaf_id().map(str::to_owned)
-                    };
-                    *slot.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some((outcome, leaf_after_reject));
-                });
-            }
+        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event
+            && matches!(*inner, CompactionEvent::CompactionStart { .. })
+        {
+            assert!(
+                !nav_session.is_idle(),
+                "compaction must be in flight at CompactionStart"
+            );
+            let session = nav_session.clone();
+            let target = nav_target.clone();
+            let slot = outcome_slot.clone();
+            tokio::spawn(async move {
+                let outcome = session
+                    .navigate_tree(
+                        &target,
+                        rpi::core::agent_session::NavigateTreeOptions {
+                            summarize: false,
+                            custom_instructions: None,
+                            replace_instructions: false,
+                            label: None,
+                        },
+                    )
+                    .await;
+                let leaf_after_reject = {
+                    let manager = session.session_manager();
+                    let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+                    manager.get_leaf_id().map(str::to_owned)
+                };
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((outcome, leaf_after_reject));
+            });
         }
     }));
 
@@ -2279,11 +2277,13 @@ async fn second_navigation_while_first_pending_is_rejected_9179() {
     // rejected. The faux provider's first call IS the branch summary —
     // call_count >= 1 proves the abort cell was set.
     let fixture = session_fixture(
-        vec![faux_assistant_message(
-            format!("BRANCH SUMMARY {}", "detail ".repeat(40)).as_str(),
-            FauxAssistantOptions::default(),
-        )
-        .into()],
+        vec![
+            faux_assistant_message(
+                format!("BRANCH SUMMARY {}", "detail ".repeat(40)).as_str(),
+                FauxAssistantOptions::default(),
+            )
+            .into(),
+        ],
         FauxProviderOptions {
             tokens_per_second: Some(60.0),
             ..Default::default()

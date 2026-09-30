@@ -15,7 +15,7 @@ use rpi_ai::types::{
     AssistantContent, AssistantMessage, AssistantRole, StopReason, TextContent, Usage, UserContent,
     UserContentBlock, UserMessage, UserRole,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::*;
 use crate::tools::test_helpers::TempDir;
@@ -195,7 +195,9 @@ fn in_memory() -> SessionManager {
 }
 
 fn header_line(id: &str, cwd: &str) -> String {
-    format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"{TS}\",\"cwd\":\"{cwd}\"}}")
+    format!(
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"{TS}\",\"cwd\":\"{cwd}\"}}"
+    )
 }
 
 fn user_line(id: &str, parent: &str, text: &str) -> String {
@@ -1055,7 +1057,7 @@ fn list_all_with_progress_surfaces_newest_sessions_first_across_dirs() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var_os(crate::config::ENV_AGENT_DIR);
-    std::env::set_var(crate::config::ENV_AGENT_DIR, &agent_dir);
+    rpi_test_env::set_var(crate::config::ENV_AGENT_DIR, &agent_dir);
 
     let mut first_partial: Option<Vec<String>> = None;
     let mut final_order: Option<Vec<String>> = None;
@@ -1071,8 +1073,8 @@ fn list_all_with_progress_surfaces_newest_sessions_first_across_dirs() {
         };
         let sessions = SessionManager::list_all_with_progress(None, Some(&mut progress), None);
         match prev {
-            Some(v) => std::env::set_var(crate::config::ENV_AGENT_DIR, v),
-            None => std::env::remove_var(crate::config::ENV_AGENT_DIR),
+            Some(v) => rpi_test_env::set_var(crate::config::ENV_AGENT_DIR, v),
+            None => rpi_test_env::remove_var(crate::config::ENV_AGENT_DIR),
         }
         sessions
     };
@@ -2742,9 +2744,10 @@ fn fork_from_rejects_empty_or_invalid_source() {
     let err =
         SessionManager::fork_from(&file, tmp.path(), Some(tmp.path()), ForkOptions::default())
             .expect_err("must fail");
-    assert!(err
-        .to_string()
-        .contains("source session file is empty or invalid"));
+    assert!(
+        err.to_string()
+            .contains("source session file is empty or invalid")
+    );
 }
 
 /// forkFrom with entry_id + position (harness repo-utils.ts getEntriesToFork;
@@ -3161,14 +3164,14 @@ fn list_all_discovers_sessions_through_symlinked_directories() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var_os(crate::config::ENV_AGENT_DIR);
-    std::env::set_var(crate::config::ENV_AGENT_DIR, &agent_dir);
+    rpi_test_env::set_var(crate::config::ENV_AGENT_DIR, &agent_dir);
 
     let sessions = SessionManager::list_all(None);
 
     // Restore env immediately.
     match prev {
-        Some(v) => std::env::set_var(crate::config::ENV_AGENT_DIR, v),
-        None => std::env::remove_var(crate::config::ENV_AGENT_DIR),
+        Some(v) => rpi_test_env::set_var(crate::config::ENV_AGENT_DIR, v),
+        None => rpi_test_env::remove_var(crate::config::ENV_AGENT_DIR),
     }
 
     let matching: Vec<_> = sessions.iter().filter(|s| s.id == "abc123").collect();

@@ -9,7 +9,7 @@
 //! cacheControlFormat, per-model thinkingLevelMap, …).
 
 use rpi_ai::api::anthropic_messages::get_anthropic_compat;
-use rpi_ai::api::openai_completions::{detect_compat, get_compat, ResolvedOpenAICompletionsCompat};
+use rpi_ai::api::openai_completions::{ResolvedOpenAICompletionsCompat, detect_compat, get_compat};
 use rpi_ai::generated::get_builtin_model;
 use rpi_ai::types::{
     CacheControlFormat, MaxTokensField, Model, ModelThinkingLevel, SessionAffinityFormat,

@@ -20,14 +20,14 @@ use std::sync::Arc;
 
 use rpi_ai::auth::{AuthContext, Credential, OAuthCredential};
 use rpi_ai::generated::get_builtin_model;
-use rpi_ai::models::{get_supported_thinking_levels, CreateModelsOptions, Models, Provider};
+use rpi_ai::models::{CreateModelsOptions, Models, Provider, get_supported_thinking_levels};
 use rpi_ai::providers::cloudflare_ai_gateway::cloudflare_ai_gateway_provider;
 use rpi_ai::providers::cloudflare_workers_ai::cloudflare_workers_ai_provider;
 use rpi_ai::providers::github_copilot::github_copilot_provider;
 use rpi_ai::providers::opencode::opencode_provider;
 use rpi_ai::providers::opencode_go::opencode_go_provider;
 use rpi_ai::providers::openrouter::openrouter_provider;
-use rpi_ai::providers::radius::{radius_provider, radius_provider_with, RadiusProviderOptions};
+use rpi_ai::providers::radius::{RadiusProviderOptions, radius_provider, radius_provider_with};
 use rpi_ai::providers::vercel_ai_gateway::vercel_ai_gateway_provider;
 use rpi_ai::types::{ApiKind, ModelThinkingLevel, ProviderHeaders};
 
@@ -127,11 +127,13 @@ async fn test_github_copilot_factory_config_and_auth() {
     assert_eq!(result.source.as_deref(), Some("COPILOT_GITHUB_TOKEN"));
 
     let ctx = FakeAuthContext::new(&[]);
-    assert!(api_key
-        .resolve(&ctx, None)
-        .await
-        .expect("resolve")
-        .is_none());
+    assert!(
+        api_key
+            .resolve(&ctx, None)
+            .await
+            .expect("resolve")
+            .is_none()
+    );
 }
 
 /// `filterModels` (github-copilot.ts:19-27) through the factory's provider.
@@ -292,11 +294,13 @@ async fn test_cloudflare_workers_ai_requires_account_config() {
 
     let missing = models_with_context(FakeAuthContext::new(&[("CLOUDFLARE_API_KEY", "cf-key")]));
     missing.set_provider(cloudflare_workers_ai_provider());
-    assert!(missing
-        .get_auth(model, None)
-        .await
-        .expect("get_auth")
-        .is_none());
+    assert!(
+        missing
+            .get_auth(model, None)
+            .await
+            .expect("get_auth")
+            .is_none()
+    );
 
     let configured = models_with_context(FakeAuthContext::new(&[
         ("CLOUDFLARE_API_KEY", "cf-key"),
@@ -352,11 +356,13 @@ async fn test_cloudflare_ai_gateway_requires_account_and_gateway_config() {
         ("CLOUDFLARE_ACCOUNT_ID", "account-id"),
     ]));
     missing_gateway.set_provider(cloudflare_ai_gateway_provider());
-    assert!(missing_gateway
-        .get_auth(model, None)
-        .await
-        .expect("get_auth")
-        .is_none());
+    assert!(
+        missing_gateway
+            .get_auth(model, None)
+            .await
+            .expect("get_auth")
+            .is_none()
+    );
 
     let configured = models_with_context(FakeAuthContext::new(&[
         ("CLOUDFLARE_API_KEY", "cf-key"),
@@ -468,10 +474,12 @@ async fn test_radius_factory_config_and_auth() {
     assert_eq!(provider.name(), "Radius");
     assert_eq!(provider.base_url(), None);
     assert!(!provider.get_models().is_empty());
-    assert!(provider
-        .get_models()
-        .iter()
-        .any(|model| model.id == "balanced"));
+    assert!(
+        provider
+            .get_models()
+            .iter()
+            .any(|model| model.id == "balanced")
+    );
 
     let auth = provider.auth();
     let api_key = auth.api_key.as_ref().expect("api key auth");

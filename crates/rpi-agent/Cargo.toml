@@ -25,3 +25,4 @@ libc.workspace = true                 # bash kill process tree
 
 [dev-dependencies]
 rpi-test-support.workspace = true
+rpi-test-env.workspace = true

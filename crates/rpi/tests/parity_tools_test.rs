@@ -27,10 +27,10 @@ use rpi_agent::{Agent, AgentOptions, InitialAgentState};
 use rpi_ai::types::StopReason;
 use rpi_test_support::diff::diff_jsonl;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxAssistantOptions, FauxProvider,
-    FauxProviderOptions,
+    FauxAssistantOptions, FauxProvider, FauxProviderOptions, faux_assistant_message, faux_text,
+    faux_tool_call,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -69,10 +69,10 @@ fn prepare_lines(text: &str) -> String {
             continue;
         }
         let mut value: Value = serde_json::from_str(line).expect("fixture/actual line is JSON");
-        if let Some(event_type) = value.get("type").and_then(Value::as_str) {
-            if DROPPED_EVENT_TYPES.contains(&event_type) {
-                continue;
-            }
+        if let Some(event_type) = value.get("type").and_then(Value::as_str)
+            && DROPPED_EVENT_TYPES.contains(&event_type)
+        {
+            continue;
         }
         // #9548: the SDK-recorded fixture carries the AgentSession layer's
         // leading system declaration (message_start/end for the prompt/tool
@@ -88,10 +88,10 @@ fn prepare_lines(text: &str) -> String {
         strip_keys(&mut value);
         // agent_end.messages: drop the session-layer system declaration the
         // same way (this test drives the bare agent).
-        if value.get("type").and_then(Value::as_str) == Some("agent_end") {
-            if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
-                messages.retain(|message| message["role"] != serde_json::json!("system"));
-            }
+        if value.get("type").and_then(Value::as_str) == Some("agent_end")
+            && let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut)
+        {
+            messages.retain(|message| message["role"] != serde_json::json!("system"));
         }
         out.push_str(&serde_json::to_string(&value).expect("render"));
         out.push('\n');

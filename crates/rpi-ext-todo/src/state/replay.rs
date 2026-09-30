@@ -17,7 +17,7 @@
 use serde_json::Value;
 
 use crate::state::TaskState;
-use crate::tool::types::{Task, TOOL_NAME};
+use crate::tool::types::{TOOL_NAME, Task};
 
 /// Discriminator for `details` envelopes that match the persisted
 /// `TaskDetails` shape. Defensive — branch entries from older or corrupt

@@ -25,13 +25,13 @@
 use indexmap::IndexSet;
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::cache::{is_server_cache_valid, MetadataCache};
+use crate::cache::{MetadataCache, is_server_cache_valid};
 use crate::metadata::{
-    format_tool_name, has_tool_filters, index_candidate_scan, is_tool_allowed, resolve_tool_prefix,
-    resource_name_to_tool_name, McpConfig, ToolPrefix, ToolSelectorCandidateIndex,
+    McpConfig, ToolPrefix, ToolSelectorCandidateIndex, format_tool_name, has_tool_filters,
+    index_candidate_scan, is_tool_allowed, resolve_tool_prefix, resource_name_to_tool_name,
 };
 use crate::utils::truncate_at_word;
 
@@ -453,13 +453,12 @@ impl DirectToolRegistry {
             self.registered
                 .insert(spec.prefixed_name.clone(), fingerprint);
             self.specs.insert(spec.prefixed_name.clone(), spec.clone());
-            if self.fallback_deactivated.remove(&spec.prefixed_name) {
-                if let Some(mut active) = surface.get_active_tools() {
-                    if !active.contains(&spec.prefixed_name) {
-                        active.push(spec.prefixed_name.clone());
-                        surface.set_active_tools(active);
-                    }
-                }
+            if self.fallback_deactivated.remove(&spec.prefixed_name)
+                && let Some(mut active) = surface.get_active_tools()
+                && !active.contains(&spec.prefixed_name)
+            {
+                active.push(spec.prefixed_name.clone());
+                surface.set_active_tools(active);
             }
             // #525: a held-out ("search"-mode) registration stays OUT of the
             // active set — remove it if a previously active tool switched
@@ -467,15 +466,15 @@ impl DirectToolRegistry {
             // search already activated stays active across re-syncs.
             if spec.held_out && !self.search_activated.contains(&spec.prefixed_name) {
                 self.lazy.insert(spec.prefixed_name.clone());
-                if let Some(active) = surface.get_active_tools() {
-                    if active.contains(&spec.prefixed_name) {
-                        let next: Vec<String> = active
-                            .iter()
-                            .filter(|name| *name != &spec.prefixed_name)
-                            .cloned()
-                            .collect();
-                        surface.set_active_tools(next);
-                    }
+                if let Some(active) = surface.get_active_tools()
+                    && active.contains(&spec.prefixed_name)
+                {
+                    let next: Vec<String> = active
+                        .iter()
+                        .filter(|name| *name != &spec.prefixed_name)
+                        .cloned()
+                        .collect();
+                    surface.set_active_tools(next);
                 }
             } else {
                 self.lazy.remove(&spec.prefixed_name);
@@ -717,38 +716,36 @@ fn prepare_direct_tool_arguments(
     // One-layer recovery: string values for schema-declared object/array
     // properties that parse to the declared shape are replaced.
     let mut prepared = args.clone();
-    if let (Some(input), Some(properties)) = (args.as_object(), object_schema.get("properties")) {
-        if let Some(properties) = properties.as_object() {
-            for (name, property_schema) in properties {
-                let Some(current) = input.get(name) else {
-                    continue;
-                };
-                let Some(text) = current.as_str() else {
-                    continue;
-                };
-                let Some(property_schema) = property_schema.as_object() else {
-                    continue;
-                };
-                let expected_type = property_schema.get("type").and_then(Value::as_str);
-                if expected_type != Some("object") && expected_type != Some("array") {
-                    continue;
-                }
-                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                    let matches = match expected_type {
-                        Some("array") => parsed.is_array(),
-                        Some("object") => parsed.is_object(),
-                        _ => false,
-                    };
-                    if matches {
-                        if let Some(map) = prepared.as_object_mut() {
-                            map.insert(name.clone(), parsed);
-                        }
-                    }
-                }
-                // Parse failures and shape mismatches fall through to the
-                // validation below (upstream comment: "Validation below
-                // reports malformed or shape-incompatible values").
+    if let (Some(input), Some(properties)) = (args.as_object(), object_schema.get("properties"))
+        && let Some(properties) = properties.as_object()
+    {
+        for (name, property_schema) in properties {
+            let Some(current) = input.get(name) else {
+                continue;
+            };
+            let Some(text) = current.as_str() else {
+                continue;
+            };
+            let Some(property_schema) = property_schema.as_object() else {
+                continue;
+            };
+            let expected_type = property_schema.get("type").and_then(Value::as_str);
+            if expected_type != Some("object") && expected_type != Some("array") {
+                continue;
             }
+            if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                let matches = match expected_type {
+                    Some("array") => parsed.is_array(),
+                    Some("object") => parsed.is_object(),
+                    _ => false,
+                };
+                if matches && let Some(map) = prepared.as_object_mut() {
+                    map.insert(name.clone(), parsed);
+                }
+            }
+            // Parse failures and shape mismatches fall through to the
+            // validation below (upstream comment: "Validation below
+            // reports malformed or shape-incompatible values").
         }
     }
 
@@ -1199,7 +1196,7 @@ fn merge(target: &mut Value, source: &Value) {
 mod tests {
     use super::*;
     use crate::cache::{CachedResource, CachedTool, ServerCacheEntry};
-    use crate::metadata::{index_candidate_scans, reset_index_candidate_scans, ServerEntry};
+    use crate::metadata::{ServerEntry, index_candidate_scans, reset_index_candidate_scans};
 
     fn spec(name: &str, server: &str) -> DirectToolSpec {
         DirectToolSpec {
@@ -2057,9 +2054,11 @@ mod tests {
         let issue = &issues[0];
         assert_eq!(issue["instancePath"], json!("/"), "{issue}");
         assert_eq!(issue["keyword"], json!("required"), "{issue}");
-        assert!(parsed
-            .get("total")
-            .is_some_and(|v| v.as_u64().is_some_and(|t| t > 0)));
+        assert!(
+            parsed
+                .get("total")
+                .is_some_and(|v| v.as_u64().is_some_and(|t| t > 0))
+        );
         assert!(parsed.get("truncated").is_some());
         // Non-object schemas pass through untouched (no validation).
         let passthrough = prepare_direct_tool_arguments(
@@ -2090,9 +2089,11 @@ mod tests {
 
         // A search match for a DIFFERENT server does not activate.
         let wrong_server = [("other".to_string(), held.prefixed_name.clone())];
-        assert!(registry
-            .activate_search_matches(&wrong_server, &mut surface)
-            .is_empty());
+        assert!(
+            registry
+                .activate_search_matches(&wrong_server, &mut surface)
+                .is_empty()
+        );
 
         // The matching activation lands additively.
         let right = [("lazy".to_string(), held.prefixed_name.clone())];

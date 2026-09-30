@@ -8,8 +8,8 @@
 
 use rpi_ext_mcp_adapter::metadata::ServerEntry;
 use rpi_ext_mcp_adapter::oauth::store::AuthStorageOptions;
-use rpi_ext_mcp_adapter::oauth::{authenticate, AuthenticateOptions};
-use serde_json::{json, Value};
+use rpi_ext_mcp_adapter::oauth::{AuthenticateOptions, authenticate};
+use serde_json::{Value, json};
 
 fn normalize_params(params: &serde_json::Map<String, Value>) -> Value {
     let mut out = serde_json::Map::new();
@@ -29,16 +29,17 @@ fn normalize_params(params: &serde_json::Map<String, Value>) -> Value {
                 &format!("localhost:{}/", extract_port(v)),
                 "localhost:$asport/",
             )),
-            ("redirect_uris", Value::Array(uris)) => json!(uris
-                .iter()
-                .map(|u| match u.as_str() {
-                    Some(s) => json!(s.replace(
-                        &format!("localhost:{}/", extract_port(s)),
-                        "localhost:$port/",
-                    )),
-                    None => u.clone(),
-                })
-                .collect::<Vec<_>>()),
+            ("redirect_uris", Value::Array(uris)) => json!(
+                uris.iter()
+                    .map(|u| match u.as_str() {
+                        Some(s) => json!(s.replace(
+                            &format!("localhost:{}/", extract_port(s)),
+                            "localhost:$port/",
+                        )),
+                        None => u.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            ),
             // O1 brand exemption: client identity fields (upstream "Pi
             // Coding Agent" / adapter repo vs rpi's own product identity).
             ("client_name", _) => json!("$client_name"),

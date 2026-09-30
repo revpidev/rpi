@@ -70,19 +70,19 @@ use serde_json::Value;
 use crate::config;
 use crate::core::keybindings::migrate_keybindings_config;
 use crate::core::prompt_templates::{
-    load_prompt_templates, LoadPromptTemplatesOptions, PromptTemplate,
+    LoadPromptTemplatesOptions, PromptTemplate, load_prompt_templates,
 };
 use crate::core::settings_manager::{Settings, SettingsManager};
 use crate::core::skills::{
-    apply_patterns, canonicalize_path, discover_skill_paths, is_enabled_by_overrides, load_skills,
-    resource_precedence_rank, DiscoverSkillsOptions, LoadSkillsOptions, LoadSkillsResult,
-    MetadataSource, PathMetadata, Skill, SourceInfo, SourceOrigin, SourceScope,
+    DiscoverSkillsOptions, LoadSkillsOptions, LoadSkillsResult, MetadataSource, PathMetadata,
+    Skill, SourceInfo, SourceOrigin, SourceScope, apply_patterns, canonicalize_path,
+    discover_skill_paths, is_enabled_by_overrides, load_skills, resource_precedence_rank,
 };
 use crate::core::system_prompt::{
-    discover_append_system_prompt_file, discover_system_prompt_file, load_project_context_files,
-    resolve_prompt_input, ContextFile,
+    ContextFile, discover_append_system_prompt_file, discover_system_prompt_file,
+    load_project_context_files, resolve_prompt_input,
 };
-use crate::core::themes::{load_theme_from_path, Theme};
+use crate::core::themes::{Theme, load_theme_from_path};
 use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
@@ -1277,7 +1277,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
     let mut accumulator: Vec<ResolvedFileResourcePath> = Vec::new();
     let mut seen_raw: HashSet<String> = HashSet::new();
     macro_rules! add {
-        ($entry:expr) => {{
+        ($entry:expr_2021) => {{
             let entry: ResolvedFileResourcePath = $entry;
             if !entry.path.as_os_str().is_empty()
                 && seen_raw.insert(entry.path.to_string_lossy().into_owned())
@@ -1627,7 +1627,7 @@ mod tests {
     use super::*;
     use crate::core::keybindings::KEYBINDING_NAME_MIGRATIONS;
     use crate::core::settings_manager::SettingsManagerCreateOptions;
-    use crate::core::themes::{create_theme, parse_theme_json, REQUIRED_COLOR_KEYS};
+    use crate::core::themes::{REQUIRED_COLOR_KEYS, create_theme, parse_theme_json};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);

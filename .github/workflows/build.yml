@@ -86,6 +86,23 @@ jobs:
           workspaces: . -> target
           key: ${{ matrix.target }}
 
+      # ---- Rust modernity gate (G15, V16-00) ----
+      # Cheap repo-state guard run once per CI invocation (single matrix leg
+      # to sidestep windows python3 quirks): edition 2024 everywhere,
+      # MSRV declaration, zero mod.rs. Local runs use the full gate from
+      # rpi-docs plan/extensions/gates.md §6 (adds clippy/fmt + the
+      # examples/wasm-extension workspace assertion).
+      - name: Rust modernity gate (G15)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -e
+          cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; eds=sorted({p["edition"] for p in json.load(sys.stdin)["packages"]}); assert eds==["2024"], eds'
+          grep -q '^rust-version = "1.85"' Cargo.toml
+          test -z "$(find . -name mod.rs -type f -not -path './target/*' -not -path './vendor/*' -not -path './external/*')"
+          echo "G15: edition 2024 + MSRV 1.85 + no mod.rs — OK"
+        shell: bash
+
       # ---- Build ----
 
       - name: Build (native)

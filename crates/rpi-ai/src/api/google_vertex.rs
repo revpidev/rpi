@@ -65,13 +65,13 @@
 //!   legitimate ADC path (unlike the Gemini API adapter, which errors
 //!   eagerly).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::google_adc::{resolve_access_token, AdcEndpoints};
+use crate::api::google_adc::{AdcEndpoints, resolve_access_token};
 use crate::api::google_generative_ai::{GoogleThinking, GoogleToolChoice};
 use crate::api::google_shared::{
     convert_messages, convert_tools, get_disabled_google_thinking_config, is_thinking_part,
@@ -81,8 +81,8 @@ use crate::api::google_shared::{
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
-use crate::models::{clamp_thinking_level, ProviderStreams};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
+use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantContent, AssistantMessage, DoneReason, ErrorReason, Model, ProviderEnv,
     ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets,
@@ -770,10 +770,10 @@ impl<'a> StreamProcessor<'a> {
     ) -> Result<(), String> {
         // GenerateContentResponse.responseId is output-only; keep the first
         // one from the stream (upstream `output.responseId ||=`).
-        if self.output.response_id.is_none() {
-            if let Some(response_id) = chunk.get("responseId").and_then(Value::as_str) {
-                self.output.response_id = Some(response_id.to_owned());
-            }
+        if self.output.response_id.is_none()
+            && let Some(response_id) = chunk.get("responseId").and_then(Value::as_str)
+        {
+            self.output.response_id = Some(response_id.to_owned());
         }
 
         let candidate = chunk
@@ -916,10 +916,10 @@ async fn run(
     };
 
     let mut params = build_params(model, context, options)?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_params) = on_payload(params.clone(), model).await {
-            params = next_params;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_params) = on_payload(params.clone(), model).await
+    {
+        params = next_params;
     }
     let (model_path, body) = params_to_wire(&params);
 

@@ -44,7 +44,7 @@ use std::sync::{Mutex, OnceLock};
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Structured host-call failure (`{"error": {"kind", "message"}}`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,47 +300,47 @@ pub fn dispatch_for_test(message: &Value) -> Value {
 /// `scripts/ask-user-question-parity` without crate internals.
 pub mod parity {
     pub use crate::config::{
-        format_key_spec_for_display, is_valid_collapse_key_spec, resolve_collapse_key,
-        validate_guidance_fields, AskUserQuestionConfig, GuidanceFields, DEFAULT_COLLAPSE_KEY,
+        AskUserQuestionConfig, DEFAULT_COLLAPSE_KEY, GuidanceFields, format_key_spec_for_display,
+        is_valid_collapse_key_spec, resolve_collapse_key, validate_guidance_fields,
     };
     pub use crate::events::{build_blocked_payload, build_prompt_payload};
     pub use crate::golden::{
-        frame_json as golden_frame_json, renders as golden_renders, GoldenFrame, GoldenRender,
-        WIDTHS as GOLDEN_WIDTHS,
+        GoldenFrame, GoldenRender, WIDTHS as GOLDEN_WIDTHS, frame_json as golden_frame_json,
+        renders as golden_renders,
     };
-    pub use crate::i18n::{match_locale, parse_locale_env, I18n, SUPPORTED_LOCALES};
+    pub use crate::i18n::{I18n, SUPPORTED_LOCALES, match_locale, parse_locale_env};
     pub use crate::parity_cases::{replay_keys_case, replay_preview_case, replay_state_case};
     pub use crate::reconcile::reconcile_active_tools;
     pub use crate::rpc_fallback::{
-        build_preview_block, format_option_line, has_dialog_ui, parse_index, run_rpc_questionnaire,
-        DialogOutcome, DialogUi, HostUi, CUSTOM_ANSWER_TITLE, MAX_PREVIEW_CHARS,
-        MULTI_SELECT_INSTRUCTIONS, MULTI_SELECT_PLACEHOLDER,
+        CUSTOM_ANSWER_TITLE, DialogOutcome, DialogUi, HostUi, MAX_PREVIEW_CHARS,
+        MULTI_SELECT_INSTRUCTIONS, MULTI_SELECT_PLACEHOLDER, build_preview_block,
+        format_option_line, has_dialog_ui, parse_index, run_rpc_questionnaire,
     };
-    pub use crate::state::build::{build_items_for_question, QuestionItem};
-    pub use crate::state::key_router::{route_key, Action, Keybindings, QuestionnaireRuntime};
+    pub use crate::state::build::{QuestionItem, build_items_for_question};
+    pub use crate::state::key_router::{Action, Keybindings, QuestionnaireRuntime, route_key};
     pub use crate::state::reducer::{
-        apply as apply_action, result_for, state_from_json, ApplyContext, ApplyResult, Effect,
-        QuestionnaireState,
+        ApplyContext, ApplyResult, Effect, QuestionnaireState, apply as apply_action, result_for,
+        state_from_json,
     };
     pub use crate::state::row_intent::{
-        is_reserved_label, label_by_kind, labels_by_kind_json, meta, reserved_label_set,
-        sentinels_to_append, RowIntentMeta, RowKind, ROW_INTENT_META, SENTINEL_KINDS,
+        ROW_INTENT_META, RowIntentMeta, RowKind, SENTINEL_KINDS, is_reserved_label, label_by_kind,
+        labels_by_kind_json, meta, reserved_label_set, sentinels_to_append,
     };
-    pub use crate::state::session::{mount_options, InputBuffer, QuestionnaireComponent};
+    pub use crate::state::session::{InputBuffer, QuestionnaireComponent, mount_options};
     pub use crate::tool::envelope::{
-        build_answer_segment, build_questionnaire_response, build_tool_result,
-        format_answer_scalar, FormatAnswerVariant, DECLINE_MESSAGE, ENVELOPE_PREFIX,
-        ENVELOPE_SUFFIX, NO_INPUT_PLACEHOLDER,
+        DECLINE_MESSAGE, ENVELOPE_PREFIX, ENVELOPE_SUFFIX, FormatAnswerVariant,
+        NO_INPUT_PLACEHOLDER, build_answer_segment, build_questionnaire_response,
+        build_tool_result, format_answer_scalar,
     };
     pub use crate::tool::normalize::{normalize_line_terminators, normalize_question_params};
     pub use crate::tool::types::{
-        question_params_schema, AnswerKind, OptionData, QuestionAnswer, QuestionData,
-        QuestionParams, QuestionnaireError, QuestionnaireResult, MAX_HEADER_LENGTH,
-        MAX_LABEL_LENGTH, MAX_OPTIONS, MAX_QUESTIONS, MIN_OPTIONS, RESERVED_LABELS,
+        AnswerKind, MAX_HEADER_LENGTH, MAX_LABEL_LENGTH, MAX_OPTIONS, MAX_QUESTIONS, MIN_OPTIONS,
+        OptionData, QuestionAnswer, QuestionData, QuestionParams, QuestionnaireError,
+        QuestionnaireResult, RESERVED_LABELS, question_params_schema,
     };
     pub use crate::tool::validate::{
-        validate_questionnaire, ValidationResult, ERROR_DUPLICATE_OPTION_LABEL,
-        ERROR_DUPLICATE_QUESTION, ERROR_NO_QUESTIONS,
+        ERROR_DUPLICATE_OPTION_LABEL, ERROR_DUPLICATE_QUESTION, ERROR_NO_QUESTIONS,
+        ValidationResult, validate_questionnaire,
     };
 }
 
@@ -435,10 +435,12 @@ mod tests {
         queue_reply(Err(("capabilityDenied", "requires tools")));
         let receipt = install_for_test(RpiHostCalls { call: fake_call }, std::ptr::null());
         assert_eq!(receipt["error"]["kind"], "init");
-        assert!(receipt["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("capabilityDenied"));
+        assert!(
+            receipt["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("capabilityDenied")
+        );
     }
 
     #[test]

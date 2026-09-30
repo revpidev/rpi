@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `PROMPT_TEMPLATES` — bundled prompt names and bodies (`review-loop.md` is
 /// localized for the structured entry points per ADR-0021; the rest are
@@ -237,17 +237,17 @@ pub fn substitute_arguments(template: &str, args: &str) -> String {
     for index in 1..=9usize {
         let marker = format!("${index}");
         let fallback_marker = format!("${{{index}:-");
-        if let Some(start) = out.find(&fallback_marker) {
-            if let Some(end_offset) = out[start..].find('}') {
-                let end = start + end_offset;
-                let fallback = &out[start + fallback_marker.len()..end];
-                let value = positional
-                    .get(index - 1)
-                    .copied()
-                    .unwrap_or(fallback)
-                    .to_string();
-                out = format!("{}{}{}", &out[..start], value, &out[end + 1..]);
-            }
+        if let Some(start) = out.find(&fallback_marker)
+            && let Some(end_offset) = out[start..].find('}')
+        {
+            let end = start + end_offset;
+            let fallback = &out[start + fallback_marker.len()..end];
+            let value = positional
+                .get(index - 1)
+                .copied()
+                .unwrap_or(fallback)
+                .to_string();
+            out = format!("{}{}{}", &out[..start], value, &out[end + 1..]);
         }
         if positional.get(index - 1).is_some() {
             out = out.replace(&marker, positional[index - 1]);

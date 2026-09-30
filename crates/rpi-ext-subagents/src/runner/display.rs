@@ -215,10 +215,10 @@ fn exact_tie_floor_1(value: f64) -> Option<u64> {
 pub fn shorten_path(path: &str) -> String {
     if let Some(home) = std::env::var_os("HOME") {
         let home = home.to_string_lossy();
-        if !home.is_empty() {
-            if let Some(rest) = path.strip_prefix(home.as_ref()) {
-                return format!("~{rest}");
-            }
+        if !home.is_empty()
+            && let Some(rest) = path.strip_prefix(home.as_ref())
+        {
+            return format!("~{rest}");
         }
     }
     path.to_string()
@@ -264,10 +264,10 @@ pub fn resolve_current_path(
     let args = args?;
     let direct = ["path", "file", "filename", "target", "cwd"];
     for key in direct {
-        if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
-            if !value.trim().is_empty() {
-                return Some(value.trim().to_string());
-            }
+        if let Some(value) = args.get(key).and_then(|v| v.as_str())
+            && !value.trim().is_empty()
+        {
+            return Some(value.trim().to_string());
         }
     }
     if tool_name == "bash" {
@@ -420,10 +420,10 @@ pub fn extract_tool_args_preview(args: &serde_json::Value) -> String {
             if let Some(array) = preview_array(value) {
                 return format!("{display_key}={}", preview_display_text(&array, 50));
             }
-            if let serde_json::Value::String(raw) = value {
-                if !raw.is_empty() {
-                    return format!("{display_key}={}", preview_display_text(raw, 50));
-                }
+            if let serde_json::Value::String(raw) = value
+                && !raw.is_empty()
+            {
+                return format!("{display_key}={}", preview_display_text(raw, 50));
             }
         }
     }

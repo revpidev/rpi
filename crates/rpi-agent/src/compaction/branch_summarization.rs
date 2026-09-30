@@ -18,16 +18,16 @@ use rpi_ai::utils::retry::RetryCallbacks;
 use rpi_ai::utils::text::content_text_assistant;
 
 use super::utils::{
-    compute_file_lists, create_file_ops, extract_file_ops_from_message, format_file_operations,
-    serialize_conversation, FileOperations, SUMMARIZATION_SYSTEM_PROMPT,
+    FileOperations, SUMMARIZATION_SYSTEM_PROMPT, compute_file_lists, create_file_ops,
+    extract_file_ops_from_message, format_file_operations, serialize_conversation,
 };
 use super::{
-    complete_summarization, estimate_tokens, get_summarization_failure, SummarizationArgs,
+    SummarizationArgs, complete_summarization, estimate_tokens, get_summarization_failure,
 };
-use crate::messages::{convert_to_llm, AgentMessage};
+use crate::messages::{AgentMessage, convert_to_llm};
 use crate::session::{
-    create_branch_summary_message, create_compaction_summary_message, create_custom_message,
-    SessionEntry,
+    SessionEntry, create_branch_summary_message, create_compaction_summary_message,
+    create_custom_message,
 };
 use crate::stream_fn::StreamFn;
 
@@ -240,18 +240,17 @@ pub fn prepare_branch_entries(entries: &[SessionEntry], token_budget: u64) -> Br
             if b.from_hook == Some(true) {
                 continue;
             }
-            if let Some(details) = &b.details {
-                if let Ok(details) = serde_json::from_value::<BranchSummaryDetails>(details.clone())
-                {
-                    for f in details.read_files {
-                        file_ops.read.insert(f);
-                    }
-                    // Modified files go into edited (upstream comment says
-                    // "both edited and written" but the code adds to `edited`
-                    // only — the code wins, branch-summarization.ts:209-214).
-                    for f in details.modified_files {
-                        file_ops.edited.insert(f);
-                    }
+            if let Some(details) = &b.details
+                && let Ok(details) = serde_json::from_value::<BranchSummaryDetails>(details.clone())
+            {
+                for f in details.read_files {
+                    file_ops.read.insert(f);
+                }
+                // Modified files go into edited (upstream comment says
+                // "both edited and written" but the code adds to `edited`
+                // only — the code wins, branch-summarization.ts:209-214).
+                for f in details.modified_files {
+                    file_ops.edited.insert(f);
                 }
             }
         }

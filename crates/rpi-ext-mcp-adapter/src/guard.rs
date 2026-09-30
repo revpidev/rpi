@@ -11,7 +11,7 @@
 //! (coding-standards §11.2; G4). `!command` secret values must never reach
 //! this module's inputs.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Defaults (mcp-output-guard.ts:17-19 area).
 pub const DEFAULT_MCP_OUTPUT_MAX_BYTES: usize = 50 * 1024;
@@ -231,7 +231,7 @@ fn truncate_string_to_bytes(value: &str, max_bytes: usize) -> String {
 // `crates/rpi/src/tools/truncate.rs`) — never partial lines, first-line
 // classification, and the host `formatSize` spelling (B/KB/MB, not the
 // adapter's old " B"/" KiB").
-use crate::truncate::{format_size, truncate_head, TruncateOptions, TruncationResult};
+use crate::truncate::{TruncateOptions, TruncationResult, format_size, truncate_head};
 
 /// `Number.prototype.toLocaleString()` for the integers the notice prints
 /// (en-US grouping).
@@ -946,13 +946,13 @@ mod tests {
 
     #[test]
     fn kill_switch_and_settings_resolution() {
-        std::env::set_var("MCP_OUTPUT_GUARD", "0");
+        rpi_test_env::set_var("MCP_OUTPUT_GUARD", "0");
         let options = resolve_guard_options(None);
         assert_eq!(options.enabled, Some(false));
-        std::env::set_var("MCP_OUTPUT_GUARD", "1");
+        rpi_test_env::set_var("MCP_OUTPUT_GUARD", "1");
         let options = resolve_guard_options(None);
         assert_eq!(options.enabled, Some(true));
-        std::env::remove_var("MCP_OUTPUT_GUARD");
+        rpi_test_env::remove_var("MCP_OUTPUT_GUARD");
 
         let settings =
             json!({ "outputGuard": { "maxBytes": 100, "maxLines": 5, "detailsMaxBytes": 64 } });
@@ -1016,8 +1016,10 @@ mod tests {
             max_bytes: 5,
             ..byte_limit.clone()
         };
-        assert!(format_truncation_notice(&first_line, None, None)
-            .contains("First line exceeds 5B limit"));
+        assert!(
+            format_truncation_notice(&first_line, None, None)
+                .contains("First line exceeds 5B limit")
+        );
     }
 
     #[test]

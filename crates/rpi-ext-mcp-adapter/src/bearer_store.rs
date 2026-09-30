@@ -22,7 +22,7 @@
 //! Security (G4): token values never reach tracing or spill files; the
 //! record type carries no `Debug`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::AdapterError;
@@ -337,10 +337,12 @@ mod tests {
         );
         // No stray chunk accounts remain (the manifest is gone).
         let manifest_after = store.read(&account).expect("short record");
-        assert!(!manifest_after
-            .as_deref()
-            .unwrap_or_default()
-            .contains("__piMcpAdapterBearerChunked"));
+        assert!(
+            !manifest_after
+                .as_deref()
+                .unwrap_or_default()
+                .contains("__piMcpAdapterBearerChunked")
+        );
     }
 
     #[test]

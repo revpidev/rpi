@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::agents::discover::{self, AgentConfig, ContextMode};
 use crate::agents::skills;
@@ -20,7 +20,7 @@ use crate::config::{ExtensionConfig, SettingsPair};
 use crate::launch::model::{self, AvailableModel};
 use crate::runner::budget;
 use crate::runner::foreground::{self, ForegroundRunInput, ForegroundRunResult};
-use crate::{session_fork, ParentSession, PluginRuntime};
+use crate::{ParentSession, PluginRuntime, session_fork};
 
 /// Per-child output override (`normalizeOutputOverride` chain step
 /// semantics): a path, disabled, or inherit the agent default.
@@ -388,12 +388,12 @@ pub enum ForkOutcome {
 /// in-memory/missing-parent cases; ADR-0026 broadened degradation to every
 /// path — the e2e scenario-2 expectation change is registered under G2).
 pub fn try_fork_session(ctx: &RunCtx, branch_file: &Path, effective_cwd: &Path) -> ForkOutcome {
-    if let Some(parent) = &ctx.parent_session {
-        if parent.file.is_none() {
-            return ForkOutcome::Degraded(
-                "parent session is in-memory and not yet persisted to disk".to_string(),
-            );
-        }
+    if let Some(parent) = &ctx.parent_session
+        && parent.file.is_none()
+    {
+        return ForkOutcome::Degraded(
+            "parent session is in-memory and not yet persisted to disk".to_string(),
+        );
     }
     match session_fork::create_fork_session(
         ctx.parent_session_file.as_deref(),
@@ -460,10 +460,10 @@ pub fn preflight_self_extension(
         return None;
     }
     for name in agent_names {
-        if let Ok(Some(agent)) = crate::agents::discover::resolve_agent_name(agents, name) {
-            if agent_authorizes_nested_fanout(agent) {
-                return Some(self_extension_missing_error());
-            }
+        if let Ok(Some(agent)) = crate::agents::discover::resolve_agent_name(agents, name)
+            && agent_authorizes_nested_fanout(agent)
+        {
+            return Some(self_extension_missing_error());
         }
     }
     None
@@ -483,10 +483,10 @@ pub async fn run_child_async(
 
     // #2338 descendant agent allowlists: the ceiling this session runs under
     // (inherited via env) gates every launch; it can only be narrowed.
-    if let Some(ceiling) = crate::launch::args::DescendantAllowlist::from_env() {
-        if !ceiling.allows(&agent.name) {
-            return Err(ceiling.restriction_message(&agent.name));
-        }
+    if let Some(ceiling) = crate::launch::args::DescendantAllowlist::from_env()
+        && !ceiling.allows(&agent.name)
+    {
+        return Err(ceiling.restriction_message(&agent.name));
     }
     // Timeout chain: child override > top-level call > agent frontmatter >
     // config > 30min.
@@ -626,12 +626,11 @@ pub async fn run_child_async(
             .ok()
             .as_deref(),
     ]);
-    if let Some(ceiling) = thinking_ceiling {
-        if let Some(requested) =
+    if let Some(ceiling) = thinking_ceiling
+        && let Some(requested) =
             model::effective_requested_thinking(resolved.as_deref(), thinking.as_deref())
-        {
-            model::assert_thinking_within_ceiling(&requested, ceiling, &agent.name, &ctx.run_id)?;
-        }
+    {
+        model::assert_thinking_within_ceiling(&requested, ceiling, &agent.name, &ctx.run_id)?;
     }
 
     // #1615 `deriveChildSessionName` (child-session-name.ts): display-only
@@ -683,25 +682,24 @@ pub async fn run_child_async(
     // Per-agent memory injection (FR-P1-08, agent-memory.ts:193): the
     // MEMORY.md head rides the system prompt; write tools switch the block
     // to read-write.
-    if let Some(memory) = &agent.memory {
-        if let Some(dir) = memory.resolve_dir(&effective_cwd, &agent.name) {
-            if let Some(text) = discover::read_agent_memory_file(&dir) {
-                let writable = agent
-                    .tools
-                    .as_ref()
-                    .map(|tools| {
-                        tools
-                            .iter()
-                            .any(|t| matches!(t.as_str(), "edit" | "write" | "bash"))
-                    })
-                    .unwrap_or(false);
-                let injection = discover::build_agent_memory_injection(&text, writable);
-                if system_prompt.is_empty() {
-                    system_prompt = injection;
-                } else {
-                    system_prompt = format!("{system_prompt}\n\n{injection}");
-                }
-            }
+    if let Some(memory) = &agent.memory
+        && let Some(dir) = memory.resolve_dir(&effective_cwd, &agent.name)
+        && let Some(text) = discover::read_agent_memory_file(&dir)
+    {
+        let writable = agent
+            .tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .any(|t| matches!(t.as_str(), "edit" | "write" | "bash"))
+            })
+            .unwrap_or(false);
+        let injection = discover::build_agent_memory_injection(&text, writable);
+        if system_prompt.is_empty() {
+            system_prompt = injection;
+        } else {
+            system_prompt = format!("{system_prompt}\n\n{injection}");
         }
     }
     // Project refinement overlay (FR-P1-08, execution.ts:1492).
@@ -835,27 +833,27 @@ pub async fn run_child_async(
     // silently drops the missing names, so a child never starts with an
     // allowlist it cannot satisfy. Runs only when an allowlist is declared;
     // excluded names (post-`--exclude-tools`) are not requirements.
-    if let Some(allowlist) = agent_tools.as_ref() {
-        if let Err(error) = crate::diagnostic::check_host_tool_face(
+    if let Some(allowlist) = agent_tools.as_ref()
+        && let Err(error) = crate::diagnostic::check_host_tool_face(
             allowlist,
             &agent.exclude_tools,
             ctx.host_builtin_tool_names
                 .as_deref()
                 .map_err(|e| e.as_str()),
             &agent.name,
-        ) {
-            // A pre-spawn rejection never launched a process: give the
-            // spawn-budget slot back so misconfigured agents cannot starve
-            // valid siblings in the same composite run (review round 1,
-            // observation 3).
-            let mut memory = crate::tool::FOREGROUND_RUN_MEMORY
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(count) = memory.spawns_by_run.get_mut(&ctx.run_id) {
-                *count = count.saturating_sub(1);
-            }
-            return Err(error);
+        )
+    {
+        // A pre-spawn rejection never launched a process: give the
+        // spawn-budget slot back so misconfigured agents cannot starve
+        // valid siblings in the same composite run (review round 1,
+        // observation 3).
+        let mut memory = crate::tool::FOREGROUND_RUN_MEMORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = memory.spawns_by_run.get_mut(&ctx.run_id) {
+            *count = count.saturating_sub(1);
         }
+        return Err(error);
     }
 
     // Fork task preamble (executor 4119-4122).
@@ -1040,10 +1038,8 @@ pub async fn run_child_async(
             );
             match gate_passed {
                 Ok(true) => {
-                    if memoized {
-                        if let Some(object) = ledger.as_object_mut() {
-                            object.insert("gateMemoized".to_string(), json!(true));
-                        }
+                    if memoized && let Some(object) = ledger.as_object_mut() {
+                        object.insert("gateMemoized".to_string(), json!(true));
                     }
                 }
                 outcome => {
@@ -1076,22 +1072,22 @@ pub async fn run_child_async(
                 &agent.name,
                 Some(input.child_index),
             );
-            if let Ok(raw) = std::fs::read_to_string(&paths.metadata_path) {
-                if let Ok(mut metadata) = serde_json::from_str::<Value>(&raw) {
-                    if let Some(target) = metadata.as_object_mut() {
-                        target.insert("acceptance".to_string(), ledger);
-                    }
-                    // TE17 R7.1.7.1: child metadata is an auxiliary artifact
-                    // — an exhausted write logs instead of dropping silently.
-                    if let Err(error) =
-                        crate::artifacts::write_metadata(&paths.metadata_path, &metadata)
-                    {
-                        tracing::warn!(
-                            path = %paths.metadata_path.display(),
-                            error = %error,
-                            "child metadata write failed after retrying"
-                        );
-                    }
+            if let Ok(raw) = std::fs::read_to_string(&paths.metadata_path)
+                && let Ok(mut metadata) = serde_json::from_str::<Value>(&raw)
+            {
+                if let Some(target) = metadata.as_object_mut() {
+                    target.insert("acceptance".to_string(), ledger);
+                }
+                // TE17 R7.1.7.1: child metadata is an auxiliary artifact
+                // — an exhausted write logs instead of dropping silently.
+                if let Err(error) =
+                    crate::artifacts::write_metadata(&paths.metadata_path, &metadata)
+                {
+                    tracing::warn!(
+                        path = %paths.metadata_path.display(),
+                        error = %error,
+                        "child metadata write failed after retrying"
+                    );
                 }
             }
         }
@@ -1099,35 +1095,34 @@ pub async fn run_child_async(
 
     // Output file: write the full output to the declared path on success.
     let mut saved_output_path = None;
-    if let Some(output_path) = &output_path {
-        if result.exit_code == 0
-            && !result.final_output.trim().is_empty()
-            && crate::artifacts::write_artifact(output_path, &result.final_output).is_ok()
-        {
-            saved_output_path = Some(output_path.clone());
-        }
+    if let Some(output_path) = &output_path
+        && result.exit_code == 0
+        && !result.final_output.trim().is_empty()
+        && crate::artifacts::write_artifact(output_path, &result.final_output).is_ok()
+    {
+        saved_output_path = Some(output_path.clone());
     }
     // #1305 `file-only`: the saved file is authoritative — the returned
     // content becomes the saved-output reference instead of the inline
     // text (`formatSavedOutputReference`, single-output.ts:160-172).
-    if output_mode == "file-only" {
-        if let Some(saved) = &saved_output_path {
-            let bytes = result.final_output.len();
-            let lines = result.final_output.lines().count().max(1);
-            let size = if bytes < 1024 {
-                format!("{bytes} B")
-            } else if bytes < 1024 * 1024 {
-                format!("{:.1} KB", bytes as f64 / 1024.0)
-            } else {
-                format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-            };
-            let reference = format!(
-                "Output saved to: {} ({size}, {lines} {}). Read this file if needed.",
-                saved.to_string_lossy(),
-                if lines == 1 { "line" } else { "lines" }
-            );
-            result.final_output = reference;
-        }
+    if output_mode == "file-only"
+        && let Some(saved) = &saved_output_path
+    {
+        let bytes = result.final_output.len();
+        let lines = result.final_output.lines().count().max(1);
+        let size = if bytes < 1024 {
+            format!("{bytes} B")
+        } else if bytes < 1024 * 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        };
+        let reference = format!(
+            "Output saved to: {} ({size}, {lines} {}). Read this file if needed.",
+            saved.to_string_lossy(),
+            if lines == 1 { "line" } else { "lines" }
+        );
+        result.final_output = reference;
     }
 
     Ok(ChildOutcome {

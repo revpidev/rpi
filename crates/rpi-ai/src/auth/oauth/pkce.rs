@@ -56,10 +56,11 @@ mod tests {
     fn verifier_is_43_base64url_chars_without_padding() {
         let pkce = generate_pkce();
         assert_eq!(pkce.verifier.len(), 43);
-        assert!(pkce
-            .verifier
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(
+            pkce.verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
         assert!(!pkce.challenge.contains('='));
         assert!(!pkce.challenge.contains('+'));
         assert!(!pkce.challenge.contains('/'));

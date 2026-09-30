@@ -3,13 +3,13 @@
 
 use std::sync::Mutex;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::HostContext;
 use crate::agents::discover;
 use crate::artifacts;
 use crate::config::SettingsPair;
 use crate::runner::budget;
-use crate::HostContext;
 
 /// Records of completed foreground runs for `{ action: "status" }`
 /// (P0 memory; the async run registry is FR-P1-04).
@@ -245,30 +245,30 @@ fn execute_subagent_tool_inner(
 
     // ADR-0016: workflowScript is a schema-level placeholder that must fail
     // loudly instead of letting the model assume JS execution.
-    if let Some(script) = object.get("workflowScript") {
-        if script.as_str().is_some_and(|s| !s.trim().is_empty()) {
-            return ToolOutcome::error(
+    if let Some(script) = object.get("workflowScript")
+        && script.as_str().is_some_and(|s| !s.trim().is_empty())
+    {
+        return ToolOutcome::error(
                 "workflowScript is not supported in rpi (see ADR-0016): this build has no JavaScript engine. Use { agent, task } for direct single delegation; composite workflows arrive with P1.".to_string(),
             );
-        }
     }
 
-    if let Some(action) = object.get("action").and_then(Value::as_str) {
-        if !action.is_empty() {
-            let deps = crate::actions::ActionDeps {
-                host: Some(host),
-                runtime: Some(runtime),
-                params: Some(params.clone()),
-            };
-            return crate::actions::handle_management_action_with(
-                action,
-                object.get("agent").and_then(Value::as_str),
-                &host.cwd(),
-                settings,
-                config,
-                &deps,
-            );
-        }
+    if let Some(action) = object.get("action").and_then(Value::as_str)
+        && !action.is_empty()
+    {
+        let deps = crate::actions::ActionDeps {
+            host: Some(host),
+            runtime: Some(runtime),
+            params: Some(params.clone()),
+        };
+        return crate::actions::handle_management_action_with(
+            action,
+            object.get("agent").and_then(Value::as_str),
+            &host.cwd(),
+            settings,
+            config,
+            &deps,
+        );
     }
 
     // Composite entries (FR-P1-01/02/03, ADR-0018): `tasks` (parallel) and
@@ -478,13 +478,13 @@ fn check_timeout_aliases(object: &serde_json::Map<String, Value>) -> Result<(), 
     };
     let timeout = positive(object.get("timeoutMs"), "timeoutMs")?;
     let max_runtime = positive(object.get("maxRuntimeMs"), "maxRuntimeMs")?;
-    if let (Some(timeout), Some(max_runtime)) = (timeout, max_runtime) {
-        if timeout != max_runtime {
-            return Err(
+    if let (Some(timeout), Some(max_runtime)) = (timeout, max_runtime)
+        && timeout != max_runtime
+    {
+        return Err(
                 "timeoutMs and maxRuntimeMs are aliases; provide only one value or use the same value for both."
                     .to_string(),
             );
-        }
     }
     Ok(())
 }
@@ -567,20 +567,22 @@ fn assemble_single_details(
     if let Some(timeout) = timeout {
         details["timeoutMs"] = json!(timeout);
     }
-    if let Some(dir) = &ctx.artifacts_dir {
-        if let Some(paths) = &result.artifact_paths {
-            details["artifacts"] = json!({
-                "dir": dir.to_string_lossy(),
-                "files": [paths.to_json()],
-            });
-        }
+    if let Some(dir) = &ctx.artifacts_dir
+        && let Some(paths) = &result.artifact_paths
+    {
+        details["artifacts"] = json!({
+            "dir": dir.to_string_lossy(),
+            "files": [paths.to_json()],
+        });
     }
     details["totalChildUsage"] = result.usage.clone();
-    details["totalCost"] = json!(result
-        .usage
-        .get("cost")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0));
+    details["totalCost"] = json!(
+        result
+            .usage
+            .get("cost")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+    );
     details
 }
 
@@ -1052,14 +1054,14 @@ fn format_failed_single_run_output(
         lines.push("Output:".to_string());
         lines.push(output.to_string());
     }
-    if let Some(paths) = artifact_paths {
-        if paths.output_path.exists() {
-            lines.push(String::new());
-            lines.push(format!(
-                "Output artifact: {}",
-                paths.output_path.to_string_lossy()
-            ));
-        }
+    if let Some(paths) = artifact_paths
+        && paths.output_path.exists()
+    {
+        lines.push(String::new());
+        lines.push(format!(
+            "Output artifact: {}",
+            paths.output_path.to_string_lossy()
+        ));
     }
     lines.join("\n")
 }

@@ -33,20 +33,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use regex::RegexBuilder;
 use rpi_agent::{AgentError, AgentTool, AgentToolResult, AgentToolUpdateCallback};
 use rpi_ai::types::{TextContent, ToolResultContent};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::tools::ToolContext;
 use crate::tools::path_utils::resolve_to_cwd;
 use crate::tools::truncate::{
-    format_size, truncate_head, truncate_line, TruncateOptions, DEFAULT_MAX_BYTES,
-    GREP_MAX_LINE_LENGTH,
+    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, TruncateOptions, format_size, truncate_head,
+    truncate_line,
 };
-use crate::tools::ToolContext;
 
 /// Default maximum number of matches (grep.ts:39).
 const DEFAULT_LIMIT: f64 = 100.0;
@@ -503,12 +503,10 @@ impl AgentTool for GrepTool {
 
         // --- formatPath (grep.ts:190-198) ---
         let format_path = |file_path: &Path| -> String {
-            if is_directory {
-                if let Ok(relative) = file_path.strip_prefix(&search_path) {
-                    let relative = relative.to_string_lossy().replace('\\', "/");
-                    if !relative.is_empty() && !relative.starts_with("..") {
-                        return relative;
-                    }
+            if is_directory && let Ok(relative) = file_path.strip_prefix(&search_path) {
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if !relative.is_empty() && !relative.starts_with("..") {
+                    return relative;
                 }
             }
             file_path

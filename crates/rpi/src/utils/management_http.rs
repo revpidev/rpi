@@ -88,10 +88,10 @@ where
     for attempt in 0..=max_retries {
         // Caller cancellation is terminal — check before every attempt
         // (signal.throwIfAborted, management-http.ts:45).
-        if let Some(token) = cancel_token {
-            if token.is_cancelled() {
-                return Err("request cancelled".to_string());
-            }
+        if let Some(token) = cancel_token
+            && token.is_cancelled()
+        {
+            return Err("request cancelled".to_string());
         }
 
         // Compute the per-attempt timeout: the binding constraint of the
@@ -168,8 +168,8 @@ mod tests {
     //! upstream `vi.spyOn(globalThis, "fetch")` becomes a scripted loopback
     //! HTTP server (no real network).
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 

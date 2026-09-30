@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use rpi_tui::components::input::Input;
 use rpi_tui::components::select_list::{SelectItem, SelectList, SelectListLayoutOptions};
 use rpi_tui::fuzzy::fuzzy_filter;
-use rpi_tui::keybindings::{get_keybindings, KeybindingsManager};
+use rpi_tui::keybindings::{KeybindingsManager, get_keybindings};
 use rpi_tui::tui::{Component, Focusable, RenderHandle};
 use rpi_tui::utils::{truncate_to_width, visible_width};
 use tokio::sync::oneshot;
@@ -62,10 +62,10 @@ fn context_label(model: &LlamaModelInfo) -> Option<String> {
             context.to_string()
         }
     };
-    if let Some(meta) = &model.meta {
-        if let Some(context) = meta.n_ctx.or(meta.n_ctx_train) {
-            return Some(format(context));
-        }
+    if let Some(meta) = &model.meta
+        && let Some(context) = meta.n_ctx.or(meta.n_ctx_train)
+    {
+        return Some(format(context));
     }
     let args = &model.status.args;
     for index in 0..args.len().saturating_sub(1) {
@@ -73,10 +73,10 @@ fn context_label(model: &LlamaModelInfo) -> Option<String> {
         if flag != "--ctx-size" && flag != "-c" && flag != "-ctx" {
             continue;
         }
-        if let Ok(value) = args[index + 1].parse::<u64>() {
-            if value > 0 {
-                return Some(format(value));
-            }
+        if let Ok(value) = args[index + 1].parse::<u64>()
+            && value > 0
+        {
+            return Some(format(value));
         }
     }
     None
@@ -91,10 +91,8 @@ fn model_description(model: &LlamaModelInfo) -> String {
     } else if model.status.value != LlamaModelStatusValue::UNLOADED {
         details.push(model.status.value.clone());
     }
-    if loaded {
-        if let Some(context) = context_label(model) {
-            details.push(format!("{context} context"));
-        }
+    if loaded && let Some(context) = context_label(model) {
+        details.push(format!("{context} context"));
     }
     details.join(" · ")
 }

@@ -418,11 +418,10 @@ impl AgentSessionRuntime {
                 if !is_user_message {
                     return Err(RpiError::Session("Invalid entry ID for forking".to_owned()));
                 }
-                if let Some(rpi_agent::session::SessionEntry::Message(entry)) = known {
-                    if let rpi_agent::AgentMessage::User(user) = &entry.message {
-                        selected_text =
-                            Some(rpi_ai::utils::text::content_text_user(&user.content, ""));
-                    }
+                if let Some(rpi_agent::session::SessionEntry::Message(entry)) = known
+                    && let rpi_agent::AgentMessage::User(user) = &entry.message
+                {
+                    selected_text = Some(rpi_ai::utils::text::content_text_user(&user.content, ""));
                 }
                 selected_entry.parent_id().map(str::to_owned)
             }

@@ -31,8 +31,8 @@ use crate::core::highlight::{get_language_from_path, highlight_code};
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
 use crate::modes::interactive::components::tool_execution::{
-    lock_recover, RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext,
-    ToolResultState,
+    RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
+    lock_recover,
 };
 
 /// `WRITE_PARTIAL_FULL_HIGHLIGHT_LINES` (write.ts:63): the streaming prefix
@@ -763,13 +763,15 @@ mod tests {
             rebuild_write_highlight_cache_full(Some("notes.txt".to_string()), "x", &theme)
                 .is_none()
         );
-        assert!(update_write_highlight_cache_incremental(
-            None,
-            Some("notes.txt".to_string()),
-            "x",
-            &theme
-        )
-        .is_none());
+        assert!(
+            update_write_highlight_cache_incremental(
+                None,
+                Some("notes.txt".to_string()),
+                "x",
+                &theme
+            )
+            .is_none()
+        );
         // An empty path resolves to no language either (`rawPath ? …`).
         assert!(
             update_write_highlight_cache_incremental(None, Some(String::new()), "x", &theme)

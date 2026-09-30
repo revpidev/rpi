@@ -9,7 +9,7 @@
 //! The `renderCall`/`renderResult` registration flags and renderers are
 //! the TE35 surface (`view/format.rs`); P0 registers without them.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub mod envelope;
 pub mod sanitize;
@@ -21,8 +21,8 @@ use crate::state::reducer::apply_task_mutation;
 use crate::state::selectors;
 use crate::state::store;
 use crate::tool::types::{
-    todo_params_schema, TaskAction, COMMAND_NAME, DEFAULT_PROMPT_SNIPPET, DEFAULT_TOOL_DESCRIPTION,
-    TOOL_LABEL, TOOL_NAME,
+    COMMAND_NAME, DEFAULT_PROMPT_SNIPPET, DEFAULT_TOOL_DESCRIPTION, TOOL_LABEL, TOOL_NAME,
+    TaskAction, todo_params_schema,
 };
 
 /// Build the `registerTool` payload (upstream `registerTodoTool`): the
@@ -268,9 +268,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
-        assert_eq!(tool_definition()["description"], json!(
-            "Manage a task list for tracking multi-step progress. Actions: create (new task), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation."
-        ));
+        assert_eq!(
+            tool_definition()["description"],
+            json!(
+                "Manage a task list for tracking multi-step progress. Actions: create (new task), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation."
+            )
+        );
     }
 
     /// The eight built-in guidelines, transcribed from
@@ -351,11 +354,15 @@ mod tests {
         );
         assert_eq!(
             properties["activeForm"]["description"],
-            json!("Present-continuous spinner label shown while status is in_progress (e.g. 'writing tests')")
+            json!(
+                "Present-continuous spinner label shown while status is in_progress (e.g. 'writing tests')"
+            )
         );
         assert_eq!(
             properties["status"]["description"],
-            json!("Set this task's status (update): one of pending, in_progress, completed, deleted. When action is list, filters returned tasks by this status.")
+            json!(
+                "Set this task's status (update): one of pending, in_progress, completed, deleted. When action is list, filters returned tasks by this status."
+            )
         );
         assert_eq!(
             properties["blockedBy"]["description"],
@@ -637,9 +644,11 @@ mod tests {
     fn todos_command_definition_registers_the_name_and_description() {
         let definition = crate::tool::todos_command_definition();
         assert_eq!(definition["name"], json!("todos"));
-        assert!(definition["description"]
-            .as_str()
-            .is_some_and(|d| d.contains("todos")));
+        assert!(
+            definition["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("todos"))
+        );
     }
 
     #[test]

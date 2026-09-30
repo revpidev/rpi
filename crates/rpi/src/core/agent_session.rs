@@ -26,10 +26,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rpi_agent::compaction::branch_summarization::{
-    collect_entries_for_branch_summary, generate_branch_summary, CollectEntriesResult,
-    GenerateBranchSummaryOptions,
+    CollectEntriesResult, GenerateBranchSummaryOptions, collect_entries_for_branch_summary,
+    generate_branch_summary,
 };
-use rpi_agent::compaction::{estimate_context_tokens, CompactionResult, SummarizationArgs};
+use rpi_agent::compaction::{CompactionResult, SummarizationArgs, estimate_context_tokens};
 use rpi_agent::messages::{AgentMessage, BashExecutionMessage, CustomMessage, CustomRole};
 use rpi_agent::session::SessionEntry;
 use rpi_agent::types::{AgentEvent, AgentTool, QueueMode, ThinkingLevel};
@@ -42,7 +42,7 @@ use rpi_ai::types::{
     UserContentBlock, UserMessage, UserRole,
 };
 use rpi_ai::utils::overflow::is_context_overflow;
-use rpi_ai::utils::retry::{is_retryable_assistant_error, RetryPolicy};
+use rpi_ai::utils::retry::{RetryPolicy, is_retryable_assistant_error};
 use rpi_ai::utils::text::content_text_user;
 use rpi_ext_host::types as ext;
 use serde::Serialize;
@@ -54,8 +54,8 @@ use crate::core::auth_guidance::{
 };
 use crate::core::compaction_runner::{CompactionEvent, CompactionRunner};
 use crate::core::extensions::{
-    read_runner, ExtensionMode, ExtensionRunner, ExtensionRunnerRef, InputEventResult, InputSource,
-    SessionStartEvent, SessionStartReason, StreamingBehavior,
+    ExtensionMode, ExtensionRunner, ExtensionRunnerRef, InputEventResult, InputSource,
+    SessionStartEvent, SessionStartReason, StreamingBehavior, read_runner,
 };
 use crate::core::model_resolver::ScopedModel;
 use crate::core::model_runtime::ModelRuntime;
@@ -64,11 +64,11 @@ use crate::core::resource_loader::DefaultResourceLoader;
 use crate::core::session_manager::{SessionManager, StoredEntry};
 use crate::core::settings_manager::{RetryConfig, SettingsManager};
 use crate::core::skills::strip_frontmatter;
-use crate::core::system_prompt::{build_system_prompt, BuildSystemPromptOptions};
-use crate::core::usage_totals::{add_usage_to_totals, create_usage_totals, UsageTotals};
+use crate::core::system_prompt::{BuildSystemPromptOptions, build_system_prompt};
+use crate::core::usage_totals::{UsageTotals, add_usage_to_totals, create_usage_totals};
 use crate::error::RpiError;
 use crate::tools::bash::create_local_bash_operations;
-use crate::tools::bash_executor::{execute_bash, BashExecutorOptions, BashResult};
+use crate::tools::bash_executor::{BashExecutorOptions, BashResult, execute_bash};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -1732,11 +1732,7 @@ impl AgentSession {
             });
         let skills_xml = skill_file_read_tool.and_then(|tool| {
             let xml = crate::core::skills::format_skills_for_prompt(&skills, tool);
-            if xml.is_empty() {
-                None
-            } else {
-                Some(xml)
-            }
+            if xml.is_empty() { None } else { Some(xml) }
         });
         drop(loader);
 
@@ -1785,11 +1781,11 @@ impl AgentSession {
         if let Some(selected) = &options.selected_tools {
             let mut seen = std::collections::HashSet::new();
             for name in selected {
-                if seen.insert(name.clone()) {
-                    if let Some(tool) = registry.get(name) {
-                        valid_tool_names.push(name.clone());
-                        tools.push(tool.clone());
-                    }
+                if seen.insert(name.clone())
+                    && let Some(tool) = registry.get(name)
+                {
+                    valid_tool_names.push(name.clone());
+                    tools.push(tool.clone());
                 }
             }
         }
@@ -3073,13 +3069,12 @@ impl AgentSession {
         }
         // Per-model default takes priority when switching to a model that
         // has one (2ff8ba622).
-        if let Some(model) = target_model {
-            if let Some(per_model) = lock(&self.inner.resource_loader)
+        if let Some(model) = target_model
+            && let Some(per_model) = lock(&self.inner.resource_loader)
                 .settings_manager()
                 .get_model_thinking_level(&model.provider, &model.id)
-            {
-                return per_model;
-            }
+        {
+            return per_model;
         }
         lock(&self.inner.resource_loader)
             .settings_manager()
@@ -3564,27 +3559,27 @@ impl AgentSession {
         // session_before_tree extension event (no-op seam).
         let mut extension_summary = None;
         let mut from_extension = false;
-        if self.runner().has_handlers("session_before_tree") {
-            if let Some(result) = self.runner().emit_session_before_tree().await {
-                if result.cancel == Some(true) {
-                    return Ok(NavigateTreeResult {
-                        cancelled: true,
-                        ..Default::default()
-                    });
-                }
-                if let Some(summary) = result.summary.filter(|_| options.summarize) {
-                    extension_summary = Some(summary);
-                    from_extension = true;
-                }
-                if result.custom_instructions.is_some() {
-                    custom_instructions = result.custom_instructions;
-                }
-                if let Some(replace) = result.replace_instructions {
-                    replace_instructions = replace;
-                }
-                if result.label.is_some() {
-                    label = result.label;
-                }
+        if self.runner().has_handlers("session_before_tree")
+            && let Some(result) = self.runner().emit_session_before_tree().await
+        {
+            if result.cancel == Some(true) {
+                return Ok(NavigateTreeResult {
+                    cancelled: true,
+                    ..Default::default()
+                });
+            }
+            if let Some(summary) = result.summary.filter(|_| options.summarize) {
+                extension_summary = Some(summary);
+                from_extension = true;
+            }
+            if result.custom_instructions.is_some() {
+                custom_instructions = result.custom_instructions;
+            }
+            if let Some(replace) = result.replace_instructions {
+                replace_instructions = replace;
+            }
+            if result.label.is_some() {
+                label = result.label;
             }
         }
 
@@ -3738,12 +3733,12 @@ impl AgentSession {
         let session = lock(&self.inner.session_manager);
         let mut result = Vec::new();
         for entry in session.get_entries() {
-            if let Some(SessionEntry::Message(message_entry)) = entry.known() {
-                if let AgentMessage::User(user) = &message_entry.message {
-                    let text = content_text_user(&user.content, "");
-                    if !text.is_empty() {
-                        result.push((message_entry.id.clone(), text));
-                    }
+            if let Some(SessionEntry::Message(message_entry)) = entry.known()
+                && let AgentMessage::User(user) = &message_entry.message
+            {
+                let text = content_text_user(&user.content, "");
+                if !text.is_empty() {
+                    result.push((message_entry.id.clone(), text));
                 }
             }
         }
@@ -3872,20 +3867,16 @@ impl AgentSession {
             let mut has_post_compaction_usage = false;
             if let Some(index) = compaction_index {
                 for entry in typed.iter().skip(index + 1).rev() {
-                    if let SessionEntry::Message(message_entry) = entry {
-                        if let AgentMessage::Assistant(assistant) = &message_entry.message {
-                            if assistant.stop_reason != StopReason::Aborted
-                                && assistant.stop_reason != StopReason::Error
-                            {
-                                let context_tokens =
-                                    rpi_ai::utils::estimate::calculate_context_tokens(
-                                        &assistant.usage,
-                                    );
-                                if context_tokens > 0 {
-                                    has_post_compaction_usage = true;
-                                    break;
-                                }
-                            }
+                    if let SessionEntry::Message(message_entry) = entry
+                        && let AgentMessage::Assistant(assistant) = &message_entry.message
+                        && assistant.stop_reason != StopReason::Aborted
+                        && assistant.stop_reason != StopReason::Error
+                    {
+                        let context_tokens =
+                            rpi_ai::utils::estimate::calculate_context_tokens(&assistant.usage);
+                        if context_tokens > 0 {
+                            has_post_compaction_usage = true;
+                            break;
                         }
                     }
                 }
@@ -3961,10 +3952,10 @@ impl AgentSession {
                     .join(format!("session-{iso}.jsonl"))
             }
         };
-        if let Some(dir) = file_path.parent() {
-            if !dir.exists() {
-                std::fs::create_dir_all(dir)?;
-            }
+        if let Some(dir) = file_path.parent()
+            && !dir.exists()
+        {
+            std::fs::create_dir_all(dir)?;
         }
 
         let session = lock(&self.inner.session_manager);

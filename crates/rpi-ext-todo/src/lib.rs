@@ -39,7 +39,7 @@ use std::sync::{Mutex, OnceLock};
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::replay::replay_via_host;
 use crate::state::store::{reset_store, store};
@@ -268,16 +268,16 @@ fn install_with_key(calls: RpiHostCalls, cookie: PluginCookie, collapse_key: Str
     // from config so a config edit shows up in the collapsed hint
     // without a re-bind (the "off" sentinel's static `collapsed` label
     // covers exactly that window).
-    if collapse_key != config::COLLAPSE_KEY_OFF {
-        if let Err(error) = host.call(
+    if collapse_key != config::COLLAPSE_KEY_OFF
+        && let Err(error) = host.call(
             "registerShortcut",
             json!({
                 "shortcut": collapse_key,
                 "description": "Collapse or expand the todo overlay",
             }),
-        ) {
-            return error_envelope("init", error);
-        }
+        )
+    {
+        return error_envelope("init", error);
     }
     for event in [
         "session_start",
@@ -1146,15 +1146,19 @@ mod tests {
         let commands = recorded("registerCommand");
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["name"], json!("todos"));
-        assert!(commands[0]["description"]
-            .as_str()
-            .is_some_and(|d| d.contains("todos")));
+        assert!(
+            commands[0]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("todos"))
+        );
         let shortcuts = recorded("registerShortcut");
         assert_eq!(shortcuts.len(), 1);
         assert_eq!(shortcuts[0]["shortcut"], json!("ctrl+shift+t"));
-        assert!(shortcuts[0]["description"]
-            .as_str()
-            .is_some_and(|d| d.contains("Collapse")));
+        assert!(
+            shortcuts[0]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("Collapse"))
+        );
     }
 
     #[test]

@@ -11,14 +11,14 @@
 //! ```
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rpi_tui::components::loader::Loader;
 use rpi_tui::components::text::Text;
 use rpi_tui::terminal::ProcessTerminal;
-use rpi_tui::tui::{shared_component, TuiInputListenerResult, TuiStopOptions};
+use rpi_tui::tui::{TuiInputListenerResult, TuiStopOptions, shared_component};
 use rpi_tui::tui_main_screen::TuiMainScreen;
 
 fn main() {

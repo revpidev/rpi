@@ -214,10 +214,10 @@ impl FirstTimeSetupComponent {
                 let next = (self.theme_index as i64 + delta).clamp(0, (len - 1).max(0));
                 if next != self.theme_index as i64 {
                     self.theme_index = next as usize;
-                    if let Some(on_theme_preview) = self.on_theme_preview.as_mut() {
-                        if let Some(name) = self.themes.get(self.theme_index) {
-                            on_theme_preview(name);
-                        }
+                    if let Some(on_theme_preview) = self.on_theme_preview.as_mut()
+                        && let Some(name) = self.themes.get(self.theme_index)
+                    {
+                        on_theme_preview(name);
                     }
                 }
             }
@@ -314,7 +314,7 @@ impl Component for FirstTimeSetupComponent {
         }
 
         lines.push(String::new()); // Spacer(1)
-                                   // Key hints (first-time-setup.ts:88-98).
+        // Key hints (first-time-setup.ts:88-98).
         let hint = format!(
             "{}  {}  {}",
             raw_key_hint(&self.theme, "↑↓", "navigate"),
@@ -362,10 +362,10 @@ impl Component for FirstTimeSetupComponent {
                     on_submit(result);
                 }
             }
-        } else if read.matches_id(data, "tui.select.cancel") {
-            if let Some(on_cancel) = self.on_cancel.as_mut() {
-                on_cancel();
-            }
+        } else if read.matches_id(data, "tui.select.cancel")
+            && let Some(on_cancel) = self.on_cancel.as_mut()
+        {
+            on_cancel();
         }
     }
 
@@ -458,13 +458,17 @@ mod tests {
         let lines: Vec<String> = component.render(80).iter().map(|l| strip_ansi(l)).collect();
         assert!(lines.iter().any(|l| l.contains('─')), "borders rendered");
         assert!(lines.iter().any(|l| l.contains("████")), "logo rendered");
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Welcome to rpi, the minimal coding agent.")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Welcome to rpi, the minimal coding agent."))
+        );
         assert!(lines.iter().any(|l| l.contains("Pick a theme.")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Detected system appearance: light")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Detected system appearance: light"))
+        );
         assert!(
             lines.iter().any(|l| l.trim_start().starts_with("→ light")),
             "detected preselected"
@@ -486,9 +490,11 @@ mod tests {
         let (component, _) = component_with(None);
         assert_eq!(component.selected_theme(), Some("dark"));
         let lines: Vec<String> = component.render(80).iter().map(|l| strip_ansi(l)).collect();
-        assert!(!lines
-            .iter()
-            .any(|l| l.contains("Detected system appearance")));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("Detected system appearance"))
+        );
     }
 
     #[test]
@@ -499,12 +505,16 @@ mod tests {
         component.handle_input("\r"); // step 1 → step 2
         let lines: Vec<String> = component.render(80).iter().map(|l| strip_ansi(l)).collect();
         assert!(!lines.iter().any(|l| l.contains("Pick a theme.")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Opt-in to anonymous usage data sharing?")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Share anonymous usage data")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Opt-in to anonymous usage data sharing?"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Share anonymous usage data"))
+        );
         assert!(lines.iter().any(|l| l.contains("Don't share")));
         assert!(lines.iter().any(|l| l.contains("finish")));
         assert!(lines.iter().any(|l| l.contains("tracking identifier")));
@@ -596,8 +606,10 @@ mod tests {
         assert_eq!(component.selected_theme(), Some("light"));
         assert!(component.selected_analytics());
         let lines: Vec<String> = component.render(80).iter().map(|l| strip_ansi(l)).collect();
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Opt-in to anonymous usage data sharing?")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Opt-in to anonymous usage data sharing?"))
+        );
     }
 }

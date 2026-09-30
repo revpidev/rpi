@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
+use crate::PluginRuntime;
 use crate::agents::discover::{self, AgentConfig};
 use crate::p1::launch_child::{self, ChildOutcome, ChildSpec, OutputOverride, RunCtx};
-use crate::PluginRuntime;
 
 /// Key pattern shared with the workflow sandbox (`KEY_PATTERN`,
 /// scripted-workflow.ts:3).
@@ -615,41 +615,40 @@ async fn launch_one(
     // failure text kept so the aggregate can say why.
     let mut spec = entry.spec.clone();
     let mut prepared = None;
-    if let Some(plan) = worktree {
-        if plan
+    if let Some(plan) = worktree
+        && plan
             .enabled
             .get(entry.spec.child_index as usize)
             .copied()
             .unwrap_or(false)
-        {
-            let cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
-            // Allocation repeats the source probe (#2081): the dispatch-time
-            // preflight is advisory — the source state can change before this
-            // child's worktree is allocated, and a dirty tree must not reach
-            // `git worktree add`.
-            if let Err(message) = crate::p1::worktree::probe_worktree_source(&cwd) {
-                return Some(Err(message));
-            }
-            let cwd_relative = match crate::p1::worktree::resolve_repo_cwd_relative(&cwd) {
-                Ok(relative) => relative,
-                Err(message) => return Some(Err(message)),
-            };
-            let info = match crate::p1::worktree::create_worktree(
-                &plan.toplevel,
-                &cwd_relative,
-                &ctx.run_id,
-                entry.spec.child_index as usize,
-                &plan.base_commit,
-                &plan.base_dir,
-                Some(&entry.spec.agent_name),
-                &plan.config,
-            ) {
-                Ok(info) => info,
-                Err(message) => return Some(Err(message)),
-            };
-            spec.cwd = Some(info.agent_cwd.clone());
-            prepared = Some(info);
+    {
+        let cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
+        // Allocation repeats the source probe (#2081): the dispatch-time
+        // preflight is advisory — the source state can change before this
+        // child's worktree is allocated, and a dirty tree must not reach
+        // `git worktree add`.
+        if let Err(message) = crate::p1::worktree::probe_worktree_source(&cwd) {
+            return Some(Err(message));
         }
+        let cwd_relative = match crate::p1::worktree::resolve_repo_cwd_relative(&cwd) {
+            Ok(relative) => relative,
+            Err(message) => return Some(Err(message)),
+        };
+        let info = match crate::p1::worktree::create_worktree(
+            &plan.toplevel,
+            &cwd_relative,
+            &ctx.run_id,
+            entry.spec.child_index as usize,
+            &plan.base_commit,
+            &plan.base_dir,
+            Some(&entry.spec.agent_name),
+            &plan.config,
+        ) {
+            Ok(info) => info,
+            Err(message) => return Some(Err(message)),
+        };
+        spec.cwd = Some(info.agent_cwd.clone());
+        prepared = Some(info);
     }
     let outcome: ChildOutcome = match launch_child::run_child_async(&spec, &agent, ctx).await {
         Ok(outcome) => outcome,

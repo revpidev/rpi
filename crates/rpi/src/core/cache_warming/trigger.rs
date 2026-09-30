@@ -19,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 use crate::core::settings_manager::CacheWarmingMode;
 
 use super::decision::{
-    evaluate_decision, get_cache_warming_delay_ms, get_prompt_cache_ttl_ms, is_replayable,
-    last_prompt_tokens, CacheWarmingDecision, MAX_IDLE_WARMING_AGE_MS, MAX_WARMING_AGE_MS,
+    CacheWarmingDecision, MAX_IDLE_WARMING_AGE_MS, MAX_WARMING_AGE_MS, evaluate_decision,
+    get_cache_warming_delay_ms, get_prompt_cache_ttl_ms, is_replayable, last_prompt_tokens,
 };
 use super::{CacheWarmingStatus, WarmingState};
 

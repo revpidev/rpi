@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use rpi_tui::terminal::ProcessTerminal;
 use rpi_tui::terminal_colors::TerminalColorScheme;
-use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
+use rpi_tui::tui::{Component, Focusable, TuiStopOptions, shared_component_from_boxed};
 use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::tui_main_screen::TuiMainScreen;
 
@@ -376,7 +376,7 @@ mod tests {
     use rpi_tui::terminal::Terminal;
 
     use super::*;
-    use crate::modes::interactive::test_support::{build_test_session, TestTerminal};
+    use crate::modes::interactive::test_support::{TestTerminal, build_test_session};
 
     /// RAII guard restoring an env var on drop.
     struct EnvGuard {
@@ -387,13 +387,13 @@ mod tests {
     impl EnvGuard {
         fn set(name: &'static str, value: &str) -> Self {
             let original = std::env::var_os(name);
-            std::env::set_var(name, value);
+            rpi_test_env::set_var(name, value);
             EnvGuard { name, original }
         }
 
         fn remove(name: &'static str) -> Self {
             let original = std::env::var_os(name);
-            std::env::remove_var(name);
+            rpi_test_env::remove_var(name);
             EnvGuard { name, original }
         }
     }
@@ -401,8 +401,8 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.original {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
+                Some(value) => rpi_test_env::set_var(self.name, value),
+                None => rpi_test_env::remove_var(self.name),
             }
         }
     }

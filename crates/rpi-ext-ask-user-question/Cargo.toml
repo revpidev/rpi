@@ -25,6 +25,7 @@ serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+rpi-test-env.workspace = true
 # TE28 deliverable 4: the five 00-feasibility §7 pre-verifications drive the
 # real extension host (tool execute + bound UI bridge) and the real cdylib
 # (l0_load), so the test binaries need the host-side types.

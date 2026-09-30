@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{Capability, HostState};
 use crate::api::{DeliverAs, SendMessageOptions, SendUserMessageOptions};
@@ -766,14 +766,18 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     .map_err(|e| (error_kind(&e), e.to_string()))
             })
         }
-        "getActiveTools" => Ok(json!(state
-            .api
-            .get_active_tools()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
-        "getAllTools" => Ok(json!(state
-            .api
-            .get_all_tools()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
+        "getActiveTools" => Ok(json!(
+            state
+                .api
+                .get_active_tools()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
+        "getAllTools" => Ok(json!(
+            state
+                .api
+                .get_all_tools()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
         "setActiveTools" => {
             let names: Vec<String> = args
                 .get("toolNames")
@@ -785,10 +789,12 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
         }
-        "getCommands" => Ok(json!(state
-            .api
-            .get_commands()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
+        "getCommands" => Ok(json!(
+            state
+                .api
+                .get_commands()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
         "setModel" => {
             let api = state.api.clone();
             let handle = state.async_handle.clone();
@@ -797,10 +803,12 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(json!(result))
         }
-        "getThinkingLevel" => Ok(json!(state
-            .api
-            .get_thinking_level()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
+        "getThinkingLevel" => Ok(json!(
+            state
+                .api
+                .get_thinking_level()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
         "setThinkingLevel" => {
             state
                 .api
@@ -871,21 +879,27 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
         // ------------------------------------------------------------------
         // Context (ContextActions via ExtensionContext)
         // ------------------------------------------------------------------
-        "ctx.isIdle" => Ok(json!(state
-            .api
-            .context()
-            .is_idle()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
-        "ctx.isProjectTrusted" => Ok(json!(state
-            .api
-            .context()
-            .is_project_trusted()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
-        "ctx.hasPendingMessages" => Ok(json!(state
-            .api
-            .context()
-            .has_pending_messages()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
+        "ctx.isIdle" => Ok(json!(
+            state
+                .api
+                .context()
+                .is_idle()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
+        "ctx.isProjectTrusted" => Ok(json!(
+            state
+                .api
+                .context()
+                .is_project_trusted()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
+        "ctx.hasPendingMessages" => Ok(json!(
+            state
+                .api
+                .context()
+                .has_pending_messages()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
         "ctx.getContextUsage" => {
             let usage = state
                 .api
@@ -955,22 +969,26 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(serde_json::to_value(results).unwrap_or(Value::Array(Vec::new())))
         }
-        "ctx.getSystemPrompt" => Ok(json!(state
-            .api
-            .context()
-            .get_system_prompt()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
+        "ctx.getSystemPrompt" => Ok(json!(
+            state
+                .api
+                .context()
+                .get_system_prompt()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
         "ctx.model" => Ok(state
             .api
             .context()
             .model()
             .map_err(|e| (error_kind(&e), e.to_string()))?
             .unwrap_or(Value::Null)),
-        "ctx.cwd" => Ok(json!(state
-            .api
-            .context()
-            .cwd()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
+        "ctx.cwd" => Ok(json!(
+            state
+                .api
+                .context()
+                .cwd()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
         "ctx.mode" => {
             let mode = state
                 .api
@@ -979,11 +997,13 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(serde_json::to_value(mode).unwrap_or(Value::Null))
         }
-        "ctx.hasUI" => Ok(json!(state
-            .api
-            .context()
-            .has_ui()
-            .map_err(|e| (error_kind(&e), e.to_string()))?)),
+        "ctx.hasUI" => Ok(json!(
+            state
+                .api
+                .context()
+                .has_ui()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
         "ctx.abort" => {
             state
                 .api
@@ -1366,7 +1386,7 @@ mod session_entries_tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::dispatch;
     use crate::api::{
@@ -1572,7 +1592,7 @@ mod session_tool_results_tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::dispatch;
     use crate::api::{
@@ -1802,7 +1822,7 @@ mod c3_dispose_tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
     use super::dispatch;

@@ -316,10 +316,10 @@ pub fn has_tool_redefinitions(messages: &[Message]) -> bool {
         };
         if let Some(added) = &system.tools_added {
             for tool in added {
-                if let Some(previous) = declared.get(&tool.name) {
-                    if !declarations_equal(previous, tool) {
-                        return true;
-                    }
+                if let Some(previous) = declared.get(&tool.name)
+                    && !declarations_equal(previous, tool)
+                {
+                    return true;
                 }
                 declared.insert(tool.name.clone(), tool.clone());
             }
@@ -533,9 +533,11 @@ mod tests {
             }]
         );
         assert_eq!(changes.tools_added, vec![changed, tool("b")]);
-        assert!(get_tool_state_changes(&[tool("a")], &[tool("a")])
-            .tools_added
-            .is_empty());
+        assert!(
+            get_tool_state_changes(&[tool("a")], &[tool("a")])
+                .tools_added
+                .is_empty()
+        );
     }
 
     #[test]

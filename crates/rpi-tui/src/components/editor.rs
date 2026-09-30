@@ -41,12 +41,12 @@ use crate::autocomplete::{
 use crate::components::select_list::{
     SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme,
 };
-use crate::keybindings::{get_keybindings, Keybinding};
+use crate::keybindings::{Keybinding, get_keybindings};
 use crate::keys::{decode_printable_key, matches_key};
 use crate::kill_ring::{KillRing, KillRingPushOptions};
 use crate::tui::{
-    Component, Focusable, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
-    TuiMouseHandlerResult, CURSOR_MARKER,
+    CURSOR_MARKER, Component, Focusable, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult,
+    TuiMouseEventType, TuiMouseHandlerResult,
 };
 use crate::tui_handle::TuiHandle;
 use crate::undo_stack::UndoStack;
@@ -54,7 +54,7 @@ use crate::utils::{
     cjk_break_regex, get_grapheme_segmenter, is_whitespace_char, slice_by_column, visible_width,
 };
 use crate::word_navigation::{
-    find_word_backward, find_word_forward, segment_words, WordNavigationOptions, WordSegment,
+    WordNavigationOptions, WordSegment, find_word_backward, find_word_forward, segment_words,
 };
 
 /// Byte offset of the `chars`-th character in `text`; `chars` == char count
@@ -172,20 +172,21 @@ fn merge_marker_segments<'a>(
 
         let marker = markers.get(marker_idx).copied();
 
-        if let Some((start, end)) = marker {
-            if seg.index >= start && seg.index < end {
-                // This segment falls inside a marker. If this is the first
-                // segment of the marker, emit a merged segment.
-                if seg.index == start {
-                    let marker_text = &text[char_to_byte(text, start)..char_to_byte(text, end)];
-                    result.push(EditorSegment {
-                        index: start,
-                        segment: marker_text,
-                    });
-                }
-                // Otherwise skip (already merged into the first segment).
-                continue;
+        if let Some((start, end)) = marker
+            && seg.index >= start
+            && seg.index < end
+        {
+            // This segment falls inside a marker. If this is the first
+            // segment of the marker, emit a merged segment.
+            if seg.index == start {
+                let marker_text = &text[char_to_byte(text, start)..char_to_byte(text, end)];
+                result.push(EditorSegment {
+                    index: start,
+                    segment: marker_text,
+                });
             }
+            // Otherwise skip (already merged into the first segment).
+            continue;
         }
         result.push(seg);
     }
@@ -229,18 +230,19 @@ pub fn word_segments_with_markers<'a>(
 
         let marker = markers.get(marker_idx).copied();
 
-        if let Some((marker_start, marker_end)) = marker {
-            if start >= marker_start && start < marker_end {
-                if start == marker_start {
-                    let marker_text =
-                        &text[char_to_byte(text, marker_start)..char_to_byte(text, marker_end)];
-                    result.push(WordSegment {
-                        segment: marker_text,
-                        is_word_like: false,
-                    });
-                }
-                continue;
+        if let Some((marker_start, marker_end)) = marker
+            && start >= marker_start
+            && start < marker_end
+        {
+            if start == marker_start {
+                let marker_text =
+                    &text[char_to_byte(text, marker_start)..char_to_byte(text, marker_end)];
+                result.push(WordSegment {
+                    segment: marker_text,
+                    is_word_like: false,
+                });
             }
+            continue;
         }
         result.push(seg);
     }
@@ -319,21 +321,21 @@ pub fn word_wrap_line(
         // Overflow check before advancing.
         if current_width + g_width > max_width {
             let mut backtracked = false;
-            if let Some(opp) = wrap_opp_index {
-                if current_width - wrap_opp_width + g_width <= max_width {
-                    // Backtrack to last wrap opportunity (the remaining
-                    // content plus the current grapheme still fits within
-                    // maxWidth).
-                    chunks.push(TextChunk {
-                        text: line[char_to_byte(line, chunk_start)..char_to_byte(line, opp)]
-                            .to_string(),
-                        start_index: chunk_start,
-                        end_index: opp,
-                    });
-                    chunk_start = opp;
-                    current_width -= wrap_opp_width;
-                    backtracked = true;
-                }
+            if let Some(opp) = wrap_opp_index
+                && current_width - wrap_opp_width + g_width <= max_width
+            {
+                // Backtrack to last wrap opportunity (the remaining
+                // content plus the current grapheme still fits within
+                // maxWidth).
+                chunks.push(TextChunk {
+                    text: line[char_to_byte(line, chunk_start)..char_to_byte(line, opp)]
+                        .to_string(),
+                    start_index: chunk_start,
+                    end_index: opp,
+                });
+                chunk_start = opp;
+                current_width -= wrap_opp_width;
+                backtracked = true;
             }
             if !backtracked && chunk_start < char_index {
                 // No viable wrap opportunity: force-break at current
@@ -2889,10 +2891,10 @@ impl Editor {
         ui.list = Some(self.create_autocomplete_list(&suggestions.prefix, &items));
 
         let best_match_index = self.get_best_autocomplete_match_index(&items, &suggestions.prefix);
-        if best_match_index >= 0 {
-            if let Some(list) = ui.list.as_mut() {
-                list.set_selected_index(best_match_index as usize);
-            }
+        if best_match_index >= 0
+            && let Some(list) = ui.list.as_mut()
+        {
+            list.set_selected_index(best_match_index as usize);
         }
 
         ui.state = Some(state);
@@ -3257,43 +3259,42 @@ impl Component for Editor {
             let mut cursor_in_padding = false;
 
             // Add cursor if this line has it.
-            if layout_line.has_cursor {
-                if let Some(cursor_pos) = layout_line.cursor_pos {
-                    let before =
-                        display_text[..char_to_byte(&display_text, cursor_pos)].to_string();
-                    let after = display_text[char_to_byte(&display_text, cursor_pos)..].to_string();
+            if layout_line.has_cursor
+                && let Some(cursor_pos) = layout_line.cursor_pos
+            {
+                let before = display_text[..char_to_byte(&display_text, cursor_pos)].to_string();
+                let after = display_text[char_to_byte(&display_text, cursor_pos)..].to_string();
 
-                    // Hardware cursor marker (zero-width, emitted before fake
-                    // cursor for IME positioning).
-                    let marker = if emit_cursor_marker {
-                        CURSOR_MARKER
-                    } else {
-                        ""
-                    };
+                // Hardware cursor marker (zero-width, emitted before fake
+                // cursor for IME positioning).
+                let marker = if emit_cursor_marker {
+                    CURSOR_MARKER
+                } else {
+                    ""
+                };
 
-                    if !after.is_empty() {
-                        // Cursor is on a character (grapheme) — replace it
-                        // with highlighted version.
-                        let after_graphemes = self.grapheme_segments(&after);
-                        let first_grapheme = after_graphemes
-                            .first()
-                            .map(|grapheme| grapheme.segment)
-                            .unwrap_or("");
-                        let rest_after = after[first_grapheme.len()..].to_string();
-                        let cursor = format!("\x1b[7m{first_grapheme}\x1b[0m");
-                        display_text = format!("{before}{marker}{cursor}{rest_after}");
-                        // lineVisibleWidth stays the same — we're replacing,
-                        // not adding.
-                    } else {
-                        // Cursor is at the end — add highlighted space.
-                        let cursor = "\x1b[7m \x1b[0m";
-                        display_text = format!("{before}{marker}{cursor}");
-                        line_visible_width += 1;
-                        // If cursor overflows content width into the padding,
-                        // flag it.
-                        if line_visible_width > content_width && padding_x > 0 {
-                            cursor_in_padding = true;
-                        }
+                if !after.is_empty() {
+                    // Cursor is on a character (grapheme) — replace it
+                    // with highlighted version.
+                    let after_graphemes = self.grapheme_segments(&after);
+                    let first_grapheme = after_graphemes
+                        .first()
+                        .map(|grapheme| grapheme.segment)
+                        .unwrap_or("");
+                    let rest_after = after[first_grapheme.len()..].to_string();
+                    let cursor = format!("\x1b[7m{first_grapheme}\x1b[0m");
+                    display_text = format!("{before}{marker}{cursor}{rest_after}");
+                    // lineVisibleWidth stays the same — we're replacing,
+                    // not adding.
+                } else {
+                    // Cursor is at the end — add highlighted space.
+                    let cursor = "\x1b[7m \x1b[0m";
+                    display_text = format!("{before}{marker}{cursor}");
+                    line_visible_width += 1;
+                    // If cursor overflows content width into the padding,
+                    // flag it.
+                    if line_visible_width > content_width && padding_x > 0 {
+                        cursor_in_padding = true;
                     }
                 }
             }
@@ -3916,8 +3917,8 @@ mod tests {
 
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use rpi_test_support::vt::strip_ansi;
@@ -4044,9 +4045,9 @@ mod tests {
     impl MockProvider {
         fn new(
             get_suggestions: impl Fn(&[String], usize, usize, bool) -> Option<AutocompleteSuggestions>
-                + Send
-                + Sync
-                + 'static,
+            + Send
+            + Sync
+            + 'static,
         ) -> Self {
             Self {
                 trigger: Vec::new(),
@@ -4239,8 +4240,8 @@ mod tests {
     #[test]
     fn browses_history_directly_without_first_moving_the_cursor() {
         use crate::keybindings::{
-            set_keybindings, tui_keybindings, KeyBindingValue, KeybindingsConfig,
-            KeybindingsManager,
+            KeyBindingValue, KeybindingsConfig, KeybindingsManager, set_keybindings,
+            tui_keybindings,
         };
 
         let _guard = KEYBINDINGS_LOCK.lock().unwrap();
@@ -6030,7 +6031,7 @@ mod tests {
         editor.handle_input("\x15"); // Ctrl+U - deletes "B"
         editor.handle_input("\x15"); // Ctrl+U - deletes newline
         editor.handle_input("\x15"); // Ctrl+U - deletes "A"
-                                     // Ring: ["SINGLE", "A\nB"].
+        // Ring: ["SINGLE", "A\nB"].
 
         // Insert in middle of "hello world".
         editor.set_text("hello world");
@@ -7523,7 +7524,7 @@ mod tests {
 
         editor.set_text("hello world");
         editor.handle_input("\x01"); // Ctrl+A - go to start
-                                     // Move cursor to the 'o' in "hello" (col 4).
+        // Move cursor to the 'o' in "hello" (col 4).
         for _ in 0..4 {
             editor.handle_input("\x1b[C");
         }
@@ -8197,7 +8198,7 @@ mod tests {
 
         // Move up to establish sticky col 15.
         editor.handle_input("\x1b[A"); // Up to line 0
-                                       // Line 0 has only 5 chars, so cursor at col 5.
+        // Line 0 has only 5 chars, so cursor at col 5.
         assert_cursor(&editor, 0, 5);
 
         // Narrow the editor.
@@ -8354,7 +8355,7 @@ mod tests {
 
         // Position cursor right after the marker (before "B").
         editor.handle_input("\x01"); // Ctrl+A
-                                     // Move past "A" and the marker.
+        // Move past "A" and the marker.
         editor.handle_input("\x1b[C"); // past "A"
         editor.handle_input("\x1b[C"); // past marker
         assert_cursor(&editor, 0, 1 + marker);
@@ -8986,25 +8987,27 @@ mod tests {
         let _ = ed.render(80);
         // Content row 1; the default editor has no side padding, so column
         // x maps directly to the grapheme column.
-        assert!(ed
-            .handle_mouse(&editor_mouse_event(
+        assert!(
+            ed.handle_mouse(&editor_mouse_event(
                 TuiMouseEventType::Click,
                 TuiMouseButton::Left,
                 3,
                 1
             ))
-            .is_some());
+            .is_some()
+        );
         assert_eq!(ed.get_cursor(), (0, 3), "click on the second 'l'");
 
         // Click far past the line end clamps to the end of the line.
-        assert!(ed
-            .handle_mouse(&editor_mouse_event(
+        assert!(
+            ed.handle_mouse(&editor_mouse_event(
                 TuiMouseEventType::Click,
                 TuiMouseButton::Left,
                 78,
                 1
             ))
-            .is_some());
+            .is_some()
+        );
         assert_eq!(ed.get_cursor(), (0, 11));
     }
 

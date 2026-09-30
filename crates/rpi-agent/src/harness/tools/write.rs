@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
@@ -122,13 +122,13 @@ impl<TContext: ToolContext> AgentHarnessTool<TContext> for WriteTool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::harness::env::nodejs::NodeExecutionEnv;
-    use crate::harness::tools::test_helpers::{text_output, TempDir, ToolEnv};
     use crate::harness::tools::ExecutionToolContext;
+    use crate::harness::tools::test_helpers::{TempDir, ToolEnv, text_output};
     use crate::harness::types::ExecutionEnv;
 
     #[tokio::test]

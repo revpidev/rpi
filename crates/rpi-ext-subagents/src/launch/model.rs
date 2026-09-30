@@ -192,10 +192,10 @@ pub fn fuzzy_resolve_model(
             if entry_id != query_id && strip_trailing_date_stamp(&entry_id) != query_id_no_date {
                 return false;
             }
-            if let Some(provider) = &query_provider {
-                if normalize_model_segment(&entry.provider) != *provider {
-                    return false;
-                }
+            if let Some(provider) = &query_provider
+                && normalize_model_segment(&entry.provider) != *provider
+            {
+                return false;
             }
             true
         })
@@ -238,13 +238,12 @@ pub fn resolve_base_model_candidate(
             .iter()
             .filter(|entry| entry.id == base_model)
             .collect();
-        if let Some(preferred) = preferred_provider {
-            if let Some(hit) = exact_matches
+        if let Some(preferred) = preferred_provider
+            && let Some(hit) = exact_matches
                 .iter()
                 .find(|entry| entry.provider == preferred)
-            {
-                return Some(hit.full_id.clone());
-            }
+        {
+            return Some(hit.full_id.clone());
         }
         if exact_matches.len() == 1 {
             return Some(exact_matches[0].full_id.clone());
@@ -310,10 +309,10 @@ pub fn resolve_subagent_model_candidate(
         return Some(resolved);
     }
     let (base, suffix) = split_thinking_suffix(model);
-    if !suffix.is_empty() {
-        if let Some(resolved) = resolve_base_model_candidate(base, models, preferred_provider) {
-            return Some(format!("{resolved}{suffix}"));
-        }
+    if !suffix.is_empty()
+        && let Some(resolved) = resolve_base_model_candidate(base, models, preferred_provider)
+    {
+        return Some(format!("{resolved}{suffix}"));
     }
     None
 }
@@ -484,16 +483,16 @@ impl ModelScopeConfig {
             }
             scopes.push((rule, "modelScope".to_string()));
         }
-        if let Some(agent_rule) = self.agents.get(agent_name) {
-            if let Some(allow) = &agent_rule.allow {
-                let rule = ModelScopeConfig {
-                    enforce: Some(agent_rule.enforce.unwrap_or(self.enforce.unwrap_or(false))),
-                    strict: agent_rule.strict.or(self.strict),
-                    allow: Some(expand(allow)),
-                    agents: Default::default(),
-                };
-                scopes.push((rule, format!("modelScope.agents.{agent_name}")));
-            }
+        if let Some(agent_rule) = self.agents.get(agent_name)
+            && let Some(allow) = &agent_rule.allow
+        {
+            let rule = ModelScopeConfig {
+                enforce: Some(agent_rule.enforce.unwrap_or(self.enforce.unwrap_or(false))),
+                strict: agent_rule.strict.or(self.strict),
+                allow: Some(expand(allow)),
+                agents: Default::default(),
+            };
+            scopes.push((rule, format!("modelScope.agents.{agent_name}")));
         }
         scopes
     }
@@ -713,15 +712,14 @@ pub fn resolve_subagent_model_override(
             }
         }
     };
-    if let Some(resolved) = resolved.as_deref() {
-        if scope.is_some_and(|s| s.enforced()) {
-            if let Some(violation) = check_model_scope(Some(resolved), scope, source) {
-                if violation.is_error {
-                    return Err(violation.message);
-                }
-                on_warn(&violation);
-            }
+    if let Some(resolved) = resolved.as_deref()
+        && scope.is_some_and(|s| s.enforced())
+        && let Some(violation) = check_model_scope(Some(resolved), scope, source)
+    {
+        if violation.is_error {
+            return Err(violation.message);
         }
+        on_warn(&violation);
     }
     Ok(resolved)
 }
@@ -836,9 +834,7 @@ pub fn build_model_candidates(
                     "Model '{}' is outside the configured subagent model scope ({}). Allowed patterns: {}.",
                     violation.model,
                     rule_origin,
-                    violation
-                        .allowed_patterns
-                        .join(", ")
+                    violation.allowed_patterns.join(", ")
                 );
                 if violation.is_error {
                     return Err(violation.message);

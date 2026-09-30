@@ -58,18 +58,18 @@ impl ApiKeyAuth for EnvApiKeyAuth {
         ctx: &dyn AuthContext,
         credential: Option<&ApiKeyCredential>,
     ) -> Result<Option<AuthResult>, ModelsError> {
-        if let Some(credential) = credential {
-            if let Some(key) = credential.key.clone().filter(|key| !key.is_empty()) {
-                return Ok(Some(AuthResult {
-                    auth: ModelAuth {
-                        api_key: Some(key),
-                        headers: None,
-                        base_url: None,
-                    },
-                    env: credential.env.clone(),
-                    source: Some("stored credential".to_owned()),
-                }));
-            }
+        if let Some(credential) = credential
+            && let Some(key) = credential.key.clone().filter(|key| !key.is_empty())
+        {
+            return Ok(Some(AuthResult {
+                auth: ModelAuth {
+                    api_key: Some(key),
+                    headers: None,
+                    base_url: None,
+                },
+                env: credential.env.clone(),
+                source: Some("stored credential".to_owned()),
+            }));
         }
         for env_var in &self.env_vars {
             // JS `if (value)` — empty strings are falsy.

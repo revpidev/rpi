@@ -44,7 +44,7 @@ use base64::Engine;
 use unicode_width::UnicodeWidthChar;
 
 use crate::terminal::{InputHandler, ResizeHandler, Terminal};
-use crate::tui::{lock_shared, Tui};
+use crate::tui::{Tui, lock_shared};
 
 /// Serializes tests that mutate process env or module globals (capabilities
 /// cache, cell dimensions); cargo runs tests in one binary with parallel
@@ -68,8 +68,8 @@ impl EnvGuard {
     pub(crate) fn set(key: &'static str, value: Option<&str>) -> EnvGuard {
         let saved = std::env::var(key).ok();
         match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+            Some(value) => rpi_test_env::set_var(key, value),
+            None => rpi_test_env::remove_var(key),
         }
         EnvGuard { key, saved }
     }
@@ -78,8 +78,8 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.saved {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
+            Some(value) => rpi_test_env::set_var(self.key, value),
+            None => rpi_test_env::remove_var(self.key),
         }
     }
 }
@@ -352,10 +352,10 @@ impl VtState {
             // Combining char: merge into the previous cell's text.
             if self.cursor_col > 0 {
                 let abs = self.abs_row();
-                if let Some(Some(cell)) = self.lines[abs].get_mut(self.cursor_col - 1) {
-                    if !cell.continuation {
-                        cell.text.push(ch);
-                    }
+                if let Some(Some(cell)) = self.lines[abs].get_mut(self.cursor_col - 1)
+                    && !cell.continuation
+                {
+                    cell.text.push(ch);
                 }
             }
             return;

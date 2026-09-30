@@ -27,7 +27,7 @@ pub mod theme;
 pub(crate) mod theme_watcher;
 pub mod tool_renderers;
 
-pub use interactive_mode::{run_interactive_mode, InteractiveMode, InteractiveModeOptions};
+pub use interactive_mode::{InteractiveMode, InteractiveModeOptions, run_interactive_mode};
 
 #[cfg(test)]
 mod snapshots;

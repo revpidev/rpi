@@ -27,7 +27,7 @@ use rpi_ai::auth::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthInteraction, AuthPrompt, AuthResult,
     AuthType, Credential, ModelAuth, ModelsError, ModelsErrorCode, ProviderAuth,
 };
-use rpi_ai::models::{now_millis, Provider, ProviderStreams, RefreshModelsContext};
+use rpi_ai::models::{Provider, ProviderStreams, RefreshModelsContext, now_millis};
 use rpi_ai::models_store::ModelsStoreEntry;
 use rpi_ai::types::{
     ApiKind, InputModality, MaxTokensField, Model, ModelCompat, ProviderEnv, SimpleStreamOptions,
@@ -37,8 +37,8 @@ use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use tokio_util::sync::CancellationToken;
 
 use super::client::{
-    llama_inference_url, normalize_llama_server_url, LlamaClient, LlamaError, LlamaModelInfo,
-    LlamaModelStatusValue,
+    LlamaClient, LlamaError, LlamaModelInfo, LlamaModelStatusValue, llama_inference_url,
+    normalize_llama_server_url,
 };
 
 /// `LLAMA_PROVIDER_ID` (provider.ts:13).

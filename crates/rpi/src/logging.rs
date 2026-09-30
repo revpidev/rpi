@@ -69,13 +69,16 @@ impl LogSink {
     pub fn install(tui_mode: bool) -> LogSink {
         let sink = LogSink::default();
         if tui_mode {
-            if let Some(file) = open_log_file() {
-                *sink.0.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Box::new(std::io::BufWriter::new(file));
-            } else {
-                // Log file unavailable (unwritable agent dir): degrade to
-                // stderr with a one-line notice instead of failing startup.
-                eprintln!("Warning: could not open log file; falling back to stderr");
+            match open_log_file() {
+                Some(file) => {
+                    *sink.0.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Box::new(std::io::BufWriter::new(file));
+                }
+                _ => {
+                    // Log file unavailable (unwritable agent dir): degrade to
+                    // stderr with a one-line notice instead of failing startup.
+                    eprintln!("Warning: could not open log file; falling back to stderr");
+                }
             }
         }
         let filter = std::env::var("RPI_LOG")

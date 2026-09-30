@@ -33,7 +33,7 @@ use std::future::Future;
 use async_trait::async_trait;
 use rpi_ai::types::{ImageContent, ToolResultContent};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
@@ -42,8 +42,8 @@ use crate::harness::tools::tool_context::ToolContext;
 use crate::harness::tools::truncation_to_value;
 use crate::harness::types::AgentHarnessTool;
 use crate::harness::utils::truncate::{
-    format_size, truncate_head, TruncationOptions, TruncationResult, DEFAULT_MAX_BYTES,
-    DEFAULT_MAX_LINES,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncationOptions, TruncationResult, format_size,
+    truncate_head,
 };
 use crate::types::{AgentToolResult, AgentToolUpdateCallback};
 
@@ -338,8 +338,8 @@ mod tests {
 
     use super::*;
     use crate::harness::env::nodejs::NodeExecutionEnv;
-    use crate::harness::tools::test_helpers::{text_output, tiny_bmp, tiny_png, TempDir};
     use crate::harness::tools::ExecutionToolContext;
+    use crate::harness::tools::test_helpers::{TempDir, text_output, tiny_bmp, tiny_png};
     use crate::harness::types::FileSystem;
 
     fn context(env: NodeExecutionEnv) -> ExecutionToolContext {
@@ -397,8 +397,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(text_output(&result)
-            .contains("[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]"));
+        assert!(
+            text_output(&result)
+                .contains("[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]")
+        );
         let truncation = &result.details["truncation"];
         assert_eq!(truncation["truncated"], Value::Bool(true));
         assert_eq!(truncation["truncatedBy"], Value::String("lines".into()));
@@ -451,9 +453,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Offset 100 is beyond end of file (3 lines total)"));
+        assert!(
+            err.to_string()
+                .contains("Offset 100 is beyond end of file (3 lines total)")
+        );
     }
 
     #[tokio::test]
@@ -600,9 +603,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Offset 9223372036854775807 is beyond end of file (100 lines total)"));
+        assert!(
+            err.to_string()
+                .contains("Offset 9223372036854775807 is beyond end of file (100 lines total)")
+        );
     }
 
     #[tokio::test]
@@ -684,12 +688,14 @@ mod tests {
         assert!(!received.2, "autoResizeImages must be false");
         assert_eq!(received.0, bmp);
         assert!(text_output(&result).contains("[Image converted from image/bmp to image/png.]"));
-        assert!(result
-            .content
-            .contains(&ToolResultContent::Image(ImageContent {
-                data: "converted".to_string(),
-                mime_type: "image/png".to_string(),
-            })));
+        assert!(
+            result
+                .content
+                .contains(&ToolResultContent::Image(ImageContent {
+                    data: "converted".to_string(),
+                    mime_type: "image/png".to_string(),
+                }))
+        );
     }
 
     #[test]

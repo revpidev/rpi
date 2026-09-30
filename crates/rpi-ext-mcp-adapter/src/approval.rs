@@ -13,15 +13,15 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::metadata::{
-    get_tool_name_candidates_with, matches_tool_pattern, resolve_tool_prefix, McpConfig,
-    ToolMetadata,
+    McpConfig, ToolMetadata, get_tool_name_candidates_with, matches_tool_pattern,
+    resolve_tool_prefix,
 };
 use crate::session_approvals::{
-    get_tool_approval_identity, restored_approval_keys, SessionApprovalEntry, SessionApprovalSink,
-    ToolApprovalIdentity,
+    SessionApprovalEntry, SessionApprovalSink, ToolApprovalIdentity, get_tool_approval_identity,
+    restored_approval_keys,
 };
 
 /// `MCP_TOOL_APPROVAL_REQUEST_EVENT` (types.ts:527 @ 10a45367).
@@ -383,7 +383,7 @@ pub fn is_tool_call_approval_required(
 /// `candidate_context` is evaluated lazily (after the cache/broker fast
 /// paths) so an unconfigured server pays no metadata scan.
 #[allow(clippy::too_many_arguments)] // upstream-shaped gate: config/cache/
-                                     // identity/origin/broker/ui/context stay explicit rather than a bag struct.
+// identity/origin/broker/ui/context stay explicit rather than a bag struct.
 pub fn ensure_tool_call_approved<F>(
     config: &McpConfig,
     cache: &ApprovalCache,

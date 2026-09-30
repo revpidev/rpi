@@ -748,8 +748,10 @@ mod tests {
             "error",
         );
         assert_eq!(error.code, SessionErrorCode::InvalidForkTarget);
-        assert!(error
-            .message
-            .contains("Entry assistant1 is not a user message"));
+        assert!(
+            error
+                .message
+                .contains("Entry assistant1 is not a user message")
+        );
     }
 }

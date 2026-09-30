@@ -178,11 +178,13 @@ async fn test_openai_factory_config_and_auth() {
     assert_eq!(result.source.as_deref(), Some("OPENAI_API_KEY"));
 
     let ctx = FakeAuthContext::new(&[]);
-    assert!(api_key
-        .resolve(&ctx, None)
-        .await
-        .expect("resolve")
-        .is_none());
+    assert!(
+        api_key
+            .resolve(&ctx, None)
+            .await
+            .expect("resolve")
+            .is_none()
+    );
 }
 
 /// Upstream: "stores native constrained-sampling capabilities in model
@@ -427,9 +429,11 @@ async fn test_google_vertex_login_flows() {
     match &events[0] {
         AuthEvent::Info { links, .. } => {
             let links = links.as_ref().expect("links");
-            assert!(links
-                .iter()
-                .any(|link| { link.label.as_deref() == Some("Application Default Credentials") }));
+            assert!(
+                links.iter().any(|link| {
+                    link.label.as_deref() == Some("Application Default Credentials")
+                })
+            );
         }
         other => panic!("expected info event, got {other:?}"),
     }
@@ -495,11 +499,13 @@ async fn test_google_vertex_resolves_adc_with_project_and_location() {
         &[adc],
     ));
     partial.set_provider(google_vertex_provider());
-    assert!(partial
-        .get_auth(&model, None)
-        .await
-        .expect("get auth")
-        .is_none());
+    assert!(
+        partial
+            .get_auth(&model, None)
+            .await
+            .expect("get auth")
+            .is_none()
+    );
 
     // Explicit key wins over ADC.
     let keyed = models_with_context(FakeAuthContext::new(&[(
@@ -610,11 +616,13 @@ async fn test_amazon_bedrock_ambient_credentials() {
 
     let unconfigured = models_with_context(FakeAuthContext::new(&[]));
     unconfigured.set_provider(amazon_bedrock_provider());
-    assert!(unconfigured
-        .get_auth(&model, None)
-        .await
-        .expect("get auth")
-        .is_none());
+    assert!(
+        unconfigured
+            .get_auth(&model, None)
+            .await
+            .expect("get auth")
+            .is_none()
+    );
 }
 
 // ---------------------------------------------------------------------------

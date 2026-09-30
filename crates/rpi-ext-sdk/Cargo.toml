@@ -2,7 +2,7 @@
 name = "rpi-ext-sdk"
 description = "Guest SDK for rpi wasm extensions (ABI v1, wasm32-unknown-unknown)"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 license = "MIT"
 
 # Workspace member since v0.1.4/V14-20: the protocol-shape tests

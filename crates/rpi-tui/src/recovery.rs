@@ -155,7 +155,7 @@ pub fn restore_terminal_handle(handle: &TuiHandle) {
 /// `unregisterSignalHandlers`.
 #[cfg(unix)]
 pub fn spawn_signal_restore(tui: &TuiMainScreen) -> Option<tokio::task::JoinHandle<()>> {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let runtime = tokio::runtime::Handle::try_current().ok()?;
     let tui = tui.clone();

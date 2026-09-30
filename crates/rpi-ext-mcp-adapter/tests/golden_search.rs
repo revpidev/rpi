@@ -8,7 +8,7 @@
 
 use rpi_ext_mcp_adapter::metadata::{McpConfig, ServerEntry, ToolMetadata};
 use rpi_ext_mcp_adapter::search::{
-    paginate, rank_suggestions, rank_tool_matches, score_tool_match, SearchState,
+    SearchState, paginate, rank_suggestions, rank_tool_matches, score_tool_match,
 };
 use serde_json::Value;
 use std::collections::HashSet;

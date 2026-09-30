@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{ConcurrentResponder, Responder, HTML_PAGE};
+use common::{ConcurrentResponder, HTML_PAGE, Responder};
 use rpi_ext_smart_fetch::batch;
 use rpi_ext_smart_fetch::pipeline::FetchPipeline;
 use rpi_ext_smart_fetch::types::FetchToolConfig;
@@ -260,9 +260,11 @@ async fn meta_refresh_loop_reports_too_many_redirects() {
         "{}",
         error.error
     );
-    assert!(error
-        .error
-        .contains("Client-side redirect limit (5) exceeded"));
+    assert!(
+        error
+            .error
+            .contains("Client-side redirect limit (5) exceeded")
+    );
     assert_eq!(error.phase.map(|p| p.as_str()), Some("loading"));
     assert_eq!(error.retryable, Some(false));
 }

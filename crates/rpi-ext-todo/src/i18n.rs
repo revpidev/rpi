@@ -72,10 +72,10 @@ impl I18n {
                 .map(|(_, raw)| *raw)
                 .unwrap_or("{}"),
         );
-        if resolved != DEFAULT_LOCALE {
-            if let Some((_, raw)) = EMBEDDED.iter().find(|(code, _)| *code == resolved) {
-                strings.extend(parse_table(raw));
-            }
+        if resolved != DEFAULT_LOCALE
+            && let Some((_, raw)) = EMBEDDED.iter().find(|(code, _)| *code == resolved)
+        {
+            strings.extend(parse_table(raw));
         }
         Self {
             locale: resolved.to_owned(),

@@ -186,11 +186,10 @@ pub fn load_project_context_files(
     let mut context_files: Vec<ContextFile> = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
-    if include_global {
-        if let Some(global_context) = load_context_file_from_dir(&resolved_agent_dir) {
-            seen_paths.insert(global_context.path.clone());
-            context_files.push(global_context);
-        }
+    if include_global && let Some(global_context) = load_context_file_from_dir(&resolved_agent_dir)
+    {
+        seen_paths.insert(global_context.path.clone());
+        context_files.push(global_context);
     }
 
     let mut ancestor_context_files: Vec<ContextFile> = Vec::new();
@@ -203,12 +202,13 @@ pub fn load_project_context_files(
             (Some(cf), Some(shadowed)) => canonicalize_path(&cf.path) == *shadowed,
             _ => false,
         };
-        if let Some(context_file) = context_file {
-            if !is_shadowed && !seen_paths.contains(&context_file.path) {
-                seen_paths.insert(context_file.path.clone());
-                // unshift: ancestors end up root-first, cwd last.
-                ancestor_context_files.insert(0, context_file);
-            }
+        if let Some(context_file) = context_file
+            && !is_shadowed
+            && !seen_paths.contains(&context_file.path)
+        {
+            seen_paths.insert(context_file.path.clone());
+            // unshift: ancestors end up root-first, cwd last.
+            ancestor_context_files.insert(0, context_file);
         }
 
         // dirname(currentDir) === currentDir → filesystem root.
@@ -423,7 +423,9 @@ fn build_rules(
 
     if (has_bash || has_powershell) && !has_grep && !has_find && !has_ls {
         if has_bash && has_powershell {
-            add_rule("Use bash or PowerShell for file operations like listing, searching, and finding files");
+            add_rule(
+                "Use bash or PowerShell for file operations like listing, searching, and finding files",
+            );
         } else if has_powershell {
             add_rule(
                 "Use PowerShell for file operations like listing, searching, and finding files",
@@ -733,7 +735,9 @@ mod tests {
         };
         let prompt = build_system_prompt(&options);
         // #9548: append rides the `<addendum>` section.
-        assert!(prompt.starts_with("CUSTOM\n\n<addendum>\nEXTRA\n</addendum>\n\n<project_context>"));
+        assert!(
+            prompt.starts_with("CUSTOM\n\n<addendum>\nEXTRA\n</addendum>\n\n<project_context>")
+        );
         // Empty append string is falsy upstream.
         let options = BuildSystemPromptOptions {
             append_system_prompt: Some(String::new()),
@@ -859,7 +863,9 @@ mod tests {
             ..options
         };
         let prompt = build_system_prompt(&options);
-        assert!(prompt.contains("Rpi documentation (read only when the user asks about rpi itself"));
+        assert!(
+            prompt.contains("Rpi documentation (read only when the user asks about rpi itself")
+        );
         assert!(prompt.contains("- Main documentation: /pkg/README.md\n"));
         assert!(prompt.contains("- Examples: /pkg/examples (extensions, custom tools, SDK)\n"));
     }
@@ -1029,10 +1035,10 @@ mod tests {
         // A valid custom section survives alongside the built-ins.
         let sections =
             build_system_prompt_sections(&section_options(&[("plan_mode", "Plan only.")], "/tmp"));
-        assert!(sections
-            .iter()
-            .any(|(name, text)| name == "plan_mode"
-                && text == "<plan_mode>\nPlan only.\n</plan_mode>"));
+        assert!(
+            sections.iter().any(|(name, text)| name == "plan_mode"
+                && text == "<plan_mode>\nPlan only.\n</plan_mode>")
+        );
     }
 
     #[test]

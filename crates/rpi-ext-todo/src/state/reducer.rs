@@ -27,9 +27,9 @@
 
 use serde_json::Value;
 
+use crate::state::TaskState;
 use crate::state::invariants::is_transition_valid;
 use crate::state::task_graph::detect_cycle;
-use crate::state::TaskState;
 use crate::tool::types::{Task, TaskAction, TaskStatus};
 
 /// Reducer outcome. Closed tagged union — adding a new action requires

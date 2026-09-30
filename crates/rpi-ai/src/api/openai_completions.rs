@@ -33,21 +33,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::anthropic_messages::resolve_cache_retention;
 use crate::api::constrained_sampling::{
-    append_grammar_tool_input_json_delta, create_grammar_tool_input_properties,
-    get_grammar_tool_input, get_json_schema_tool_parameters, resolve_grammar_constrained_sampling,
-    resolve_json_schema_strict_sampling, GrammarToolInputJsonBuffer,
+    GrammarToolInputJsonBuffer, append_grammar_tool_input_json_delta,
+    create_grammar_tool_input_properties, get_grammar_tool_input, get_json_schema_tool_parameters,
+    resolve_grammar_constrained_sampling, resolve_json_schema_strict_sampling,
 };
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
-use crate::api::simple_options::{build_base_options, MIN_ANSWER_TOKENS};
+use crate::api::simple_options::{MIN_ANSWER_TOKENS, build_base_options};
 use crate::api::sse::{ServerSentEvent, SseDecoder};
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
-use crate::models::{clamp_thinking_level, ProviderStreams};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
+use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantContent, AssistantMessage, CacheControlFormat, CacheRetention, ChatTemplateKwargValue,
     ChatTemplateKwargVarKind, DoneReason, ErrorReason, InputModality, MaxTokensField, Message,
@@ -59,7 +59,7 @@ use crate::types::{
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::send_provider_request;
-use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
+use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::headers::{
@@ -68,7 +68,7 @@ use crate::utils::headers::{
 };
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions,
+    ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::transform_messages::transform_messages;
@@ -1193,10 +1193,10 @@ fn apply_anthropic_cache_control(
             break;
         }
     }
-    if let Some(tools) = tools {
-        if let Some(last_tool) = tools.last_mut() {
-            last_tool["cache_control"] = cache_control.clone();
-        }
+    if let Some(tools) = tools
+        && let Some(last_tool) = tools.last_mut()
+    {
+        last_tool["cache_control"] = cache_control.clone();
     }
     for message in messages.iter_mut().rev() {
         let role = message.get("role").and_then(Value::as_str);
@@ -1420,20 +1420,19 @@ pub fn build_params(
         .compat
         .as_ref()
         .and_then(|compat| compat.vercel_gateway_routing.as_ref())
+        && (routing.only.is_some() || routing.order.is_some())
     {
-        if routing.only.is_some() || routing.order.is_some() {
-            let mut gateway = Map::new();
-            if let Some(only) = &routing.only {
-                gateway.insert("only".to_owned(), json!(only));
-            }
-            if let Some(order) = &routing.order {
-                gateway.insert("order".to_owned(), json!(order));
-            }
-            params.insert(
-                "providerOptions".to_owned(),
-                json!({"gateway": Value::Object(gateway)}),
-            );
+        let mut gateway = Map::new();
+        if let Some(only) = &routing.only {
+            gateway.insert("only".to_owned(), json!(only));
         }
+        if let Some(order) = &routing.order {
+            gateway.insert("order".to_owned(), json!(order));
+        }
+        params.insert(
+            "providerOptions".to_owned(),
+            json!({"gateway": Value::Object(gateway)}),
+        );
     }
 
     // 25a2c8dcf (#7568): merged last so custom keys override the named
@@ -1465,12 +1464,11 @@ fn apply_thinking_params(
                 json!({"type": "disabled"})
             },
         );
-        if let Some(effort) = reasoning_effort {
-            if compat.supports_reasoning_effort {
-                if let Some(value) = mapped_zai(model, effort) {
-                    params.insert("reasoning_effort".to_owned(), json!(value));
-                }
-            }
+        if let Some(effort) = reasoning_effort
+            && compat.supports_reasoning_effort
+            && let Some(value) = mapped_zai(model, effort)
+        {
+            params.insert("reasoning_effort".to_owned(), json!(value));
         }
     } else if compat.thinking_format == ThinkingFormat::Qwen && model.reasoning {
         params.insert(
@@ -1480,13 +1478,13 @@ fn apply_thinking_params(
         // 4c1a0b92e (#6998/#6951): qwen thinking models also take
         // `reasoning_effort` (mapped through thinkingLevelMap, JS `??`
         // semantics) when the provider supports it.
-        if let Some(effort) = reasoning_effort {
-            if compat.supports_reasoning_effort {
-                params.insert(
-                    "reasoning_effort".to_owned(),
-                    json!(mapped_or_level_name(model, effort)),
-                );
-            }
+        if let Some(effort) = reasoning_effort
+            && compat.supports_reasoning_effort
+        {
+            params.insert(
+                "reasoning_effort".to_owned(),
+                json!(mapped_or_level_name(model, effort)),
+            );
         }
     } else if compat.thinking_format == ThinkingFormat::QwenChatTemplate && model.reasoning {
         params.insert(
@@ -1536,13 +1534,13 @@ fn apply_thinking_params(
         } else if off_is_not_null(model) {
             params.insert("thinking".to_owned(), json!({"type": "disabled"}));
         }
-        if let Some(effort) = reasoning_effort {
-            if compat.supports_reasoning_effort {
-                params.insert(
-                    "reasoning_effort".to_owned(),
-                    json!(mapped_or_level_name(model, effort)),
-                );
-            }
+        if let Some(effort) = reasoning_effort
+            && compat.supports_reasoning_effort
+        {
+            params.insert(
+                "reasoning_effort".to_owned(),
+                json!(mapped_or_level_name(model, effort)),
+            );
         }
     } else if compat.thinking_format == ThinkingFormat::Openrouter && model.reasoning {
         // OpenRouter normalizes reasoning across providers via a nested
@@ -1563,28 +1561,27 @@ fn apply_thinking_params(
         && reasoning_effort.is_some()
     {
         // Only a mapped (non-null) effort string is sent.
-        if let Some(effort) = reasoning_effort {
-            if let Some(Some(value)) = model
+        if let Some(effort) = reasoning_effort
+            && let Some(Some(value)) = model
                 .thinking_level_map
                 .as_ref()
                 .and_then(|map| map.get(&effort))
                 .cloned()
-            {
-                params.insert("reasoning".to_owned(), json!({"effort": value}));
-            }
+        {
+            params.insert("reasoning".to_owned(), json!({"effort": value}));
         }
     } else if compat.thinking_format == ThinkingFormat::Together && model.reasoning {
         params.insert(
             "reasoning".to_owned(),
             json!({"enabled": reasoning_effort.is_some()}),
         );
-        if let Some(effort) = reasoning_effort {
-            if compat.supports_reasoning_effort {
-                params.insert(
-                    "reasoning_effort".to_owned(),
-                    json!(mapped_or_level_name(model, effort)),
-                );
-            }
+        if let Some(effort) = reasoning_effort
+            && compat.supports_reasoning_effort
+        {
+            params.insert(
+                "reasoning_effort".to_owned(),
+                json!(mapped_or_level_name(model, effort)),
+            );
         }
     } else if compat.thinking_format == ThinkingFormat::StringThinking && model.reasoning {
         if let Some(effort) = reasoning_effort {
@@ -1606,10 +1603,12 @@ fn apply_thinking_params(
                 json!(mapped_or_level_name(model, effort)),
             );
         }
-    } else if reasoning_effort.is_none() && model.reasoning && compat.supports_reasoning_effort {
-        if let Some(Some(off)) = off_value(model) {
-            params.insert("reasoning_effort".to_owned(), json!(off));
-        }
+    } else if reasoning_effort.is_none()
+        && model.reasoning
+        && compat.supports_reasoning_effort
+        && let Some(Some(off)) = off_value(model)
+    {
+        params.insert("reasoning_effort".to_owned(), json!(off));
     }
 }
 
@@ -1806,10 +1805,8 @@ fn fill_missing_common_reasoning_detail_fields(target: &mut Value, source: &Valu
     let falsy = target
         .get("format")
         .is_none_or(|value| value.is_null() || value == &Value::String(String::new()));
-    if falsy {
-        if let Some(format) = source.get("format").filter(|value| value.is_string()) {
-            target.insert("format".to_owned(), format.clone());
-        }
+    if falsy && let Some(format) = source.get("format").filter(|value| value.is_string()) {
+        target.insert("format".to_owned(), format.clone());
     }
 }
 
@@ -1824,43 +1821,42 @@ fn append_openai_reasoning_detail(details: &mut Vec<Value>, detail: &Value) {
         "reasoning.summary" => "summary",
         _ => "",
     };
-    if !merge_field.is_empty() {
-        if let Some(last) = details.last_mut() {
-            let last_type = last.get("type").and_then(Value::as_str).unwrap_or("");
-            if last_type == detail_type {
-                if let (Some(last_object), Some(detail_object)) =
-                    (last.as_object_mut(), detail.as_object())
-                {
-                    let chunk = detail_object
+    if !merge_field.is_empty()
+        && let Some(last) = details.last_mut()
+    {
+        let last_type = last.get("type").and_then(Value::as_str).unwrap_or("");
+        if last_type == detail_type {
+            if let (Some(last_object), Some(detail_object)) =
+                (last.as_object_mut(), detail.as_object())
+            {
+                let chunk = detail_object
+                    .get(merge_field)
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let joined = format!(
+                    "{}{chunk}",
+                    last_object
                         .get(merge_field)
                         .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let joined = format!(
-                        "{}{chunk}",
-                        last_object
-                            .get(merge_field)
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                    );
-                    last_object.insert(merge_field.to_owned(), json!(joined));
-                    if detail_type == "reasoning.text" {
-                        // `lastDetail.signature ||= detail.signature`.
-                        let falsy = last_object.get("signature").is_none_or(|value| {
-                            value.is_null() || value == &Value::String(String::new())
-                        });
-                        if falsy {
-                            if let Some(signature) = detail_object
-                                .get("signature")
-                                .filter(|value| value.is_string())
-                            {
-                                last_object.insert("signature".to_owned(), signature.clone());
-                            }
-                        }
+                        .unwrap_or("")
+                );
+                last_object.insert(merge_field.to_owned(), json!(joined));
+                if detail_type == "reasoning.text" {
+                    // `lastDetail.signature ||= detail.signature`.
+                    let falsy = last_object.get("signature").is_none_or(|value| {
+                        value.is_null() || value == &Value::String(String::new())
+                    });
+                    if falsy
+                        && let Some(signature) = detail_object
+                            .get("signature")
+                            .filter(|value| value.is_string())
+                    {
+                        last_object.insert("signature".to_owned(), signature.clone());
                     }
                 }
-                fill_missing_common_reasoning_detail_fields(last, detail);
-                return;
             }
+            fill_missing_common_reasoning_detail_fields(last, detail);
+            return;
         }
     }
     details.push(detail.clone());
@@ -2043,10 +2039,10 @@ impl<'a> CompletionsProcessor<'a> {
 
         let mut content_index =
             stream_index.and_then(|index| self.tool_call_by_index.get(&index).copied());
-        if content_index.is_none() {
-            if let Some(id) = id {
-                content_index = self.tool_call_by_id.get(id).copied();
-            }
+        if content_index.is_none()
+            && let Some(id) = id
+        {
+            content_index = self.tool_call_by_id.get(id).copied();
         }
 
         if content_index.is_none() {
@@ -2123,10 +2119,11 @@ impl<'a> CompletionsProcessor<'a> {
         if let Some(id) = id.filter(|id| !id.is_empty()) {
             self.tool_call_by_id.insert(id.to_owned(), index);
         }
-        if let Some(AssistantContent::ToolCall(block)) = self.output.content.get_mut(index) {
-            if block.name.is_empty() && !name.is_empty() {
-                block.name = name.to_owned();
-            }
+        if let Some(AssistantContent::ToolCall(block)) = self.output.content.get_mut(index)
+            && block.name.is_empty()
+            && !name.is_empty()
+        {
+            block.name = name.to_owned();
         }
 
         // Custom-tool upgrade: a function-created block that later turns out
@@ -2176,18 +2173,17 @@ impl<'a> CompletionsProcessor<'a> {
 
         // OpenAI documents ChatCompletionChunk.id as the unique chat completion
         // identifier; each chunk in a streamed completion carries the same id.
-        if self.output.response_id.is_none() {
-            if let Some(id) = chunk.get("id").and_then(Value::as_str) {
-                self.output.response_id = Some(id.to_owned());
-            }
+        if self.output.response_id.is_none()
+            && let Some(id) = chunk.get("id").and_then(Value::as_str)
+        {
+            self.output.response_id = Some(id.to_owned());
         }
-        if let Some(chunk_model) = chunk.get("model").and_then(Value::as_str) {
-            if !chunk_model.is_empty()
-                && chunk_model != self.model.id
-                && self.output.response_model.is_none()
-            {
-                self.output.response_model = Some(chunk_model.to_owned());
-            }
+        if let Some(chunk_model) = chunk.get("model").and_then(Value::as_str)
+            && !chunk_model.is_empty()
+            && chunk_model != self.model.id
+            && self.output.response_model.is_none()
+        {
+            self.output.response_model = Some(chunk_model.to_owned());
         }
         if chunk.get("usage").is_some_and(is_js_truthy) {
             self.output.usage = parse_chunk_usage(&chunk["usage"], self.model);
@@ -2203,43 +2199,42 @@ impl<'a> CompletionsProcessor<'a> {
 
         // Fallback: some providers (e.g., Moonshot) return usage in
         // choice.usage instead of the standard chunk.usage.
-        if !chunk.get("usage").is_some_and(is_js_truthy) {
-            if let Some(usage) = choice.get("usage").filter(|usage| is_js_truthy(usage)) {
-                self.output.usage = parse_chunk_usage(usage, self.model);
-            }
+        if !chunk.get("usage").is_some_and(is_js_truthy)
+            && let Some(usage) = choice.get("usage").filter(|usage| is_js_truthy(usage))
+        {
+            self.output.usage = parse_chunk_usage(usage, self.model);
         }
 
-        if let Some(finish_reason) = choice.get("finish_reason") {
-            if is_js_truthy(finish_reason) {
-                // fe1c9b6d5: preserve the raw provider reason before mapping.
-                self.output.raw_stop_reason = finish_reason.as_str().map(str::to_owned);
-                let (stop_reason, error_message) = map_stop_reason(finish_reason.as_str());
-                self.output.stop_reason = stop_reason;
-                if let Some(error_message) = error_message {
-                    self.output.error_message = Some(error_message);
-                }
-                self.has_finish_reason = true;
+        if let Some(finish_reason) = choice.get("finish_reason")
+            && is_js_truthy(finish_reason)
+        {
+            // fe1c9b6d5: preserve the raw provider reason before mapping.
+            self.output.raw_stop_reason = finish_reason.as_str().map(str::to_owned);
+            let (stop_reason, error_message) = map_stop_reason(finish_reason.as_str());
+            self.output.stop_reason = stop_reason;
+            if let Some(error_message) = error_message {
+                self.output.error_message = Some(error_message);
             }
+            self.has_finish_reason = true;
         }
 
         let Some(delta) = choice.get("delta").filter(|delta| is_js_truthy(delta)) else {
             return Ok(());
         };
 
-        if let Some(content) = delta.get("content").and_then(Value::as_str) {
-            if !content.is_empty() {
-                let content_index = self.ensure_text_block(events);
-                if let Some(AssistantContent::Text(block)) =
-                    self.output.content.get_mut(content_index)
-                {
-                    block.text.push_str(content);
-                }
-                events.push(StreamEvent::TextDelta {
-                    content_index,
-                    delta: content.to_owned(),
-                    partial: Arc::new(self.output.clone()),
-                });
+        if let Some(content) = delta.get("content").and_then(Value::as_str)
+            && !content.is_empty()
+        {
+            let content_index = self.ensure_text_block(events);
+            if let Some(AssistantContent::Text(block)) = self.output.content.get_mut(content_index)
+            {
+                block.text.push_str(content);
             }
+            events.push(StreamEvent::TextDelta {
+                content_index,
+                delta: content.to_owned(),
+                partial: Arc::new(self.output.clone()),
+            });
         }
 
         // Some endpoints return reasoning in reasoning_content (llama.cpp), or
@@ -2310,12 +2305,10 @@ impl<'a> CompletionsProcessor<'a> {
                     });
                 if let Some(AssistantContent::ToolCall(block)) =
                     self.output.content.get_mut(content_index)
+                    && block.name.is_empty()
+                    && let Some(name) = name
                 {
-                    if block.name.is_empty() {
-                        if let Some(name) = name {
-                            block.name = name.to_owned();
-                        }
-                    }
+                    block.name = name.to_owned();
                 }
 
                 let mut delta_text = String::new();
@@ -2592,10 +2585,10 @@ async fn run(
         cache_retention,
         &grammar_tool_input_properties,
     )?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_params) = on_payload(params.clone(), model).await {
-            params = next_params;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_params) = on_payload(params.clone(), model).await
+    {
+        params = next_params;
     }
 
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
@@ -2654,11 +2647,11 @@ async fn run(
                                 format!("Request failed with status {status}"),
                             );
                             let mut message = format_provider_error(&normalized, None);
-                            if let Some(raw) = raw_metadata {
-                                if !message.contains(&raw) {
-                                    message.push('\n');
-                                    message.push_str(&raw);
-                                }
+                            if let Some(raw) = raw_metadata
+                                && !message.contains(&raw)
+                            {
+                                message.push('\n');
+                                message.push_str(&raw);
                             }
                             Err(ProviderErrorInfo {
                                 status: Some(status),
@@ -2905,7 +2898,7 @@ impl ProviderStreams for OpenAiCompletions {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -3310,14 +3303,16 @@ pub(crate) mod tests {
     fn test_convert_messages_user_text_and_image() {
         let model = make_model(json!({"input": ["text", "image"]}));
         let ctx = context(
-            vec![serde_json::from_value(json!({
-                "role": "user", "timestamp": 0,
-                "content": [
-                    {"type": "text", "text": "look"},
-                    {"type": "image", "data": "AAAA", "mimeType": "image/png"}
-                ]
-            }))
-            .expect("user")],
+            vec![
+                serde_json::from_value(json!({
+                    "role": "user", "timestamp": 0,
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image", "data": "AAAA", "mimeType": "image/png"}
+                    ]
+                }))
+                .expect("user"),
+            ],
             None,
         );
         let compat = get_compat(&model);
@@ -3747,7 +3742,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod build_and_stream_tests {
     use futures::StreamExt;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::tests::{context, make_model, same_model_assistant, tool, tool_result, user_text};
     use super::*;
@@ -3879,9 +3874,11 @@ mod build_and_stream_tests {
         );
         let compat = get_compat(&model);
         let params = convert_messages(&model, &ctx, &compat, &no_grammar()).expect("messages");
-        assert!(!params
-            .iter()
-            .any(|msg| msg["role"] == json!("system") && msg.get("tools").is_some()));
+        assert!(
+            !params
+                .iter()
+                .any(|msg| msg["role"] == json!("system") && msg.get("tools").is_some())
+        );
         let opts = options(StreamOptions::default());
         let built = params_for(&model, &ctx, &opts, CacheRetention::Short);
         let names: Vec<&str> = built["tools"]

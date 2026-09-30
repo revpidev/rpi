@@ -21,7 +21,7 @@ use rpi_ai::types::{
     ImagesOutputContent, ImagesOutputModality, ImagesStopReason, InputModality, ModelCost,
     ModelCostRates, ProviderResponse, TextContent,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -567,10 +567,12 @@ async fn resolves_final_assistant_images_result() {
     .await
     .expect("dispatch");
 
-    assert!(output
-        .output
-        .iter()
-        .any(|item| matches!(item, ImagesOutputContent::Image(_))));
+    assert!(
+        output
+            .output
+            .iter()
+            .any(|item| matches!(item, ImagesOutputContent::Image(_)))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -643,10 +645,12 @@ async fn images_models_generate_images_applies_auth_and_dispatches() {
         .await;
 
     assert_eq!(output.stop_reason, ImagesStopReason::Stop);
-    assert!(output
-        .output
-        .iter()
-        .any(|item| matches!(item, ImagesOutputContent::Image(_))));
+    assert!(
+        output
+            .output
+            .iter()
+            .any(|item| matches!(item, ImagesOutputContent::Image(_)))
+    );
     let request = requests.recv().await.expect("request");
     assert_eq!(request.header("authorization"), Some("Bearer or-key"));
 }

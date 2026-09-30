@@ -32,9 +32,9 @@ use sha2::Digest;
 
 use crate::error::AdapterError;
 use crate::metadata::{
+    McpResource, McpTool, ServerEntry, ToolMetadata, ToolPrefix, ToolSelectorCandidateIndex,
     format_prompt_command_name, format_tool_name, has_tool_filters, index_candidate_scan,
-    is_tool_allowed, resolve_tool_prefix, resource_name_to_tool_name, McpResource, McpTool,
-    ServerEntry, ToolMetadata, ToolPrefix, ToolSelectorCandidateIndex,
+    is_tool_allowed, resolve_tool_prefix, resource_name_to_tool_name,
 };
 
 /// `CACHE_VERSION` (metadata-cache.ts:33).
@@ -160,22 +160,20 @@ pub fn save_metadata_cache(path: &Path, cache: &MetadataCache) -> Result<(), Ada
     }
 
     let mut merged_servers = IndexMap::new();
-    if let Ok(raw) = std::fs::read_to_string(path) {
-        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
-            let obj = value.as_object();
-            let version_ok =
-                obj.and_then(|o| o.get("version")).and_then(Value::as_u64) == Some(CACHE_VERSION);
-            if version_ok {
-                if let Some(existing) = obj
-                    .and_then(|o| o.get("servers"))
-                    .and_then(Value::as_object)
-                {
-                    for (name, entry) in existing {
-                        if let Ok(entry) = serde_json::from_value::<ServerCacheEntry>(entry.clone())
-                        {
-                            merged_servers.insert(name.clone(), entry);
-                        }
-                    }
+    if let Ok(raw) = std::fs::read_to_string(path)
+        && let Ok(value) = serde_json::from_str::<Value>(&raw)
+    {
+        let obj = value.as_object();
+        let version_ok =
+            obj.and_then(|o| o.get("version")).and_then(Value::as_u64) == Some(CACHE_VERSION);
+        if version_ok
+            && let Some(existing) = obj
+                .and_then(|o| o.get("servers"))
+                .and_then(Value::as_object)
+        {
+            for (name, entry) in existing {
+                if let Ok(entry) = serde_json::from_value::<ServerCacheEntry>(entry.clone()) {
+                    merged_servers.insert(name.clone(), entry);
                 }
             }
         }
@@ -285,10 +283,10 @@ pub fn compute_server_hash(definition: &ServerEntry) -> Result<String, AdapterEr
                         .collect();
                     normalized.insert("args".to_string(), Value::Array(args));
                 }
-                if let Some(env) = obj.get("env") {
-                    if let Ok(Some(interp)) = crate::utils::interpolate_env_record(Some(env)) {
-                        normalized.insert("env".to_string(), Value::Object(interp));
-                    }
+                if let Some(env) = obj.get("env")
+                    && let Ok(Some(interp)) = crate::utils::interpolate_env_record(Some(env))
+                {
+                    normalized.insert("env".to_string(), Value::Object(interp));
                 }
                 if let Some(timeout) = obj.get("timeoutMs") {
                     normalized.insert("timeoutMs".to_string(), timeout.clone());
@@ -682,7 +680,7 @@ mod tests {
 
     #[test]
     fn config_hash_interpolates_env_before_hashing() {
-        std::env::set_var("RPI_MCP_HASH_TEST", "resolved-value");
+        rpi_test_env::set_var("RPI_MCP_HASH_TEST", "resolved-value");
         let templated =
             entry(json!({ "command": "node", "env": { "TOKEN": "$env:RPI_MCP_HASH_TEST" } }));
         let literal = entry(json!({ "command": "node", "env": { "TOKEN": "resolved-value" } }));
@@ -690,7 +688,7 @@ mod tests {
             compute_server_hash(&templated).expect("hash"),
             compute_server_hash(&literal).expect("hash")
         );
-        std::env::remove_var("RPI_MCP_HASH_TEST");
+        rpi_test_env::remove_var("RPI_MCP_HASH_TEST");
     }
 
     #[test]
@@ -899,12 +897,14 @@ mod tests {
         assert!(loaded.servers.contains_key("a"));
         assert!(loaded.servers.contains_key("b"));
         // No temp file survives the atomic rename.
-        assert!(std::fs::read_dir(&dir)
-            .map(|mut it| it.all(|e| e
-                .as_ref()
-                .map(|e| { !e.file_name().to_string_lossy().ends_with(".tmp") })
-                .unwrap_or(true)))
-            .unwrap_or(true));
+        assert!(
+            std::fs::read_dir(&dir)
+                .map(|mut it| it.all(|e| e
+                    .as_ref()
+                    .map(|e| { !e.file_name().to_string_lossy().ends_with(".tmp") })
+                    .unwrap_or(true)))
+                .unwrap_or(true)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1059,11 +1059,13 @@ mod tests {
         assert_eq!(loaded.servers.len(), 2);
         assert_eq!(loaded.servers["first"].cached_at, 1);
         assert_eq!(loaded.servers["second"].cached_at, 2);
-        assert!(std::fs::read_dir(&dir)
-            .map(|mut it| it.all(|entry| entry
-                .map(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
-                .unwrap_or(true)))
-            .unwrap_or(true));
+        assert!(
+            std::fs::read_dir(&dir)
+                .map(|mut it| it.all(|entry| entry
+                    .map(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+                    .unwrap_or(true)))
+                .unwrap_or(true)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

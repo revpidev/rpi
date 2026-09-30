@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use rpi_ext_host::host::NativeExtensionHost;
 
-use super::interactive_mode::commands_selectors::spawn_async;
 use super::interactive_mode::InteractiveUi;
+use super::interactive_mode::commands_selectors::spawn_async;
 use crate::core::agent_session::AgentSession;
 
 /// Resolved built-in keybindings as `(action_id, keys)` pairs — the input
@@ -63,10 +63,10 @@ fn lock_editor_hook(
                 // (interactive-mode.ts:1833-1838).
                 spawn_async(async move {
                     let ctx = host.core().create_context();
-                    if let Err(error) = handler(ctx).await {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.show_error(&format!("Shortcut handler error: {error}"));
-                        }
+                    if let Err(error) = handler(ctx).await
+                        && let Some(ui) = ui_weak.upgrade()
+                    {
+                        ui.show_error(&format!("Shortcut handler error: {error}"));
                     }
                 });
                 return true;

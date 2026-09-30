@@ -63,16 +63,16 @@ fn parse_no_proxy_entry(entry: &str) -> Option<(String, u16)> {
         return None;
     }
 
-    if trimmed.starts_with('[') {
-        if let Some(closing_bracket) = trimmed.find(']') {
-            let host = trimmed[1..closing_bracket].to_owned();
-            let rest = &trimmed[closing_bracket + 1..];
-            if let Some(port_text) = rest.strip_prefix(':') {
-                let port = port_text.parse::<u16>().unwrap_or(0);
-                return Some((host, port));
-            }
-            return Some((host, 0));
+    if trimmed.starts_with('[')
+        && let Some(closing_bracket) = trimmed.find(']')
+    {
+        let host = trimmed[1..closing_bracket].to_owned();
+        let rest = &trimmed[closing_bracket + 1..];
+        if let Some(port_text) = rest.strip_prefix(':') {
+            let port = port_text.parse::<u16>().unwrap_or(0);
+            return Some((host, port));
         }
+        return Some((host, 0));
     }
 
     // More than one colon and no brackets: a bare IPv6 address.
@@ -80,12 +80,12 @@ fn parse_no_proxy_entry(entry: &str) -> Option<(String, u16)> {
         return Some((trimmed, 0));
     }
 
-    if let Some(colon_index) = trimmed.rfind(':') {
-        if colon_index == trimmed.find(':').expect("rfind implies find") {
-            let host = trimmed[..colon_index].to_owned();
-            if let Ok(port) = trimmed[colon_index + 1..].parse::<u16>() {
-                return Some((host, port));
-            }
+    if let Some(colon_index) = trimmed.rfind(':')
+        && colon_index == trimmed.find(':').expect("rfind implies find")
+    {
+        let host = trimmed[..colon_index].to_owned();
+        if let Ok(port) = trimmed[colon_index + 1..].parse::<u16>() {
+            return Some((host, port));
         }
     }
 

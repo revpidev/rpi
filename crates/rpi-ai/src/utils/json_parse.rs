@@ -178,41 +178,41 @@ pub fn strip_lone_surrogate_escapes(json: &str) -> String {
             continue;
         }
         if c == '\\' {
-            if chars.get(index + 1) == Some(&'u') {
-                if let Some(code) = hex4(index) {
-                    if (0xd800..0xdc00).contains(&code) {
-                        // High surrogate: keep only when immediately followed
-                        // by a low-surrogate escape.
-                        let next_slash = index + 6;
-                        let paired = chars.get(next_slash) == Some(&'\\')
-                            && chars.get(next_slash + 1) == Some(&'u')
-                            && hex4(next_slash)
-                                .map(|low| (0xdc00..0xe000).contains(&low))
-                                .unwrap_or(false);
-                        if paired {
-                            out.push_str(&chars[index..index + 6].iter().collect::<String>());
-                        }
-                        index += 6;
-                        continue;
+            if chars.get(index + 1) == Some(&'u')
+                && let Some(code) = hex4(index)
+            {
+                if (0xd800..0xdc00).contains(&code) {
+                    // High surrogate: keep only when immediately followed
+                    // by a low-surrogate escape.
+                    let next_slash = index + 6;
+                    let paired = chars.get(next_slash) == Some(&'\\')
+                        && chars.get(next_slash + 1) == Some(&'u')
+                        && hex4(next_slash)
+                            .map(|low| (0xdc00..0xe000).contains(&low))
+                            .unwrap_or(false);
+                    if paired {
+                        out.push_str(&chars[index..index + 6].iter().collect::<String>());
                     }
-                    if (0xdc00..0xe000).contains(&code) {
-                        // Low surrogate: keep only when immediately preceded
-                        // by a high-surrogate escape. The preceding pair was
-                        // already emitted, so check the tail of `out`.
-                        let mut tail = out.chars().rev().take(6).collect::<Vec<char>>();
-                        tail.reverse();
-                        let preceded = tail.len() == 6
-                            && tail[0] == '\\'
-                            && tail[1] == 'u'
-                            && u16::from_str_radix(&tail[2..6].iter().collect::<String>(), 16)
-                                .map(|high| (0xd800..0xdc00).contains(&high))
-                                .unwrap_or(false);
-                        if preceded {
-                            out.push_str(&chars[index..index + 6].iter().collect::<String>());
-                        }
-                        index += 6;
-                        continue;
+                    index += 6;
+                    continue;
+                }
+                if (0xdc00..0xe000).contains(&code) {
+                    // Low surrogate: keep only when immediately preceded
+                    // by a high-surrogate escape. The preceding pair was
+                    // already emitted, so check the tail of `out`.
+                    let mut tail = out.chars().rev().take(6).collect::<Vec<char>>();
+                    tail.reverse();
+                    let preceded = tail.len() == 6
+                        && tail[0] == '\\'
+                        && tail[1] == 'u'
+                        && u16::from_str_radix(&tail[2..6].iter().collect::<String>(), 16)
+                            .map(|high| (0xd800..0xdc00).contains(&high))
+                            .unwrap_or(false);
+                    if preceded {
+                        out.push_str(&chars[index..index + 6].iter().collect::<String>());
                     }
+                    index += 6;
+                    continue;
                 }
             }
             // Non-`\u` escape: emit both characters so an escaped quote does
@@ -514,7 +514,7 @@ pub fn parse_streaming_json_value(partial_json: Option<&str>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
 

@@ -184,7 +184,9 @@ impl DescendantAllowlist {
         } else {
             self.allowed_agents.join(", ")
         };
-        format!("Capability ceiling from {sources} does not allow agent '{agent_name}'. Allowed agents: {allowed}.")
+        format!(
+            "Capability ceiling from {sources} does not allow agent '{agent_name}'. Allowed agents: {allowed}."
+        )
     }
 }
 
@@ -939,9 +941,11 @@ mod allowed_agents_tests {
         let intersected = inherited.intersect(own, "coordinator");
         assert_eq!(intersected.allowed_agents, vec!["scout".to_string()]);
         assert!(intersected.sources.contains(&"parent".to_string()));
-        assert!(intersected
-            .sources
-            .contains(&"agent:coordinator".to_string()));
+        assert!(
+            intersected
+                .sources
+                .contains(&"agent:coordinator".to_string())
+        );
     }
 
     #[test]
@@ -969,29 +973,29 @@ mod allowed_agents_tests {
     fn env_decode_tri_state() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Unset → unrestricted.
-        std::env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
+        rpi_test_env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
         assert!(DescendantAllowlist::from_env().is_none());
         // Set-empty → deny-all.
-        std::env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, "");
+        rpi_test_env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, "");
         let ceiling = DescendantAllowlist::from_env().expect("deny-all");
         assert!(ceiling.allowed_agents.is_empty());
         // JSON value round-trips.
         let encoded = list(&["scout"], &["agent:x"]).to_env_value();
-        std::env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, &encoded);
+        rpi_test_env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, &encoded);
         let decoded = DescendantAllowlist::from_env().expect("decoded");
         assert_eq!(decoded.allowed_agents, vec!["scout".to_string()]);
         assert_eq!(decoded.sources, vec!["agent:x".to_string()]);
         // Malformed fails closed to deny-all (never widens).
-        std::env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, "{not json");
+        rpi_test_env::set_var(SUBAGENT_ALLOWED_AGENTS_ENV, "{not json");
         let failed = DescendantAllowlist::from_env().expect("fail-closed");
         assert!(failed.allowed_agents.is_empty());
-        std::env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
+        rpi_test_env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
     }
 
     #[test]
     fn effective_allowlist_combines_env_and_agent() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
+        rpi_test_env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
         // Neither side declares → unrestricted.
         assert!(effective_descendant_allowlist(None, "worker").is_none());
         // Agent-only declaration restricts the child.
@@ -1000,7 +1004,7 @@ mod allowed_agents_tests {
         assert_eq!(own.allowed_agents, vec!["scout".to_string()]);
         assert_eq!(own.sources, vec!["agent:worker".to_string()]);
         // Inherited ∩ agent narrows further.
-        std::env::set_var(
+        rpi_test_env::set_var(
             SUBAGENT_ALLOWED_AGENTS_ENV,
             list(&["scout", "reviewer"], &["agent:outer"]).to_env_value(),
         );
@@ -1012,7 +1016,7 @@ mod allowed_agents_tests {
         assert_eq!(both.allowed_agents, vec!["scout".to_string()]);
         assert!(both.sources.contains(&"agent:outer".to_string()));
         assert!(both.sources.contains(&"agent:coordinator".to_string()));
-        std::env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
+        rpi_test_env::remove_var(SUBAGENT_ALLOWED_AGENTS_ENV);
     }
 }
 
@@ -1043,12 +1047,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         static LOCK2: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK2.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("RPI_SUBAGENT_CACHE_RETENTION");
-        std::env::remove_var("RPI_CACHE_RETENTION");
+        rpi_test_env::remove_var("RPI_SUBAGENT_CACHE_RETENTION");
+        rpi_test_env::remove_var("RPI_CACHE_RETENTION");
         let input = base_input();
         let plain = build_rpi_args(&input).expect("args build");
         assert!(!plain.env.contains_key("RPI_CACHE_RETENTION"));
-        std::env::set_var("RPI_SUBAGENT_CACHE_RETENTION", "short");
+        rpi_test_env::set_var("RPI_SUBAGENT_CACHE_RETENTION", "short");
         let overridden = build_rpi_args(&input).expect("args build");
         assert_eq!(
             overridden.env.get("RPI_CACHE_RETENTION"),
@@ -1056,14 +1060,14 @@ mod tests {
         );
         // An explicit parent RPI_CACHE_RETENTION does not block the
         // child-only tier (the child-only value wins for children).
-        std::env::set_var("RPI_CACHE_RETENTION", "long");
+        rpi_test_env::set_var("RPI_CACHE_RETENTION", "long");
         let both = build_rpi_args(&input).expect("args build");
         assert_eq!(
             both.env.get("RPI_CACHE_RETENTION"),
             Some(&Some("short".to_string()))
         );
-        std::env::remove_var("RPI_SUBAGENT_CACHE_RETENTION");
-        std::env::remove_var("RPI_CACHE_RETENTION");
+        rpi_test_env::remove_var("RPI_SUBAGENT_CACHE_RETENTION");
+        rpi_test_env::remove_var("RPI_CACHE_RETENTION");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1075,7 +1079,7 @@ mod tests {
     #[test]
     fn parent_session_env_explicit_wins_over_inherited() {
         // A stale inherited value (as a child host would carry).
-        std::env::set_var(SUBAGENT_PARENT_SESSION_ENV, "stale-orchestrator-session");
+        rpi_test_env::set_var(SUBAGENT_PARENT_SESSION_ENV, "stale-orchestrator-session");
         let dir = std::env::temp_dir().join(format!("rpi-sub-args-ps-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut input = base_input();
@@ -1100,7 +1104,7 @@ mod tests {
         );
         cleanup_temp_dir(&result.temp_dir);
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var(SUBAGENT_PARENT_SESSION_ENV);
+        rpi_test_env::remove_var(SUBAGENT_PARENT_SESSION_ENV);
     }
 
     #[test]

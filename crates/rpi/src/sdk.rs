@@ -19,15 +19,15 @@ use rpi_agent::{Agent, AgentMessage, AgentOptions, AgentTool, InitialAgentState}
 use rpi_ai::types::{Message, Model, StreamOptions, TextContent};
 
 use crate::config::{get_agent_dir, get_default_session_dir_path};
-use crate::core::agent_session::{AgentSession, AgentSessionConfig, ALL_BUILTIN_TOOL_NAMES};
+use crate::core::agent_session::{ALL_BUILTIN_TOOL_NAMES, AgentSession, AgentSessionConfig};
 use crate::core::agent_session_services::CreateAgentSessionServicesOptions;
 use crate::core::auth_guidance::format_no_models_available_message;
 use crate::core::extensions::{
-    extension_after_tool_call_hook, new_extension_runner_ref, NoopExtensionRunner,
-    SessionStartEvent,
+    NoopExtensionRunner, SessionStartEvent, extension_after_tool_call_hook,
+    new_extension_runner_ref,
 };
 use crate::core::model_resolver::{
-    find_initial_model, FindInitialModelOptions, ScopedModel, DEFAULT_THINKING_LEVEL,
+    DEFAULT_THINKING_LEVEL, FindInitialModelOptions, ScopedModel, find_initial_model,
 };
 use crate::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
 use crate::core::session_manager::{NewSessionOptions, SessionManager};
@@ -36,11 +36,11 @@ use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 pub use crate::core::agent_session_runtime::{
-    create_agent_session_runtime, AgentSessionRuntime, CreateAgentSessionRuntimeResult,
-    CreateRuntimeOptions,
+    AgentSessionRuntime, CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    create_agent_session_runtime,
 };
 pub use crate::core::agent_session_services::{
-    create_agent_session_services, AgentSessionRuntimeDiagnostic, AgentSessionServices,
+    AgentSessionRuntimeDiagnostic, AgentSessionServices, create_agent_session_services,
 };
 
 /// `noTools: "all" | "builtin"` (sdk.ts:60-61).
@@ -214,19 +214,20 @@ pub async fn create_agent_session(
     // branch requires a saved model entry (sdk.ts:196 `existingSession.model`)
     // — a session with messages but no model_change entry falls through to
     // findInitialModel, like upstream.
-    if model.is_none() && has_existing_session {
-        if let Some(saved) = &existing_model {
-            if let Some(restored) = model_runtime.get_model(&saved.provider, &saved.model_id) {
-                if model_runtime.has_configured_auth(&restored.provider) {
-                    model = Some(restored);
-                }
-            }
-            if model.is_none() {
-                model_fallback_message = Some(format!(
-                    "Could not restore model {}/{}",
-                    saved.provider, saved.model_id
-                ));
-            }
+    if model.is_none()
+        && has_existing_session
+        && let Some(saved) = &existing_model
+    {
+        if let Some(restored) = model_runtime.get_model(&saved.provider, &saved.model_id)
+            && model_runtime.has_configured_auth(&restored.provider)
+        {
+            model = Some(restored);
+        }
+        if model.is_none() {
+            model_fallback_message = Some(format!(
+                "Could not restore model {}/{}",
+                saved.provider, saved.model_id
+            ));
         }
     }
 

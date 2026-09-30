@@ -84,9 +84,9 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use comrak::nodes::{Node, NodeValue, Sourcepos};
 use comrak::Arena;
-use comrak::{parse_document, Options};
+use comrak::nodes::{Node, NodeValue, Sourcepos};
+use comrak::{Options, parse_document};
 
 use crate::latex::render_latex;
 use crate::terminal_image::{get_capabilities, hyperlink, is_image_line};
@@ -657,24 +657,24 @@ struct LatexBlockToken<'a> {
 fn tokenize_block_latex(source: &str) -> Option<LatexBlockToken<'_>> {
     // dollarMatch: `^ {0,3}\$\$[ \t]*(?:\n)?([\s\S]*?)\$\$[ \t]*(?:\n|$)`.
     // A falsy (empty) content group makes upstream fall through.
-    if let Some((content, raw_len)) = match_block_delimited(source, "$$", "$$") {
-        if !content.is_empty() {
-            return Some(LatexBlockToken {
-                raw: &source[..raw_len],
-                text: trim_js(content),
-                pending: false,
-            });
-        }
+    if let Some((content, raw_len)) = match_block_delimited(source, "$$", "$$")
+        && !content.is_empty()
+    {
+        return Some(LatexBlockToken {
+            raw: &source[..raw_len],
+            text: trim_js(content),
+            pending: false,
+        });
     }
     // bracketMatch: `^ {0,3}\\\[[ \t]*(?:\n)?([\s\S]*?)\\\][ \t]*(?:\n|$)`.
-    if let Some((content, raw_len)) = match_block_delimited(source, "\\[", "\\]") {
-        if !content.is_empty() {
-            return Some(LatexBlockToken {
-                raw: &source[..raw_len],
-                text: trim_js(content),
-                pending: false,
-            });
-        }
+    if let Some((content, raw_len)) = match_block_delimited(source, "\\[", "\\]")
+        && !content.is_empty()
+    {
+        return Some(LatexBlockToken {
+            raw: &source[..raw_len],
+            text: trim_js(content),
+            pending: false,
+        });
     }
     // pendingBracket: `^ {0,3}\\\[[ \t]*(?:\n)?([\s\S]*)$` — always pending.
     if let Some(rest) = strip_block_opening(source, "\\[") {
@@ -686,14 +686,15 @@ fn tokenize_block_latex(source: &str) -> Option<LatexBlockToken<'_>> {
     }
     // pendingDollar: `^ {0,3}\$\$[ \t]*(?:\n)?([\s\S]*)$` — pending only for
     // non-empty math-looking content.
-    if let Some(rest) = strip_block_opening(source, "$$") {
-        if !rest.is_empty() && looks_like_pending_dollar_math(rest) {
-            return Some(LatexBlockToken {
-                raw: source,
-                text: rest,
-                pending: true,
-            });
-        }
+    if let Some(rest) = strip_block_opening(source, "$$")
+        && !rest.is_empty()
+        && looks_like_pending_dollar_math(rest)
+    {
+        return Some(LatexBlockToken {
+            raw: source,
+            text: rest,
+            pending: true,
+        });
     }
     None
 }
@@ -1823,16 +1824,16 @@ impl Markdown {
                 }
             }
             NodeValue::Paragraph => {
-                if self.options.render_latex {
-                    if let Some(latex_lines) = self.render_paragraph_with_latex(
+                if self.options.render_latex
+                    && let Some(latex_lines) = self.render_paragraph_with_latex(
                         token,
                         source,
                         index,
                         next_token_type,
                         style_context,
-                    ) {
-                        return latex_lines;
-                    }
+                    )
+                {
+                    return latex_lines;
                 }
                 let paragraph_text = self.render_inline_tokens(token, source, index, style_context);
                 lines.push(paragraph_text);
@@ -2452,14 +2453,13 @@ impl Component for Markdown {
             .unwrap_or_else(|| self.text.clone());
 
         // Check cache.
-        if let Some(cache) = self.cache.borrow().as_ref() {
-            if cache.text == self.text
-                && cache.transformed == transformed_text
-                && cache.width == width
-                && cache.render_latex == self.options.render_latex
-            {
-                return cache.lines.clone();
-            }
+        if let Some(cache) = self.cache.borrow().as_ref()
+            && cache.text == self.text
+            && cache.transformed == transformed_text
+            && cache.width == width
+            && cache.render_latex == self.options.render_latex
+        {
+            return cache.lines.clone();
         }
 
         // Don't render anything if there's no actual text (upstream checks
@@ -2618,7 +2618,7 @@ mod tests {
     //! asserted against the component's own render output.
 
     use super::*;
-    use crate::terminal_image::{reset_capabilities_cache, set_capabilities, TerminalCapabilities};
+    use crate::terminal_image::{TerminalCapabilities, reset_capabilities_cache, set_capabilities};
 
     /// V15-13 FR-L1 R3 (rpi#53): the [`LineIndex`] table must produce
     /// byte-identical offsets to the pre-fix scan ([`byte_offset_of_scan`])
@@ -2834,7 +2834,9 @@ mod tests {
 
     #[test]
     fn renders_mixed_ordered_and_unordered_nested_lists() {
-        let markdown = md("1. Ordered item\n   - Unordered nested\n   - Another nested\n2. Second ordered\n   - More nested");
+        let markdown = md(
+            "1. Ordered item\n   - Unordered nested\n   - Another nested\n2. Second ordered\n   - More nested",
+        );
         let lines = plain(&markdown, 80);
         assert!(lines.iter().any(|l| l.contains("1. Ordered item")));
         assert!(lines.iter().any(|l| l.contains("    - Unordered nested")));
@@ -2999,7 +3001,9 @@ mod tests {
 
     #[test]
     fn renders_table_with_alignment() {
-        let markdown = md("| Left | Center | Right |\n| :--- | :---: | ---: |\n| A | B | C |\n| Long text | Middle | End |");
+        let markdown = md(
+            "| Left | Center | Right |\n| :--- | :---: | ---: |\n| A | B | C |\n| Long text | Middle | End |",
+        );
         let lines = plain(&markdown, 80);
         assert!(lines.iter().any(|l| l.contains("Left")));
         assert!(lines.iter().any(|l| l.contains("Center")));
@@ -3009,17 +3013,23 @@ mod tests {
 
     #[test]
     fn handles_tables_with_varying_column_widths() {
-        let markdown = md("| Short | Very long column header |\n| --- | --- |\n| A | This is a much longer cell content |\n| B | Short |");
+        let markdown = md(
+            "| Short | Very long column header |\n| --- | --- |\n| A | This is a much longer cell content |\n| B | Short |",
+        );
         let lines = plain(&markdown, 80);
         assert!(lines.iter().any(|l| l.contains("Very long column header")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("This is a much longer cell content")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("This is a much longer cell content"))
+        );
     }
 
     #[test]
     fn wraps_table_cells_when_table_exceeds_available_width() {
-        let markdown = md("| Command | Description | Example |\n| --- | --- | --- |\n| npm install | Install all dependencies | npm install |\n| npm run build | Build the project | npm run build |");
+        let markdown = md(
+            "| Command | Description | Example |\n| --- | --- | --- |\n| npm install | Install all dependencies | npm install |\n| npm run build | Build the project | npm run build |",
+        );
         let width = 50;
         let lines = plain(&markdown, width);
         for line in &lines {
@@ -3287,7 +3297,9 @@ mod tests {
 
     #[test]
     fn renders_lists_and_tables_together() {
-        let markdown = md("# Test Document\n\n- Item 1\n  - Nested item\n- Item 2\n\n| Col1 | Col2 |\n| --- | --- |\n| A | B |");
+        let markdown = md(
+            "# Test Document\n\n- Item 1\n  - Nested item\n- Item 2\n\n| Col1 | Col2 |\n| --- | --- |\n| A | B |",
+        );
         let lines = plain(&markdown, 80);
         assert!(lines.iter().any(|l| l.contains("Test Document")));
         assert!(lines.iter().any(|l| l.contains("- Item 1")));
@@ -3671,7 +3683,9 @@ mod tests {
 
     #[test]
     fn wraps_long_blockquote_lines_and_borders_each_wrapped_line() {
-        let markdown = md("> This is a very long blockquote line that should wrap to multiple lines when rendered");
+        let markdown = md(
+            "> This is a very long blockquote line that should wrap to multiple lines when rendered",
+        );
         let lines = plain(&markdown, 30);
         let content: Vec<&String> = lines.iter().filter(|l| !l.is_empty()).collect();
         assert!(content.len() > 1, "Expected multiple wrapped lines");

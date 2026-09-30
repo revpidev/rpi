@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rpi_tui::terminal::ProcessTerminal;
-use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
+use rpi_tui::tui::{Component, Focusable, TuiStopOptions, shared_component_from_boxed};
 use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::tui_main_screen::TuiMainScreen;
 

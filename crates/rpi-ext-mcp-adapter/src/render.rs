@@ -21,7 +21,7 @@
 //! via a `column` node (ComponentTree v1 has no inline spans, so the title
 //! line and the muted remainder become two styled text children).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `DEFAULT_MAX_COLLAPSED_LINES` (tool-result-renderer.ts:36).
 pub const DEFAULT_MAX_COLLAPSED_LINES: usize = 3;

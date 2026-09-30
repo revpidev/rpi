@@ -19,7 +19,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{result_text, RecordingBridge};
+use common::{RecordingBridge, result_text};
 use rpi_agent::types::AgentToolResult;
 use rpi_ai::types::{TextContent, ToolResultContent};
 use rpi_ext_host::host::NativeExtensionHost;

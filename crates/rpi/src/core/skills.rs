@@ -1098,10 +1098,10 @@ pub fn discover_skill_paths(options: &DiscoverSkillsOptions) -> Vec<ResolvedSkil
             .as_ref()
             .map(|home| home.join(config::AGENTS_DIR_NAME).join("skills"));
         for agents_skills_dir in collect_ancestor_agents_skill_dirs(&cwd) {
-            if let Some(user_dir) = &user_agents_skills_dir {
-                if resolve_against_cwd(&agents_skills_dir) == resolve_against_cwd(user_dir) {
-                    continue;
-                }
+            if let Some(user_dir) = &user_agents_skills_dir
+                && resolve_against_cwd(&agents_skills_dir) == resolve_against_cwd(user_dir)
+            {
+                continue;
             }
             let agents_base_dir = agents_skills_dir
                 .parent()
@@ -1287,7 +1287,7 @@ pub fn load_skills(options: &LoadSkillsOptions) -> LoadSkillsResult {
     }
 
     macro_rules! add_skills {
-        ($result:expr) => {{
+        ($result:expr_2021) => {{
             let result: LoadSkillsResult = $result;
             all_diagnostics.extend(result.diagnostics);
             for skill in result.skills {
@@ -1580,18 +1580,26 @@ mod tests {
             validate_name(&"a".repeat(65)),
             vec![format!("name exceeds {MAX_NAME_LENGTH} characters (65)")]
         );
-        assert!(validate_name("Invalid_Name")
-            .iter()
-            .any(|e| e.contains("invalid characters")));
-        assert!(validate_name("-bad")
-            .iter()
-            .any(|e| e.contains("start or end with a hyphen")));
-        assert!(validate_name("bad-")
-            .iter()
-            .any(|e| e.contains("start or end with a hyphen")));
-        assert!(validate_name("bad--name")
-            .iter()
-            .any(|e| e.contains("consecutive hyphens")));
+        assert!(
+            validate_name("Invalid_Name")
+                .iter()
+                .any(|e| e.contains("invalid characters"))
+        );
+        assert!(
+            validate_name("-bad")
+                .iter()
+                .any(|e| e.contains("start or end with a hyphen"))
+        );
+        assert!(
+            validate_name("bad-")
+                .iter()
+                .any(|e| e.contains("start or end with a hyphen"))
+        );
+        assert!(
+            validate_name("bad--name")
+                .iter()
+                .any(|e| e.contains("consecutive hyphens"))
+        );
     }
 
     #[test]
@@ -1922,9 +1930,11 @@ mod tests {
 
         let (skill, diagnostics) = load_skill_from_file(&file, SkillLoadSource::Path);
         assert!(skill.is_none());
-        assert!(diagnostics
-            .iter()
-            .any(|d| d.message == "description is required"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "description is required")
+        );
     }
 
     #[test]
@@ -1940,9 +1950,11 @@ mod tests {
         assert!(!skill.disable_model_invocation);
         assert_eq!(skill.source_info.scope, SourceScope::Project);
         assert_eq!(skill.source_info.source, "local");
-        assert!(diagnostics
-            .iter()
-            .any(|d| d.message.contains("invalid characters")));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("invalid characters"))
+        );
     }
 
     #[test]
@@ -1989,10 +2001,12 @@ mod tests {
             include_defaults: false,
         });
         assert_eq!(result.skills.len(), 1);
-        assert!(!result
-            .diagnostics
-            .iter()
-            .any(|d| d.kind == DiagnosticKind::Collision));
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::Collision)
+        );
     }
 
     #[test]
@@ -2031,14 +2045,18 @@ mod tests {
         assert_eq!(scope_of("u"), Some(SourceScope::User));
         assert_eq!(scope_of("p"), Some(SourceScope::Project));
         assert_eq!(scope_of("o"), Some(SourceScope::Temporary));
-        assert!(result
-            .diagnostics
-            .iter()
-            .any(|d| d.message == "skill path is not a markdown file"));
-        assert!(result
-            .diagnostics
-            .iter()
-            .any(|d| d.message == "skill path does not exist"));
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message == "skill path is not a markdown file")
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message == "skill path does not exist")
+        );
     }
 
     // ---- discovery ----
@@ -2103,15 +2121,21 @@ mod tests {
         // project settings entry remains (upstream never gates settings).
         options.project_trusted = false;
         let paths = discover_skill_paths(&options);
-        assert!(!paths
-            .iter()
-            .any(|p| p.path.starts_with(options.cwd.join(".rpi/skills"))));
-        assert!(paths
-            .iter()
-            .any(|p| p.path.starts_with(&project_settings_dir)));
-        assert!(paths
-            .iter()
-            .any(|p| p.path.starts_with(options.agent_dir.join("skills"))));
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.path.starts_with(options.cwd.join(".rpi/skills")))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.path.starts_with(&project_settings_dir))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.path.starts_with(options.agent_dir.join("skills")))
+        );
     }
 
     #[test]
@@ -2216,8 +2240,10 @@ mod tests {
         assert!(read_prompt.contains(
             "Use the read tool to load a skill's file when the task matches its description."
         ));
-        assert!(bash_prompt
-            .contains("Use bash to load a skill's file when the task matches its description."));
+        assert!(
+            bash_prompt
+                .contains("Use bash to load a skill's file when the task matches its description.")
+        );
         assert_eq!(
             read_prompt.replace("Use the read tool", "Use bash"),
             bash_prompt

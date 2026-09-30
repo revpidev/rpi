@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rpi_ai::auth::{find_env_keys, AuthContext};
-use rpi_ai::models::{create_models, get_supported_thinking_levels, CreateModelsOptions, Provider};
+use rpi_ai::auth::{AuthContext, find_env_keys};
+use rpi_ai::models::{CreateModelsOptions, Provider, create_models, get_supported_thinking_levels};
 use rpi_ai::providers::cerebras::cerebras_provider;
 use rpi_ai::providers::deepseek::deepseek_provider;
 use rpi_ai::providers::fireworks::fireworks_provider;

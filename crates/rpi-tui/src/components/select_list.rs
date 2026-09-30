@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::keybindings::{get_keybindings, Keybinding};
+use crate::keybindings::{Keybinding, get_keybindings};
 use crate::tui::{
     Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
     TuiMouseHandlerResult,
@@ -232,41 +232,41 @@ impl SelectList {
         let prefix = if is_selected { "→ " } else { "  " };
         let prefix_width = visible_width(prefix);
 
-        if let Some(description_single_line) = description_single_line {
-            if width > 40 {
-                let effective_primary_column_width = primary_column_width
-                    .min(width.saturating_sub(prefix_width + 4))
-                    .max(1);
-                let max_primary_width = effective_primary_column_width
-                    .saturating_sub(PRIMARY_COLUMN_GAP)
-                    .max(1);
-                let truncated_value = self.truncate_primary(
-                    item,
-                    is_selected,
-                    max_primary_width,
-                    effective_primary_column_width,
-                );
-                let truncated_value_width = visible_width(&truncated_value);
-                let spacing = " ".repeat(
-                    effective_primary_column_width
-                        .saturating_sub(truncated_value_width)
-                        .max(1),
-                );
-                let description_start = prefix_width + truncated_value_width + spacing.len();
-                let remaining_width = width.saturating_sub(description_start + 2); // -2 for safety
+        if let Some(description_single_line) = description_single_line
+            && width > 40
+        {
+            let effective_primary_column_width = primary_column_width
+                .min(width.saturating_sub(prefix_width + 4))
+                .max(1);
+            let max_primary_width = effective_primary_column_width
+                .saturating_sub(PRIMARY_COLUMN_GAP)
+                .max(1);
+            let truncated_value = self.truncate_primary(
+                item,
+                is_selected,
+                max_primary_width,
+                effective_primary_column_width,
+            );
+            let truncated_value_width = visible_width(&truncated_value);
+            let spacing = " ".repeat(
+                effective_primary_column_width
+                    .saturating_sub(truncated_value_width)
+                    .max(1),
+            );
+            let description_start = prefix_width + truncated_value_width + spacing.len();
+            let remaining_width = width.saturating_sub(description_start + 2); // -2 for safety
 
-                if remaining_width > MIN_DESCRIPTION_WIDTH {
-                    let truncated_desc =
-                        truncate_to_width(description_single_line, remaining_width, "", false);
-                    if is_selected {
-                        return (self.theme.selected_text)(&format!(
-                            "{prefix}{truncated_value}{spacing}{truncated_desc}"
-                        ));
-                    }
-
-                    let desc_text = (self.theme.description)(&format!("{spacing}{truncated_desc}"));
-                    return format!("{prefix}{truncated_value}{desc_text}");
+            if remaining_width > MIN_DESCRIPTION_WIDTH {
+                let truncated_desc =
+                    truncate_to_width(description_single_line, remaining_width, "", false);
+                if is_selected {
+                    return (self.theme.selected_text)(&format!(
+                        "{prefix}{truncated_value}{spacing}{truncated_desc}"
+                    ));
                 }
+
+                let desc_text = (self.theme.description)(&format!("{spacing}{truncated_desc}"));
+                return format!("{prefix}{truncated_value}{desc_text}");
             }
         }
 
@@ -340,10 +340,10 @@ impl SelectList {
     }
 
     fn notify_selection_change(&mut self) {
-        if let Some(selected_item) = self.filtered_items.get(self.selected_index) {
-            if let Some(on_selection_change) = self.on_selection_change.as_mut() {
-                on_selection_change(selected_item);
-            }
+        if let Some(selected_item) = self.filtered_items.get(self.selected_index)
+            && let Some(on_selection_change) = self.on_selection_change.as_mut()
+        {
+            on_selection_change(selected_item);
         }
     }
 }
@@ -418,10 +418,10 @@ impl Component for SelectList {
         if changed {
             self.notify_selection_change();
         }
-        if let Some(on_select) = self.on_select.as_mut() {
-            if let Some(selected_item) = self.filtered_items.get(self.selected_index) {
-                on_select(selected_item);
-            }
+        if let Some(on_select) = self.on_select.as_mut()
+            && let Some(selected_item) = self.filtered_items.get(self.selected_index)
+        {
+            on_select(selected_item);
         }
         Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
             handled: true,
@@ -506,17 +506,17 @@ impl Component for SelectList {
         }
         // Enter
         else if kb.matches(key_data, Keybinding::SelectConfirm) {
-            if let Some(selected_item) = self.filtered_items.get(self.selected_index) {
-                if let Some(on_select) = self.on_select.as_mut() {
-                    on_select(selected_item);
-                }
+            if let Some(selected_item) = self.filtered_items.get(self.selected_index)
+                && let Some(on_select) = self.on_select.as_mut()
+            {
+                on_select(selected_item);
             }
         }
         // Escape or Ctrl+C
-        else if kb.matches(key_data, Keybinding::SelectCancel) {
-            if let Some(on_cancel) = self.on_cancel.as_mut() {
-                on_cancel();
-            }
+        else if kb.matches(key_data, Keybinding::SelectCancel)
+            && let Some(on_cancel) = self.on_cancel.as_mut()
+        {
+            on_cancel();
         }
     }
 }

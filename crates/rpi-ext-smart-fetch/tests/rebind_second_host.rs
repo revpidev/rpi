@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Two fake hosts, switched by the cookie VALUE (0xA / 0xB — never
 /// dereferenced). Each records every host call + its canned `ctx.cwd`.

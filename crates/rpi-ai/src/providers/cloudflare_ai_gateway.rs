@@ -14,11 +14,11 @@ use std::sync::Arc;
 use crate::api::anthropic_messages::AnthropicMessages;
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::openai_responses::OpenAiResponses;
-use crate::auth::cloudflare_auth::cloudflare_ai_gateway_auth;
 use crate::auth::ProviderAuth;
+use crate::auth::cloudflare_auth::cloudflare_ai_gateway_auth;
 use crate::generated::get_builtin_models;
 use crate::models::{
-    create_provider, CreateProviderOptions, Provider, ProviderApi, ProviderStreams,
+    CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
 use crate::types::ApiKind;
 

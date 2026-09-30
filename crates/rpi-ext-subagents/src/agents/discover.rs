@@ -178,19 +178,19 @@ impl MemoryConfig {
             }
         }
         // Shorthand `project:notes`.
-        if scope.is_none() || path.is_none() {
-            if let Some((raw_scope, raw_path)) = body.split_once(':') {
-                let raw_scope = raw_scope.trim();
-                let raw_path = raw_path.trim().trim_matches('"');
-                if scope.is_none() {
-                    scope = match raw_scope {
-                        "user" => Some("user"),
-                        _ => Some("project"),
-                    };
-                }
-                if path.is_none() && !raw_path.is_empty() {
-                    path = Some(raw_path.to_string());
-                }
+        if (scope.is_none() || path.is_none())
+            && let Some((raw_scope, raw_path)) = body.split_once(':')
+        {
+            let raw_scope = raw_scope.trim();
+            let raw_path = raw_path.trim().trim_matches('"');
+            if scope.is_none() {
+                scope = match raw_scope {
+                    "user" => Some("user"),
+                    _ => Some("project"),
+                };
+            }
+            if path.is_none() && !raw_path.is_empty() {
+                path = Some(raw_path.to_string());
             }
         }
         Some(Self {
@@ -567,11 +567,7 @@ fn normalize_aliases(raw: Option<Vec<String>>, runtime_name: &str) -> Option<Vec
         }
         out.push(alias.to_string());
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// `splitToolList` (agents.ts:531-545).
@@ -635,7 +631,7 @@ pub fn agent_from_content(
         Some(_) => {
             return Err(format!(
                 "Agent '{local_name}' has invalid async frontmatter; expected true or false."
-            ))
+            ));
         }
         None => None,
     };
@@ -645,7 +641,7 @@ pub fn agent_from_content(
             _ => {
                 return Err(format!(
                     "Agent '{local_name}' has invalid timeoutMs frontmatter; expected a positive integer."
-                ))
+                ));
             }
         },
         None => None,
@@ -754,7 +750,7 @@ pub fn agent_from_content(
             Some(other) => {
                 return Err(format!(
                     "Agent '{local_name}' has invalid outputMode; expected 'inline' or 'file-only' (got '{other}')."
-                ))
+                ));
             }
             None => None,
         },
@@ -765,7 +761,7 @@ pub fn agent_from_content(
             Some(other) => {
                 return Err(format!(
                     "Agent '{local_name}' has invalid advertise frontmatter; expected true or false (got '{other}')."
-                ))
+                ));
             }
             None => None,
         },
@@ -1227,10 +1223,10 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
     // default) fixed user dirs — fixed definitions win on same-name because
     // scan dirs load last (agents.ts discovery order + the upstream test
     // "lets fixed user agents override same-name scan-dir agents").
-    if scope != "project" {
-        if let Some(scan_dirs) = settings.user.agent_scan_dirs.as_deref() {
-            user_dirs.extend(expand_agent_scan_dirs(scan_dirs));
-        }
+    if scope != "project"
+        && let Some(scan_dirs) = settings.user.agent_scan_dirs.as_deref()
+    {
+        user_dirs.extend(expand_agent_scan_dirs(scan_dirs));
     }
     let default_model = settings.default_model.clone();
     // `applySubagentDefaults` (agents.ts:995-1009, called per scope at
@@ -1581,78 +1577,78 @@ fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::A
     if let Some(description) = &entry.description {
         agent.description = description.clone();
     }
-    if let Some(model) = &entry.model {
-        if !agent.has_frontmatter_field(&["model"]) {
-            agent.model = model.clone();
-        }
+    if let Some(model) = &entry.model
+        && !agent.has_frontmatter_field(&["model"])
+    {
+        agent.model = model.clone();
     }
-    if let Some(disabled) = entry.disabled {
-        if agent.disabled.is_none() {
-            agent.disabled = Some(disabled);
-        }
+    if let Some(disabled) = entry.disabled
+        && agent.disabled.is_none()
+    {
+        agent.disabled = Some(disabled);
     }
-    if let Some(tools_override) = &entry.tools {
-        if !agent.has_frontmatter_field(&["tools"]) {
-            apply_tools_override(agent, tools_override);
-        }
+    if let Some(tools_override) = &entry.tools
+        && !agent.has_frontmatter_field(&["tools"])
+    {
+        apply_tools_override(agent, tools_override);
     }
     // #1776: fill-only like the other custom-agent fields (rpi keeps the
     // v0.48 custom-override model; upstream v0.66 made custom overrides
     // wholesale in #1796/#1798 — open item 03 附录 C.4-3, out of TE18 scope).
-    if let Some(exclude) = &entry.exclude_tools {
-        if !agent.has_frontmatter_field(&["excludeTools"]) {
-            agent.exclude_tools = exclude.clone().unwrap_or_default();
-        }
+    if let Some(exclude) = &entry.exclude_tools
+        && !agent.has_frontmatter_field(&["excludeTools"])
+    {
+        agent.exclude_tools = exclude.clone().unwrap_or_default();
     }
-    if let Some(allowed) = &entry.allowed_agents {
-        if !agent.has_frontmatter_field(&["allowedAgents"]) {
-            agent.allowed_agents = allowed.clone();
-        }
+    if let Some(allowed) = &entry.allowed_agents
+        && !agent.has_frontmatter_field(&["allowedAgents"])
+    {
+        agent.allowed_agents = allowed.clone();
     }
-    if let Some(thinking) = &entry.thinking {
-        if !agent.has_frontmatter_field(&["thinking"]) {
-            agent.thinking = match thinking {
-                Some(level) => ThinkingSpec::Level(level.clone()),
-                None => ThinkingSpec::Unset,
-            };
-        }
+    if let Some(thinking) = &entry.thinking
+        && !agent.has_frontmatter_field(&["thinking"])
+    {
+        agent.thinking = match thinking {
+            Some(level) => ThinkingSpec::Level(level.clone()),
+            None => ThinkingSpec::Unset,
+        };
     }
-    if let Some(mode) = &entry.system_prompt_mode {
-        if !agent.has_frontmatter_field(&["systemPromptMode"]) {
-            agent.system_prompt_mode = match mode.as_str() {
-                "append" => "append",
-                _ => "replace",
-            };
-        }
+    if let Some(mode) = &entry.system_prompt_mode
+        && !agent.has_frontmatter_field(&["systemPromptMode"])
+    {
+        agent.system_prompt_mode = match mode.as_str() {
+            "append" => "append",
+            _ => "replace",
+        };
     }
-    if let Some(inherit) = entry.inherit_project_context {
-        if !agent.has_frontmatter_field(&["inheritProjectContext"]) {
-            agent.inherit_project_context = inherit;
-        }
+    if let Some(inherit) = entry.inherit_project_context
+        && !agent.has_frontmatter_field(&["inheritProjectContext"])
+    {
+        agent.inherit_project_context = inherit;
     }
-    if let Some(inherit) = entry.inherit_skills {
-        if !agent.has_frontmatter_field(&["inheritSkills"]) {
-            agent.inherit_skills = inherit;
-        }
+    if let Some(inherit) = entry.inherit_skills
+        && !agent.has_frontmatter_field(&["inheritSkills"])
+    {
+        agent.inherit_skills = inherit;
     }
-    if let Some(default_context) = &entry.default_context {
-        if !agent.has_frontmatter_field(&["defaultContext"]) {
-            agent.default_context = match default_context.as_deref() {
-                Some("fork") => Some(ContextMode::Fork),
-                Some("fresh") => Some(ContextMode::Fresh),
-                _ => None,
-            };
-        }
+    if let Some(default_context) = &entry.default_context
+        && !agent.has_frontmatter_field(&["defaultContext"])
+    {
+        agent.default_context = match default_context.as_deref() {
+            Some("fork") => Some(ContextMode::Fork),
+            Some("fresh") => Some(ContextMode::Fresh),
+            _ => None,
+        };
     }
-    if let Some(role) = &entry.acceptance_role {
-        if !agent.has_frontmatter_field(&["acceptanceRole"]) {
-            agent.acceptance_role = role.clone();
-        }
+    if let Some(role) = &entry.acceptance_role
+        && !agent.has_frontmatter_field(&["acceptanceRole"])
+    {
+        agent.acceptance_role = role.clone();
     }
-    if let Some(skills) = &entry.skills {
-        if !agent.has_frontmatter_field(&["skill", "skills"]) {
-            agent.skills = skills.clone().unwrap_or_default();
-        }
+    if let Some(skills) = &entry.skills
+        && !agent.has_frontmatter_field(&["skill", "skills"])
+    {
+        agent.skills = skills.clone().unwrap_or_default();
     }
 }
 
@@ -2005,9 +2001,11 @@ mod tests {
             discover_agents_with_user_dirs(&project, "project", &settings, None, vec![]).unwrap();
         // Builtins stay in the map (mergeAgentsForScope always seeds them);
         // the project scope only suppresses the user level.
-        assert!(found_project_only
-            .iter()
-            .all(|a| a.source != AgentSource::User));
+        assert!(
+            found_project_only
+                .iter()
+                .all(|a| a.source != AgentSource::User)
+        );
         assert_eq!(
             found_project_only
                 .iter()
@@ -2367,10 +2365,12 @@ mod discovery_robustness_tests {
         assert_eq!(names(&agents), vec!["good".to_string()]);
         if !readable {
             assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
-            assert!(diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.path == locked
-                    && diagnostic.error.contains("cannot read directory")));
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.path == locked
+                        && diagnostic.error.contains("cannot read directory"))
+            );
         }
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2493,11 +2493,9 @@ mod discovery_robustness_tests {
         .unwrap();
         let settings = crate::config::SettingsPair {
             user: crate::config::SubagentSettings {
-                agent_scan_dirs: Some(vec![root
-                    .join("*")
-                    .join("agents")
-                    .to_string_lossy()
-                    .to_string()]),
+                agent_scan_dirs: Some(vec![
+                    root.join("*").join("agents").to_string_lossy().to_string(),
+                ]),
                 ..Default::default()
             },
             ..Default::default()
@@ -2836,12 +2834,16 @@ mod te18_tools_tests {
             vec!["bash".to_string(), "edit".to_string()]
         );
         // Omitted → empty; an empty block list also carries no effect.
-        assert!(agent_with("name: a\ndescription: d")
-            .exclude_tools
-            .is_empty());
-        assert!(agent_with("name: a\ndescription: d\nexcludeTools:")
-            .exclude_tools
-            .is_empty());
+        assert!(
+            agent_with("name: a\ndescription: d")
+                .exclude_tools
+                .is_empty()
+        );
+        assert!(
+            agent_with("name: a\ndescription: d\nexcludeTools:")
+                .exclude_tools
+                .is_empty()
+        );
     }
 
     #[test]

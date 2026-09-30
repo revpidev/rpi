@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::components::input::Input;
 use crate::fuzzy::fuzzy_filter;
-use crate::keybindings::{get_keybindings, Keybinding};
+use crate::keybindings::{Keybinding, get_keybindings};
 use crate::tui::{
     Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
     TuiMouseHandlerResult,
@@ -409,14 +409,14 @@ impl SettingsList {
         }
 
         // Add description for selected item.
-        if let Some(selected_item) = self.selected_item() {
-            if let Some(description) = &selected_item.description {
-                lines.push(String::new());
-                let wrapped_description =
-                    wrap_text_with_ansi(description, width.saturating_sub(4).max(1));
-                for line in wrapped_description {
-                    lines.push((self.theme.description)(&format!("  {line}")));
-                }
+        if let Some(selected_item) = self.selected_item()
+            && let Some(description) = &selected_item.description
+        {
+            lines.push(String::new());
+            let wrapped_description =
+                wrap_text_with_ansi(description, width.saturating_sub(4).max(1));
+            for line in wrapped_description {
+                lines.push((self.theme.description)(&format!("  {line}")));
             }
         }
 
@@ -585,14 +585,14 @@ impl Component for SettingsList {
             if let Some(on_cancel) = self.on_cancel.as_mut() {
                 on_cancel();
             }
-        } else if self.search_enabled {
-            if let Some(search_input) = self.search_input.as_mut() {
-                // The query is forwarded verbatim — spaces included
-                // (settings-list.ts:192-195 @ 4181f66, bf4a90d81).
-                search_input.handle_input(data);
-                let query = search_input.get_value().to_string();
-                self.apply_filter(&query);
-            }
+        } else if self.search_enabled
+            && let Some(search_input) = self.search_input.as_mut()
+        {
+            // The query is forwarded verbatim — spaces included
+            // (settings-list.ts:192-195 @ 4181f66, bf4a90d81).
+            search_input.handle_input(data);
+            let query = search_input.get_value().to_string();
+            self.apply_filter(&query);
         }
     }
 
@@ -1143,14 +1143,15 @@ mod tests {
             _ => panic!("search input press bubbles focus"),
         }
         // Row 1 (spacer): no result.
-        assert!(list
-            .handle_mouse(&settings_mouse_event(
+        assert!(
+            list.handle_mouse(&settings_mouse_event(
                 TuiMouseEventType::Press,
                 TuiMouseButton::Left,
                 1,
                 None,
             ))
-            .is_none());
+            .is_none()
+        );
         // Row 2 is the first item row.
         match list.handle_mouse(&settings_mouse_event(
             TuiMouseEventType::Press,

@@ -32,8 +32,8 @@
 
 use std::path::{Path, PathBuf};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use base64::Engine;
 use serde_json::Value;
 
@@ -91,12 +91,12 @@ fn decode_canonical_base64_str(
     if reencoded != text {
         return Err(invalid());
     }
-    if let Some(expected) = expected_bytes {
-        if decoded.len() != expected {
-            return Err(AdapterError::InvalidConfigValue(format!(
-                "value must decode to exactly {expected} bytes"
-            )));
-        }
+    if let Some(expected) = expected_bytes
+        && decoded.len() != expected
+    {
+        return Err(AdapterError::InvalidConfigValue(format!(
+            "value must decode to exactly {expected} bytes"
+        )));
     }
     Ok(decoded)
 }
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn roundtrip_write_read_remove() {
         key_env(|| {
-            std::env::set_var(OAUTH_FILE_KEY_ENV, valid_key());
+            rpi_test_env::set_var(OAUTH_FILE_KEY_ENV, valid_key());
             let dir = std::env::temp_dir().join(format!(
                 "rpi-enc-store-{}",
                 std::time::SystemTime::now()
@@ -563,14 +563,14 @@ mod tests {
             store.remove("sha256-abc").expect("remove");
             assert_eq!(store.read("sha256-abc").expect("read after remove"), None);
             let _ = std::fs::remove_dir_all(&dir);
-            std::env::remove_var(OAUTH_FILE_KEY_ENV);
+            rpi_test_env::remove_var(OAUTH_FILE_KEY_ENV);
         })
     }
 
     #[test]
     fn missing_key_fails_with_env_named_in_cause() {
         key_env(|| {
-            std::env::remove_var(OAUTH_FILE_KEY_ENV);
+            rpi_test_env::remove_var(OAUTH_FILE_KEY_ENV);
             let dir = std::env::temp_dir().join("rpi-enc-store-missing-key");
             let store = EncryptedFileSecretStore::with_root(dir);
             let err = store.read("sha256-x").expect_err("key required");
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn account_swap_fails_tag_verification() {
         key_env(|| {
-            std::env::set_var(OAUTH_FILE_KEY_ENV, valid_key());
+            rpi_test_env::set_var(OAUTH_FILE_KEY_ENV, valid_key());
             let dir = std::env::temp_dir().join(format!(
                 "rpi-enc-store-swap-{}",
                 std::time::SystemTime::now()
@@ -604,14 +604,14 @@ mod tests {
             let err = store.read("sha256-account-b").expect_err("tag mismatch");
             assert!(format_oauth_credential_store_unavailable(&err).is_some());
             let _ = std::fs::remove_dir_all(&dir);
-            std::env::remove_var(OAUTH_FILE_KEY_ENV);
+            rpi_test_env::remove_var(OAUTH_FILE_KEY_ENV);
         })
     }
 
     #[test]
     fn symlink_envelope_is_refused() {
         key_env(|| {
-            std::env::set_var(OAUTH_FILE_KEY_ENV, valid_key());
+            rpi_test_env::set_var(OAUTH_FILE_KEY_ENV, valid_key());
             let base = std::env::temp_dir().join(format!(
                 "rpi-enc-store-symlink-{}",
                 std::time::SystemTime::now()
@@ -631,12 +631,14 @@ mod tests {
             #[cfg(unix)]
             {
                 let error = store.read("sha256-a").expect_err("symlink refused");
-                assert!(error
-                    .to_string()
-                    .contains("Refusing non-regular OAuth credential file"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Refusing non-regular OAuth credential file")
+                );
             }
             let _ = std::fs::remove_dir_all(&base);
-            std::env::remove_var(OAUTH_FILE_KEY_ENV);
+            rpi_test_env::remove_var(OAUTH_FILE_KEY_ENV);
         })
     }
 }

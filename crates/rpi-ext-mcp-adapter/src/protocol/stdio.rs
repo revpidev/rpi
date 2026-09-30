@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn resolve_env_overlays_interpolated_overrides() {
-        std::env::set_var("RPI_MCP_STDIO_TEST", "resolved");
+        rpi_test_env::set_var("RPI_MCP_STDIO_TEST", "resolved");
         let definition = ServerEntry(
             json!({ "env": { "RPI_MCP_STDIO_TEST": "$env:RPI_MCP_STDIO_TEST", "EXTRA": "x" } })
                 .as_object()
@@ -450,7 +450,7 @@ mod tests {
         let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
         assert_eq!(get("RPI_MCP_STDIO_TEST").as_deref(), Some("resolved"));
         assert_eq!(get("EXTRA").as_deref(), Some("x"));
-        std::env::remove_var("RPI_MCP_STDIO_TEST");
+        rpi_test_env::remove_var("RPI_MCP_STDIO_TEST");
     }
 
     #[cfg(unix)]
@@ -459,10 +459,10 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         let key = "RPI_MCP_STDIO_BIN_TEST";
-        std::env::set_var(key, OsString::from_vec(vec![0xff, 0xfe, b'A']));
+        rpi_test_env::set_var(key, OsString::from_vec(vec![0xff, 0xfe, b'A']));
         let definition = ServerEntry(serde_json::Map::new());
         let env = resolve_env(&definition).expect("env resolves");
-        std::env::remove_var(key);
+        rpi_test_env::remove_var(key);
         let value = env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         // Lossy decode, matching Node's `process.env` (U+FFFD per bad byte).
         assert_eq!(value.as_deref(), Some("\u{fffd}\u{fffd}A"));
@@ -520,7 +520,7 @@ mod tests {
         // explicit overrides; a `PATH`-style base entry disappears.
         // Uniquely-named var: Rust tests share one process, so the
         // ambient env is mutated by sibling tests.
-        std::env::set_var("RPI_MCP_TE24_INHERIT_TEST", "from-env");
+        rpi_test_env::set_var("RPI_MCP_TE24_INHERIT_TEST", "from-env");
         let definition = ServerEntry(
             json!({
                 "command": "x",
@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(names.len(), 2, "only the two overrides: {names:?}");
         assert!(names.contains(&"ONLY"));
         assert!(names.contains(&"RPI_MCP_TE24_INHERIT_TEST"));
-        std::env::remove_var("RPI_MCP_TE24_INHERIT_TEST");
+        rpi_test_env::remove_var("RPI_MCP_TE24_INHERIT_TEST");
     }
 
     #[test]

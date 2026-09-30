@@ -31,16 +31,16 @@ use rpi::core::settings_manager::{
     WithLockCallback,
 };
 use rpi::core::skills::{
-    load_skills, DiagnosticKind, DiagnosticResourceType, LoadSkillsOptions, ResourceDiagnostic,
-    Skill, SourceOrigin, SourceScope,
+    DiagnosticKind, DiagnosticResourceType, LoadSkillsOptions, ResourceDiagnostic, Skill,
+    SourceOrigin, SourceScope, load_skills,
 };
 use rpi::core::themes::{
-    get_resolved_theme_colors, load_theme_from_path, ColorMode, Theme, ALLOWED_COLOR_KEYS,
-    BG_COLOR_KEYS,
+    ALLOWED_COLOR_KEYS, BG_COLOR_KEYS, ColorMode, Theme, get_resolved_theme_colors,
+    load_theme_from_path,
 };
 use rpi::error::RpiError;
-use rpi_test_support::{diff_text, Normalizer};
-use serde_json::{json, Map, Value};
+use rpi_test_support::{Normalizer, diff_text};
+use serde_json::{Map, Value, json};
 
 // ---------------------------------------------------------------------------
 // Shared helpers

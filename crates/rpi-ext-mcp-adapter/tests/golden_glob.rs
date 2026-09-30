@@ -9,10 +9,10 @@
 //! upstream outputs.
 
 use rpi_ext_mcp_adapter::metadata::{
-    get_tool_name_candidates, is_tool_allowed, matches_tool_pattern, ServerEntry, ToolPrefix,
+    ServerEntry, ToolPrefix, get_tool_name_candidates, is_tool_allowed, matches_tool_pattern,
 };
 use rpi_ext_mcp_adapter::search::resolve_search_keywords;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn parse_prefix(s: &str) -> ToolPrefix {
     match s {
@@ -90,7 +90,7 @@ fn search_keywords_resolution_matches_upstream() {
 /// consumed by `score_tool_match`, never embedded into metadata.
 #[test]
 fn search_keywords_do_not_appear_in_tool_metadata() {
-    use rpi_ext_mcp_adapter::metadata::{build_tool_metadata, McpTool};
+    use rpi_ext_mcp_adapter::metadata::{McpTool, build_tool_metadata};
     let definition = ServerEntry(
         json!({
             "searchKeywords": {

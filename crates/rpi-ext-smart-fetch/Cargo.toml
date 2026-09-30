@@ -51,6 +51,7 @@ mime_guess = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+rpi-test-env.workspace = true
 # V13-04 §4 integration anchor (M7): build a synthetic multi-chunk
 # `wreq::Response` (mock seam: `Response::from(http::Response<Body>)`)
 # without a network.

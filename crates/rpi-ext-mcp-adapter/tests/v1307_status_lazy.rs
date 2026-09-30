@@ -4,14 +4,14 @@
 //! and the loop exits. Dedicated binary: `STATE` is a OnceLock per test
 //! binary, so this install cannot share with other install tests.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
 use rpi_ext_mcp_adapter::install_for_test;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const KEY: &str = "mcp";
 

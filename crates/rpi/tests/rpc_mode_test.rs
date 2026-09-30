@@ -12,15 +12,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 use rpi::core::agent_session_runtime::{
-    create_agent_session_runtime, CreateAgentSessionRuntimeFactory,
-    CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    CreateAgentSessionRuntimeFactory, CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    create_agent_session_runtime,
 };
 use rpi::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
@@ -28,8 +28,8 @@ use rpi::modes::rpc::run_rpc_mode;
 use rpi_agent::messages::AgentMessage;
 use rpi_ai::types::Model;
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAiProvider, FauxAssistantOptions, FauxModelDefinition,
-    FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message,
 };
 
 // ---------------------------------------------------------------------------
@@ -179,11 +179,11 @@ impl RpcSession {
                 events.push(value);
                 continue;
             }
-            if let Some(id) = id {
-                if value.get("id").and_then(Value::as_str) != Some(id) {
-                    events.push(value);
-                    continue;
-                }
+            if let Some(id) = id
+                && value.get("id").and_then(Value::as_str) != Some(id)
+            {
+                events.push(value);
+                continue;
             }
             return (value, events);
         }
@@ -681,10 +681,12 @@ async fn bash_commands() {
         .await;
     let update = rpc.next_event("bash_execution_update").await;
     assert_eq!(update["id"], "b1");
-    assert!(update["delta"]
-        .as_str()
-        .expect("delta")
-        .contains("hello-rpc"));
+    assert!(
+        update["delta"]
+            .as_str()
+            .expect("delta")
+            .contains("hello-rpc")
+    );
     let response = rpc.next_response(Some("b1")).await;
     let data = &response["data"];
     assert_eq!(data["output"], "hello-rpc");
@@ -1104,10 +1106,12 @@ async fn steer_follow_up_abort_during_streaming() {
     let response = rpc.next_response(Some("p2")).await;
     assert_eq!(response["success"], false);
     assert_eq!(response["command"], "prompt");
-    assert!(response["error"]
-        .as_str()
-        .expect("error")
-        .contains("streamingBehavior"));
+    assert!(
+        response["error"]
+            .as_str()
+            .expect("error")
+            .contains("streamingBehavior")
+    );
 
     // prompt with streamingBehavior=steer queues instead (rpc.md §prompt).
     rpc.send(&json!({"id": "p3", "type": "prompt", "message": "steer via prompt", "streamingBehavior": "steer"}))
@@ -1286,10 +1290,12 @@ async fn get_commands_with_prompt_template() {
     assert_eq!(source_info["scope"], "user");
     assert_eq!(source_info["origin"], "top-level");
     assert_eq!(source_info["source"], "local");
-    assert!(source_info["path"]
-        .as_str()
-        .expect("path")
-        .ends_with("hello.md"));
+    assert!(
+        source_info["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("hello.md")
+    );
 
     assert_eq!(rpc.close_and_wait().await, 0);
 }
@@ -1307,10 +1313,12 @@ async fn protocol_errors_and_framing() {
     let response = rpc.next_response(None).await;
     assert_eq!(response["command"], "parse");
     assert_eq!(response["success"], false);
-    assert!(response["error"]
-        .as_str()
-        .expect("error")
-        .starts_with("Failed to parse command: "));
+    assert!(
+        response["error"]
+            .as_str()
+            .expect("error")
+            .starts_with("Failed to parse command: ")
+    );
     assert!(response.get("id").is_none());
 
     // Empty / whitespace-only lines also return a parse error (upstream does not
@@ -1319,10 +1327,12 @@ async fn protocol_errors_and_framing() {
     let response = rpc.next_response(None).await;
     assert_eq!(response["command"], "parse");
     assert_eq!(response["success"], false);
-    assert!(response["error"]
-        .as_str()
-        .expect("error")
-        .starts_with("Failed to parse command: "));
+    assert!(
+        response["error"]
+            .as_str()
+            .expect("error")
+            .starts_with("Failed to parse command: ")
+    );
 
     // Unknown command (rpc-mode.ts:695-698).
     rpc.send(&json!({"id": "u1", "type": "frobnicate"})).await;
@@ -1394,10 +1404,12 @@ async fn export_html_in_memory_session_errors() {
     rpc.send(&json!({"id": "x1", "type": "export_html"})).await;
     let response = rpc.next_response(Some("x1")).await;
     assert_eq!(response["success"], false);
-    assert!(response["error"]
-        .as_str()
-        .expect("error")
-        .contains("Cannot export in-memory session to HTML"));
+    assert!(
+        response["error"]
+            .as_str()
+            .expect("error")
+            .contains("Cannot export in-memory session to HTML")
+    );
 
     assert_eq!(rpc.close_and_wait().await, 0);
 }

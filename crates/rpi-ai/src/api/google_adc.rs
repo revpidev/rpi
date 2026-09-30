@@ -48,7 +48,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::types::ProviderEnv;
 use crate::utils::provider_env::get_provider_env_value;
@@ -251,14 +251,14 @@ fn parse_token_response(body: &str, source: &str) -> Result<String, String> {
 /// `{error}: {error_description}` wording when the body carries an `error`
 /// field, otherwise an HTTP status summary.
 fn token_error_message(status: u16, body: &str) -> String {
-    if let Ok(json) = serde_json::from_str::<Value>(body) {
-        if let Some(error) = json.get("error").and_then(Value::as_str) {
-            let description = json
-                .get("error_description")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            return format!("{error}: {description}");
-        }
+    if let Ok(json) = serde_json::from_str::<Value>(body)
+        && let Some(error) = json.get("error").and_then(Value::as_str)
+    {
+        let description = json
+            .get("error_description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return format!("{error}: {description}");
     }
     format!("Token request failed with status {status}.")
 }
@@ -386,17 +386,17 @@ pub async fn resolve_access_token(
         .well_known_file
         .clone()
         .or_else(default_well_known_file);
-    if let Some(path) = well_known {
-        if path.is_file() {
-            let contents = std::fs::read_to_string(&path).map_err(|error| {
-                format!(
-                    "Unable to read the credential file at {}: {error}",
-                    path.display()
-                )
-            })?;
-            let credentials = parse_credential_file(&contents)?;
-            return fetch_access_token(&credentials, endpoints).await;
-        }
+    if let Some(path) = well_known
+        && path.is_file()
+    {
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "Unable to read the credential file at {}: {error}",
+                path.display()
+            )
+        })?;
+        let credentials = parse_credential_file(&contents)?;
+        return fetch_access_token(&credentials, endpoints).await;
     }
 
     if let Ok(token) = fetch_metadata_access_token(endpoints).await {

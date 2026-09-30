@@ -29,7 +29,7 @@ use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::interactive_ui::{ComponentEvent, DisposeReason};
 use rpi_ext_host::types::{ExtensionMode, ToolExecuteRequest};
 use rpi_test_support::ui_host::ScriptedUiBridge;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

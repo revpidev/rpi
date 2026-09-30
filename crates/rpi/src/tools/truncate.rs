@@ -362,10 +362,10 @@ pub fn truncate_line(line: &str, max_chars: Option<usize>) -> TruncatedLine {
 
     // If we sliced in the middle of a surrogate pair (last element is a high
     // surrogate 0xD800-0xDBFF), drop it to avoid a lone surrogate.
-    if let Some(&last) = truncated.last() {
-        if (0xD800..=0xDBFF).contains(&last) {
-            truncated.pop();
-        }
+    if let Some(&last) = truncated.last()
+        && (0xD800..=0xDBFF).contains(&last)
+    {
+        truncated.pop();
     }
 
     let text = String::from_utf16_lossy(&truncated);

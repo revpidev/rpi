@@ -1164,7 +1164,7 @@ pub trait CommandContextActions: Send + Sync {
     async fn navigate_tree(&self, target_id: &str, options: NavigateTreeOptions) -> bool;
     /// Returns `cancelled`.
     async fn switch_session(&self, session_path: &str, with_session: Option<WithSessionFn>)
-        -> bool;
+    -> bool;
     async fn reload(&self);
 }
 

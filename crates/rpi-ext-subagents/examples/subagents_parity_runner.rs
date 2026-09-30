@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn normalize_argv(args: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();

@@ -8,10 +8,10 @@ use rpi_ext_host::api::{EventHandler, ExtensionApi};
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
 use rpi_ext_host::types::{
-    self as ext, ExtensionError, ToolDefinition, EVENT_BEFORE_PROVIDER_HEADERS,
-    EVENT_BEFORE_PROVIDER_REQUEST, EVENT_SESSION_BEFORE_SWITCH, EVENT_SESSION_START,
+    self as ext, EVENT_BEFORE_PROVIDER_HEADERS, EVENT_BEFORE_PROVIDER_REQUEST,
+    EVENT_SESSION_BEFORE_SWITCH, EVENT_SESSION_START, ExtensionError, ToolDefinition,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -584,17 +584,21 @@ async fn runner_emit_error_unsubscribe_stops_delivery() {
 
     host.emit(EVENT_SESSION_START, json!({})).await;
     assert_eq!(errors.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
-    assert!(transient
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty());
+    assert!(
+        transient
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    );
 
     host.emit(EVENT_SESSION_START, json!({})).await;
     assert_eq!(errors.lock().unwrap_or_else(|e| e.into_inner()).len(), 2);
-    assert!(transient
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty());
+    assert!(
+        transient
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -757,10 +761,13 @@ async fn runner_message_end_unmodified_returns_none() {
             .unwrap();
     })])
     .await;
-    assert!(host
-        .emit_message_end(json!({"type": ext::EVENT_MESSAGE_END, "message": user_message("hi")}))
+    assert!(
+        host.emit_message_end(
+            json!({"type": ext::EVENT_MESSAGE_END, "message": user_message("hi")})
+        )
         .await
-        .is_none());
+        .is_none()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,9 +1013,11 @@ async fn runner_user_bash_invalid_results_fail_closed() {
         );
         let errors = errors.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(errors.len(), 1, "case: {description}");
-        assert!(errors[0]
-            .error
-            .starts_with("Invalid user_bash handler result"));
+        assert!(
+            errors[0]
+                .error
+                .starts_with("Invalid user_bash handler result")
+        );
     }
 }
 
@@ -1325,12 +1334,13 @@ async fn runner_before_agent_start_no_results_returns_none() {
         .unwrap();
     })])
     .await;
-    assert!(host
-        .emit_before_agent_start(
+    assert!(
+        host.emit_before_agent_start(
             json!({"type": ext::EVENT_BEFORE_AGENT_START, "prompt": "hi", "systemPrompt": "base"})
         )
         .await
-        .is_none());
+        .is_none()
+    );
 }
 
 // ---------------------------------------------------------------------------

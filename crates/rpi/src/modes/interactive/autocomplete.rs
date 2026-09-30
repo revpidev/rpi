@@ -53,9 +53,9 @@ use rpi_tui::autocomplete::{
 use rpi_tui::fuzzy::fuzzy_filter;
 
 use crate::core::skills::{SourceInfo, SourceScope};
-use crate::core::slash_commands::{is_builtin_command, BUILTIN_SLASH_COMMANDS};
+use crate::core::slash_commands::{BUILTIN_SLASH_COMMANDS, is_builtin_command};
 use crate::modes::interactive::components::model_search::{
-    get_model_selector_search_text, ModelSearchItem,
+    ModelSearchItem, get_model_selector_search_text,
 };
 use crate::modes::interactive::interactive_mode::InteractiveUi;
 
@@ -387,7 +387,7 @@ mod tests {
     use crate::core::model_resolver::ScopedModel;
     use crate::core::skills::{SourceInfo, SourceOrigin, SourceScope};
     use crate::modes::interactive::interactive_mode::{InteractiveMode, InteractiveModeOptions};
-    use crate::modes::interactive::test_support::{build_test_session, TestTerminal};
+    use crate::modes::interactive::test_support::{TestTerminal, build_test_session};
 
     use super::*;
 
@@ -396,7 +396,7 @@ mod tests {
     /// `${VAR}` env reference); clear it so the registry path is
     /// deterministic.
     fn clear_test_api_key() {
-        std::env::remove_var("RPI_TEST_INTERACTIVE_KEY");
+        rpi_test_env::remove_var("RPI_TEST_INTERACTIVE_KEY");
     }
 
     async fn mode_harness() -> InteractiveMode {
@@ -611,11 +611,12 @@ mod tests {
         let ui = Arc::clone(&mode.ui_state);
         // No scoped models; the registry snapshot is empty (test API key
         // cleared) → no suggestions (interactive-mode.ts:562).
-        assert!(ui
-            .session()
-            .model_runtime()
-            .get_available_snapshot()
-            .is_empty());
+        assert!(
+            ui.session()
+                .model_runtime()
+                .get_available_snapshot()
+                .is_empty()
+        );
         let provider = create_base_autocomplete_provider(&ui);
         assert!(get_suggestions(provider.as_ref(), "/model m1", false).is_none());
     }

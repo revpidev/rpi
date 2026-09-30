@@ -18,7 +18,7 @@ use std::time::Duration;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
 use rpi_ext_mcp_adapter::{dispatch, dispatcher_for_test, install_for_test};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The byte-exact `/mcp status` baseline for the fixture config below; the
 /// same literal is asserted against `commands::format_status_text` in its
@@ -191,9 +191,9 @@ async fn command_wiring_end_to_end() {
     let saved_home = std::env::var_os("HOME");
     let saved_agent_dir = std::env::var_os("RPI_CODING_AGENT_DIR");
     let saved_direct_tools = std::env::var_os("MCP_DIRECT_TOOLS");
-    std::env::set_var("HOME", &dir);
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
-    std::env::remove_var("MCP_DIRECT_TOOLS");
+    rpi_test_env::set_var("HOME", &dir);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+    rpi_test_env::remove_var("MCP_DIRECT_TOOLS");
     // Pre-create the metadata cache: its absence flips init into
     // `bootstrap-all` (connects every server, including lazy ones); an empty
     // cache keeps init to eager/keep-alive servers only (none here).
@@ -404,16 +404,16 @@ async fn command_wiring_end_to_end() {
 
     // Env restore.
     match saved_home {
-        Some(value) => std::env::set_var("HOME", value),
-        None => std::env::remove_var("HOME"),
+        Some(value) => rpi_test_env::set_var("HOME", value),
+        None => rpi_test_env::remove_var("HOME"),
     }
     match saved_agent_dir {
-        Some(value) => std::env::set_var("RPI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("RPI_CODING_AGENT_DIR"),
+        Some(value) => rpi_test_env::set_var("RPI_CODING_AGENT_DIR", value),
+        None => rpi_test_env::remove_var("RPI_CODING_AGENT_DIR"),
     }
     match saved_direct_tools {
-        Some(value) => std::env::set_var("MCP_DIRECT_TOOLS", value),
-        None => std::env::remove_var("MCP_DIRECT_TOOLS"),
+        Some(value) => rpi_test_env::set_var("MCP_DIRECT_TOOLS", value),
+        None => rpi_test_env::remove_var("MCP_DIRECT_TOOLS"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

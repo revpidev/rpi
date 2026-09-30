@@ -72,7 +72,7 @@ async fn each_native_plugin_gets_its_own_module_table() {
     // designed test seam `MCP_DIRECT_TOOLS=__none__` suppresses direct-tool
     // resolution; this binary runs a single test, so the process-wide env is
     // contained (TE37 hardening).
-    std::env::set_var("MCP_DIRECT_TOOLS", "__none__");
+    rpi_test_env::set_var("MCP_DIRECT_TOOLS", "__none__");
     // The subagents cdylib splits on `RPI_SUBAGENT_CHILD` at load time: a
     // gate run from inside a subagent session (ambient RPI_SUBAGENT_CHILD=1)
     // would load it in child mode and register only `contact_supervisor`.
@@ -86,7 +86,7 @@ async fn each_native_plugin_gets_its_own_module_table() {
         "RPI_SUBAGENT_CHILD_AGENT",
         "RPI_SUBAGENT_CHILD_INDEX",
     ] {
-        std::env::remove_var(name);
+        rpi_test_env::remove_var(name);
     }
     let plugin_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

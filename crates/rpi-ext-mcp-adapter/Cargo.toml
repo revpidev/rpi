@@ -58,3 +58,6 @@ aes-gcm = { workspace = true, features = ["getrandom"] }
 # upstream behavior (design risk R4).
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
 
+
+[dev-dependencies]
+rpi-test-env.workspace = true

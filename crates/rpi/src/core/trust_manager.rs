@@ -272,10 +272,10 @@ fn with_trust_file_lock<T>(
 fn find_nearest_trust_entry(data: &TrustFile, cwd: &Path) -> Option<(PathBuf, bool)> {
     let mut current_dir = normalize_cwd(cwd);
     loop {
-        if let Some(value) = data.get(&current_dir.to_string_lossy().into_owned()) {
-            if let Some(decision) = value.as_bool() {
-                return Some((current_dir, decision));
-            }
+        if let Some(value) = data.get(&current_dir.to_string_lossy().into_owned())
+            && let Some(decision) = value.as_bool()
+        {
+            return Some((current_dir, decision));
         }
         if !current_dir.pop() {
             return None;
@@ -418,14 +418,14 @@ pub fn resolve_project_trusted(
 
     // The `project_trust` extension event (project-trust.ts:54-70): the
     // first yes/no wins; `remember: true` persists the decision.
-    if let Some(event) = extension_event {
-        if event.trusted != ProjectTrustEventDecision::Undecided {
-            let trusted = event.trusted == ProjectTrustEventDecision::Yes;
-            if event.remember == Some(true) {
-                trust_store.set(cwd, Some(trusted))?;
-            }
-            return Ok(trusted);
+    if let Some(event) = extension_event
+        && event.trusted != ProjectTrustEventDecision::Undecided
+    {
+        let trusted = event.trusted == ProjectTrustEventDecision::Yes;
+        if event.remember == Some(true) {
+            trust_store.set(cwd, Some(trusted))?;
         }
+        return Ok(trusted);
     }
 
     if let Some(decision) = trust_store.get(cwd)? {
@@ -461,18 +461,18 @@ fn apply_trust_selection(
     selected: Option<String>,
     trust_store: &ProjectTrustStore,
 ) -> Result<bool, RpiError> {
-    if let Some(selected) = selected {
-        if let Some(option) = options.iter().find(|option| option.label == selected) {
-            if !option.updates.is_empty() {
-                let updates: Vec<(PathBuf, Option<bool>)> = option
-                    .updates
-                    .iter()
-                    .map(|update| (update.path.clone(), update.decision))
-                    .collect();
-                trust_store.set_many(&updates)?;
-            }
-            return Ok(option.trusted);
+    if let Some(selected) = selected
+        && let Some(option) = options.iter().find(|option| option.label == selected)
+    {
+        if !option.updates.is_empty() {
+            let updates: Vec<(PathBuf, Option<bool>)> = option
+                .updates
+                .iter()
+                .map(|update| (update.path.clone(), update.decision))
+                .collect();
+            trust_store.set_many(&updates)?;
         }
+        return Ok(option.trusted);
     }
     Ok(false)
 }
@@ -503,14 +503,14 @@ pub async fn resolve_project_trusted_async(
     if !has_trust_requiring_project_resources(cwd) {
         return Ok(true);
     }
-    if let Some(event) = extension_event {
-        if event.trusted != ProjectTrustEventDecision::Undecided {
-            let trusted = event.trusted == ProjectTrustEventDecision::Yes;
-            if event.remember == Some(true) {
-                trust_store.set(cwd, Some(trusted))?;
-            }
-            return Ok(trusted);
+    if let Some(event) = extension_event
+        && event.trusted != ProjectTrustEventDecision::Undecided
+    {
+        let trusted = event.trusted == ProjectTrustEventDecision::Yes;
+        if event.remember == Some(true) {
+            trust_store.set(cwd, Some(trusted))?;
         }
+        return Ok(trusted);
     }
     if let Some(decision) = trust_store.get(cwd)? {
         return Ok(decision);
@@ -570,8 +570,8 @@ mod tests {
                 .collect();
             for (name, value) in vars {
                 match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
+                    Some(v) => rpi_test_env::set_var(name, v),
+                    None => rpi_test_env::remove_var(name),
                 }
             }
             (lock, EnvGuard { saved })
@@ -582,8 +582,8 @@ mod tests {
         fn drop(&mut self) {
             for (name, value) in &self.saved {
                 match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
+                    Some(v) => rpi_test_env::set_var(name, v),
+                    None => rpi_test_env::remove_var(name),
                 }
             }
         }

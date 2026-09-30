@@ -32,10 +32,10 @@ use rpi_agent::{Agent, AgentOptions, InitialAgentState};
 use rpi_ai::types::{StopReason, TextContent, ToolResultContent};
 use rpi_test_support::diff::diff_jsonl;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxAssistantOptions, FauxProvider,
-    FauxProviderOptions,
+    FauxAssistantOptions, FauxProvider, FauxProviderOptions, faux_assistant_message, faux_text,
+    faux_tool_call,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -85,10 +85,10 @@ fn prepare_lines(text: &str) -> String {
             continue;
         }
         let mut value: Value = serde_json::from_str(line).expect("fixture/actual line is JSON");
-        if let Some(event_type) = value.get("type").and_then(Value::as_str) {
-            if DROPPED_EVENT_TYPES.contains(&event_type) {
-                continue;
-            }
+        if let Some(event_type) = value.get("type").and_then(Value::as_str)
+            && DROPPED_EVENT_TYPES.contains(&event_type)
+        {
+            continue;
         }
         if matches!(
             value.get("type").and_then(Value::as_str),
@@ -98,10 +98,10 @@ fn prepare_lines(text: &str) -> String {
             continue;
         }
         strip_keys(&mut value);
-        if value.get("type").and_then(Value::as_str) == Some("agent_end") {
-            if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
-                messages.retain(|message| message["role"] != serde_json::json!("system"));
-            }
+        if value.get("type").and_then(Value::as_str) == Some("agent_end")
+            && let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut)
+        {
+            messages.retain(|message| message["role"] != serde_json::json!("system"));
         }
         out.push_str(&serde_json::to_string(&value).expect("render"));
         out.push('\n');
@@ -310,11 +310,13 @@ fn fixture_bash_tool() -> FixtureTool {
 async fn parity_single_turn() {
     async fn scenario() {
         let provider = FauxProvider::new(FauxProviderOptions::default());
-        provider.set_responses(vec![faux_assistant_message(
-            "Hello from the faux provider!",
-            FauxAssistantOptions::default(),
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message(
+                "Hello from the faux provider!",
+                FauxAssistantOptions::default(),
+            )
+            .into(),
+        ]);
         let agent = agent_for(&provider, Vec::new());
         let events = subscribe(&agent);
 
@@ -383,11 +385,13 @@ async fn parity_abort() {
             tokens_per_second: Some(50.0),
             ..Default::default()
         });
-        provider.set_responses(vec![faux_assistant_message(
-            "A long answer that the user will abort before it finishes streaming. ".repeat(8),
-            FauxAssistantOptions::default(),
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message(
+                "A long answer that the user will abort before it finishes streaming. ".repeat(8),
+                FauxAssistantOptions::default(),
+            )
+            .into(),
+        ]);
         let agent = Arc::new(agent_for(&provider, Vec::new()));
         let events = subscribe(&agent);
 
@@ -415,14 +419,16 @@ async fn parity_abort() {
 async fn parity_length_truncation() {
     async fn scenario() {
         let provider = FauxProvider::new(FauxProviderOptions::default());
-        provider.set_responses(vec![faux_assistant_message(
-            "Truncated answer that hit the max token limit",
-            FauxAssistantOptions {
-                stop_reason: Some(StopReason::Length),
-                ..Default::default()
-            },
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message(
+                "Truncated answer that hit the max token limit",
+                FauxAssistantOptions {
+                    stop_reason: Some(StopReason::Length),
+                    ..Default::default()
+                },
+            )
+            .into(),
+        ]);
         let agent = agent_for(&provider, Vec::new());
         let events = subscribe(&agent);
 

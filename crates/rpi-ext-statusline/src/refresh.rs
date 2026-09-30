@@ -10,15 +10,15 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::config::{self, Placement, DEFAULT_LIVE_REFRESH_MS};
-use crate::payload::{build_stdin_json, HOOK_EVENT_STATUS};
+use crate::config::{self, DEFAULT_LIVE_REFRESH_MS, Placement};
+use crate::payload::{HOOK_EVENT_STATUS, build_stdin_json};
 use crate::render::{footer_tree, status_text};
 use crate::runner::{self, CancelToken, ScriptError};
 use crate::state::{EngineState, Snapshot};
-use crate::{host_ok, AsyncHostCalls, ENGINE};
+use crate::{AsyncHostCalls, ENGINE, host_ok};
 
 /// `ui.setStatus` key (the `status` placement channel). Distinct from the
 /// mcp-adapter's "mcp" key so both footers can coexist.
@@ -439,10 +439,10 @@ fn snapshot_from_engine(
     with_engine(|engine| {
         if let Some(info) = &ctx.session_file {
             let path = info.get("path").and_then(Value::as_str).map(str::to_owned);
-            if let Some(id) = info.get("id").and_then(Value::as_str) {
-                if !id.is_empty() {
-                    engine.set_authoritative_session(path, id.to_owned());
-                }
+            if let Some(id) = info.get("id").and_then(Value::as_str)
+                && !id.is_empty()
+            {
+                engine.set_authoritative_session(path, id.to_owned());
             }
         }
         let (transcript_path, session_id) = match engine.authoritative_session() {

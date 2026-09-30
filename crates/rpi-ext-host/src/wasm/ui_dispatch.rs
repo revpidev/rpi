@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::host_call::{block_on, str_arg};
 use super::HostState;
+use super::host_call::{block_on, str_arg};
 use crate::api::{
     ExtensionWidgetOptions, NotifyType, UiDialogOptions, WidgetContent, WidgetPlacement,
     WorkingIndicatorOptions,

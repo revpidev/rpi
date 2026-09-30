@@ -29,11 +29,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rpi_agent::compaction::{
-    calculate_context_tokens, compact as run_compact, estimate_context_tokens,
-    estimate_messages_tokens, prepare_compaction, should_compact, CompactionResult,
-    CompactionSettings, SummarizationArgs,
+    CompactionResult, CompactionSettings, SummarizationArgs, calculate_context_tokens,
+    compact as run_compact, estimate_context_tokens, estimate_messages_tokens, prepare_compaction,
+    should_compact,
 };
-use rpi_agent::session::{get_latest_compaction_entry, parse_iso8601_ms, SessionEntry};
+use rpi_agent::session::{SessionEntry, get_latest_compaction_entry, parse_iso8601_ms};
 use rpi_agent::types::ThinkingLevel;
 use rpi_agent::{Agent, StreamFn};
 use rpi_ai::types::{AssistantMessage, Model, StopReason};
@@ -539,9 +539,10 @@ impl CompactionRunner {
 
         // `session_compact` with the saved entry (found by summary,
         // agent-session.ts:1876-1891 / :2156-2172).
-        if let Some(runner) = self.extension_runner() {
-            if runner.has_handlers("session_compact") {
-                let saved_entry = self
+        if let Some(runner) = self.extension_runner()
+            && runner.has_handlers("session_compact")
+        {
+            let saved_entry = self
                     .session()
                     .get_entries()
                     .into_iter()
@@ -549,21 +550,20 @@ impl CompactionRunner {
                     .find(
                         |entry| matches!(entry, SessionEntry::Compaction(compaction) if compaction.summary == result.summary),
                     );
-                if let Some(entry) = saved_entry {
-                    match serde_json::to_value(&entry) {
-                        Ok(value) => {
-                            runner
-                                .emit_session_compact(
-                                    value,
-                                    from_extension,
-                                    reason.as_str(),
-                                    will_retry,
-                                )
-                                .await;
-                        }
-                        Err(error) => {
-                            tracing::warn!("session_compact payload serialize failed: {error}")
-                        }
+            if let Some(entry) = saved_entry {
+                match serde_json::to_value(&entry) {
+                    Ok(value) => {
+                        runner
+                            .emit_session_compact(
+                                value,
+                                from_extension,
+                                reason.as_str(),
+                                will_retry,
+                            )
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!("session_compact payload serialize failed: {error}")
                     }
                 }
             }
@@ -614,10 +614,10 @@ impl CompactionRunner {
         let path = self.path_entries();
         let compaction_entry = get_latest_compaction_entry(&path);
         let compaction_ts = compaction_entry.and_then(|entry| parse_iso8601_ms(&entry.timestamp));
-        if let Some(ts) = compaction_ts {
-            if assistant_message.timestamp <= ts {
-                return false;
-            }
+        if let Some(ts) = compaction_ts
+            && assistant_message.timestamp <= ts
+        {
+            return false;
         }
 
         // Case 1: Recoverable failure (agent-session.ts:1990-2001 @ 32850ef7c).
@@ -711,10 +711,9 @@ impl CompactionRunner {
                     // compaction right after one just finished.
                     if let (Some(ts), rpi_agent::AgentMessage::Assistant(usage_msg)) =
                         (compaction_ts, &messages[last_usage_index])
+                        && usage_msg.timestamp <= ts
                     {
-                        if usage_msg.timestamp <= ts {
-                            return false;
-                        }
+                        return false;
                     }
                 }
                 estimate.tokens

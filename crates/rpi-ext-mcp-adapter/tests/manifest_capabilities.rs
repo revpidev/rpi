@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
 use rpi_ext_mcp_adapter::{commands, install_for_test};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct FakeHost {
     registered_commands: Mutex<Vec<String>>,

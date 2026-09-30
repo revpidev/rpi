@@ -11,8 +11,8 @@
 //!   resource-loader.ts:500-504).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::InlineExtension;

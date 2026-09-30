@@ -14,8 +14,8 @@
 //!   Google in `google_default_transport_is_not_rejected` and covered by the
 //!   existing Google contract tests.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -24,7 +24,7 @@ use rpi_ai::types::{
     StreamEvent, StreamOptions, Transport,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Unroutable loopback address: any reqwest (default-transport) attempt fails
 /// fast with a connect error, so reaching the canned body proves the custom
@@ -80,10 +80,10 @@ fn model(api: &str, provider: &str, base_url: &str, extra: Value) -> Model {
 fn context() -> Context {
     Context {
         system_prompt: None,
-        messages: vec![serde_json::from_value(
-            json!({"role": "user", "content": "hello", "timestamp": 1}),
-        )
-        .expect("user")],
+        messages: vec![
+            serde_json::from_value(json!({"role": "user", "content": "hello", "timestamp": 1}))
+                .expect("user"),
+        ],
         tools: None,
     }
 }
@@ -116,10 +116,10 @@ fn terminal_error_message(events: &[StreamEvent]) -> &str {
     for event in events.iter().rev() {
         match event {
             StreamEvent::Error { error, .. } => {
-                return error.error_message.as_deref().expect("error message")
+                return error.error_message.as_deref().expect("error message");
             }
             StreamEvent::Done { message, .. } => {
-                return message.error_message.as_deref().expect("error message")
+                return message.error_message.as_deref().expect("error message");
             }
             _ => {}
         }

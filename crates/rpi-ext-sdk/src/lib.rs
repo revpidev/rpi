@@ -12,7 +12,7 @@
 //! → host requests go through `rpi_host_call` as JSON (see
 //! `docs/extension-abi.md`).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub mod events;
 pub mod interactive_ui;
@@ -21,8 +21,11 @@ pub mod session_entries;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "rpi")]
-extern "C" {
-    fn rpi_host_call(ptr: *const u8, len: usize) -> u64;
+unsafe extern "C" {
+    // `safe`: the guest owns both buffers; the host import honors the
+    // v1 ABI contract (reads `len` bytes at `ptr`, returns a packed
+    // ptr/len pair the guest may read).
+    safe fn rpi_host_call(ptr: *const u8, len: usize) -> u64;
 }
 
 // ============================================================================
@@ -34,7 +37,7 @@ extern "C" {
 /// # Safety
 /// Called by the host with a byte length; the returned region stays valid
 /// until `rpi_dealloc`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rpi_alloc(len: usize) -> *mut u8 {
     let mut buf: Vec<u8> = Vec::with_capacity(len.max(1));
     let ptr = buf.as_mut_ptr();
@@ -46,7 +49,7 @@ pub extern "C" fn rpi_alloc(len: usize) -> *mut u8 {
 ///
 /// # Safety
 /// `ptr`/`len` must come from `rpi_alloc`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rpi_dealloc(ptr: *mut u8, len: usize) {
     drop(unsafe { Vec::from_raw_parts(ptr, 0, len) });
 }
@@ -96,7 +99,9 @@ pub fn host_call_typed(
     });
     let bytes = serde_json::to_vec(&request)
         .map_err(|error| InteractiveUiError::protocol(format!("host request JSON: {error}")))?;
-    let packed = unsafe { rpi_host_call(bytes.as_ptr(), bytes.len()) };
+    // `rpi_host_call` is declared `safe` in the extern block: the guest owns
+    // both buffers and the host honors the v1 ABI contract.
+    let packed = rpi_host_call(bytes.as_ptr(), bytes.len());
     let ptr = (packed >> 32) as u32 as *mut u8;
     let len = (packed & 0xffff_ffff) as usize;
     let response: Value = serde_json::from_slice(&unpack(ptr, len))
@@ -376,14 +381,14 @@ impl Extension {
 #[macro_export]
 macro_rules! export {
     ($register:path) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn rpi_extension_init() -> u64 {
             let mut ext = $crate::Extension::new();
             $register(&mut ext);
             $crate::finish_init()
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn rpi_dispatch(ptr: u32, len: usize) -> u64 {
             $crate::dispatch(ptr, len)
         }
@@ -475,7 +480,7 @@ pub fn dispatch_value(message: Vec<u8>) -> u64 {
         Err(error) => {
             return pack_json(
                 &json!({"error": {"kind": "invalidRequest", "message": error.to_string()}}),
-            )
+            );
         }
     };
     match route(message) {
@@ -689,11 +694,11 @@ mod tests {
                 Ok(Value::Null)
             });
             let calls_b = calls.clone();
-            let id_b = ext.on(&event_for_b, move |_| {
+
+            ext.on(&event_for_b, move |_| {
                 calls_b.lock().unwrap().push("B");
                 Ok(Value::Null)
-            });
-            id_b
+            })
         };
         ID_SLOT.with(|slot| *slot.borrow_mut() = Some(id_b));
 

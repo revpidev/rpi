@@ -9,17 +9,17 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use rpi::cli::args::{parse_args, Args};
+use rpi::cli::args::{Args, parse_args};
 use rpi::cli::auth_check::{
-    check_provider_auth, create_auth_check_model_runtime, get_provider_credential, AuthCheckReason,
-    AuthCheckStatus,
+    AuthCheckReason, AuthCheckStatus, check_provider_auth, create_auth_check_model_runtime,
+    get_provider_credential,
 };
-use rpi::cli::auth_command::{parse_auth_command, validate_auth_command_args, AuthCommandKind};
+use rpi::cli::auth_command::{AuthCommandKind, parse_auth_command, validate_auth_command_args};
 use rpi::cli::credential_print::{
-    resolve_credential_for_print, DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS,
+    DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS, resolve_credential_for_print,
 };
 use rpi::cli::run_auth::run_auth;
 use rpi_ai::auth::{
@@ -549,11 +549,11 @@ impl OAuthAuth for FailingRefreshOAuth {
 }
 
 /// Register a custom OAuth provider with `FailingRefreshOAuth` on the runtime.
-async fn runtime_with_failing_oauth_provider(
-) -> (Arc<rpi::core::model_runtime::ModelRuntime>, TempDir) {
+async fn runtime_with_failing_oauth_provider()
+-> (Arc<rpi::core::model_runtime::ModelRuntime>, TempDir) {
     use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
     use rpi_ai::api::openai_completions::OpenAiCompletions;
-    use rpi_ai::models::{create_provider, CreateProviderOptions, ProviderApi};
+    use rpi_ai::models::{CreateProviderOptions, ProviderApi, create_provider};
 
     let temp = TempDir::new();
     // Pre-seed an expired OAuth credential so the refresh path is triggered.
@@ -660,7 +660,7 @@ async fn test_auth_check_refresh_get_auth_none_maps_to_not_ready_exit_1() {
     // but `getProviderAuth` returns Ok(None) (resolve returns None).
     use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
     use rpi_ai::api::openai_completions::OpenAiCompletions;
-    use rpi_ai::models::{create_provider, CreateProviderOptions, ProviderApi};
+    use rpi_ai::models::{CreateProviderOptions, ProviderApi, create_provider};
 
     let _temp = TempDir::new();
     let store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::in_memory(HashMap::new()));

@@ -944,8 +944,8 @@ pub(crate) fn index_candidate_scan(
 /// evaluated candidates plus every *other* configured server's known current
 /// candidates.
 #[allow(clippy::too_many_arguments)] // upstream-shaped index builder: the
-                                     // tool surface, definition, prefix modes
-                                     // and metadata maps are all explicit.
+// tool surface, definition, prefix modes
+// and metadata maps are all explicit.
 fn build_selector_candidate_index(
     tools: &[McpTool],
     resources: &[McpResource],
@@ -1051,23 +1051,23 @@ pub fn format_schema(schema: &Value, indent: &str) -> String {
         return format!("{indent}(no schema)");
     };
 
-    if s.get("type").and_then(Value::as_str) == Some("object") {
-        if let Some(props) = s.get("properties").and_then(Value::as_object) {
-            let required = required_set(s);
-            if props.is_empty() {
-                return format!("{indent}(no parameters)");
-            }
-            let mut lines: Vec<String> = Vec::new();
-            for (name, prop_schema) in props {
-                lines.extend(format_property(
-                    name,
-                    prop_schema,
-                    required.contains(name),
-                    indent,
-                ));
-            }
-            return lines.join("\n");
+    if s.get("type").and_then(Value::as_str) == Some("object")
+        && let Some(props) = s.get("properties").and_then(Value::as_object)
+    {
+        let required = required_set(s);
+        if props.is_empty() {
+            return format!("{indent}(no parameters)");
         }
+        let mut lines: Vec<String> = Vec::new();
+        for (name, prop_schema) in props {
+            lines.extend(format_property(
+                name,
+                prop_schema,
+                required.contains(name),
+                indent,
+            ));
+        }
+        return lines.join("\n");
     }
 
     let lines = format_nested_schema(s, indent);

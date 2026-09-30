@@ -135,10 +135,10 @@ pub fn filter_orchestration_entries(entries: &mut Vec<Value>) {
         let Some(message) = entry.get("message") else {
             return true;
         };
-        if let Some(custom_type) = message.get("customType").and_then(Value::as_str) {
-            if PARENT_ONLY_CUSTOM_MESSAGE_TYPES.contains(&custom_type) {
-                return false;
-            }
+        if let Some(custom_type) = message.get("customType").and_then(Value::as_str)
+            && PARENT_ONLY_CUSTOM_MESSAGE_TYPES.contains(&custom_type)
+        {
+            return false;
         }
         if message.get("role").and_then(Value::as_str) == Some("toolResult")
             && message.get("toolName").and_then(Value::as_str) == Some("subagent")

@@ -23,8 +23,8 @@ use std::sync::Arc;
 use rpi_ai::auth::{AuthResult, CredentialStore, ModelsError};
 
 use crate::cli::args::Args;
-use crate::cli::auth_command::{get_auth_credential, validate_auth_command_args, AuthCommandError};
-use crate::core::model_resolver::{resolve_cli_model, ResolveCliModelOptions};
+use crate::cli::auth_command::{AuthCommandError, get_auth_credential, validate_auth_command_args};
+use crate::core::model_resolver::{ResolveCliModelOptions, resolve_cli_model};
 use crate::core::model_runtime::ModelRuntime;
 
 /// `AuthCheckStatus` (auth-check.ts:8).
@@ -209,10 +209,8 @@ pub async fn get_provider_credential(
     refresh: bool,
 ) -> Result<Option<String>, ModelsError> {
     let stored = credentials.read(provider_id, None).await?;
-    if !refresh {
-        if let Some(rpi_ai::auth::Credential::OAuth(oauth)) = &stored {
-            return Ok(Some(oauth.access.clone()));
-        }
+    if !refresh && let Some(rpi_ai::auth::Credential::OAuth(oauth)) = &stored {
+        return Ok(Some(oauth.access.clone()));
     }
     let auth: Option<AuthResult> = model_runtime.get_provider_auth(provider_id, None).await?;
     Ok(auth.and_then(|a| get_auth_credential(&a)))

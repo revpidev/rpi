@@ -32,10 +32,10 @@ use rpi_ai::types::{
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{
-    now_millis, run_agent_loop, run_agent_loop_continue, thinking_level_from_model_level,
     AfterToolCallFn, AgentContext, AgentEventSink, AgentLoopConfig, AgentLoopTurnUpdate,
     BeforeToolCallFn, ConvertToLlmFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext,
     PrepareNextTurnFn, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn,
+    now_millis, run_agent_loop, run_agent_loop_continue, thinking_level_from_model_level,
 };
 use crate::error::AgentError;
 use crate::messages::AgentMessage;
@@ -406,10 +406,10 @@ impl Agent {
             initial.system_prompt.as_deref(),
             Some(&declared_tools),
         );
-        if !matches!(messages.first(), Some(AgentMessage::System(_))) {
-            if let Some(initial_message) = initial_message {
-                messages.insert(0, AgentMessage::System(initial_message));
-            }
+        if !matches!(messages.first(), Some(AgentMessage::System(_)))
+            && let Some(initial_message) = initial_message
+        {
+            messages.insert(0, AgentMessage::System(initial_message));
         }
         Self {
             state: Arc::new(Mutex::new(AgentState {
@@ -868,22 +868,23 @@ impl Agent {
         };
 
         let should_stop_after_turn: Option<ShouldStopAfterTurnFn> =
-            if let Some(agent_callback) = self.should_stop_after_turn.clone() {
-                let active_run = self.active_run.clone();
-                Some(Arc::new(move |context: ShouldStopAfterTurnContext| {
-                    let agent_callback = agent_callback.clone();
-                    let active_run = active_run.clone();
-                    Box::pin(async move {
-                        // Upstream reads `this.signal` at call time (agent.ts:461).
-                        let signal = lock(&active_run)
-                            .as_ref()
-                            .map(|run| run.signal.clone())
-                            .unwrap_or_default();
-                        agent_callback(context, signal).await
-                    })
-                }))
-            } else {
-                None
+            match self.should_stop_after_turn.clone() {
+                Some(agent_callback) => {
+                    let active_run = self.active_run.clone();
+                    Some(Arc::new(move |context: ShouldStopAfterTurnContext| {
+                        let agent_callback = agent_callback.clone();
+                        let active_run = active_run.clone();
+                        Box::pin(async move {
+                            // Upstream reads `this.signal` at call time (agent.ts:461).
+                            let signal = lock(&active_run)
+                                .as_ref()
+                                .map(|run| run.signal.clone())
+                                .unwrap_or_default();
+                            agent_callback(context, signal).await
+                        })
+                    }))
+                }
+                _ => None,
             };
 
         AgentLoopConfig {
@@ -1100,10 +1101,10 @@ async fn process_events(
                 state.pending_tool_calls.remove(tool_call_id);
             }
             AgentEvent::TurnEnd { message, .. } => {
-                if let AgentMessage::Assistant(assistant) = message {
-                    if let Some(error_message) = &assistant.error_message {
-                        state.error_message = Some(error_message.clone());
-                    }
+                if let AgentMessage::Assistant(assistant) = message
+                    && let Some(error_message) = &assistant.error_message
+                {
+                    state.error_message = Some(error_message.clone());
                 }
             }
             AgentEvent::AgentEnd { .. } => {

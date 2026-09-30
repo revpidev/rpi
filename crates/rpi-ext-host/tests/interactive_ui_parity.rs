@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 use rpi_ext_host::interactive_ui as native;
 use rpi_ext_sdk::interactive_ui as wasm;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Scripted transport (implements both HostCall traits)
@@ -103,7 +103,7 @@ impl wasm::HostCall for FakeHost {
 
 /// Serialize both sides and assert byte equality; returns the JSON string.
 macro_rules! assert_same_json {
-    ($native:expr, $wasm:expr) => {{
+    ($native:expr_2021, $wasm:expr_2021) => {{
         let native_json = serde_json::to_string(&$native).expect("native json");
         let wasm_json = serde_json::to_string(&$wasm).expect("wasm json");
         assert_eq!(native_json, wasm_json, "native vs wasm JSON");
@@ -114,7 +114,7 @@ macro_rules! assert_same_json {
 /// Parse one JSON sample into both type sets and re-serialize to the same
 /// bytes (bidirectional wire compatibility).
 macro_rules! assert_cross_parse {
-    ($json:expr, $native_ty:ty, $wasm_ty:ty) => {{
+    ($json:expr_2021, $native_ty:ty, $wasm_ty:ty) => {{
         let native_value: $native_ty = serde_json::from_str($json).expect("native parse");
         let wasm_value: $wasm_ty = serde_json::from_str($json).expect("wasm parse");
         assert_eq!(

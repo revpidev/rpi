@@ -76,33 +76,32 @@ pub fn build_system_prompt(options: &Value) -> String {
     {
         prompt_sections.push(("addendum".to_owned(), append.to_owned()));
     }
-    if let Some(files) = map.get("contextFiles").and_then(Value::as_array) {
-        if !files.is_empty() {
-            let mut blocks = vec!["Project-specific instructions and guidelines:".to_owned()];
-            for file in files {
-                let path = file.get("path").and_then(Value::as_str).unwrap_or("");
-                let content = file.get("content").and_then(Value::as_str).unwrap_or("");
-                blocks.push(format!(
-                    "<project_instructions path=\"{path}\">\n{content}\n</project_instructions>"
-                ));
-            }
-            prompt_sections.push(("project_context".to_owned(), blocks.join("\n\n")));
+    if let Some(files) = map.get("contextFiles").and_then(Value::as_array)
+        && !files.is_empty()
+    {
+        let mut blocks = vec!["Project-specific instructions and guidelines:".to_owned()];
+        for file in files {
+            let path = file.get("path").and_then(Value::as_str).unwrap_or("");
+            let content = file.get("content").and_then(Value::as_str).unwrap_or("");
+            blocks.push(format!(
+                "<project_instructions path=\"{path}\">\n{content}\n</project_instructions>"
+            ));
         }
+        prompt_sections.push(("project_context".to_owned(), blocks.join("\n\n")));
     }
     // Skills: the host pre-formats to `skillsXml` (there is no `skills`
     // array on the rpi options JSON). Upstream gates the section on a
     // read/bash skill-file-read tool being selected (system-prompt.ts:160-167).
     let tools = selected_tools(map);
     let has_skill_read_tool = tools.iter().any(|tool| tool == "read" || tool == "bash");
-    if has_skill_read_tool {
-        if let Some(skills_xml) = map
+    if has_skill_read_tool
+        && let Some(skills_xml) = map
             .get("skillsXml")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            prompt_sections.push(("skills".to_owned(), skills_xml.to_owned()));
-        }
+    {
+        prompt_sections.push(("skills".to_owned(), skills_xml.to_owned()));
     }
     if let Some(cwd) = map.get("cwd").and_then(Value::as_str) {
         prompt_sections.push(("cwd".to_owned(), cwd.replace('\\', "/")));
@@ -209,7 +208,9 @@ fn build_rules(map: &serde_json::Map<String, Value>) -> String {
     let (has_bash, has_powershell) = (has("bash"), has("powershell"));
     if (has_bash || has_powershell) && !has("grep") && !has("find") && !has("ls") {
         if has_bash && has_powershell {
-            add_rule("Use bash or PowerShell for file operations like listing, searching, and finding files");
+            add_rule(
+                "Use bash or PowerShell for file operations like listing, searching, and finding files",
+            );
         } else if has_powershell {
             add_rule(
                 "Use PowerShell for file operations like listing, searching, and finding files",
@@ -222,12 +223,12 @@ fn build_rules(map: &serde_json::Map<String, Value>) -> String {
     // then the flat `promptGuidelines` extras (system-prompt.ts:111-114).
     let tool_guidelines = map.get("toolGuidelines").and_then(Value::as_object);
     for name in &tools {
-        if let Some(lines) = tool_guidelines.and_then(|guidelines| guidelines.get(name)) {
-            if let Some(lines) = lines.as_array() {
-                for line in lines {
-                    if let Some(line) = line.as_str() {
-                        add_rule(line);
-                    }
+        if let Some(lines) = tool_guidelines.and_then(|guidelines| guidelines.get(name))
+            && let Some(lines) = lines.as_array()
+        {
+            for line in lines {
+                if let Some(line) = line.as_str() {
+                    add_rule(line);
                 }
             }
         }

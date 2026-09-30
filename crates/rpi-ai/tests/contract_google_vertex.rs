@@ -15,16 +15,17 @@ use std::time::Duration;
 use futures::StreamExt;
 use rpi_ai::api::google_adc::AdcEndpoints;
 use rpi_ai::api::google_vertex::{
+    GCP_VERTEX_CREDENTIALS_MARKER, GoogleVertex, GoogleVertexOptions,
     base_url_includes_api_version, is_placeholder_api_key, resolve_api_key,
     resolve_custom_base_url, resolve_location, resolve_project, resolve_request_url, stream,
-    stream_simple, GoogleVertex, GoogleVertexOptions, GCP_VERTEX_CREDENTIALS_MARKER,
+    stream_simple,
 };
 use rpi_ai::models::ProviderStreams;
 use rpi_ai::types::{
     ApiKind, Context, Message, Model, ProviderEnv, SimpleStreamOptions, StopReason, StreamEvent,
     StreamOptions, ThinkingLevel, Tool,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -858,7 +859,9 @@ async fn test_error_flow_http_400_json_body_verbatim() {
     // SDK `throwErrorIfNotOK`: JSON error bodies are the message verbatim.
     assert_eq!(
         error.error_message.as_deref(),
-        Some("{\"error\":{\"code\":400,\"message\":\"Invalid JSON payload\",\"status\":\"INVALID_ARGUMENT\"}}")
+        Some(
+            "{\"error\":{\"code\":400,\"message\":\"Invalid JSON payload\",\"status\":\"INVALID_ARGUMENT\"}}"
+        )
     );
     let _ = rx.recv().await;
 }
@@ -1214,7 +1217,9 @@ async fn test_adc_missing_project_and_location_errors() {
     };
     assert_eq!(
         error.error_message.as_deref(),
-        Some("Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options.")
+        Some(
+            "Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options."
+        )
     );
 
     // Missing location.

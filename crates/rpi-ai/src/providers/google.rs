@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use crate::api::google_generative_ai::GoogleGenerativeAi;
-use crate::auth::{env_api_key_auth, ProviderAuth};
+use crate::auth::{ProviderAuth, env_api_key_auth};
 use crate::generated::get_builtin_models;
-use crate::models::{create_provider, CreateProviderOptions, Provider, ProviderApi};
+use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `googleProvider()`.
 pub fn google_provider() -> Arc<dyn Provider> {

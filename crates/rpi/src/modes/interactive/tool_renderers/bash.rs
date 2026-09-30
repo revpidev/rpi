@@ -33,13 +33,13 @@ use super::render_utils::{invalid_arg_text, str_value};
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
 use crate::modes::interactive::components::tool_execution::{
-    get_text_output, lock_recover, RenderShell, ResultRenderOptions, ToolDefinition,
-    ToolRenderContext, ToolResultState,
+    RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
+    get_text_output, lock_recover,
 };
 use crate::modes::interactive::components::visual_truncate::{
-    truncate_to_visual_lines, VisualTruncateResult,
+    VisualTruncateResult, truncate_to_visual_lines,
 };
-use crate::tools::truncate::{format_size, DEFAULT_MAX_BYTES};
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
 
 /// `BASH_PREVIEW_LINES` (bash.ts:204).
 const BASH_PREVIEW_LINES: usize = 5;
@@ -69,10 +69,12 @@ struct TickerGuard {
 impl TickerGuard {
     fn start(render_handle: RenderHandle) -> Self {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let thread_handle = thread::spawn(move || loop {
-            match stop_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => render_handle.request_render(),
+        let thread_handle = thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => render_handle.request_render(),
+                }
             }
         });
         Self {
@@ -211,10 +213,10 @@ struct BashResultRenderComponent {
 
 impl BashResultRenderComponent {
     fn preview(&self, width: usize) -> VisualTruncateResult {
-        if let Some((cached_width, cached)) = &*self.cache.borrow() {
-            if *cached_width == width {
-                return cached.clone();
-            }
+        if let Some((cached_width, cached)) = &*self.cache.borrow()
+            && *cached_width == width
+        {
+            return cached.clone();
         }
         // padding_x = 0: the component sits inside the component's `Box`
         // (visual-truncate.rs doc).
@@ -360,12 +362,10 @@ impl ToolDefinition for BashToolRenderer {
             && truncation.truncated
             && full_output_path.is_some()
             && output.ends_with(']')
+            && let Some(footer_start) = output.rfind("\n\n[")
+            && output[footer_start..].contains(full_output_path.unwrap_or_default())
         {
-            if let Some(footer_start) = output.rfind("\n\n[") {
-                if output[footer_start..].contains(full_output_path.unwrap_or_default()) {
-                    output = output[..footer_start].trim_end().to_string();
-                }
-            }
+            output = output[..footer_start].trim_end().to_string();
         }
 
         // bash.ts:263-267: per-line `toolOutput` coloring.
@@ -579,8 +579,11 @@ mod tests {
         assert!(stripped.contains("line12"));
         assert!(!stripped.contains("line7\n") || stripped.matches("line7").count() <= 1);
         // Warnings line.
-        assert!(stripped
-            .contains("[Full output: /tmp/rpi-bash-abc.log. Truncated: showing 12 of 50 lines]"));
+        assert!(
+            stripped.contains(
+                "[Full output: /tmp/rpi-bash-abc.log. Truncated: showing 12 of 50 lines]"
+            )
+        );
         // Timing line: `Took` once settled (startedAt set by render_call).
         renderer.render_call(&json!({"command": "lscpu"}), &theme, &context);
         let component = renderer

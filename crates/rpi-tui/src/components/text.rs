@@ -70,10 +70,11 @@ impl Text {
     /// cache keyed on the text value).
     pub(crate) fn render_text(&self, text: &str, width: usize) -> Vec<String> {
         // Check cache
-        if let Some(cache) = self.cache.borrow().as_ref() {
-            if cache.text == text && cache.width == width {
-                return cache.lines.clone();
-            }
+        if let Some(cache) = self.cache.borrow().as_ref()
+            && cache.text == text
+            && cache.width == width
+        {
+            return cache.lines.clone();
         }
 
         // Don't render anything if there's no actual text

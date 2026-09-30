@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rpi::core::output_guard::RawStdout;
-use rpi::modes::rpc::ui_bridge::{new_pending_ui_table, PendingUiTable, RpcUiBridge};
+use rpi::modes::rpc::ui_bridge::{PendingUiTable, RpcUiBridge, new_pending_ui_table};
 use rpi_ext_host::api::{NotifyType, UiBridge, UiDialogOptions, WidgetContent};
 use rpi_tui::tui::Component as _;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 /// Test double for the RPC stdout sink: forwards each write into a channel
@@ -451,21 +451,23 @@ async fn w4_tool_render_override_and_inheritance() {
     assert!(out.contains("EXT-CALL:call-9"), "out: {out}");
     // renderResult not provided → None (component falls back to built-in result
     // rendering = slot inheritance).
-    assert!(definition
-        .render_result(
-            &rpi::modes::interactive::components::tool_execution::ToolResultState {
-                content: Vec::new(),
-                is_error: false,
-                details: None,
-            },
-            rpi::modes::interactive::components::tool_execution::ResultRenderOptions {
-                expanded: false,
-                is_partial: false,
-            },
-            &theme,
-            &context,
-        )
-        .is_none());
+    assert!(
+        definition
+            .render_result(
+                &rpi::modes::interactive::components::tool_execution::ToolResultState {
+                    content: Vec::new(),
+                    is_error: false,
+                    details: None,
+                },
+                rpi::modes::interactive::components::tool_execution::ResultRenderOptions {
+                    expanded: false,
+                    is_partial: false,
+                },
+                &theme,
+                &context,
+            )
+            .is_none()
+    );
 }
 
 /// T17: per-hook merge at the component level — an extension missing a hook inherits

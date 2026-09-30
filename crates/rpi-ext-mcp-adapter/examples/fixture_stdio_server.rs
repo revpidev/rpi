@@ -26,14 +26,13 @@ fn main() {
     }
     let log_path = std::env::var("RPI_MCP_FIXTURE_LOG").ok();
     let log = |frame: &str| {
-        if let Some(path) = &log_path {
-            if let Ok(mut file) = std::fs::OpenOptions::new()
+        if let Some(path) = &log_path
+            && let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-            {
-                let _ = writeln!(file, "{frame}");
-            }
+        {
+            let _ = writeln!(file, "{frame}");
         }
     };
 

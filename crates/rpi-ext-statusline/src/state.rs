@@ -200,10 +200,9 @@ impl LiveMeasure {
         if let Some(output) = payload
             .pointer("/message/usage/output")
             .and_then(Value::as_u64)
+            && output > 0
         {
-            if output > 0 {
-                self.streaming_output_tokens = Some(output);
-            }
+            self.streaming_output_tokens = Some(output);
         }
     }
 
@@ -213,10 +212,10 @@ impl LiveMeasure {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             return;
         }
-        if let Some(output) = message.pointer("/usage/output").and_then(Value::as_u64) {
-            if output > 0 {
-                self.output_tokens_exact = Some(output);
-            }
+        if let Some(output) = message.pointer("/usage/output").and_then(Value::as_u64)
+            && output > 0
+        {
+            self.output_tokens_exact = Some(output);
         }
         if let Some(started) = self.message_started_at {
             self.message_ended_elapsed_ms = Some(started.elapsed().as_millis());
@@ -893,10 +892,12 @@ mod tests {
         engine.set_authoritative_session(Some("/a/b.jsonl".into()), "sid-1".into());
         engine.on_session_start(Some("new"));
         assert_eq!(engine.authoritative_session(), None);
-        assert!(!engine
-            .live
-            .as_ref()
-            .is_some_and(|live| live.ever_measured()));
+        assert!(
+            !engine
+                .live
+                .as_ref()
+                .is_some_and(|live| live.ever_measured())
+        );
         // reload keeps totals but resets live + authoritative too.
         engine.set_authoritative_session(None, "sid-2".into());
         engine.on_session_start(Some("reload"));
@@ -971,7 +972,7 @@ mod tests {
         let cwd = Path::new("/definitely/not/here");
         // Point the resolution at the fixture via the env override.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", &session_dir);
+        rpi_test_env::set_var("RPI_CODING_AGENT_SESSION_DIR", &session_dir);
         let mut state = EngineState::default();
         state.ensure_transcript(cwd, None);
         assert_eq!(state.transcript_path(), Some(file.as_path()));
@@ -987,7 +988,7 @@ mod tests {
         std::fs::remove_file(&file).expect("remove");
         state.ensure_transcript(cwd, None);
         assert_eq!(state.transcript_path(), None);
-        std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
+        rpi_test_env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1013,7 +1014,7 @@ mod tests {
             .expect("backdate mtime");
 
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", &session_dir);
+        rpi_test_env::set_var("RPI_CODING_AGENT_SESSION_DIR", &session_dir);
         let mut state = EngineState::default();
         state.ensure_transcript(Path::new("/cwd"), None);
         assert_eq!(
@@ -1029,7 +1030,7 @@ mod tests {
         std::fs::write(&current, b"{}").expect("write");
         state.ensure_transcript(Path::new("/cwd"), None);
         assert_eq!(state.transcript_path(), Some(current.as_path()));
-        std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
+        rpi_test_env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

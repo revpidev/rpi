@@ -17,14 +17,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::{BoxFuture, FutureExt, Shared};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::metadata::ServerEntry;
 use crate::oauth::store::{AuthStorageOptions, OAuthCredentialStore};
 use crate::protocol::http::{
-    resolve_http_config_with_server, HttpConfig, LegacySseTransport, StreamableHttpTransport,
-    SSE_FALLBACK_STATUSES,
+    HttpConfig, LegacySseTransport, SSE_FALLBACK_STATUSES, StreamableHttpTransport,
+    resolve_http_config_with_server,
 };
 use crate::protocol::stdio::connect_stdio;
 use crate::protocol::{DiscoveredMetadata, McpClient, ProtocolError, ProtocolVersionMode};
@@ -368,11 +368,11 @@ impl McpServerManager {
                 "MCP server manager is closed".to_string(),
             ));
         }
-        if let Some(existing) = self.get_connection(name) {
-            if existing.status() == ConnectionStatus::Connected {
-                existing.touch();
-                return Ok(existing);
-            }
+        if let Some(existing) = self.get_connection(name)
+            && existing.status() == ConnectionStatus::Connected
+        {
+            existing.touch();
+            return Ok(existing);
         }
 
         let shared = {
@@ -1592,17 +1592,15 @@ async fn enrich_http_connection_error(
     // (RFC1918/link-local/ULA) points at Local Network Privacy — the hint
     // replaces the probe (no amplified request). [VARIANT] the guidance
     // names rpi instead of Pi (brand policy).
-    if cfg!(target_os = "macos") {
-        if let Ok(Some(url)) = crate::utils::resolve_server_url(definition.get("url")) {
-            if is_literal_local_address(&url)
-                && !local_network_failure_codes(&original_message).is_empty()
-            {
-                let codes = local_network_failure_codes(&original_message).join(", ");
-                return ProtocolError::Transport(format!(
-                    "{original_message} — {codes} — macOS Local Network Privacy may be blocking access. Check System Settings > Privacy & Security > Local Network for the app hosting rpi; enable access if listed and restart it. Try launching rpi from Terminal.app or SSH. Routing or firewall problems can also cause this error."
-                ));
-            }
-        }
+    if cfg!(target_os = "macos")
+        && let Ok(Some(url)) = crate::utils::resolve_server_url(definition.get("url"))
+        && is_literal_local_address(&url)
+        && !local_network_failure_codes(&original_message).is_empty()
+    {
+        let codes = local_network_failure_codes(&original_message).join(", ");
+        return ProtocolError::Transport(format!(
+            "{original_message} — {codes} — macOS Local Network Privacy may be blocking access. Check System Settings > Privacy & Security > Local Network for the app hosting rpi; enable access if listed and restart it. Try launching rpi from Terminal.app or SSH. Routing or firewall problems can also cause this error."
+        ));
     }
     let url = match crate::utils::resolve_server_url(definition.get("url")) {
         Ok(Some(url)) => url,
@@ -1864,10 +1862,12 @@ mod tests {
         let (config, _) = http_config_with_auth(&store, "srv", &definition)
             .await
             .expect("config");
-        assert!(!config
-            .headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+        assert!(
+            !config
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        );
     }
 
     #[tokio::test]

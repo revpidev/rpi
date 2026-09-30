@@ -1191,12 +1191,16 @@ mod tests {
         // keybindings.test.ts @ 4181f66 (16ad96ae8).
         let keybindings = KeybindingsManager::with_defaults();
 
-        assert!(keybindings
-            .get_keys(Keybinding::EditorHistoryPrevious)
-            .is_empty());
-        assert!(keybindings
-            .get_keys(Keybinding::EditorHistoryNext)
-            .is_empty());
+        assert!(
+            keybindings
+                .get_keys(Keybinding::EditorHistoryPrevious)
+                .is_empty()
+        );
+        assert!(
+            keybindings
+                .get_keys(Keybinding::EditorHistoryNext)
+                .is_empty()
+        );
         // Unbound actions never match, so default keys keep their editor
         // behavior (e.g. ctrl+p is not swallowed by a history action).
         assert!(!keybindings.matches("\x10", Keybinding::EditorHistoryPrevious));

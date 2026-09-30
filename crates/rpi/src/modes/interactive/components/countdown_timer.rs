@@ -35,18 +35,20 @@ impl CountdownTimer {
         on_tick(remaining_seconds);
 
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let thread_handle = thread::spawn(move || loop {
-            match stop_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {
-                    remaining_seconds = remaining_seconds.saturating_sub(1);
-                    on_tick(remaining_seconds);
-                    if let Some(handle) = &render_handle {
-                        handle.request_render();
-                    }
-                    if remaining_seconds == 0 {
-                        on_expire();
-                        break;
+        let thread_handle = thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        remaining_seconds = remaining_seconds.saturating_sub(1);
+                        on_tick(remaining_seconds);
+                        if let Some(handle) = &render_handle {
+                            handle.request_render();
+                        }
+                        if remaining_seconds == 0 {
+                            on_expire();
+                            break;
+                        }
                     }
                 }
             }

@@ -199,10 +199,10 @@ impl CustomEditor {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Extension-registered shortcuts first (custom-editor.ts:32-34).
-        if let Some(handler) = self.on_extension_shortcut.as_mut() {
-            if handler(data) {
-                return;
-            }
+        if let Some(handler) = self.on_extension_shortcut.as_mut()
+            && handler(data)
+        {
+            return;
         }
 
         // Clipboard paste keybinding (custom-editor.ts:37-41).
@@ -346,8 +346,8 @@ impl Focusable for CustomEditorRegion {
 mod tests {
     use super::*;
     use rpi_tui::tui_main_screen::TuiMainScreen;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::MutexGuard;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Serializes the tests in this module: every test installs the global
     /// keybinding registry (and one test installs user overrides), and cargo

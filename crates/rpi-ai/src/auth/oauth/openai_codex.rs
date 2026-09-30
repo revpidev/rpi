@@ -36,14 +36,14 @@
 //!   `f64` with JS `Number` semantics (`""` → 0, trim, finite, ≥ 0 required).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::Html;
 use axum::routing::get;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -52,7 +52,7 @@ use super::super::resolve::{ModelsError, ModelsErrorCode};
 use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
 use super::callback_page::{default_callback_host, oauth_error_html, oauth_success_html};
 use super::device_code::{
-    poll_oauth_device_code_flow, DeviceCodePollOptions, DeviceCodePollResult, CANCEL_MESSAGE,
+    CANCEL_MESSAGE, DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
 use super::pkce::generate_pkce;
 
@@ -165,10 +165,11 @@ fn manual_code_from_input(
     expected_state: &str,
 ) -> Result<Option<String>, ModelsError> {
     let parsed = parse_authorization_input(input);
-    if let Some(state) = parsed.state.as_deref() {
-        if !state.is_empty() && state != expected_state {
-            return Err(error("State mismatch"));
-        }
+    if let Some(state) = parsed.state.as_deref()
+        && !state.is_empty()
+        && state != expected_state
+    {
+        return Err(error("State mismatch"));
     }
     Ok(parsed.code.filter(|code| !code.is_empty()))
 }
@@ -1008,8 +1009,8 @@ mod tests {
     //! fake-clock tests (the flow-level checks here assert the
     //! request/response mapping with a 1s interval instead).
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1313,10 +1314,13 @@ mod tests {
     /// Wrap a `manual_code`-only handler with the leading login-method
     /// selection: the flow prompts `select` before the browser flow starts.
     fn browser_flow(
-        manual: impl Fn(InteractionHandle, AuthPrompt) -> BoxFutureSend<'static, Result<String, ModelsError>>
-            + Send
-            + Sync
-            + 'static,
+        manual: impl Fn(
+            InteractionHandle,
+            AuthPrompt,
+        ) -> BoxFutureSend<'static, Result<String, ModelsError>>
+        + Send
+        + Sync
+        + 'static,
     ) -> PromptHandler {
         Box::new(move |handle, prompt| match prompt {
             AuthPrompt::Select { .. } => Box::pin(async move { Ok("browser".to_owned()) }),
@@ -1936,10 +1940,12 @@ mod tests {
             credential.extra.get("accountId"),
             Some(&json!("account-cb"))
         );
-        assert!(handle
-            .manual_signal()
-            .expect("manual signal")
-            .is_cancelled());
+        assert!(
+            handle
+                .manual_signal()
+                .expect("manual signal")
+                .is_cancelled()
+        );
 
         let bodies = mock.requests_matching("/oauth/token");
         assert_eq!(bodies.len(), 1);
@@ -1948,9 +1954,11 @@ mod tests {
             bodies[0].form_get("redirect_uri").as_deref(),
             Some(REDIRECT_URI)
         );
-        assert!(bodies[0]
-            .form_get("code_verifier")
-            .is_some_and(|verifier| !verifier.is_empty()));
+        assert!(
+            bodies[0]
+                .form_get("code_verifier")
+                .is_some_and(|verifier| !verifier.is_empty())
+        );
     }
 
     /// Browser flow via the manual prompt: a pasted redirect URL with the

@@ -38,8 +38,8 @@ use rpi_agent::{Agent, AgentOptions, InitialAgentState};
 use rpi_ai::types::{AssistantMessage, StopReason};
 use rpi_test_support::diff::diff_jsonl;
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAssistantOptions, FauxModelDefinition, FauxProvider,
-    FauxProviderOptions, FauxResponseStep,
+    FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    faux_assistant_message,
 };
 use serde_json::Value;
 

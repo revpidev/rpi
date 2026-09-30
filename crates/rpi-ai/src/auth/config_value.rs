@@ -166,10 +166,10 @@ fn resolve_env_config_value(name: &str, env: Option<&ProviderEnv>) -> Option<Str
 fn get_template_env_var_names(parts: &[TemplatePart]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for part in parts {
-        if let TemplatePart::Env(name) = part {
-            if !names.contains(name) {
-                names.push(name.clone());
-            }
+        if let TemplatePart::Env(name) = part
+            && !names.contains(name)
+        {
+            names.push(name.clone());
         }
     }
     names
@@ -342,11 +342,7 @@ fn execute_command_uncached(command: &str) -> Option<String> {
         return None;
     }
     let value = String::from_utf8_lossy(&output).trim().to_owned();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 /// `executeCommand` — process-lifetime cache of both hits and misses.
@@ -469,14 +465,14 @@ mod tests {
         fn set(name: &'static str, value: &str) -> Self {
             // Distinct variable names per test: process env is global, so
             // tests never share a name (upstream does the same).
-            std::env::set_var(name, value);
+            rpi_test_env::set_var(name, value);
             Self(name)
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            std::env::remove_var(self.0);
+            rpi_test_env::remove_var(self.0);
         }
     }
 
@@ -594,17 +590,17 @@ mod tests {
     #[test]
     fn does_not_cache_environment_values() {
         let dynamic: &'static str = "TEST_CONFIG_DYNAMIC";
-        std::env::set_var(dynamic, "first");
+        rpi_test_env::set_var(dynamic, "first");
         assert_eq!(
             resolve_config_value("$TEST_CONFIG_DYNAMIC", None).as_deref(),
             Some("first")
         );
-        std::env::set_var(dynamic, "second");
+        rpi_test_env::set_var(dynamic, "second");
         assert_eq!(
             resolve_config_value("$TEST_CONFIG_DYNAMIC", None).as_deref(),
             Some("second")
         );
-        std::env::remove_var(dynamic);
+        rpi_test_env::remove_var(dynamic);
     }
 
     #[test]

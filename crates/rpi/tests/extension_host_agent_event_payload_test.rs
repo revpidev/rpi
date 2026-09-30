@@ -22,10 +22,10 @@ use rpi_ext_host::api::ContextActions;
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -375,9 +375,11 @@ async fn agent_event_payloads_match_upstream_shapes() {
     assert_eq!(tool_starts.len(), 1);
     assert_eq!(tool_starts[0]["type"], "tool_execution_start");
     assert_eq!(tool_starts[0]["toolName"], "updating");
-    assert!(!tool_starts[0]["toolCallId"]
-        .as_str()
-        .is_some_and(str::is_empty));
+    assert!(
+        !tool_starts[0]["toolCallId"]
+            .as_str()
+            .is_some_and(str::is_empty)
+    );
     assert_eq!(tool_starts[0]["args"], json!({"n": 1}));
 
     // tool_execution_update: {type, toolCallId, toolName, args, partialResult}.

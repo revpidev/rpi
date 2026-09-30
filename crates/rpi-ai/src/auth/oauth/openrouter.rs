@@ -29,13 +29,13 @@
 //!   and is not ported (deviation D-032).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::State;
 use axum::http::{Method, StatusCode};
 use axum::response::Html;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -1147,10 +1147,12 @@ mod tests {
         assert_eq!(credential.access, "sk-or-test");
         assert_eq!(credential.refresh, "");
         assert_eq!(credential.expires, EXPIRES_NEVER);
-        assert!(handle
-            .manual_signal()
-            .expect("manual signal")
-            .is_cancelled());
+        assert!(
+            handle
+                .manual_signal()
+                .expect("manual signal")
+                .is_cancelled()
+        );
 
         // Exchange body + PKCE cross-check (base64url(sha256(verifier))).
         let bodies = mock.bodies();
@@ -1539,11 +1541,13 @@ mod tests {
             .await
             .expect("callback response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response
-            .text()
-            .await
-            .expect("page")
-            .contains("OpenRouter returned no authorization code."));
+        assert!(
+            response
+                .text()
+                .await
+                .expect("page")
+                .contains("OpenRouter returned no authorization code.")
+        );
 
         // The wait was not settled: a valid callback completes the login.
         let response = reqwest::get(format!("{callback_url}?code=callback-code"))

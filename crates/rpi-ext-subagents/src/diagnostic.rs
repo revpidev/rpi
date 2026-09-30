@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `PI_CORE_CHILD_TOOLS` (tool-availability.ts:16).
 pub const PI_CORE_CHILD_TOOLS: [&str; 7] = ["bash", "edit", "find", "grep", "ls", "read", "write"];
@@ -247,8 +247,10 @@ mod tests {
         // absent tool is reported.
         assert_eq!(diagnostic.missing, vec!["web_search".to_string()]);
         let message = format_child_tool_diagnostic(&diagnostic);
-        assert!(message
-            .starts_with("Agent 'researcher' requested unavailable child tools: web_search."));
+        assert!(
+            message
+                .starts_with("Agent 'researcher' requested unavailable child tools: web_search.")
+        );
         assert!(message.contains("strict allowlist"));
         // Read-back matches.
         assert_eq!(read_child_tool_diagnostic_error(Some(&path)), Some(message));

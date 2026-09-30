@@ -19,12 +19,12 @@ pub mod normalize;
 pub mod ui_host;
 pub mod vt;
 
-pub use diff::{diff_event_sequence, diff_events_normalized, diff_jsonl, diff_text, DiffFailure};
+pub use diff::{DiffFailure, diff_event_sequence, diff_events_normalized, diff_jsonl, diff_text};
 pub use error::TestSupportError;
 pub use faux::{
-    faux_assistant_message, faux_text, faux_thinking, faux_tool_call, FauxAiProvider,
-    FauxAssistantOptions, FauxContent, FauxModelDefinition, FauxProvider, FauxProviderOptions,
-    FauxResponseStep, FauxState,
+    FauxAiProvider, FauxAssistantOptions, FauxContent, FauxModelDefinition, FauxProvider,
+    FauxProviderOptions, FauxResponseStep, FauxState, faux_assistant_message, faux_text,
+    faux_thinking, faux_tool_call,
 };
 pub use normalize::Normalizer;
 pub use vt::VirtualTerminal;

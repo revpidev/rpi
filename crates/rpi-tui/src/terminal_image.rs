@@ -35,8 +35,8 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
 
@@ -511,20 +511,20 @@ pub fn encode_kitty(base64_data: &str, options: &KittyEncodeOptions) -> String {
     }
     // Upstream uses JS truthiness (`if (options.columns)`, ...), so zero is
     // omitted (terminal-image.ts:180-182).
-    if let Some(columns) = options.columns {
-        if columns != 0 {
-            params.push(format!("c={columns}"));
-        }
+    if let Some(columns) = options.columns
+        && columns != 0
+    {
+        params.push(format!("c={columns}"));
     }
-    if let Some(rows) = options.rows {
-        if rows != 0 {
-            params.push(format!("r={rows}"));
-        }
+    if let Some(rows) = options.rows
+        && rows != 0
+    {
+        params.push(format!("r={rows}"));
     }
-    if let Some(image_id) = options.image_id {
-        if image_id != 0 {
-            params.push(format!("i={image_id}"));
-        }
+    if let Some(image_id) = options.image_id
+        && image_id != 0
+    {
+        params.push(format!("i={image_id}"));
     }
     let params = params.join(",");
 
@@ -702,10 +702,10 @@ pub fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
         },
     );
     registry.order.push_back(metadata.image_id);
-    if registry.map.len() > KITTY_IMAGE_METADATA_LIMIT {
-        if let Some(oldest_image_id) = registry.order.pop_front() {
-            registry.map.remove(&oldest_image_id);
-        }
+    if registry.map.len() > KITTY_IMAGE_METADATA_LIMIT
+        && let Some(oldest_image_id) = registry.order.pop_front()
+    {
+        registry.map.remove(&oldest_image_id);
     }
 }
 
@@ -1188,19 +1188,19 @@ mod tests {
             .map(|&k| (k, std::env::var(k).ok()))
             .collect();
         for &k in &ENV_KEYS {
-            std::env::remove_var(k);
+            rpi_test_env::remove_var(k);
         }
         for (k, v) in overrides {
             match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
+                Some(v) => rpi_test_env::set_var(k, v),
+                None => rpi_test_env::remove_var(k),
             }
         }
         f();
         for (k, v) in saved {
             match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
+                Some(v) => rpi_test_env::set_var(k, v),
+                None => rpi_test_env::remove_var(k),
             }
         }
     }
@@ -1526,8 +1526,8 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_capabilities_enables_images_and_hyperlinks_for_warp_via_warp_terminal_session_uuid(
-    ) {
+    fn test_detect_capabilities_enables_images_and_hyperlinks_for_warp_via_warp_terminal_session_uuid()
+     {
         with_env(
             &[(
                 "WARP_TERMINAL_SESSION_UUID",
@@ -1751,8 +1751,8 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_capabilities_enables_truecolor_and_hyperlinks_for_windows_terminal_outside_multiplexers(
-    ) {
+    fn test_detect_capabilities_enables_truecolor_and_hyperlinks_for_windows_terminal_outside_multiplexers()
+     {
         with_env(
             &[
                 ("WT_SESSION", Some("session")),

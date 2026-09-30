@@ -2,8 +2,8 @@
 //!
 //! Port of the write tool tests from `tools.test.ts:240-260`.
 
-use rpi::tools::write::{create_write_tool, WriteToolOptions};
 use rpi::tools::ToolContext;
+use rpi::tools::write::{WriteToolOptions, create_write_tool};
 use rpi_agent::error::AgentError;
 use serde_json::json;
 use std::path::PathBuf;
@@ -217,7 +217,7 @@ async fn test_write_metadata() {
 #[tokio::test]
 async fn test_write_and_edit_share_mutation_queue() {
     // Write and edit on the same file should serialize (no torn write).
-    use rpi::tools::edit::{create_edit_tool, EditToolOptions};
+    use rpi::tools::edit::{EditToolOptions, create_edit_tool};
 
     let tmp = TempDir::new();
     let file_path = tmp.path().join("shared.txt");

@@ -287,10 +287,10 @@ pub struct ModelsJson {
 // ---------------------------------------------------------------------------
 
 fn check_min_length(errors: &mut Vec<String>, path: &str, value: &Option<String>) {
-    if let Some(value) = value {
-        if value.is_empty() {
-            errors.push(format!("  - {path}: must NOT have fewer than 1 characters"));
-        }
+    if let Some(value) = value
+        && value.is_empty()
+    {
+        errors.push(format!("  - {path}: must NOT have fewer than 1 characters"));
     }
 }
 
@@ -304,10 +304,10 @@ fn validate(config: &ModelsJson) -> Vec<String> {
         check_min_length(&mut errors, &format!("{base}.baseUrl"), &provider.base_url);
         check_min_length(&mut errors, &format!("{base}.apiKey"), &provider.api_key);
         check_min_length(&mut errors, &format!("{base}.api"), &provider.api);
-        if let Some(oauth) = &provider.oauth {
-            if oauth != "radius" {
-                errors.push(format!("  - {base}.oauth: must be equal to constant"));
-            }
+        if let Some(oauth) = &provider.oauth
+            && oauth != "radius"
+        {
+            errors.push(format!("  - {base}.oauth: must be equal to constant"));
         }
         for (index, model) in provider.models.as_deref().unwrap_or(&[]).iter().enumerate() {
             let base = format!("{base}.models.{index}");

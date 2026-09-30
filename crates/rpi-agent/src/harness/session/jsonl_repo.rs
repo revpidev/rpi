@@ -30,7 +30,7 @@ use crate::harness::types::{
 use crate::session::parse_iso8601_ms;
 
 use super::jsonl_storage::{
-    load_jsonl_session_metadata, JsonlSessionStorage, JsonlSessionStorageCreateOptions,
+    JsonlSessionStorage, JsonlSessionStorageCreateOptions, load_jsonl_session_metadata,
 };
 use super::repo_utils::{
     create_session_id, create_timestamp, get_entries_to_fork, get_file_system_result_or_throw,
@@ -372,7 +372,7 @@ impl SessionRepo<JsonlSessionMetadata, JsonlSessionCreateOptions, JsonlSessionLi
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
 
     /// `expect_err` without a `T: Debug` bound (the storage types are not `Debug`).
     fn expect_err<T, E>(result: Result<T, E>, message: &str) -> E {
@@ -382,7 +382,7 @@ mod tests {
         }
     }
     use crate::harness::session::repo_utils::test_support::{
-        assistant_message, user_message, TestFs,
+        TestFs, assistant_message, user_message,
     };
     use crate::harness::types::{Session, SessionCreateOptions, SessionEntryCursorOptions};
 

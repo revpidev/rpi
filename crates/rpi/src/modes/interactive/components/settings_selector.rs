@@ -608,24 +608,24 @@ impl SelectSubmenu {
             list.set_selected_index(index);
         }
         list.on_select = Some(Box::new(move |item: &SelectItem| {
-            if let Ok(mut callback) = on_select.lock() {
-                if let Some(callback) = callback.as_mut() {
-                    callback(item);
-                }
+            if let Ok(mut callback) = on_select.lock()
+                && let Some(callback) = callback.as_mut()
+            {
+                callback(item);
             }
         }));
         list.on_cancel = Some(Box::new(move || {
-            if let Ok(mut callback) = on_cancel.lock() {
-                if let Some(callback) = callback.as_mut() {
-                    callback();
-                }
+            if let Ok(mut callback) = on_cancel.lock()
+                && let Some(callback) = callback.as_mut()
+            {
+                callback();
             }
         }));
         list.on_selection_change = Some(Box::new(move |item: &SelectItem| {
-            if let Ok(mut callback) = on_selection_change.lock() {
-                if let Some(callback) = callback.as_mut() {
-                    callback(item);
-                }
+            if let Ok(mut callback) = on_selection_change.lock()
+                && let Some(callback) = callback.as_mut()
+            {
+                callback(item);
             }
         }));
         list
@@ -1162,10 +1162,10 @@ fn single_mode_theme_items(available_themes: &[String], current_theme: &str) -> 
 
 /// `preferredTheme` (settings-selector.ts:243-247).
 fn preferred_theme(available_themes: &[String], preferred: Option<&str>, fallback: &str) -> String {
-    if let Some(preferred) = preferred {
-        if available_themes.iter().any(|t| t == preferred) {
-            return preferred.to_string();
-        }
+    if let Some(preferred) = preferred
+        && available_themes.iter().any(|t| t == preferred)
+    {
+        return preferred.to_string();
     }
     if available_themes.iter().any(|t| t == fallback) {
         return fallback.to_string();
@@ -2569,9 +2569,11 @@ mod tests {
         // row #9668/V15-05; the 10-row window always scrolls).
         let supports_images = get_capabilities().images.is_some();
         let item_count = if supports_images { 33 } else { 31 };
-        assert!(lines
-            .iter()
-            .any(|l| l.contains(&format!("(1/{item_count})"))));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!("(1/{item_count})")))
+        );
     }
 
     /// rpi#54 (V15-12 FR-B): the settings row renders `unlimited` for the
@@ -2585,9 +2587,11 @@ mod tests {
         // The selector's choice list round-trips the label to the stored
         // numeric value (`update_value` parses by label; settings persist
         // the number, so the rename needs no migration).
-        assert!(HTTP_IDLE_TIMEOUT_CHOICES
-            .iter()
-            .any(|(label, ms)| *label == "unlimited" && *ms == 0));
+        assert!(
+            HTTP_IDLE_TIMEOUT_CHOICES
+                .iter()
+                .any(|(label, ms)| *label == "unlimited" && *ms == 0)
+        );
     }
 
     #[test]
@@ -2604,9 +2608,11 @@ mod tests {
         // First item is Auto-compact (values false → true).
         component.handle_input("\r");
         let lines = render_plain(&component, 100);
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Auto-compact") && l.contains("true")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Auto-compact") && l.contains("true"))
+        );
         assert_eq!(
             *received.lock().unwrap(),
             vec![SettingsChange::AutoCompact(true)]
@@ -2712,9 +2718,11 @@ mod tests {
             .get_settings_list()
             .update_value("autocompact", "true");
         let lines = render_plain(&component, 100);
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Auto-compact") && l.contains("true")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Auto-compact") && l.contains("true"))
+        );
     }
 
     #[test]
@@ -2860,7 +2868,7 @@ mod tests {
         }
         component.handle_input("\r"); // open submenu
         component.handle_input("\r"); // → level step
-                                      // Esc at step 2 goes back to step 1 (SteppedSubmenu).
+        // Esc at step 2 goes back to step 1 (SteppedSubmenu).
         component.handle_input("\x1b");
         let joined = render_plain(&component, 100).join("\n");
         assert!(joined.contains("Step 1/2"), "esc backs to model step");
@@ -2959,9 +2967,11 @@ mod tests {
         }
         component.handle_input("\r");
         let lines = render_plain(&component, 100);
-        assert!(lines
-            .join("\n")
-            .contains("Select a theme, or choose Automatic"));
+        assert!(
+            lines
+                .join("\n")
+                .contains("Select a theme, or choose Automatic")
+        );
         // Esc cancels the theme submenu back to the main panel.
         component.handle_input("\x1b");
         let lines = render_plain(&component, 100);
@@ -3001,9 +3011,11 @@ mod tests {
         component.handle_input("\r");
         let events = received.lock().unwrap();
         // Preview events fired during selection, then the write-back.
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, SettingsChange::ThemePreview(name) if name == "light/dark")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SettingsChange::ThemePreview(name) if name == "light/dark"))
+        );
         // Back on the automatic menu; pick "Apply" (3rd item) → Theme event
         // with the combined setting.
         drop(events);
@@ -3012,9 +3024,11 @@ mod tests {
         }
         component.handle_input("\r");
         let events = received.lock().unwrap();
-        assert!(events
-            .iter()
-            .any(|e| *e == SettingsChange::Theme("light/dark".to_string())));
+        assert!(
+            events
+                .iter()
+                .any(|e| *e == SettingsChange::Theme("light/dark".to_string()))
+        );
     }
 
     #[test]

@@ -23,11 +23,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
-use futures::future::{join_all, FutureExt, Shared};
+use futures::future::{FutureExt, Shared, join_all};
 
 use crate::auth::{
-    resolve_provider_auth, AuthContext, AuthResolutionOverrides, AuthResult, CredentialStore,
-    DefaultAuthContext, InMemoryCredentialStore, ModelsError, ModelsErrorCode, ProviderAuth,
+    AuthContext, AuthResolutionOverrides, AuthResult, CredentialStore, DefaultAuthContext,
+    InMemoryCredentialStore, ModelsError, ModelsErrorCode, ProviderAuth, resolve_provider_auth,
 };
 use crate::models::CreateModelsOptions;
 use crate::models_json::OrderedMap;
@@ -867,11 +867,13 @@ mod tests {
         let ghost = test_image_model("ghost", "m");
         let result = models.generate_images(&ghost, &context(), None).await;
         assert_eq!(result.stop_reason, ImagesStopReason::Error);
-        assert!(result
-            .error_message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Unknown provider: ghost"));
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Unknown provider: ghost")
+        );
 
         // Unconfigured (resolve -> None) still dispatches; the provider decides.
         let calls = Arc::new(Mutex::new(Vec::new()));

@@ -177,10 +177,10 @@ where
             .queues
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = queues.get(&queue_key) {
-            if Arc::strong_count(entry) == 2 {
-                queues.remove(&queue_key);
-            }
+        if let Some(entry) = queues.get(&queue_key)
+            && Arc::strong_count(entry) == 2
+        {
+            queues.remove(&queue_key);
         }
     }
 

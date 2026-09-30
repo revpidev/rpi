@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use url::Url;
 
 use crate::api::constrained_sampling::create_grammar_tool_input_properties;
@@ -53,20 +53,20 @@ use crate::api::openai_completions::{mapped_or_level_name, off_is_not_null, off_
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
 use crate::api::openai_responses::OPENAI_RESPONSES_MIN_OUTPUT_TOKENS;
 use crate::api::openai_responses_shared::{
-    convert_responses_messages, convert_responses_tools, ConvertResponsesMessagesOptions,
-    ConvertResponsesToolsOptions, ResponsesStreamOptions, ResponsesStreamProcessor,
+    ConvertResponsesMessagesOptions, ConvertResponsesToolsOptions, ResponsesStreamOptions,
+    ResponsesStreamProcessor, convert_responses_messages, convert_responses_tools,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
-use crate::models::{clamp_thinking_level, ProviderStreams};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
+use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantMessage, DoneReason, ErrorReason, Model, ModelThinkingLevel, ProviderHeaders,
     ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
     TranscriptContext, Usage,
 };
 use crate::utils::custom_fetch::send_provider_request;
-use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
+use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
     headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
@@ -74,7 +74,7 @@ use crate::utils::headers::{
 };
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions,
+    ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 
 // ---------------------------------------------------------------------------
@@ -257,10 +257,10 @@ pub fn resolve_azure_config(
         .or_else(|| get_provider_env_value("AZURE_OPENAI_RESOURCE_NAME", env));
 
     let mut resolved = base_url;
-    if resolved.is_none() {
-        if let Some(resource_name) = resource_name {
-            resolved = Some(build_default_base_url(&resource_name));
-        }
+    if resolved.is_none()
+        && let Some(resource_name) = resource_name
+    {
+        resolved = Some(build_default_base_url(&resource_name));
     }
     if resolved.is_none() && !model.base_url.is_empty() {
         resolved = Some(model.base_url.clone());
@@ -507,10 +507,10 @@ async fn run(
         &deployment_name,
         &grammar_tool_input_properties,
     )?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_params) = on_payload(params.clone(), model).await {
-            params = next_params;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_params) = on_payload(params.clone(), model).await
+    {
+        params = next_params;
     }
 
     let url = format!("{}/responses", config.base_url);
@@ -820,7 +820,7 @@ impl ProviderStreams for AzureOpenAiResponses {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::api::openai_completions::tests as common;

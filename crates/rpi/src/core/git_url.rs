@@ -59,24 +59,24 @@ struct SplitRef {
 /// scp-like, protocol and shorthand forms.
 fn split_ref(url: &str) -> SplitRef {
     // Scp-like `git@host:path[@ref]`.
-    if let Some(rest) = url.strip_prefix("git@") {
-        if let Some(colon) = rest.find(':') {
-            let path_with_maybe_ref = &rest[colon + 1..];
-            if let Some(at) = path_with_maybe_ref.find('@') {
-                let repo_path = &path_with_maybe_ref[..at];
-                let ref_ = &path_with_maybe_ref[at + 1..];
-                if !repo_path.is_empty() && !ref_.is_empty() {
-                    return SplitRef {
-                        repo: format!("git@{}:{}", &rest[..colon], repo_path),
-                        ref_: Some(ref_.to_string()),
-                    };
-                }
+    if let Some(rest) = url.strip_prefix("git@")
+        && let Some(colon) = rest.find(':')
+    {
+        let path_with_maybe_ref = &rest[colon + 1..];
+        if let Some(at) = path_with_maybe_ref.find('@') {
+            let repo_path = &path_with_maybe_ref[..at];
+            let ref_ = &path_with_maybe_ref[at + 1..];
+            if !repo_path.is_empty() && !ref_.is_empty() {
+                return SplitRef {
+                    repo: format!("git@{}:{}", &rest[..colon], repo_path),
+                    ref_: Some(ref_.to_string()),
+                };
             }
-            return SplitRef {
-                repo: url.to_string(),
-                ref_: None,
-            };
         }
+        return SplitRef {
+            repo: url.to_string(),
+            ref_: None,
+        };
     }
 
     if url.contains("://") {

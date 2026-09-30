@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::build::QuestionItem;
 use crate::state::reducer::QuestionnaireState;
-use crate::state::row_intent::{meta, RowKind};
+use crate::state::row_intent::{RowKind, meta};
 use crate::tool::types::{AnswerKind, QuestionAnswer, QuestionData};
 
 /// `KEYBIND_UP` (`tui.select.up`).

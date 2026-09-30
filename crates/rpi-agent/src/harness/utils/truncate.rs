@@ -171,22 +171,22 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationRes
     // `lines` is guaranteed non-empty here: the early return above would have
     // caught an empty string (0 lines, 0 bytes), so upstream's `lines[0]`
     // cannot throw.
-    if let Some(first) = lines.first() {
-        if utf8_byte_length(first) > max_bytes {
-            return TruncationResult {
-                content: String::new(),
-                truncated: true,
-                truncated_by: Some(TruncatedBy::Bytes),
-                total_lines,
-                total_bytes,
-                output_lines: 0,
-                output_bytes: 0,
-                last_line_partial: false,
-                first_line_exceeds_limit: true,
-                max_lines,
-                max_bytes,
-            };
-        }
+    if let Some(first) = lines.first()
+        && utf8_byte_length(first) > max_bytes
+    {
+        return TruncationResult {
+            content: String::new(),
+            truncated: true,
+            truncated_by: Some(TruncatedBy::Bytes),
+            total_lines,
+            total_bytes,
+            output_lines: 0,
+            output_bytes: 0,
+            last_line_partial: false,
+            first_line_exceeds_limit: true,
+            max_lines,
+            max_bytes,
+        };
     }
 
     // Collect complete lines that fit (truncate.ts:175-191). The first line

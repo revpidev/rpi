@@ -24,10 +24,10 @@ use crate::api::anthropic_messages::AnthropicMessages;
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::openai_responses::OpenAiResponses;
 use crate::auth::oauth::github_copilot_oauth;
-use crate::auth::{env_api_key_auth, Credential, ProviderAuth};
+use crate::auth::{Credential, ProviderAuth, env_api_key_auth};
 use crate::generated::get_builtin_models;
 use crate::models::{
-    create_provider, CreateProviderOptions, Provider, ProviderApi, ProviderStreams,
+    CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
 use crate::types::{
     ApiKind, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,

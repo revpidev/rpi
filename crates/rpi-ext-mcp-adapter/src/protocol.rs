@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
@@ -280,32 +280,32 @@ impl McpClient {
         // `subscriptions/listen` responses carry STRING ids (`listen:N`);
         // a RESULT is the spec's graceful-close signal, an ERROR is the
         // pre-ack rejection (SDK `_onresponse` demux).
-        if is_response {
-            if let Some(listen_id) = message.get("id").and_then(Value::as_str) {
-                let entry = self
-                    .listen_states
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(listen_id);
-                if let Some(mut entry) = entry {
-                    if let Some(error) = message.get("error") {
-                        let outcome = Err(ProtocolError::Rpc {
-                            code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
-                            message: error
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown error")
-                                .to_string(),
-                            data: error.get("data").cloned(),
-                        });
-                        if let Some(ack) = entry.ack.take() {
-                            let _ = ack.send(outcome);
-                        }
-                    } else if let Some(closed) = entry.closed.take() {
+        if is_response && let Some(listen_id) = message.get("id").and_then(Value::as_str) {
+            let entry = self
+                .listen_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(listen_id);
+            if let Some(mut entry) = entry {
+                if let Some(error) = message.get("error") {
+                    let outcome = Err(ProtocolError::Rpc {
+                        code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+                        message: error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                        data: error.get("data").cloned(),
+                    });
+                    if let Some(ack) = entry.ack.take() {
+                        let _ = ack.send(outcome);
+                    }
+                } else {
+                    if let Some(closed) = entry.closed.take() {
                         let _ = closed.send("graceful".to_string());
                     }
-                    return;
                 }
+                return;
             }
         }
         let id = message.get("id").and_then(Value::as_u64);

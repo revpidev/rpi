@@ -34,18 +34,18 @@ use futures::future::BoxFuture;
 
 use crate::api::pi_messages::PiMessages;
 use crate::auth::oauth::radius::RadiusOAuth;
-use crate::auth::{env_api_key_auth, Credential, ModelsError, ProviderAuth};
+use crate::auth::{Credential, ModelsError, ProviderAuth, env_api_key_auth};
 use crate::models::{
-    create_provider, now_millis, CreateProviderOptions, InflightRefresh, ModelsPublication,
-    Provider, ProviderApi, RefreshModelsContext,
+    CreateProviderOptions, InflightRefresh, ModelsPublication, Provider, ProviderApi,
+    RefreshModelsContext, create_provider, now_millis,
 };
 use crate::models_store::ModelsStoreEntry;
 use crate::types::{Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext};
 use crate::utils::event_stream::AssistantMessageEventStream;
 
 use super::radius_config::{
-    get_radius_models, get_radius_models_from_config, load_radius_gateway_config,
-    normalize_radius_gateway_url, DEFAULT_RADIUS_GATEWAY,
+    DEFAULT_RADIUS_GATEWAY, get_radius_models, get_radius_models_from_config,
+    load_radius_gateway_config, normalize_radius_gateway_url,
 };
 
 /// `RadiusProviderOptions`.
@@ -235,34 +235,34 @@ impl Provider for RadiusProvider {
 
                     // Import catalogs cached by the pre-ModelsStore Radius
                     // implementation (radius.ts:42-49).
-                    if stored.is_none() {
-                        if let Some(Credential::OAuth(oauth)) = &context.credential {
-                            let legacy = get_radius_models(&id, Some(oauth));
-                            if !legacy.is_empty() {
-                                let legacy_clone = legacy.clone();
-                                let models_for_update = models.clone();
-                                let applied = context
-                                    .publish
-                                    .publish(ModelsPublication {
-                                        persist: Some(Some(ModelsStoreEntry {
-                                            models: legacy,
-                                            last_modified: None,
-                                            checked_at: Some(now_millis()),
-                                            etag: None,
-                                        })),
-                                        update: Some(Box::new(move || {
-                                            *models_for_update
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner()) = legacy_clone;
-                                        })),
-                                    })
-                                    .await?;
-                                // radius.ts:49-62: a stale generation or
-                                // cancelled signal aborts the rest of the
-                                // refresh here as well.
-                                if !applied {
-                                    return Ok(());
-                                }
+                    if stored.is_none()
+                        && let Some(Credential::OAuth(oauth)) = &context.credential
+                    {
+                        let legacy = get_radius_models(&id, Some(oauth));
+                        if !legacy.is_empty() {
+                            let legacy_clone = legacy.clone();
+                            let models_for_update = models.clone();
+                            let applied = context
+                                .publish
+                                .publish(ModelsPublication {
+                                    persist: Some(Some(ModelsStoreEntry {
+                                        models: legacy,
+                                        last_modified: None,
+                                        checked_at: Some(now_millis()),
+                                        etag: None,
+                                    })),
+                                    update: Some(Box::new(move || {
+                                        *models_for_update
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) = legacy_clone;
+                                    })),
+                                })
+                                .await?;
+                            // radius.ts:49-62: a stale generation or
+                            // cancelled signal aborts the rest of the
+                            // refresh here as well.
+                            if !applied {
+                                return Ok(());
                             }
                         }
                     }
@@ -698,11 +698,13 @@ mod tests {
             ..Default::default()
         });
         let context = make_context(store, Some(oauth_credential("access-token")), true, true).await;
-        assert!(provider
-            .refresh_models(context)
-            .expect("refresh")
-            .await
-            .is_err());
+        assert!(
+            provider
+                .refresh_models(context)
+                .expect("refresh")
+                .await
+                .is_err()
+        );
         // The restored list is retained despite the failed fetch.
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["radius-large".to_owned()]);

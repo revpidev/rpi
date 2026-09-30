@@ -5,7 +5,7 @@
 //! `(result, params)` / `(answer)` and are the LLM-facing contract: text and
 //! `details` must stay byte/field-identical to upstream (R-Q3, 附录 C).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tool::types::{AnswerKind, QuestionAnswer, QuestionParams, QuestionnaireResult};
 
@@ -203,7 +203,9 @@ mod tests {
         let value = build_questionnaire_response(Some(&result), &params);
         assert_eq!(
             value["content"][0]["text"],
-            json!("User has answered your questions: \"Q1?\"=\"A\". You can now continue with the user's answers in mind.")
+            json!(
+                "User has answered your questions: \"Q1?\"=\"A\". You can now continue with the user's answers in mind."
+            )
         );
         assert_eq!(value["details"]["cancelled"], json!(false));
         assert_eq!(value["details"]["answers"][0]["kind"], json!("option"));
@@ -313,7 +315,9 @@ mod tests {
         let value = build_questionnaire_response(Some(&result), &params);
         assert_eq!(
             value["content"][0]["text"],
-            json!("User has answered your questions: \"Q2?\"=\"B\". You can now continue with the user's answers in mind.")
+            json!(
+                "User has answered your questions: \"Q2?\"=\"B\". You can now continue with the user's answers in mind."
+            )
         );
     }
 }

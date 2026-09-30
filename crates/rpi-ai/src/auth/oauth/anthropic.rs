@@ -22,14 +22,14 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::super::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
 use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
 use super::callback_page::{
-    default_callback_host, CallbackPageCopy, OAuthCallbackServer, CALLBACK_PORT,
+    CALLBACK_PORT, CallbackPageCopy, OAuthCallbackServer, default_callback_host,
 };
 use super::pkce::generate_pkce;
 
@@ -43,8 +43,7 @@ const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// `REDIRECT_URI` = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`.
 const REDIRECT_URI: &str = "http://localhost:53692/callback";
 /// `SCOPES` (verbatim).
-const SCOPES: &str =
-    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 /// `AbortSignal.timeout(30_000)`.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// `expires = Date.now() + expires_in * 1000 - 5 * 60 * 1000`.
@@ -360,10 +359,11 @@ fn finalize_manual_input(
     parsed: ParsedAuthorizationInput,
     verifier: &str,
 ) -> Result<(String, String), ModelsError> {
-    if let Some(state) = parsed.state.as_deref() {
-        if !state.is_empty() && state != verifier {
-            return Err(error("OAuth state mismatch"));
-        }
+    if let Some(state) = parsed.state.as_deref()
+        && !state.is_empty()
+        && state != verifier
+    {
+        return Err(error("OAuth state mismatch"));
     }
     let code = parsed.code.filter(|code| !code.is_empty());
     let state = parsed.state.or_else(|| Some(verifier.to_owned()));
@@ -446,7 +446,7 @@ mod tests {
 
     use axum::http::StatusCode;
     use axum::response::Json;
-    use axum::routing::{post, Router};
+    use axum::routing::{Router, post};
     use tokio::sync::oneshot;
 
     use super::super::super::types::BoxFutureSend;
@@ -694,9 +694,11 @@ mod tests {
             body["state"].as_str(),
             handle.auth_url_param("state").as_deref()
         );
-        assert!(body["code_verifier"]
-            .as_str()
-            .is_some_and(|v| !v.is_empty()));
+        assert!(
+            body["code_verifier"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
     }
 
     /// `omits scope from refresh token requests`.
@@ -747,22 +749,28 @@ mod tests {
 
         let credential = oauth.login(&interaction).await.expect("login");
         assert_eq!(credential.access, "access");
-        assert!(handle
-            .events()
-            .iter()
-            .any(|event| matches!(event, AuthEvent::AuthUrl { .. })));
-        assert!(handle
-            .prompts
-            .lock()
-            .expect("lock")
-            .iter()
-            .any(|prompt| matches!(prompt, AuthPrompt::ManualCode { .. })));
+        assert!(
+            handle
+                .events()
+                .iter()
+                .any(|event| matches!(event, AuthEvent::AuthUrl { .. }))
+        );
+        assert!(
+            handle
+                .prompts
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|prompt| matches!(prompt, AuthPrompt::ManualCode { .. }))
+        );
         // The prompt's signal is cancelled once login settles, so UIs can
         // dismiss it.
-        assert!(handle
-            .manual_signal()
-            .expect("manual signal")
-            .is_cancelled());
+        assert!(
+            handle
+                .manual_signal()
+                .expect("manual signal")
+                .is_cancelled()
+        );
     }
 
     /// Manual input whose `state` does not match the verifier fails verbatim.
@@ -843,10 +851,12 @@ mod tests {
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0]["code"], "callback-code");
         assert_eq!(bodies[0]["state"].as_str(), Some(state.as_str()));
-        assert!(handle
-            .manual_signal()
-            .expect("manual signal")
-            .is_cancelled());
+        assert!(
+            handle
+                .manual_signal()
+                .expect("manual signal")
+                .is_cancelled()
+        );
     }
 
     /// A cancelled/failed manual prompt propagates its error.

@@ -11,10 +11,10 @@
 //! bracket is wired by TE29 (RPC walker) / TE30 (component), which is why
 //! `tool::execute` does not emit `blocked` yet.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::tool::types::QuestionParams;
 use crate::HostCall;
+use crate::tool::types::QuestionParams;
 
 /// `ASK_USER_PROMPT_EVENT` — emitted while the questionnaire is about to open.
 pub const ASK_USER_PROMPT_EVENT: &str = "rpiv:ask-user:prompt";

@@ -654,7 +654,7 @@ pub fn build_context_messages(entries: &[SessionEntry]) -> Vec<AgentMessage> {
 #[cfg(test)]
 mod tests {
     use rpi_ai::types::{AssistantRole, StopReason, Usage};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::messages::{BashExecutionMessage, BashExecutionRole};

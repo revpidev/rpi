@@ -14,8 +14,8 @@ use std::boxed::Box as StdBox;
 use std::sync::Arc;
 
 use rpi_ext_host::types::MarkdownTransformerFn;
-use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
 use rpi_tui::components::r#box::Box as TuiBox;
+use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
 use rpi_tui::tui::Component;
 
 use crate::core::themes::Theme;

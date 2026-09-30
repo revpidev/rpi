@@ -11,7 +11,7 @@
 //!      newline).
 
 use rpi_ext_mcp_adapter::cache::{
-    load_metadata_cache, save_metadata_cache, MetadataCache, CACHE_VERSION,
+    CACHE_VERSION, MetadataCache, load_metadata_cache, save_metadata_cache,
 };
 use serde_json::Value;
 

@@ -21,7 +21,7 @@ use crate::layout_node::{
     Basis, LayoutNode, LayoutViewport, StackAlign, StackEntry, StackKind, StackLayoutNode,
     StackVisibleFn,
 };
-use crate::tui::{lock_component, same_component, Component, SharedComponent};
+use crate::tui::{Component, SharedComponent, lock_component, same_component};
 
 /// `StackEntryOptions` (stack.ts:4-11): raw, unnormalized options accepted by
 /// [`Stack::add_child`].

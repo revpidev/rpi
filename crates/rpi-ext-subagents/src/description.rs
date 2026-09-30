@@ -111,7 +111,9 @@ fn render_custom_template(template: &str, cwd: &Path) -> String {
                     "agentDir" => Some(agent_dir.clone()),
                     "projectConfigDir" => Some(project_config_dir.clone()),
                     _ => {
-                        tracing::warn!("subagent-tool-description.md: unknown placeholder {{{{{name}}}}} left unchanged.");
+                        tracing::warn!(
+                            "subagent-tool-description.md: unknown placeholder {{{{{name}}}}} left unchanged."
+                        );
                         None
                     }
                 };
@@ -202,7 +204,9 @@ pub fn build_subagent_tool_description(config: &ExtensionConfig, cwd: &Path) -> 
         ToolDescriptionMode::Custom => match load_custom_tool_description(cwd) {
             Some(custom) => with_mandatory_safety_guidance(&custom),
             None => {
-                tracing::warn!("subagent-tool-description.md was not found or valid for toolDescriptionMode \"custom\"; using full description.");
+                tracing::warn!(
+                    "subagent-tool-description.md was not found or valid for toolDescriptionMode \"custom\"; using full description."
+                );
                 format!("{FULL_SUBAGENT_TOOL_DESCRIPTION}{SUBAGENT_SAFETY_GUIDANCE}")
             }
         },

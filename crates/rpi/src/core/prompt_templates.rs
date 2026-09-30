@@ -317,12 +317,12 @@ fn load_template_from_file(file_path: &Path) -> Option<PromptTemplate> {
         .get("description")
         .cloned()
         .unwrap_or_default();
-    if description.is_empty() {
-        if let Some(first_line) = parsed.body.lines().find(|line| !line.trim().is_empty()) {
-            description = first_line.chars().take(60).collect();
-            if first_line.chars().count() > 60 {
-                description.push_str("...");
-            }
+    if description.is_empty()
+        && let Some(first_line) = parsed.body.lines().find(|line| !line.trim().is_empty())
+    {
+        description = first_line.chars().take(60).collect();
+        if first_line.chars().count() > 60 {
+            description.push_str("...");
         }
     }
 
@@ -377,10 +377,11 @@ pub fn load_templates_from_dir(dir: &Path) -> Vec<PromptTemplate> {
             file_type.is_file()
         };
 
-        if is_file && entry.file_name().to_string_lossy().ends_with(".md") {
-            if let Some(template) = load_template_from_file(&full_path) {
-                templates.push(template);
-            }
+        if is_file
+            && entry.file_name().to_string_lossy().ends_with(".md")
+            && let Some(template) = load_template_from_file(&full_path)
+        {
+            templates.push(template);
         }
     }
 

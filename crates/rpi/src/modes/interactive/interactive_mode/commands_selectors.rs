@@ -41,13 +41,13 @@ use rpi_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType};
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::types::{Model, ModelThinkingLevel, ThinkingLevel};
 use rpi_tui::terminal_colors::TerminalColorScheme;
-use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
+use rpi_tui::tui::{Component, Focusable, TuiStopOptions, shared_component_from_boxed};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    child_address, install_global_keybindings, lock, remove_child_by_address, EditorInput,
-    FocusableRegion, InteractiveMode, InteractiveUi, SharedChild, UiCommand,
+    EditorInput, FocusableRegion, InteractiveMode, InteractiveUi, SharedChild, UiCommand,
+    child_address, install_global_keybindings, lock, remove_child_by_address,
 };
 use crate::core::agent_session::{
     AgentSession, BashChunkCallback, CycleDirection, ExecuteBashOptions, ExtensionBindings,
@@ -852,13 +852,12 @@ fn show_api_key_login_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorPro
                     previous_model,
                 )
                 .await
+                    && error.message != "Login cancelled"
                 {
-                    if error.message != "Login cancelled" {
-                        ui.show_error(&format!(
-                            "Failed to save API key for {provider_name}: {}",
-                            error.message
-                        ));
-                    }
+                    ui.show_error(&format!(
+                        "Failed to save API key for {provider_name}: {}",
+                        error.message
+                    ));
                 }
             }
             Err(error) => {
@@ -915,9 +914,13 @@ fn show_ambient_auth_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProv
 /// the built-in extension).
 fn llama_cpp_post_login_guidance(action_label: &str, loaded_model_count: usize) -> String {
     if loaded_model_count == 0 {
-        format!("{action_label}. No llama.cpp models are loaded. Use /llama to load a model, then /model to select it.")
+        format!(
+            "{action_label}. No llama.cpp models are loaded. Use /llama to load a model, then /model to select it."
+        )
     } else {
-        format!("{action_label}. Use /model to select a loaded llama.cpp model, or /llama to manage models.")
+        format!(
+            "{action_label}. Use /model to select a loaded llama.cpp model, or /llama to manage models."
+        )
     }
 }
 
@@ -956,13 +959,13 @@ async fn finish_authentication(
             match default_model_for_provider(provider_id) {
                 None => {
                     selection_error = Some(format!(
-                    "{action_label}, but no default model is configured for provider \"{provider_id}\". Use /model to select a model."
-                ));
+                        "{action_label}, but no default model is configured for provider \"{provider_id}\". Use /model to select a model."
+                    ));
                 }
                 Some(_default_model_id) if provider_models.is_empty() => {
                     selection_error = Some(format!(
-                    "{action_label}, but no models are available for that provider. Use /model to select a model."
-                ));
+                        "{action_label}, but no models are available for that provider. Use /model to select a model."
+                    ));
                 }
                 Some(default_model_id) => {
                     let candidate = provider_models
@@ -980,8 +983,8 @@ async fn finish_authentication(
                     match candidate {
                         None => {
                             selection_error = Some(format!(
-                            "{action_label}, but its default model \"{default_model_id}\" is not available. Use /model to select a model."
-                        ));
+                                "{action_label}, but its default model \"{default_model_id}\" is not available. Use /model to select a model."
+                            ));
                         }
                         // `setModel(selectedModel, { persist: true })`
                         // (interactive-mode.ts:5698 @ 2ff8ba622): the post-login
@@ -1002,8 +1005,8 @@ async fn finish_authentication(
                                 Err(error) => {
                                     selected_model = None;
                                     selection_error = Some(format!(
-                                    "{action_label}, but selecting its default model failed: {error}. Use /model to select a model."
-                                ));
+                                        "{action_label}, but selecting its default model failed: {error}. Use /model to select a model."
+                                    ));
                                 }
                             }
                         }
@@ -1203,15 +1206,15 @@ fn show_login_auth_type_selector(
         ui.show_status("No login methods available.");
         return;
     }
-    if let Some(providers) = &provider_options {
-        if options.len() == 1 {
-            // Only one method: start it directly (interactive-mode.ts:4957-
-            // 4962).
-            if let Some(provider) = providers.first() {
-                start_provider_login(ui, provider);
-            }
-            return;
+    if let Some(providers) = &provider_options
+        && options.len() == 1
+    {
+        // Only one method: start it directly (interactive-mode.ts:4957-
+        // 4962).
+        if let Some(provider) = providers.first() {
+            start_provider_login(ui, provider);
         }
+        return;
     }
 
     let title = match &provider_options {
@@ -2894,11 +2897,7 @@ fn read_clipboard_image_png() -> Option<Vec<u8>> {
         &["-selection", "clipboard", "-t", "image/png", "-o"],
         CLIPBOARD_READ_TIMEOUT,
     )?;
-    if bytes.is_empty() {
-        None
-    } else {
-        Some(bytes)
-    }
+    if bytes.is_empty() { None } else { Some(bytes) }
 }
 
 /// `readClipboardText` (clipboard.ts:36-47) — the native clipboard addon is
@@ -2966,15 +2965,15 @@ mod tests {
         AgentSessionRuntime, CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
     };
     use crate::core::agent_session_services::{
-        create_agent_session_services, CreateAgentSessionServicesOptions,
+        CreateAgentSessionServicesOptions, create_agent_session_services,
     };
     use crate::core::model_resolver::find_exact_model_reference_match;
     use crate::core::session_manager::NewSessionOptions;
     use crate::modes::interactive::interactive_mode::InteractiveModeOptions;
     use crate::modes::interactive::test_support::{
-        build_test_session, TempDir, TestSession, TestTerminal,
+        TempDir, TestSession, TestTerminal, build_test_session,
     };
-    use crate::sdk::{create_agent_session, CreateAgentSessionOptions, NoTools};
+    use crate::sdk::{CreateAgentSessionOptions, NoTools, create_agent_session};
 
     fn user_message(text: &str) -> AgentMessage {
         AgentMessage::User(UserMessage {
@@ -3925,8 +3924,8 @@ mod tests {
     impl Drop for PathEnvRestore {
         fn drop(&mut self) {
             match &self.previous {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
+                Some(value) => rpi_test_env::set_var("PATH", value),
+                None => rpi_test_env::remove_var("PATH"),
             }
         }
     }
@@ -3940,7 +3939,7 @@ mod tests {
             path.push(':');
             path.push_str(previous);
         }
-        std::env::set_var("PATH", &path);
+        rpi_test_env::set_var("PATH", &path);
         PathEnvRestore { previous }
     }
 
@@ -4130,7 +4129,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _restore = ColorFgBg(std::env::var_os("COLORFGBG"));
-        std::env::set_var("COLORFGBG", "15;0");
+        rpi_test_env::set_var("COLORFGBG", "15;0");
 
         let (mode, _terminal, _session, _tmp) = mode_harness().await;
         let ui = &mode.ui_state;
@@ -4152,8 +4151,8 @@ mod tests {
     impl Drop for ColorFgBg {
         fn drop(&mut self) {
             match &self.0 {
-                Some(value) => std::env::set_var("COLORFGBG", value),
-                None => std::env::remove_var("COLORFGBG"),
+                Some(value) => rpi_test_env::set_var("COLORFGBG", value),
+                None => rpi_test_env::remove_var("COLORFGBG"),
             }
         }
     }

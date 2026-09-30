@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `LEVEL_RANK` (acceptance.ts:28-33).
 pub fn level_rank(level: &str) -> Option<u8> {
@@ -347,12 +347,11 @@ pub fn run_memoized_gate_command(
         .join("verify")
         .join(run_id)
         .join(format!("{cache_key}.json"));
-    if let Ok(raw) = std::fs::read_to_string(&cache_path) {
-        if let Ok(cached) = serde_json::from_str::<Value>(&raw) {
-            if let Some(passed) = cached["passed"].as_bool() {
-                return (Ok(passed), true);
-            }
-        }
+    if let Ok(raw) = std::fs::read_to_string(&cache_path)
+        && let Ok(cached) = serde_json::from_str::<Value>(&raw)
+        && let Some(passed) = cached["passed"].as_bool()
+    {
+        return (Ok(passed), true);
     }
     let verdict = run_gate_command(command, cwd);
     if let Ok(passed) = &verdict {
@@ -480,10 +479,9 @@ pub fn usage_budget_allows_launch(
         .get("costUsd")
         .and_then(|c| c.get("hard"))
         .and_then(Value::as_f64)
+        && accumulated_cost >= hard
     {
-        if accumulated_cost >= hard {
-            return Ok(false);
-        }
+        return Ok(false);
     }
     Ok(true)
 }

@@ -38,17 +38,17 @@
 
 use std::collections::HashSet;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::HostCall;
 use crate::config::{self, COLLAPSE_KEY_OFF};
 use crate::i18n::I18n;
+use crate::state::TaskState;
 use crate::state::selectors::{
     select_has_active, select_overlay_layout, select_show_task_ids, select_todo_counts,
 };
-use crate::state::TaskState;
 use crate::tool::types::{Task, TaskStatus};
-use crate::view::{format_overlay_task_line, AnsiTheme, TodoTheme};
-use crate::HostCall;
+use crate::view::{AnsiTheme, TodoTheme, format_overlay_task_line};
 
 /// Widget key — verbatim (`WIDGET_KEY`).
 pub const WIDGET_KEY: &str = "rpiv-todos";
@@ -432,10 +432,10 @@ impl TodoOverlay {
     /// Tear the overlay down (upstream `dispose`): remove the widget,
     /// clear the ctx, reset the collapse flag and the display state.
     pub fn dispose(&mut self, host: &dyn HostCall) {
-        if self.ui_bound {
-            if let Err(error) = push_widget(host, None) {
-                tracing::warn!(%error, "rpiv-todo: dispose setWidget rejected");
-            }
+        if self.ui_bound
+            && let Err(error) = push_widget(host, None)
+        {
+            tracing::warn!(%error, "rpiv-todo: dispose setWidget rejected");
         }
         self.widget_registered = false;
         self.ui_bound = false;
@@ -1025,10 +1025,12 @@ mod tests {
         assert!(expanded[expanded.len() - 2].contains("└─"));
 
         host.tools_expanded = Some(false);
-        assert!(overlay
-            .test_render(&host, &i18n, 200)
-            .join("\n")
-            .contains("+7 more"));
+        assert!(
+            overlay
+                .test_render(&host, &i18n, 200)
+                .join("\n")
+                .contains("+7 more")
+        );
     }
 
     #[test]
@@ -1041,10 +1043,12 @@ mod tests {
         let host = MockHost::new();
         let mut overlay = overlay_with(&host);
         let i18n = I18n::for_locale("en");
-        assert!(overlay
-            .test_render(&host, &i18n, 200)
-            .join("\n")
-            .contains("+7 more"));
+        assert!(
+            overlay
+                .test_render(&host, &i18n, 200)
+                .join("\n")
+                .contains("+7 more")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1245,9 +1249,11 @@ mod tests {
         let mut overlay = overlay_with(&host);
         let i18n = I18n::for_locale("en");
         let lines = overlay.test_render(&host, &i18n, 20);
-        assert!(lines
-            .iter()
-            .all(|line| rpi_tui::utils::visible_width(line) <= 20));
+        assert!(
+            lines
+                .iter()
+                .all(|line| rpi_tui::utils::visible_width(line) <= 20)
+        );
         assert!(lines[1].contains('…'));
     }
 
@@ -1263,10 +1269,12 @@ mod tests {
         let host = MockHost::new();
         let mut overlay = overlay_with(&host);
         let i18n = I18n::for_locale("en");
-        assert!(overlay
-            .test_render(&host, &i18n, 200)
-            .join("\n")
-            .contains("Todos (1/2)"));
+        assert!(
+            overlay
+                .test_render(&host, &i18n, 200)
+                .join("\n")
+                .contains("Todos (1/2)")
+        );
         let second = overlay.test_render(&host, &i18n, 200).join("\n");
         assert!(second.contains("Todos (1/2)"));
         assert!(second.contains("next"));
@@ -1439,20 +1447,26 @@ mod tests {
         let host = MockHost::new();
         let mut overlay = overlay_with(&host);
         let i18n = I18n::for_locale("en");
-        assert!(overlay
-            .test_render(&host, &i18n, 200)
-            .join("\n")
-            .contains("done"));
+        assert!(
+            overlay
+                .test_render(&host, &i18n, 200)
+                .join("\n")
+                .contains("done")
+        );
         overlay.hide_completed_tasks_from_previous_turn(&host, &i18n);
-        assert!(!overlay
-            .test_render(&host, &i18n, 200)
-            .join("\n")
-            .contains("done"));
+        assert!(
+            !overlay
+                .test_render(&host, &i18n, 200)
+                .join("\n")
+                .contains("done")
+        );
         overlay.reset_completed_display_state();
-        assert!(overlay
-            .test_render(&host, &i18n, 200)
-            .join("\n")
-            .contains("done"));
+        assert!(
+            overlay
+                .test_render(&host, &i18n, 200)
+                .join("\n")
+                .contains("done")
+        );
     }
 
     #[test]
@@ -1664,9 +1678,11 @@ mod tests {
         let before = host.push_count();
         controller.handle_shortcut(&host, &i18n);
         assert!(host.push_count() > before);
-        assert!(controller
-            .overlay()
-            .is_some_and(|overlay| overlay.is_collapsed()));
+        assert!(
+            controller
+                .overlay()
+                .is_some_and(|overlay| overlay.is_collapsed())
+        );
     }
 
     struct HeadlessHost;
@@ -1745,10 +1761,12 @@ mod tests {
         let mut overlay = overlay_with(&host);
         let i18n = I18n::for_locale("en");
         overlay.hide_completed_tasks_from_previous_turn(&host, &i18n);
-        assert!(!overlay
-            .test_render(&host, &i18n, 200)
-            .join("\n")
-            .contains("done"));
+        assert!(
+            !overlay
+                .test_render(&host, &i18n, 200)
+                .join("\n")
+                .contains("done")
+        );
         // clear resets nextId (3 -> 1; the re-created task brings it to 2)
         // — the decrease resets the completed-display state, so the
         // re-created completed task shows again.
@@ -1757,10 +1775,12 @@ mod tests {
             json!({"action": "create", "subject": "done"}),
             json!({"action": "update", "id": 1, "status": "completed"}),
         ]);
-        assert!(overlay
-            .test_render(&host, &i18n, 200)
-            .join("\n")
-            .contains("done"));
+        assert!(
+            overlay
+                .test_render(&host, &i18n, 200)
+                .join("\n")
+                .contains("done")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1866,7 +1886,11 @@ mod tests {
             crate::__reset_state();
             assert_eq!(
                 golden_scenario_lines("wide", width, false),
-                vec!["● Todos (0/1)".to_owned(), expected_row.to_owned(), String::new()],
+                vec![
+                    "● Todos (0/1)".to_owned(),
+                    expected_row.to_owned(),
+                    String::new()
+                ],
                 "wide @ {width}"
             );
         }

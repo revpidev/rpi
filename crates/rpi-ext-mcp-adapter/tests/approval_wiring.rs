@@ -24,10 +24,10 @@ use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
 use rpi_ext_mcp_adapter::metadata::ToolMetadata;
 use rpi_ext_mcp_adapter::session_approvals::{
-    entry_to_value, get_tool_approval_identity, MCP_APPROVAL_CUSTOM_TYPE,
+    MCP_APPROVAL_CUSTOM_TYPE, entry_to_value, get_tool_approval_identity,
 };
 use rpi_ext_mcp_adapter::{dispatch, dispatcher_for_test, install_for_test};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// What the fake host answers for `ctx.sessionEntries` (TE33).
 enum SessionEntriesReply {
@@ -176,7 +176,7 @@ async fn session_approvals_restore_rebuild_and_persist() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     std::fs::write(dir.join(".mcp.json"), json!({"mcpServers": {}}).to_string()).expect("config");
     let saved_agent_dir = std::env::var_os("RPI_CODING_AGENT_DIR");
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
 
     let tool = approval_tool();
     let identity_a = get_tool_approval_identity("demo", &tool, &json!({"query": "a"}));
@@ -295,13 +295,17 @@ async fn session_approvals_restore_rebuild_and_persist() {
 
     // A8: a session grant persists exactly one strict entry (names + hashes).
     let identity_c = get_tool_approval_identity("demo", &tool, &json!({"query": "c"}));
-    assert!(runtime
-        .approval
-        .grant_session("demo", "search", &identity_c));
+    assert!(
+        runtime
+            .approval
+            .grant_session("demo", "search", &identity_c)
+    );
     // A cache hit does not re-emit.
-    assert!(!runtime
-        .approval
-        .grant_session("demo", "search", &identity_c));
+    assert!(
+        !runtime
+            .approval
+            .grant_session("demo", "search", &identity_c)
+    );
 
     let appended = host
         .append_entries
@@ -335,9 +339,11 @@ async fn session_approvals_restore_rebuild_and_persist() {
     // @ 928c30c); the ABI path below closes TE-D41 for V14-25+ hosts.
     *host.session_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let identity_d = get_tool_approval_identity("demo", &tool, &json!({"query": "d"}));
-    assert!(runtime
-        .approval
-        .grant_session("demo", "search", &identity_d));
+    assert!(
+        runtime
+            .approval
+            .grant_session("demo", "search", &identity_d)
+    );
     assert_eq!(runtime.approval.len(), 4);
     dispatch_event(
         "session_tree",
@@ -523,10 +529,10 @@ async fn session_approvals_restore_rebuild_and_persist() {
         "A8: no cached unsupported verdict survives"
     );
 
-    std::env::remove_var("RPI_CODING_AGENT_DIR");
+    rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
     match saved_agent_dir {
-        Some(value) => std::env::set_var("RPI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("RPI_CODING_AGENT_DIR"),
+        Some(value) => rpi_test_env::set_var("RPI_CODING_AGENT_DIR", value),
+        None => rpi_test_env::remove_var("RPI_CODING_AGENT_DIR"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

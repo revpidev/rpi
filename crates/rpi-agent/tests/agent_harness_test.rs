@@ -24,10 +24,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rpi_agent::error::AgentError;
+use rpi_agent::harness::session::Session as SessionFacade;
 use rpi_agent::harness::session::memory_storage::{
     InMemorySessionStorage, InMemorySessionStorageOptions,
 };
-use rpi_agent::harness::session::Session as SessionFacade;
 use rpi_agent::harness::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessTool, AgentHarnessToolContextSource,
     BeforeAgentStartResult, CompactResult, SessionContextBuildOptions, SessionEntryCursorOptions,
@@ -48,10 +48,10 @@ use rpi_ai::types::{
 };
 use rpi_ai::utils::retry::RetryPolicy;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_tool_call,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 /// Wall-clock ceiling for every async test in this file: a deadlock
@@ -728,20 +728,24 @@ async fn test_abort_clears_steer_followup_preserves_next_turn_body() {
         .expect("abort spawned by the time prompt settles");
     let abort_result = abort_result.await.expect("abort task").expect("abort");
     assert_eq!(first.stop_reason, StopReason::Aborted);
-    assert!(aborted_signal
-        .lock()
-        .expect("signal")
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled));
+    assert!(
+        aborted_signal
+            .lock()
+            .expect("signal")
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    );
 
     harness.prompt("second", None).await.expect("second prompt");
 
     assert_eq!(abort_result.cleared_steer.len(), 1);
     assert_eq!(abort_result.cleared_follow_up.len(), 1);
-    assert!(queue_updates
-        .lock()
-        .expect("queue updates")
-        .contains(&(0, 0, 1)));
+    assert!(
+        queue_updates
+            .lock()
+            .expect("queue updates")
+            .contains(&(0, 0, 1))
+    );
     assert_eq!(
         *second_request_text.lock().expect("text"),
         vec!["first", "next", "second"]
@@ -843,11 +847,9 @@ async fn test_hook_failure_settles_with_persisted_error_message() {
 
 async fn test_hook_failure_settles_with_persisted_error_message_body() {
     let (models, faux) = new_faux(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message(
-        "should not be used",
-        Default::default(),
-    )
-    .into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("should not be used", Default::default()).into(),
+    ]);
     let session = new_session();
     let harness = Arc::new(
         AgentHarness::new(base_options(
@@ -1112,7 +1114,9 @@ async fn test_pending_writes_ordered_after_agent_messages() {
 
 async fn test_pending_writes_ordered_after_agent_messages_body() {
     let (models, faux) = new_faux(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message("ok", Default::default()).into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("ok", Default::default()).into(),
+    ]);
     let session = new_session();
     let harness = Arc::new(
         AgentHarness::new(base_options(
@@ -1129,21 +1133,20 @@ async fn test_pending_writes_ordered_after_agent_messages_body() {
             let harness = Arc::clone(&harness);
             let wrote_pending = Arc::clone(&wrote_pending);
             async move {
-                if let AgentHarnessEvent::Agent(AgentEvent::MessageEnd { message }) = &event {
-                    if matches!(message, AgentMessage::Assistant(_))
-                        && !wrote_pending.swap(true, Ordering::SeqCst)
-                    {
-                        harness
-                            .append_message(AgentMessage::Custom(CustomMessage {
-                                role: CustomRole::Custom,
-                                custom_type: "listener".to_owned(),
-                                content: UserContent::Text("listener write".to_owned()),
-                                display: true,
-                                details: None,
-                                timestamp: 3,
-                            }))
-                            .await?;
-                    }
+                if let AgentHarnessEvent::Agent(AgentEvent::MessageEnd { message }) = &event
+                    && matches!(message, AgentMessage::Assistant(_))
+                    && !wrote_pending.swap(true, Ordering::SeqCst)
+                {
+                    harness
+                        .append_message(AgentMessage::Custom(CustomMessage {
+                            role: CustomRole::Custom,
+                            custom_type: "listener".to_owned(),
+                            content: UserContent::Text("listener write".to_owned()),
+                            display: true,
+                            details: None,
+                            timestamp: 3,
+                        }))
+                        .await?;
                 }
                 Ok(())
             }
@@ -1186,7 +1189,9 @@ async fn test_wait_for_idle_waits_for_settlement_and_listeners() {
 
 async fn test_wait_for_idle_waits_for_settlement_and_listeners_body() {
     let (models, faux) = new_faux(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message("ok", Default::default()).into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("ok", Default::default()).into(),
+    ]);
     let harness = Arc::new(
         AgentHarness::new(base_options(
             &models,
@@ -1494,11 +1499,13 @@ async fn test_static_tool_context_passed_to_tools_body() {
 
     let received = received.lock().expect("received");
     assert_eq!(received.len(), 1);
-    assert!(received[0]
-        .marker
-        .as_ref()
-        .zip(tool_context.marker.as_ref())
-        .is_some_and(|(a, b)| Arc::ptr_eq(a, b)));
+    assert!(
+        received[0]
+            .marker
+            .as_ref()
+            .zip(tool_context.marker.as_ref())
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+    );
 }
 
 /// "resolves async tool context providers for each turn snapshot" (:525-560).
@@ -1602,11 +1609,9 @@ async fn test_compaction_persists_generated_usage() {
 
 async fn test_compaction_persists_generated_usage_body() {
     let (models, faux) = new_faux(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message(
-        "## Goal\nTest summary",
-        Default::default(),
-    )
-    .into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("## Goal\nTest summary", Default::default()).into(),
+    ]);
     let session = seed_two_message_session().await;
     let harness = Arc::new(
         AgentHarness::new(base_options(
@@ -2001,11 +2006,9 @@ async fn test_branch_summary_persists_generated_usage() {
 
 async fn test_branch_summary_persists_generated_usage_body() {
     let (models, faux) = new_faux(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message(
-        "## Goal\nBranch summary",
-        Default::default(),
-    )
-    .into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("## Goal\nBranch summary", Default::default()).into(),
+    ]);
     let (session, target_id) = seed_branch_session().await;
     let harness = Arc::new(
         AgentHarness::new(base_options(
@@ -2509,7 +2512,9 @@ async fn test_drain_failure_requeues_steer_message_and_fails_run() {
 
 async fn test_drain_failure_requeues_steer_message_and_fails_run_body() {
     let (models, faux) = new_faux(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message("ok", Default::default()).into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("ok", Default::default()).into(),
+    ]);
     let harness = Arc::new(
         AgentHarness::new(base_options(
             &models,
@@ -2560,16 +2565,15 @@ async fn test_drain_failure_requeues_steer_message_and_fails_run_body() {
             let steered = Arc::clone(&steered);
             let fail_queue_update = Arc::clone(&fail_queue_update);
             async move {
-                if let AgentHarnessEvent::Agent(AgentEvent::MessageStart { message }) = &event {
-                    if matches!(message, AgentMessage::Assistant(_))
-                        && !steered.swap(true, Ordering::SeqCst)
-                    {
-                        // The push's own notification must succeed; arm the
-                        // failure only for the drain that follows.
-                        *steer_result.lock().expect("steer result") =
-                            Some(harness.steer("one", None).await);
-                        fail_queue_update.store(true, Ordering::SeqCst);
-                    }
+                if let AgentHarnessEvent::Agent(AgentEvent::MessageStart { message }) = &event
+                    && matches!(message, AgentMessage::Assistant(_))
+                    && !steered.swap(true, Ordering::SeqCst)
+                {
+                    // The push's own notification must succeed; arm the
+                    // failure only for the drain that follows.
+                    *steer_result.lock().expect("steer result") =
+                        Some(harness.steer("one", None).await);
+                    fail_queue_update.store(true, Ordering::SeqCst);
                 }
                 Ok(())
             }
@@ -2587,12 +2591,14 @@ async fn test_drain_failure_requeues_steer_message_and_fails_run_body() {
         response.error_message.as_deref(),
         Some("queue update exploded")
     );
-    assert!(steer_result
-        .lock()
-        .expect("steer result")
-        .as_ref()
-        .expect("steered during the run")
-        .is_ok());
+    assert!(
+        steer_result
+            .lock()
+            .expect("steer result")
+            .as_ref()
+            .expect("steered during the run")
+            .is_ok()
+    );
     // The drain removed the message (its notification carried the empty
     // queue) and then rolled it back into the queue head: an idle `abort`
     // returns the restored message.
@@ -2682,11 +2688,9 @@ async fn test_failed_failure_reporting_aggregates_unknown_error() {
 
 async fn test_failed_failure_reporting_aggregates_unknown_error_body() {
     let (models, faux) = new_faux(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message(
-        "should not be used",
-        Default::default(),
-    )
-    .into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("should not be used", Default::default()).into(),
+    ]);
     let storage = FailingAppendStorage {
         inner: InMemorySessionStorage::new(InMemorySessionStorageOptions::default())
             .expect("in-memory storage"),
@@ -2738,7 +2742,9 @@ async fn test_finally_flush_failure_overrides_run_failure() {
 
 async fn test_finally_flush_failure_overrides_run_failure_body() {
     let (models, faux) = new_faux(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message("ok", Default::default()).into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("ok", Default::default()).into(),
+    ]);
     let storage = FailingAppendStorage {
         inner: InMemorySessionStorage::new(InMemorySessionStorageOptions::default())
             .expect("in-memory storage"),

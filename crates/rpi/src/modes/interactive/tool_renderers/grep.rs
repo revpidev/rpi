@@ -17,10 +17,10 @@ use super::render_utils::{invalid_arg_text, js_value_text, shorten_path, str_val
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
 use crate::modes::interactive::components::tool_execution::{
-    get_text_output, RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext,
-    ToolResultState,
+    RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
+    get_text_output,
 };
-use crate::tools::truncate::{format_size, DEFAULT_MAX_BYTES};
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
 
 /// `maxLines` for the collapsed result preview (grep.ts:106).
 const GREP_PREVIEW_LINES: usize = 15;
@@ -57,10 +57,10 @@ fn format_grep_call(args: &Value, theme: &Theme) -> String {
         )
     );
     // grep.ts:88: `if (glob)` — JS truthiness: only non-empty strings render.
-    if let Some(glob) = glob {
-        if !glob.is_empty() {
-            text.push_str(&theme.fg("toolOutput", &format!(" ({glob})")));
-        }
+    if let Some(glob) = glob
+        && !glob.is_empty()
+    {
+        text.push_str(&theme.fg("toolOutput", &format!(" ({glob})")));
     }
     // grep.ts:89: `if (limit !== undefined)` — any present value renders.
     if let Some(limit) = args.get("limit") {
@@ -449,8 +449,10 @@ mod tests {
             )
             .expect("result component");
         let stripped = strip_ansi(&component.render(80).join("\n"));
-        assert!(stripped
-            .contains("\n[Truncated: 100 matches limit, 50.0KB limit, some lines truncated]"));
+        assert!(
+            stripped
+                .contains("\n[Truncated: 100 matches limit, 50.0KB limit, some lines truncated]")
+        );
         // No details → no warning line.
         let plain = renderer
             .render_result(

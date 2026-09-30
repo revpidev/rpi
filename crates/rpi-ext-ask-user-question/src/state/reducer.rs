@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::build::QuestionItem;
 use crate::state::key_router::Action;
@@ -541,20 +541,16 @@ fn confirm_handler(
         };
     };
     let mut answer = answer.clone();
-    if answer.kind == AnswerKind::Option {
-        if let Some(labels) = answer.answer.as_ref() {
-            if let Some(question) = ctx.questions.get(answer.question_index) {
-                if let Some(matched) = question
-                    .options
-                    .iter()
-                    .find(|option| &option.label == labels)
-                {
-                    if let Some(preview) = matched.preview.as_ref().filter(|p| !p.is_empty()) {
-                        answer.preview = Some(preview.clone());
-                    }
-                }
-            }
-        }
+    if answer.kind == AnswerKind::Option
+        && let Some(labels) = answer.answer.as_ref()
+        && let Some(question) = ctx.questions.get(answer.question_index)
+        && let Some(matched) = question
+            .options
+            .iter()
+            .find(|option| &option.label == labels)
+        && let Some(preview) = matched.preview.as_ref().filter(|p| !p.is_empty())
+    {
+        answer.preview = Some(preview.clone());
     }
     if let Some(pending) = state
         .notes_by_tab
@@ -705,14 +701,14 @@ fn notes_exit_handler(
     let mut answers = state.answers.clone();
     if trimmed.is_empty() {
         notes.remove(&state.current_tab);
-        if let Some(previous) = answers.get(&state.current_tab).cloned() {
-            if previous.notes.is_some() {
-                let stripped = QuestionAnswer {
-                    notes: None,
-                    ..previous
-                };
-                answers.insert(state.current_tab, stripped);
-            }
+        if let Some(previous) = answers.get(&state.current_tab).cloned()
+            && previous.notes.is_some()
+        {
+            let stripped = QuestionAnswer {
+                notes: None,
+                ..previous
+            };
+            answers.insert(state.current_tab, stripped);
         }
     } else {
         notes.insert(state.current_tab, trimmed.clone());
@@ -821,7 +817,7 @@ mod tests {
     use super::*;
     use crate::i18n::I18n;
     use crate::state::build::build_items_for_question;
-    use crate::state::key_router::{route_key, Keybindings, QuestionnaireRuntime};
+    use crate::state::key_router::{Keybindings, QuestionnaireRuntime, route_key};
     use crate::tool::types::OptionData;
 
     fn question(multi_select: bool) -> QuestionData {

@@ -15,10 +15,10 @@ use std::sync::Arc;
 
 use crate::api::anthropic_messages::AnthropicMessages;
 use crate::api::openai_completions::OpenAiCompletions;
-use crate::auth::{env_api_key_auth, ProviderAuth};
+use crate::auth::{ProviderAuth, env_api_key_auth};
 use crate::generated::get_builtin_models;
 use crate::models::{
-    create_provider, CreateProviderOptions, Provider, ProviderApi, ProviderStreams,
+    CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
 use crate::types::ApiKind;
 

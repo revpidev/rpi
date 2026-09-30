@@ -7,9 +7,9 @@
 use std::sync::Arc;
 
 use crate::api::anthropic_messages::AnthropicMessages;
-use crate::auth::{anthropic_api_key_auth, anthropic_oauth, ProviderAuth};
+use crate::auth::{ProviderAuth, anthropic_api_key_auth, anthropic_oauth};
 use crate::generated::get_builtin_models;
-use crate::models::{create_provider, CreateProviderOptions, Provider, ProviderApi};
+use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `anthropicProvider()`.
 pub fn anthropic_provider() -> Arc<dyn Provider> {

@@ -48,9 +48,9 @@ use std::path::{Path, PathBuf};
 
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::session::{
-    BranchSummaryEntry, CompactionEntry, CustomEntry, CustomMessageEntry, FileEntry, LabelEntry,
-    MessageEntry, ModelChangeEntry, SessionEntry, SessionHeader, SessionInfoEntry,
-    ThinkingLevelChangeEntry, CURRENT_SESSION_VERSION,
+    BranchSummaryEntry, CURRENT_SESSION_VERSION, CompactionEntry, CustomEntry, CustomMessageEntry,
+    FileEntry, LabelEntry, MessageEntry, ModelChangeEntry, SessionEntry, SessionHeader,
+    SessionInfoEntry, ThinkingLevelChangeEntry,
 };
 // Entry → context-message conversion and the ISO 8601 parse live in
 // `rpi_agent::session` (T08): one implementation shared with the compaction
@@ -308,13 +308,13 @@ impl StoredEntry {
                 "parentId".to_owned(),
                 parent_id.map(Value::String).unwrap_or(Value::Null),
             );
-            if let Some(Value::String(current)) = obj.get("firstKeptEntryId").cloned() {
-                if let Some(replacement) = replacement_by_label_id.get(&current) {
-                    obj.insert(
-                        "firstKeptEntryId".to_owned(),
-                        Value::String(replacement.clone()),
-                    );
-                }
+            if let Some(Value::String(current)) = obj.get("firstKeptEntryId").cloned()
+                && let Some(replacement) = replacement_by_label_id.get(&current)
+            {
+                obj.insert(
+                    "firstKeptEntryId".to_owned(),
+                    Value::String(replacement.clone()),
+                );
             }
         }
         Ok(FileEntryRecord::from_value(raw))
@@ -437,15 +437,14 @@ fn migrate_v2_to_v3(entries: &mut [Value]) {
                     .and_then(|m| m.get("role"))
                     .and_then(Value::as_str)
                     == Some("hookMessage");
-                if is_hook {
-                    if let Some(role) = entry
+                if is_hook
+                    && let Some(role) = entry
                         .as_object_mut()
                         .and_then(|obj| obj.get_mut("message"))
                         .and_then(Value::as_object_mut)
                         .and_then(|msg| msg.get_mut("role"))
-                    {
-                        *role = Value::String("custom".to_owned());
-                    }
+                {
+                    *role = Value::String("custom".to_owned());
                 }
             }
             _ => {}
@@ -1865,10 +1864,10 @@ impl SessionManager {
         from_hook: Option<bool>,
         usage: Option<Usage>,
     ) -> Result<String, RpiError> {
-        if let Some(id) = branch_from_id {
-            if !self.by_id.contains_key(id) {
-                return Err(RpiError::Session(format!("Entry {id} not found")));
-            }
+        if let Some(id) = branch_from_id
+            && !self.by_id.contains_key(id)
+        {
+            return Err(RpiError::Session(format!("Entry {id} not found")));
         }
         // `const fromId = this.leafId ?? "root"` is captured BEFORE the
         // leaf reset (session-manager.ts:1405-1406 @ 9841914, d711bd5f0):
@@ -2273,10 +2272,10 @@ impl SessionManager {
                 by_id: {
                     let mut map = HashMap::new();
                     for (i, r) in source_records.iter().enumerate() {
-                        if !r.is_header() {
-                            if let Some(id) = r.entry_id() {
-                                map.insert(id.to_owned(), i);
-                            }
+                        if !r.is_header()
+                            && let Some(id) = r.entry_id()
+                        {
+                            map.insert(id.to_owned(), i);
                         }
                     }
                     map
@@ -2649,14 +2648,12 @@ fn list_sessions_from_dir_with_progress(
         let publish_partial = loaded == 1
             || loaded.is_multiple_of(CURRENT_SESSION_LIST_PUBLISH_INTERVAL)
             || loaded == total;
-        if publish_partial {
-            if let Some(progress) = on_progress.as_mut() {
-                // `sortSessionInfos([...partialSessions])` — the snapshot is
-                // sorted; the accumulator keeps completion order.
-                let mut snapshot = partial.clone();
-                sort_session_infos(&mut snapshot);
-                progress(loaded, total, Some(&snapshot));
-            }
+        if publish_partial && let Some(progress) = on_progress.as_mut() {
+            // `sortSessionInfos([...partialSessions])` — the snapshot is
+            // sorted; the accumulator keeps completion order.
+            let mut snapshot = partial.clone();
+            sort_session_infos(&mut snapshot);
+            progress(loaded, total, Some(&snapshot));
         }
     }
     partial
@@ -2839,12 +2836,10 @@ impl SessionManager {
             let publish_partial = index == 0
                 || loaded.is_multiple_of(ALL_SESSION_LIST_PUBLISH_INTERVAL)
                 || loaded == total;
-            if publish_partial {
-                if let Some(progress) = on_progress.as_mut() {
-                    let mut snapshot = partial.clone();
-                    sort_session_infos(&mut snapshot);
-                    progress(loaded, total, Some(&snapshot));
-                }
+            if publish_partial && let Some(progress) = on_progress.as_mut() {
+                let mut snapshot = partial.clone();
+                sort_session_infos(&mut snapshot);
+                progress(loaded, total, Some(&snapshot));
             }
         }
         sort_session_infos(&mut partial);

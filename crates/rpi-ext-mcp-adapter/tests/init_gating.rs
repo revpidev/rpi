@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use futures::future::{BoxFuture, FutureExt, Shared};
-use rpi_ext_mcp_adapter::proxy::{initialize_mcp, McpRuntime, ProxyDispatcher};
+use rpi_ext_mcp_adapter::proxy::{McpRuntime, ProxyDispatcher, initialize_mcp};
 use serde_json::json;
 
 type InitFuture = Shared<BoxFuture<'static, Result<Arc<McpRuntime>, Arc<String>>>>;

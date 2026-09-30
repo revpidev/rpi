@@ -6,7 +6,7 @@
 //! short-circuit before `duplicate_option_label` (upstream `:17`).
 
 use crate::tool::types::{
-    QuestionParams, QuestionnaireError, MAX_QUESTIONS, MIN_OPTIONS, RESERVED_LABELS,
+    MAX_QUESTIONS, MIN_OPTIONS, QuestionParams, QuestionnaireError, RESERVED_LABELS,
 };
 
 /// `ERROR_NO_QUESTIONS` (upstream literal).

@@ -469,12 +469,12 @@ impl HostActions for SessionHostActions {
                 if let Some(api_key) = &auth.api_key {
                     result["apiKey"] = serde_json::json!(api_key);
                 }
-                if let Some(headers) = &auth.headers {
-                    if !headers.is_empty() {
-                        let headers_map: std::collections::HashMap<String, Option<String>> =
-                            headers.clone();
-                        result["headers"] = serde_json::json!(headers_map);
-                    }
+                if let Some(headers) = &auth.headers
+                    && !headers.is_empty()
+                {
+                    let headers_map: std::collections::HashMap<String, Option<String>> =
+                        headers.clone();
+                    result["headers"] = serde_json::json!(headers_map);
                 }
                 if let Some(base_url) = &auth.base_url {
                     result["baseUrl"] = serde_json::json!(base_url);
@@ -591,7 +591,7 @@ async fn exec_command(
                 stderr: String::new(),
                 code: 1,
                 killed: false,
-            }
+            };
         }
     };
     // Timeout: SIGKILL by pid, then collect whatever output was produced.

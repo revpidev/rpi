@@ -18,7 +18,7 @@
 //! Theme color names used (present in both bundled themes): `toolTitle`,
 //! `accent`, `success`, `error`, `warning`, `muted`, `dim`, `toolOutput`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Braille spinner frames (same glyphs as the TE08 smart-fetch renderer).
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -866,9 +866,11 @@ mod tests {
         let lines = card_lines(&tree);
         assert!(lines[0].0.starts_with("✓ researcher · Done"), "{lines:?}");
         assert_eq!(lines[0].1, "success");
-        assert!(lines
-            .iter()
-            .any(|(text, _)| text == "output: /tmp/art/out.md"));
+        assert!(
+            lines
+                .iter()
+                .any(|(text, _)| text == "output: /tmp/art/out.md")
+        );
     }
 
     #[test]

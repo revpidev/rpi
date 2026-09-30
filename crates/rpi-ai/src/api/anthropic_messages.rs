@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::constrained_sampling::{
@@ -41,7 +41,7 @@ use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
 };
 use crate::api::sse::{ServerSentEvent, SseDecoder};
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
 use crate::models::ProviderStreams;
 use crate::types::{
     AnthropicAllowedFallbackModel, AssistantContent, AssistantMessage, CacheRetention, DoneReason,
@@ -52,7 +52,7 @@ use crate::types::{
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::send_provider_request;
-use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
+use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
     headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
@@ -61,7 +61,7 @@ use crate::utils::headers::{
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions,
+    ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::transcript::resolve_transcript;
@@ -251,15 +251,15 @@ pub fn to_claude_code_name(name: &str) -> String {
 /// `fromClaudeCodeName`: map a (canonical) CC name back to the tool's own
 /// casing from the current tool list.
 pub fn from_claude_code_name(name: &str, tools: Option<&[Tool]>) -> String {
-    if let Some(tools) = tools {
-        if !tools.is_empty() {
-            let lower_name = name.to_lowercase();
-            if let Some(matched) = tools
-                .iter()
-                .find(|tool| tool.name.to_lowercase() == lower_name)
-            {
-                return matched.name.clone();
-            }
+    if let Some(tools) = tools
+        && !tools.is_empty()
+    {
+        let lower_name = name.to_lowercase();
+        if let Some(matched) = tools
+            .iter()
+            .find(|tool| tool.name.to_lowercase() == lower_name)
+        {
+            return matched.name.clone();
         }
     }
     name.to_owned()
@@ -536,28 +536,28 @@ fn build_request_headers(
     }
 
     // OAuth: Bearer auth, Claude Code identity headers.
-    if let Some(api_key) = api_key {
-        if is_oauth {
-            if let Some(betas) = &beta_header {
-                base.insert("anthropic-beta".to_owned(), Some(betas.clone()));
-            }
-            base.insert(
-                "user-agent".to_owned(),
-                Some(format!("claude-cli/{CLAUDE_CODE_VERSION}")),
-            );
-            base.insert("x-app".to_owned(), Some("cli".to_owned()));
-            base.insert(
-                "authorization".to_owned(),
-                Some(format!("Bearer {api_key}")),
-            );
-            let headers = merge_headers_chain(&[
-                rpi_user_agent_headers(),
-                Some(base),
-                model_headers(model),
-                options.stream.headers.clone(),
-            ]);
-            return (headers, true);
+    if let Some(api_key) = api_key
+        && is_oauth
+    {
+        if let Some(betas) = &beta_header {
+            base.insert("anthropic-beta".to_owned(), Some(betas.clone()));
         }
+        base.insert(
+            "user-agent".to_owned(),
+            Some(format!("claude-cli/{CLAUDE_CODE_VERSION}")),
+        );
+        base.insert("x-app".to_owned(), Some("cli".to_owned()));
+        base.insert(
+            "authorization".to_owned(),
+            Some(format!("Bearer {api_key}")),
+        );
+        let headers = merge_headers_chain(&[
+            rpi_user_agent_headers(),
+            Some(base),
+            model_headers(model),
+            options.stream.headers.clone(),
+        ]);
+        return (headers, true);
     }
 
     // API key or header-owned auth.
@@ -874,15 +874,13 @@ fn convert_messages(
                 // :1339-1346 — only same-provider anthropic-messages
                 // assistants with a valid recorded effort replay a marker
                 // (4e69b0c28).
-                if let Some(managed_provider) = managed_provider {
-                    if assistant.api == crate::types::ApiKind::from("anthropic-messages")
-                        && assistant.provider == managed_provider
-                        && is_anthropic_effort(assistant.provider_thinking_level.as_deref())
-                    {
-                        if let Some(level) = &assistant.provider_thinking_level {
-                            assistant_levels.insert(message_index, level.clone());
-                        }
-                    }
+                if let Some(managed_provider) = managed_provider
+                    && assistant.api == crate::types::ApiKind::from("anthropic-messages")
+                    && assistant.provider == managed_provider
+                    && is_anthropic_effort(assistant.provider_thinking_level.as_deref())
+                    && let Some(level) = &assistant.provider_thinking_level
+                {
+                    assistant_levels.insert(message_index, level.clone());
                 }
             }
             Message::ToolResult(_) => {
@@ -910,36 +908,36 @@ fn convert_messages(
     // conversation history (#9548 also allows the trailing pending system
     // message to carry the breakpoint; tool_addition/tool_removal blocks
     // included).
-    if let (Some(cache_control), Some(last_message)) = (cache_control, params.last_mut()) {
-        if matches!(
+    if let (Some(cache_control), Some(last_message)) = (cache_control, params.last_mut())
+        && matches!(
             last_message.get("role").and_then(Value::as_str),
             Some("user") | Some("system")
-        ) {
-            match last_message.get_mut("content") {
-                Some(Value::Array(blocks)) => {
-                    if let Some(last_block) = blocks.last_mut() {
-                        if matches!(
-                            last_block.get("type").and_then(Value::as_str),
-                            Some("text")
-                                | Some("image")
-                                | Some("tool_result")
-                                | Some("tool_addition")
-                                | Some("tool_removal")
-                        ) {
-                            last_block["cache_control"] = cache_control.clone();
-                        }
-                    }
+        )
+    {
+        match last_message.get_mut("content") {
+            Some(Value::Array(blocks)) => {
+                if let Some(last_block) = blocks.last_mut()
+                    && matches!(
+                        last_block.get("type").and_then(Value::as_str),
+                        Some("text")
+                            | Some("image")
+                            | Some("tool_result")
+                            | Some("tool_addition")
+                            | Some("tool_removal")
+                    )
+                {
+                    last_block["cache_control"] = cache_control.clone();
                 }
-                Some(Value::String(text)) => {
-                    let text = text.clone();
-                    last_message["content"] = json!([{
-                        "type": "text",
-                        "text": text,
-                        "cache_control": cache_control,
-                    }]);
-                }
-                _ => {}
             }
+            Some(Value::String(text)) => {
+                let text = text.clone();
+                last_message["content"] = json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": cache_control,
+                }]);
+            }
+            _ => {}
         }
     }
 
@@ -1114,10 +1112,12 @@ fn build_params(
 
     // Temperature is incompatible with extended thinking and unsupported on
     // Claude Opus 4.7+ / managed-effort models (:1090-1097).
-    if let Some(temperature) = options.stream.temperature {
-        if options.thinking_enabled != Some(true) && !managed && compat.supports_temperature {
-            params["temperature"] = json!(temperature);
-        }
+    if let Some(temperature) = options.stream.temperature
+        && options.thinking_enabled != Some(true)
+        && !managed
+        && compat.supports_temperature
+    {
+        params["temperature"] = json!(temperature);
     }
 
     let tool_cache_control = if compat.supports_cache_control_on_tools {
@@ -1237,10 +1237,10 @@ fn build_params(
         }
     }
 
-    if let Some(metadata) = &options.stream.metadata {
-        if let Some(user_id) = metadata.get("user_id").and_then(Value::as_str) {
-            params["metadata"] = json!({"user_id": user_id});
-        }
+    if let Some(metadata) = &options.stream.metadata
+        && let Some(user_id) = metadata.get("user_id").and_then(Value::as_str)
+    {
+        params["metadata"] = json!({"user_id": user_id});
     }
 
     if let Some(tool_choice) = &options.tool_choice {
@@ -1427,10 +1427,10 @@ impl<'a> StreamProcessor<'a> {
                 }
                 // :592-593 — server-reported input transformations (latest
                 // assignment wins; message_delta may replace them later).
-                if let Some(transformations) = message.get("input_transformations") {
-                    if transformations.is_array() {
-                        self.input_transformations = Some(transformations.clone());
-                    }
+                if let Some(transformations) = message.get("input_transformations")
+                    && transformations.is_array()
+                {
+                    self.input_transformations = Some(transformations.clone());
                 }
                 // :598 — keep the requested model ID on the assistant message
                 // and record the provider-reported model separately (#9188,
@@ -1718,22 +1718,22 @@ impl<'a> StreamProcessor<'a> {
             Some("message_delta") => {
                 let delta = &event["delta"];
                 // :745-746 — replaces any message_start-collected array.
-                if let Some(transformations) = event.get("input_transformations") {
-                    if transformations.is_array() {
-                        self.input_transformations = Some(transformations.clone());
-                    }
+                if let Some(transformations) = event.get("input_transformations")
+                    && transformations.is_array()
+                {
+                    self.input_transformations = Some(transformations.clone());
                 }
-                if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str) {
-                    if !reason.is_empty() {
-                        // 926eb15c1: preserve the raw provider reason before
-                        // mapping.
-                        self.output.raw_stop_reason = Some(reason.to_owned());
-                        let (stop_reason, error_message) =
-                            map_stop_reason(reason, delta.get("stop_details"))?;
-                        self.output.stop_reason = stop_reason;
-                        if let Some(error_message) = error_message {
-                            self.output.error_message = Some(error_message);
-                        }
+                if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str)
+                    && !reason.is_empty()
+                {
+                    // 926eb15c1: preserve the raw provider reason before
+                    // mapping.
+                    self.output.raw_stop_reason = Some(reason.to_owned());
+                    let (stop_reason, error_message) =
+                        map_stop_reason(reason, delta.get("stop_details"))?;
+                    self.output.stop_reason = stop_reason;
+                    if let Some(error_message) = error_message {
+                        self.output.error_message = Some(error_message);
                     }
                 }
                 // Only update usage fields if present (not null). Preserves
@@ -1782,14 +1782,14 @@ impl<'a> StreamProcessor<'a> {
             // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
             // treated as "stream ended without a usable stop reason".
             StopReason::Pending | StopReason::Deferred => {
-                return Err("Anthropic stream ended without a stop reason".to_owned())
+                return Err("Anthropic stream ended without a stop reason".to_owned());
             }
             StopReason::Aborted | StopReason::Error => {
                 return Err(self
                     .output
                     .error_message
                     .clone()
-                    .unwrap_or_else(|| "An unknown error occurred".to_owned()))
+                    .unwrap_or_else(|| "An unknown error occurred".to_owned()));
             }
             StopReason::Stop => DoneReason::Stop,
             StopReason::Length => DoneReason::Length,
@@ -1798,33 +1798,32 @@ impl<'a> StreamProcessor<'a> {
         // :790-803 (4e69b0c28): surface collected input transformations as a
         // diagnostic on the successful final message — `undefined` fields
         // are dropped from the JSON just like upstream's `?? undefined`.
-        if let Some(transformations) = &self.input_transformations {
-            if let Some(entries) = transformations.as_array() {
-                if !entries.is_empty() {
-                    let mapped: Vec<Value> = entries
-                        .iter()
-                        .map(|entry| {
-                            let mut object = serde_json::Map::new();
-                            for key in ["type", "path", "reason"] {
-                                if let Some(value) = entry.get(key).and_then(Value::as_str) {
-                                    object.insert(key.to_owned(), json!(value));
-                                }
-                            }
-                            Value::Object(object)
-                        })
-                        .collect();
-                    let mut details = serde_json::Map::new();
-                    details.insert("transformations".to_owned(), Value::Array(mapped));
-                    self.output.diagnostics.get_or_insert_with(Vec::new).push(
-                        crate::types::AssistantMessageDiagnostic {
-                            kind: "anthropic_input_transformations".to_owned(),
-                            timestamp: now_ms(),
-                            error: None,
-                            details: Some(details),
-                        },
-                    );
-                }
-            }
+        if let Some(transformations) = &self.input_transformations
+            && let Some(entries) = transformations.as_array()
+            && !entries.is_empty()
+        {
+            let mapped: Vec<Value> = entries
+                .iter()
+                .map(|entry| {
+                    let mut object = serde_json::Map::new();
+                    for key in ["type", "path", "reason"] {
+                        if let Some(value) = entry.get(key).and_then(Value::as_str) {
+                            object.insert(key.to_owned(), json!(value));
+                        }
+                    }
+                    Value::Object(object)
+                })
+                .collect();
+            let mut details = serde_json::Map::new();
+            details.insert("transformations".to_owned(), Value::Array(mapped));
+            self.output.diagnostics.get_or_insert_with(Vec::new).push(
+                crate::types::AssistantMessageDiagnostic {
+                    kind: "anthropic_input_transformations".to_owned(),
+                    timestamp: now_ms(),
+                    error: None,
+                    details: Some(details),
+                },
+            );
         }
         Ok(reason)
     }
@@ -1913,13 +1912,13 @@ async fn run(
     );
 
     let mut params = build_params(model, context, is_oauth_token, native_tool_changes, options)?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(mut next_params) = on_payload(params.clone(), model).await {
-            // :571-572 — the SDK transport always streams; a caller-supplied
-            // payload cannot turn that off.
-            next_params["stream"] = json!(true);
-            params = next_params;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(mut next_params) = on_payload(params.clone(), model).await
+    {
+        // :571-572 — the SDK transport always streams; a caller-supplied
+        // payload cannot turn that off.
+        next_params["stream"] = json!(true);
+        params = next_params;
     }
 
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
@@ -2849,9 +2848,11 @@ pub(crate) mod tests {
         )
         .expect("tools");
         assert!(converted[0].get("strict").is_none());
-        assert!(converted[0]["input_schema"]
-            .get("additionalProperties")
-            .is_none());
+        assert!(
+            converted[0]["input_schema"]
+                .get("additionalProperties")
+                .is_none()
+        );
 
         // "require" unsupported → error.
         let require_tool: Tool = serde_json::from_value(json!({
@@ -3389,9 +3390,11 @@ pub(crate) mod tests {
         let (events, reason, output) = drive_sse(&model, sse.as_bytes());
         assert_eq!(reason, Ok(DoneReason::Stop));
         assert_eq!(output.content.len(), 1);
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, StreamEvent::TextStart { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TextStart { .. }))
+        );
 
         // Mid-output: hard error with the upstream message.
         let sse = concat!(
@@ -3801,7 +3804,7 @@ mod mid_convo_effort_tests {
     //! still carries the stream-start-initialized output).
     use std::sync::{Arc, Mutex};
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::tests::{assistant_message, context, make_model, user_text};
     use super::*;
@@ -3840,10 +3843,10 @@ mod mid_convo_effort_tests {
             &model.provider,
             &model.id,
         );
-        if let Message::Assistant(message) = &mut message {
-            if let Some(level) = level {
-                message.provider_thinking_level = Some(level.to_owned());
-            }
+        if let Message::Assistant(message) = &mut message
+            && let Some(level) = level
+        {
+            message.provider_thinking_level = Some(level.to_owned());
         }
         message
     }
@@ -4275,7 +4278,7 @@ mod fireworks_mid_convo_tools_tests {
     //! `http://127.0.0.1:9` endpoint fail the request).
     use std::sync::{Arc, Mutex};
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::tests::{assistant_message, user_text};
     use super::*;
@@ -4318,8 +4321,8 @@ mod fireworks_mid_convo_tools_tests {
             .result()
             .await
             .expect("error message from unreachable endpoint");
-        let captured = payload.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        captured
+
+        payload.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Unsigned thinking replays with `signature: ""` (allowEmptySignature,
@@ -4411,7 +4414,7 @@ mod vercel_unsigned_thinking_tests {
     //! this asserts the replay semantics with an explicit compat overlay.
     use std::sync::{Arc, Mutex};
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::tests::{assistant_message, context, make_model, user_text};
     use super::*;
@@ -4453,8 +4456,8 @@ mod vercel_unsigned_thinking_tests {
             .result()
             .await
             .expect("error message from unreachable endpoint");
-        let captured = payload.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        captured
+
+        payload.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// #9676: Vercel AI Gateway emits unsigned thinking for translated
@@ -4501,7 +4504,7 @@ mod transcript_tool_changes_tests {
     //! capture, then let the unreachable endpoint fail the request).
     use std::sync::{Arc, Mutex};
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::tests::{context, make_model, user_text};
     use super::*;
@@ -4591,8 +4594,8 @@ mod transcript_tool_changes_tests {
         let event_stream = stream(model, context, options);
         // The endpoint is unreachable; the payload was captured first.
         let _ = event_stream.result().await;
-        let captured = payload.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        captured
+
+        payload.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// "sends Anthropic updates and tool changes in native system messages"

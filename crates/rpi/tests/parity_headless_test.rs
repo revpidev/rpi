@@ -29,26 +29,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use rpi::core::agent_session::{AgentSession, AgentSessionEvent, PromptOptions};
 use rpi::core::agent_session_runtime::{
-    create_agent_session_runtime, AgentSessionRuntime, CreateAgentSessionRuntimeFactory,
-    CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    AgentSessionRuntime, CreateAgentSessionRuntimeFactory, CreateAgentSessionRuntimeResult,
+    CreateRuntimeOptions, create_agent_session_runtime,
 };
 use rpi::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::output_guard::RawStdout;
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
-use rpi::modes::print_mode::{run_print_mode, PrintModeOptions, PrintOutputMode};
+use rpi::modes::print_mode::{PrintModeOptions, PrintOutputMode, run_print_mode};
 use rpi_agent::types::AgentEvent;
 use rpi_ai::types::StopReason;
 use rpi_test_support::diff::diff_jsonl;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -435,11 +435,13 @@ async fn parity_single_turn() {
     async fn scenario() {
         let run = start_scenario(
             "single-turn",
-            vec![faux_assistant_message(
-                "Hello from the faux provider!",
-                FauxAssistantOptions::default(),
-            )
-            .into()],
+            vec![
+                faux_assistant_message(
+                    "Hello from the faux provider!",
+                    FauxAssistantOptions::default(),
+                )
+                .into(),
+            ],
             FauxProviderOptions::default(),
             |_| {},
         )
@@ -597,11 +599,14 @@ async fn parity_abort() {
     async fn scenario() {
         let run = start_scenario(
             "abort",
-            vec![faux_assistant_message(
-                "A long answer that the user will abort before it finishes streaming. ".repeat(8),
-                FauxAssistantOptions::default(),
-            )
-            .into()],
+            vec![
+                faux_assistant_message(
+                    "A long answer that the user will abort before it finishes streaming. "
+                        .repeat(8),
+                    FauxAssistantOptions::default(),
+                )
+                .into(),
+            ],
             FauxProviderOptions {
                 tokens_per_second: Some(50.0),
                 ..Default::default()
@@ -635,14 +640,16 @@ async fn parity_length_truncation() {
     async fn scenario() {
         let run = start_scenario(
             "length-truncation",
-            vec![faux_assistant_message(
-                "Truncated answer that hit the max token limit",
-                FauxAssistantOptions {
-                    stop_reason: Some(StopReason::Length),
-                    ..Default::default()
-                },
-            )
-            .into()],
+            vec![
+                faux_assistant_message(
+                    "Truncated answer that hit the max token limit",
+                    FauxAssistantOptions {
+                        stop_reason: Some(StopReason::Length),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            ],
             FauxProviderOptions::default(),
             |_| {},
         )
@@ -763,11 +770,13 @@ async fn build_runtime(
 async fn print_mode_text_output() {
     let (mut runtime, _tmp) = build_runtime(
         "print-text",
-        vec![faux_assistant_message(
-            "Hello from the faux provider!",
-            FauxAssistantOptions::default(),
-        )
-        .into()],
+        vec![
+            faux_assistant_message(
+                "Hello from the faux provider!",
+                FauxAssistantOptions::default(),
+            )
+            .into(),
+        ],
     )
     .await;
     let out = SharedBuf::default();
@@ -796,11 +805,13 @@ async fn print_mode_text_output() {
 async fn print_mode_json_event_stream() {
     let (mut runtime, _tmp) = build_runtime(
         "print-json",
-        vec![faux_assistant_message(
-            "Hello from the faux provider!",
-            FauxAssistantOptions::default(),
-        )
-        .into()],
+        vec![
+            faux_assistant_message(
+                "Hello from the faux provider!",
+                FauxAssistantOptions::default(),
+            )
+            .into(),
+        ],
     )
     .await;
     let out = SharedBuf::default();
@@ -901,15 +912,17 @@ async fn print_mode_sends_all_messages_in_order() {
 async fn print_mode_error_and_aborted_exit_1() {
     let (mut runtime, _tmp) = build_runtime(
         "print-error",
-        vec![faux_assistant_message(
-            "",
-            FauxAssistantOptions {
-                stop_reason: Some(StopReason::Error),
-                error_message: Some("provider exploded".to_owned()),
-                ..Default::default()
-            },
-        )
-        .into()],
+        vec![
+            faux_assistant_message(
+                "",
+                FauxAssistantOptions {
+                    stop_reason: Some(StopReason::Error),
+                    error_message: Some("provider exploded".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .into(),
+        ],
     )
     .await;
     let out = SharedBuf::default();
@@ -931,15 +944,17 @@ async fn print_mode_error_and_aborted_exit_1() {
 
     let (mut runtime, _tmp) = build_runtime(
         "print-aborted",
-        vec![faux_assistant_message(
-            "",
-            FauxAssistantOptions {
-                stop_reason: Some(StopReason::Aborted),
-                error_message: Some("Request was aborted".to_owned()),
-                ..Default::default()
-            },
-        )
-        .into()],
+        vec![
+            faux_assistant_message(
+                "",
+                FauxAssistantOptions {
+                    stop_reason: Some(StopReason::Aborted),
+                    error_message: Some("Request was aborted".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .into(),
+        ],
     )
     .await;
     let out = SharedBuf::default();

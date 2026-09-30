@@ -43,7 +43,7 @@ use super::super::interaction::{AuthEvent, AuthInteraction};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
 use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
-    poll_oauth_device_code_flow, DeviceCodePollOptions, DeviceCodePollResult, CANCEL_MESSAGE,
+    CANCEL_MESSAGE, DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
 
 /// Muse Code CLI client id.
@@ -315,12 +315,10 @@ impl MetaOAuth {
             .get("access_token")
             .and_then(Value::as_str)
             .filter(|token| !token.is_empty());
-        if ok {
-            if let Some(token) = access_token {
-                return DeviceCodePollResult::Complete {
-                    value: token.to_owned(),
-                };
-            }
+        if ok && let Some(token) = access_token {
+            return DeviceCodePollResult::Complete {
+                value: token.to_owned(),
+            };
         }
 
         match json.get("error").and_then(Value::as_str) {

@@ -65,7 +65,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rpi_tui::components::input::Input;
@@ -81,7 +81,7 @@ use crate::core::themes::Theme;
 use super::dynamic_border::DynamicBorder;
 use super::keybinding_hints::{key_hint, key_text};
 use super::session_selector_search::{
-    filter_and_sort_sessions, has_session_name, NameFilter, SortMode,
+    NameFilter, SortMode, filter_and_sort_sessions, has_session_name,
 };
 
 /// `SessionScope` (session-selector.ts:23).
@@ -139,10 +139,10 @@ fn shorten_path(path: &str) -> String {
     if path.is_empty() {
         return path.to_string();
     }
-    if let Some(home) = home_dir() {
-        if let Some(rest) = path.strip_prefix(&home) {
-            return format!("~{rest}");
-        }
+    if let Some(home) = home_dir()
+        && let Some(rest) = path.strip_prefix(&home)
+    {
+        return format!("~{rest}");
     }
     path.to_string()
 }
@@ -2045,24 +2045,32 @@ mod tests {
         let callbacks = Callbacks::new();
         let mut component = build(&harness, &callbacks, false, false, None);
 
-        assert!(body_lines(&component, 80)
-            .join("\n")
-            .contains("Sort: Threaded"));
+        assert!(
+            body_lines(&component, 80)
+                .join("\n")
+                .contains("Sort: Threaded")
+        );
 
         component.handle_input("\x13"); // Ctrl+S
-        assert!(body_lines(&component, 80)
-            .join("\n")
-            .contains("Sort: Recent"));
+        assert!(
+            body_lines(&component, 80)
+                .join("\n")
+                .contains("Sort: Recent")
+        );
 
         component.handle_input("\x13"); // Ctrl+S
-        assert!(body_lines(&component, 80)
-            .join("\n")
-            .contains("Sort: Fuzzy"));
+        assert!(
+            body_lines(&component, 80)
+                .join("\n")
+                .contains("Sort: Fuzzy")
+        );
 
         component.handle_input("\x13"); // Ctrl+S
-        assert!(body_lines(&component, 80)
-            .join("\n")
-            .contains("Sort: Threaded"));
+        assert!(
+            body_lines(&component, 80)
+                .join("\n")
+                .contains("Sort: Threaded")
+        );
     }
 
     #[test]
@@ -2317,9 +2325,11 @@ mod tests {
         let mut component = build(&harness, &callbacks, true, false, None);
 
         component.handle_input("\x04"); // Enter confirmation
-        assert!(body_lines(&component, 80)
-            .join("\n")
-            .contains("Delete session?"));
+        assert!(
+            body_lines(&component, 80)
+                .join("\n")
+                .contains("Delete session?")
+        );
         component.handle_input("\x1b"); // Escape aborts
         assert!(callbacks.deleted.lock().unwrap().is_empty());
         let joined = body_lines(&component, 80).join("\n");
@@ -2347,9 +2357,11 @@ mod tests {
         component.handle_input("\x04");
         component.handle_input("\x03"); // Ctrl+C = tui.select.cancel
         assert!(callbacks.deleted.lock().unwrap().is_empty());
-        assert!(!body_lines(&component, 80)
-            .join("\n")
-            .contains("Delete session?"));
+        assert!(
+            !body_lines(&component, 80)
+                .join("\n")
+                .contains("Delete session?")
+        );
     }
 
     #[test]
@@ -2519,9 +2531,11 @@ mod tests {
         component.handle_input("\r");
         assert!(callbacks.renamed.lock().unwrap().is_empty());
         // Still in rename mode (upstream returns early on empty input).
-        assert!(body_lines(&component, 80)
-            .join("\n")
-            .contains("Rename Session"));
+        assert!(
+            body_lines(&component, 80)
+                .join("\n")
+                .contains("Rename Session")
+        );
     }
 
     #[test]

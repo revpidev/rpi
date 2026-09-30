@@ -46,7 +46,10 @@ pub const ENV_CODING_AGENT: &str = "RPI_CODING_AGENT";
 /// Called by the CLI/RPC entry points only (T10 wiring); SDK embedding must
 /// not call this.
 pub fn set_coding_agent_marker() {
-    std::env::set_var(ENV_CODING_AGENT, "true");
+    // SAFETY: entry-point-only contract (see doc above) — called from
+    // single-threaded process startup, before the runtime spawns any
+    // worker threads; no concurrent env readers exist yet.
+    unsafe { std::env::set_var(ENV_CODING_AGENT, "true") };
 }
 
 /// Presence check for the process marker. Upstream never reads the variable
@@ -70,7 +73,10 @@ pub const ENV_AI_AGENT: &str = "AI_AGENT";
 ///
 /// Called by the CLI/RPC entry points only; SDK embedding must not call this.
 pub fn set_ai_agent_marker() {
-    std::env::set_var(ENV_AI_AGENT, crate::config::APP_NAME);
+    // SAFETY: entry-point-only contract (see doc above) — called from
+    // single-threaded process startup, before the runtime spawns any
+    // worker threads; no concurrent env readers exist yet.
+    unsafe { std::env::set_var(ENV_AI_AGENT, crate::config::APP_NAME) };
 }
 
 // ---------------------------------------------------------------------------
@@ -120,8 +126,11 @@ pub fn is_offline() -> bool {
 /// `--offline` linkage (main.ts:477-479): offline mode sets both
 /// `RPI_OFFLINE=1` and `RPI_SKIP_VERSION_CHECK=1` for child processes.
 pub fn set_offline_env() {
-    std::env::set_var(ENV_OFFLINE, "1");
-    std::env::set_var(ENV_SKIP_VERSION_CHECK, "1");
+    // SAFETY: startup-phase write (`--offline` linkage, main.ts:476-480) —
+    // called from entry-point dispatch before any tasks (env readers) are
+    // spawned; no concurrent env readers exist yet.
+    unsafe { std::env::set_var(ENV_OFFLINE, "1") };
+    unsafe { std::env::set_var(ENV_SKIP_VERSION_CHECK, "1") };
 }
 
 /// `process.env.PI_SKIP_VERSION_CHECK` truthiness (version-check.ts:71):
@@ -312,8 +321,8 @@ pub(crate) mod test_env {
                 .collect();
             for (name, value) in vars {
                 match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
+                    Some(v) => rpi_test_env::set_var(name, v),
+                    None => rpi_test_env::remove_var(name),
                 }
             }
             (lock, EnvGuard { saved })
@@ -324,8 +333,8 @@ pub(crate) mod test_env {
         fn drop(&mut self) {
             for (name, value) in &self.saved {
                 match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
+                    Some(v) => rpi_test_env::set_var(name, v),
+                    None => rpi_test_env::remove_var(name),
                 }
             }
         }
@@ -361,11 +370,11 @@ mod tests {
     fn test_is_offline_truthy_flag() {
         let (_lock, _guard) = EnvGuard::set(&[(ENV_OFFLINE, None)]);
         assert!(!is_offline());
-        std::env::set_var(ENV_OFFLINE, "1");
+        rpi_test_env::set_var(ENV_OFFLINE, "1");
         assert!(is_offline());
-        std::env::set_var(ENV_OFFLINE, "true");
+        rpi_test_env::set_var(ENV_OFFLINE, "true");
         assert!(is_offline());
-        std::env::set_var(ENV_OFFLINE, "0");
+        rpi_test_env::set_var(ENV_OFFLINE, "0");
         assert!(!is_offline());
     }
 
@@ -388,9 +397,9 @@ mod tests {
     fn test_skip_version_check_any_non_empty() {
         let (_lock, _guard) = EnvGuard::set(&[(ENV_SKIP_VERSION_CHECK, None)]);
         assert!(!skip_version_check());
-        std::env::set_var(ENV_SKIP_VERSION_CHECK, "");
+        rpi_test_env::set_var(ENV_SKIP_VERSION_CHECK, "");
         assert!(!skip_version_check());
-        std::env::set_var(ENV_SKIP_VERSION_CHECK, "0");
+        rpi_test_env::set_var(ENV_SKIP_VERSION_CHECK, "0");
         assert!(skip_version_check());
     }
 
@@ -400,11 +409,11 @@ mod tests {
     fn test_telemetry_enabled_override() {
         let (_lock, _guard) = EnvGuard::set(&[(ENV_TELEMETRY, None)]);
         assert_eq!(telemetry_enabled_override(), None);
-        std::env::set_var(ENV_TELEMETRY, "1");
+        rpi_test_env::set_var(ENV_TELEMETRY, "1");
         assert_eq!(telemetry_enabled_override(), Some(true));
-        std::env::set_var(ENV_TELEMETRY, "no");
+        rpi_test_env::set_var(ENV_TELEMETRY, "no");
         assert_eq!(telemetry_enabled_override(), Some(false));
-        std::env::set_var(ENV_TELEMETRY, "");
+        rpi_test_env::set_var(ENV_TELEMETRY, "");
         assert_eq!(telemetry_enabled_override(), Some(false));
     }
 
@@ -413,9 +422,9 @@ mod tests {
     fn test_cache_retention_long_exact_match() {
         let (_lock, _guard) = EnvGuard::set(&[(ENV_CACHE_RETENTION, None)]);
         assert!(!cache_retention_long());
-        std::env::set_var(ENV_CACHE_RETENTION, "long");
+        rpi_test_env::set_var(ENV_CACHE_RETENTION, "long");
         assert!(cache_retention_long());
-        std::env::set_var(ENV_CACHE_RETENTION, "LONG");
+        rpi_test_env::set_var(ENV_CACHE_RETENTION, "LONG");
         assert!(!cache_retention_long());
     }
 
@@ -441,14 +450,14 @@ mod tests {
             (ENV_HARDWARE_CURSOR, ()),
             (ENV_CLEAR_ON_SHRINK, ()),
         ] {
-            std::env::set_var(name, "true");
+            rpi_test_env::set_var(name, "true");
         }
         // "true" is NOT accepted for the === "1" flags.
         assert!(!experimental_enabled());
         assert!(!timing_enabled());
         assert!(!hardware_cursor_enabled());
         assert!(!clear_on_shrink_enabled());
-        std::env::set_var(ENV_EXPERIMENTAL, "1");
+        rpi_test_env::set_var(ENV_EXPERIMENTAL, "1");
         assert!(experimental_enabled());
     }
 
@@ -457,7 +466,7 @@ mod tests {
     fn test_startup_benchmark_truthy_flag() {
         let (_lock, _guard) = EnvGuard::set(&[(ENV_STARTUP_BENCHMARK, None)]);
         assert!(!startup_benchmark_enabled());
-        std::env::set_var(ENV_STARTUP_BENCHMARK, "yes");
+        rpi_test_env::set_var(ENV_STARTUP_BENCHMARK, "yes");
         assert!(startup_benchmark_enabled());
     }
 
@@ -466,9 +475,9 @@ mod tests {
     fn test_tui_write_log_path() {
         let (_lock, _guard) = EnvGuard::set(&[(ENV_TUI_WRITE_LOG, None)]);
         assert_eq!(tui_write_log_path(), None);
-        std::env::set_var(ENV_TUI_WRITE_LOG, "");
+        rpi_test_env::set_var(ENV_TUI_WRITE_LOG, "");
         assert_eq!(tui_write_log_path(), None);
-        std::env::set_var(ENV_TUI_WRITE_LOG, "/tmp/rpi-ansi.log");
+        rpi_test_env::set_var(ENV_TUI_WRITE_LOG, "/tmp/rpi-ansi.log");
         assert_eq!(tui_write_log_path().as_deref(), Some("/tmp/rpi-ansi.log"));
     }
 
@@ -477,12 +486,12 @@ mod tests {
     fn test_external_editor_from_env_precedence() {
         let (_lock, _guard) = EnvGuard::set(&[(ENV_VISUAL, None), (ENV_EDITOR, None)]);
         assert_eq!(external_editor_from_env(), None);
-        std::env::set_var(ENV_EDITOR, "emacs");
+        rpi_test_env::set_var(ENV_EDITOR, "emacs");
         assert_eq!(external_editor_from_env().as_deref(), Some("emacs"));
-        std::env::set_var(ENV_VISUAL, "vim");
+        rpi_test_env::set_var(ENV_VISUAL, "vim");
         assert_eq!(external_editor_from_env().as_deref(), Some("vim"));
         // Empty VISUAL falls through to EDITOR (JS `||`).
-        std::env::set_var(ENV_VISUAL, "");
+        rpi_test_env::set_var(ENV_VISUAL, "");
         assert_eq!(external_editor_from_env().as_deref(), Some("emacs"));
     }
 
@@ -521,9 +530,9 @@ mod tests {
     fn test_package_dir_override() {
         let (_lock, _guard) = EnvGuard::set(&[(ENV_PACKAGE_DIR, None)]);
         assert_eq!(package_dir_override(), None);
-        std::env::set_var(ENV_PACKAGE_DIR, "");
+        rpi_test_env::set_var(ENV_PACKAGE_DIR, "");
         assert_eq!(package_dir_override(), None);
-        std::env::set_var(ENV_PACKAGE_DIR, "/nix/store/abc-rpi");
+        rpi_test_env::set_var(ENV_PACKAGE_DIR, "/nix/store/abc-rpi");
         assert_eq!(
             package_dir_override(),
             Some(PathBuf::from("/nix/store/abc-rpi"))

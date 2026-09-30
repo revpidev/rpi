@@ -518,16 +518,14 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
         let Some(bridge_object) = bridge.as_object() else {
             return Err("config.intercomBridge must be a JSON object".into());
         };
-        if let Some(mode) = bridge_object.get("mode") {
-            if !mode
+        if let Some(mode) = bridge_object.get("mode")
+            && !mode
                 .as_str()
                 .is_some_and(|m| matches!(m, "off" | "always" | "fork-only"))
-            {
-                return Err(
-                    "config.intercomBridge.mode must be \"always\", \"fork-only\", or \"off\""
-                        .into(),
-                );
-            }
+        {
+            return Err(
+                "config.intercomBridge.mode must be \"always\", \"fork-only\", or \"off\"".into(),
+            );
         }
         config.intercom_bridge = Some(bridge.clone());
     }
@@ -541,7 +539,7 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
                 None => {
                     return Err(
                         "config.artifactConfig.cleanupDays must be a non-negative integer".into(),
-                    )
+                    );
                 }
             }
         }
@@ -561,10 +559,10 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
         "scheduledRuns",
         "fleetKeybindings",
     ] {
-        if let Some(value) = object.get(key) {
-            if !value.is_object() {
-                return Err(format!("config.{key} must be a JSON object"));
-            }
+        if let Some(value) = object.get(key)
+            && !value.is_object()
+        {
+            return Err(format!("config.{key} must be a JSON object"));
         }
     }
     Ok(config)
@@ -706,7 +704,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'disableBuiltins'; expected a boolean.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -717,7 +715,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'defaultModel'; expected a non-empty string.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -729,7 +727,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'disableThinking'; expected a boolean.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -740,7 +738,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'defaultThinking'; expected a non-empty string.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -770,7 +768,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'defaultExtensions'; expected an array of non-empty strings.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -800,7 +798,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'defaultSubagentOnlyExtensions'; expected an array of non-empty strings.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -811,7 +809,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 "Subagent settings in '{}' {}",
                 path.to_string_lossy(),
                 message
-            ))
+            ));
         }
     }
     // —— v0.66 keys (TE19) ——
@@ -830,7 +828,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'maxThinking'; expected one of off, minimal, low, medium, high, xhigh, or max.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -842,7 +840,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'defaultProvider'; expected a non-empty string.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -875,7 +873,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'agentScanDirs'; expected an array of strings.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -906,7 +904,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 return Err(format!(
                     "Subagent settings in '{}' have invalid 'agentExcludeDirs'; expected an array of non-empty strings.",
                     path.to_string_lossy()
-                ))
+                ));
             }
         }
     }
@@ -945,7 +943,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     name,
                                     "model",
                                     "a string or false",
-                                ))
+                                ));
                             }
                         });
                     }
@@ -987,7 +985,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     name,
                                     "tools",
                                     "an array of strings, \"inherit\", or false",
-                                ))
+                                ));
                             }
                         });
                     }
@@ -1019,7 +1017,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     name,
                                     "thinking",
                                     "a string or false",
-                                ))
+                                ));
                             }
                         });
                     }
@@ -1032,7 +1030,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     name,
                                     "systemPromptMode",
                                     "'append' or 'replace'",
-                                ))
+                                ));
                             }
                         });
                     }
@@ -1062,7 +1060,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     name,
                                     "defaultContext",
                                     "'fresh', 'fork', or false",
-                                ))
+                                ));
                             }
                         });
                     }
@@ -1078,7 +1076,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     name,
                                     "acceptanceRole",
                                     "'read-only', 'writer', or false",
-                                ))
+                                ));
                             }
                         });
                     }
@@ -1103,7 +1101,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     name,
                                     "defaultProvider",
                                     "a non-empty string or false",
-                                ))
+                                ));
                             }
                         });
                     }
@@ -1132,7 +1130,7 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     name,
                                     "outputMode",
                                     "'inline' or 'file-only'",
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1476,14 +1474,18 @@ mod tests {
         );
         let bad_provider = dir.join("bad-provider.json");
         std::fs::write(&bad_provider, r#"{"subagents":{"defaultProvider":42}}"#).unwrap();
-        assert!(read_subagent_settings(&bad_provider)
-            .unwrap_err()
-            .contains("invalid 'defaultProvider'"));
+        assert!(
+            read_subagent_settings(&bad_provider)
+                .unwrap_err()
+                .contains("invalid 'defaultProvider'")
+        );
         let bad_scan = dir.join("bad-scan.json");
         std::fs::write(&bad_scan, r#"{"subagents":{"agentScanDirs":["/ok",42]}}"#).unwrap();
-        assert!(read_subagent_settings(&bad_scan)
-            .unwrap_err()
-            .contains("invalid 'agentScanDirs'"));
+        assert!(
+            read_subagent_settings(&bad_scan)
+                .unwrap_err()
+                .contains("invalid 'agentScanDirs'")
+        );
         // Override fields: defaultProvider string|false, allowNestedSubagents
         // bool, outputMode enum.
         let override_path = dir.join("overrides.json");
@@ -1513,9 +1515,11 @@ mod tests {
             r#"{"subagents":{"agentOverrides":{"x":{"outputMode":"boxed"}}}}"#,
         )
         .unwrap();
-        assert!(read_subagent_settings(&bad_mode)
-            .unwrap_err()
-            .contains("outputMode"));
+        assert!(
+            read_subagent_settings(&bad_mode)
+                .unwrap_err()
+                .contains("outputMode")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1600,12 +1604,14 @@ mod tests {
         assert_eq!(worker.system_prompt.as_deref(), Some("custom"));
         assert_eq!(worker.inherit_skills, Some(false));
         // completionGuard is beyond the documented set → ignored, not fatal.
-        assert!(settings
-            .overrides
-            .get("reviewer")
-            .unwrap()
-            .disabled
-            .is_none());
+        assert!(
+            settings
+                .overrides
+                .get("reviewer")
+                .unwrap()
+                .disabled
+                .is_none()
+        );
         std::fs::write(&path, r#"{"subagents":{"disableBuiltins":"yes"}}"#).unwrap();
         assert!(read_subagent_settings(&path).is_err());
         std::fs::write(&path, r#"{"subagents":{"defaultThinking":""}}"#).unwrap();
@@ -1672,12 +1678,12 @@ mod tests {
         let config = parse(r#"{"waitTool":{"enabled":false}}"#).unwrap();
         // config disabled → false; env true overrides.
         assert!(!config.wait_tool_enabled());
-        std::env::set_var("RPI_SUBAGENT_WAIT_TOOL_ENABLED", "1");
+        rpi_test_env::set_var("RPI_SUBAGENT_WAIT_TOOL_ENABLED", "1");
         assert!(config.wait_tool_enabled());
-        std::env::set_var("RPI_SUBAGENT_WAIT_TOOL_ENABLED", "bogus");
+        rpi_test_env::set_var("RPI_SUBAGENT_WAIT_TOOL_ENABLED", "bogus");
         // invalid env values warn and fall through to the config value.
         assert!(!config.wait_tool_enabled());
-        std::env::remove_var("RPI_SUBAGENT_WAIT_TOOL_ENABLED");
+        rpi_test_env::remove_var("RPI_SUBAGENT_WAIT_TOOL_ENABLED");
     }
 
     #[test]

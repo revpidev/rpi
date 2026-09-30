@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rpi::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};

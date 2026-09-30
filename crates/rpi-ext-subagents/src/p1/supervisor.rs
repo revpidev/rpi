@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const SUPERVISOR_CHANNEL_DIR_ENV: &str = "RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR";
 pub const SUPERVISOR_CHILD_INDEX_ENV: &str = "RPI_SUBAGENT_CHILD_INDEX";
@@ -101,10 +101,10 @@ pub fn read_requests(dir: &Path) -> Vec<Value> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
-                requests.push(value);
-            }
+        if let Ok(raw) = std::fs::read_to_string(&path)
+            && let Ok(value) = serde_json::from_str::<Value>(&raw)
+        {
+            requests.push(value);
         }
     }
     requests.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
@@ -241,23 +241,18 @@ impl ChildSupervisorContext {
                     .to_string();
                 if reason == "interview_request" {
                     // Fenced JSON extraction (L179-189).
-                    if let Some(start) = message.find("```") {
-                        if let Some(body) = message[start + 3..]
+                    if let Some(start) = message.find("```")
+                        && let Some(body) = message[start + 3..]
                             .strip_prefix("json\n")
                             .or_else(|| message[start + 3..].split_once('\n').map(|(_, rest)| rest))
-                        {
-                            if let Some(end) = body.find("```") {
-                                if let Ok(parsed) =
-                                    serde_json::from_str::<Value>(body[..end].trim())
-                                {
-                                    return json!({
-                                        "content": [{ "type": "text", "text": message }],
-                                        "details": { "structured": parsed },
-                                        "isError": false,
-                                    });
-                                }
-                            }
-                        }
+                        && let Some(end) = body.find("```")
+                        && let Ok(parsed) = serde_json::from_str::<Value>(body[..end].trim())
+                    {
+                        return json!({
+                            "content": [{ "type": "text", "text": message }],
+                            "details": { "structured": parsed },
+                            "isError": false,
+                        });
                     }
                 }
                 return ok_result(&message);
@@ -543,10 +538,10 @@ pub fn apply_intercom_bridge(
     if !active {
         return;
     }
-    if let Some(tool_list) = tools.as_mut() {
-        if !tool_list.iter().any(|t| t == "contact_supervisor") {
-            tool_list.push("contact_supervisor".to_string());
-        }
+    if let Some(tool_list) = tools.as_mut()
+        && !tool_list.iter().any(|t| t == "contact_supervisor")
+    {
+        tool_list.push("contact_supervisor".to_string());
     }
     let instruction = "Intercom orchestration channel: contact_supervisor reaches the parent orchestrator (this session's owner). Use reason need_decision for blocking decisions or clarifications, interview_request for structured input, progress_update for short non-blocking updates when a discovery changes the plan. Do not send routine completion handoffs.";
     if !system_prompt.contains("Intercom orchestration channel:") {
@@ -589,10 +584,12 @@ mod tests {
         assert_eq!(tools.as_ref().unwrap().len(), 1);
 
         apply_intercom_bridge("fork-only", Some("fork"), &mut tools, &mut prompt);
-        assert!(tools
-            .as_ref()
-            .unwrap()
-            .contains(&"contact_supervisor".to_string()));
+        assert!(
+            tools
+                .as_ref()
+                .unwrap()
+                .contains(&"contact_supervisor".to_string())
+        );
         assert!(prompt.contains("Intercom orchestration channel:"));
 
         apply_intercom_bridge("always", None, &mut tools, &mut prompt);
@@ -622,10 +619,12 @@ mod tests {
         let pending =
             parent_supervisor_action("pending", None, None, "session-vanished", &missing_root);
         assert_eq!(pending["isError"], Value::Bool(false));
-        assert!(pending["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("(none)"));
+        assert!(
+            pending["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("(none)")
+        );
         // Session-scoped probe over the (missing) global root: false.
         assert!(!has_pending_blocking_requests("session-vanished"));
         // A channel dir that disappears between listing and reading: the
@@ -784,10 +783,12 @@ mod tests {
 
         // Owning session sees it and can reply.
         let pending = parent_supervisor_action("pending", None, None, "session-a", &root);
-        assert!(pending["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("req1"));
+        assert!(
+            pending["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("req1")
+        );
         let reply =
             parent_supervisor_action("reply", Some("req1"), Some("Ship it."), "session-a", &root);
         assert_eq!(reply["isError"], Value::Bool(false));

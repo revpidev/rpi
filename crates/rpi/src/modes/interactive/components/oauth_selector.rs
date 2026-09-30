@@ -546,10 +546,12 @@ mod tests {
             Box::new(|| {}),
             None,
         );
-        assert!(empty
-            .render(60)
-            .join("\n")
-            .contains("No providers available"));
+        assert!(
+            empty
+                .render(60)
+                .join("\n")
+                .contains("No providers available")
+        );
 
         // Logout mode with no providers.
         let empty_logout = OAuthSelectorComponent::new(
@@ -560,10 +562,12 @@ mod tests {
             Box::new(|| {}),
             None,
         );
-        assert!(empty_logout
-            .render(60)
-            .join("\n")
-            .contains("No providers logged in. Use /login first."));
+        assert!(
+            empty_logout
+                .render(60)
+                .join("\n")
+                .contains("No providers logged in. Use /login first.")
+        );
 
         // Scroll indicator appears once rows exceed the 8-row window.
         let many: Vec<AuthSelectorProvider> = (0..12)
@@ -609,12 +613,16 @@ mod tests {
                 source: source.map(str::to_string),
             }),
         };
-        assert!(component
-            .format_status_indicator(&ok(None))
-            .contains("✓ configured"));
-        assert!(component
-            .format_status_indicator(&ok(Some("stored credential")))
-            .contains("✓ configured"));
+        assert!(
+            component
+                .format_status_indicator(&ok(None))
+                .contains("✓ configured")
+        );
+        assert!(
+            component
+                .format_status_indicator(&ok(Some("stored credential")))
+                .contains("✓ configured")
+        );
         let env = component.format_status_indicator(&ok(Some("ANTHROPIC_API_KEY, FOO")));
         assert!(env.contains("✓ env: ANTHROPIC_API_KEY, FOO"));
         // Non-env source falls back to the raw label.
@@ -632,8 +640,10 @@ mod tests {
                 source: None,
             }),
         };
-        assert!(component
-            .format_status_indicator(&mismatched)
-            .contains("API key configured"));
+        assert!(
+            component
+                .format_status_indicator(&mismatched)
+                .contains("API key configured")
+        );
     }
 }

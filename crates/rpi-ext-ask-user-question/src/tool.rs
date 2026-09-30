@@ -13,7 +13,7 @@
 //! arm with the interactive component (`ui.custom` equivalent); the
 //! surrounding order and guards stay.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub mod envelope;
 pub mod normalize;
@@ -21,8 +21,8 @@ pub mod types;
 pub mod validate;
 
 use crate::config::{
-    default_prompt_guidelines, default_prompt_snippet, AskUserQuestionConfig,
-    DEFAULT_TOOL_DESCRIPTION,
+    AskUserQuestionConfig, DEFAULT_TOOL_DESCRIPTION, default_prompt_guidelines,
+    default_prompt_snippet,
 };
 use crate::events;
 use crate::i18n::I18n;
@@ -31,9 +31,9 @@ use crate::rpc_fallback;
 use crate::tool::envelope::build_tool_result;
 use crate::tool::normalize::normalize_question_params;
 use crate::tool::types::{
-    question_params_schema, QuestionParams, QuestionnaireError, QuestionnaireResult,
+    QuestionParams, QuestionnaireError, QuestionnaireResult, question_params_schema,
 };
-use crate::tool::validate::{validate_questionnaire, ValidationResult};
+use crate::tool::validate::{ValidationResult, validate_questionnaire};
 use crate::{HostCall, HostError};
 
 /// Canonical tool name (`ASK_USER_QUESTION_TOOL_NAME`, re-exported for
@@ -427,10 +427,12 @@ mod tests {
         assert_eq!(definition["name"], "ask_user_question");
         assert_eq!(definition["label"], "Ask User Question");
         assert_eq!(definition["description"], DEFAULT_TOOL_DESCRIPTION);
-        assert!(definition["promptSnippet"]
-            .as_str()
-            .expect("snippet")
-            .contains("up to 4 structured questions"));
+        assert!(
+            definition["promptSnippet"]
+                .as_str()
+                .expect("snippet")
+                .contains("up to 4 structured questions")
+        );
         assert_eq!(
             definition["promptGuidelines"]
                 .as_array()
@@ -646,10 +648,12 @@ mod tests {
         let params: QuestionParams = serde_json::from_value(valid_params()).expect("params");
         let result = run_rpc_path_with(&host, &params, &I18n::for_locale("en"), || {});
         assert_eq!(result["isError"], json!(true));
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .expect("text")
-            .contains("host dialog failed"));
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .contains("host dialog failed")
+        );
         let calls = host.calls();
         assert_eq!(calls[0].1["data"], json!({ "active": true }));
         assert_eq!(calls[2].1["data"], json!({ "active": false }));
@@ -745,9 +749,11 @@ mod tests {
             .collect();
         assert_eq!(renders.len(), 2);
         let first_lines = renders[0]["lines"].as_array().expect("lines");
-        assert!(first_lines
-            .iter()
-            .any(|line| line.as_str().is_some_and(|line| line.contains("Pick one?"))));
+        assert!(
+            first_lines
+                .iter()
+                .any(|line| line.as_str().is_some_and(|line| line.contains("Pick one?")))
+        );
         assert_eq!(renders[1]["done"]["answers"][0]["answer"], json!("A"));
     }
 
@@ -766,10 +772,12 @@ mod tests {
         ]);
         let result = execute(&host, &valid_params());
         assert_eq!(result["isError"], json!(true));
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .expect("text")
-            .contains("component failed: internal: registry exploded"));
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .contains("component failed: internal: registry exploded")
+        );
         let methods: Vec<String> = host
             .calls()
             .iter()
@@ -839,10 +847,12 @@ mod tests {
         let host = FakeHost::new(&[("ctx.hasUI", json!(true))]);
         let result = execute(&host, &json!({"questions": "not an array"}));
         assert_eq!(result["isError"], json!(true));
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .expect("text")
-            .starts_with("Error: invalid ask_user_question parameters"));
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .starts_with("Error: invalid ask_user_question parameters")
+        );
         assert_eq!(host.calls().len(), 0, "no host call before params parse");
     }
 

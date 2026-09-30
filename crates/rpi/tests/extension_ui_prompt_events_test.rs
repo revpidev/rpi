@@ -15,10 +15,10 @@ use rpi_ext_host::api::UiBridge;
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

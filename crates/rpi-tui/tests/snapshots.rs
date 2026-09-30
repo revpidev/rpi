@@ -18,9 +18,9 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
+use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::input::Input;
 use rpi_tui::components::loader::{Loader, LoaderIndicatorOptions};
-use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::select_list::{SelectItem, SelectList, SelectListTheme};
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
@@ -558,8 +558,8 @@ use rpi_tui::components::settings_list::{
     SettingItem, SettingsList, SettingsListOptions, SettingsListTheme, SubmenuDone,
 };
 use rpi_tui::terminal_image::{
-    reset_capabilities_cache, set_capabilities, ImageDimensions, ImageProtocol,
-    TerminalCapabilities,
+    ImageDimensions, ImageProtocol, TerminalCapabilities, reset_capabilities_cache,
+    set_capabilities,
 };
 
 use std::sync::Mutex as StdMutex;

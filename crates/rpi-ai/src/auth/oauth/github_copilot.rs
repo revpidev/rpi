@@ -38,14 +38,14 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::super::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
 use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
-    poll_oauth_device_code_flow, DeviceCodePollOptions, DeviceCodePollResult,
+    DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
 use crate::generated::get_builtin_models;
 
@@ -172,10 +172,10 @@ fn get_base_url_from_token(token: &str) -> Option<String> {
 /// `getGitHubCopilotBaseUrl` — token `proxy-ep` wins; then the enterprise
 /// fallback; then the individual default.
 fn get_github_copilot_base_url(token: Option<&str>, enterprise_domain: Option<&str>) -> String {
-    if let Some(token) = token {
-        if let Some(url) = get_base_url_from_token(token) {
-            return url;
-        }
+    if let Some(token) = token
+        && let Some(url) = get_base_url_from_token(token)
+    {
+        return url;
     }
     match enterprise_domain {
         Some(domain) => format!("https://copilot-api.{domain}"),
@@ -1476,9 +1476,10 @@ mod tests {
         let poll = &requests[1];
         assert_eq!(poll.path, "/github.com/login/oauth/access_token");
         assert!(poll.body.contains("device_code=device-code"));
-        assert!(poll
-            .body
-            .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"));
+        assert!(
+            poll.body
+                .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code")
+        );
 
         // Copilot token exchange: GitHub token as Bearer + Copilot headers.
         let exchange = &requests[2];

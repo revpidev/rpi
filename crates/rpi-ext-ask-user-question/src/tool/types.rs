@@ -11,7 +11,7 @@
 //! - `state/row-intent.ts` (`ROW_INTENT_META`/`LABELS_BY_KIND`, re-sourced below)
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Maximum questions per invocation (`MAX_QUESTIONS`).
 pub const MAX_QUESTIONS: usize = 4;
@@ -314,10 +314,12 @@ mod tests {
         let option = &question["properties"]["options"]["items"];
         assert_eq!(option["required"], json!(["label", "description"]));
         assert_eq!(option["properties"]["label"]["maxLength"], MAX_LABEL_LENGTH);
-        assert!(option["properties"]["preview"]["description"]
-            .as_str()
-            .expect("preview description")
-            .starts_with("Optional preview content"));
+        assert!(
+            option["properties"]["preview"]["description"]
+                .as_str()
+                .expect("preview description")
+                .starts_with("Optional preview content")
+        );
         // Every property carries a model-facing description (the upstream
         // TypeBox schemas all do).
         for (name, property) in option["properties"].as_object().expect("option properties") {

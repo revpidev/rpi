@@ -10,10 +10,10 @@
 //! Intentional differences: none beyond those of `stack.rs` (which see).
 
 use crate::components::stack::{
-    allocate_stack_sizes, visible_stack_entries, Stack, StackChild, StackEntryOptions, StackOptions,
+    Stack, StackChild, StackEntryOptions, StackOptions, allocate_stack_sizes, visible_stack_entries,
 };
 use crate::layout_node::{LayoutNode, LayoutViewport, StackKind};
-use crate::tui::{lock_component, Component, SharedComponent};
+use crate::tui::{Component, SharedComponent, lock_component};
 
 /// `VStack.render` (v-stack.ts:10-30), shared by `Stack::render` dispatch.
 pub(crate) fn render_v_stack(stack: &Stack, width: usize) -> Vec<String> {

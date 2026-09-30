@@ -194,12 +194,12 @@ impl JsonFileModelsStore {
         // existing target file's permissions/ACLs — copy them onto the tmp
         // file before the rename (a fresh file keeps the default mode).
         #[cfg(unix)]
-        if write_result.is_ok() {
-            if let Ok(existing) = tokio::fs::metadata(&self.path).await {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = existing.permissions().mode();
-                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-            }
+        if write_result.is_ok()
+            && let Ok(existing) = tokio::fs::metadata(&self.path).await
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = existing.permissions().mode();
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
         }
         let result = match write_result {
             Ok(()) => tokio::fs::rename(&tmp, &self.path).await,

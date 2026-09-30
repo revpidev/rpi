@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::tools::bash::{BashExecError, BashExecOptions, BashOperations};
 use crate::tools::random_hex_16;
 use crate::tools::sanitize::{sanitize_binary_output, strip_ansi};
-use crate::tools::truncate::{self, TruncateOptions, DEFAULT_MAX_BYTES};
+use crate::tools::truncate::{self, DEFAULT_MAX_BYTES, TruncateOptions};
 
 /// Result of a user bash execution (bash-executor.ts:29-40).
 pub struct BashResult {
@@ -193,7 +193,7 @@ pub async fn execute_bash(
                 let removed = st.output_chunks.remove(0);
                 st.output_bytes = st.output_bytes.saturating_sub(removed.len());
             }
-            if let Some(ref cb) = on_chunk.as_ref() {
+            if let Some(cb) = on_chunk.as_ref() {
                 cb(&text);
             }
         }

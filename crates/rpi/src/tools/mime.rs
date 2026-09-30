@@ -291,7 +291,7 @@ mod tests {
         buf.extend_from_slice(b"IHDR");
         buf.extend_from_slice(&[0x00; 13]); // IHDR data
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IHDR CRC
-                                                          // acTL chunk: length 8
+        // acTL chunk: length 8
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x08]);
         buf.extend_from_slice(b"acTL");
         buf.extend_from_slice(&[0x00; 12]); // acTL data + CRC
@@ -336,7 +336,7 @@ mod tests {
         buf.extend_from_slice(b"IHDR");
         buf.extend_from_slice(&[0x00; 13]); // IHDR data
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IHDR CRC
-                                                          // IDAT chunk before any acTL → static PNG
+        // IDAT chunk before any acTL → static PNG
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x10]);
         buf.extend_from_slice(b"IDAT");
         buf.extend_from_slice(&[0x00; 20]); // IDAT data + CRC

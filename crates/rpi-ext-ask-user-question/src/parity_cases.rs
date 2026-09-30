@@ -11,9 +11,9 @@
 use serde_json::Value;
 
 use crate::i18n::I18n;
-use crate::state::build::{build_items_for_question, QuestionItem};
-use crate::state::key_router::{route_key, Action, Keybindings, QuestionnaireRuntime};
-use crate::state::reducer::{apply, state_from_json, ApplyContext};
+use crate::state::build::{QuestionItem, build_items_for_question};
+use crate::state::key_router::{Action, Keybindings, QuestionnaireRuntime, route_key};
+use crate::state::reducer::{ApplyContext, apply, state_from_json};
 use crate::tool::types::QuestionData;
 
 /// Questions of a fixture case (`questions` is always present).

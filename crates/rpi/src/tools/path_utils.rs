@@ -56,12 +56,13 @@ fn percent_decode(s: &str) -> String {
     let mut result = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                result.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+        {
+            result.push(h * 16 + l);
+            i += 3;
+            continue;
         }
         result.push(bytes[i]);
         i += 1;
@@ -119,13 +120,13 @@ fn normalize_path_inner(
         if let Some(home) = std::env::var_os("HOME") {
             return home.to_string_lossy().into_owned();
         }
-    } else if let Some(rest) = normalized.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join(rest)
-                .to_string_lossy()
-                .into_owned();
-        }
+    } else if let Some(rest) = normalized.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home)
+            .join(rest)
+            .to_string_lossy()
+            .into_owned();
     }
 
     // file:// URL → path (paths.ts:74-76).

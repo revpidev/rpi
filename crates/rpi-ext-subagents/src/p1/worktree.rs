@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::ExtensionConfig;
 
@@ -1334,9 +1334,11 @@ mod tests {
         std::fs::remove_file(toplevel.join("untracked.txt")).unwrap();
         // Tracked modifications reject too.
         std::fs::write(toplevel.join("base.txt"), "mutated").unwrap();
-        assert!(probe_worktree_source(&toplevel)
-            .unwrap_err()
-            .contains("clean git working tree"));
+        assert!(
+            probe_worktree_source(&toplevel)
+                .unwrap_err()
+                .contains("clean git working tree")
+        );
         run_git_checked(&toplevel, &["checkout", "--", "base.txt"], "checkout").unwrap();
         // Dirt under .rpi/subagents is excluded (upstream excludes
         // `.pi/subagents`, artifacts.ts:6).
@@ -1391,10 +1393,12 @@ mod tests {
         // Happy path: verified symlink back to the source.
         assert!(link_node_modules_if_present(&toplevel, &worktree).unwrap());
         let link = worktree.join("node_modules");
-        assert!(std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(link.join("dep.txt").exists());
         // Existing link → optional skip.
         assert!(!link_node_modules_if_present(&toplevel, &worktree).unwrap());

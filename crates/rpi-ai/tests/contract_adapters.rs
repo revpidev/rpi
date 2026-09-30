@@ -18,7 +18,7 @@ use rpi_ai::types::{
     ApiKind, Context, Message, Model, SimpleStreamOptions, SimpleToolChoice, StopReason,
     StreamEvent, StreamOptions,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;

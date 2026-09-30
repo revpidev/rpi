@@ -16,7 +16,7 @@ use crate::state::row_intent::RowKind;
 use crate::tool::types::QuestionData;
 use crate::view::inline_input;
 use crate::view::theme::Theme;
-use crate::view::{multi_select, preview, submit, tab_bar, truncate_line, RenderedFrame};
+use crate::view::{RenderedFrame, multi_select, preview, submit, tab_bar, truncate_line};
 
 /// Hint literals (canonical-English fallbacks of the `hint.*` locale keys).
 pub const HINT_PART_ENTER: &str = "Enter to select";
@@ -984,7 +984,7 @@ mod tests {
         let mut lines: Vec<String> = (0..30).map(|index| index.to_string()).collect();
         lines.push(String::new());
         lines.push("hint".to_owned()); // footer (bottom_fixed = 1… the blank is middle)
-                                       // No focus: top-anchored window — only the bottom is clipped.
+        // No focus: top-anchored window — only the bottom is clipped.
         let (out, _) = apply_scroll_window(lines.clone(), None, None, 2, 1, 10, &theme);
         assert_eq!(out.len(), 10);
         assert_eq!(strip_ansi(&out[0]), "0");
@@ -1064,9 +1064,11 @@ mod tests {
         let frame = render(&m);
         assert_eq!(frame.lines.len(), 8, "frame clamps to the height");
         let plain: Vec<String> = frame.lines.iter().map(|line| strip_ansi(line)).collect();
-        assert!(plain
-            .iter()
-            .any(|line| line == "↓" || line == "↑" || line == "↕"));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line == "↓" || line == "↑" || line == "↕")
+        );
         assert!(
             plain.last().expect("hint").starts_with("Enter to select"),
             "sticky footer survives"

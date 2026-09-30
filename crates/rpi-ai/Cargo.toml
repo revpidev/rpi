@@ -33,6 +33,7 @@ zstd.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+rpi-test-env.workspace = true
 # rpi#54 (V15-12 FR-A'): `#[tokio::test(start_paused = true)]` for the
 # virtual-clock silence tests (same pattern as the rpi crate V14-22 tick
 # tests and rpi-ext-smart-fetch FR-P2-D).

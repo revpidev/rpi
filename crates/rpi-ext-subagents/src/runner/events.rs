@@ -9,7 +9,7 @@
 //!
 //! Intentional differences: none in the protocol limits or parsing rules.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const MAX_CHILD_PENDING_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CHILD_STDERR_BYTES: usize = 128 * 1024;
@@ -231,14 +231,14 @@ impl AggregateProjection {
                 self.valid = false;
             }
         }
-        if let Some(Token::Number { phase }) = &self.token {
-            if matches!(
+        if let Some(Token::Number { phase }) = &self.token
+            && matches!(
                 phase,
                 NumberPhase::Zero | NumberPhase::Int | NumberPhase::Frac | NumberPhase::ExpDigits
-            ) {
-                self.token = None;
-                self.complete_value(None);
-            }
+            )
+        {
+            self.token = None;
+            self.complete_value(None);
         }
         if !self.valid
             || self.token.is_some()
@@ -251,12 +251,12 @@ impl AggregateProjection {
         if self.event_type.as_deref() == Some("turn_end") {
             return Some(r#"{"type":"turn_end"}"#.to_string());
         }
-        if self.event_type.as_deref() == Some("agent_end") {
-            if let Some(will_retry) = self.will_retry {
-                return Some(
-                    serde_json::json!({"type": "agent_end", "willRetry": will_retry}).to_string(),
-                );
-            }
+        if self.event_type.as_deref() == Some("agent_end")
+            && let Some(will_retry) = self.will_retry
+        {
+            return Some(
+                serde_json::json!({"type": "agent_end", "willRetry": will_retry}).to_string(),
+            );
         }
         None
     }
@@ -625,15 +625,15 @@ impl AggregateProjection {
         };
         let top_key = self.top_key.clone();
         if matches!(container, Container::Object(_)) && stack_len == 1 {
-            if top_key.as_deref() == Some("type") {
-                if let Some(Value::String(event)) = &value {
-                    self.event_type = Some(event.clone());
-                }
+            if top_key.as_deref() == Some("type")
+                && let Some(Value::String(event)) = &value
+            {
+                self.event_type = Some(event.clone());
             }
-            if top_key.as_deref() == Some("willRetry") {
-                if let Some(Value::Bool(flag)) = &value {
-                    self.will_retry = Some(*flag);
-                }
+            if top_key.as_deref() == Some("willRetry")
+                && let Some(Value::Bool(flag)) = &value
+            {
+                self.will_retry = Some(*flag);
             }
             self.top_key = None;
         }
@@ -1382,7 +1382,7 @@ mod tests {
         tail.push("abcdefgh".as_bytes());
         assert_eq!(tail.text(), "abcdefgh");
         tail.push("é".as_bytes()); // 2 bytes
-                                   // 10 bytes > 8: drop 2 from the front ("ab"), é stays whole.
+        // 10 bytes > 8: drop 2 from the front ("ab"), é stays whole.
         assert_eq!(tail.text(), "cdefghé");
         assert_eq!(tail.byte_length(), 8);
     }
@@ -1458,9 +1458,11 @@ mod tests {
             reader.end();
         }
         assert!(limits[0].observed_bytes >= 18);
-        assert!(limits[0]
-            .message()
-            .starts_with("protocol_output_limit: child stdout line exceeded 16 bytes"));
+        assert!(
+            limits[0]
+                .message()
+                .starts_with("protocol_output_limit: child stdout line exceeded 16 bytes")
+        );
     }
 
     #[test]
@@ -1784,9 +1786,11 @@ mod tests {
         let long = "a\n".repeat(10);
         let result = truncate_output(&long, 200_000, 5, Some("/tmp/out.md"));
         assert!(result.truncated);
-        assert!(result
-            .text
-            .starts_with("[TRUNCATED: showing first 5 of 11 lines"));
+        assert!(
+            result
+                .text
+                .starts_with("[TRUNCATED: showing first 5 of 11 lines")
+        );
         assert!(result.text.contains("- full output at /tmp/out.md]"));
         let big = "x".repeat(300 * 1024);
         let result = truncate_output(&big, 200 * 1024, 5000, None);

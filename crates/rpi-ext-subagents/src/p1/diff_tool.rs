@@ -13,7 +13,7 @@
 //! → capture at registration, subagent-prompt-runtime.ts:456-462), with the
 //! reviewer's tools line naming the tool playing the requiredTools role.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `WATCHDOG_DIFF_TOOL_NAME` (diff-tool.ts:6).
 pub const WATCHDOG_DIFF_TOOL_NAME: &str = "watchdog_diff";

@@ -193,16 +193,16 @@ impl ThinkingSelectorComponent {
             select_list_theme(theme),
             Some(THINKING_SELECT_LIST_LAYOUT),
         );
-        if let Some(level) = preselect {
-            if let Some(index) = items.iter().position(|item| item.value == level.as_str()) {
-                list.set_selected_index(index);
-            }
+        if let Some(level) = preselect
+            && let Some(index) = items.iter().position(|item| item.value == level.as_str())
+        {
+            list.set_selected_index(index);
         }
         list.on_select = Some(Box::new(move |item| {
-            if let Some(level) = thinking_level_from_str(&item.value) {
-                if let Ok(mut callback) = on_select.lock() {
-                    callback(level);
-                }
+            if let Some(level) = thinking_level_from_str(&item.value)
+                && let Ok(mut callback) = on_select.lock()
+            {
+                callback(level);
             }
         }));
         list
@@ -288,12 +288,11 @@ impl Component for ThinkingSelectorComponent {
                 read.matches_id(data, "app.thinking.save")
             };
             if is_save {
-                if let Some(item) = self.select_list.get_selected_item() {
-                    if let Some(level) = thinking_level_from_str(&item.value) {
-                        if let Some(callback) = self.on_select_as_default.as_mut() {
-                            callback(level);
-                        }
-                    }
+                if let Some(item) = self.select_list.get_selected_item()
+                    && let Some(level) = thinking_level_from_str(&item.value)
+                    && let Some(callback) = self.on_select_as_default.as_mut()
+                {
+                    callback(level);
                 }
                 return;
             }

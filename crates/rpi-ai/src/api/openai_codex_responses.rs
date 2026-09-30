@@ -34,28 +34,28 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 use regex::Regex;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::api::codex_ws::cache as ws_cache;
 use crate::api::codex_ws::{self, CodexError};
 use crate::api::constrained_sampling::create_grammar_tool_input_properties;
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
-use crate::api::openai_responses::{apply_service_tier_pricing, OPENAI_TOOL_CALL_PROVIDERS};
+use crate::api::openai_responses::{OPENAI_TOOL_CALL_PROVIDERS, apply_service_tier_pricing};
 use crate::api::openai_responses_shared::{
-    convert_responses_messages, convert_responses_tools, ConvertResponsesMessagesOptions,
-    ConvertResponsesToolsOptions, ResponsesStreamOptions, ResponsesStreamProcessor,
+    ConvertResponsesMessagesOptions, ConvertResponsesToolsOptions, ResponsesStreamOptions,
+    ResponsesStreamProcessor, convert_responses_messages, convert_responses_tools,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
-use crate::models::{clamp_thinking_level, ProviderStreams};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
+use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantMessage, AssistantMessageDiagnostic, CacheRetention, Context, DiagnosticErrorInfo,
     DoneReason, ErrorReason, Message, Model, ModelThinkingLevel, NumberOrString, ProviderHeaders,
     ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
     TranscriptContext, Transport, Usage,
 };
-use crate::utils::custom_fetch::{send_provider_request, SendFailure};
+use crate::utils::custom_fetch::{SendFailure, send_provider_request};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::headers_to_record;
 use crate::utils::uuid::uuidv7;
@@ -147,19 +147,18 @@ fn is_retryable_error(status: u16, error_text: &str) -> bool {
 
 /// `getRetryAfterDelayMs`.
 fn get_retry_after_delay_ms(headers: &HashMap<String, String>) -> Option<u64> {
-    if let Some(retry_after_ms) = headers.get("retry-after-ms") {
-        if let Ok(millis) = retry_after_ms.parse::<f64>() {
-            if millis.is_finite() {
-                return Some(millis.max(0.0) as u64);
-            }
-        }
+    if let Some(retry_after_ms) = headers.get("retry-after-ms")
+        && let Ok(millis) = retry_after_ms.parse::<f64>()
+        && millis.is_finite()
+    {
+        return Some(millis.max(0.0) as u64);
     }
 
     let retry_after = headers.get("retry-after")?;
-    if let Ok(seconds) = retry_after.parse::<f64>() {
-        if seconds.is_finite() {
-            return Some((seconds * 1000.0).max(0.0) as u64);
-        }
+    if let Ok(seconds) = retry_after.parse::<f64>()
+        && seconds.is_finite()
+    {
+        return Some((seconds * 1000.0).max(0.0) as u64);
     }
 
     if let Ok(date) = httpdate::parse_http_date(retry_after) {
@@ -255,8 +254,8 @@ pub fn resolve_codex_websocket_url(base_url: Option<&str>) -> String {
 /// real ChatGPT tokens are base64url, so both alphabets are tried (padded and
 /// unpadded).
 fn decode_jwt_payload(segment: &str) -> Option<Vec<u8>> {
-    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
         if let Ok(bytes) = engine.decode(segment) {
             return Some(bytes);
@@ -788,48 +787,47 @@ fn parse_error_response(status: u16, status_text: Option<&str>, raw: &str) -> Pa
     }
     let mut friendly_message: Option<String> = None;
 
-    if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
-        if let Some(error) = parsed.get("error").filter(|error| error.is_object()) {
-            let code = error
-                .get("code")
+    if let Ok(parsed) = serde_json::from_str::<Value>(raw)
+        && let Some(error) = parsed.get("error").filter(|error| error.is_object())
+    {
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .or_else(|| error.get("type").and_then(Value::as_str))
+            .unwrap_or("");
+        static USAGE_LIMIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            // invariant: literal pattern compiles
+            Regex::new(r"(?i)usage_limit_reached|usage_not_included|rate_limit_exceeded").unwrap()
+        });
+        if USAGE_LIMIT_RE.is_match(code) || status == 429 {
+            let plan = error
+                .get("plan_type")
                 .and_then(Value::as_str)
-                .or_else(|| error.get("type").and_then(Value::as_str))
-                .unwrap_or("");
-            static USAGE_LIMIT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                // invariant: literal pattern compiles
-                Regex::new(r"(?i)usage_limit_reached|usage_not_included|rate_limit_exceeded")
-                    .unwrap()
-            });
-            if USAGE_LIMIT_RE.is_match(code) || status == 429 {
-                let plan = error
-                    .get("plan_type")
-                    .and_then(Value::as_str)
-                    .map(|plan| format!(" ({} plan)", plan.to_lowercase()))
-                    .unwrap_or_default();
-                let minutes = error
-                    .get("resets_at")
-                    .and_then(Value::as_f64)
-                    .map(|resets_at| {
-                        let now_ms = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|duration| duration.as_millis() as f64)
-                            .unwrap_or(0.0);
-                        ((resets_at * 1000.0 - now_ms) / 60000.0).round().max(0.0) as u64
-                    });
-                let when = minutes
-                    .map(|minutes| format!(" Try again in ~{minutes} min."))
-                    .unwrap_or_default();
-                friendly_message = Some(
-                    format!("You have hit your ChatGPT usage limit{plan}.{when}")
-                        .trim()
-                        .to_owned(),
-                );
-            }
-            if let Some(error_message) = error.get("message").and_then(Value::as_str) {
-                message = error_message.to_owned();
-            } else if let Some(friendly) = &friendly_message {
-                message = friendly.clone();
-            }
+                .map(|plan| format!(" ({} plan)", plan.to_lowercase()))
+                .unwrap_or_default();
+            let minutes = error
+                .get("resets_at")
+                .and_then(Value::as_f64)
+                .map(|resets_at| {
+                    let now_ms = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as f64)
+                        .unwrap_or(0.0);
+                    ((resets_at * 1000.0 - now_ms) / 60000.0).round().max(0.0) as u64
+                });
+            let when = minutes
+                .map(|minutes| format!(" Try again in ~{minutes} min."))
+                .unwrap_or_default();
+            friendly_message = Some(
+                format!("You have hit your ChatGPT usage limit{plan}.{when}")
+                    .trim()
+                    .to_owned(),
+            );
+        }
+        if let Some(error_message) = error.get("message").and_then(Value::as_str) {
+            message = error_message.to_owned();
+        } else if let Some(friendly) = &friendly_message {
+            message = friendly.clone();
         }
     }
 
@@ -1203,10 +1201,10 @@ async fn run(
         &grammar_tool_input_properties,
     )
     .map_err(CodexError::Other)?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_body) = on_payload(body.clone(), model).await {
-            body = next_body;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_body) = on_payload(body.clone(), model).await
+    {
+        body = next_body;
     }
     let websocket_request_id = codex_session_id
         .clone()
@@ -1687,7 +1685,7 @@ impl ProviderStreams for OpenAiCodexResponses {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::api::openai_completions::tests as common;
@@ -1945,9 +1943,11 @@ mod tests {
             .expect("ok")
             .expect("event");
         assert_eq!(passthrough["type"], json!("codex.rate_limits"));
-        assert!(map_codex_event(&json!({"x": 1}), &mut None)
-            .expect("ok")
-            .is_none());
+        assert!(
+            map_codex_event(&json!({"x": 1}), &mut None)
+                .expect("ok")
+                .is_none()
+        );
     }
 
     /// c3e7bc60a @ 4181f66 (#7766): a boolean `response.end_turn` on
@@ -2260,12 +2260,16 @@ mod tests {
         let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
         assert_eq!(top_level_names(&body), vec!["base_tool"]);
         let input = body["input"].as_array().expect("input");
-        assert!(input
-            .iter()
-            .any(|item| item["type"] == json!("additional_tools")));
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("tool_search_output")));
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == json!("additional_tools"))
+        );
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("tool_search_output"))
+        );
 
         // supportsMidConvoSystemMessages + supportsToolSearch only: the
         // client tool-search pair.
@@ -2275,24 +2279,32 @@ mod tests {
         let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
         assert_eq!(top_level_names(&body), vec!["base_tool"]);
         let input = body["input"].as_array().expect("input");
-        assert!(input
-            .iter()
-            .any(|item| item["type"] == json!("tool_search_output")));
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("additional_tools")));
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == json!("tool_search_output"))
+        );
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("additional_tools"))
+        );
 
         // Neither (gpt-5.3-codex-spark shape): every tool stays top-level.
         let m = model(json!({"compat": {"supportsOpenAIGrammarTools": true}}));
         let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
         assert_eq!(top_level_names(&body), vec!["base_tool", "late_tool"]);
         let input = body["input"].as_array().expect("input");
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("additional_tools")));
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("tool_search_output")));
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("additional_tools"))
+        );
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("tool_search_output"))
+        );
     }
 
     /// #9548 (openai-codex-responses.ts:243): the stream entry resolves the
@@ -2439,9 +2451,11 @@ mod tests {
         );
         assert_eq!(headers.get("session-id"), Some(&"sess".to_owned()));
         assert_eq!(headers.get("x-client-request-id"), Some(&"sess".to_owned()));
-        assert!(headers
-            .get("user-agent")
-            .is_some_and(|ua| ua.starts_with("rpi (")));
+        assert!(
+            headers
+                .get("user-agent")
+                .is_some_and(|ua| ua.starts_with("rpi ("))
+        );
     }
 
     #[test]

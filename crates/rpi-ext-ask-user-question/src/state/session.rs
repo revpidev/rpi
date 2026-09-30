@@ -27,25 +27,25 @@
 use std::collections::VecDeque;
 
 use rpi_ext_host::interactive_ui::{
-    edit_external, mount_component, poll_component, render_component, set_component_hidden,
     Component, ComponentCursor, ComponentEvent, ComponentFrame, DisposeReason, DoneValue,
     HostCall as AbiHostCall, InteractiveUiError, MountOptions, OverlayAnchor, OverlayOptions,
-    SizeValue,
+    SizeValue, edit_external, mount_component, poll_component, render_component,
+    set_component_hidden,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::config::{resolve_collapse_key, AskUserQuestionConfig};
+use crate::HostCall;
+use crate::config::{AskUserQuestionConfig, resolve_collapse_key};
 use crate::i18n::I18n;
-use crate::state::build::{build_items_for_question, QuestionItem};
+use crate::state::build::{QuestionItem, build_items_for_question};
 use crate::state::key_router::{
-    route_key, Action, Keybindings, QuestionnaireRuntime, KEYBIND_EDITOR_DOWN, KEYBIND_EDITOR_UP,
-    KEYBIND_NEW_LINE,
+    Action, KEYBIND_EDITOR_DOWN, KEYBIND_EDITOR_UP, KEYBIND_NEW_LINE, Keybindings,
+    QuestionnaireRuntime, route_key,
 };
-use crate::state::reducer::{apply, result_for, ApplyContext, Effect, QuestionnaireState};
+use crate::state::reducer::{ApplyContext, Effect, QuestionnaireState, apply, result_for};
 use crate::tool::types::{QuestionData, QuestionParams, QuestionnaireResult};
 use crate::view::dialog::{self, DialogModel};
 use crate::view::theme::Theme;
-use crate::HostCall;
 
 /// Char-indexed multiline text buffer with a cursor.
 ///
@@ -458,10 +458,10 @@ impl QuestionnaireComponent {
             return;
         }
         if action.is_ignore() {
-            if self.state.input_mode {
-                if let Some(data) = source {
-                    self.input.handle_input(data, &self.keybindings);
-                }
+            if self.state.input_mode
+                && let Some(data) = source
+            {
+                self.input.handle_input(data, &self.keybindings);
             }
             return;
         }

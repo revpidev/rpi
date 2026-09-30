@@ -39,7 +39,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rpi_agent::messages::AgentMessage;
-use rpi_agent::session::{parse_iso8601_ms, SessionEntry};
+use rpi_agent::session::{SessionEntry, parse_iso8601_ms};
 use rpi_ai::types::{AssistantContent, StopReason, ToolResultContent, UserContent};
 use rpi_ai::utils::text::{content_text_assistant, content_text_tool_result, content_text_user};
 use rpi_tui::components::input::Input;
@@ -51,12 +51,12 @@ use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::utils::{slice_by_column, truncate_to_width, visible_width, wrap_text_with_ansi};
 use serde_json::{Map, Value};
 
-use crate::core::session_manager::{now_iso8601, SessionTreeNode};
+use crate::core::session_manager::{SessionTreeNode, now_iso8601};
 use crate::core::settings_manager::TreeFilterMode;
 use crate::core::themes::Theme;
 
 use super::dynamic_border::DynamicBorder;
-use super::keybinding_hints::{format_key_text, key_hint, KeyTextFormatOptions};
+use super::keybinding_hints::{KeyTextFormatOptions, format_key_text, key_hint};
 
 /// Gutter info: position (displayIndent where connector was shown) and
 /// whether to show `│` (tree-selector.ts:20-24).
@@ -116,18 +116,17 @@ fn render_horizontal_viewport(rows: &[HorizontalViewportRow], width: usize) -> V
     // Only pan horizontally when needed to keep enough selected-row content
     // visible after its anchor.
     let mut horizontal_scroll = 0;
-    if let Some(selected_row) = selected_row {
-        if max_horizontal_scroll > 0 {
-            let min_visible_anchor_content_width = MAX_VISIBLE_ANCHOR_CONTENT_WIDTH
-                .min(MIN_VISIBLE_ANCHOR_CONTENT_WIDTH.max(viewport_width / 3));
-            if selected_row.anchor_col
-                > viewport_width.saturating_sub(min_visible_anchor_content_width)
-            {
-                let anchor_context_width =
-                    MAX_ANCHOR_CONTEXT_WIDTH.min(MIN_ANCHOR_CONTEXT_WIDTH.max(viewport_width / 4));
-                horizontal_scroll = max_horizontal_scroll
-                    .min(selected_row.anchor_col.saturating_sub(anchor_context_width));
-            }
+    if let Some(selected_row) = selected_row
+        && max_horizontal_scroll > 0
+    {
+        let min_visible_anchor_content_width = MAX_VISIBLE_ANCHOR_CONTENT_WIDTH
+            .min(MIN_VISIBLE_ANCHOR_CONTENT_WIDTH.max(viewport_width / 3));
+        if selected_row.anchor_col > viewport_width.saturating_sub(min_visible_anchor_content_width)
+        {
+            let anchor_context_width =
+                MAX_ANCHOR_CONTEXT_WIDTH.min(MIN_ANCHOR_CONTEXT_WIDTH.max(viewport_width / 4));
+            horizontal_scroll = max_horizontal_scroll
+                .min(selected_row.anchor_col.saturating_sub(anchor_context_width));
         }
     }
 
@@ -397,18 +396,18 @@ impl TreeList {
         )) = stack.pop()
         {
             // Extract tool calls from assistant messages for later lookup.
-            if let Some(SessionEntry::Message(message_entry)) = node.entry.known() {
-                if let AgentMessage::Assistant(assistant) = &message_entry.message {
-                    for block in &assistant.content {
-                        if let AssistantContent::ToolCall(tool_call) = block {
-                            self.tool_call_map.insert(
-                                tool_call.id.clone(),
-                                ToolCallInfo {
-                                    name: tool_call.name.clone(),
-                                    arguments: tool_call.arguments.clone(),
-                                },
-                            );
-                        }
+            if let Some(SessionEntry::Message(message_entry)) = node.entry.known()
+                && let AgentMessage::Assistant(assistant) = &message_entry.message
+            {
+                for block in &assistant.content {
+                    if let AssistantContent::ToolCall(tool_call) = block {
+                        self.tool_call_map.insert(
+                            tool_call.id.clone(),
+                            ToolCallInfo {
+                                name: tool_call.name.clone(),
+                                arguments: tool_call.arguments.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -501,14 +500,13 @@ impl TreeList {
         // Update lastSelectedId only when we have a valid selection
         // (non-empty list). This preserves the selection when switching
         // through empty filter results.
-        if !self.filtered_nodes.is_empty() {
-            if let Some(id) = self
+        if !self.filtered_nodes.is_empty()
+            && let Some(id) = self
                 .filtered_nodes
                 .get(self.selected_index)
                 .map(|node| node.node.entry.id().to_string())
-            {
-                self.last_selected_id = Some(id);
-            }
+        {
+            self.last_selected_id = Some(id);
         }
 
         let search_tokens: Vec<String> = self
@@ -536,18 +534,17 @@ impl TreeList {
                 // Skip assistant messages with only tool calls (no text)
                 // unless error/aborted. Always show current leaf so the
                 // active position is visible.
-                if let Some(SessionEntry::Message(message_entry)) = entry.known() {
-                    if let AgentMessage::Assistant(assistant) = &message_entry.message {
-                        if !is_current_leaf {
-                            let has_text = has_text_content(&assistant.content);
-                            let is_error_or_aborted = assistant.stop_reason != StopReason::Stop
-                                && assistant.stop_reason != StopReason::ToolUse;
-                            // Only hide if no text AND not an error/aborted
-                            // message.
-                            if !has_text && !is_error_or_aborted {
-                                return false;
-                            }
-                        }
+                if let Some(SessionEntry::Message(message_entry)) = entry.known()
+                    && let AgentMessage::Assistant(assistant) = &message_entry.message
+                    && !is_current_leaf
+                {
+                    let has_text = has_text_content(&assistant.content);
+                    let is_error_or_aborted = assistant.stop_reason != StopReason::Stop
+                        && assistant.stop_reason != StopReason::ToolUse;
+                    // Only hide if no text AND not an error/aborted
+                    // message.
+                    if !has_text && !is_error_or_aborted {
+                        return false;
                     }
                 }
 
@@ -607,10 +604,10 @@ impl TreeList {
             let mut skip_set: HashSet<String> = HashSet::new();
             for flat_node in &self.flat_nodes {
                 let id = flat_node.node.entry.id().to_string();
-                if let Some(parent_id) = flat_node.node.entry.parent_id() {
-                    if self.folded_nodes.contains(parent_id) || skip_set.contains(parent_id) {
-                        skip_set.insert(id);
-                    }
+                if let Some(parent_id) = flat_node.node.entry.parent_id()
+                    && (self.folded_nodes.contains(parent_id) || skip_set.contains(parent_id))
+                {
+                    skip_set.insert(id);
                 }
             }
             self.filtered_nodes
@@ -632,14 +629,13 @@ impl TreeList {
 
         // Update lastSelectedId to the actual selection (may have changed
         // due to parent walk).
-        if !self.filtered_nodes.is_empty() {
-            if let Some(id) = self
+        if !self.filtered_nodes.is_empty()
+            && let Some(id) = self
                 .filtered_nodes
                 .get(self.selected_index)
                 .map(|node| node.node.entry.id().to_string())
-            {
-                self.last_selected_id = Some(id);
-            }
+        {
+            self.last_selected_id = Some(id);
         }
     }
 
@@ -1522,10 +1518,10 @@ impl Component for TreeList {
                 .filtered_nodes
                 .get(self.selected_index)
                 .map(|node| (node.node.entry.id().to_string(), node.node.label.clone()));
-            if let Some((id, label)) = selected {
-                if let Some(callback) = self.on_label_edit.as_mut() {
-                    callback(&id, label.as_deref());
-                }
+            if let Some((id, label)) = selected
+                && let Some(callback) = self.on_label_edit.as_mut()
+            {
+                callback(&id, label.as_deref());
             }
         } else if read.matches_id(data, "app.tree.toggleLabelTimestamp") {
             self.show_label_timestamps = !self.show_label_timestamps;
@@ -1552,11 +1548,12 @@ fn format_tool_call(name: &str, arguments: &Map<String, Value>) -> String {
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok());
     let shorten_path = |path: String| -> String {
-        if let Some(home) = &home {
-            if !home.is_empty() && path.starts_with(home.as_str()) {
-                let suffix: String = path.chars().skip(home.chars().count()).collect();
-                return format!("~{suffix}");
-            }
+        if let Some(home) = &home
+            && !home.is_empty()
+            && path.starts_with(home.as_str())
+        {
+            let suffix: String = path.chars().skip(home.chars().count()).collect();
+            return format!("~{suffix}");
         }
         path
     };
@@ -2154,10 +2151,10 @@ impl LabelInput {
     /// `constructor` (tree-selector.ts:1287-1293).
     fn new(entry_id: String, current_label: Option<&str>, theme: Arc<Theme>) -> Self {
         let mut input = Input::new();
-        if let Some(label) = current_label {
-            if !label.is_empty() {
-                input.set_value(label);
-            }
+        if let Some(label) = current_label
+            && !label.is_empty()
+        {
+            input.set_value(label);
         }
         Self {
             input,
@@ -2479,10 +2476,9 @@ impl Component for TreeSelectorComponent {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take()
+                && let Some(callback) = self.on_copy.as_mut()
             {
-                if let Some(callback) = self.on_copy.as_mut() {
-                    callback(text.as_deref());
-                }
+                callback(text.as_deref());
             }
         }
     }
@@ -3140,7 +3136,9 @@ mod tests {
         let list = tree_list(mixed_tree(), None, 5, None, TreeFilterMode::All);
         assert_eq!(
             filtered_ids(&list),
-            vec!["r", "m1", "m2", "m3", "l1", "c1", "mc1", "tl1", "si1", "comp1", "bs1", "cm1"]
+            vec![
+                "r", "m1", "m2", "m3", "l1", "c1", "mc1", "tl1", "si1", "comp1", "bs1", "cm1"
+            ]
         );
     }
 

@@ -32,7 +32,7 @@ use crate::core::themes::Theme;
 
 use super::dynamic_border::DynamicBorder;
 use super::keybinding_hints::key_text;
-use super::model_search::{get_model_search_text, ModelSearchItem};
+use super::model_search::{ModelSearchItem, get_model_search_text};
 
 /// `EnabledIds` (scoped-models-selector.ts:18-19): `None` = all enabled (no
 /// filter), `Some` = explicit ordered list.
@@ -676,8 +676,8 @@ mod tests {
     use super::*;
     use crate::core::themes::load_theme;
     use rpi_ai::types::ApiKind;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn theme() -> Arc<Theme> {
         Arc::new(load_theme("dark", None).expect("builtin dark theme"))

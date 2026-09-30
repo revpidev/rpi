@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct FakeHost {
     cwd: PathBuf,
@@ -193,9 +193,9 @@ impl Sandbox {
         )
         .unwrap();
         std::fs::create_dir_all(&dump_root).unwrap();
-        std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
-        std::env::set_var("RPI_SUBAGENT_RPI_BINARY", fixed_child_binary());
-        std::env::set_var(
+        rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+        rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", fixed_child_binary());
+        rpi_test_env::set_var(
             "RPI_SUBAGENT_EXTENSION_PATH",
             "/opt/rpi-ext/librpi_ext_subagents.so",
         );
@@ -252,10 +252,10 @@ fn assert_no_rpi_subagent_children() -> bool {
         if !name.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        if let Ok(cmdline) = std::fs::read_to_string(entry.path().join("cmdline")) {
-            if cmdline.contains("rpi-subagents-fixed-child") {
-                return false;
-            }
+        if let Ok(cmdline) = std::fs::read_to_string(entry.path().join("cmdline"))
+            && cmdline.contains("rpi-subagents-fixed-child")
+        {
+            return false;
         }
     }
     true
@@ -268,7 +268,7 @@ fn e2e_fixed_child_full_pipeline() {
     // `RPI_SUBAGENT_DEPTH`, so an inherited value would make the env dump
     // below assert depth 2. Single-test binary — the process env is
     // contained.
-    std::env::remove_var("RPI_SUBAGENT_DEPTH");
+    rpi_test_env::remove_var("RPI_SUBAGENT_DEPTH");
     let sandbox = Sandbox::new();
     let host = Arc::new(FakeHost {
         cwd: sandbox.project.clone(),
@@ -286,8 +286,8 @@ fn e2e_fixed_child_full_pipeline() {
 
     // ---- Scenario 1: plain foreground run (scout) ----------------------
     let dump = sandbox.dump("ok");
-    std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-    std::env::set_var("RPI_E2E_MODE", "ok");
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+    rpi_test_env::set_var("RPI_E2E_MODE", "ok");
     let result =
         execute(json!({ "agent": "scout", "task": "map the codebase", "timeoutMs": 30000 }));
     assert_eq!(result["isError"], Value::Bool(false), "{result}");
@@ -362,10 +362,12 @@ fn e2e_fixed_child_full_pipeline() {
     );
     assert!(find_flag("--no-extensions").is_none());
     // task text rides argv under the 8000-char limit.
-    assert!(argv_lines
-        .last()
-        .unwrap()
-        .starts_with("Task: map the codebase"));
+    assert!(
+        argv_lines
+            .last()
+            .unwrap()
+            .starts_with("Task: map the codebase")
+    );
 
     // env dump: the child-side contract.
     let env_text = std::fs::read_to_string(dump.join("env.txt")).unwrap();
@@ -393,11 +395,12 @@ fn e2e_fixed_child_full_pipeline() {
     // artifacts trail (project mode).
     let artifacts_dir = sandbox.project.join(".rpi/subagents/artifacts");
     let base = artifacts_dir.join(format!("{run_id}_scout_0"));
-    assert!(base
-        .parent()
-        .unwrap()
-        .join(format!("{run_id}_scout_0_input.md"))
-        .exists());
+    assert!(
+        base.parent()
+            .unwrap()
+            .join(format!("{run_id}_scout_0_input.md"))
+            .exists()
+    );
     let output_content = std::fs::read_to_string(
         base.parent()
             .unwrap()
@@ -405,18 +408,20 @@ fn e2e_fixed_child_full_pipeline() {
     )
     .unwrap();
     assert_eq!(output_content, "Fixed child result: analysis complete");
-    assert!(base
-        .parent()
-        .unwrap()
-        .join(format!("{run_id}_scout_0_transcript.jsonl"))
-        .exists());
+    assert!(
+        base.parent()
+            .unwrap()
+            .join(format!("{run_id}_scout_0_transcript.jsonl"))
+            .exists()
+    );
     // FR-P0-09 fifth artifact: the raw child event stream, on by default
     // (`artifactConfig.includeJsonl !== false`, execution.ts:1517-1519).
-    assert!(base
-        .parent()
-        .unwrap()
-        .join(format!("{run_id}_scout_0.jsonl"))
-        .exists());
+    assert!(
+        base.parent()
+            .unwrap()
+            .join(format!("{run_id}_scout_0.jsonl"))
+            .exists()
+    );
     let meta: Value = serde_json::from_str(
         &std::fs::read_to_string(
             base.parent()
@@ -484,7 +489,7 @@ fn e2e_fixed_child_full_pipeline() {
     }));
 
     let dump = sandbox.dump("fork");
-    std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
     let result = execute(json!({
         "agent": "delegate",
         "task": "continue from the fork",
@@ -601,7 +606,7 @@ fn e2e_fixed_child_full_pipeline() {
     )
     .unwrap();
     let dual_dump = sandbox.dump("dual");
-    std::env::set_var("RPI_E2E_DUMP_DIR", &dual_dump);
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dual_dump);
     let dual_runs = dual_dir.join("runs");
     let result = execute(json!({
         "agent": "delegate",
@@ -643,8 +648,8 @@ fn e2e_fixed_child_full_pipeline() {
     // the first + the drain/terminal frame), NOT one toolUpdate per event
     // (audit #3: per-event sync FFI).
     let thrash_dump = sandbox.dump("thrash");
-    std::env::set_var("RPI_E2E_DUMP_DIR", &thrash_dump);
-    std::env::set_var("RPI_E2E_MODE", "thrash");
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &thrash_dump);
+    rpi_test_env::set_var("RPI_E2E_MODE", "thrash");
     let _ = take_tool_updates(); // baseline: drain frames from earlier scenarios
     let result = execute(json!({
         "agent": "scout",
@@ -660,7 +665,7 @@ fn e2e_fixed_child_full_pipeline() {
     assert!(pushed >= 1, "initial/drain frame still pushed: {pushed}");
 
     // ---- Scenario 4: depth block ---------------------------------------
-    std::env::set_var("RPI_SUBAGENT_DEPTH", "2");
+    rpi_test_env::set_var("RPI_SUBAGENT_DEPTH", "2");
     let result = execute(json!({ "agent": "scout", "task": "go deeper", "timeoutMs": 5000 }));
     assert_eq!(result["isError"], Value::Bool(true));
     let text = result["content"][0]["text"].as_str().unwrap();
@@ -670,18 +675,18 @@ fn e2e_fixed_child_full_pipeline() {
     );
     // No child spawned: no new dump dir contents.
     let dump = sandbox.dump("blocked");
-    std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
     let result = execute(json!({ "agent": "scout", "task": "still blocked", "timeoutMs": 5000 }));
     assert!(result["isError"] == Value::Bool(true));
     assert!(!dump.join("pid.txt").exists(), "no child process spawned");
-    std::env::remove_var("RPI_SUBAGENT_DEPTH");
+    rpi_test_env::remove_var("RPI_SUBAGENT_DEPTH");
 
     // ---- Scenario 5: timeout ladder + process reclamation --------------
     // The child emits a NON-terminal assistant message (toolCall present) and
     // hangs: only the timeout ladder (SIGINT → SIGTERM → SIGKILL) reclaims it.
     let dump = sandbox.dump("timeout");
-    std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-    std::env::set_var("RPI_E2E_MODE", "partial_toolcall_then_hang");
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+    rpi_test_env::set_var("RPI_E2E_MODE", "partial_toolcall_then_hang");
     let started = std::time::Instant::now();
     let result = execute(json!({ "agent": "scout", "task": "hang around", "timeoutMs": 1500 }));
     let elapsed = started.elapsed();
@@ -709,8 +714,8 @@ fn e2e_fixed_child_full_pipeline() {
     // The child reaches a clean terminal stop but keeps running; the drain
     // ladder SIGTERMs it after the 1s grace (execution.ts:571-623).
     let dump = sandbox.dump("drain");
-    std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-    std::env::set_var("RPI_E2E_MODE", "partial_then_hang");
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+    rpi_test_env::set_var("RPI_E2E_MODE", "partial_then_hang");
     let started = std::time::Instant::now();
     let result = execute(json!({
         "agent": "scout",
@@ -724,10 +729,12 @@ fn e2e_fixed_child_full_pipeline() {
         elapsed.as_secs() < 20,
         "drain ladder finished promptly: {elapsed:?}"
     );
-    assert!(result["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("partial output before hanging"));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("partial output before hanging")
+    );
     let pid: u32 = std::fs::read_to_string(dump.join("pid.txt"))
         .unwrap()
         .trim()
@@ -739,7 +746,7 @@ fn e2e_fixed_child_full_pipeline() {
     );
 
     // ---- Scenario 6: child failure propagates ---------------------------
-    std::env::set_var("RPI_E2E_MODE", "fail");
+    rpi_test_env::set_var("RPI_E2E_MODE", "fail");
     let result = execute(json!({
         "agent": "scout",
         "task": "explode",
@@ -752,7 +759,7 @@ fn e2e_fixed_child_full_pipeline() {
     assert_eq!(result["details"]["results"][0]["exitCode"], 3);
 
     // ---- Scenario 7: raw non-JSON output on nonzero exit ---------------
-    std::env::set_var("RPI_E2E_MODE", "rawjunk");
+    rpi_test_env::set_var("RPI_E2E_MODE", "rawjunk");
     let result = execute(json!({
         "agent": "scout",
         "task": "junk",
@@ -760,13 +767,15 @@ fn e2e_fixed_child_full_pipeline() {
         "artifacts": false
     }));
     assert_eq!(result["isError"], Value::Bool(true), "{result}");
-    assert!(result["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("this is not json at all"));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("this is not json at all")
+    );
 
     // ---- Scenario 8: willRetry then settled ----------------------------
-    std::env::set_var("RPI_E2E_MODE", "willretry");
+    rpi_test_env::set_var("RPI_E2E_MODE", "willretry");
     let result = execute(json!({
         "agent": "scout",
         "task": "retry once",
@@ -786,8 +795,8 @@ fn e2e_fixed_child_full_pipeline() {
         // Tool activity happened before the retryable failure: the guard must
         // keep the run to ONE child (no whole-task replay on the same cwd).
         let dump = sandbox.dump("fallback-guard-tools");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "fallback-fail-tools");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "fallback-fail-tools");
         let result = execute(json!({
             "agent": "fallbacker",
             "task": "fail after tools",
@@ -809,8 +818,8 @@ fn e2e_fixed_child_full_pipeline() {
         // No tool activity: same-launch switching is gone (v0.70 #2270) —
         // the run fails after exactly one spawn, no retry note.
         let dump = sandbox.dump("fallback-chain-no-tools");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "fallback-fail-no-tools");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "fallback-fail-no-tools");
         let result = execute(json!({
             "agent": "fallbacker",
             "task": "fail without tools",
@@ -832,8 +841,8 @@ fn e2e_fixed_child_full_pipeline() {
         // Context overflow is terminal: no fallback candidate is consumed and
         // the attempt note explains why (R7.1.2.2).
         let dump = sandbox.dump("fallback-overflow");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "fallback-fail-overflow");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "fallback-fail-overflow");
         let result = execute(json!({
             "agent": "fallbacker",
             "task": "overflow",
@@ -855,8 +864,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 8c (TE14): background shares the same guard (A2) ------
     {
         let dump = sandbox.dump("fallback-async-tools");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "fallback-fail-tools");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "fallback-fail-tools");
         let result = execute(json!({
             "agent": "fallbacker",
             "task": "async fail after tools",
@@ -879,8 +888,8 @@ fn e2e_fixed_child_full_pipeline() {
     }
     {
         let dump = sandbox.dump("fallback-async-no-tools");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "fallback-fail-no-tools");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "fallback-fail-no-tools");
         let result = execute(json!({
             "agent": "fallbacker",
             "task": "async fail without tools",
@@ -906,8 +915,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 9 (TE05): parallel tasks composition (FR-P1-01) ----
     {
         let dump = sandbox.dump("parallel");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         let result = execute(json!({
             "tasks": [
                 { "key": "alpha", "agent": "scout", "task": "scan A" },
@@ -952,8 +961,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 10 (TE05): chain steps composition (FR-P1-02) --------
     {
         let dump = sandbox.dump("chain");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         let result = execute(json!({
             "steps": [
                 { "agent": "scout", "task": "gather {task}" },
@@ -995,8 +1004,8 @@ fn e2e_fixed_child_full_pipeline() {
         // ---- Scenario 10b (TE09 FR-B): chain-mode streaming frames ------
         {
             let dump = sandbox.dump("chain-stream");
-            std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-            std::env::set_var("RPI_E2E_MODE", "ok");
+            rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+            rpi_test_env::set_var("RPI_E2E_MODE", "ok");
             take_tool_updates();
             let result = execute(json!({
                 "steps": [
@@ -1033,8 +1042,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 11 (TE05): background run lifecycle (FR-P1-04) ------
     {
         let dump = sandbox.dump("async");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         let result = execute(json!({
             "agent": "scout",
             "task": "async work",
@@ -1083,11 +1092,11 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 12b (rpi#29): tasks steps go live mid-batch ----
     {
         let dump = sandbox.dump("step-live");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "slow");
-        std::env::set_var("RPI_E2E_SLOW_MS", "2000");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "slow");
+        rpi_test_env::set_var("RPI_E2E_SLOW_MS", "2000");
         // Children 0/2 sleep 2s; child 1 (fast) finishes immediately.
-        std::env::set_var("RPI_E2E_SLOW_INDICES", "0,2");
+        rpi_test_env::set_var("RPI_E2E_SLOW_INDICES", "0,2");
         let result = execute(json!({
             "tasks": [
                 { "key": "slow-a", "agent": "scout", "task": "slow A" },
@@ -1143,10 +1152,10 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 12c (rpi#30): globalConcurrencyLimit caps the batch ----
     {
         let dump = sandbox.dump("global-cap");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "slow");
-        std::env::set_var("RPI_E2E_SLOW_MS", "1500");
-        std::env::remove_var("RPI_E2E_SLOW_INDICES");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "slow");
+        rpi_test_env::set_var("RPI_E2E_SLOW_MS", "1500");
+        rpi_test_env::remove_var("RPI_E2E_SLOW_INDICES");
         // Cap the run-wide child concurrency at 2 while the per-batch
         // concurrency is 4 — without the global semaphore all four children
         // would run at once (pre-fix: dead code, no enforcement point).
@@ -1212,10 +1221,10 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 12d (TE16): stop marks tasks sub-steps stopped ------
     {
         let dump = sandbox.dump("stop-terminal");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "slow");
-        std::env::set_var("RPI_E2E_SLOW_MS", "5000");
-        std::env::remove_var("RPI_E2E_SLOW_INDICES");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "slow");
+        rpi_test_env::set_var("RPI_E2E_SLOW_MS", "5000");
+        rpi_test_env::remove_var("RPI_E2E_SLOW_INDICES");
         let result = execute(json!({
             "tasks": [
                 { "key": "a", "agent": "scout", "task": "stopped A" },
@@ -1253,8 +1262,8 @@ fn e2e_fixed_child_full_pipeline() {
     {
         let dump = sandbox.dump("output-collision");
         let _ = std::fs::remove_dir_all(&dump);
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         let shared = sandbox.project.join("shared-report.md");
         let result = execute(json!({
             "tasks": [
@@ -1281,8 +1290,8 @@ fn e2e_fixed_child_full_pipeline() {
     {
         let dump = sandbox.dump("base-ref-invalid");
         let _ = std::fs::remove_dir_all(&dump);
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         for bad in [json!("HEAD~1"), json!("-b"), json!("a b"), json!(42)] {
             let result = execute(json!({
                 "tasks": [{ "key": "a", "agent": "scout", "task": "base ref", "worktree": true }],
@@ -1305,8 +1314,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 13 (TE09): foreground streaming snapshots (FR-A) ----
     {
         let dump = sandbox.dump("streaming");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "tools");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "tools");
         // The wait tool's on_update pushes are fire-and-forget tokio tasks
         // (2026-08-16 wait-hang fix): earlier wait scenarios' trailing frames
         // can land a tick late and would steal frames[0]. Settle them out of
@@ -1385,8 +1394,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 14 (TE09): notify 归位 + renderer (FR-D) --------------
     {
         let dump = sandbox.dump("notify");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         take_sent_messages();
         take_sent_message_calls();
         let result = execute(json!({
@@ -1492,15 +1501,19 @@ fn e2e_fixed_child_full_pipeline() {
             &json!({ "expanded": false }),
         );
         let children = tree["children"].as_array().unwrap();
-        assert!(children[0]["props"]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("✓ scout completed"));
+        assert!(
+            children[0]["props"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("✓ scout completed")
+        );
         assert_eq!(children[0]["props"]["fg"], json!("success"));
-        assert!(children[1]["props"]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("  ⎿  Fixed child result"));
+        assert!(
+            children[1]["props"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("  ⎿  Fixed child result")
+        );
         // TE17: the muted run-id correlation line is visible in the
         // collapsed state (upstream extension/index.ts:690-694 pattern).
         let run_line = children
@@ -1520,8 +1533,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 12 (TE05): budget rejection paths (FR-P1-04/09) -----
     {
         let dump = sandbox.dump("budget");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         // Drain the session spawn ledger to its cap via the sandbox config
         // (maxSubagentSpawnsPerSession: 1): the ledger is keyed by session id
         // hash — a unique agent dir per scenario isolates prior counts. Use
@@ -1555,8 +1568,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- Scenario 15 (TE11): render dispatch + fleet widget lifecycle ----
     {
         let dump = sandbox.dump("te11");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         // Shrink the fleet linger window so the empty-state removal is
         // observable without a 60 s wait (atomic seam — env updates race
         // the loop's worker thread).
@@ -1684,8 +1697,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- TE18 Scenario: excludeTools argv + global-context env (FR-B/FR-H) --
     {
         let dump = sandbox.dump("exclude-tools");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         let result = execute(json!({
             "agent": "excluder",
             "task": "narrow tools",
@@ -1726,8 +1739,8 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- TE18 Scenario: pre-spawn tool-face gate fails closed (FR-C) -----
     {
         let dump = sandbox.dump("gate-fail");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
         let result = execute(json!({
             "agent": "gater",
             "task": "needs web_search",
@@ -1755,9 +1768,9 @@ fn e2e_fixed_child_full_pipeline() {
     // ---- from the background continuation) ----------------------------
     {
         let dump = sandbox.dump("detach");
-        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
-        std::env::set_var("RPI_E2E_MODE", "slow");
-        std::env::set_var("RPI_E2E_SLOW_MS", "4000");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "slow");
+        rpi_test_env::set_var("RPI_E2E_SLOW_MS", "4000");
         SENT_MESSAGES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1880,8 +1893,8 @@ fn e2e_fixed_child_full_pipeline() {
             );
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        std::env::remove_var("RPI_E2E_SLOW_MS");
-        std::env::set_var("RPI_E2E_MODE", "ok");
+        rpi_test_env::remove_var("RPI_E2E_SLOW_MS");
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
     }
 
     // Final sweep: nothing left running.

@@ -29,21 +29,21 @@
 //!   `{model, contents, config}` (as upstream); the wire conversion happens
 //!   after the hook, mirroring the SDK pipeline.
 
-use serde_json::{json, Map, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::google_shared::{
-    convert_messages, convert_tools, get_disabled_google_thinking_config, is_thinking_part,
-    map_stop_reason, resolve_google_function_calling_mode, resolve_google_thinking_level,
-    retain_thought_signature, retry_google_request, supports_google_strict_tool_sampling,
-    to_google_thinking_level, uses_google_thinking_level, GoogleThinkingLevel,
+    GoogleThinkingLevel, convert_messages, convert_tools, get_disabled_google_thinking_config,
+    is_thinking_part, map_stop_reason, resolve_google_function_calling_mode,
+    resolve_google_thinking_level, retain_thought_signature, retry_google_request,
+    supports_google_strict_tool_sampling, to_google_thinking_level, uses_google_thinking_level,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
-use crate::models::{clamp_thinking_level, ProviderStreams};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
+use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantContent, AssistantMessage, DoneReason, ErrorReason, Model, ProviderResponse,
     SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets, ThinkingLevel,
@@ -550,12 +550,11 @@ impl<'a> StreamProcessor<'a> {
     ) -> Result<(), String> {
         // GenerateContentResponse.responseId is output-only; keep the first
         // non-empty one from the stream.
-        if self.output.response_id.as_deref().unwrap_or("").is_empty() {
-            if let Some(response_id) = chunk.get("responseId").and_then(Value::as_str) {
-                if !response_id.is_empty() {
-                    self.output.response_id = Some(response_id.to_owned());
-                }
-            }
+        if self.output.response_id.as_deref().unwrap_or("").is_empty()
+            && let Some(response_id) = chunk.get("responseId").and_then(Value::as_str)
+            && !response_id.is_empty()
+        {
+            self.output.response_id = Some(response_id.to_owned());
         }
 
         let candidate = chunk
@@ -688,10 +687,10 @@ async fn run(
 
     let headers = build_request_headers(model, Some(api_key), options.stream.headers.as_ref());
     let mut params = build_params(model, context, options)?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_params) = on_payload(params.clone(), model).await {
-            params = next_params;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_params) = on_payload(params.clone(), model).await
+    {
+        params = next_params;
     }
     let (model_path, body) = params_to_wire(&params);
 

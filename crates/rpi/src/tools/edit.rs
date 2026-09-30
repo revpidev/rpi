@@ -13,16 +13,16 @@ use async_trait::async_trait;
 use rpi_agent::error::AgentError;
 use rpi_agent::types::{AgentTool, AgentToolResult};
 use rpi_ai::types::{TextContent, ToolResultContent};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::edit_diff::{
-    apply_edits_to_normalized_content, detect_line_ending, generate_diff_string,
-    generate_unified_patch, normalize_to_lf, restore_line_endings, strip_bom, EditReplacement,
+    EditReplacement, apply_edits_to_normalized_content, detect_line_ending, generate_diff_string,
+    generate_unified_patch, normalize_to_lf, restore_line_endings, strip_bom,
 };
 use super::file_mutation_queue::with_file_mutation_queue;
 use super::path_utils::resolve_to_cwd;
-use crate::tools::{io_error_message, ToolContext};
+use crate::tools::{ToolContext, io_error_message};
 
 // ---------------------------------------------------------------------------
 // Operations trait (edit.ts:74-87)

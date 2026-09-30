@@ -32,7 +32,7 @@ use crate::core::package_manager::{ResolvedPaths, ResourcePathMetadata};
 use crate::core::settings_manager::{
     PackageSource, PackageSourceFilter, Settings, SettingsManager,
 };
-use crate::core::skills::{canonicalize_path, lexical_relative, SourceOrigin, SourceScope};
+use crate::core::skills::{SourceOrigin, SourceScope, canonicalize_path, lexical_relative};
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::dynamic_border::DynamicBorder;
 use crate::modes::interactive::components::keybinding_hints::{key_hint, raw_key_hint};
@@ -978,12 +978,11 @@ impl ResourceList {
                     self.scope() == ConfigWriteScope::Project
                         || get_item_scope(resource) == SourceScope::User
                 };
-                if allowed {
-                    if let Some((path, resource_type, enabled)) =
+                if allowed
+                    && let Some((path, resource_type, enabled)) =
                         self.toggle_resource(group, subgroup, item)
-                    {
-                        self.update_item(&path, resource_type, enabled);
-                    }
+                {
+                    self.update_item(&path, resource_type, enabled);
                 }
             }
             return;

@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use rpi_ai::api::google_generative_ai::{stream_simple, GoogleGenerativeAi};
+use rpi_ai::api::google_generative_ai::{GoogleGenerativeAi, stream_simple};
 use rpi_ai::api::google_shared::{
     convert_messages, convert_tools, is_thinking_part, map_stop_reason, map_stop_reason_string,
     requires_tool_call_id, resolve_google_function_calling_mode, retain_thought_signature,
@@ -27,7 +27,7 @@ use rpi_ai::types::{
     ApiKind, Context, Message, Model, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
     ThinkingBudgets, ThinkingLevel, Tool,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -475,9 +475,11 @@ async fn test_google_tool_call_stream() {
         body["tools"][0]["functionDeclarations"][0]["name"],
         json!("test_tool")
     );
-    assert!(body["tools"][0]["functionDeclarations"][0]
-        .get("parametersJsonSchema")
-        .is_some());
+    assert!(
+        body["tools"][0]["functionDeclarations"][0]
+            .get("parametersJsonSchema")
+            .is_some()
+    );
     // No toolChoice and no strict tools: no toolConfig.
     assert!(body.get("toolConfig").is_none());
 
@@ -549,10 +551,12 @@ async fn test_google_tool_call_with_length_finish_keeps_length() {
     assert_eq!(*reason, rpi_ai::types::DoneReason::Length);
     assert_eq!(message.stop_reason, StopReason::Length);
     assert_eq!(message.raw_stop_reason.as_deref(), Some("MAX_TOKENS"));
-    assert!(message
-        .content
-        .iter()
-        .any(|block| matches!(block, rpi_ai::types::AssistantContent::ToolCall(_))));
+    assert!(
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, rpi_ai::types::AssistantContent::ToolCall(_)))
+    );
 }
 
 #[tokio::test]
@@ -1263,17 +1267,23 @@ fn test_convert_messages_drops_signature_for_other_model() {
     );
     let parts = function_call_parts(&contents);
     assert_eq!(parts.len(), 2);
-    assert!(parts
-        .iter()
-        .all(|part| part.get("thoughtSignature").is_none()));
-    assert!(parts
-        .iter()
-        .all(|part| part["functionCall"].get("id").is_none()));
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.get("thoughtSignature").is_none())
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|part| part["functionCall"].get("id").is_none())
+    );
     let responses = function_response_parts(&contents);
     assert_eq!(responses.len(), 2);
-    assert!(responses
-        .iter()
-        .all(|part| part["functionResponse"].get("id").is_none()));
+    assert!(
+        responses
+            .iter()
+            .all(|part| part["functionResponse"].get("id").is_none())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,9 +1412,11 @@ fn test_convert_messages_drops_signed_empty_blocks_for_other_model() {
         .iter()
         .find(|content| content["role"] == json!("model"))
         .expect("model turn");
-    assert!(!serde_json::to_string(model_turn)
-        .expect("json")
-        .contains(VALID_SIG));
+    assert!(
+        !serde_json::to_string(model_turn)
+            .expect("json")
+            .contains(VALID_SIG)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,9 +1468,11 @@ fn test_image_tool_result_separate_turn_for_gemini_2_x() {
     assert_eq!(contents.len(), 5);
     // All function responses merge into one user turn.
     let merged = contents[2]["parts"].as_array().expect("parts");
-    assert!(merged
-        .iter()
-        .all(|part| part.get("functionResponse").is_some()));
+    assert!(
+        merged
+            .iter()
+            .all(|part| part.get("functionResponse").is_some())
+    );
     // Images go in a separate synthetic user turn for Gemini < 3.
     assert_eq!(contents[3]["role"], json!("user"));
     assert_eq!(contents[3]["parts"][0]["text"], json!("Tool result image:"));

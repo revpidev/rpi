@@ -12,9 +12,9 @@
 //! JPEG/WebP EXIF parser in `exif-orientation.ts`).
 
 use base64::Engine;
-use image::imageops::FilterType;
 use image::DynamicImage;
 use image::ImageEncoder;
+use image::imageops::FilterType;
 
 // ---------------------------------------------------------------------------
 // Constants (image-resize-core.ts:22-29)
@@ -146,12 +146,11 @@ fn read_exif_orientation(bytes: &[u8]) -> u32 {
     let reader = exif::Reader::new();
     match reader.read_from_container(&mut cursor) {
         Ok(exif_data) => {
-            if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY) {
-                if let Some(v) = field.value.get_uint(0) {
-                    if (1..=8).contains(&v) {
-                        return v;
-                    }
-                }
+            if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                && let Some(v) = field.value.get_uint(0)
+                && (1..=8).contains(&v)
+            {
+                return v;
             }
             1
         }
@@ -421,10 +420,10 @@ pub fn process_image(
         })?;
 
         let mut hints = Vec::new();
-        if let Some(from) = &normalized.converted_from {
-            if let Some(h) = conversion_hint(from, &resized.mime_type) {
-                hints.push(h);
-            }
+        if let Some(from) = &normalized.converted_from
+            && let Some(h) = conversion_hint(from, &resized.mime_type)
+        {
+            hints.push(h);
         }
         if let Some(note) = format_dimension_note(&resized) {
             hints.push(note);
@@ -440,10 +439,10 @@ pub fn process_image(
     } else {
         // No auto-resize: base64 the normalised bytes (image-process.ts:109-118).
         let mut hints = Vec::new();
-        if let Some(from) = &normalized.converted_from {
-            if let Some(h) = conversion_hint(from, &normalized.mime_type) {
-                hints.push(h);
-            }
+        if let Some(from) = &normalized.converted_from
+            && let Some(h) = conversion_hint(from, &normalized.mime_type)
+        {
+            hints.push(h);
         }
 
         // Decode for dimensions; default to (0, 0) if undecodable.
@@ -524,10 +523,12 @@ mod tests {
         assert!(result.width <= MAX_WIDTH);
         assert!(result.height <= MAX_HEIGHT);
         // Should have a dimension hint.
-        assert!(result
-            .hints
-            .iter()
-            .any(|h| h.starts_with("[Image: original")));
+        assert!(
+            result
+                .hints
+                .iter()
+                .any(|h| h.starts_with("[Image: original"))
+        );
         // Hint should mention original 3000x3000.
         let dim_hint = result
             .hints
@@ -548,10 +549,12 @@ mod tests {
         let result = process_image(&bmp, "image/bmp", true).unwrap();
         assert_eq!(result.mime_type, "image/png");
         // Should have conversion hint.
-        assert!(result
-            .hints
-            .iter()
-            .any(|h| h == "[Image converted from image/bmp to image/png.]"));
+        assert!(
+            result
+                .hints
+                .iter()
+                .any(|h| h == "[Image converted from image/bmp to image/png.]")
+        );
         // Dimensions preserved (small image, no resize needed).
         assert_eq!(result.width, 20);
         assert_eq!(result.height, 20);
@@ -593,10 +596,12 @@ mod tests {
         let bmp = make_small_bmp();
         let result = process_image(&bmp, "image/bmp", false).unwrap();
         assert_eq!(result.mime_type, "image/png");
-        assert!(result
-            .hints
-            .iter()
-            .any(|h| h == "[Image converted from image/bmp to image/png.]"));
+        assert!(
+            result
+                .hints
+                .iter()
+                .any(|h| h == "[Image converted from image/bmp to image/png.]")
+        );
     }
 
     #[test]

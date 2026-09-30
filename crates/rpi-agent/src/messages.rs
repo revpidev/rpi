@@ -153,19 +153,18 @@ pub fn bash_execution_to_text(msg: &BashExecutionMessage) -> String {
     }
     if msg.cancelled {
         text.push_str("\n\n(command cancelled)");
-    } else if let Some(exit_code) = msg.exit_code {
-        if exit_code != 0 {
-            text.push_str(&format!("\n\nCommand exited with code {exit_code}"));
-        }
+    } else if let Some(exit_code) = msg.exit_code
+        && exit_code != 0
+    {
+        text.push_str(&format!("\n\nCommand exited with code {exit_code}"));
     }
-    if msg.truncated {
-        if let Some(full_output_path) = &msg.full_output_path {
-            if !full_output_path.is_empty() {
-                text.push_str(&format!(
-                    "\n\n[Output truncated. Full output: {full_output_path}]"
-                ));
-            }
-        }
+    if msg.truncated
+        && let Some(full_output_path) = &msg.full_output_path
+        && !full_output_path.is_empty()
+    {
+        text.push_str(&format!(
+            "\n\n[Output truncated. Full output: {full_output_path}]"
+        ));
     }
     text
 }
@@ -243,7 +242,7 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use rpi_ai::types::{AssistantRole, StopReason, Usage};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
 

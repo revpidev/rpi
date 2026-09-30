@@ -9,7 +9,7 @@
 //! row render block, the inline-input render branch) land with Q2/Q3 and keep
 //! their exhaustive matches, reading flags from this table.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tool::types::{QuestionData, RESERVED_LABELS};
 

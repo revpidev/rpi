@@ -92,10 +92,10 @@ where
     // strong_count == 2 means: one in the map + one in our `mutex` variable.
     {
         let mut map = file_mutexes().lock().await;
-        if let Some(entry) = map.get(&key) {
-            if Arc::strong_count(entry) == 2 {
-                map.remove(&key);
-            }
+        if let Some(entry) = map.get(&key)
+            && Arc::strong_count(entry) == 2
+        {
+            map.remove(&key);
         }
     }
 

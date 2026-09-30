@@ -18,7 +18,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{close_silently, CodexError, WsStream};
+use super::{CodexError, WsStream, close_silently};
 use crate::session_resources::register_session_resource_cleanup;
 
 /// `SESSION_WEBSOCKET_CACHE_TTL_MS` (idle TTL).

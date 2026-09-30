@@ -21,18 +21,18 @@ pub mod oauth;
 pub mod resolve;
 pub mod types;
 
-pub use anthropic_auth::{anthropic_api_key_auth, AnthropicApiKeyAuth};
+pub use anthropic_auth::{AnthropicApiKeyAuth, anthropic_api_key_auth};
 pub use credential_store::InMemoryCredentialStore;
 pub use env_keys::{
-    find_env_keys, get_env_api_key, ANTHROPIC_API_KEY_ENV, ANTHROPIC_AUTH_TOKEN_ENV,
-    ANTHROPIC_OAUTH_TOKEN_ENV,
+    ANTHROPIC_API_KEY_ENV, ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, find_env_keys,
+    get_env_api_key,
 };
 pub use file_store::{
-    read_stored_credential, Backend, FileAuthStorageBackend, FileCredentialStore,
-    InMemoryAuthStorageBackend,
+    Backend, FileAuthStorageBackend, FileCredentialStore, InMemoryAuthStorageBackend,
+    read_stored_credential,
 };
-pub use helpers::{env_api_key_auth, EnvApiKeyAuth};
+pub use helpers::{EnvApiKeyAuth, env_api_key_auth};
 pub use interaction::{AuthEvent, AuthInfoLink, AuthInteraction, AuthPrompt, SelectOption};
-pub use oauth::{anthropic_oauth, OAuthCallbackServer};
-pub use resolve::{resolve_provider_auth, AuthResolutionOverrides, ModelsError, ModelsErrorCode};
+pub use oauth::{OAuthCallbackServer, anthropic_oauth};
+pub use resolve::{AuthResolutionOverrides, ModelsError, ModelsErrorCode, resolve_provider_auth};
 pub use types::*;

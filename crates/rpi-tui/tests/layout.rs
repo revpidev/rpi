@@ -34,9 +34,9 @@ use rpi_tui::components::v_stack::VStack;
 use rpi_tui::layout::render_layout_frame;
 use rpi_tui::layout_node::{Basis, StackAlign};
 use rpi_tui::terminal_image::{
-    encode_kitty, register_kitty_image_metadata, KittyEncodeOptions, KittyImageMetadata,
+    KittyEncodeOptions, KittyImageMetadata, encode_kitty, register_kitty_image_metadata,
 };
-use rpi_tui::tui::{shared_component, Component, RenderHandle, SharedComponent};
+use rpi_tui::tui::{Component, RenderHandle, SharedComponent, shared_component};
 
 /// `visibleLines` (layout.test.ts:11-13): strip terminal sequences, trim end.
 fn visible_lines(lines: &[String]) -> Vec<String> {
@@ -324,7 +324,9 @@ fn includes_nested_minimum_sizes_in_intrinsic_stack_measurement() {
 
     assert_eq!(
         visible_lines(&frame.lines),
-        ["body", "top1", "top2", "top3", "selector", "", "", "below", "footer"]
+        [
+            "body", "top1", "top2", "top3", "selector", "", "", "below", "footer"
+        ]
     );
 }
 
@@ -625,10 +627,12 @@ fn renders_a_proportional_glyph_scrollbar_with_an_expanded_active_thumb() {
     followed_handle.set_lines(grown);
     let growth_frame = render_layout_frame(&followed, 6, 4, noop_render_handle());
     with_scroll_view(&followed, |sv| assert_eq!(sv.scroll_top(), 5));
-    assert!(growth_frame
-        .lines
-        .iter()
-        .all(|line| !strip_ansi(line).contains(['│', '┃'])));
+    assert!(
+        growth_frame
+            .lines
+            .iter()
+            .all(|line| !strip_ansi(line).contains(['│', '┃']))
+    );
 
     // (h) Content fitting the viewport never shows the auto scrollbar.
     let fitting = shared_component(ScrollView::new(
@@ -644,10 +648,12 @@ fn renders_a_proportional_glyph_scrollbar_with_an_expanded_active_thumb() {
     with_scroll_view(&fitting, |sv| {
         sv.scroll_by(1);
     });
-    assert!(render_layout_frame(&fitting, 6, 4, noop_render_handle())
-        .lines
-        .iter()
-        .all(|line| !strip_ansi(line).contains(['│', '┃'])));
+    assert!(
+        render_layout_frame(&fitting, 6, 4, noop_render_handle())
+            .lines
+            .iter()
+            .all(|line| !strip_ansi(line).contains(['│', '┃']))
+    );
 
     // (i) scrollbar=always reserves a column (child width 5) and renders
     // the thumb even when the content fits.
@@ -662,9 +668,11 @@ fn renders_a_proportional_glyph_scrollbar_with_an_expanded_active_thumb() {
     ));
     let always_fitting_frame = render_layout_frame(&always_fitting, 6, 4, noop_render_handle());
     assert_eq!(always_fitting_frame.root.children[0].rect.width, 5);
-    assert!(visible(&always_fitting_frame.lines)
-        .iter()
-        .all(|line| line.ends_with('┃')));
+    assert!(
+        visible(&always_fitting_frame.lines)
+            .iter()
+            .all(|line| line.ends_with('┃'))
+    );
 
     // (j) With overflow: 2 thumb rows + 2 track rows, and the reserved
     // column's reset prefix sits after the content background (unstyled

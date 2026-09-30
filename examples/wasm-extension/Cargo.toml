@@ -2,7 +2,7 @@
 name = "rpi-wasm-extension-example"
 description = "Example rpi wasm extension (permission gate): ABI v1 guest"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 # Standalone crate: built for wasm32-unknown-unknown, not the host

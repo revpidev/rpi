@@ -166,30 +166,30 @@ where
 
         // Abort: terminal but not successful. Never retry an aborted message.
         if response.stop_reason == StopReason::Aborted {
-            if let Some((attempt, _)) = last_retry {
-                if let Some(cb) = callbacks.and_then(|c| c.on_retry_finished.as_ref()) {
-                    cb((false, attempt, None)).await;
-                }
+            if let Some((attempt, _)) = last_retry
+                && let Some(cb) = callbacks.and_then(|c| c.on_retry_finished.as_ref())
+            {
+                cb((false, attempt, None)).await;
             }
             return response;
         }
 
         // Success: non-error, non-abort responses return as-is.
         if response.stop_reason != StopReason::Error {
-            if let Some((attempt, _)) = last_retry {
-                if let Some(cb) = callbacks.and_then(|c| c.on_retry_finished.as_ref()) {
-                    cb((true, attempt, None)).await;
-                }
+            if let Some((attempt, _)) = last_retry
+                && let Some(cb) = callbacks.and_then(|c| c.on_retry_finished.as_ref())
+            {
+                cb((true, attempt, None)).await;
             }
             return response;
         }
 
         // Non-retryable, or budget exhausted: return the final error message.
         if attempt >= max_attempts || !is_retryable_assistant_error(&response) {
-            if let Some((attempt, _)) = last_retry {
-                if let Some(cb) = callbacks.and_then(|c| c.on_retry_finished.as_ref()) {
-                    cb((false, attempt, response.error_message.clone())).await;
-                }
+            if let Some((attempt, _)) = last_retry
+                && let Some(cb) = callbacks.and_then(|c| c.on_retry_finished.as_ref())
+            {
+                cb((false, attempt, response.error_message.clone())).await;
             }
             return response;
         }

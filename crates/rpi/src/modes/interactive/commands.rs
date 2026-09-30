@@ -54,18 +54,18 @@ use rpi_tui::components::markdown::Markdown;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
 
+use crate::RpiError;
 use crate::core::session_manager::now_iso8601;
 use crate::core::themes::Theme;
 use crate::core::usage_totals::get_usage_cost_breakdown;
+use crate::modes::interactive::components::DynamicBorder;
 use crate::modes::interactive::components::bordered_loader::BorderedLoaderComponent;
 use crate::modes::interactive::components::keybinding_hints::key_display_text;
 use crate::modes::interactive::components::util::to_locale_string;
-use crate::modes::interactive::components::DynamicBorder;
 use crate::modes::interactive::footer::format_tokens;
 use crate::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveUi, ShareState, UiCommand,
 };
-use crate::RpiError;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -283,17 +283,20 @@ impl InteractiveUi {
             .map(|rest| rest.trim_start().trim())
             .unwrap_or("");
         if name.is_empty() {
-            if let Some(current_name) = self.session().session_name() {
-                let mut chat = lock(&self.chat_container);
-                chat.children.push(Box::new(Spacer::new(1)));
-                chat.children.push(Box::new(Text::new(
-                    lock(&self.theme).fg("dim", &format!("Session name: {current_name}")),
-                    1,
-                    0,
-                    None,
-                )));
-            } else {
-                self.show_warning("Usage: /name <name>");
+            match self.session().session_name() {
+                Some(current_name) => {
+                    let mut chat = lock(&self.chat_container);
+                    chat.children.push(Box::new(Spacer::new(1)));
+                    chat.children.push(Box::new(Text::new(
+                        lock(&self.theme).fg("dim", &format!("Session name: {current_name}")),
+                        1,
+                        0,
+                        None,
+                    )));
+                }
+                _ => {
+                    self.show_warning("Usage: /name <name>");
+                }
             }
             self.render_handle.request_render();
             return;
@@ -765,7 +768,7 @@ mod tests {
     use super::*;
     use crate::modes::interactive::interactive_mode::InteractiveModeOptions;
     use crate::modes::interactive::test_support::{
-        build_test_session, install_noop_product_transports, TestTerminal,
+        TestTerminal, build_test_session, install_noop_product_transports,
     };
     use rpi_agent::messages::AgentMessage;
     use rpi_ai::types::{ApiKind, AssistantMessage, AssistantRole, StopReason, Usage};
@@ -1481,12 +1484,12 @@ mod tests {
 
         let log_path = {
             let _guard = lock(&ENV_LOCK);
-            std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+            rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
             // Resolved while the env override is active (get_agent_dir reads
             // the env at call time).
             let log_path = crate::config::get_agent_dir().join("rpi-debug.log");
             ui.handle_debug_command();
-            std::env::remove_var("RPI_CODING_AGENT_DIR");
+            rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
             log_path
         };
 

@@ -6,15 +6,15 @@
 //! All tests run against real temporary directories; no network access.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use rpi::tools::find::{create_find_tool, FindToolOptions};
-use rpi::tools::grep::{create_grep_tool, GrepToolOptions};
-use rpi::tools::ls::{create_ls_tool, LsToolOptions};
 use rpi::tools::ToolContext;
+use rpi::tools::find::{FindToolOptions, create_find_tool};
+use rpi::tools::grep::{GrepToolOptions, create_grep_tool};
+use rpi::tools::ls::{LsToolOptions, create_ls_tool};
 use rpi_agent::types::AgentTool;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -911,7 +911,7 @@ mod ls_tool {
 mod optional_tool_wiring {
     use super::*;
     use rpi::core::agent_session_services::{
-        create_agent_session_services, CreateAgentSessionServicesOptions,
+        CreateAgentSessionServicesOptions, create_agent_session_services,
     };
     use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
     use rpi::core::session_manager::{NewSessionOptions, SessionManager};
@@ -1037,7 +1037,7 @@ mod optional_tool_wiring {
 mod default_tools_setting {
     use super::*;
     use rpi::core::agent_session_services::{
-        create_agent_session_services, CreateAgentSessionServicesOptions,
+        CreateAgentSessionServicesOptions, create_agent_session_services,
     };
     use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
     use rpi::core::session_manager::{NewSessionOptions, SessionManager};

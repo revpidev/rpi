@@ -6,15 +6,15 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rpi_ext_host::ExtError;
 use rpi_ext_host::api::{
     EventBus, ExecOptions, ExecResult, ExtensionApi, ExtensionRuntime, HostActions, InsertionMap,
     SendMessageOptions, SendUserMessageOptions,
 };
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
-use rpi_ext_host::types::{self as ext, FlagType, FlagValue, EVENT_SESSION_START};
-use rpi_ext_host::ExtError;
-use serde_json::{json, Value};
+use rpi_ext_host::types::{self as ext, EVENT_SESSION_START, FlagType, FlagValue};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Mock HostActions
@@ -223,11 +223,11 @@ async fn host_with(extensions: Vec<InlineExtension>) -> NativeExtensionHost {
 fn inline_ext_async(
     name: &str,
     register: impl Fn(
-            rpi_ext_host::api::ExtensionApi,
-        ) -> rpi_ext_host::api::BoxFuture<'static, Result<(), String>>
-        + Send
-        + Sync
-        + 'static,
+        rpi_ext_host::api::ExtensionApi,
+    ) -> rpi_ext_host::api::BoxFuture<'static, Result<(), String>>
+    + Send
+    + Sync
+    + 'static,
 ) -> InlineExtension {
     let factory: ExtensionFactory = Arc::new(move |api| register(api));
     InlineExtension::Named {
@@ -728,11 +728,13 @@ async fn api_factory_failure_rolls_back_registrations() {
     // Provider registration discarded: nothing flushes on bind.
     let actions = Arc::new(MockActions::default());
     host.bind_actions(actions.clone()).await;
-    assert!(actions
-        .registered_providers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty());
+    assert!(
+        actions
+            .registered_providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    );
 }
 
 /// Commit on success: the pending flag default and provider registration

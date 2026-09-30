@@ -14,7 +14,7 @@ use rpi_ext_host::api::ExtensionApi;
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
 use rpi_test_support::faux::{FauxAiProvider, FauxProvider, FauxProviderOptions};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -295,13 +295,13 @@ async fn stream_and_stream_simple_collect_events_and_result() {
 
     for simple in [false, true] {
         let fixture = fixture(None).await;
-        fixture
-            .provider
-            .set_responses(vec![rpi_test_support::faux::faux_assistant_message(
+        fixture.provider.set_responses(vec![
+            rpi_test_support::faux::faux_assistant_message(
                 "custom provider response",
                 rpi_test_support::faux::FauxAssistantOptions::default(),
             )
-            .into()]);
+            .into(),
+        ]);
         let model = serde_json::to_value(fixture.provider.get_model(None).expect("faux model"))
             .expect("model json");
         let context = json!({"messages": [
@@ -371,13 +371,13 @@ async fn stream_simple_options_reach_the_provider() {
     use futures::StreamExt;
 
     let fixture = fixture(None).await;
-    fixture
-        .provider
-        .set_responses(vec![rpi_test_support::faux::faux_assistant_message(
+    fixture.provider.set_responses(vec![
+        rpi_test_support::faux::faux_assistant_message(
             "ok",
             rpi_test_support::faux::FauxAssistantOptions::default(),
         )
-        .into()]);
+        .into(),
+    ]);
     let model = serde_json::to_value(fixture.provider.get_model(None).expect("faux model"))
         .expect("model json");
     let context = json!({"messages": [

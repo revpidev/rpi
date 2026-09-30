@@ -145,10 +145,10 @@ pub fn transform_messages(
 
                 // ToolResult: normalize toolCallId if we have a mapping.
                 Message::ToolResult(mut result) => {
-                    if let Some(normalized_id) = tool_call_id_map.get(&result.tool_call_id) {
-                        if *normalized_id != result.tool_call_id {
-                            result.tool_call_id = normalized_id.clone();
-                        }
+                    if let Some(normalized_id) = tool_call_id_map.get(&result.tool_call_id)
+                        && *normalized_id != result.tool_call_id
+                    {
+                        result.tool_call_id = normalized_id.clone();
                     }
                     Message::ToolResult(result)
                 }
@@ -213,17 +213,15 @@ pub fn transform_messages(
                                     normalized_tool_call.thought_signature = None;
                                 }
 
-                                if !is_same_model {
-                                    if let Some(normalize) = normalize_tool_call_id.as_deref_mut() {
-                                        let normalized_id =
-                                            normalize(&tool_call.id, model, &assistant_msg);
-                                        if normalized_id != tool_call.id {
-                                            tool_call_id_map.insert(
-                                                tool_call.id.clone(),
-                                                normalized_id.clone(),
-                                            );
-                                            normalized_tool_call.id = normalized_id;
-                                        }
+                                if !is_same_model
+                                    && let Some(normalize) = normalize_tool_call_id.as_deref_mut()
+                                {
+                                    let normalized_id =
+                                        normalize(&tool_call.id, model, &assistant_msg);
+                                    if normalized_id != tool_call.id {
+                                        tool_call_id_map
+                                            .insert(tool_call.id.clone(), normalized_id.clone());
+                                        normalized_tool_call.id = normalized_id;
                                     }
                                 }
 
@@ -344,7 +342,7 @@ pub fn transform_messages(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Map};
+    use serde_json::{Map, json};
 
     use super::*;
     use crate::types::{

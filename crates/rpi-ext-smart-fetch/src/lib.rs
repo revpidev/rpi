@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::batch::BatchProgressSink;
 use crate::pipeline::{FetchExecutionHooks, FetchPipeline};
@@ -815,7 +815,7 @@ fn dispatch_message(message: &Value) -> Value {
         // Render protocol (host_call.rs:245-281): synchronous, pure JSON —
         // never touches the plugin runtime (FR-P2-E).
         Some("render") => {
-            let tree = match (
+            match (
                 message.get("what").and_then(Value::as_str),
                 message.get("toolName").and_then(Value::as_str),
             ) {
@@ -842,8 +842,7 @@ fn dispatch_message(message: &Value) -> Value {
                     message.get("context").unwrap_or(&Value::Null),
                 ),
                 _ => Value::Null,
-            };
-            tree
+            }
         }
         Some("toolExecute") => {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
@@ -930,14 +929,14 @@ pub mod parity {
         format_duration_ms, markdown_to_text, parse_and_format_json, render_json_content,
         strip_extractor_comments, truncate_content,
     };
-    pub use crate::http::{resolve_platform, resolve_profile, UPSTREAM_PROFILES};
+    pub use crate::http::{UPSTREAM_PROFILES, resolve_platform, resolve_profile};
     pub use crate::pipeline::{
         extract_client_side_redirect, extract_qualified_alternate_links, is_attachment_disposition,
         is_textual_content_type, normalize_content_type,
     };
     pub use crate::render::{
-        render_batch_call, render_batch_result, render_web_fetch_call, render_web_fetch_result,
-        truncate_middle, SPINNER_FRAMES,
+        SPINNER_FRAMES, render_batch_call, render_batch_result, render_web_fetch_call,
+        render_web_fetch_result, truncate_middle,
     };
     pub use crate::settings::{normalize_settings, resolve_settings};
 }

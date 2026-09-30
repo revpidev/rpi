@@ -197,19 +197,19 @@ fn is_extension_file(name: &str) -> bool {
 /// file that exists, or an `index.wasm`.
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
     let manifest_path = dir.join("rpi-extension.json");
-    if manifest_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-            // #8337: BOM stripped before parse (pi-manifest.ts:19).
-            let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(content) {
-                // `wasm` wins over `native` when both are present
-                // (docs/extension-abi.md §5).
-                for field in ["wasm", "native"] {
-                    if let Some(entry) = manifest.get(field).and_then(|w| w.as_str()) {
-                        let resolved = dir.join(entry);
-                        if resolved.is_file() {
-                            return Some(vec![resolved]);
-                        }
+    if manifest_path.is_file()
+        && let Ok(content) = std::fs::read_to_string(&manifest_path)
+    {
+        // #8337: BOM stripped before parse (pi-manifest.ts:19).
+        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(content) {
+            // `wasm` wins over `native` when both are present
+            // (docs/extension-abi.md §5).
+            for field in ["wasm", "native"] {
+                if let Some(entry) = manifest.get(field).and_then(|w| w.as_str()) {
+                    let resolved = dir.join(entry);
+                    if resolved.is_file() {
+                        return Some(vec![resolved]);
                     }
                 }
             }
@@ -256,10 +256,11 @@ pub fn discover_extensions_in_dir(dir: &Path) -> Vec<PathBuf> {
             continue;
         }
 
-        if is_dir_like && entry_path.is_dir() {
-            if let Some(entries) = resolve_extension_entries(&entry_path) {
-                discovered.extend(entries);
-            }
+        if is_dir_like
+            && entry_path.is_dir()
+            && let Some(entries) = resolve_extension_entries(&entry_path)
+        {
+            discovered.extend(entries);
         }
     }
 
@@ -682,11 +683,7 @@ impl ExtensionLoader {
 /// (W7); relative paths resolve against `cwd`.
 fn expand_cli_path(path: &str, cwd: &Path) -> PathBuf {
     let p = PathBuf::from(path);
-    if p.is_absolute() {
-        p
-    } else {
-        cwd.join(p)
-    }
+    if p.is_absolute() { p } else { cwd.join(p) }
 }
 
 // ============================================================================
@@ -767,7 +764,7 @@ fn wasm_capabilities_for(
             return Err(format!(
                 "Failed to load extension: unsupported rpiAbi {other:?} (host implements {})",
                 crate::wasm::RPI_ABI_VERSION
-            ))
+            ));
         }
     }
     let mut capabilities = std::collections::HashSet::new();
@@ -780,7 +777,7 @@ fn wasm_capabilities_for(
                 return Err(format!(
                     "Failed to load extension: unknown capability \"{name}\" in {}",
                     manifest_path.display()
-                ))
+                ));
             }
         }
     }

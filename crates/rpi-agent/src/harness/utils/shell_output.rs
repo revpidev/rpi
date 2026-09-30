@@ -22,7 +22,7 @@
 //!   `Array.from`); `trimToLastUtf8Bytes` uses `str::len` (UTF-8 bytes).
 
 use std::collections::BTreeMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -33,8 +33,8 @@ use crate::harness::types::{
 };
 
 use super::truncate::{
-    truncate_tail, TruncatedBy, TruncationOptions, TruncationResult, DEFAULT_MAX_BYTES,
-    DEFAULT_MAX_LINES,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, TruncationOptions, TruncationResult,
+    truncate_tail,
 };
 
 /// `ShellCaptureProgress` (shell-output.ts:4-9).

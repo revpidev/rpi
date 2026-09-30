@@ -8,7 +8,7 @@
 //! supports more diagram kinds; layout differences from the pinned
 //! grok-build revision are recorded per case below.
 
-use rpi_tui::mermaid::{render, MermaidStyles, Style};
+use rpi_tui::mermaid::{MermaidStyles, Style, render};
 
 fn neutral_styles() -> MermaidStyles {
     MermaidStyles {

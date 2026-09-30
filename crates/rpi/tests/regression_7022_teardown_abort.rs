@@ -24,18 +24,18 @@ use serde_json::Value;
 
 use rpi::core::agent_session::AgentSessionEvent;
 use rpi::core::agent_session_runtime::{
-    create_agent_session_runtime, AgentSessionRuntime, CreateAgentSessionRuntimeFactory,
-    CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    AgentSessionRuntime, CreateAgentSessionRuntimeFactory, CreateAgentSessionRuntimeResult,
+    CreateRuntimeOptions, create_agent_session_runtime,
 };
 use rpi::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
 use rpi_agent::types::AgentEvent;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_tool_call,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -318,10 +318,10 @@ async fn teardown_aborts_active_turn_before_shutdown_event() {
     let first_end = Arc::new(AtomicBool::new(false));
     let flag = first_end.clone();
     let _unsub = runtime.session().subscribe(Arc::new(move |event| {
-        if let AgentSessionEvent::Agent(agent_event) = &event {
-            if matches!(&**agent_event, AgentEvent::MessageEnd { .. }) {
-                flag.store(true, Ordering::SeqCst);
-            }
+        if let AgentSessionEvent::Agent(agent_event) = &event
+            && matches!(&**agent_event, AgentEvent::MessageEnd { .. })
+        {
+            flag.store(true, Ordering::SeqCst);
         }
     }));
 

@@ -90,10 +90,10 @@ impl ExtensionSelectorComponent {
             on_toggle_tools_expanded: opts.on_toggle_tools_expanded,
             countdown: None,
         };
-        if let (Some(render_handle), Some(timeout_ms)) = (opts.render_handle, opts.timeout_ms) {
-            if timeout_ms > 0 {
-                component.countdown = Some(component.start_countdown(timeout_ms, render_handle));
-            }
+        if let (Some(render_handle), Some(timeout_ms)) = (opts.render_handle, opts.timeout_ms)
+            && timeout_ms > 0
+        {
+            component.countdown = Some(component.start_countdown(timeout_ms, render_handle));
         }
         component
     }
@@ -223,7 +223,7 @@ impl Component for ExtensionSelectorComponent {
         }
 
         lines.push(String::new()); // Spacer(1)
-                                   // Key hints (extension-selector.ts:63-73).
+        // Key hints (extension-selector.ts:63-73).
         let hint = format!(
             "{}  {}  {}",
             raw_key_hint(&self.theme, "↑↓", "navigate"),
@@ -251,15 +251,14 @@ impl Component for ExtensionSelectorComponent {
             self.selected_index =
                 (self.selected_index + 1).min(self.options.len().saturating_sub(1));
         } else if read.matches_id(data, "tui.select.confirm") || data == "\n" {
-            if let Some(option) = self.options.get(self.selected_index) {
-                if let Some(on_select) = self
+            if let Some(option) = self.options.get(self.selected_index)
+                && let Some(on_select) = self
                     .on_select
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .as_mut()
-                {
-                    on_select(Some(option.clone()));
-                }
+            {
+                on_select(Some(option.clone()));
             }
         } else if read.matches_id(data, "tui.select.cancel") {
             self.fire_cancel();

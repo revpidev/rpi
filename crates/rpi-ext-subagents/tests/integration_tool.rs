@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Fake host state: answers the host calls the plugin makes.
 struct FakeHost {
@@ -69,8 +69,8 @@ fn execute(params: Value) -> Value {
 #[test]
 fn tool_surface_integration() {
     let dir = sandbox();
-    std::env::set_var("RPI_CODING_AGENT_DIR", dir.join("agent"));
-    std::env::set_var("RPI_SUBAGENT_RPI_BINARY", "/nonexistent-rpi");
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", dir.join("agent"));
+    rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", "/nonexistent-rpi");
     // TE05: pin the foreground default (asyncByDefault defaults to true with
     // FR-P1-04); the async path has its own assertions above.
     std::fs::create_dir_all(dir.join("agent").join("extensions").join("subagent")).unwrap();
@@ -139,10 +139,12 @@ fn tool_surface_integration() {
     // get on unknown agent.
     let result = execute(json!({ "action": "get", "agent": "nope" }));
     assert_eq!(result["isError"], Value::Bool(true));
-    assert!(result["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("Unknown agent: nope"));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown agent: nope")
+    );
 
     // doctor sections.
     let result = execute(json!({ "action": "doctor" }));
@@ -155,10 +157,12 @@ fn tool_surface_integration() {
     // workflowScript placeholder fails loudly (ADR-0016).
     let result = execute(json!({ "workflowScript": "return runs.run('x', {})" }));
     assert_eq!(result["isError"], Value::Bool(true));
-    assert!(result["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("ADR-0016"));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ADR-0016")
+    );
 
     // async:true starts a background run (FR-P1-04): immediate receipt,
     // not an error; the run itself fails fast on the missing binary but the
@@ -174,10 +178,12 @@ fn tool_surface_integration() {
 
     // status before any run.
     let result = execute(json!({ "action": "status" }));
-    assert!(result["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("Foreground runs (this session):"));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Foreground runs (this session):")
+    );
 
     // Single delegation with a missing binary fails fast with a clear error.
     let result = execute(json!({ "agent": "scout", "task": "look around", "timeoutMs": 2000 }));
@@ -199,10 +205,12 @@ fn tool_surface_integration() {
         result["details"]["mode"], "management",
         "nonBlocking receipt carries management details: {result}"
     );
-    assert!(result["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("without blocking"));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("without blocking")
+    );
 
     // TE38 W0 (admission ordering, #2326/#2101 semantics + W1's #2081
     // preflight): a worktree dispatch against a dirty git tree is rejected
@@ -338,10 +346,12 @@ fn orchestration_skill_legacy_user_copy_is_preserved() {
         std::fs::read_to_string(legacy_dir.join("SKILL.md")).unwrap(),
         "---\nname: pi-subagents\n---\n\nMy own local tweaks.\n"
     );
-    assert!(agent_dir
-        .join("skills/rpi-subagents")
-        .join("SKILL.md")
-        .is_file());
+    assert!(
+        agent_dir
+            .join("skills/rpi-subagents")
+            .join("SKILL.md")
+            .is_file()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

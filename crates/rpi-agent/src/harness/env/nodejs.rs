@@ -39,7 +39,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -472,7 +472,7 @@ async fn run_command(command: &str, args: &[&str], timeout_ms: u64) -> RunComman
             return RunCommandResult {
                 stdout: String::new(),
                 status: None,
-            }
+            };
         }
     };
     let pid = child.id();
@@ -648,10 +648,8 @@ fn get_shell_env(
     inherit_env: bool,
 ) -> BTreeMap<String, String> {
     let mut merged = BTreeMap::new();
-    if inherit_env {
-        if let Some(base) = base_env {
-            merged.extend(base.iter().map(|(key, value)| (key.clone(), value.clone())));
-        }
+    if inherit_env && let Some(base) = base_env {
+        merged.extend(base.iter().map(|(key, value)| (key.clone(), value.clone())));
     }
     if let Some(extra) = extra_env {
         merged.extend(
@@ -880,12 +878,12 @@ impl FileSystem for NodeExecutionEnv {
         {
             return Err(aborted_file_error());
         }
-        if let Some(parent) = Path::new(&resolved).parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|error| to_file_error(error, None))?;
-            }
+        if let Some(parent) = Path::new(&resolved).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| to_file_error(error, None))?;
         }
         if abort_signal
             .as_ref()
@@ -904,12 +902,12 @@ impl FileSystem for NodeExecutionEnv {
         _abort_signal: Option<CancellationToken>,
     ) -> Result<(), FileError> {
         let resolved = resolve_path(&self.cwd, path);
-        if let Some(parent) = Path::new(&resolved).parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|error| to_file_error(error, None))?;
-            }
+        if let Some(parent) = Path::new(&resolved).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| to_file_error(error, None))?;
         }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -1222,14 +1220,12 @@ impl Shell for NodeExecutionEnv {
         // `child.stdin.end(command)` with errors ignored (nodejs.ts:427-430).
         // The task ends on EPIPE once the child exits; the write end is held
         // by the task and released with it.
-        if command_from_stdin {
-            if let Some(mut stdin) = child.stdin.take() {
-                let command = command.to_string();
-                tokio::spawn(async move {
-                    let _ = stdin.write_all(command.as_bytes()).await;
-                    let _ = stdin.shutdown().await;
-                });
-            }
+        if command_from_stdin && let Some(mut stdin) = child.stdin.take() {
+            let command = command.to_string();
+            tokio::spawn(async move {
+                let _ = stdin.write_all(command.as_bytes()).await;
+                let _ = stdin.shutdown().await;
+            });
         }
 
         // Abort listener (nodejs.ts:398-402, 447-453): kill the tree when the

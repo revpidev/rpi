@@ -15,8 +15,8 @@
 //!   hooks in there.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Poll interval while waiting on `gh gist create` (cancellation latency).
@@ -131,13 +131,12 @@ impl ShareRunner for SystemShareRunner {
 /// dirs so an unexpected parent is never deleted).
 pub fn cleanup_share_tmp_file(path: &Path) {
     let _ = std::fs::remove_file(path);
-    if let Some(parent) = path.parent() {
-        if parent
+    if let Some(parent) = path.parent()
+        && parent
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with("rpi-share-"))
-        {
-            let _ = std::fs::remove_dir(parent);
-        }
+    {
+        let _ = std::fs::remove_dir(parent);
     }
 }
 
@@ -153,13 +152,12 @@ pub fn restrict_share_tmp_file_permissions(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        if let Some(parent) = path.parent() {
-            if parent
+        if let Some(parent) = path.parent()
+            && parent
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().starts_with("rpi-share-"))
-            {
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
+        {
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
     #[cfg(not(unix))]

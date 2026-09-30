@@ -35,18 +35,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::images::images_models::{now_ms, ProviderImages};
+use crate::images::images_models::{ProviderImages, now_ms};
 use crate::types::{
     AssistantImages, ImageContent, ImagesContext, ImagesModel, ImagesOptions, ImagesOutputContent,
     ImagesOutputModality, ImagesStopReason, ProviderHeaders, TextContent, Usage, UsageCost,
 };
 use crate::utils::custom_fetch::send_provider_request;
-use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
+use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::headers::{headers_to_record, merge_headers, provider_headers_to_header_map};
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions,
+    ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 
@@ -118,10 +118,10 @@ async fn generate_images_inner(
     };
 
     let mut params = build_params(model, context);
-    if let Some(on_payload) = options.and_then(|options| options.on_payload.as_ref()) {
-        if let Some(next_params) = on_payload(params.clone(), model).await {
-            params = next_params;
-        }
+    if let Some(on_payload) = options.and_then(|options| options.on_payload.as_ref())
+        && let Some(next_params) = on_payload(params.clone(), model).await
+    {
+        params = next_params;
     }
 
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
@@ -219,13 +219,13 @@ async fn generate_images_inner(
     }
 
     if let Some(choice) = parsed.choices.first() {
-        if let Some(RawMessageContent::Text(content)) = &choice.message.content {
-            if !content.is_empty() {
-                output.output.push(ImagesOutputContent::Text(TextContent {
-                    text: content.clone(),
-                    text_signature: None,
-                }));
-            }
+        if let Some(RawMessageContent::Text(content)) = &choice.message.content
+            && !content.is_empty()
+        {
+            output.output.push(ImagesOutputContent::Text(TextContent {
+                text: content.clone(),
+                text_signature: None,
+            }));
         }
         for image in &choice.message.images {
             let image_url = match &image.image_url {

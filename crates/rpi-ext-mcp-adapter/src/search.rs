@@ -14,8 +14,8 @@
 use std::collections::HashSet;
 
 use crate::metadata::{
-    get_server_prefix, get_tool_name_candidates, matches_tool_pattern, resolve_tool_prefix,
-    McpConfig, ServerEntry, ToolMetadata, ToolPrefix,
+    McpConfig, ServerEntry, ToolMetadata, ToolPrefix, get_server_prefix, get_tool_name_candidates,
+    matches_tool_pattern, resolve_tool_prefix,
 };
 use serde_json::Value;
 
@@ -436,10 +436,10 @@ fn rank_prepared_matches(
         return matches;
     }
     for prepared_server in &catalog.servers {
-        if let Some(server) = server {
-            if prepared_server.server_name != server {
-                continue;
-            }
+        if let Some(server) = server
+            && prepared_server.server_name != server
+        {
+            continue;
         }
         // search-ranking.ts:246: skip servers in active failure backoff.
         if state
@@ -605,13 +605,15 @@ mod tests {
             ),
             None
         );
-        assert!(score_tool_match(
-            &tool("sync_icon", "Sync an icon."),
-            "better-icons",
-            "synchronize",
-            None
-        )
-        .is_some());
+        assert!(
+            score_tool_match(
+                &tool("sync_icon", "Sync an icon."),
+                "better-icons",
+                "synchronize",
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -624,21 +626,25 @@ mod tests {
             score_tool_match(&advanced, "demo", "fuzzy lookup", None),
             None
         );
-        assert!(score_tool_match(
-            &advanced,
-            "demo",
-            "fuzzy lookup",
-            Some(&["fuzzy lookup".to_string(), "legacy".to_string()])
-        )
-        .is_some());
+        assert!(
+            score_tool_match(
+                &advanced,
+                "demo",
+                "fuzzy lookup",
+                Some(&["fuzzy lookup".to_string(), "legacy".to_string()])
+            )
+            .is_some()
+        );
         assert_eq!(score_tool_match(&advanced, "demo", "fuzzy", None), None);
-        assert!(score_tool_match(
-            &advanced,
-            "demo",
-            "fuzzy",
-            Some(&["fuzzy lookup".to_string()])
-        )
-        .is_some());
+        assert!(
+            score_tool_match(
+                &advanced,
+                "demo",
+                "fuzzy",
+                Some(&["fuzzy lookup".to_string()])
+            )
+            .is_some()
+        );
     }
 
     #[test]

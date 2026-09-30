@@ -36,7 +36,7 @@ use super::super::interaction::{AuthEvent, AuthInteraction};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
 use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
-    poll_oauth_device_code_flow, DeviceCodePollOptions, DeviceCodePollResult, CANCEL_MESSAGE,
+    CANCEL_MESSAGE, DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
 use crate::utils::provider_env::get_provider_env_value;
 
@@ -263,14 +263,15 @@ impl KimiCodingOAuth {
         let expires_in = json.get("expires_in").and_then(Value::as_f64);
         if let (Some(access_token), Some(refresh_token), Some(expires_in)) =
             (access_token, refresh_token, expires_in)
+            && !access_token.is_empty()
+            && !refresh_token.is_empty()
+            && expires_in > 0.0
         {
-            if !access_token.is_empty() && !refresh_token.is_empty() && expires_in > 0.0 {
-                return Ok(TokenResponse {
-                    access: access_token.to_owned(),
-                    refresh: refresh_token.to_owned(),
-                    expires: now_ms() + (expires_in * 1000.0) as i64,
-                });
-            }
+            return Ok(TokenResponse {
+                access: access_token.to_owned(),
+                refresh: refresh_token.to_owned(),
+                expires: now_ms() + (expires_in * 1000.0) as i64,
+            });
         }
         Err(error(format!(
             "Kimi Code token {operation} response missing fields: {json}"
@@ -767,7 +768,7 @@ mod tests {
         impl EnvGuard {
             fn set(entries: &[(&'static str, &str)]) -> Self {
                 for (name, value) in entries {
-                    std::env::set_var(name, value);
+                    rpi_test_env::set_var(name, value);
                 }
                 Self(entries.iter().map(|(name, _)| *name).collect())
             }
@@ -775,7 +776,7 @@ mod tests {
         impl Drop for EnvGuard {
             fn drop(&mut self) {
                 for name in &self.0 {
-                    std::env::remove_var(name);
+                    rpi_test_env::remove_var(name);
                 }
             }
         }
@@ -875,12 +876,14 @@ mod tests {
         assert!(credential.expires <= before + 3600 * 1000 + 5000);
 
         match handle.events().as_slice() {
-            [AuthEvent::DeviceCode {
-                user_code,
-                verification_uri,
-                interval_seconds,
-                expires_in_seconds,
-            }] => {
+            [
+                AuthEvent::DeviceCode {
+                    user_code,
+                    verification_uri,
+                    interval_seconds,
+                    expires_in_seconds,
+                },
+            ] => {
                 assert_eq!(user_code, "ABCD-1234");
                 assert_eq!(
                     verification_uri,

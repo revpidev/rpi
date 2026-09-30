@@ -10,7 +10,7 @@
 //! deliberately (the Q3 rich-interaction pass re-records this baseline).
 
 use rpi_ext_host::interactive_ui::Component;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::i18n::I18n;
 use crate::state::session::QuestionnaireComponent;
@@ -166,11 +166,7 @@ fn height_stability_questions() -> Vec<QuestionData> {
             question: "Which report format should the build emit?".to_owned(),
             header: "Format".to_owned(),
             options: vec![
-                preview_option(
-                    "Short",
-                    "One-line summary",
-                    "# Short\n\n`ok`",
-                ),
+                preview_option("Short", "One-line summary", "# Short\n\n`ok`"),
                 preview_option(
                     "Long",
                     "Full markdown report",
@@ -484,10 +480,12 @@ mod tests {
         // Frame 2 (after ctrl+] again) is the full dialog again.
         let reopened = &scenario.frames[2];
         assert!(reopened.lines.len() > 5);
-        assert!(reopened
-            .lines
-            .iter()
-            .any(|line| line.contains("Which library")));
+        assert!(
+            reopened
+                .lines
+                .iter()
+                .any(|line| line.contains("Which library"))
+        );
         // Frame 3 (confirm) carries done.
         assert!(scenario.frames[3].done.is_some());
     }

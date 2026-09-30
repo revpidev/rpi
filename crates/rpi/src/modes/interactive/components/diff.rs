@@ -335,18 +335,19 @@ struct Path {
 /// component when it has the same kind.
 fn add_to_path(path: &Path, added: bool, removed: bool, old_pos_inc: i32) -> Path {
     let last = &path.last_component;
-    if let Some(last) = last {
-        if last.added == added && last.removed == removed {
-            return Path {
-                old_pos: path.old_pos + old_pos_inc,
-                last_component: Some(Box::new(Component {
-                    count: last.count + 1,
-                    added,
-                    removed,
-                    previous: last.previous.clone(),
-                })),
-            };
-        }
+    if let Some(last) = last
+        && last.added == added
+        && last.removed == removed
+    {
+        return Path {
+            old_pos: path.old_pos + old_pos_inc,
+            last_component: Some(Box::new(Component {
+                count: last.count + 1,
+                added,
+                removed,
+                previous: last.previous.clone(),
+            })),
+        };
     }
     Path {
         old_pos: path.old_pos + old_pos_inc,

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct FakeHost {
     cwd: PathBuf,
@@ -229,13 +229,12 @@ fn e2e_real_rpi_child_and_stream_fixture() {
     );
 
     // 2. Full pipeline through the plugin with the real child.
-    // Safety of set_var in tests: this is the only test in this binary.
-    unsafe {
-        std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
-        std::env::set_var("RPI_SUBAGENT_RPI_BINARY", &rpi);
-        std::env::set_var("RPI_SUBAGENT_EXTENSION_PATH", &cdylib);
-        std::env::set_var("STUBPAR_API_KEY", "stub-key");
-    }
+    // Env writes via the test-only helper (see rpi-test-env contract);
+    // this is the only test in this binary.
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+    rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", &rpi);
+    rpi_test_env::set_var("RPI_SUBAGENT_EXTENSION_PATH", &cdylib);
+    rpi_test_env::set_var("STUBPAR_API_KEY", "stub-key");
     // TE05: pin the P0 foreground default in the sandbox config
     // (asyncByDefault defaults to true with FR-P1-04).
     std::fs::create_dir_all(agent_dir.join("extensions").join("subagent")).unwrap();

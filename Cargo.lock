@@ -3116,6 +3116,7 @@ dependencies = [
  "rpi-agent",
  "rpi-ai",
  "rpi-ext-host",
+ "rpi-test-env",
  "rpi-test-support",
  "rpi-tui",
  "semver",
@@ -3146,6 +3147,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rpi-ai",
+ "rpi-test-env",
  "rpi-test-support",
  "serde",
  "serde_json",
@@ -3176,6 +3178,7 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
+ "rpi-test-env",
  "serde",
  "serde_json",
  "sha2",
@@ -3197,6 +3200,7 @@ dependencies = [
  "rpi-agent",
  "rpi-ai",
  "rpi-ext-host",
+ "rpi-test-env",
  "rpi-tui",
  "serde",
  "serde_json",
@@ -3215,6 +3219,7 @@ dependencies = [
  "rpi-agent",
  "rpi-ai",
  "rpi-ext-sdk",
+ "rpi-test-env",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -3240,6 +3245,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rpi-ext-host",
+ "rpi-test-env",
  "serde",
  "serde_json",
  "sha2",
@@ -3272,6 +3278,7 @@ dependencies = [
  "rpi-agent",
  "rpi-ai",
  "rpi-ext-host",
+ "rpi-test-env",
  "scraper",
  "serde",
  "serde_json",
@@ -3291,6 +3298,7 @@ version = "0.1.5"
 dependencies = [
  "abi_stable",
  "rpi-ext-host",
+ "rpi-test-env",
  "serde",
  "serde_json",
  "tokio",
@@ -3308,6 +3316,7 @@ dependencies = [
  "rpi-agent",
  "rpi-ai",
  "rpi-ext-host",
+ "rpi-test-env",
  "serde",
  "serde_json",
  "sha2",
@@ -3328,6 +3337,10 @@ dependencies = [
  "serde_json",
  "tracing",
 ]
+
+[[package]]
+name = "rpi-test-env"
+version = "0.1.5"
 
 [[package]]
 name = "rpi-test-native-plugin"
@@ -3361,6 +3374,7 @@ dependencies = [
  "comrak",
  "crossterm",
  "regex",
+ "rpi-test-env",
  "rpi-test-support",
  "serde",
  "serde_json",

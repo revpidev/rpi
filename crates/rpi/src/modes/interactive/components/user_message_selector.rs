@@ -220,10 +220,10 @@ impl Component for UserMessageSelectorComponent {
                 self.selected_index + 1
             };
         } else if read.matches_id(data, "tui.select.confirm") {
-            if let Some(message) = self.messages.get(self.selected_index) {
-                if let Some(on_select) = self.on_select.as_mut() {
-                    on_select(&message.id);
-                }
+            if let Some(message) = self.messages.get(self.selected_index)
+                && let Some(on_select) = self.on_select.as_mut()
+            {
+                on_select(&message.id);
             }
         } else if read.matches_id(data, "tui.select.cancel") {
             self.cancel();
@@ -323,9 +323,11 @@ mod tests {
 
         let lines: Vec<String> = component.render(80).iter().map(|l| strip_ansi(l)).collect();
         assert!(lines.iter().any(|l| l.contains("Fork from Message")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Select a user message to copy the active path")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Select a user message to copy the active path"))
+        );
         assert!(lines.iter().any(|l| l.contains('─')), "borders rendered");
         // Selected entry: accent cursor + bold text + metadata.
         let selected_line = lines

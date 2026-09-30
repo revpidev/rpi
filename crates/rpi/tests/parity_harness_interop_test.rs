@@ -37,11 +37,11 @@ use std::sync::Arc;
 
 use rpi::core::session_manager::{NewSessionOptions, SessionManager, StoredEntry};
 use rpi_agent::harness::env::nodejs::NodeExecutionEnv;
+use rpi_agent::harness::session::Session as SessionFacade;
 use rpi_agent::harness::session::jsonl_repo::JsonlSessionRepo;
 use rpi_agent::harness::session::jsonl_storage::{
     JsonlSessionStorage, JsonlSessionStorageCreateOptions,
 };
-use rpi_agent::harness::session::Session as SessionFacade;
 use rpi_agent::harness::types::{
     AppendCompactionOptions, MoveToSummary, SessionContextBuildOptions,
 };
@@ -54,8 +54,8 @@ use rpi_agent::session::{MessageEntry, SessionEntry};
 use rpi_ai::types::{
     AssistantContent, Usage, UsageCost, UserContent, UserContentBlock, UserMessage, UserRole,
 };
-use rpi_test_support::faux::{faux_assistant_message, FauxAssistantOptions};
-use serde_json::{json, Value};
+use rpi_test_support::faux::{FauxAssistantOptions, faux_assistant_message};
+use serde_json::{Value, json};
 
 const SCENARIOS: &[&str] = &[
     "abort",
@@ -605,12 +605,14 @@ async fn harness_retained_tail_session_loads_in_session_manager() {
     // Move to root: leaf is None, context cleared, later appends hang under null.
     session.move_to(None, None).await.expect("move to root");
     assert_eq!(session.get_leaf_id().await.expect("leaf"), None);
-    assert!(session
-        .build_context(SessionContextBuildOptions::default())
-        .await
-        .expect("context")
-        .messages
-        .is_empty());
+    assert!(
+        session
+            .build_context(SessionContextBuildOptions::default())
+            .await
+            .expect("context")
+            .messages
+            .is_empty()
+    );
     let u5 = session.append_message(user_msg("seven")).await.expect("u5");
     let u5_entry = session.get_entry(&u5).await.expect("entry").expect("found");
     assert_eq!(u5_entry.parent_id(), None);

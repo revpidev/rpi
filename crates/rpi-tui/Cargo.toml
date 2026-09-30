@@ -20,3 +20,4 @@ comrak.workspace = true
 
 [dev-dependencies]
 rpi-test-support.workspace = true
+rpi-test-env.workspace = true

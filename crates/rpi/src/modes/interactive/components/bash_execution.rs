@@ -27,7 +27,7 @@ use rpi_tui::tui::{Component, Container, RenderHandle};
 use crate::core::themes::Theme;
 use crate::tools::sanitize::strip_ansi;
 use crate::tools::truncate::{
-    truncate_tail, TruncateOptions, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncateOptions, TruncationResult, truncate_tail,
 };
 
 use super::dynamic_border::DynamicBorder;
@@ -77,10 +77,10 @@ struct CachedVisualTruncation {
 
 impl Component for CachedVisualTruncation {
     fn render(&self, width: usize) -> Vec<String> {
-        if let Some((cached_width, lines)) = self.cache.borrow().as_ref() {
-            if *cached_width == width {
-                return lines.clone();
-            }
+        if let Some((cached_width, lines)) = self.cache.borrow().as_ref()
+            && *cached_width == width
+        {
+            return lines.clone();
         }
         let result =
             truncate_to_visual_lines(&self.text, self.max_visual_lines, width, self.padding_x);
@@ -356,13 +356,11 @@ impl BashExecutionComponent {
             // truncation) (bash-execution.ts:195-199).
             let was_truncated = self.truncation_result.as_ref().is_some_and(|t| t.truncated)
                 || context_truncation.truncated;
-            if was_truncated {
-                if let Some(path) = &self.full_output_path {
-                    status_parts.push(
-                        self.theme
-                            .fg("warning", &format!("Output truncated. Full output: {path}")),
-                    );
-                }
+            if was_truncated && let Some(path) = &self.full_output_path {
+                status_parts.push(
+                    self.theme
+                        .fg("warning", &format!("Output truncated. Full output: {path}")),
+                );
             }
 
             if !status_parts.is_empty() {

@@ -373,15 +373,17 @@ mod tests {
 
         let err = parse_auth_command(&owned(&["auth", "print-api-key", "--min-expiry", "30m"]))
             .unwrap_err();
-        assert!(err
-            .0
-            .contains("--min-expiry is only supported by print-bearer-token"));
+        assert!(
+            err.0
+                .contains("--min-expiry is only supported by print-bearer-token")
+        );
 
         let err =
             parse_auth_command(&owned(&["auth", "check", "--min-expiry", "30m"])).unwrap_err();
-        assert!(err
-            .0
-            .contains("--min-expiry is only supported by print-bearer-token"));
+        assert!(
+            err.0
+                .contains("--min-expiry is only supported by print-bearer-token")
+        );
     }
 
     #[test]

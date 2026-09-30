@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rpi_ext_host::host::NativeExtensionHost;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 

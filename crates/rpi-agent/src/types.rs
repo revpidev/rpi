@@ -219,7 +219,7 @@ pub enum AgentEvent {
 #[cfg(test)]
 mod tests {
     use rpi_ai::types::{AssistantRole, StopReason, TextContent, ToolResultRole, Usage, UserRole};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::messages::BashExecutionMessage;

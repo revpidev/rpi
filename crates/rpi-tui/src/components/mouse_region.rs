@@ -15,8 +15,8 @@
 //!   identical).
 
 use crate::tui::{
-    dispatch_mouse_event, lock_component, Component, SharedComponent, TuiMouseEvent,
-    TuiMouseEventResult, TuiMouseHandlerResult,
+    Component, SharedComponent, TuiMouseEvent, TuiMouseEventResult, TuiMouseHandlerResult,
+    dispatch_mouse_event, lock_component,
 };
 
 /// `MouseRegionHandler` (mouse-region.ts:10).
@@ -68,10 +68,10 @@ mod tests {
     use super::*;
     use crate::components::text::Text;
     use crate::tui::{
-        shared_component, TuiMouseButton, TuiMouseEventResult as Result_, TuiMouseEventType,
+        TuiMouseButton, TuiMouseEventResult as Result_, TuiMouseEventType, shared_component,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn event(event_type: TuiMouseEventType, button: TuiMouseButton) -> TuiMouseEvent {
         TuiMouseEvent {

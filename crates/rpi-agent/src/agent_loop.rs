@@ -28,16 +28,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
+use futures::Stream;
 use futures::future::{BoxFuture, Shared};
 use futures::prelude::*;
-use futures::Stream;
 use rpi_ai::types::{
     AssistantContent, AssistantMessage, AssistantRole, Context, Message, Model, ModelThinkingLevel,
     StopReason, StreamEvent, StreamOptions, TextContent, ThinkingBudgets, ThinkingLevel, Tool,
     ToolResultContent, ToolResultMessage, ToolResultRole, Usage,
 };
 use rpi_ai::utils::validation::validate_tool_arguments;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -1047,20 +1047,18 @@ async fn stream_assistant_response(
                 return finalize_streamed_message(context, error, added_partial, emit).await;
             }
             other => {
-                if stream_started {
-                    if let Some(partial) = stream_event_partial(&other) {
-                        // V15-13 zero-copy delta path: the accumulated
-                        // partial is shared by `Arc` straight into the
-                        // event (and from there into the agent state, every
-                        // listener, and the UI queue); no deep copies per
-                        // delta, and `context.messages` stays untouched
-                        // until finalize.
-                        emit(AgentEvent::MessageUpdate {
-                            message: std::sync::Arc::clone(partial),
-                            assistant_message_event: std::sync::Arc::new(other),
-                        })
-                        .await;
-                    }
+                if stream_started && let Some(partial) = stream_event_partial(&other) {
+                    // V15-13 zero-copy delta path: the accumulated
+                    // partial is shared by `Arc` straight into the
+                    // event (and from there into the agent state, every
+                    // listener, and the UI queue); no deep copies per
+                    // delta, and `context.messages` stays untouched
+                    // until finalize.
+                    emit(AgentEvent::MessageUpdate {
+                        message: std::sync::Arc::clone(partial),
+                        assistant_message_event: std::sync::Arc::new(other),
+                    })
+                    .await;
                 }
             }
         }

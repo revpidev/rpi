@@ -13,7 +13,7 @@ use rpi_ai::types::ImageContent;
 use thiserror::Error;
 
 use crate::tools::image_process::process_image;
-use crate::tools::mime::{detect_supported_image_mime_type, IMAGE_TYPE_SNIFF_BYTES};
+use crate::tools::mime::{IMAGE_TYPE_SNIFF_BYTES, detect_supported_image_mime_type};
 use crate::tools::path_utils::resolve_read_path;
 
 /// `ProcessedFiles` (file-processor.ts:13-16).

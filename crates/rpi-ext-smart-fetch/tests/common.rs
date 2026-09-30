@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 /// One scripted response: (status line, response headers, body).

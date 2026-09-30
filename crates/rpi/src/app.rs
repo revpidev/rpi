@@ -19,39 +19,39 @@ use std::sync::{Arc, Mutex};
 
 use rpi_agent::types::ThinkingLevel;
 
-use crate::cli::args::{parse_args, print_help, Args, Mode};
-use crate::cli::diagnostics::{has_error, DiagnosticLevel};
-use crate::cli::file_processor::{process_file_arguments, FileProcessError};
+use crate::cli::args::{Args, Mode, parse_args, print_help};
+use crate::cli::diagnostics::{DiagnosticLevel, has_error};
+use crate::cli::file_processor::{FileProcessError, process_file_arguments};
 use crate::cli::initial_message::build_initial_message;
 use crate::cli::list_models::list_models;
 use crate::config::{
-    get_agent_dir, resolve_session_dir_from_env, ENV_OFFLINE, ENV_SKIP_VERSION_CHECK, VERSION,
+    ENV_OFFLINE, ENV_SKIP_VERSION_CHECK, VERSION, get_agent_dir, resolve_session_dir_from_env,
 };
 use crate::core::agent_session_runtime::{
-    create_agent_session_runtime, CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    CreateAgentSessionRuntimeResult, CreateRuntimeOptions, create_agent_session_runtime,
 };
 use crate::core::agent_session_services::AgentSessionRuntimeDiagnostic;
 use crate::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use crate::core::auth_guidance::format_no_models_available_message;
 use crate::core::extensions::{SessionStartEvent, SessionStartReason};
 use crate::core::model_resolver::{
-    resolve_cli_model, resolve_model_scope_with_diagnostics, ResolveCliModelOptions, ScopedModel,
+    ResolveCliModelOptions, ScopedModel, resolve_cli_model, resolve_model_scope_with_diagnostics,
 };
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::session_cwd::{format_missing_session_cwd_error, get_missing_session_cwd_issue};
-use crate::core::session_manager::{assert_valid_session_id, NewSessionOptions, SessionManager};
+use crate::core::session_manager::{NewSessionOptions, SessionManager, assert_valid_session_id};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::trust_manager::{
-    default_project_trust_from_settings, has_trust_requiring_project_resources,
-    resolve_project_trusted, ProjectTrustContext, ProjectTrustStore,
+    ProjectTrustContext, ProjectTrustStore, default_project_trust_from_settings,
+    has_trust_requiring_project_resources, resolve_project_trusted,
 };
 use crate::error::RpiError;
 use crate::modes::interactive::run_interactive_mode;
-use crate::modes::print_mode::{run_print_mode, PrintModeOptions, PrintOutputMode};
+use crate::modes::print_mode::{PrintModeOptions, PrintOutputMode, run_print_mode};
 use crate::modes::rpc::run_rpc_mode;
-use crate::sdk::{create_agent_session, CreateAgentSessionOptions, NoTools};
+use crate::sdk::{CreateAgentSessionOptions, NoTools, create_agent_session};
 use crate::tools::path_utils::resolve_path;
 
 /// Upstream `EXTENSION_LOAD_FAILURE_HINT` (main.ts:52).
@@ -311,10 +311,10 @@ async fn create_session_manager(
     }
 
     if let Some(fork_arg) = &parsed.fork {
-        if let Some(session_id) = &parsed.session_id {
-            if find_local_session_by_exact_id(session_id, cwd, session_dir).is_some() {
-                return Err(format!("Session already exists with id '{session_id}'"));
-            }
+        if let Some(session_id) = &parsed.session_id
+            && find_local_session_by_exact_id(session_id, cwd, session_dir).is_some()
+        {
+            return Err(format!("Session already exists with id '{session_id}'"));
         }
 
         return match resolve_session_path(fork_arg, cwd, session_dir) {
@@ -606,9 +606,10 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     let offline_mode = args.iter().any(|a| a == "--offline")
         || is_truthy_env_flag(std::env::var(ENV_OFFLINE).ok().as_deref());
     if offline_mode {
-        // SAFETY-FREE note: single-threaded startup phase; no readers race.
-        std::env::set_var(ENV_OFFLINE, "1");
-        std::env::set_var(ENV_SKIP_VERSION_CHECK, "1");
+        // SAFETY: single-threaded startup phase (main.ts:476-480); runtime
+        // workers exist but no tasks (env readers) have been spawned yet.
+        unsafe { std::env::set_var(ENV_OFFLINE, "1") };
+        unsafe { std::env::set_var(ENV_SKIP_VERSION_CHECK, "1") };
     }
 
     // Subcommand dispatch (main.ts:492-507). `update --models` landed in
@@ -625,10 +626,10 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         if first == "self-uninstall" {
             return crate::cli::package_command::run_self_uninstall(&args);
         }
-        if first == "auth" {
-            if let Some(exit_code) = crate::cli::run_auth::run_auth(&args).await {
-                return exit_code;
-            }
+        if first == "auth"
+            && let Some(exit_code) = crate::cli::run_auth::run_auth(&args).await
+        {
+            return exit_code;
         }
         if crate::cli::package_command::parse_package_command(&args).is_some() {
             return crate::cli::package_command::run_package_command(&args);
@@ -1424,7 +1425,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             .await
         }
         AppMode::Print | AppMode::Json => {
-            let exit_code = run_print_mode(
+            run_print_mode(
                 &mut runtime,
                 PrintModeOptions {
                     mode: match app_mode {
@@ -1438,8 +1439,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                 crate::core::output_guard::RawStdout::new(Box::new(std::io::stdout())),
                 &mut err,
             )
-            .await;
-            exit_code
+            .await
         }
     }
 }

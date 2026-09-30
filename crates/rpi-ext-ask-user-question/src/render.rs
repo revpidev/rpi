@@ -50,7 +50,7 @@
 //! are replaced with a space (single-line integrity for the summary line; the execute
 //! path's full #192 normalization is unrelated and runs later).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::i18n::I18n;
 use crate::tool::TOOL_NAME;
@@ -133,14 +133,14 @@ impl AnsiRenderTheme {
 
 /// `#rrggbb` → truecolor SGR prefix (host `fg_ansi` truecolor arm).
 fn hex_prefix(hex: &str) -> String {
-    if hex.len() == 6 {
-        if let (Some(r), Some(g), Some(b)) = (
+    if hex.len() == 6
+        && let (Some(r), Some(g), Some(b)) = (
             u8::from_str_radix(&hex[0..2], 16).ok(),
             u8::from_str_radix(&hex[2..4], 16).ok(),
             u8::from_str_radix(&hex[4..6], 16).ok(),
-        ) {
-            return format!("\x1b[38;2;{r};{g};{b}m");
-        }
+        )
+    {
+        return format!("\x1b[38;2;{r};{g};{b}m");
     }
     String::new()
 }

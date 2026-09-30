@@ -58,12 +58,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::api::constrained_sampling::resolve_json_schema_strict_sampling;
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
-use crate::models::{clamp_thinking_level, ProviderStreams};
+use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantRole, CacheRetention, DoneReason, ErrorReason,
     InputModality, Message, Model, ModelThinkingLevel, ProviderHeaders, ProviderResponse,
@@ -71,7 +71,7 @@ use crate::types::{
     TranscriptContext, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
-use crate::utils::custom_fetch::{send_provider_request, SendFailure};
+use crate::utils::custom_fetch::{SendFailure, send_provider_request};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::headers::{
@@ -80,7 +80,7 @@ use crate::utils::headers::{
 };
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions, RetryError,
+    ProviderErrorInfo, ProviderRetryOptions, RetryError, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::transform_messages::transform_messages;
@@ -280,10 +280,9 @@ fn build_request_headers(
         && !headers
             .keys()
             .any(|key| key.eq_ignore_ascii_case("x-affinity"))
+        && let Some(session_id) = &options.stream.session_id
     {
-        if let Some(session_id) = &options.stream.session_id {
-            headers.insert("x-affinity".to_owned(), Some(session_id.clone()));
-        }
+        headers.insert("x-affinity".to_owned(), Some(session_id.clone()));
     }
 
     headers
@@ -333,10 +332,10 @@ fn build_chat_payload(
     if let Some(reasoning_effort) = &options.reasoning_effort {
         payload.insert("reasoningEffort".to_owned(), json!(reasoning_effort));
     }
-    if should_use_prompt_caching(&options.stream) {
-        if let Some(session_id) = &options.stream.session_id {
-            payload.insert("promptCacheKey".to_owned(), json!(session_id));
-        }
+    if should_use_prompt_caching(&options.stream)
+        && let Some(session_id) = &options.stream.session_id
+    {
+        payload.insert("promptCacheKey".to_owned(), json!(session_id));
     }
 
     Ok(Value::Object(payload))
@@ -1000,10 +999,10 @@ impl<'a> StreamProcessor<'a> {
     /// `consumeChatStream` per-chunk body.
     fn handle_chunk(&mut self, chunk: &CompletionChunk, events: &AssistantMessageEventStream) {
         // Keep the first non-empty response id (`output.responseId ||= chunk.id`).
-        if self.output.response_id.as_deref().unwrap_or("").is_empty() {
-            if let Some(id) = chunk.id.as_ref().filter(|id| !id.is_empty()) {
-                self.output.response_id = Some(id.clone());
-            }
+        if self.output.response_id.as_deref().unwrap_or("").is_empty()
+            && let Some(id) = chunk.id.as_ref().filter(|id| !id.is_empty())
+        {
+            self.output.response_id = Some(id.clone());
         }
 
         if let Some(usage) = &chunk.usage {
@@ -1234,10 +1233,10 @@ async fn run(
     let transformed_messages = transform_messages(&context.messages, model, Some(&mut normalize));
 
     let mut payload = build_chat_payload(model, context, &transformed_messages, options)?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_payload) = on_payload(payload.clone(), model).await {
-            payload = next_payload;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_payload) = on_payload(payload.clone(), model).await
+    {
+        payload = next_payload;
     }
     // `JSON.stringify(toMistralWirePayload(payload))` (9dd90a497).
     let wire_payload = to_mistral_wire_payload(&payload);
@@ -1344,19 +1343,18 @@ async fn run(
         Err(error) => {
             // 9dd90a497: `onResponse` observes the HTTP response before the
             // `!response.ok` throw, so it also fires for error statuses.
-            if let RetryError::Provider(info) = &error {
-                if let (Some(on_response), Some(status)) =
+            if let RetryError::Provider(info) = &error
+                && let (Some(on_response), Some(status)) =
                     (&options.stream.on_response, info.status)
-                {
-                    on_response(
-                        ProviderResponse {
-                            status,
-                            headers: info.headers.clone().unwrap_or_default(),
-                        },
-                        model,
-                    )
-                    .await;
-                }
+            {
+                on_response(
+                    ProviderResponse {
+                        status,
+                        headers: info.headers.clone().unwrap_or_default(),
+                    },
+                    model,
+                )
+                .await;
             }
             return Err(error.message());
         }

@@ -18,13 +18,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
 use crate::harness::tools::edit_diff::{
-    apply_edits_to_normalized_content, detect_line_ending, generate_diff_string,
-    generate_unified_patch, normalize_to_lf, restore_line_endings, strip_bom, Edit,
+    Edit, apply_edits_to_normalized_content, detect_line_ending, generate_diff_string,
+    generate_unified_patch, normalize_to_lf, restore_line_endings, strip_bom,
 };
 use crate::harness::tools::file_mutation_queue::with_file_mutation_queue;
 use crate::harness::tools::path_utils::resolve_tool_path;
@@ -70,12 +70,11 @@ fn prepare_edit_arguments(args: Value) -> Value {
     let Value::Object(mut map) = args else {
         return args;
     };
-    if let Some(Value::String(s)) = map.get("edits") {
-        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-            if parsed.is_array() {
-                map.insert("edits".into(), parsed);
-            }
-        }
+    if let Some(Value::String(s)) = map.get("edits")
+        && let Ok(parsed) = serde_json::from_str::<Value>(s)
+        && parsed.is_array()
+    {
+        map.insert("edits".into(), parsed);
     }
 
     let old_text = map.get("oldText").cloned();
@@ -281,15 +280,15 @@ impl<TContext: ToolContext> AgentHarnessTool<TContext> for EditTool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use serde_json::Value;
 
     use super::*;
     use crate::harness::env::nodejs::NodeExecutionEnv;
-    use crate::harness::tools::test_helpers::{apply_unified_patch, text_output, TempDir, ToolEnv};
     use crate::harness::tools::ExecutionToolContext;
+    use crate::harness::tools::test_helpers::{TempDir, ToolEnv, apply_unified_patch, text_output};
     use crate::harness::types::ExecutionEnv;
 
     #[tokio::test]

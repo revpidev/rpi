@@ -25,10 +25,10 @@ const CONFIG_DIR_NAME: &str = ".rpi";
 /// passwd fallback).
 pub fn home_dir() -> Option<PathBuf> {
     for key in ["HOME", "USERPROFILE"] {
-        if let Some(value) = std::env::var_os(key) {
-            if !value.is_empty() {
-                return Some(PathBuf::from(value));
-            }
+        if let Some(value) = std::env::var_os(key)
+            && !value.is_empty()
+        {
+            return Some(PathBuf::from(value));
         }
     }
     None
@@ -68,10 +68,10 @@ fn normalize_path(input: &str) -> PathBuf {
 /// `getAgentDir` equivalent (rpi config.rs:111-121): `RPI_CODING_AGENT_DIR`
 /// env override, else `~/.rpi/agent`.
 pub fn get_agent_dir() -> PathBuf {
-    if let Some(env_dir) = std::env::var_os(ENV_AGENT_DIR) {
-        if !env_dir.is_empty() {
-            return normalize_path(&env_dir.to_string_lossy());
-        }
+    if let Some(env_dir) = std::env::var_os(ENV_AGENT_DIR)
+        && !env_dir.is_empty()
+    {
+        return normalize_path(&env_dir.to_string_lossy());
     }
     match home_dir() {
         Some(home) => home.join(CONFIG_DIR_NAME).join("agent"),
@@ -108,10 +108,10 @@ fn expand_tilde_and_resolve(configured: &str) -> PathBuf {
 /// `RPI_CODING_AGENT_SESSION_DIR` env > `settings.sessionDir` >
 /// `<agentDir>/sessions/--<encoded cwd>--`.
 pub fn resolve_session_dir(cwd: &Path, settings_session_dir: Option<&str>) -> PathBuf {
-    if let Some(env_dir) = std::env::var_os(ENV_SESSION_DIR) {
-        if !env_dir.is_empty() {
-            return normalize_path(&env_dir.to_string_lossy());
-        }
+    if let Some(env_dir) = std::env::var_os(ENV_SESSION_DIR)
+        && !env_dir.is_empty()
+    {
+        return normalize_path(&env_dir.to_string_lossy());
     }
     if let Some(configured) = settings_session_dir.filter(|s| !s.is_empty()) {
         return expand_tilde_and_resolve(configured);

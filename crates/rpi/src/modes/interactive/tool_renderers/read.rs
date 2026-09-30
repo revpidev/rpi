@@ -31,11 +31,11 @@ use crate::core::highlight::{get_language_from_path, highlight_code};
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::{key_hint, key_text};
 use crate::modes::interactive::components::tool_execution::{
-    get_text_output, RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext,
-    ToolResultState,
+    RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
+    get_text_output,
 };
 use crate::tools::path_utils::resolve_path;
-use crate::tools::truncate::{format_size, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
 /// `COMPACT_RESOURCE_FILE_NAMES` (read.ts:42): file names classified as
 /// "resource" in the collapsed call.
@@ -735,12 +735,10 @@ mod tests {
         let tmp = TempDir::new();
         let cwd_str = tmp.path().to_string_lossy();
         // Ordinary file, missing path, empty path, non-string path.
-        assert!(get_compact_read_classification(
-            &json!({"path": "src/main.rs"}),
-            &cwd_str,
-            tmp.path()
-        )
-        .is_none());
+        assert!(
+            get_compact_read_classification(&json!({"path": "src/main.rs"}), &cwd_str, tmp.path())
+                .is_none()
+        );
         assert!(get_compact_read_classification(&json!({}), &cwd_str, tmp.path()).is_none());
         assert!(
             get_compact_read_classification(&json!({"path": ""}), &cwd_str, tmp.path()).is_none()
@@ -749,12 +747,14 @@ mod tests {
             get_compact_read_classification(&json!({"path": 42}), &cwd_str, tmp.path()).is_none()
         );
         // `file_path` wins: an unclassifiable file_path hides a classifiable path.
-        assert!(get_compact_read_classification(
-            &json!({"file_path": "notes.txt", "path": "AGENTS.md"}),
-            &cwd_str,
-            tmp.path()
-        )
-        .is_none());
+        assert!(
+            get_compact_read_classification(
+                &json!({"file_path": "notes.txt", "path": "AGENTS.md"}),
+                &cwd_str,
+                tmp.path()
+            )
+            .is_none()
+        );
     }
 
     // --- renderCall (collapsed vs expanded) ----------------------------------

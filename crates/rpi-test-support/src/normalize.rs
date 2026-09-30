@@ -68,10 +68,11 @@ const CWD_KEYS: &[&str] = &["cwd"];
 /// the byte anchor for everything else without modeling JS key-insertion
 /// order in the Rust type system.
 fn canonicalize_error_message_placement(map: &mut serde_json::Map<String, Value>) {
-    if map.contains_key("errorMessage") && map.contains_key("timestamp") {
-        if let Some((_, value)) = map.shift_remove_entry("errorMessage") {
-            map.insert("errorMessage".to_owned(), value);
-        }
+    if map.contains_key("errorMessage")
+        && map.contains_key("timestamp")
+        && let Some((_, value)) = map.shift_remove_entry("errorMessage")
+    {
+        map.insert("errorMessage".to_owned(), value);
     }
 }
 
@@ -124,12 +125,12 @@ impl Normalizer {
                         *val = Value::String(PATH_PLACEHOLDER.to_owned());
                         continue;
                     }
-                    if ID_KEYS.contains(&key.as_str()) {
-                        if let Value::String(raw) = val {
-                            let mapped = self.placeholder_for(&raw.clone());
-                            *val = Value::String(mapped);
-                            continue;
-                        }
+                    if ID_KEYS.contains(&key.as_str())
+                        && let Value::String(raw) = val
+                    {
+                        let mapped = self.placeholder_for(&raw.clone());
+                        *val = Value::String(mapped);
+                        continue;
                     }
                     self.normalize_json(val);
                 }

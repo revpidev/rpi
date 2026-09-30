@@ -28,14 +28,14 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{
-    resolve_provider_auth, AuthContext, AuthInteraction, AuthOperationOptions,
-    AuthResolutionOverrides, AuthResult, AuthType, Credential, CredentialStore, DefaultAuthContext,
-    InMemoryCredentialStore, ModelsError, ModelsErrorCode, ProviderAuth,
+    AuthContext, AuthInteraction, AuthOperationOptions, AuthResolutionOverrides, AuthResult,
+    AuthType, Credential, CredentialStore, DefaultAuthContext, InMemoryCredentialStore,
+    ModelsError, ModelsErrorCode, ProviderAuth, resolve_provider_auth,
 };
 use crate::models_json::OrderedMap;
 use crate::models_store::{
@@ -944,10 +944,10 @@ impl Models {
         // If the caller already cancelled, reject immediately
         // (models.ts:567 `signal.throwIfAborted()`).
         let caller_signal = interaction.signal();
-        if let Some(ref token) = caller_signal {
-            if token.is_cancelled() {
-                return Err(ModelsError::aborted());
-            }
+        if let Some(ref token) = caller_signal
+            && token.is_cancelled()
+        {
+            return Err(ModelsError::aborted());
         }
 
         // The login network flow runs outside the store lock
@@ -1734,7 +1734,7 @@ pub fn models_are_equal(a: Option<&Model>, b: Option<&Model>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Map};
+    use serde_json::{Map, json};
 
     use super::*;
     use crate::auth::{ApiKeyAuth, ApiKeyCredential, AuthEvent, AuthPrompt, ModelAuth};
@@ -2941,9 +2941,9 @@ mod tests {
         auth: ProviderAuth,
         models: Vec<Model>,
         callback: impl Fn(RefreshModelsContext) -> BoxFuture<'static, Result<(), ModelsError>>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Arc<dyn Provider> {
         Arc::new(CallbackProvider {
             id: id.to_owned(),
@@ -4211,10 +4211,12 @@ mod tests {
 
         // Provider-level auth: no model headers.
         let provider_auth = models.get_provider_auth("p1", None).await.expect("auth");
-        assert!(provider_auth
-            .as_ref()
-            .and_then(|r| r.auth.headers.as_ref())
-            .is_none());
+        assert!(
+            provider_auth
+                .as_ref()
+                .and_then(|r| r.auth.headers.as_ref())
+                .is_none()
+        );
 
         // Model-level auth: model headers merged.
         let model_auth = models.get_auth(&model, None).await.expect("auth");
@@ -5200,10 +5202,12 @@ mod tests {
         token.cancel();
         let result = refresh_task.await.expect("join");
         assert!(result.aborted);
-        assert!(models
-            .refresh_controllers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        assert!(
+            models
+                .refresh_controllers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
     }
 }

@@ -5,8 +5,8 @@
 //! v0.1.4 TE23 target track; see the fixture `provenance` field).
 
 use rpi_ext_mcp_adapter::metadata::{
-    format_prompt_command_name, format_tool_name, get_server_prefix, get_tool_name_candidates,
-    resolve_server_from_tool_name, sanitize_prompt_name, ToolPrefix,
+    ToolPrefix, format_prompt_command_name, format_tool_name, get_server_prefix,
+    get_tool_name_candidates, resolve_server_from_tool_name, sanitize_prompt_name,
 };
 use serde_json::Value;
 

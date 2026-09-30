@@ -39,11 +39,11 @@ use rpi_ext_host::api::{
 };
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_tool_call,
 };
 use rpi_tui::terminal::{InputHandler, ResizeHandler, Terminal};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
@@ -111,8 +111,8 @@ impl EnvGuard {
         let mut set = |name: &'static str, value: Option<String>| {
             previous.push((name, std::env::var(name).ok()));
             match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
+                Some(value) => rpi_test_env::set_var(name, value),
+                None => rpi_test_env::remove_var(name),
             }
         };
         let home = home.to_string_lossy().into_owned();
@@ -137,8 +137,8 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         for (name, value) in self.previous.drain(..) {
             match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
+                Some(value) => rpi_test_env::set_var(name, value),
+                None => rpi_test_env::remove_var(name),
             }
         }
     }
@@ -1145,7 +1145,7 @@ async fn tui_external_editor_ctrl_g_edits_draft() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
         .expect("chmod editor");
-    unsafe { std::env::set_var("VISUAL", script.display().to_string()) };
+    rpi_test_env::set_var("VISUAL", script.display().to_string());
 
     // Enter input mode with a small draft, then Ctrl+G (R-Q5.9/Q5.11).
     fixture.term.feed("\x1b[B");
@@ -1381,10 +1381,10 @@ async fn await_frame(output: &SharedBuf, frame_type: &str, timeout: Duration) ->
     while Instant::now() < deadline {
         let text = String::from_utf8_lossy(&output.bytes()).into_owned();
         for line in text.lines() {
-            if let Ok(value) = serde_json::from_str::<Value>(line) {
-                if value["type"] == frame_type {
-                    return value;
-                }
+            if let Ok(value) = serde_json::from_str::<Value>(line)
+                && value["type"] == frame_type
+            {
+                return value;
             }
         }
         sleep(Duration::from_millis(25)).await;

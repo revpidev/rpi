@@ -14,11 +14,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::PluginRuntime;
 use crate::agents::discover::{self, AgentConfig, ContextMode};
 use crate::p1::launch_child::{self, ChildSpec, OutputOverride, RunCtx};
-use crate::PluginRuntime;
 
 /// `CHAIN_DIR_MAX_AGE_MS` (settings.ts:11): 24h scratch retention.
 pub const CHAIN_DIR_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -76,12 +76,12 @@ pub fn parse_steps(steps: &Value) -> Result<Vec<StepSpec>, String> {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
-        if let Some(binding) = &binding {
-            if !bindings.insert(binding.clone()) {
-                return Err(format!(
-                    "Duplicate output binding '{binding}' in steps; each `as` name must be unique."
-                ));
-            }
+        if let Some(binding) = &binding
+            && !bindings.insert(binding.clone())
+        {
+            return Err(format!(
+                "Duplicate output binding '{binding}' in steps; each `as` name must be unique."
+            ));
         }
         let output = match object.get("output") {
             Some(Value::Bool(false)) => OutputOverride::Disabled,

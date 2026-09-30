@@ -32,20 +32,20 @@ fn config_hash_matches_upstream_sha256_vectors() {
                 "RPI_MCP_FIXTURE_HOST",
                 "RPI_MCP_FIXTURE_DEFINITELY_UNSET",
             ] {
-                std::env::remove_var(key);
+                rpi_test_env::remove_var(key);
             }
             let env = case["env"].as_object().cloned().unwrap_or_default();
             match env.get("HOME").and_then(Value::as_str) {
-                Some(home) => std::env::set_var("HOME", home),
+                Some(home) => rpi_test_env::set_var("HOME", home),
                 None => {
                     if let Some(home) = &saved_home {
-                        std::env::set_var("HOME", home);
+                        rpi_test_env::set_var("HOME", home);
                     }
                 }
             }
             for (key, value) in &env {
                 if key != "HOME" {
-                    std::env::set_var(key, value.as_str().unwrap_or_default());
+                    rpi_test_env::set_var(key, value.as_str().unwrap_or_default());
                 }
             }
 
@@ -67,14 +67,14 @@ fn config_hash_matches_upstream_sha256_vectors() {
         "RPI_MCP_FIXTURE_HOST",
         "RPI_MCP_FIXTURE_DEFINITELY_UNSET",
     ] {
-        std::env::remove_var(key);
+        rpi_test_env::remove_var(key);
     }
     match saved_home {
-        Some(home) => std::env::set_var("HOME", home),
-        None => std::env::remove_var("HOME"),
+        Some(home) => rpi_test_env::set_var("HOME", home),
+        None => rpi_test_env::remove_var("HOME"),
     }
     for key in saved_fixture_vars {
-        std::env::remove_var(key);
+        rpi_test_env::remove_var(key);
     }
     run.expect("hash vector comparison panicked");
 

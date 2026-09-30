@@ -565,15 +565,14 @@ impl StreamableHttpTransport {
 
     fn extra_headers(&self, is_handshake: bool) -> Vec<(String, String)> {
         let mut headers = Vec::new();
-        if !is_handshake {
-            if let Some(session) = self
+        if !is_handshake
+            && let Some(session) = self
                 .session_id
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
-            {
-                headers.push(("mcp-session-id".to_string(), session));
-            }
+        {
+            headers.push(("mcp-session-id".to_string(), session));
         }
         if let Some(version) = self
             .protocol_version
@@ -797,10 +796,10 @@ impl StreamableHttpTransport {
     }
 
     fn forward_sse_event(&self, event: SseEvent) {
-        if let Some(id) = &event.id {
-            if !id.is_empty() {
-                *self.last_event_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
-            }
+        if let Some(id) = &event.id
+            && !id.is_empty()
+        {
+            *self.last_event_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
         }
         if event.event.is_some() && event.event.as_deref() != Some("message") {
             return;
@@ -809,13 +808,13 @@ impl StreamableHttpTransport {
             Ok(message) => {
                 // A response clears its request's replay wait (SDK
                 // `receivedResponse`); the message id is forwarded as-is.
-                if message.get("result").is_some() || message.get("error").is_some() {
-                    if let Some(id) = message.get("id").and_then(Value::as_u64) {
-                        self.replay_request_ids
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&id);
-                    }
+                if (message.get("result").is_some() || message.get("error").is_some())
+                    && let Some(id) = message.get("id").and_then(Value::as_u64)
+                {
+                    self.replay_request_ids
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
                 }
                 let _ = self.incoming.send(message);
             }
@@ -874,10 +873,10 @@ impl McpTransport for StreamableHttpTransport {
             });
         }
         if status.as_u16() == 202 {
-            if is_initialized_notification {
-                if let Some(this) = self.me.lock().unwrap_or_else(|e| e.into_inner()).upgrade() {
-                    this.open_standalone_stream();
-                }
+            if is_initialized_notification
+                && let Some(this) = self.me.lock().unwrap_or_else(|e| e.into_inner()).upgrade()
+            {
+                this.open_standalone_stream();
             }
             return Ok(());
         }
@@ -905,15 +904,14 @@ impl McpTransport for StreamableHttpTransport {
                         // the pending id. Registering the slot here (after
                         // the pump) — insert() returns false if the
                         // response already resolved this id.
-                        if let Some(id) = request_id {
-                            if this
+                        if let Some(id) = request_id
+                            && this
                                 .replay_request_ids
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .insert(id)
-                            {
-                                this.schedule_request_replay(id, 0).await;
-                            }
+                        {
+                            this.schedule_request_replay(id, 0).await;
                         }
                     });
                 }

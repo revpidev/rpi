@@ -27,10 +27,10 @@ pub fn build_initial_message(
     if let Some(stdin) = stdin_content {
         parts.push(stdin.to_owned());
     }
-    if let Some(file_text) = file_text {
-        if !file_text.is_empty() {
-            parts.push(file_text.to_owned());
-        }
+    if let Some(file_text) = file_text
+        && !file_text.is_empty()
+    {
+        parts.push(file_text.to_owned());
     }
     if !messages.is_empty() {
         parts.push(messages.remove(0));

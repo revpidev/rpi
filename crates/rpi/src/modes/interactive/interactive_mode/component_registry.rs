@@ -32,15 +32,16 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use rpi_ext_host::interactive_ui::{
-    ComponentCursor, ComponentEvent, ComponentFrame, ComponentHandle, DisposeReason,
-    InteractiveUiError, MountOptions, OverlayAnchor as WireAnchor, OverlayOptions as WireOverlay,
-    SizeValue as WireSize, CURSOR_MARKER, DEFAULT_MAX_FRAME_ROWS, DEFAULT_MAX_LINE_BYTES,
+    CURSOR_MARKER, ComponentCursor, ComponentEvent, ComponentFrame, ComponentHandle,
+    DEFAULT_MAX_FRAME_ROWS, DEFAULT_MAX_LINE_BYTES, DisposeReason, InteractiveUiError,
+    MountOptions, OverlayAnchor as WireAnchor, OverlayOptions as WireOverlay,
+    SizeValue as WireSize,
 };
 use rpi_tui::keys::matches_key;
 use rpi_tui::tui::{
-    shared_component_from_boxed, Component, Focusable, OverlayAnchor, OverlayMargin,
-    OverlayMarginSpec, OverlayOptions, SharedComponent, SizeValue, TuiInputListener,
-    TuiInputListenerResult,
+    Component, Focusable, OverlayAnchor, OverlayMargin, OverlayMarginSpec, OverlayOptions,
+    SharedComponent, SizeValue, TuiInputListener, TuiInputListenerResult,
+    shared_component_from_boxed,
 };
 use rpi_tui::utils::{extract_segments, get_grapheme_cell_range, slice_by_column, visible_width};
 use serde_json::Value;
@@ -249,16 +250,15 @@ impl MountState {
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if status_class {
-            if let Some(pending) = queue
+        if status_class
+            && let Some(pending) = queue
                 .iter_mut()
                 .find(|pending| std::mem::discriminant(*pending) == std::mem::discriminant(&event))
-            {
-                *pending = event;
-                drop(queue);
-                self.notify.notify_one();
-                return;
-            }
+        {
+            *pending = event;
+            drop(queue);
+            self.notify.notify_one();
+            return;
         }
         if queue.len() >= EVENT_QUEUE_CAPACITY {
             drop(queue);
@@ -429,20 +429,22 @@ impl MountState {
                 self.mounted.store(true, Ordering::SeqCst);
                 self.focused.store(self.capturing, Ordering::SeqCst);
             }
-        } else if let Some(entry) = self
-            .entry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            if hidden && mounted {
-                self.mount.hide_editor_region(&entry);
-                self.mounted.store(false, Ordering::SeqCst);
-                self.focused.store(false, Ordering::SeqCst);
-            } else if !hidden && !mounted {
-                self.mount.show_editor_region(entry);
-                self.mounted.store(true, Ordering::SeqCst);
-                self.focused.store(true, Ordering::SeqCst);
+        } else {
+            if let Some(entry) = self
+                .entry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                if hidden && mounted {
+                    self.mount.hide_editor_region(&entry);
+                    self.mounted.store(false, Ordering::SeqCst);
+                    self.focused.store(false, Ordering::SeqCst);
+                } else if !hidden && !mounted {
+                    self.mount.show_editor_region(entry);
+                    self.mounted.store(true, Ordering::SeqCst);
+                    self.focused.store(true, Ordering::SeqCst);
+                }
             }
         }
         self.mount.request_render();
@@ -614,10 +616,11 @@ impl MountState {
         };
         handle.spawn(async move {
             tokio::time::sleep(limit).await;
-            if let Some(state) = weak.upgrade() {
-                if !state.is_closed() && !state.disposing.load(Ordering::SeqCst) {
-                    state.begin_dispose(DisposeReason::Timeout);
-                }
+            if let Some(state) = weak.upgrade()
+                && !state.is_closed()
+                && !state.disposing.load(Ordering::SeqCst)
+            {
+                state.begin_dispose(DisposeReason::Timeout);
             }
         });
     }
@@ -638,20 +641,25 @@ impl MountState {
             self.mount.remove_input_listener(id);
         }
         self.mounted.store(false, Ordering::SeqCst);
-        if let Some(overlay) = self
+        match self
             .overlay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
-            overlay.hide();
-        } else if let Some(entry) = self
-            .entry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            self.mount.hide_editor_region(&entry);
+            Some(overlay) => {
+                overlay.hide();
+            }
+            _ => {
+                if let Some(entry) = self
+                    .entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                {
+                    self.mount.hide_editor_region(&entry);
+                }
+            }
         }
         if let Some(value) = done {
             *self
@@ -684,11 +692,11 @@ impl MountState {
         let weak = Arc::downgrade(self);
         let grace = self.dispose_grace;
         let force = move || {
-            if let Some(state) = weak.upgrade() {
-                if !state.is_closed() {
-                    state.log("timeout", Some("disposeGraceExpired".to_owned()));
-                    state.close(None);
-                }
+            if let Some(state) = weak.upgrade()
+                && !state.is_closed()
+            {
+                state.log("timeout", Some("disposeGraceExpired".to_owned()));
+                state.close(None);
             }
         };
         match tokio::runtime::Handle::try_current() {
@@ -798,10 +806,10 @@ fn render_frame(frame: &FrameBuffer, width: usize) -> Vec<String> {
         if let Some(line) = out.get_mut(cursor.row) {
             let mut col = cursor.col.min(visible_width(line));
             // Snap out of a wide grapheme so the split does not drop it.
-            if let Some(range) = get_grapheme_cell_range(line, col) {
-                if range.end > col {
-                    col = range.start;
-                }
+            if let Some(range) = get_grapheme_cell_range(line, col)
+                && range.end > col
+            {
+                col = range.start;
             }
             let segments = extract_segments(line, col, col, usize::MAX - col, true);
             *line = format!("{}{}{}", segments.before, CURSOR_MARKER, segments.after);
@@ -1000,11 +1008,11 @@ impl ComponentRegistry {
                 .active
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(state) = active.as_ref() {
-                if !state.closed.load(Ordering::SeqCst) {
-                    // R-U1.6: never silently replace an active component.
-                    return Err(InteractiveUiError::component_already_mounted());
-                }
+            if let Some(state) = active.as_ref()
+                && !state.closed.load(Ordering::SeqCst)
+            {
+                // R-U1.6: never silently replace an active component.
+                return Err(InteractiveUiError::component_already_mounted());
             }
         }
         let handle = ComponentHandle(self.next_handle.fetch_add(1, Ordering::SeqCst));
@@ -1432,10 +1440,10 @@ mod interactive_component {
         fn deliver_input(&self, data: &str) -> bool {
             let mut listeners = self.listeners.lock().unwrap();
             for listener in listeners.values_mut() {
-                if let Some(result) = listener(data) {
-                    if result.consume {
-                        return true;
-                    }
+                if let Some(result) = listener(data)
+                    && result.consume
+                {
+                    return true;
                 }
             }
             false
@@ -1600,9 +1608,11 @@ mod interactive_component {
         assert_eq!(registry.live_counts(), (0, 0));
         // The foreign-owner path is rejected too (R-U8.2).
         let third = mount_overlay(&registry, &mount, MountOptions::default());
-        assert!(drain_poll_error(&registry, "other", third)
-            .message
-            .contains("unknownHandle"));
+        assert!(
+            drain_poll_error(&registry, "other", third)
+                .message
+                .contains("unknownHandle")
+        );
         registry.dispose("ext", third).expect("dispose");
     }
 
@@ -1695,9 +1705,11 @@ mod interactive_component {
         // Editor-region mounts are focused.
         input_entry(&registry, "x");
         let events = drain_events(&registry, handle);
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, ComponentEvent::Input { data } if data == "x")));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ComponentEvent::Input { data } if data == "x"))
+        );
         registry.dispose("ext", handle).expect("dispose");
         assert_eq!(mount.editor_hides.load(Ordering::SeqCst), 1);
         assert!(mount.editor.lock().unwrap().is_none());
@@ -1944,12 +1956,14 @@ mod interactive_component {
         );
         // While hidden the proxy is not focused: ordinary keys dropped.
         input_entry(&registry, "z");
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            registry.poll("ext", handle)
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                registry.poll("ext", handle)
+            )
+            .await
+            .is_err()
+        );
         registry.set_hidden("ext", handle, false).expect("show");
         assert_eq!(
             registry.poll("ext", handle).await.unwrap(),
@@ -2036,12 +2050,14 @@ mod interactive_component {
         );
         // Hidden when the dialog opened: no blur.
         registry.dialog_opened();
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            registry.poll("ext", handle)
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                registry.poll("ext", handle)
+            )
+            .await
+            .is_err()
+        );
         // Shown again while the dialog is open: the mount is deferred.
         registry.set_hidden("ext", handle, false).expect("show");
         assert_eq!(

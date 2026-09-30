@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use crate::api::azure_openai_responses::AzureOpenAiResponses;
-use crate::auth::{env_api_key_auth, ProviderAuth};
+use crate::auth::{ProviderAuth, env_api_key_auth};
 use crate::generated::get_builtin_models;
-use crate::models::{create_provider, CreateProviderOptions, Provider, ProviderApi};
+use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `azureOpenAIResponsesProvider()`.
 pub fn azure_openai_responses_provider() -> Arc<dyn Provider> {

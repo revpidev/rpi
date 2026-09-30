@@ -14,7 +14,7 @@ use rpi_ext_mcp_adapter::lifecycle::LifecycleManager;
 use rpi_ext_mcp_adapter::manager::{ConnectionStatus, McpServerManager};
 use rpi_ext_mcp_adapter::metadata::ServerEntry;
 use rpi_ext_mcp_adapter::proxy;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -299,8 +299,8 @@ async fn proxy_end_to_end_five_modes() {
 
     let saved_home = std::env::var_os("HOME");
     let saved_agent = std::env::var_os("RPI_CODING_AGENT_DIR");
-    std::env::set_var("HOME", &home);
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent);
+    rpi_test_env::set_var("HOME", &home);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent);
 
     std::panic::AssertUnwindSafe(async {
         let dispatcher = Arc::new(proxy::ProxyDispatcher::new());
@@ -481,12 +481,12 @@ async fn proxy_end_to_end_five_modes() {
     .await;
 
     match saved_home {
-        Some(home) => std::env::set_var("HOME", home),
-        None => std::env::remove_var("HOME"),
+        Some(home) => rpi_test_env::set_var("HOME", home),
+        None => rpi_test_env::remove_var("HOME"),
     }
     match saved_agent {
-        Some(agent) => std::env::set_var("RPI_CODING_AGENT_DIR", agent),
-        None => std::env::remove_var("RPI_CODING_AGENT_DIR"),
+        Some(agent) => rpi_test_env::set_var("RPI_CODING_AGENT_DIR", agent),
+        None => rpi_test_env::remove_var("RPI_CODING_AGENT_DIR"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -671,15 +671,16 @@ async fn http_streamable_json_flow_and_headers() {
         .expect("tools/list");
     assert_eq!(tools_list.session_header.as_deref(), Some("sess-1"));
     assert_eq!(tools_list.version_header.as_deref(), Some("2025-03-26"));
-    assert!(seen
-        .iter()
-        .any(|r| r.rpc_method == "notifications/initialized"));
+    assert!(
+        seen.iter()
+            .any(|r| r.rpc_method == "notifications/initialized")
+    );
 }
 
 #[tokio::test]
 async fn http_bearer_and_command_secret_headers() {
     // Static bearer via env var + a `!command`-resolved custom header.
-    std::env::set_var("RPI_MCP_BEARER_TEST", "env-token-123");
+    rpi_test_env::set_var("RPI_MCP_BEARER_TEST", "env-token-123");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let seen_auth = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
@@ -736,7 +737,7 @@ async fn http_bearer_and_command_secret_headers() {
     assert_eq!(connection.status(), ConnectionStatus::Connected);
     manager.close_all().await;
     stop.cancel();
-    std::env::remove_var("RPI_MCP_BEARER_TEST");
+    rpi_test_env::remove_var("RPI_MCP_BEARER_TEST");
 
     let auth = seen_auth.lock().unwrap_or_else(|e| e.into_inner());
     assert!(!auth.is_empty());
@@ -840,10 +841,10 @@ async fn http_fallback_to_legacy_sse_with_status(fail_status: u16) {
                 let path = parts.next().unwrap_or_default().to_string();
                 let mut content_length = 0usize;
                 for line in lines {
-                    if let Some((name, value)) = line.split_once(':') {
-                        if name.trim().eq_ignore_ascii_case("content-length") {
-                            content_length = value.trim().parse().unwrap_or(0);
-                        }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
                     }
                 }
                 let mut body = buf[header_end + 4..].to_vec();
@@ -996,8 +997,8 @@ async fn direct_tools_resolve_execute_and_sync() {
 
     let saved_home = std::env::var_os("HOME");
     let saved_agent = std::env::var_os("RPI_CODING_AGENT_DIR");
-    std::env::set_var("HOME", &home);
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent);
+    rpi_test_env::set_var("HOME", &home);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent);
 
     std::panic::AssertUnwindSafe(async {
         let dispatcher = Arc::new(proxy::ProxyDispatcher::new());
@@ -1129,12 +1130,12 @@ async fn direct_tools_resolve_execute_and_sync() {
     .await;
 
     match saved_home {
-        Some(home) => std::env::set_var("HOME", home),
-        None => std::env::remove_var("HOME"),
+        Some(home) => rpi_test_env::set_var("HOME", home),
+        None => rpi_test_env::remove_var("HOME"),
     }
     match saved_agent {
-        Some(agent) => std::env::set_var("RPI_CODING_AGENT_DIR", agent),
-        None => std::env::remove_var("RPI_CODING_AGENT_DIR"),
+        Some(agent) => rpi_test_env::set_var("RPI_CODING_AGENT_DIR", agent),
+        None => rpi_test_env::remove_var("RPI_CODING_AGENT_DIR"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

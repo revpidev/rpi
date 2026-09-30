@@ -43,7 +43,7 @@ use std::path::PathBuf;
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub use runtime::PluginRuntime;
 
@@ -273,12 +273,11 @@ impl HostCallsContext<'_> {
 
 impl HostContext for HostCallsContext<'_> {
     fn cwd(&self) -> PathBuf {
-        if let Some(cwd) = host_call_ok(self.calls, self.cookie, "ctx.cwd", json!({})) {
-            if let Some(cwd) = cwd.as_str() {
-                if !cwd.is_empty() {
-                    return PathBuf::from(cwd);
-                }
-            }
+        if let Some(cwd) = host_call_ok(self.calls, self.cookie, "ctx.cwd", json!({}))
+            && let Some(cwd) = cwd.as_str()
+            && !cwd.is_empty()
+        {
+            return PathBuf::from(cwd);
         }
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
@@ -439,11 +438,7 @@ fn host_call_ok(calls: &RpiHostCalls, cookie: usize, method: &str, args: Value) 
         return None;
     }
     let ok = response.get("ok").cloned().unwrap_or(Value::Null);
-    if ok.is_null() {
-        None
-    } else {
-        Some(ok)
-    }
+    if ok.is_null() { None } else { Some(ok) }
 }
 
 fn pack(value: &Value) -> RVec<u8> {
@@ -557,15 +552,15 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             // carried a resolved budget (the handler counts every tool call,
             // nudges at the soft cap, and blocks past the hard cap for tools
             // in the block list).
-            if crate::p1::tool_budget::budget_from_env().is_some() {
-                if let Err(error) = register("on", json!({ "event": "tool_call" })) {
-                    return json!({"error": {"kind": "init", "message": error.to_string()}});
-                }
+            if crate::p1::tool_budget::budget_from_env().is_some()
+                && let Err(error) = register("on", json!({ "event": "tool_call" }))
+            {
+                return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
             // #2333 reviewer diff tool: register when the parent captured a
             // launch baseline (gated by the agent's tools naming it).
-            if crate::p1::diff_tool::baseline_from_env().is_some() {
-                if let Err(error) = register(
+            if crate::p1::diff_tool::baseline_from_env().is_some()
+                && let Err(error) = register(
                     "registerTool",
                     json!({
                         "name": crate::p1::diff_tool::WATCHDOG_DIFF_TOOL_NAME,
@@ -580,9 +575,9 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                             "additionalProperties": false
                         }
                     }),
-                ) {
-                    return json!({"error": {"kind": "init", "message": error.to_string()}});
-                }
+                )
+            {
+                return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
             // #1615: the parent named this child at launch — surface it
             // through `setSessionName` so the child's session file is
@@ -591,13 +586,13 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             // in env, not the session name, in rpi's model).
             if let Ok(name) = std::env::var(launch::args::SUBAGENT_SESSION_NAME_ENV) {
                 let name = name.trim().to_string();
-                if !name.is_empty() {
-                    if let Err(error) = register("setSessionName", json!({ "name": name })) {
-                        tracing::warn!(
-                            error = %error.to_string(),
-                            "setSessionName rejected; child session keeps its default name"
-                        );
-                    }
+                if !name.is_empty()
+                    && let Err(error) = register("setSessionName", json!({ "name": name }))
+                {
+                    tracing::warn!(
+                        error = %error.to_string(),
+                        "setSessionName rejected; child session keeps its default name"
+                    );
                 }
             }
             // Supervisor client (FR-P1-10): children with a channel dir get
@@ -606,8 +601,8 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             // carries no manifest → capabilities=[] → registerTool is denied;
             // the child must survive that (packaged installs with the
             // manifest register normally).
-            if crate::p1::supervisor::ChildSupervisorContext::from_env().is_some() {
-                if let Err(error) = register(
+            if crate::p1::supervisor::ChildSupervisorContext::from_env().is_some()
+                && let Err(error) = register(
                     "registerTool",
                     json!({
                         "name": "contact_supervisor",
@@ -615,12 +610,12 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                         "description": "Contact the parent orchestrator session: need_decision (blocking clarification), interview_request (structured input), or progress_update (non-blocking note).",
                         "parameters": crate::p1::supervisor::ChildSupervisorContext::tool_schema(),
                     }),
-                ) {
-                    tracing::warn!(
-                        error = %error.to_string(),
-                        "contact_supervisor registration denied (bare-file extension load carries no capabilities); child continues without it"
-                    );
-                }
+                )
+            {
+                tracing::warn!(
+                    error = %error.to_string(),
+                    "contact_supervisor registration denied (bare-file extension load carries no capabilities); child continues without it"
+                );
             }
             // #2087/#2272 (v0.70): a fanout child that itself coordinates
             // descendants must be able to answer their supervisor asks and
@@ -656,8 +651,8 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                         "subagent_supervisor registration denied for nested coordinator"
                     );
                 }
-                if config::load_config().wait_tool_enabled() {
-                    if let Err(error) = register(
+                if config::load_config().wait_tool_enabled()
+                    && let Err(error) = register(
                         "registerTool",
                         json!({
                             "name": "subagent_wait",
@@ -674,12 +669,12 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                                 }
                             },
                         }),
-                    ) {
-                        tracing::warn!(
-                            error = %error.to_string(),
-                            "subagent_wait registration denied for nested coordinator"
-                        );
-                    }
+                    )
+                {
+                    tracing::warn!(
+                        error = %error.to_string(),
+                        "subagent_wait registration denied for nested coordinator"
+                    );
                 }
             }
             // Steer inbox consumer (FR-P1-04, subagent-prompt-runtime.ts
@@ -687,18 +682,18 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             // child with a steer inbox, poll it and inject messages through
             // `sendUserMessage` (deliverAs steer|followUp), writing an ack
             // per consumed request.
-            if let Ok(inbox) = std::env::var(launch::args::SUBAGENT_STEER_INBOX_ENV) {
-                if !inbox.trim().is_empty() {
-                    let inbox = std::path::PathBuf::from(inbox);
-                    let calls_copy = RpiHostCalls { call: calls.call };
-                    let cookie_copy = cookie;
-                    plugin_runtime.spawn(async move {
-                        steer_inbox_loop(calls_copy, cookie_copy, inbox).await;
-                    });
-                }
+            if let Ok(inbox) = std::env::var(launch::args::SUBAGENT_STEER_INBOX_ENV)
+                && !inbox.trim().is_empty()
+            {
+                let inbox = std::path::PathBuf::from(inbox);
+                let calls_copy = RpiHostCalls { call: calls.call };
+                let cookie_copy = cookie;
+                plugin_runtime.spawn(async move {
+                    steer_inbox_loop(calls_copy, cookie_copy, inbox).await;
+                });
             }
-            if mode == PluginMode::ChildFanout {
-                if let Err(error) = register(
+            if mode == PluginMode::ChildFanout
+                && let Err(error) = register(
                     "registerTool",
                     json!({
                         "name": "subagent",
@@ -712,9 +707,9 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                         "renderCall": true,
                         "renderResult": true,
                     }),
-                ) {
-                    return json!({"error": {"kind": "init", "message": error.to_string()}});
-                }
+                )
+            {
+                return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
         }
         PluginMode::Parent => {
@@ -813,8 +808,8 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             }
             // `subagent_wait` (FR-P1-04, wait-tool.ts): registered unless
             // disabled by config.waitTool / RPI_SUBAGENT_WAIT_TOOL_ENABLED.
-            if config.wait_tool_enabled() {
-                if let Err(error) = register(
+            if config.wait_tool_enabled()
+                && let Err(error) = register(
                     "registerTool",
                     json!({
                         "name": "subagent_wait",
@@ -831,9 +826,9 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                             }
                         },
                     }),
-                ) {
-                    return json!({"error": {"kind": "init", "message": error.to_string()}});
-                }
+                )
+            {
+                return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
             // Startup: stale async-run reconciliation (ADR-0019 crash branch)
             // + artifact cleanup (index.ts:371-372).
@@ -948,18 +943,17 @@ fn dispatch_message(message: &Value) -> Value {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             // Child-safe mode blocks mutating management actions before
             // execution (fanout-child.ts allowlist, L174-189).
-            if state.mode == PluginMode::ChildFanout {
-                if let Some(action) = params.get("action").and_then(Value::as_str) {
-                    if !matches!(action, "list" | "get" | "status" | "doctor") {
-                        return json!({
-                            "content": [{ "type": "text", "text": format!(
-                                "Management action \"{action}\" is blocked in child-safe fanout mode. Allowed: list, get, status, doctor."
-                            )}],
-                            "isError": true,
-                            "details": { "mode": "single", "results": [] },
-                        });
-                    }
-                }
+            if state.mode == PluginMode::ChildFanout
+                && let Some(action) = params.get("action").and_then(Value::as_str)
+                && !matches!(action, "list" | "get" | "status" | "doctor")
+            {
+                return json!({
+                    "content": [{ "type": "text", "text": format!(
+                        "Management action \"{action}\" is blocked in child-safe fanout mode. Allowed: list, get, status, doctor."
+                    )}],
+                    "isError": true,
+                    "details": { "mode": "single", "results": [] },
+                });
             }
             if tool_name == "subagent_wait" {
                 let tool_call_id = message
@@ -1325,9 +1319,18 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
             else if let Some(attention) = waited["attention"].as_object() {
                 format!(
                     "Wait stopped: background run {} is blocked on a pending supervisor request {}. Reply with subagent_supervisor({{action:\"reply\", replyTo:\"{}\", message:\"<explicit answer>\"}}), then wait again.",
-                    attention.get("runId").and_then(Value::as_str).unwrap_or("?"),
-                    attention.get("requestId").and_then(Value::as_str).unwrap_or("?"),
-                    attention.get("requestId").and_then(Value::as_str).unwrap_or("?"),
+                    attention
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                    attention
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                    attention
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
                 )
             }
             // The timeout branch (wait_for_runs deadline) must read as a

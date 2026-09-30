@@ -128,9 +128,10 @@ mod tests {
     fn run_id_shape() {
         let id = random_run_id();
         assert_eq!(id.len(), 8);
-        assert!(id
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

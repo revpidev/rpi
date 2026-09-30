@@ -42,15 +42,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
 use crate::models::ProviderStreams;
 use crate::types::{
-    tagged_tool_call, AssistantContent, AssistantMessage, AssistantMessageDiagnostic,
-    AssistantRole, CacheRetention, DiagnosticErrorInfo, DoneReason, ErrorReason, Model,
-    NumberOrString, ProviderEnv, ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent,
-    StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Usage,
+    AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantRole, CacheRetention,
+    DiagnosticErrorInfo, DoneReason, ErrorReason, Model, NumberOrString, ProviderEnv,
+    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, TextContent,
+    ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Usage, tagged_tool_call,
 };
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -719,23 +719,21 @@ fn create_error_message(model: &Model, failure: StreamFailure, aborted: bool) ->
         error_message: Some(failure.message.clone()),
         ..initial_partial(model)
     };
-    if !aborted {
-        if let Some(response_error) = failure.response_error {
-            append_diagnostic(
-                &mut message,
-                AssistantMessageDiagnostic {
-                    kind: "pi_messages_response_failure".to_owned(),
-                    timestamp: now_ms(),
-                    error: Some(DiagnosticErrorInfo {
-                        name: Some("PiMessagesResponseError".to_owned()),
-                        message: response_error.message,
-                        stack: None,
-                        code: response_error.code.map(NumberOrString::String),
-                    }),
-                    details: Some(response_error.diagnostic_details),
-                },
-            );
-        }
+    if !aborted && let Some(response_error) = failure.response_error {
+        append_diagnostic(
+            &mut message,
+            AssistantMessageDiagnostic {
+                kind: "pi_messages_response_failure".to_owned(),
+                timestamp: now_ms(),
+                error: Some(DiagnosticErrorInfo {
+                    name: Some("PiMessagesResponseError".to_owned()),
+                    message: response_error.message,
+                    stack: None,
+                    code: response_error.code.map(NumberOrString::String),
+                }),
+                details: Some(response_error.diagnostic_details),
+            },
+        );
     }
     message
 }
@@ -802,10 +800,10 @@ async fn run(
         "context": context,
         "options": request_options,
     });
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_payload) = on_payload(payload.clone(), model).await {
-            payload = next_payload;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_payload) = on_payload(payload.clone(), model).await
+    {
+        payload = next_payload;
     }
 
     let mut headers = reqwest::header::HeaderMap::new();

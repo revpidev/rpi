@@ -17,21 +17,21 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use rpi_ai::api::bedrock::event_stream::{
-    encode_message, event_frame, exception_frame, HeaderValue,
+    HeaderValue, encode_message, event_frame, exception_frame,
 };
 use rpi_ai::api::bedrock::sigv4::{self, SigV4Credentials};
 use rpi_ai::api::bedrock_converse_stream::{
-    filtered_custom_headers, format_bedrock_error, get_standard_bedrock_endpoint_region,
-    is_reserved_header, map_thinking_level_to_effort, resolve_bedrock_config, stream,
-    supports_adaptive_thinking, supports_native_xhigh_effort, BedrockOptions, BedrockToolChoice,
-    EMPTY_TEXT_PLACEHOLDER,
+    BedrockOptions, BedrockToolChoice, EMPTY_TEXT_PLACEHOLDER, filtered_custom_headers,
+    format_bedrock_error, get_standard_bedrock_endpoint_region, is_reserved_header,
+    map_thinking_level_to_effort, resolve_bedrock_config, stream, supports_adaptive_thinking,
+    supports_native_xhigh_effort,
 };
 use rpi_ai::types::{
     ApiKind, AssistantMessage, AssistantMessageDiagnostic, Context, DoneReason, Message, Model,
     ProviderEnv, StopReason, StreamEvent, StreamOptions, ThinkingLevel, ToolResultMessage,
     ToolResultRole,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -1105,7 +1105,7 @@ impl EnvGuard {
             .iter()
             .map(|name| {
                 let value = std::env::var(name).ok();
-                std::env::remove_var(name);
+                rpi_test_env::remove_var(name);
                 (*name, value)
             })
             .collect();
@@ -1117,8 +1117,8 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         for (name, value) in &self.saved {
             match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
+                Some(value) => rpi_test_env::set_var(name, value),
+                None => rpi_test_env::remove_var(name),
             }
         }
     }
@@ -1203,13 +1203,13 @@ fn test_resolve_config_explicit_and_scoped_profiles() {
 
     // Ambient process AWS_PROFILE: endpoint NOT pinned and region deferred
     // (upstream: SDK default chain; rpi falls back to us-east-1 downstream).
-    std::env::set_var("AWS_PROFILE", "ambient-bedrock-profile");
+    rpi_test_env::set_var("AWS_PROFILE", "ambient-bedrock-profile");
     let config = resolve_bedrock_config(&model, &BedrockOptions::default());
     assert_eq!(config.profile.as_deref(), Some("ambient-bedrock-profile"));
     assert_eq!(config.endpoint, None);
     assert_eq!(config.region, None);
     assert_eq!(config.effective_region(), "us-east-1");
-    std::env::remove_var("AWS_PROFILE");
+    rpi_test_env::remove_var("AWS_PROFILE");
 }
 
 #[test]
@@ -1332,10 +1332,12 @@ async fn test_custom_headers_applied_reserved_not_overridden() {
     assert_eq!(request.header("x-custom"), Some("v"));
     // Reserved caller values must not have replaced the signed headers.
     assert_ne!(request.header("authorization"), Some("evil"));
-    assert!(request
-        .header("authorization")
-        .expect("authorization")
-        .starts_with("AWS4-HMAC-SHA256 "),);
+    assert!(
+        request
+            .header("authorization")
+            .expect("authorization")
+            .starts_with("AWS4-HMAC-SHA256 "),
+    );
     assert_ne!(request.header("x-amz-date"), Some("evil"));
     assert_ne!(request.header("host"), Some("evil"));
     // The custom header participated in the signature (build step).
@@ -1847,9 +1849,11 @@ async fn test_tool_config_strict_gating() {
         tools: Some(prefer_tools),
     });
     let (payload, _) = capture_payload(&nova_model, &prefer_ctx, no_cache_options()).await;
-    assert!(payload["toolConfig"]["tools"][0]["toolSpec"]
-        .get("strict")
-        .is_none());
+    assert!(
+        payload["toolConfig"]["tools"][0]["toolSpec"]
+            .get("strict")
+            .is_none()
+    );
 
     // toolChoice mapping.
     let mut options = no_cache_options();
@@ -1986,9 +1990,11 @@ async fn test_thinking_payload_adaptive_and_budget() {
         payload["additionalModelRequestFields"]["output_config"],
         json!({"effort": "high"})
     );
-    assert!(payload["additionalModelRequestFields"]
-        .get("anthropic_beta")
-        .is_none());
+    assert!(
+        payload["additionalModelRequestFields"]
+            .get("anthropic_beta")
+            .is_none()
+    );
 
     // Adaptive + xhigh on Fable 5.
     let fable = make_model(
@@ -2024,9 +2030,11 @@ async fn test_thinking_payload_adaptive_and_budget() {
     options.reasoning = Some(ThinkingLevel::High);
     options.interleaved_thinking = Some(false);
     let (payload, _) = capture_payload(&sonnet45, &ctx, options).await;
-    assert!(payload["additionalModelRequestFields"]
-        .get("anthropic_beta")
-        .is_none());
+    assert!(
+        payload["additionalModelRequestFields"]
+            .get("anthropic_beta")
+            .is_none()
+    );
 
     // Non-Claude model: no additionalModelRequestFields at all.
     let nova = make_model(

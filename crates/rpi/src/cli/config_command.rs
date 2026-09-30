@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rpi_tui::terminal::ProcessTerminal;
-use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
+use rpi_tui::tui::{Component, Focusable, TuiStopOptions, shared_component_from_boxed};
 use rpi_tui::tui_main_screen::TuiMainScreen;
 
 use crate::config::{APP_NAME, CONFIG_DIR_NAME};
@@ -29,8 +29,8 @@ use crate::core::package_manager::{DefaultPackageManager, PackageCommandRunner, 
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::themes::load_theme;
 use crate::core::trust_manager::{
-    default_project_trust_from_settings, resolve_project_trusted, ProjectTrustContext,
-    ProjectTrustStore,
+    ProjectTrustContext, ProjectTrustStore, default_project_trust_from_settings,
+    resolve_project_trusted,
 };
 use crate::error::RpiError;
 use crate::modes::interactive::components::config_selector::{

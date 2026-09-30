@@ -206,9 +206,11 @@ mod tests {
             .iter()
             .find(|l| l.contains("Installing extension"))
             .unwrap();
-        assert!(rpi_tui::components::loader::DEFAULT_FRAMES
-            .iter()
-            .any(|frame| message_line.contains(frame)));
+        assert!(
+            rpi_tui::components::loader::DEFAULT_FRAMES
+                .iter()
+                .any(|frame| message_line.contains(frame))
+        );
         component.dispose();
     }
 

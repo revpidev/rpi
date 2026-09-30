@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::mpsc;
 
@@ -734,14 +734,13 @@ async fn rebind_session(
     // `bindCommandContext` (runner.ts:410-418): runtime-backed command
     // actions on the session's host (Weak — the runtime owns this closure's
     // inverse path).
-    if let Some(runtime) = runtime.upgrade() {
-        if let Some(host) =
+    if let Some(runtime) = runtime.upgrade()
+        && let Some(host) =
             crate::core::extension_host_adapter::host_of_runner(&session.extension_runner())
-        {
-            host.runtime().set_command_actions(Some(Arc::new(
-                crate::core::extension_context::RuntimeCommandActions::new(&runtime),
-            )));
-        }
+    {
+        host.runtime().set_command_actions(Some(Arc::new(
+            crate::core::extension_context::RuntimeCommandActions::new(&runtime),
+        )));
     }
 
     let event_output = state.output.clone();
@@ -771,12 +770,11 @@ async fn rebind_session(
             }
         }
         // `checkShutdownRequested` on agent_settled (rpc-mode.ts:357-359).
-        if is_settled {
-            if let Some(state) = state_weak.upgrade() {
-                if state.shutdown_requested.load(Ordering::SeqCst) {
-                    let _ = state.shutdown.send(0);
-                }
-            }
+        if is_settled
+            && let Some(state) = state_weak.upgrade()
+            && state.shutdown_requested.load(Ordering::SeqCst)
+        {
+            let _ = state.shutdown.send(0);
         }
     }));
 
@@ -851,14 +849,14 @@ async fn dispatch(
                         },
                     )
                     .await;
-                if let Err(error) = result {
-                    if !accepted.load(Ordering::SeqCst) {
-                        prompt_output.write(&serialize_json_line(&error_response(
-                            &id,
-                            "prompt",
-                            &error_message(&error),
-                        )));
-                    }
+                if let Err(error) = result
+                    && !accepted.load(Ordering::SeqCst)
+                {
+                    prompt_output.write(&serialize_json_line(&error_response(
+                        &id,
+                        "prompt",
+                        &error_message(&error),
+                    )));
                 }
             });
             Ok(None)
@@ -1256,7 +1254,7 @@ async fn read_record<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result
 fn register_signal_handlers() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         for (kind, code) in [(SignalKind::terminate(), 143), (SignalKind::hangup(), 129)] {
             if let Ok(mut stream) = signal(kind) {
                 std::thread::spawn(move || {

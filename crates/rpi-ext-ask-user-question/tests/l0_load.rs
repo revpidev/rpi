@@ -110,12 +110,10 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
     std::fs::create_dir_all(sandbox.join("home")).unwrap();
     std::fs::create_dir_all(sandbox.join("agent")).unwrap();
     // Safety: single test in this binary (see file header).
-    unsafe {
-        std::env::set_var("HOME", sandbox.join("home"));
-        std::env::set_var("USERPROFILE", sandbox.join("home"));
-        std::env::remove_var("XDG_CONFIG_HOME");
-        std::env::set_var("RPI_CODING_AGENT_DIR", sandbox.join("agent"));
-    }
+    rpi_test_env::set_var("HOME", sandbox.join("home"));
+    rpi_test_env::set_var("USERPROFILE", sandbox.join("home"));
+    rpi_test_env::remove_var("XDG_CONFIG_HOME");
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", sandbox.join("agent"));
 
     // 1. Without `tools` the registerTool host call is denied -> load error.
     let denied = package("denied", Some(r#"["session","events","ui"]"#), &plugin);
@@ -159,13 +157,11 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
         4
     );
     assert_eq!(
-        definition.parameters["properties"]["questions"]["items"]["properties"]["options"]
-            ["minItems"],
+        definition.parameters["properties"]["questions"]["items"]["properties"]["options"]["minItems"],
         2
     );
     assert_eq!(
-        definition.parameters["properties"]["questions"]["items"]["properties"]["options"]
-            ["maxItems"],
+        definition.parameters["properties"]["questions"]["items"]["properties"]["options"]["maxItems"],
         4
     );
 

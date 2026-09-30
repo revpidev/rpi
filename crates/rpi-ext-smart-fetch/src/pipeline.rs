@@ -442,8 +442,7 @@ pub fn build_thrown_fetch_error(
                 },
                 code: if effective_phase == FetchErrorPhase::Processing {
                     Some(FetchErrorCode::ProcessingError)
-                } else if effective_phase == FetchErrorPhase::Loading
-                    && context.mime_type.is_some()
+                } else if effective_phase == FetchErrorPhase::Loading && context.mime_type.is_some()
                 {
                     Some(FetchErrorCode::DownloadError)
                 } else {
@@ -1244,10 +1243,9 @@ impl FetchPipeline {
         if std::cmp::min(word_count, extracted_text_word_count)
             < MIN_EXTRACTED_WORDS_BEFORE_ALTERNATE_FALLBACK
             && !alternate_links.is_empty()
+            && let Some(alternate_result) = try_alternate().await
         {
-            if let Some(alternate_result) = try_alternate().await {
-                return alternate_result;
-            }
+            return alternate_result;
         }
 
         // includeReplies=false comment stripping (extract.ts:1657-1673) —

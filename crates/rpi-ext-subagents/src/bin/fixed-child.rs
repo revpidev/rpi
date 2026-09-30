@@ -94,25 +94,21 @@ fn main() {
         // Snapshot the system-prompt temp file before the parent cleans it up.
         let mut iter = args.iter().skip(1);
         while let Some(arg) = iter.next() {
-            if arg == "--system-prompt" || arg == "--append-system-prompt" {
-                if let Some(path) = iter.next() {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        let _ = std::fs::write(
-                            std::path::Path::new(&dump_dir).join("prompt.md"),
-                            &content,
-                        );
-                        if let Some(indexed) = &indexed_dir {
-                            let _ = std::fs::write(indexed.join("prompt.md"), &content);
-                        }
-                        #[cfg(unix)]
-                        if let Ok(meta) = std::fs::metadata(path) {
-                            use std::os::unix::fs::PermissionsExt;
-                            let _ = std::fs::write(
-                                std::path::Path::new(&dump_dir).join("prompt.mode"),
-                                format!("{:o}", meta.permissions().mode() & 0o777),
-                            );
-                        }
-                    }
+            if (arg == "--system-prompt" || arg == "--append-system-prompt")
+                && let Some(path) = iter.next()
+                && let Ok(content) = std::fs::read_to_string(path)
+            {
+                let _ = std::fs::write(std::path::Path::new(&dump_dir).join("prompt.md"), &content);
+                if let Some(indexed) = &indexed_dir {
+                    let _ = std::fs::write(indexed.join("prompt.md"), &content);
+                }
+                #[cfg(unix)]
+                if let Ok(meta) = std::fs::metadata(path) {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::write(
+                        std::path::Path::new(&dump_dir).join("prompt.mode"),
+                        format!("{:o}", meta.permissions().mode() & 0o777),
+                    );
                 }
             }
         }

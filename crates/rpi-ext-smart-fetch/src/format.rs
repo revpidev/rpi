@@ -195,12 +195,12 @@ pub fn suggest_retry_timeout_ms(error: &FetchError) -> Option<u64> {
         // — 0 values fall through to the phase branches below.
         if let (Some(content_length), Some(downloaded_bytes)) =
             (error.content_length, error.downloaded_bytes)
+            && downloaded_bytes > 0
+            && content_length > 0
         {
-            if downloaded_bytes > 0 && content_length > 0 {
-                let projected_ms =
-                    (timeout_ms as f64 * content_length as f64) / downloaded_bytes as f64;
-                return Some(round_suggested_timeout_ms(projected_ms * 1.5));
-            }
+            let projected_ms =
+                (timeout_ms as f64 * content_length as f64) / downloaded_bytes as f64;
+            return Some(round_suggested_timeout_ms(projected_ms * 1.5));
         }
     }
     if phase == FetchErrorPhase::Processing {
@@ -221,16 +221,15 @@ pub fn build_user_facing_fetch_error_summary(error: &FetchError) -> String {
         .code
         .map(|c| c == crate::types::FetchErrorCode::HttpError)
         == Some(true)
+        && let Some(status_code) = error.status_code
     {
-        if let Some(status_code) = error.status_code {
-            let status_text = error
-                .status_text
-                .as_deref()
-                .filter(|t| !t.is_empty())
-                .map(|t| format!(" {t}"))
-                .unwrap_or_default();
-            return format!("Server responded with {status_code}{status_text}");
-        }
+        let status_text = error
+            .status_text
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(|t| format!(" {t}"))
+            .unwrap_or_default();
+        return format!("Server responded with {status_code}{status_text}");
     }
 
     let code = error.code;
@@ -678,11 +677,7 @@ fn js_number_to_string(number: &serde_json::Number) -> String {
             e.abs()
         )
     };
-    if negative {
-        format!("-{body}")
-    } else {
-        body
-    }
+    if negative { format!("-{body}") } else { body }
 }
 
 /// `renderJsonContent` (format.ts:389-402).

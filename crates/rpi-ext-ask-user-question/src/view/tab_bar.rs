@@ -90,14 +90,16 @@ mod tests {
     fn tab_bar_hidden_for_a_single_question() {
         let i18n = I18n::for_locale("en");
         let theme = Theme::dark();
-        assert!(render(
-            &QuestionnaireState::initial(),
-            &questions(1),
-            &i18n,
-            &theme,
-            80
-        )
-        .is_empty());
+        assert!(
+            render(
+                &QuestionnaireState::initial(),
+                &questions(1),
+                &i18n,
+                &theme,
+                80
+            )
+            .is_empty()
+        );
     }
 
     #[test]

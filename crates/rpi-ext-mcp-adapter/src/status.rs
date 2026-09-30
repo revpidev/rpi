@@ -8,7 +8,7 @@
 //! existing connection and metadata state (design requirement).
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::manager::{ConnectionStatus, McpServerManager};
 use crate::metadata::{McpConfig, ServerEntry};

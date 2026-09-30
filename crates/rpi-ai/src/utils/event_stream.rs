@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
+use futures::Stream;
 use futures::future::{BoxFuture, Shared};
 use futures::prelude::*;
-use futures::Stream;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::types::{AssistantMessage, StreamEvent};

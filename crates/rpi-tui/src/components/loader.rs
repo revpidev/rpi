@@ -14,9 +14,9 @@
 //!   `currentFrame` + `setText` in the interval callback and stores the text
 //!   on the component). The rendered bytes are identical.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -187,15 +187,17 @@ impl Loader {
         let current_frame = Arc::clone(&self.current_frame);
         let render_handle = self.render_handle.clone();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        self.thread_handle = Some(thread::spawn(move || loop {
-            match stop_rx.recv_timeout(interval) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {
-                    current_frame.store(
-                        (current_frame.load(Ordering::SeqCst) + 1) % frames_len,
-                        Ordering::SeqCst,
-                    );
-                    render_handle.request_render();
+        self.thread_handle = Some(thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        current_frame.store(
+                            (current_frame.load(Ordering::SeqCst) + 1) % frames_len,
+                            Ordering::SeqCst,
+                        );
+                        render_handle.request_render();
+                    }
                 }
             }
         }));

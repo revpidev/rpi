@@ -11,7 +11,7 @@ use crate::auth::{
     AuthPrompt, AuthResult, ModelAuth, ModelsError, ModelsErrorCode, ProviderAuth, SelectOption,
 };
 use crate::generated::get_builtin_models;
-use crate::models::{create_provider, CreateProviderOptions, Provider, ProviderApi};
+use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `VERTEX_ADC_PATH`.
 const VERTEX_ADC_PATH: &str = "~/.config/gcloud/application_default_credentials.json";

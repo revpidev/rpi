@@ -137,8 +137,8 @@ mod tests {
     //! they expire"): stacked reversed-video lines, width truncation, and
     //! per-entry expiry driven deterministically via `tick`.
 
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use super::*;

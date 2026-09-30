@@ -381,10 +381,10 @@ impl MarkdownContentCache {
     pub fn new(question: &QuestionData, theme: Theme, i18n: I18n) -> Self {
         let mut preview_texts = HashMap::new();
         for (index, option) in question.options.iter().enumerate() {
-            if let Some(raw) = option.preview.as_deref() {
-                if !raw.is_empty() {
-                    preview_texts.insert(index, raw.to_owned());
-                }
+            if let Some(raw) = option.preview.as_deref()
+                && !raw.is_empty()
+            {
+                preview_texts.insert(index, raw.to_owned());
             }
         }
         Self {
@@ -818,9 +818,11 @@ mod tests {
         assert_eq!(gated.last().map(String::as_str), Some(""));
 
         let placeholder = block.render_block(60, 1, PreviewLayoutMode::Stacked, true, false);
-        assert!(placeholder
-            .iter()
-            .any(|line| strip_ansi(line).contains("No preview available")));
+        assert!(
+            placeholder
+                .iter()
+                .any(|line| strip_ansi(line).contains("No preview available"))
+        );
     }
 
     #[test]

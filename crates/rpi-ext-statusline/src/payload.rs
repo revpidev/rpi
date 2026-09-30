@@ -10,7 +10,7 @@
 //! rows) — a CC script parsing `transcript_path` itself reads zeros
 //! (TE-D34).
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::state::{LiveSnapshot, Snapshot, Totals};
 
@@ -47,13 +47,13 @@ pub fn build_stdin_json(snapshot: &Snapshot) -> Value {
         root.insert("transcript_path".into(), json!(path));
     }
     // model: {id, display_name} from ctx.model ({id, name, ...}).
-    if let Some(model) = &snapshot.model {
-        if let (Some(id), Some(name)) = (
+    if let Some(model) = &snapshot.model
+        && let (Some(id), Some(name)) = (
             model.get("id").and_then(Value::as_str),
             model.get("name").and_then(Value::as_str),
-        ) {
-            root.insert("model".into(), json!({"id": id, "display_name": name}));
-        }
+        )
+    {
+        root.insert("model".into(), json!({"id": id, "display_name": name}));
     }
     root.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
     root.insert(
@@ -257,10 +257,12 @@ mod tests {
             "018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e"
         );
         assert_eq!(payload["session_name"], "statusline-work");
-        assert!(payload["transcript_path"]
-            .as_str()
-            .unwrap()
-            .ends_with(".jsonl"));
+        assert!(
+            payload["transcript_path"]
+                .as_str()
+                .unwrap()
+                .ends_with(".jsonl")
+        );
         assert_eq!(payload["model"]["id"], "glm-5.1");
         assert_eq!(payload["model"]["display_name"], "GLM-5.1");
         assert_eq!(
@@ -306,9 +308,11 @@ mod tests {
         }
         assert_eq!(payload["cost"]["total_cost_usd"], 0.0);
         assert_eq!(payload["context_window"]["context_window_size"], 0);
-        assert!(payload["context_window"]
-            .get("total_input_tokens")
-            .is_none());
+        assert!(
+            payload["context_window"]
+                .get("total_input_tokens")
+                .is_none()
+        );
         assert!(payload["context_window"].get("used_percentage").is_none());
         assert!(payload["context_window"].get("current_usage").is_none());
         assert_eq!(payload["exceeds_200k_tokens"], false);
@@ -344,9 +348,11 @@ mod tests {
         snapshot.context_usage = None;
         let payload = build_stdin_json(&snapshot);
         assert_eq!(payload["context_window"]["context_window_size"], 200_000);
-        assert!(payload["context_window"]
-            .get("total_input_tokens")
-            .is_none());
+        assert!(
+            payload["context_window"]
+                .get("total_input_tokens")
+                .is_none()
+        );
     }
 
     #[test]
@@ -410,9 +416,11 @@ mod tests {
         );
         // Never streamed / liveTokens unconfigured → block omitted.
         snapshot.live_output = None;
-        assert!(build_stdin_json(&snapshot)["rpi"]
-            .get("live_output")
-            .is_none());
+        assert!(
+            build_stdin_json(&snapshot)["rpi"]
+                .get("live_output")
+                .is_none()
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! the T02 self-check "normalizer unit tests" applied to the real
 //! fixtures).
 
-use rpi_test_support::{diff_jsonl, Normalizer};
+use rpi_test_support::{Normalizer, diff_jsonl};
 
 const SCENARIOS: &[&str] = &[
     "single-turn",

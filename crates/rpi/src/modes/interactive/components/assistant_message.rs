@@ -21,8 +21,8 @@ use rpi_tui::components::mouse_region::MouseRegion;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
 use rpi_tui::tui::{
-    shared_component_from_boxed, Component, Container, TuiMouseButton, TuiMouseEvent,
-    TuiMouseEventResult, TuiMouseEventType, TuiMouseHandlerResult,
+    Component, Container, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
+    TuiMouseHandlerResult, shared_component_from_boxed,
 };
 
 use crate::core::themes::Theme;

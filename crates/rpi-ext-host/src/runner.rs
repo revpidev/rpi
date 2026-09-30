@@ -31,17 +31,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::api::{
     EventHandler, ExtensionContext, ExtensionRuntime, HostActions, InsertionMap, LoadedExtension,
     Unsubscribe,
 };
 use crate::types::{
-    is_session_before_event, DiagnosticKind, ExtensionError, ExtensionFlag, ExtensionShortcut,
-    HostDiagnostic, RegisteredCommand, RegisteredTool, ResolvedCommand, EVENT_BEFORE_AGENT_START,
-    EVENT_CONTEXT, EVENT_INPUT, EVENT_MESSAGE_END, EVENT_TOOL_CALL, EVENT_TOOL_RESULT,
-    EVENT_USER_BASH,
+    DiagnosticKind, EVENT_BEFORE_AGENT_START, EVENT_CONTEXT, EVENT_INPUT, EVENT_MESSAGE_END,
+    EVENT_TOOL_CALL, EVENT_TOOL_RESULT, EVENT_USER_BASH, ExtensionError, ExtensionFlag,
+    ExtensionShortcut, HostDiagnostic, RegisteredCommand, RegisteredTool, ResolvedCommand,
+    is_session_before_event,
 };
 
 fn read<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -163,26 +163,26 @@ fn merge_system_prompt_options(current: &mut Value, update: &Value) {
     };
     const MAP_FIELDS: [&str; 3] = ["sections", "toolSnippets", "toolGuidelines"];
     for (key, value) in update_map {
-        if MAP_FIELDS.contains(&key.as_str()) {
-            if let Some(update_entries) = value.as_object() {
-                let current_entries = current_map
-                    .entry(key.clone())
-                    .or_insert_with(|| Value::Object(Map::new()));
-                if let Some(current_entries) = current_entries.as_object_mut() {
-                    for (entry_key, entry_value) in update_entries {
-                        if entry_value.is_null() {
-                            current_entries.remove(entry_key);
-                        } else {
-                            current_entries.insert(entry_key.clone(), entry_value.clone());
-                        }
+        if MAP_FIELDS.contains(&key.as_str())
+            && let Some(update_entries) = value.as_object()
+        {
+            let current_entries = current_map
+                .entry(key.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(current_entries) = current_entries.as_object_mut() {
+                for (entry_key, entry_value) in update_entries {
+                    if entry_value.is_null() {
+                        current_entries.remove(entry_key);
+                    } else {
+                        current_entries.insert(entry_key.clone(), entry_value.clone());
                     }
-                    // A map field left empty reads as absent upstream
-                    // (the builders treat `{}` like `undefined`).
-                    if current_entries.is_empty() {
-                        current_map.remove(key);
-                    }
-                    continue;
                 }
+                // A map field left empty reads as absent upstream
+                // (the builders treat `{}` like `undefined`).
+                if current_entries.is_empty() {
+                    current_map.remove(key);
+                }
+                continue;
             }
         }
         if value.is_null() {
@@ -647,10 +647,9 @@ impl ExtensionRunnerCore {
                     if let Ok(Some(result)) = serde_json::from_value::<
                         Option<CacheWarmingDecisionEventResult>,
                     >(handler_result)
+                        && let Some(override_action) = result.action
                     {
-                        if let Some(override_action) = result.action {
-                            action = override_action;
-                        }
+                        action = override_action;
                     }
                 }
                 Err(error) => self.emit_error(ExtensionError::new(
@@ -723,13 +722,13 @@ impl ExtensionRunnerCore {
                     }
                     // camelCase patch keys (types.ts:1079-1084).
                     for key in ["content", "details", "isError", "usage"] {
-                        if let Some(value) = handler_result.get(key) {
-                            if !value.is_null() {
-                                if let Value::Object(map) = &mut current_event {
-                                    map.insert(key.to_owned(), value.clone());
-                                }
-                                modified = true;
+                        if let Some(value) = handler_result.get(key)
+                            && !value.is_null()
+                        {
+                            if let Value::Object(map) = &mut current_event {
+                                map.insert(key.to_owned(), value.clone());
                             }
+                            modified = true;
                         }
                     }
                 }
@@ -781,11 +780,11 @@ impl ExtensionRunnerCore {
                 .await
                 .map_err(|error| ExtensionError::new(&path, EVENT_TOOL_CALL, error))?;
             if !handler_result.is_null() {
-                if let Some(input) = handler_result.get("input") {
-                    if !input.is_null() {
-                        current_input = input.clone();
-                        input_modified = true;
-                    }
+                if let Some(input) = handler_result.get("input")
+                    && !input.is_null()
+                {
+                    current_input = input.clone();
+                    input_modified = true;
                 }
                 let block = handler_result
                     .get("block")
@@ -856,10 +855,10 @@ impl ExtensionRunnerCore {
             });
             match handler(event, ctx).await {
                 Ok(handler_result) => {
-                    if let Some(messages) = handler_result.get("messages") {
-                        if !messages.is_null() {
-                            current_messages = messages.clone();
-                        }
+                    if let Some(messages) = handler_result.get("messages")
+                        && !messages.is_null()
+                    {
+                        current_messages = messages.clone();
                     }
                 }
                 Err(error) => {
@@ -993,10 +992,10 @@ impl ExtensionRunnerCore {
                     if handler_result.is_null() {
                         continue;
                     }
-                    if let Some(message) = handler_result.get("message") {
-                        if !message.is_null() {
-                            messages.push(message.clone());
-                        }
+                    if let Some(message) = handler_result.get("message")
+                        && !message.is_null()
+                    {
+                        messages.push(message.clone());
                     }
                     // rpi bridge: the handler's returned options MERGE onto
                     // the current ones (key-level, like upstream in-place
@@ -1004,13 +1003,13 @@ impl ExtensionRunnerCore {
                     // fields; `null` clears a key). Map-valued fields
                     // (`sections`/`toolSnippets`/`toolGuidelines`) merge
                     // per-key so chained handlers accumulate custom sections.
-                    if let Some(options) = handler_result.get("systemPromptOptions") {
-                        if options.is_object() {
-                            merge_system_prompt_options(&mut current_options, options);
-                            current_render =
-                                crate::system_prompt_bridge::build_system_prompt(&current_options);
-                            modified = true;
-                        }
+                    if let Some(options) = handler_result.get("systemPromptOptions")
+                        && options.is_object()
+                    {
+                        merge_system_prompt_options(&mut current_options, options);
+                        current_render =
+                            crate::system_prompt_bridge::build_system_prompt(&current_options);
+                        modified = true;
                     }
                     if let Some(system_prompt) = handler_result.get("systemPrompt") {
                         // rpi ruling (V15-06 ruling 12): a JSON `null` counts
@@ -1124,10 +1123,10 @@ impl ExtensionRunnerCore {
                                 current_text = text.clone();
                             }
                             // `result.images ?? currentImages` (runner.ts:1207).
-                            if let Some(images) = handler_result.get("images") {
-                                if !images.is_null() {
-                                    current_images = Some(images.clone());
-                                }
+                            if let Some(images) = handler_result.get("images")
+                                && !images.is_null()
+                            {
+                                current_images = Some(images.clone());
                             }
                         }
                         _ => {}
@@ -1193,10 +1192,11 @@ fn build_builtin_keybindings(
             let normalized = key.to_lowercase();
             // runner.ts:102-106: a reserved binding already recorded beats a
             // non-reserved one for the same key.
-            if let Some(existing) = builtins.get(&normalized) {
-                if existing.restrict_override && !restrict_override {
-                    continue;
-                }
+            if let Some(existing) = builtins.get(&normalized)
+                && existing.restrict_override
+                && !restrict_override
+            {
+                continue;
             }
             builtins.insert(
                 normalized,

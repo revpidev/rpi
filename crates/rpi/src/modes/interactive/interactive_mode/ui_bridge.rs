@@ -38,7 +38,7 @@ use rpi_tui::tui::{Component, Focusable};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use super::{lock, InteractiveUi};
+use super::{InteractiveUi, lock};
 use crate::modes::interactive::component_tree::component_from_tree;
 use crate::modes::interactive::components::extension_editor::ExtensionEditorComponent;
 use crate::modes::interactive::components::extension_input::ExtensionInputComponent;
@@ -155,11 +155,11 @@ impl InteractiveUiBridge {
         // editor region; an unconditional hide would close the replacement.
         // The component focus restore shares that guard: a superseded dialog
         // must not remount/refocus the component over the replacement.
-        if let Some(ui) = self.ui() {
-            if ui.selector_is_current(&entry) {
-                ui.hide_selector_if_current(&entry);
-                ui.component_registry.dialog_closed();
-            }
+        if let Some(ui) = self.ui()
+            && ui.selector_is_current(&entry)
+        {
+            ui.hide_selector_if_current(&entry);
+            ui.component_registry.dialog_closed();
         }
         result
     }

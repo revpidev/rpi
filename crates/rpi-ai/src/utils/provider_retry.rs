@@ -134,10 +134,10 @@ fn retry_delay_ms(
     retry_index: u32,
     max_retry_delay_ms: Option<u64>,
 ) -> Result<u64, String> {
-    if let Some(retry_after_ms) = error.header("retry-after-ms") {
-        if let Ok(value) = retry_after_ms.parse::<f64>() {
-            return validate_server_retry_delay_ms(value, max_retry_delay_ms, &error.message);
-        }
+    if let Some(retry_after_ms) = error.header("retry-after-ms")
+        && let Ok(value) = retry_after_ms.parse::<f64>()
+    {
+        return validate_server_retry_delay_ms(value, max_retry_delay_ms, &error.message);
     }
 
     if let Some(retry_after) = error.header("retry-after") {

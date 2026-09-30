@@ -53,10 +53,10 @@ pub fn ensure_safe_component(value: &str, what: &str) -> Result<(), String> {
 /// `getAgentDir` equivalent (utils.ts:97-102, `PI_CODING_AGENT_DIR ?? ~/.pi/agent`
 /// → `RPI_CODING_AGENT_DIR ?? ~/.rpi/agent`).
 pub fn get_agent_dir() -> PathBuf {
-    if let Some(env_dir) = std::env::var_os(ENV_AGENT_DIR) {
-        if !env_dir.is_empty() {
-            return normalize_path(&env_dir.to_string_lossy());
-        }
+    if let Some(env_dir) = std::env::var_os(ENV_AGENT_DIR)
+        && !env_dir.is_empty()
+    {
+        return normalize_path(&env_dir.to_string_lossy());
     }
     match home_dir() {
         Some(home) => home.join(CONFIG_DIR_NAME).join("agent"),
@@ -74,10 +74,10 @@ pub fn get_project_config_dir(project_root: &Path) -> PathBuf {
 /// mcp-adapter, no passwd fallback).
 pub fn home_dir() -> Option<PathBuf> {
     for key in ["HOME", "USERPROFILE"] {
-        if let Some(value) = std::env::var_os(key) {
-            if !value.is_empty() {
-                return Some(PathBuf::from(value));
-            }
+        if let Some(value) = std::env::var_os(key)
+            && !value.is_empty()
+        {
+            return Some(PathBuf::from(value));
         }
     }
     None
@@ -232,10 +232,10 @@ pub fn encode_cwd_dir_name(resolved_cwd: &str) -> String {
 /// session lookup are derived from this deterministic layout instead of
 /// `ctx.sessionManager` upstream uses. See TE04 deviation TE-D16.
 pub fn resolve_parent_session_dir(cwd: &Path, settings_session_dir: Option<&str>) -> PathBuf {
-    if let Some(env_dir) = std::env::var_os(ENV_SESSION_DIR) {
-        if !env_dir.is_empty() {
-            return normalize_path(&env_dir.to_string_lossy());
-        }
+    if let Some(env_dir) = std::env::var_os(ENV_SESSION_DIR)
+        && !env_dir.is_empty()
+    {
+        return normalize_path(&env_dir.to_string_lossy());
     }
     if let Some(configured) = settings_session_dir.filter(|s| !s.is_empty()) {
         return expand_tilde_and_resolve(configured);

@@ -17,19 +17,19 @@ use serde_json::Value;
 
 use rpi::core::agent_session::AgentSessionEvent;
 use rpi::core::agent_session_runtime::{
-    create_agent_session_runtime, AgentSessionRuntime, CreateAgentSessionRuntimeFactory,
-    CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    AgentSessionRuntime, CreateAgentSessionRuntimeFactory, CreateAgentSessionRuntimeResult,
+    CreateRuntimeOptions, create_agent_session_runtime,
 };
 use rpi::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
 use rpi::modes::json_event::to_json_event;
 use rpi_agent::types::AgentEvent;
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAiProvider, FauxAssistantOptions, FauxModelDefinition,
-    FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);

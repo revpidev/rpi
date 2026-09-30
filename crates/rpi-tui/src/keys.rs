@@ -822,14 +822,14 @@ fn matches_kitty_sequence(data: &str, expected_codepoint: i32, expected_modifier
     // to different physical positions, so Ctrl+K could falsely match Ctrl+V
     // (letter remapping) and Ctrl+/ could falsely match Ctrl+[ (symbol remapping)
     // if the base layout key were always considered.
-    if let Some(base_layout_key) = parsed.base_layout_key {
-        if base_layout_key == expected_codepoint {
-            let cp = normalized_codepoint;
-            let is_latin_letter = (97..=122).contains(&cp); // a-z
-            let is_known_symbol = char::from_u32(cp as u32).is_some_and(is_symbol_key);
-            if !is_latin_letter && !is_known_symbol {
-                return true;
-            }
+    if let Some(base_layout_key) = parsed.base_layout_key
+        && base_layout_key == expected_codepoint
+    {
+        let cp = normalized_codepoint;
+        let is_latin_letter = (97..=122).contains(&cp); // a-z
+        let is_known_symbol = char::from_u32(cp as u32).is_some_and(is_symbol_key);
+        if !is_latin_letter && !is_known_symbol {
+            return true;
         }
     }
 
@@ -1320,13 +1320,12 @@ pub fn matches_key(data: &str, key_id: &str) -> bool {
                         // Legacy: ctrl+alt+key is ESC followed by the control character.
                         // If that legacy form does not match, continue so CSI-u and
                         // modifyOtherKeys sequences from tmux can still be recognized.
-                        if let Some(ctrl_char) = raw_ctrl {
-                            if data.len() == 2
-                                && data.as_bytes()[0] == b'\x1b'
-                                && data.as_bytes()[1] == ctrl_char as u8
-                            {
-                                return true;
-                            }
+                        if let Some(ctrl_char) = raw_ctrl
+                            && data.len() == 2
+                            && data.as_bytes()[0] == b'\x1b'
+                            && data.as_bytes()[1] == ctrl_char as u8
+                        {
+                            return true;
                         }
                     }
 
@@ -1345,10 +1344,11 @@ pub fn matches_key(data: &str, key_id: &str) -> bool {
 
                     if modifier == MOD_CTRL {
                         // Legacy: ctrl+key sends the control character
-                        if let Some(ctrl_char) = raw_ctrl {
-                            if data.len() == 1 && data.as_bytes()[0] == ctrl_char as u8 {
-                                return true;
-                            }
+                        if let Some(ctrl_char) = raw_ctrl
+                            && data.len() == 1
+                            && data.as_bytes()[0] == ctrl_char as u8
+                        {
+                            return true;
                         }
                         return matches_kitty_sequence(data, codepoint, MOD_CTRL)
                             || matches_printable_modify_other_keys(data, codepoint, MOD_CTRL);
@@ -1630,10 +1630,10 @@ pub fn decode_kitty_printable(data: &str) -> Option<char> {
 
     // Prefer the shifted keycode when Shift is held.
     let mut effective_codepoint = codepoint;
-    if modifier & MOD_SHIFT != 0 {
-        if let Some(shifted_key) = shifted_key {
-            effective_codepoint = shifted_key;
-        }
+    if modifier & MOD_SHIFT != 0
+        && let Some(shifted_key) = shifted_key
+    {
+        effective_codepoint = shifted_key;
     }
     effective_codepoint = normalize_kitty_functional_codepoint(effective_codepoint);
     // Drop control characters or invalid codepoints.
@@ -1705,8 +1705,8 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.previous {
-                Some(previous) => std::env::set_var(self.name, previous),
-                None => std::env::remove_var(self.name),
+                Some(previous) => rpi_test_env::set_var(self.name, previous),
+                None => rpi_test_env::remove_var(self.name),
             }
         }
     }
@@ -1714,8 +1714,8 @@ mod tests {
     fn with_env(name: &'static str, value: Option<&str>) -> EnvGuard {
         let previous = std::env::var(name).ok();
         match value {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
+            Some(value) => rpi_test_env::set_var(name, value),
+            None => rpi_test_env::remove_var(name),
         }
         EnvGuard { name, previous }
     }

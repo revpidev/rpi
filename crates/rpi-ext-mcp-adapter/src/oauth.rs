@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::AdapterError;
@@ -429,15 +429,14 @@ async fn discover_auth_server_metadata_with_override(
         return Ok(metadata);
     }
 
-    if !skip_validation {
-        if let Some(origin) = metadata_origin.as_deref() {
-            if !issuers_match(&metadata.issuer, origin) {
-                return Err(AdapterError::InvalidConfigValue(format!(
-                    "auth server issuer mismatch: {origin} vs {}",
-                    metadata.issuer
-                )));
-            }
-        }
+    if !skip_validation
+        && let Some(origin) = metadata_origin.as_deref()
+        && !issuers_match(&metadata.issuer, origin)
+    {
+        return Err(AdapterError::InvalidConfigValue(format!(
+            "auth server issuer mismatch: {origin} vs {}",
+            metadata.issuer
+        )));
     }
 
     Ok(metadata)
@@ -749,16 +748,16 @@ async fn authenticate_client_credentials(
     // mcp-auth-flow.ts:469-474: a token-less stored registration is dead for
     // client_credentials (no interactive grant can have produced it); clear
     // it before resolving identity unless a clientId is configured.
-    if config.client_id.is_none() {
-        if let Some(entry) = store.get_for_url(server_name, server_url)? {
-            if entry.client_info.is_some() && entry.tokens.is_none() {
-                // Upstream clears synchronously and lets store write
-                // failures propagate (mcp-auth-flow.ts:469-474): a silent
-                // failure would let the second read reuse the dead
-                // registration below.
-                store.clear_client_info(server_name)?;
-            }
-        }
+    if config.client_id.is_none()
+        && let Some(entry) = store.get_for_url(server_name, server_url)?
+        && entry.client_info.is_some()
+        && entry.tokens.is_none()
+    {
+        // Upstream clears synchronously and lets store write
+        // failures propagate (mcp-auth-flow.ts:469-474): a silent
+        // failure would let the second read reuse the dead
+        // registration below.
+        store.clear_client_info(server_name)?;
     }
     let mut stored_secret: Option<String> = None;
     let client_id = match &config.client_id {
@@ -1004,73 +1003,73 @@ pub async fn authenticate_with_store(
     let fetch = OAuthFetch::new(definition, server_url, server_name);
 
     // Check existing credentials first.
-    if let Some(entry) = store.get_for_url(server_name, server_url)? {
-        if let Some(tokens) = &entry.tokens {
-            // Check expiry
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            let expired = tokens.expires_at.is_some_and(|exp| exp < now);
-            if !expired {
-                return Ok(AuthStatus::Authenticated);
-            }
-            // Try refresh token
-            if let Some(refresh) = &tokens.refresh_token {
-                if let Some(issuer) = &tokens.issuer {
-                    let metadata_override = configured_auth_server_metadata_url(definition)
-                        .ok()
-                        .flatten();
-                    if let Ok(metadata) = discover_auth_server_metadata_with_override(
-                        server_url,
-                        options.skip_issuer_metadata_validation,
-                        metadata_override.as_deref(),
-                        &fetch,
-                    )
-                    .await
-                    {
-                        // DCR-registered clients: prefer the configured
-                        // client id, fall back to the stored registration —
-                        // config.client_id alone would silently fail the
-                        // refresh for dynamically registered clients.
-                        let refresh_client_id = config
-                            .client_id
-                            .clone()
-                            .or_else(|| entry.client_info.as_ref().map(|c| c.client_id.clone()));
-                        let refresh_client_secret = config.client_secret.clone().or_else(|| {
-                            entry
-                                .client_info
-                                .as_ref()
-                                .and_then(|c| c.client_secret.clone())
-                        });
-                        match refresh_token(
-                            &metadata.token_endpoint,
-                            &refresh_client_id,
-                            refresh,
-                            &refresh_client_secret,
-                            &fetch,
-                        )
-                        .await
-                        {
-                            Ok(new_tokens) => {
-                                store.update_tokens(server_name, new_tokens, Some(server_url))?;
-                                return Ok(AuthStatus::Authenticated);
-                            }
-                            // #503: only an `invalid_grant` rejection means the
-                            // stored dynamic client is stale — drop the
-                            // registration so the interactive leg below
-                            // re-registers with the current callback URI.
-                            // Transient failures (network/parse/other error
-                            // codes) keep the registration for a later retry.
-                            Err(AdapterError::OAuthInvalidGrant) => {
-                                let _ = store.clear_client_info(server_name);
-                            }
-                            Err(_) => {}
-                        }
+    if let Some(entry) = store.get_for_url(server_name, server_url)?
+        && let Some(tokens) = &entry.tokens
+    {
+        // Check expiry
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let expired = tokens.expires_at.is_some_and(|exp| exp < now);
+        if !expired {
+            return Ok(AuthStatus::Authenticated);
+        }
+        // Try refresh token
+        if let Some(refresh) = &tokens.refresh_token
+            && let Some(issuer) = &tokens.issuer
+        {
+            let metadata_override = configured_auth_server_metadata_url(definition)
+                .ok()
+                .flatten();
+            if let Ok(metadata) = discover_auth_server_metadata_with_override(
+                server_url,
+                options.skip_issuer_metadata_validation,
+                metadata_override.as_deref(),
+                &fetch,
+            )
+            .await
+            {
+                // DCR-registered clients: prefer the configured
+                // client id, fall back to the stored registration —
+                // config.client_id alone would silently fail the
+                // refresh for dynamically registered clients.
+                let refresh_client_id = config
+                    .client_id
+                    .clone()
+                    .or_else(|| entry.client_info.as_ref().map(|c| c.client_id.clone()));
+                let refresh_client_secret = config.client_secret.clone().or_else(|| {
+                    entry
+                        .client_info
+                        .as_ref()
+                        .and_then(|c| c.client_secret.clone())
+                });
+                match refresh_token(
+                    &metadata.token_endpoint,
+                    &refresh_client_id,
+                    refresh,
+                    &refresh_client_secret,
+                    &fetch,
+                )
+                .await
+                {
+                    Ok(new_tokens) => {
+                        store.update_tokens(server_name, new_tokens, Some(server_url))?;
+                        return Ok(AuthStatus::Authenticated);
                     }
-                    let _ = issuer;
+                    // #503: only an `invalid_grant` rejection means the
+                    // stored dynamic client is stale — drop the
+                    // registration so the interactive leg below
+                    // re-registers with the current callback URI.
+                    // Transient failures (network/parse/other error
+                    // codes) keep the registration for a later retry.
+                    Err(AdapterError::OAuthInvalidGrant) => {
+                        let _ = store.clear_client_info(server_name);
+                    }
+                    Err(_) => {}
                 }
             }
+            let _ = issuer;
         }
     }
 
@@ -1171,10 +1170,9 @@ pub async fn authenticate_with_store(
             if let Some(info) = stored_entry
                 .as_ref()
                 .and_then(|entry| entry.client_info.as_ref())
+                && !registration_reusable(info, has_tokens, refresh_capable, &redirect_uri)
             {
-                if !registration_reusable(info, has_tokens, refresh_capable, &redirect_uri) {
-                    let _ = store.clear_client_info(server_name);
-                }
+                let _ = store.clear_client_info(server_name);
             }
             if let Some(info) = &stored {
                 if refresh_capable {
@@ -1463,7 +1461,7 @@ fn parse_loopback_redirect_uri(
             None => {
                 return Err(invalid(&format!(
                     "Invalid OAuth redirectUri: {redirect_uri}"
-                )))
+                )));
             }
         };
         let authority_end = redirect_uri[authority_start..]
@@ -1485,7 +1483,7 @@ fn parse_loopback_redirect_uri(
         Err(_) => {
             return Err(invalid(&format!(
                 "Invalid OAuth redirectUri: {redirect_uri}"
-            )))
+            )));
         }
     };
     if !url.username().is_empty() || url.password().is_some() {
@@ -1972,7 +1970,7 @@ mod tests {
         // trimmed at parse; an interpolation that empties it is rejected
         // at the auth boundary (an unset env var must not silently change
         // the CIMD surface).
-        std::env::set_var("RPI_TEST_CIMD_HOST", "cimd.example.test");
+        rpi_test_env::set_var("RPI_TEST_CIMD_HOST", "cimd.example.test");
         let entry = ServerEntry(
             json!({
                 "url": "https://test/mcp",
@@ -1989,7 +1987,7 @@ mod tests {
             config.client_metadata_url.as_deref(),
             Some("https://cimd.example.test/client.json")
         );
-        std::env::remove_var("RPI_TEST_CIMD_HOST");
+        rpi_test_env::remove_var("RPI_TEST_CIMD_HOST");
 
         let unset = ServerEntry(
             json!({
@@ -2136,9 +2134,11 @@ mod tests {
             .expect("local target");
         assert_eq!(dynamic.1, None, "{{port}} must bind OS-assigned, not :1");
         // Manual mode.
-        assert!(parse("https://client.example.com/client.json")
-            .expect("manual")
-            .is_none());
+        assert!(
+            parse("https://client.example.com/client.json")
+                .expect("manual")
+                .is_none()
+        );
         // Hard errors, message for message with upstream.
         let cases = [
             (

@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use rpi_ai::auth::{
-    anthropic_oauth, resolve_provider_auth, AuthContext, Credential, CredentialStore,
-    DefaultAuthContext, InMemoryCredentialStore, OAuthCredential, ProviderAuth,
+    AuthContext, Credential, CredentialStore, DefaultAuthContext, InMemoryCredentialStore,
+    OAuthCredential, ProviderAuth, anthropic_oauth, resolve_provider_auth,
 };
 use serde_json::Map;
 

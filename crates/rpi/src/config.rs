@@ -109,10 +109,10 @@ pub fn atomic_write(path: &Path, text: &str) -> std::io::Result<()> {
 /// `getAgentDir` (config.ts:515-521): `RPI_CODING_AGENT_DIR` env override,
 /// else `~/.rpi/agent`.
 pub fn get_agent_dir() -> PathBuf {
-    if let Some(env_dir) = std::env::var_os(ENV_AGENT_DIR) {
-        if !env_dir.is_empty() {
-            return PathBuf::from(normalize_path(&env_dir.to_string_lossy()));
-        }
+    if let Some(env_dir) = std::env::var_os(ENV_AGENT_DIR)
+        && !env_dir.is_empty()
+    {
+        return PathBuf::from(normalize_path(&env_dir.to_string_lossy()));
     }
     match home_dir() {
         Some(home) => home.join(CONFIG_DIR_NAME).join("agent"),
@@ -251,10 +251,10 @@ pub const ENV_PACKAGE_DIR: &str = "RPI_PACKAGE_DIR";
 /// always a native binary, so the Node `package.json` walk has no
 /// counterpart).
 pub fn get_package_dir() -> PathBuf {
-    if let Some(env_dir) = std::env::var_os(ENV_PACKAGE_DIR) {
-        if !env_dir.is_empty() {
-            return PathBuf::from(normalize_path(&env_dir.to_string_lossy()));
-        }
+    if let Some(env_dir) = std::env::var_os(ENV_PACKAGE_DIR)
+        && !env_dir.is_empty()
+    {
+        return PathBuf::from(normalize_path(&env_dir.to_string_lossy()));
     }
     std::env::current_exe()
         .ok()
@@ -702,23 +702,23 @@ mod self_update_tests {
     fn share_viewer_url_default_override_and_empty_fallback() {
         // Single test for all env manipulation — parallel tests would race
         // on `RPI_SHARE_VIEWER_URL`.
-        std::env::remove_var(ENV_SHARE_VIEWER_URL);
+        rpi_test_env::remove_var(ENV_SHARE_VIEWER_URL);
         assert_eq!(
             get_share_viewer_url("abc123"),
             "https://revpi.dev/session/#abc123"
         );
-        std::env::set_var(ENV_SHARE_VIEWER_URL, "https://viewer.example.com/s/");
+        rpi_test_env::set_var(ENV_SHARE_VIEWER_URL, "https://viewer.example.com/s/");
         assert_eq!(
             get_share_viewer_url("abc123"),
             "https://viewer.example.com/s/#abc123"
         );
         // Empty env value is falsy upstream (`||` fallback, config.ts:506).
-        std::env::set_var(ENV_SHARE_VIEWER_URL, "");
+        rpi_test_env::set_var(ENV_SHARE_VIEWER_URL, "");
         assert_eq!(
             get_share_viewer_url("abc123"),
             "https://revpi.dev/session/#abc123"
         );
-        std::env::remove_var(ENV_SHARE_VIEWER_URL);
+        rpi_test_env::remove_var(ENV_SHARE_VIEWER_URL);
     }
 
     // ---- T18: install manifest + build target + update instruction ----
@@ -806,11 +806,11 @@ mod self_update_tests {
         // the agent dir); a redirected agent dir deletes itself instead.
         let agent_dir = get_agent_dir();
         let data_dir = get_uninstall_data_dir();
-        if let Some(home) = home_dir() {
-            if agent_dir == home.join(CONFIG_DIR_NAME).join("agent") {
-                assert_eq!(data_dir, home.join(CONFIG_DIR_NAME));
-                return;
-            }
+        if let Some(home) = home_dir()
+            && agent_dir == home.join(CONFIG_DIR_NAME).join("agent")
+        {
+            assert_eq!(data_dir, home.join(CONFIG_DIR_NAME));
+            return;
         }
         assert_eq!(data_dir, agent_dir);
     }

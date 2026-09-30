@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use rpi::core::extension_host_adapter::ExtensionHostAdapter;
 use rpi::core::extensions::ExtensionRunner;
-use rpi::tools::{create_builtin_tools, BuiltinToolOptions, ToolContext};
+use rpi::tools::{BuiltinToolOptions, ToolContext, create_builtin_tools};
 use rpi_ai::types::{ConstrainedSampling, ConstrainedSamplingConfig, ConstrainedSamplingStrict};
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};

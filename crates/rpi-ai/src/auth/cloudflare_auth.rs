@@ -225,11 +225,12 @@ mod tests {
     async fn workers_ai_requires_account_and_returns_scoped_env() {
         let auth = cloudflare_workers_ai_auth();
         let missing = ctx(&[(CLOUDFLARE_API_KEY, "cf-key")]);
-        assert!(auth
-            .resolve(&missing, None)
-            .await
-            .expect("resolve")
-            .is_none());
+        assert!(
+            auth.resolve(&missing, None)
+                .await
+                .expect("resolve")
+                .is_none()
+        );
 
         let configured = ctx(&[
             (CLOUDFLARE_API_KEY, "cf-key"),
@@ -259,11 +260,12 @@ mod tests {
             (CLOUDFLARE_API_KEY, "cf-key"),
             (CLOUDFLARE_ACCOUNT_ID, "acct"),
         ]);
-        assert!(auth
-            .resolve(&missing_gateway, None)
-            .await
-            .expect("resolve")
-            .is_none());
+        assert!(
+            auth.resolve(&missing_gateway, None)
+                .await
+                .expect("resolve")
+                .is_none()
+        );
 
         let configured = ctx(&[
             (CLOUDFLARE_API_KEY, "cf-key"),

@@ -2,8 +2,9 @@
 
 fn main() {
     // Marker env for child processes/extensions (cli.ts:13-14).
-    // SAFETY-FREE note: set before the runtime starts; no readers race.
-    std::env::set_var("RPI_CODING_AGENT", "true");
+    // SAFETY: process start; the tokio runtime and its worker threads do
+    // not exist yet, so no concurrent env readers can race this write.
+    unsafe { std::env::set_var("RPI_CODING_AGENT", "true") };
     rpi::core::environment::set_ai_agent_marker();
 
     let args: Vec<String> = std::env::args().skip(1).collect();

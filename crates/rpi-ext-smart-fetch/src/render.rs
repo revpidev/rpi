@@ -20,7 +20,7 @@
 //! [`DEFAULT_RENDER_WIDTH`]; §5.5 manual-check territory, not a parity
 //! surface).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `SPINNER_FRAMES` (index.ts:43), verbatim.
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -414,18 +414,18 @@ pub fn render_batch_result(result: &Value, options: &Value, context: &Value) -> 
                 context_render_width(context),
             ));
             // index.ts:215-219: the expanded error detail line.
-            if expanded && status == "error" {
-                if let Some(error) = item
+            if expanded
+                && status == "error"
+                && let Some(error) = item
                     .get("error")
                     .and_then(Value::as_str)
                     .filter(|error| !error.is_empty())
-                {
-                    children.push(text_node_styled(
-                        &format!("  error: {error}"),
-                        "error",
-                        false,
-                    ));
-                }
+            {
+                children.push(text_node_styled(
+                    &format!("  error: {error}"),
+                    "error",
+                    false,
+                ));
             }
         }
     }
@@ -541,10 +541,12 @@ mod tests {
             &json!({ "isPartial": true }),
             &json!({}),
         );
-        assert!(tree["props"]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("✗ https://ex.com/bad"));
+        assert!(
+            tree["props"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("✗ https://ex.com/bad")
+        );
         assert_eq!(tree["props"]["fg"], json!("error"));
     }
 
@@ -648,7 +650,9 @@ mod tests {
         let children = tree["children"].as_array().unwrap();
         assert_eq!(
             children[0]["props"]["text"],
-            json!("File size: 12345\nMime type: application/pdf\nFile path: /tmp/smart-fetch-rpi/report.pdf")
+            json!(
+                "File size: 12345\nMime type: application/pdf\nFile path: /tmp/smart-fetch-rpi/report.pdf"
+            )
         );
         assert_eq!(children[0]["props"]["fg"], json!("muted"));
     }
@@ -676,18 +680,24 @@ mod tests {
             children[0]["props"]["text"],
             json!("batch_web_fetch 2/3 done · ok 1 · err 1 · concurrency 8")
         );
-        assert!(children[1]["props"]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("✓ "));
-        assert!(children[2]["props"]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("✗ "));
-        assert!(children[3]["props"]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("⠦ "));
+        assert!(
+            children[1]["props"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("✓ ")
+        );
+        assert!(
+            children[2]["props"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("✗ ")
+        );
+        assert!(
+            children[3]["props"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("⠦ ")
+        );
 
         let expanded = render_batch_result(&result, &json!({ "expanded": true }), &json!({}));
         let children = expanded["children"].as_array().unwrap();

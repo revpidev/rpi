@@ -102,8 +102,7 @@ fn spawn_stub_server_with_call(
                         "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
                         "data: [DONE]\n\n",
                     ),
-                    tool_name,
-                    escaped
+                    tool_name, escaped
                 )
             } else {
                 concat!(

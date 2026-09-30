@@ -11,7 +11,7 @@ use crate::auth::{
     AuthPrompt, AuthResult, ModelAuth, ModelsError, ModelsErrorCode, ProviderAuth, SelectOption,
 };
 use crate::generated::get_builtin_models;
-use crate::models::{create_provider, CreateProviderOptions, Provider, ProviderApi};
+use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 use crate::types::ProviderEnv;
 
 /// `bedrockAuth` — Bedrock accepts a bearer token or the AWS SDK's default
@@ -128,18 +128,18 @@ impl ApiKeyAuth for BedrockAuth {
             }
         }
 
-        if let Some(credential) = credential {
-            if let Some(key) = credential.key.clone().filter(|key| !key.is_empty()) {
-                return Ok(Some(AuthResult {
-                    auth: ModelAuth {
-                        api_key: Some(key),
-                        headers: None,
-                        base_url: None,
-                    },
-                    env: credential.env.clone(),
-                    source: Some("stored credential".to_owned()),
-                }));
-            }
+        if let Some(credential) = credential
+            && let Some(key) = credential.key.clone().filter(|key| !key.is_empty())
+        {
+            return Ok(Some(AuthResult {
+                auth: ModelAuth {
+                    api_key: Some(key),
+                    headers: None,
+                    base_url: None,
+                },
+                env: credential.env.clone(),
+                source: Some("stored credential".to_owned()),
+            }));
         }
         if ctx
             .env("AWS_BEARER_TOKEN_BEDROCK")

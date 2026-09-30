@@ -449,10 +449,10 @@ impl WidthCache {
     }
 
     fn insert(&mut self, key: String, value: usize) {
-        if self.map.len() >= WIDTH_CACHE_SIZE {
-            if let Some(first) = self.order.pop_front() {
-                self.map.remove(&first);
-            }
+        if self.map.len() >= WIDTH_CACHE_SIZE
+            && let Some(first) = self.order.pop_front()
+        {
+            self.map.remove(&first);
         }
         self.map.insert(key.clone(), value);
         self.order.push_back(key);
@@ -1270,8 +1270,7 @@ const CJK_PUNCTUATION_EXPLICIT: [char; 18] = [
 /// Character-class contents for the CJK punctuation half of
 /// `autocompleteSeparatorRegex` (utils.ts:63, #9746) — embedded into the
 /// editor trigger/debounce patterns (editor.ts:254-267).
-pub const CJK_PUNCTUATION_CLASS_CONTENT: &str =
-    "\u{00B7}\u{3001}-\u{3003}\u{3008}-\u{3011}\u{3014}-\u{301F}\u{3030}\u{303D}\u{30A0}\u{30FB}\u{FE45}-\u{FE46}\u{FF61}-\u{FF65}\u{16FE2}\u{FF0C}\u{FF0E}\u{FF1A}\u{FF1B}\u{FF01}\u{FF1F}\u{FF08}\u{FF09}\u{FF3B}\u{FF3D}\u{FF5B}\u{FF5D}\u{201C}\u{201D}\u{2018}\u{2019}\u{2026}\u{2014}";
+pub const CJK_PUNCTUATION_CLASS_CONTENT: &str = "\u{00B7}\u{3001}-\u{3003}\u{3008}-\u{3011}\u{3014}-\u{301F}\u{3030}\u{303D}\u{30A0}\u{30FB}\u{FE45}-\u{FE46}\u{FF61}-\u{FF65}\u{16FE2}\u{FF0C}\u{FF0E}\u{FF1A}\u{FF1B}\u{FF01}\u{FF1F}\u{FF08}\u{FF09}\u{FF3B}\u{FF3D}\u{FF5B}\u{FF5D}\u{201C}\u{201D}\u{2018}\u{2019}\u{2026}\u{2014}";
 
 /// `cjkPunctuationRegex` (utils.ts:57-62, #9746 `bfa686240`): CJK letters
 /// remain part of words and paths; only punctuation can separate prose
@@ -5272,8 +5271,8 @@ mod tests {
     }
 
     #[test]
-    fn should_reset_underline_but_preserve_background_when_wrapping_underlined_text_inside_background(
-    ) {
+    fn should_reset_underline_but_preserve_background_when_wrapping_underlined_text_inside_background()
+     {
         let underline_on = "\x1b[4m";
         let underline_off = "\x1b[24m";
         let reset = "\x1b[0m";

@@ -130,12 +130,10 @@ fn meta_fallback(html: &str, values: &[&str], key_attribute: &str) -> Option<Str
             .value()
             .attr(key_attribute)
             .is_some_and(|key| values.contains(&key));
-        if matched {
-            if let Some(content) = meta.value().attr("content") {
-                let content = content.trim();
-                if !content.is_empty() {
-                    return Some(content.to_string());
-                }
+        if matched && let Some(content) = meta.value().attr("content") {
+            let content = content.trim();
+            if !content.is_empty() {
+                return Some(content.to_string());
             }
         }
     }
@@ -143,11 +141,7 @@ fn meta_fallback(html: &str, values: &[&str], key_attribute: &str) -> Option<Str
 }
 
 fn non_empty(value: String) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 // ===== DOM fallback chain (extract.ts:407-603) — byte-parity surface =====

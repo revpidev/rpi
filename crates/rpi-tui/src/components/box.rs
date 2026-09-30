@@ -161,10 +161,10 @@ impl Component for Box {
         let bg_sample = self.bg_fn.as_ref().map(|bg_fn| bg_fn("test"));
 
         // Check cache validity
-        if self.match_cache(width, &child_lines, &bg_sample) {
-            if let Some(cache) = self.cache.borrow().as_ref() {
-                return cache.lines.clone();
-            }
+        if self.match_cache(width, &child_lines, &bg_sample)
+            && let Some(cache) = self.cache.borrow().as_ref()
+        {
+            return cache.lines.clone();
         }
 
         // Apply background and padding
@@ -452,17 +452,20 @@ mod tests {
         b.render(20);
 
         // Top padding row: no child at contentY = -1.
-        assert!(b
-            .handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 0))
-            .is_none());
+        assert!(
+            b.handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 0))
+                .is_none()
+        );
         // Filler row (contentY 0): filler has no handler.
-        assert!(b
-            .handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 1))
-            .is_none());
+        assert!(
+            b.handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 1))
+                .is_none()
+        );
         // Spy row (contentY 1 → local y 0; x shifted by padding 2).
-        assert!(b
-            .handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 2))
-            .is_some());
+        assert!(
+            b.handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 2))
+                .is_some()
+        );
         assert_eq!(seen.load(Ordering::SeqCst), 1);
         assert_eq!(*seen_x.lock().unwrap(), 3);
         assert_eq!(*seen_y.lock().unwrap(), 0);

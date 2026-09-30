@@ -34,6 +34,7 @@ name = "rpi-subagents-fixed-child"
 path = "src/bin/fixed-child.rs"
 
 [dev-dependencies]
+rpi-test-env.workspace = true
 rpi-ai.workspace = true
 rpi-agent.workspace = true
 rpi-ext-host.workspace = true

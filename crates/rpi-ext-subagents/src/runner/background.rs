@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::p1::launch_child::RunCtx;
 
@@ -257,11 +257,7 @@ pub fn find_active_run(query: &str) -> Option<Arc<AsyncRunHandle>> {
             STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
         )
     };
-    if terminal {
-        None
-    } else {
-        Some(handle)
-    }
+    if terminal { None } else { Some(handle) }
 }
 
 /// Snapshot the status document.
@@ -486,15 +482,14 @@ impl SpawnBudgetLedger {
             let mut state = ledger.read();
             let count = state["count"].as_u64().unwrap_or(0);
             let granted = state["granted"].as_u64().unwrap_or(0);
-            if let Some(limit) = configured_limit {
-                if count + amount > limit + granted {
+            if let Some(limit) = configured_limit
+                && count + amount > limit + granted {
                     return Err(format!(
                         "Subagent spawn budget exhausted for this session: {} of {} spawns used (grant more with subagent({{action:\"grant-spawn-budget\"}})).",
                         count,
                         limit + granted
                     ));
                 }
-            }
             state["count"] = json!(count + amount);
             ledger.write(&state);
             Ok(())
@@ -1195,20 +1190,20 @@ pub async fn drive_run(
 
 fn mark_step(handle: &Arc<AsyncRunHandle>, index: usize, state: &str) {
     update_status(handle, |status| {
-        if let Some(steps) = status["steps"].as_array_mut() {
-            if let Some(step) = steps.get_mut(index) {
-                step["status"] = json!(state);
-            }
+        if let Some(steps) = status["steps"].as_array_mut()
+            && let Some(step) = steps.get_mut(index)
+        {
+            step["status"] = json!(state);
         }
     });
 }
 
 fn set_step_field(handle: &Arc<AsyncRunHandle>, index: usize, mutate: impl FnOnce(&mut Value)) {
     update_status(handle, |status| {
-        if let Some(steps) = status["steps"].as_array_mut() {
-            if let Some(step) = steps.get_mut(index) {
-                mutate(step);
-            }
+        if let Some(steps) = status["steps"].as_array_mut()
+            && let Some(step) = steps.get_mut(index)
+        {
+            mutate(step);
         }
     });
 }
@@ -1695,7 +1690,11 @@ fn steer_needs_decision_message(run_id: &str, asks: &[Value]) -> String {
     format!(
         "need_decision: steering not delivered or queued — background run {run_id} is blocked on {} pending supervisor ask(s). No reply was attempted. Reply explicitly{} first:\n{replies}",
         asks.len(),
-        if ambiguous { " to the intended request ID" } else { "" }
+        if ambiguous {
+            " to the intended request ID"
+        } else {
+            ""
+        }
     )
 }
 
@@ -1766,13 +1765,11 @@ pub async fn drain_outstanding_work(
         // blocking ask, yield immediately (upstream `drainOutstandingWork`
         // breaks on `hasPendingSupervisorRequest`) instead of burning the
         // drain budget on children nobody can unblock.
-        if let Some(session_id) = yield_on_pending_asks_for {
-            if crate::p1::supervisor::has_pending_blocking_requests(session_id) {
-                tracing::info!(
-                    "auto-drain yielded: pending supervisor ask for session {session_id}"
-                );
-                return Ok(());
-            }
+        if let Some(session_id) = yield_on_pending_asks_for
+            && crate::p1::supervisor::has_pending_blocking_requests(session_id)
+        {
+            tracing::info!("auto-drain yielded: pending supervisor ask for session {session_id}");
+            return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(
@@ -1971,7 +1968,7 @@ pub async fn wait_for_runs_with_session_asks(
                     None => {
                         return Err(format!(
                             "No active run matched \"{query}\". Nothing to wait for."
-                        ))
+                        ));
                     }
                 }
             }
@@ -2027,50 +2024,49 @@ pub async fn wait_for_runs_with_session_asks(
         }
         // #2345 session-wide supervisor barrier: yield for pending blocking
         // asks this orchestrator session owns outside the waited runs.
-        if let Some(session_id) = orchestrator_session_id {
-            if !session_id.is_empty()
-                && crate::p1::supervisor::has_pending_blocking_requests(session_id)
-            {
-                let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-                let snapshots: Vec<Value> = initial_ids
-                    .iter()
-                    .filter_map(|id| runs.get(id.as_str()).map(|h| status_snapshot(h)))
-                    .collect();
-                drop(runs);
-                return Ok(json!({
-                    "waited": 0,
-                    "all": all,
-                    "wait": {
-                        "reason": "supervisor_request",
-                        "timedOut": false,
-                        "activeRunIds": initial_ids,
-                    },
-                    "runs": snapshots,
-                    "text": "Wait yielded for a pending supervisor request. Background work remains active and will continue after the supervisor reply.",
-                }));
-            }
+        if let Some(session_id) = orchestrator_session_id
+            && !session_id.is_empty()
+            && crate::p1::supervisor::has_pending_blocking_requests(session_id)
+        {
+            let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            let snapshots: Vec<Value> = initial_ids
+                .iter()
+                .filter_map(|id| runs.get(id.as_str()).map(|h| status_snapshot(h)))
+                .collect();
+            drop(runs);
+            return Ok(json!({
+                "waited": 0,
+                "all": all,
+                "wait": {
+                    "reason": "supervisor_request",
+                    "timedOut": false,
+                    "activeRunIds": initial_ids,
+                },
+                "runs": snapshots,
+                "text": "Wait yielded for a pending supervisor request. Background work remains active and will continue after the supervisor reply.",
+            }));
         }
         // User abort (extension-ABI abort-channel gap): the wait tool is a
         // synchronous dispatch the runtime cannot cancel, so it polls the
         // probe each cycle and returns promptly. The runs themselves keep
         // going — an aborted wait interrupts the *wait*, not the work
         // (upstream semantics: abort rejects the wait promise only).
-        if let Some(is_aborted) = is_aborted {
-            if is_aborted() {
-                let snapshots: Vec<Value> = {
-                    let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-                    initial_ids
-                        .iter()
-                        .filter_map(|run_id| runs.get(run_id.as_str()).map(|h| status_snapshot(h)))
-                        .collect()
-                };
-                return Ok(json!({
-                    "waited": 0,
-                    "all": all,
-                    "aborted": true,
-                    "runs": snapshots,
-                }));
-            }
+        if let Some(is_aborted) = is_aborted
+            && is_aborted()
+        {
+            let snapshots: Vec<Value> = {
+                let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+                initial_ids
+                    .iter()
+                    .filter_map(|run_id| runs.get(run_id.as_str()).map(|h| status_snapshot(h)))
+                    .collect()
+            };
+            return Ok(json!({
+                "waited": 0,
+                "all": all,
+                "aborted": true,
+                "runs": snapshots,
+            }));
         }
         let snapshots: Vec<Value> = {
             // Single lock acquisition: `find_run` takes the same mutex and
@@ -2328,9 +2324,11 @@ pub(crate) mod tests {
         let _guard = REGISTRY_TEST_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert!(wait_for_runs(Some("nope"), false, 10, None, None)
-            .await
-            .is_err());
+        assert!(
+            wait_for_runs(Some("nope"), false, 10, None, None)
+                .await
+                .is_err()
+        );
     }
 
     /// TE38 W7 (#2202 @ b72714de): the headless drain yields immediately
@@ -2387,7 +2385,9 @@ pub(crate) mod tests {
         assert_eq!(result["waited"], json!(0));
         assert_eq!(
             result["text"],
-            json!("Wait yielded for a pending supervisor request. Background work remains active and will continue after the supervisor reply.")
+            json!(
+                "Wait yielded for a pending supervisor request. Background work remains active and will continue after the supervisor reply."
+            )
         );
         // No session barrier → the wait proceeds normally (times out bounded).
         let _ = std::fs::remove_file(&request_path);
@@ -2754,10 +2754,12 @@ pub(crate) mod tests {
         assert!(finished < failed, "terminal state first, diagnostic second");
         let diagnostic: Value = serde_json::from_str(events.lines().nth(failed).unwrap()).unwrap();
         assert_eq!(diagnostic["runId"], json!("te17-terminal-defer"));
-        assert!(diagnostic["path"]
-            .as_str()
-            .unwrap()
-            .ends_with("status.json"));
+        assert!(
+            diagnostic["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("status.json")
+        );
         assert!(diagnostic["attempts"].is_u64());
         // Flushing is idempotent.
         flush_pending_status_write_failure(&handle);
@@ -2863,10 +2865,12 @@ pub(crate) mod tests {
             .expect("result write failure recorded in the run event log");
         let diagnostic: Value = serde_json::from_str(failure_line).unwrap();
         assert_eq!(diagnostic["runId"], json!(run_id));
-        assert!(diagnostic["path"]
-            .as_str()
-            .unwrap()
-            .contains(&format!("{run_id}.json")));
+        assert!(
+            diagnostic["path"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{run_id}.json"))
+        );
         assert!(diagnostic["attempts"].is_u64());
         let _ = std::fs::remove_dir_all(&result_dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3059,10 +3063,12 @@ pub(crate) mod tests {
     fn record_child_pid_writes_only_for_async_runs() {
         // The async-runs root holds no directory for this id → no file.
         record_child_pid("no-such-run-id-xyz", 4242);
-        assert!(!async_runs_dir()
-            .join("no-such-run-id-xyz")
-            .join("children.jsonl")
-            .exists());
+        assert!(
+            !async_runs_dir()
+                .join("no-such-run-id-xyz")
+                .join("children.jsonl")
+                .exists()
+        );
     }
 
     // ---- V13-01 FR-C: status write coalescing + terminal flush ---------
@@ -3212,13 +3218,15 @@ pub(crate) mod tests {
             worktree_plan: None,
         };
         assert!(async_body_output_collision(&clean, &[]).is_none());
-        assert!(async_body_output_collision(
-            &AsyncBody::Single {
-                spec: Box::new(entry(0, json!("a.md")).spec),
-            },
-            &[]
-        )
-        .is_none());
+        assert!(
+            async_body_output_collision(
+                &AsyncBody::Single {
+                    spec: Box::new(entry(0, json!("a.md")).spec),
+                },
+                &[]
+            )
+            .is_none()
+        );
     }
 
     #[test]

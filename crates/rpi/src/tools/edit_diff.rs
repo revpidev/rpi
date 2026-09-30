@@ -297,12 +297,12 @@ fn apply_replacements_preserving_unchanged_lines(
         let Some((start_line, end_line)) = range else {
             continue;
         };
-        if let Some(current) = groups.last_mut() {
-            if start_line < current.end_line {
-                current.end_line = current.end_line.max(end_line);
-                current.replacements.push((*replacement).clone());
-                continue;
-            }
+        if let Some(current) = groups.last_mut()
+            && start_line < current.end_line
+        {
+            current.end_line = current.end_line.max(end_line);
+            current.replacements.push((*replacement).clone());
+            continue;
         }
         groups.push(Group {
             start_line,
@@ -693,11 +693,7 @@ fn myers_diff(a: &[String], b: &[String]) -> Vec<DiffEntry> {
         } else {
             let vk_minus_1 = vp[((k - 1) + offset as isize) as usize];
             let vk_plus_1 = vp[((k + 1) + offset as isize) as usize];
-            if vk_minus_1 < vk_plus_1 {
-                k + 1
-            } else {
-                k - 1
-            }
+            if vk_minus_1 < vk_plus_1 { k + 1 } else { k - 1 }
         };
 
         let prev_x = vp[(prev_k + offset as isize) as usize];
@@ -743,11 +739,12 @@ fn group_diff_parts(entries: &[DiffEntry]) -> Vec<DiffPart> {
             DiffEntry::Removed(l) => (false, true, l),
             DiffEntry::Added(l) => (true, false, l),
         };
-        if let Some(last) = parts.last_mut() {
-            if last.added == added && last.removed == removed {
-                last.lines.push(line.clone());
-                continue;
-            }
+        if let Some(last) = parts.last_mut()
+            && last.added == added
+            && last.removed == removed
+        {
+            last.lines.push(line.clone());
+            continue;
         }
         parts.push(DiffPart {
             added,

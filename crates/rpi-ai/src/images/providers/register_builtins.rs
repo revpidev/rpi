@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::api::openrouter_images::openrouter_images_api;
 use crate::images::images_api_registry::{
-    register_images_api_provider, ImagesApiProvider, ImagesFunction,
+    ImagesApiProvider, ImagesFunction, register_images_api_provider,
 };
 use crate::types::{AssistantImages, ImagesApiKind, ImagesContext, ImagesModel, ImagesOptions};
 

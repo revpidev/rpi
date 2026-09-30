@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::error::AdapterError;
 use crate::metadata::McpConfig;
@@ -190,12 +190,12 @@ pub fn write_project_server_disabled_override(
     })?;
 
     let existing = servers.get(server_name).cloned();
-    if let Some(ref existing) = existing {
-        if !existing.is_object() {
-            return Err(AdapterError::InvalidConfigValue(format!(
-                "server \"{server_name}\" must be an object"
-            )));
-        }
+    if let Some(ref existing) = existing
+        && !existing.is_object()
+    {
+        return Err(AdapterError::InvalidConfigValue(format!(
+            "server \"{server_name}\" must be an object"
+        )));
     }
 
     let existing_obj = existing

@@ -18,7 +18,7 @@
 //!   classification agrees on the pinned corpus; exotic cases like digit
 //!   + punctuation segments may differ).
 
-use crate::utils::{get_word_segmenter, is_whitespace_char, PUNCTUATION_REGEX};
+use crate::utils::{PUNCTUATION_REGEX, get_word_segmenter, is_whitespace_char};
 
 // =============================================================================
 // Word segmentation (ICU-equivalent default)

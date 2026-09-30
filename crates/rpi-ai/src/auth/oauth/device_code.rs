@@ -204,8 +204,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::oneshot;
 
@@ -264,10 +264,10 @@ mod tests {
             ms: u64,
             signal: Option<CancellationToken>,
         ) -> BoxFutureSend<'_, Result<(), ModelsError>> {
-            if let Some(token) = &signal {
-                if token.is_cancelled() {
-                    return Box::pin(async { Err(cancelled()) });
-                }
+            if let Some(token) = &signal
+                && token.is_cancelled()
+            {
+                return Box::pin(async { Err(cancelled()) });
             }
             if ms == 0 {
                 return Box::pin(async { Ok(()) });

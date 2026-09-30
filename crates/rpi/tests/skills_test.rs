@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi::core::skills::{
-    discover_skill_paths, expand_skill_command, format_skills_for_prompt, load_skills,
     DiagnosticKind, DiscoverSkillsOptions, LoadSkillsOptions, SkillFileReadTool, SourceScope,
+    discover_skill_paths, expand_skill_command, format_skills_for_prompt, load_skills,
 };
 
 // ---------------------------------------------------------------------------
@@ -457,10 +457,7 @@ fn skills_expand_command_exact_format_with_args() {
     let want = format!(
         "<skill name=\"deploy\" location=\"{}\">\nReferences are relative to {}.\n\nRun the deploy pipeline.\n\nVerify the rollout.\n</skill>\n\nto staging",
         skill_file.display(),
-        skill_file
-            .parent()
-            .expect("skill dir")
-            .display()
+        skill_file.parent().expect("skill dir").display()
     );
     assert_eq!(expanded, want);
 

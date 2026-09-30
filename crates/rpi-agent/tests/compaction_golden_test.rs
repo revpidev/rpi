@@ -15,16 +15,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rpi_agent::compaction::branch_summarization::{
-    generate_branch_summary, prepare_branch_entries, GenerateBranchSummaryOptions,
+    GenerateBranchSummaryOptions, generate_branch_summary, prepare_branch_entries,
 };
 use rpi_agent::compaction::utils::{
-    compute_file_lists, create_file_ops, format_file_operations, serialize_conversation,
-    FileOperations, SUMMARIZATION_SYSTEM_PROMPT,
+    FileOperations, SUMMARIZATION_SYSTEM_PROMPT, compute_file_lists, create_file_ops,
+    format_file_operations, serialize_conversation,
 };
 use rpi_agent::compaction::{
-    calculate_context_tokens, compact, complete_summarization, estimate_context_tokens,
-    estimate_tokens, find_cut_point, generate_summary_with_usage, prepare_compaction,
-    CompactionSettings, SummarizationArgs,
+    CompactionSettings, SummarizationArgs, calculate_context_tokens, compact,
+    complete_summarization, estimate_context_tokens, estimate_tokens, find_cut_point,
+    generate_summary_with_usage, prepare_compaction,
 };
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::session::SessionEntry;
@@ -32,7 +32,7 @@ use rpi_agent::stream_fn::BoxStream;
 use rpi_ai::types::{
     AssistantMessage, Context, DoneReason, Model, StopReason, StreamEvent, StreamOptions, Usage,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generated/compaction")
@@ -751,7 +751,9 @@ async fn summarization_length_stop_rejects_with_byte_exact_message() {
             "Branch summarization",
         )
         .as_deref(),
-        Some("Branch summarization failed: generation hit the token cap and the summary is incomplete")
+        Some(
+            "Branch summarization failed: generation hit the token cap and the summary is incomplete"
+        )
     );
     assert_eq!(
         rpi_agent::compaction::get_summarization_failure(
@@ -1198,11 +1200,13 @@ async fn prompt_branch_summary_byte_exact() {
             .map(|v| v.as_str().expect("str").to_owned())
             .collect::<Vec<_>>()
     );
-    assert!(result
-        .modified_files
-        .as_ref()
-        .expect("modifiedFiles")
-        .is_empty());
+    assert!(
+        result
+            .modified_files
+            .as_ref()
+            .expect("modifiedFiles")
+            .is_empty()
+    );
     let (_, captured_options) = &capture.calls.lock().expect("calls")[0];
     assert_eq!(
         captured_options.max_tokens,

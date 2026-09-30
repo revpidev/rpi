@@ -30,7 +30,7 @@ use super::super::interaction::{AuthEvent, AuthInteraction};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
 use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
-    poll_oauth_device_code_flow, DeviceCodePollOptions, DeviceCodePollResult, CANCEL_MESSAGE,
+    CANCEL_MESSAGE, DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
 
 /// `XAI_CLIENT_ID`.
@@ -611,10 +611,10 @@ mod tests {
 
         fn notify(&self, event: AuthEvent) {
             self.handle.events.lock().expect("lock").push(event.clone());
-            if matches!(event, AuthEvent::DeviceCode { .. }) {
-                if let Some(callback) = &self.on_device_code {
-                    callback();
-                }
+            if matches!(event, AuthEvent::DeviceCode { .. })
+                && let Some(callback) = &self.on_device_code
+            {
+                callback();
             }
         }
     }
@@ -823,12 +823,14 @@ mod tests {
         assert!(credential.expires <= before + 21_600 * 1000 - REFRESH_SKEW_MS + 5000);
 
         match handle.events().as_slice() {
-            [AuthEvent::DeviceCode {
-                user_code,
-                verification_uri,
-                interval_seconds,
-                expires_in_seconds,
-            }] => {
+            [
+                AuthEvent::DeviceCode {
+                    user_code,
+                    verification_uri,
+                    interval_seconds,
+                    expires_in_seconds,
+                },
+            ] => {
                 assert_eq!(user_code, "ABCD-1234");
                 // No verification_uri_complete in the response: the plain
                 // verification URI is notified.
@@ -877,9 +879,11 @@ mod tests {
 
         oauth.login(&interaction).await.expect("login");
         match handle.events().as_slice() {
-            [AuthEvent::DeviceCode {
-                verification_uri, ..
-            }] => assert_eq!(
+            [
+                AuthEvent::DeviceCode {
+                    verification_uri, ..
+                },
+            ] => assert_eq!(
                 verification_uri,
                 "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"
             ),

@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use rpi_agent::agent::AgentListener;
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::stream_fn::StreamFn;
@@ -30,9 +30,9 @@ use rpi_ai::types::{
     StreamEvent, TextContent, ToolResultContent, Usage, UserContent, UserMessage, UserRole,
 };
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAssistantOptions, FauxProvider, FauxProviderOptions,
+    FauxAssistantOptions, FauxProvider, FauxProviderOptions, faux_assistant_message,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);

@@ -19,10 +19,10 @@ use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
 use rpi_ext_host::types as ext;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_tool_call,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -282,11 +282,13 @@ async fn w3_send_message_next_turn_queues_for_next_prompt() {
         .expect("send_message");
     // nextTurn: not part of the current message stream.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(fixture
-        .session
-        .messages()
-        .iter()
-        .all(|m| { !matches!(m, rpi_agent::messages::AgentMessage::Custom(_)) }));
+    assert!(
+        fixture
+            .session
+            .messages()
+            .iter()
+            .all(|m| { !matches!(m, rpi_agent::messages::AgentMessage::Custom(_)) })
+    );
 
     fixture
         .session
@@ -613,10 +615,12 @@ async fn w3_runtime_tool_addition_declared_via_system_message() {
     // request) and the active set keeps it.
     let result = tool_result_json(&fixture.session);
     assert!(result.get("addedToolNames").is_none() || result["addedToolNames"].is_null());
-    assert!(fixture
-        .session
-        .get_active_tool_names()
-        .contains(&"extra".to_owned()));
+    assert!(
+        fixture
+            .session
+            .get_active_tool_names()
+            .contains(&"extra".to_owned())
+    );
     // The declaration rode a system message with toolsAdded: [extra].
     let declared_extra = fixture
         .session

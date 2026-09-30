@@ -276,7 +276,7 @@ mod tests {
     use super::*;
     use crate::modes::interactive::interactive_mode::{InteractiveMode, InteractiveModeOptions};
     use crate::modes::interactive::test_support::{
-        build_test_session, TempDir, TestSession, TestTerminal,
+        TempDir, TestSession, TestTerminal, build_test_session,
     };
     use rpi_tui::tui::Component;
 
@@ -313,7 +313,7 @@ mod tests {
         // default (settings-manager.ts:854-864). The restore guard lives in
         // the returned tuple so `$VISUAL` stays set for the whole test.
         let previous = std::env::var("VISUAL").ok();
-        std::env::set_var("VISUAL", script.display().to_string());
+        rpi_test_env::set_var("VISUAL", script.display().to_string());
         (mode, terminal, _tmp, EnvRestore { previous })
     }
 
@@ -324,8 +324,8 @@ mod tests {
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             match &self.previous {
-                Some(value) => std::env::set_var("VISUAL", value),
-                None => std::env::remove_var("VISUAL"),
+                Some(value) => rpi_test_env::set_var("VISUAL", value),
+                None => rpi_test_env::remove_var("VISUAL"),
             }
         }
     }

@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::paths;
 
@@ -381,15 +381,15 @@ pub fn cleanup_old_artifacts(dir: &Path, max_age_days: u64) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    if let Ok(meta) = std::fs::metadata(&marker_path) {
-        if let Ok(modified) = meta.modified() {
-            let mtime = modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            if (now as u128) < mtime + DAY_MS as u128 {
-                return;
-            }
+    if let Ok(meta) = std::fs::metadata(&marker_path)
+        && let Ok(modified) = meta.modified()
+    {
+        let mtime = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if (now as u128) < mtime + DAY_MS as u128 {
+            return;
         }
     }
     let cutoff = now.saturating_sub(max_age_days * DAY_MS);

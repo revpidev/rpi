@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use rpi_ext_host::types::SessionEntryInfo as NativeEntry;
 use rpi_ext_sdk::interactive_ui::{HostCall, InteractiveUiError, InteractiveUiErrorKind};
 use rpi_ext_sdk::session_entries as wasm;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Scripted transport

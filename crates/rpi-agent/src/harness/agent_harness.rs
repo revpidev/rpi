@@ -55,8 +55,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use rpi_ai::models::Models;
 use rpi_ai::types::{
     AssistantContent, AssistantMessage, AssistantRole, ErrorReason, ImageContent, Model,
@@ -69,31 +69,30 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{
-    now_millis, run_agent_loop, thinking_level_from_model_level, AgentContext, AgentEventSink,
-    AgentLoopConfig, AgentLoopTurnUpdate,
+    AgentContext, AgentEventSink, AgentLoopConfig, AgentLoopTurnUpdate, now_millis, run_agent_loop,
+    thinking_level_from_model_level,
 };
 use crate::compaction::branch_summarization::{
-    collect_entries_for_branch_summary, generate_branch_summary, BranchSummaryDetails,
-    GenerateBranchSummaryOptions, DEFAULT_BRANCH_RESERVE_TOKENS,
+    BranchSummaryDetails, DEFAULT_BRANCH_RESERVE_TOKENS, GenerateBranchSummaryOptions,
+    collect_entries_for_branch_summary, generate_branch_summary,
 };
-use crate::compaction::{compact as run_compact, SummarizationArgs, DEFAULT_COMPACTION_SETTINGS};
+use crate::compaction::{DEFAULT_COMPACTION_SETTINGS, SummarizationArgs, compact as run_compact};
 use crate::error::AgentError;
-use crate::messages::{convert_to_llm, AgentMessage};
-use crate::session::{build_context_messages, SessionEntry};
+use crate::messages::{AgentMessage, convert_to_llm};
+use crate::session::{SessionEntry, build_context_messages};
 use crate::stream_fn::{BoxStream, StreamFn};
 use crate::types::{AgentEvent, AgentTool, AgentToolResult, QueueMode, ThinkingLevel};
 
 use super::prompt_templates::format_prompt_template_invocation;
 use super::skills::format_skill_invocation;
 use super::types::{
-    apply_stream_options_patch, AbortResult, AgentHarnessError, AgentHarnessErrorCode,
-    AgentHarnessEvent, AgentHarnessOptions, AgentHarnessOwnEvent, AgentHarnessPhase,
-    AgentHarnessPromptOptions, AgentHarnessResources, AgentHarnessStreamOptions,
-    AgentHarnessSystemPrompt, AgentHarnessTool, AgentHarnessToolContextSource,
-    AppendCompactionOptions, CompactResult, CompactionPreparation, HarnessHookResult,
-    MoveToSummary, NavigateTreeResult, PendingSessionWrite, RetryOperation, Session,
-    SessionContextBuildOptions, SessionError, SessionMetadata, SystemPromptContext,
-    TreePreparation, TurnState, UpdateSource,
+    AbortResult, AgentHarnessError, AgentHarnessErrorCode, AgentHarnessEvent, AgentHarnessOptions,
+    AgentHarnessOwnEvent, AgentHarnessPhase, AgentHarnessPromptOptions, AgentHarnessResources,
+    AgentHarnessStreamOptions, AgentHarnessSystemPrompt, AgentHarnessTool,
+    AgentHarnessToolContextSource, AppendCompactionOptions, CompactResult, CompactionPreparation,
+    HarnessHookResult, MoveToSummary, NavigateTreeResult, PendingSessionWrite, RetryOperation,
+    Session, SessionContextBuildOptions, SessionError, SessionMetadata, SystemPromptContext,
+    TreePreparation, TurnState, UpdateSource, apply_stream_options_patch,
 };
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -478,46 +477,46 @@ fn prepare_harness_compaction(
     // first_kept_entry_id anchor for backward compatibility.
     let mut compactable: std::borrow::Cow<'_, [SessionEntry]> =
         std::borrow::Cow::Borrowed(branch_entries);
-    if let Some(index) = prev_compaction_index {
-        if let SessionEntry::Compaction(prev_compaction) = &branch_entries[index] {
-            previous_summary = Some(prev_compaction.summary.clone());
-            if let Some(tail) = &prev_compaction.retained_tail {
-                let mut virtualized: Vec<SessionEntry> = tail
-                    .iter()
-                    .enumerate()
-                    .map(|(tail_index, message)| {
-                        let virtual_id = format!("{}:retained:{}", prev_compaction.id, tail_index);
-                        SessionEntry::Message(crate::session::MessageEntry {
-                            parent_id: Some(if tail_index == 0 {
-                                prev_compaction.id.clone()
-                            } else {
-                                format!("{}:retained:{}", prev_compaction.id, tail_index - 1)
-                            }),
-                            // Entry timestamps are ISO strings in the
-                            // consolidated session skeleton; messages carry
-                            // epoch ms (messages.ts: virtual entry
-                            // `timestamp: message.timestamp`).
-                            timestamp: crate::harness::session::repo_utils::format_iso8601_ms(
-                                agent_message_epoch_ms(message).max(0) as u64,
-                            ),
-                            id: virtual_id,
-                            message: message.clone(),
-                        })
+    if let Some(index) = prev_compaction_index
+        && let SessionEntry::Compaction(prev_compaction) = &branch_entries[index]
+    {
+        previous_summary = Some(prev_compaction.summary.clone());
+        if let Some(tail) = &prev_compaction.retained_tail {
+            let mut virtualized: Vec<SessionEntry> = tail
+                .iter()
+                .enumerate()
+                .map(|(tail_index, message)| {
+                    let virtual_id = format!("{}:retained:{}", prev_compaction.id, tail_index);
+                    SessionEntry::Message(crate::session::MessageEntry {
+                        parent_id: Some(if tail_index == 0 {
+                            prev_compaction.id.clone()
+                        } else {
+                            format!("{}:retained:{}", prev_compaction.id, tail_index - 1)
+                        }),
+                        // Entry timestamps are ISO strings in the
+                        // consolidated session skeleton; messages carry
+                        // epoch ms (messages.ts: virtual entry
+                        // `timestamp: message.timestamp`).
+                        timestamp: crate::harness::session::repo_utils::format_iso8601_ms(
+                            agent_message_epoch_ms(message).max(0) as u64,
+                        ),
+                        id: virtual_id,
+                        message: message.clone(),
                     })
-                    .collect();
-                virtualized.extend_from_slice(&branch_entries[index + 1..]);
-                compactable = std::borrow::Cow::Owned(virtualized);
-            } else {
-                // Legacy anchor (v1 form): start at the recorded first kept
-                // entry, or right after the compaction when unknown.
-                let boundary_start = branch_entries
-                    .iter()
-                    .position(|entry| {
-                        Some(entry.id()) == prev_compaction.first_kept_entry_id.as_deref()
-                    })
-                    .unwrap_or(index + 1);
-                compactable = std::borrow::Cow::Borrowed(&branch_entries[boundary_start..]);
-            }
+                })
+                .collect();
+            virtualized.extend_from_slice(&branch_entries[index + 1..]);
+            compactable = std::borrow::Cow::Owned(virtualized);
+        } else {
+            // Legacy anchor (v1 form): start at the recorded first kept
+            // entry, or right after the compaction when unknown.
+            let boundary_start = branch_entries
+                .iter()
+                .position(|entry| {
+                    Some(entry.id()) == prev_compaction.first_kept_entry_id.as_deref()
+                })
+                .unwrap_or(index + 1);
+            compactable = std::borrow::Cow::Borrowed(&branch_entries[boundary_start..]);
         }
     }
     let boundary_end = compactable.len();
@@ -1005,10 +1004,10 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
             Some(&effective_prompt),
             Some(&declared_tools),
         );
-        if !matches!(messages.first(), Some(AgentMessage::System(_))) {
-            if let Some(initial) = initial {
-                messages.insert(0, AgentMessage::System(initial));
-            }
+        if !matches!(messages.first(), Some(AgentMessage::System(_)))
+            && let Some(initial) = initial
+        {
+            messages.insert(0, AgentMessage::System(initial));
         }
         AgentContext {
             messages,
@@ -2205,15 +2204,14 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
             .await
             .map_err(session_error)?;
         let mut summary_entry = None;
-        if let Some(summary_id) = summary_id {
-            if let Some(SessionEntry::BranchSummary(entry)) = self
+        if let Some(summary_id) = summary_id
+            && let Some(SessionEntry::BranchSummary(entry)) = self
                 .session
                 .get_entry(&summary_id)
                 .await
                 .map_err(session_error)?
-            {
-                summary_entry = Some(entry);
-            }
+        {
+            summary_entry = Some(entry);
         }
         let current_leaf_id = self.session.get_leaf_id().await.map_err(session_error)?;
         self.emit_own(

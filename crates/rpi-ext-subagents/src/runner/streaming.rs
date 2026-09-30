@@ -14,7 +14,7 @@
 //! ever carries `active_long_running`/`needs_attention`, both products of
 //! that engine).
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::display::{extract_text_from_content, format_tool_call};
 use super::events::ChildRunState;
@@ -427,10 +427,12 @@ mod tests {
 
         state.recent_output = vec!["x".repeat(2500)];
         let bounded = bound_streamed_recent_output(&state);
-        assert!(bounded[0]
-            .as_str()
-            .unwrap()
-            .ends_with("\u{2026} [truncated]"));
+        assert!(
+            bounded[0]
+                .as_str()
+                .unwrap()
+                .ends_with("\u{2026} [truncated]")
+        );
         assert_eq!(
             bounded[0].as_str().unwrap().encode_utf16().count(),
             MAX_STREAMED_OUTPUT_LINE_CHARS + "… [truncated]".encode_utf16().count()

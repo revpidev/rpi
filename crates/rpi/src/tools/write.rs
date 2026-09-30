@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rpi_agent::types::{AgentTool, AgentToolResult};
 use rpi_ai::types::{TextContent, ToolResultContent};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::file_mutation_queue::with_file_mutation_queue;

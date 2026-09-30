@@ -537,11 +537,13 @@ fn test_compute_edits_diff_missing_file() {
         &cwd,
     );
     assert!(result.error.is_some());
-    assert!(result
-        .error
-        .as_ref()
-        .unwrap()
-        .contains("Could not edit file:"));
+    assert!(
+        result
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Could not edit file:")
+    );
     assert!(result.error.as_ref().unwrap().contains("ENOENT"));
 }
 

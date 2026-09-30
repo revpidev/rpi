@@ -38,7 +38,7 @@ use crate::components::stack::{allocate_stack_sizes, visible_stack_entries};
 use crate::layout_node::{Basis, LayoutNode, LayoutViewport, StackAlign, StackKind};
 use crate::terminal_image::{crop_kitty_image_line, get_kitty_image_metadata, is_image_line};
 use crate::tui::{
-    composite_tui_line, lock_component, RenderHandle, SharedComponent, CURSOR_MARKER,
+    CURSOR_MARKER, RenderHandle, SharedComponent, composite_tui_line, lock_component,
 };
 use crate::utils::{
     extract_ansi_code, get_active_background_ansi, get_grapheme_cell_range, slice_by_column,
@@ -213,10 +213,9 @@ fn layout_component(
                 // Scroll the hardware-cursor line (CURSOR_MARKER) into view.
                 if let Some(cursor_line) =
                     lines.iter().position(|line| line.contains(CURSOR_MARKER))
+                    && cursor_line >= allocated_height
                 {
-                    if cursor_line >= allocated_height {
-                        line_offset = cursor_line - allocated_height + 1;
-                    }
+                    line_offset = cursor_line - allocated_height + 1;
                 }
             }
             let rect = LayoutRect {
@@ -528,7 +527,9 @@ fn replace_scrollbar_cell(
     };
     // `\x1b[0m\x1b]8;;\x07` (layout.ts:276): reset styles, close any open
     // OSC 8 hyperlink, then optionally re-open the preserved background.
-    format!("{before}{before_padding}\x1b[0m\x1b]8;;\x07{background}{cell_padding_before}{replacement}{cell_padding_after}{after}")
+    format!(
+        "{before}{before_padding}\x1b[0m\x1b]8;;\x07{background}{cell_padding_before}{replacement}{cell_padding_after}{after}"
+    )
 }
 
 /// `getScrollbarGeometry` (layout.ts:280-307 @ 9841914, 457ae8c79).
@@ -864,10 +865,10 @@ pub fn get_scroll_views_at(frame: &LayoutFrame, x: isize, y: isize) -> Vec<Share
         if !contains_point(&layout_box.clip, x, y) {
             return;
         }
-        if let Some(shared) = layout_box.scroll_view.as_ref() {
-            if contains_point(&layout_box.rect, x, y) {
-                result.push((shared.clone(), depth));
-            }
+        if let Some(shared) = layout_box.scroll_view.as_ref()
+            && contains_point(&layout_box.rect, x, y)
+        {
+            result.push((shared.clone(), depth));
         }
         for child in &layout_box.children {
             visit(child, x, y, depth + 1, result);

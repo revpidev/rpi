@@ -12,8 +12,8 @@ use crate::constants::{
     DEFAULT_BATCH_CONCURRENCY, DEFAULT_BROWSER, DEFAULT_MAX_CHARS, DEFAULT_OS, DEFAULT_TIMEOUT_MS,
 };
 use crate::format::{
-    build_fetch_error_response_text, build_fetch_response_text, build_header,
-    build_user_facing_fetch_error_summary, HeaderValue,
+    HeaderValue, build_fetch_error_response_text, build_fetch_response_text, build_header,
+    build_user_facing_fetch_error_summary,
 };
 use crate::pipeline::{FetchExecutionHooks, FetchPipeline};
 use crate::types::{
@@ -717,11 +717,12 @@ pub fn batch_details_json(result: &BatchFetchResult, verbose: bool) -> serde_jso
             map.insert("index".to_string(), json!(item.index));
             map.insert(
                 "url".to_string(),
-                json!(item
-                    .request
-                    .as_ref()
-                    .map(|opts| opts.url.clone())
-                    .unwrap_or_else(|| item.request_url.clone())),
+                json!(
+                    item.request
+                        .as_ref()
+                        .map(|opts| opts.url.clone())
+                        .unwrap_or_else(|| item.request_url.clone())
+                ),
             );
             map.insert("status".to_string(), json!(item.status));
             map.insert("progress".to_string(), json!(PROGRESS_DONE));

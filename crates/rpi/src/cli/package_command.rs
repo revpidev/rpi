@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{APP_NAME, PACKAGE_NAME, VERSION};
 use crate::core::extension_registry::ExtensionInstallInfo;
 use crate::core::model_runtime::{
-    CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput, DEFAULT_MODEL_REFRESH_TIMEOUT_MS,
+    CreateModelRuntimeOptions, DEFAULT_MODEL_REFRESH_TIMEOUT_MS, ModelRuntime, ModelsPathInput,
 };
 use crate::core::package_manager::{
     ConfiguredPackage, DefaultPackageManager, InstallConfirmCallback, PackageCommandRunner,
@@ -42,13 +42,13 @@ use crate::core::self_update::{BinarySelfUpdateRequest, BinarySelfUpdateSeam};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::skills::SourceScope;
 use crate::core::trust_manager::{
-    default_project_trust_from_settings, resolve_project_trusted, ProjectTrustContext,
-    ProjectTrustStore,
+    ProjectTrustContext, ProjectTrustStore, default_project_trust_from_settings,
+    resolve_project_trusted,
 };
 use crate::core::version_check::{
-    channel_probe_url, get_latest_rpi_release_with, is_newer_package_version,
-    version_check_endpoint, LatestVersionTransport, ReqwestLatestVersionTransport, UpdateChannel,
-    DEFAULT_VERSION_CHECK_TIMEOUT,
+    DEFAULT_VERSION_CHECK_TIMEOUT, LatestVersionTransport, ReqwestLatestVersionTransport,
+    UpdateChannel, channel_probe_url, get_latest_rpi_release_with, is_newer_package_version,
+    version_check_endpoint,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -57,8 +57,7 @@ use std::sync::Arc;
 /// literal `rpi` mirrors `APP_NAME` (config.rs); the
 /// `usage_lines_start_with_app_name` test binds the two so a rename cannot
 /// silently leave the help text stale (T14 review N-1).
-pub const UPDATE_USAGE: &str =
-    "rpi update [source|self|rpi] [--self|--extensions|--models|--all] [--extension <source>] [--rc] [--approve|--no-approve] [--force] [--yes]";
+pub const UPDATE_USAGE: &str = "rpi update [source|self|rpi] [--self|--extensions|--models|--all] [--extension <source>] [--rc] [--approve|--no-approve] [--force] [--yes]";
 
 /// `UpdateTarget` (package-manager-cli.ts:35).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,18 +690,18 @@ pub async fn run_update_in(
         manager.set_progress_callback(Some(Box::new(|event| {
             // Upstream prints `start` messages dim to stdout
             // (package-manager-cli.ts:758-762).
-            if event.kind == crate::core::package_manager::ProgressKind::Start {
-                if let Some(message) = &event.message {
-                    println!("{message}");
-                }
+            if event.kind == crate::core::package_manager::ProgressKind::Start
+                && let Some(message) = &event.message
+            {
+                println!("{message}");
             }
             // Rpi-specific: a multi-extension batch continues past a
             // failing source (per-extension errors surface here, not
             // only as the run's final error line).
-            if event.kind == crate::core::package_manager::ProgressKind::Error {
-                if let Some(message) = &event.message {
-                    eprintln!("Error: {message}");
-                }
+            if event.kind == crate::core::package_manager::ProgressKind::Error
+                && let Some(message) = &event.message
+            {
+                eprintln!("Error: {message}");
             }
         })));
         manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
@@ -1311,10 +1310,10 @@ pub fn run_package_command_in(
     manager.set_progress_callback(Some(Box::new(|event| {
         // Upstream prints `start` messages dim to stdout
         // (package-manager-cli.ts:758-762).
-        if event.kind == crate::core::package_manager::ProgressKind::Start {
-            if let Some(message) = &event.message {
-                println!("{message}");
-            }
+        if event.kind == crate::core::package_manager::ProgressKind::Start
+            && let Some(message) = &event.message
+        {
+            println!("{message}");
         }
     })));
     manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
@@ -1478,8 +1477,8 @@ mod package_command_tests {
     use super::*;
     use crate::core::package_manager::CommandRequest;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1896,8 +1895,8 @@ mod update_cli_tests {
     use crate::core::version_check::LatestVersionTransport;
     use futures::future::BoxFuture;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2323,10 +2322,12 @@ mod update_cli_tests {
         )
         .await;
         assert_eq!(code, 0);
-        assert!(runner
-            .calls()
-            .iter()
-            .any(|call| call.contains("install") && call.contains("foo@latest")));
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("install") && call.contains("foo@latest"))
+        );
         // The self target never ran: no release probe.
         assert_eq!(transport.call_count(), 0);
     }
@@ -2429,10 +2430,12 @@ mod update_cli_tests {
         )
         .await;
         assert_eq!(code, 0);
-        assert!(!runner
-            .calls()
-            .iter()
-            .any(|call| call.contains("project-pkg")));
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("project-pkg"))
+        );
 
         // A stored trust decision makes the project packages visible.
         let trust_store = ProjectTrustStore::new(&dirs.agent_dir);
@@ -2448,10 +2451,12 @@ mod update_cli_tests {
         )
         .await;
         assert_eq!(code, 0);
-        assert!(runner
-            .calls()
-            .iter()
-            .any(|call| call.contains("project-pkg")));
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("project-pkg"))
+        );
     }
 
     // ---- self target (the test binary is a standalone executable → the
@@ -2764,10 +2769,12 @@ mod update_cli_tests {
         // Extensions update succeeded; the binary self-update then ran to
         // completion (T18, ADR-0011 §7 / D-054: no more exit 1).
         assert_eq!(code, 0);
-        assert!(runner
-            .calls()
-            .iter()
-            .any(|call| call.contains("foo@latest")));
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("foo@latest"))
+        );
         assert_eq!(transport.call_count(), 1);
         assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary");
     }

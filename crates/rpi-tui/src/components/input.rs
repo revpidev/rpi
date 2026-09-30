@@ -12,12 +12,12 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 
-use crate::keybindings::{get_keybindings, Keybinding};
+use crate::keybindings::{Keybinding, get_keybindings};
 use crate::keys::decode_kitty_printable;
 use crate::kill_ring::{KillRing, KillRingPushOptions};
 use crate::tui::{
-    Component, Focusable, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
-    TuiMouseHandlerResult, CURSOR_MARKER,
+    CURSOR_MARKER, Component, Focusable, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult,
+    TuiMouseEventType, TuiMouseHandlerResult,
 };
 use crate::undo_stack::UndoStack;
 use crate::utils::{
@@ -1455,9 +1455,11 @@ mod tests {
         let mut field = input();
         type_text(&mut field, "hello");
         // Row != 0.
-        assert!(field
-            .handle_mouse(&input_mouse_event(TuiMouseEventType::Press, 3, 1))
-            .is_none());
+        assert!(
+            field
+                .handle_mouse(&input_mouse_event(TuiMouseEventType::Press, 3, 1))
+                .is_none()
+        );
         // Non-press types.
         for event_type in [
             TuiMouseEventType::Click,

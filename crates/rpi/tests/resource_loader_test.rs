@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi::core::keybindings::KEYBINDING_NAME_MIGRATIONS;
 use rpi::core::resource_loader::{
-    migrate_keybindings_config_file_at, DefaultResourceLoader, DefaultResourceLoaderOptions,
-    DiagnosticKind, DiagnosticResourceType, PackageResource, PackageResourcePaths,
-    ResourceExtensionPath, ResourceExtensionPaths,
+    DefaultResourceLoader, DefaultResourceLoaderOptions, DiagnosticKind, DiagnosticResourceType,
+    PackageResource, PackageResourcePaths, ResourceExtensionPath, ResourceExtensionPaths,
+    migrate_keybindings_config_file_at,
 };
 use rpi::core::settings_manager::{Settings, SettingsManager, SettingsManagerCreateOptions};
 use rpi::core::skills::{SourceInfo, SourceOrigin, SourceScope};
@@ -152,11 +152,13 @@ fn should_discover_skills_from_agent_dir() {
     let mut loader = DefaultResourceLoader::new(fixture.options());
     loader.reload();
 
-    assert!(loader
-        .resources()
-        .skills
-        .iter()
-        .any(|s| s.name == "test-skill"));
+    assert!(
+        loader
+            .resources()
+            .skills
+            .iter()
+            .any(|s| s.name == "test-skill")
+    );
 }
 
 #[test]
@@ -176,15 +178,18 @@ fn should_ignore_extra_markdown_files_in_auto_discovered_skill_dirs() {
     let mut loader = DefaultResourceLoader::new(fixture.options());
     loader.reload();
 
-    assert!(loader
-        .resources()
-        .skills
-        .iter()
-        .any(|s| s.name == "browser-tools"));
-    assert!(!loader.skill_diagnostics().iter().any(|d| d
-        .path
-        .as_ref()
-        .is_some_and(|p| p.to_string_lossy().ends_with("EFFICIENCY.md"))));
+    assert!(
+        loader
+            .resources()
+            .skills
+            .iter()
+            .any(|s| s.name == "browser-tools")
+    );
+    assert!(!loader.skill_diagnostics().iter().any(|d| {
+        d.path
+            .as_ref()
+            .is_some_and(|p| p.to_string_lossy().ends_with("EFFICIENCY.md"))
+    }));
 }
 
 #[test]
@@ -198,11 +203,13 @@ fn should_discover_prompts_from_agent_dir() {
     let mut loader = DefaultResourceLoader::new(fixture.options());
     loader.reload();
 
-    assert!(loader
-        .resources()
-        .prompts
-        .iter()
-        .any(|p| p.name == "test-prompt"));
+    assert!(
+        loader
+            .resources()
+            .prompts
+            .iter()
+            .any(|p| p.name == "test-prompt")
+    );
 }
 
 #[test]
@@ -269,18 +276,21 @@ fn should_prefer_project_resources_over_user_on_name_collisions() {
         .iter()
         .filter(|d| d.kind == DiagnosticKind::Collision)
         .collect();
-    assert!(collisions.iter().any(|d| d
-        .collision
-        .as_ref()
-        .is_some_and(|c| c.resource_type == DiagnosticResourceType::Prompt)));
-    assert!(collisions.iter().any(|d| d
-        .collision
-        .as_ref()
-        .is_some_and(|c| c.resource_type == DiagnosticResourceType::Skill)));
-    assert!(collisions.iter().any(|d| d
-        .collision
-        .as_ref()
-        .is_some_and(|c| c.resource_type == DiagnosticResourceType::Theme)));
+    assert!(collisions.iter().any(|d| {
+        d.collision
+            .as_ref()
+            .is_some_and(|c| c.resource_type == DiagnosticResourceType::Prompt)
+    }));
+    assert!(collisions.iter().any(|d| {
+        d.collision
+            .as_ref()
+            .is_some_and(|c| c.resource_type == DiagnosticResourceType::Skill)
+    }));
+    assert!(collisions.iter().any(|d| {
+        d.collision
+            .as_ref()
+            .is_some_and(|c| c.resource_type == DiagnosticResourceType::Theme)
+    }));
 }
 
 #[test]
@@ -315,16 +325,19 @@ fn should_honor_overrides_for_auto_discovered_resources() {
     let mut loader = DefaultResourceLoader::new(options);
     loader.reload();
 
-    assert!(!loader
-        .resources()
-        .skills
-        .iter()
-        .any(|s| s.name == "skip-skill"));
+    assert!(
+        !loader
+            .resources()
+            .skills
+            .iter()
+            .any(|s| s.name == "skip-skill")
+    );
     assert!(!loader.resources().prompts.iter().any(|p| p.name == "skip"));
-    assert!(!loader.resources().themes.iter().any(|t| t
-        .source_path
-        .as_ref()
-        .is_some_and(|p| p.to_string_lossy().ends_with("skip.json"))));
+    assert!(!loader.resources().themes.iter().any(|t| {
+        t.source_path
+            .as_ref()
+            .is_some_and(|p| p.to_string_lossy().ends_with("skip.json"))
+    }));
 }
 
 #[test]
@@ -338,11 +351,13 @@ fn should_discover_agents_md_context_files() {
     let mut loader = DefaultResourceLoader::new(fixture.options());
     loader.reload();
 
-    assert!(loader
-        .resources()
-        .context_files
-        .iter()
-        .any(|f| f.path == fixture.cwd.join("AGENTS.md")));
+    assert!(
+        loader
+            .resources()
+            .context_files
+            .iter()
+            .any(|f| f.path == fixture.cwd.join("AGENTS.md"))
+    );
 }
 
 #[test]
@@ -354,11 +369,11 @@ fn should_ignore_context_file_candidates_that_are_directories() {
     let mut loader = DefaultResourceLoader::new(fixture.options());
     loader.reload();
 
-    assert!(loader
-        .resources()
-        .context_files
-        .iter()
-        .any(|f| f.path == fixture.cwd.join("CLAUDE.md") && f.content == "Fallback instructions"));
+    assert!(
+        loader.resources().context_files.iter().any(
+            |f| f.path == fixture.cwd.join("CLAUDE.md") && f.content == "Fallback instructions"
+        )
+    );
 }
 
 #[test]
@@ -439,31 +454,41 @@ fn should_skip_project_resources_that_require_trust_when_project_is_not_trusted(
         Some("Global system prompt.")
     );
     // Context files load regardless of trust.
-    assert!(loader
-        .resources()
-        .context_files
-        .iter()
-        .any(|f| f.path == fixture.agent_dir.join("AGENTS.md")));
-    assert!(loader
-        .resources()
-        .context_files
-        .iter()
-        .any(|f| f.path == fixture.cwd.join("AGENTS.md")));
-    assert!(!loader
-        .resources()
-        .skills
-        .iter()
-        .any(|s| s.name == "project-skill"));
-    assert!(!loader
-        .resources()
-        .prompts
-        .iter()
-        .any(|p| p.name == "project"));
-    assert!(!loader
-        .resources()
-        .themes
-        .iter()
-        .any(|t| t.name.as_deref() == Some("project-theme")));
+    assert!(
+        loader
+            .resources()
+            .context_files
+            .iter()
+            .any(|f| f.path == fixture.agent_dir.join("AGENTS.md"))
+    );
+    assert!(
+        loader
+            .resources()
+            .context_files
+            .iter()
+            .any(|f| f.path == fixture.cwd.join("AGENTS.md"))
+    );
+    assert!(
+        !loader
+            .resources()
+            .skills
+            .iter()
+            .any(|s| s.name == "project-skill")
+    );
+    assert!(
+        !loader
+            .resources()
+            .prompts
+            .iter()
+            .any(|p| p.name == "project")
+    );
+    assert!(
+        !loader
+            .resources()
+            .themes
+            .iter()
+            .any(|t| t.name.as_deref() == Some("project-theme"))
+    );
 }
 
 #[test]
@@ -477,11 +502,13 @@ fn should_discover_append_system_md() {
     let mut loader = DefaultResourceLoader::new(fixture.options());
     loader.reload();
 
-    assert!(loader
-        .resources()
-        .append_system_prompt
-        .iter()
-        .any(|s| s == "Additional instructions."));
+    assert!(
+        loader
+            .resources()
+            .append_system_prompt
+            .iter()
+            .any(|s| s == "Additional instructions.")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -564,17 +591,21 @@ fn extend_resources_loads_skills_and_prompts_with_extension_metadata() {
     assert_eq!(skill.source_info.source, "extension:extra");
     assert_eq!(skill.source_info.path, skill_path);
 
-    assert!(loader
-        .resources()
-        .prompts
-        .iter()
-        .any(|p| p.name == "extra" && p.file_path == prompt_path));
+    assert!(
+        loader
+            .resources()
+            .prompts
+            .iter()
+            .any(|p| p.name == "extra" && p.file_path == prompt_path)
+    );
     // Prompt source info is exposed for the extension host (no sourceInfo on
     // the Rust PromptTemplate itself).
-    assert!(loader
-        .extension_prompt_source_infos()
-        .iter()
-        .any(|(p, _)| p == &prompt_path));
+    assert!(
+        loader
+            .extension_prompt_source_infos()
+            .iter()
+            .any(|(p, _)| p == &prompt_path)
+    );
 }
 
 #[test]
@@ -663,11 +694,13 @@ fn system_prompt_source_path_captured_for_existing_file() {
         Some(system_md.as_path()),
         "source path should be captured for existing SYSTEM.md"
     );
-    assert!(loader
-        .resources()
-        .system_prompt
-        .as_ref()
-        .is_some_and(|s| !s.is_empty()));
+    assert!(
+        loader
+            .resources()
+            .system_prompt
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+    );
 }
 
 #[test]
@@ -684,11 +717,13 @@ fn system_prompt_source_path_none_for_inline_text() {
         None,
         "inline system prompt should have no source path"
     );
-    assert!(loader
-        .resources()
-        .system_prompt
-        .as_ref()
-        .is_some_and(|s| s == "inline prompt text"));
+    assert!(
+        loader
+            .resources()
+            .system_prompt
+            .as_ref()
+            .is_some_and(|s| s == "inline prompt text")
+    );
 }
 
 #[test]
@@ -740,25 +775,31 @@ fn set_project_trusted_loads_second_phase_resources() {
     // Pre-trust group: only global/user resources.
     loader.reload();
     assert!(!loader.is_project_trusted());
-    assert!(loader
-        .resources()
-        .skills
-        .iter()
-        .any(|s| s.name == "global-skill"));
-    assert!(!loader
-        .resources()
-        .skills
-        .iter()
-        .any(|s| s.name == "phase-skill"));
+    assert!(
+        loader
+            .resources()
+            .skills
+            .iter()
+            .any(|s| s.name == "global-skill")
+    );
+    assert!(
+        !loader
+            .resources()
+            .skills
+            .iter()
+            .any(|s| s.name == "phase-skill")
+    );
 
     // Post-trust group: project resources join after trust resolves.
     loader.set_project_trusted(true);
     loader.reload();
-    assert!(loader
-        .resources()
-        .skills
-        .iter()
-        .any(|s| s.name == "phase-skill"));
+    assert!(
+        loader
+            .resources()
+            .skills
+            .iter()
+            .any(|s| s.name == "phase-skill")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -835,45 +876,57 @@ fn rank_order_prefers_project_settings_then_auto_then_user() {
 
     let mut settings_manager =
         SettingsManager::in_memory(Settings::new(), SettingsManagerCreateOptions::default());
-    settings_manager.set_skill_paths(vec![user_settings_skill
-        .parent()
-        .expect("parent")
-        .parent()
-        .expect("grandparent")
-        .to_string_lossy()
-        .into_owned()]);
-    settings_manager
-        .set_project_skill_paths(vec![project_settings_skill
+    settings_manager.set_skill_paths(vec![
+        user_settings_skill
             .parent()
             .expect("parent")
             .parent()
             .expect("grandparent")
             .to_string_lossy()
-            .into_owned()])
+            .into_owned(),
+    ]);
+    settings_manager
+        .set_project_skill_paths(vec![
+            project_settings_skill
+                .parent()
+                .expect("parent")
+                .parent()
+                .expect("grandparent")
+                .to_string_lossy()
+                .into_owned(),
+        ])
         .expect("project skills write");
-    settings_manager.set_prompt_template_paths(vec![user_settings_prompt
-        .parent()
-        .expect("parent")
-        .to_string_lossy()
-        .into_owned()]);
-    settings_manager
-        .set_project_prompt_template_paths(vec![project_settings_prompt
+    settings_manager.set_prompt_template_paths(vec![
+        user_settings_prompt
             .parent()
             .expect("parent")
             .to_string_lossy()
-            .into_owned()])
+            .into_owned(),
+    ]);
+    settings_manager
+        .set_project_prompt_template_paths(vec![
+            project_settings_prompt
+                .parent()
+                .expect("parent")
+                .to_string_lossy()
+                .into_owned(),
+        ])
         .expect("project prompts write");
-    settings_manager.set_theme_paths(vec![user_settings_theme
-        .parent()
-        .expect("parent")
-        .to_string_lossy()
-        .into_owned()]);
-    settings_manager
-        .set_project_theme_paths(vec![project_settings_theme
+    settings_manager.set_theme_paths(vec![
+        user_settings_theme
             .parent()
             .expect("parent")
             .to_string_lossy()
-            .into_owned()])
+            .into_owned(),
+    ]);
+    settings_manager
+        .set_project_theme_paths(vec![
+            project_settings_theme
+                .parent()
+                .expect("parent")
+                .to_string_lossy()
+                .into_owned(),
+        ])
         .expect("project themes write");
 
     let mut options = fixture.options();
@@ -1003,38 +1056,50 @@ fn missing_cli_paths_surface_diagnostics() {
 
     // Extensions placeholder: existence-check error with the resolved path.
     assert_eq!(loader.resources().extensions.errors.len(), 1);
-    assert!(loader.resources().extensions.errors[0]
-        .error
-        .contains("Extension path does not exist:"));
+    assert!(
+        loader.resources().extensions.errors[0]
+            .error
+            .contains("Extension path does not exist:")
+    );
     assert_eq!(loader.resources().extensions.errors[0].path, missing);
 
     // Skills/themes warn inside the loader pass, which suppresses the CLI
     // error (resource-loader.ts:425-432, 459-464 dedupe by path).
-    assert!(loader
-        .skill_diagnostics()
-        .iter()
-        .any(|d| d.kind == DiagnosticKind::Warning && d.message == "skill path does not exist"));
-    assert!(!loader
-        .skill_diagnostics()
-        .iter()
-        .any(|d| d.kind == DiagnosticKind::Error));
-    assert!(loader
-        .theme_diagnostics()
-        .iter()
-        .any(|d| d.kind == DiagnosticKind::Warning && d.message == "theme path does not exist"));
-    assert!(!loader
-        .theme_diagnostics()
-        .iter()
-        .any(|d| d.kind == DiagnosticKind::Error));
+    assert!(
+        loader
+            .skill_diagnostics()
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::Warning && d.message == "skill path does not exist")
+    );
+    assert!(
+        !loader
+            .skill_diagnostics()
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::Error)
+    );
+    assert!(
+        loader
+            .theme_diagnostics()
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::Warning && d.message == "theme path does not exist")
+    );
+    assert!(
+        !loader
+            .theme_diagnostics()
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::Error)
+    );
 
     // Prompt template loading skips missing paths silently, so the CLI error
     // fires (resource-loader.ts:440-451).
-    assert!(loader
-        .prompt_diagnostics()
-        .iter()
-        .any(|d| d.kind == DiagnosticKind::Error
-            && d.message == "Prompt template path does not exist"
-            && d.path.as_deref() == Some(missing.as_path())));
+    assert!(
+        loader
+            .prompt_diagnostics()
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::Error
+                && d.message == "Prompt template path does not exist"
+                && d.path.as_deref() == Some(missing.as_path()))
+    );
 }
 
 #[test]

@@ -50,7 +50,7 @@ use crate::core::themes::Theme;
 
 use super::dynamic_border::DynamicBorder;
 use super::keybinding_hints::{key_hint, key_text};
-use super::model_search::{get_model_selector_search_text, ModelSearchItem};
+use super::model_search::{ModelSearchItem, get_model_selector_search_text};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -829,7 +829,7 @@ mod tests {
     }}"#;
 
     async fn runtime_with_models_json(models_json: &str) -> (TempDir, Arc<ModelRuntime>) {
-        std::env::set_var(ENV_KEY, "test-api-key");
+        rpi_test_env::set_var(ENV_KEY, "test-api-key");
         let tmp = TempDir::new();
         let agent_dir = tmp.0.join("agent");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");

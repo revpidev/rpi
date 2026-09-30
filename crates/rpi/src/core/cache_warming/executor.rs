@@ -14,7 +14,7 @@ use rpi_ai::types::StopReason;
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use rpi_ext_host::types::{CacheWarmingAction, CacheWarmingDecisionEvent};
 
-use super::trigger::{lock, CacheWarmer, Phase};
+use super::trigger::{CacheWarmer, Phase, lock};
 
 /// Wall-clock epoch ms (`Date.now()`) for the `/session` display field.
 fn wall_epoch_ms() -> u64 {

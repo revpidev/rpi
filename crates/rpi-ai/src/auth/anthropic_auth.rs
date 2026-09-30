@@ -51,18 +51,18 @@ impl ApiKeyAuth for AnthropicApiKeyAuth {
         credential: Option<&ApiKeyCredential>,
     ) -> Result<Option<AuthResult>, ModelsError> {
         // Stored key wins (`credential?.key` — empty strings are falsy).
-        if let Some(credential) = credential {
-            if let Some(key) = credential.key.clone().filter(|key| !key.is_empty()) {
-                return Ok(Some(AuthResult {
-                    auth: ModelAuth {
-                        api_key: Some(key),
-                        headers: None,
-                        base_url: None,
-                    },
-                    env: credential.env.clone(),
-                    source: Some("stored credential".to_owned()),
-                }));
-            }
+        if let Some(credential) = credential
+            && let Some(key) = credential.key.clone().filter(|key| !key.is_empty())
+        {
+            return Ok(Some(AuthResult {
+                auth: ModelAuth {
+                    api_key: Some(key),
+                    headers: None,
+                    base_url: None,
+                },
+                env: credential.env.clone(),
+                source: Some("stored credential".to_owned()),
+            }));
         }
 
         // ANTHROPIC_AUTH_TOKEN → Authorization: Bearer header (not x-api-key).

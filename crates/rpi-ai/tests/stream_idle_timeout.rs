@@ -156,10 +156,10 @@ fn model(base_url: &str) -> Model {
 fn context() -> Context {
     Context {
         system_prompt: None,
-        messages: vec![serde_json::from_value(
-            json!({"role": "user", "content": "hello", "timestamp": 1}),
-        )
-        .expect("user")],
+        messages: vec![
+            serde_json::from_value(json!({"role": "user", "content": "hello", "timestamp": 1}))
+                .expect("user"),
+        ],
         tools: None,
     }
 }

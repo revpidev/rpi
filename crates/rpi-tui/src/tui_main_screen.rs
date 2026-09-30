@@ -35,13 +35,13 @@ use crate::terminal::{InputHandler, ResizeHandler, Terminal};
 use crate::terminal_colors::{RgbColor, TerminalColorScheme};
 use crate::terminal_image::{delete_kitty_image, is_image_line};
 use crate::tui::{
-    lock_component, lock_shared, same_component, OverlayHandle, OverlayOptions, RenderHandle,
-    SharedComponent, SharedTerminal, TerminalColorSchemeListener, Tui, TuiInputListener, TuiMode,
-    TuiStopOptions,
+    OverlayHandle, OverlayOptions, RenderHandle, SharedComponent, SharedTerminal,
+    TerminalColorSchemeListener, Tui, TuiInputListener, TuiMode, TuiStopOptions, lock_component,
+    lock_shared, same_component,
 };
 use crate::tui_base::{
-    env_flag_is_1, schedule_render, CursorPos, PendingOsc11BackgroundQuery,
-    PendingTerminalColorSchemeQuery, RenderSchedule, TerminalSizeCache, TuiBase,
+    CursorPos, PendingOsc11BackgroundQuery, PendingTerminalColorSchemeQuery, RenderSchedule,
+    TerminalSizeCache, TuiBase, env_flag_is_1, schedule_render,
 };
 use crate::utils::{slice_by_column, visible_width, width_divergence_extra};
 
@@ -1881,20 +1881,20 @@ mod tests {
     use super::*;
     use crate::keys::{is_key_release, matches_key};
     use crate::test_vt::{
-        render_and_flush, send_input, settle, state_lock, EnvGuard, TestTui, VirtualTerminal,
+        EnvGuard, TestTui, VirtualTerminal, render_and_flush, send_input, settle, state_lock,
     };
     use crate::tui::{
-        composite_tui_line, shared_component, Component, Focusable, OverlayAnchor, OverlayMargin,
-        OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, SizeValue,
-        TuiInputListenerResult, CURSOR_MARKER,
+        CURSOR_MARKER, Component, Focusable, OverlayAnchor, OverlayMargin, OverlayMarginSpec,
+        OverlayOptions, OverlayUnfocusOptions, SizeValue, TuiInputListenerResult,
+        composite_tui_line, shared_component,
     };
     use crate::tui_base::TuiBase;
     use crate::utils::slice_by_column;
     use std::sync::atomic::AtomicBool;
 
     use crate::terminal_image::{
-        reset_capabilities_cache, set_capabilities, set_cell_dimensions, CellDimensions,
-        TerminalCapabilities,
+        CellDimensions, TerminalCapabilities, reset_capabilities_cache, set_capabilities,
+        set_cell_dimensions,
     };
 
     /// `TestTui` drive impl backing the shared settle/render helpers.
@@ -2180,7 +2180,7 @@ mod tests {
         }
     }
 
-    use crate::terminal_image::{allocate_image_id, encode_kitty, KittyEncodeOptions};
+    use crate::terminal_image::{KittyEncodeOptions, allocate_image_id, encode_kitty};
 
     /// Kitty image lines like the upstream `Image` component produces
     /// (image.ts:90-98): the placement sequence followed by `rows - 1`
@@ -5141,18 +5141,24 @@ mod tests {
         tui.start();
         settle(&tui);
 
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("first")));
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("second")));
-        assert!(terminal
-            .get_viewport()
-            .iter()
-            .any(|line| line.contains("third")));
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("first"))
+        );
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("second"))
+        );
+        assert!(
+            terminal
+                .get_viewport()
+                .iter()
+                .any(|line| line.contains("third"))
+        );
 
         tui.clear();
         tui.request_render(false);

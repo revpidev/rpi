@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -19,7 +19,7 @@ use rpi_ai::types::{TextContent, ToolResultContent};
 use crate::tools::output_accumulator::{
     OutputAccumulator, OutputAccumulatorOptions, OutputSnapshot,
 };
-use crate::tools::truncate::{format_size, TruncatedBy, DEFAULT_MAX_BYTES};
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, TruncatedBy, format_size};
 use crate::tools::{SessionEnv, ToolContext};
 
 pub const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
@@ -384,12 +384,10 @@ impl BashOperations for LocalBashOperations {
             });
         }
         drop(tx);
-        if from_stdin {
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(command.as_bytes()).await;
-                let _ = stdin.shutdown().await;
-            }
+        if from_stdin && let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(command.as_bytes()).await;
+            let _ = stdin.shutdown().await;
         }
         let mut timed_out = false;
         let mut aborted = false;
@@ -469,10 +467,10 @@ struct BashTool {
 
 fn make_details(snapshot: &OutputSnapshot) -> Value {
     let mut map = serde_json::Map::new();
-    if snapshot.truncation.truncated {
-        if let Ok(v) = serde_json::to_value(&snapshot.truncation) {
-            map.insert("truncation".into(), v);
-        }
+    if snapshot.truncation.truncated
+        && let Ok(v) = serde_json::to_value(&snapshot.truncation)
+    {
+        map.insert("truncation".into(), v);
     }
     if let Some(ref p) = snapshot.full_output_path {
         map.insert(
@@ -552,22 +550,22 @@ impl BashTool {
         ] {
             env.remove(*k);
         }
-        if self.expose_session_environment {
-            if let Some(ref cell) = self.session_env {
-                let s = cell.read().unwrap_or_else(|e| e.into_inner());
-                env.insert("RPI_SESSION_ID".into(), s.session_id.clone());
-                if let Some(ref f) = s.session_file {
-                    env.insert("RPI_SESSION_FILE".into(), f.to_string_lossy().into_owned());
-                }
-                if let Some(ref p) = s.provider {
-                    env.insert("RPI_PROVIDER".into(), p.clone());
-                }
-                if let Some(ref m) = s.model {
-                    env.insert("RPI_MODEL".into(), m.clone());
-                }
-                if let Some(ref l) = s.reasoning_level {
-                    env.insert("RPI_REASONING_LEVEL".into(), l.clone());
-                }
+        if self.expose_session_environment
+            && let Some(ref cell) = self.session_env
+        {
+            let s = cell.read().unwrap_or_else(|e| e.into_inner());
+            env.insert("RPI_SESSION_ID".into(), s.session_id.clone());
+            if let Some(ref f) = s.session_file {
+                env.insert("RPI_SESSION_FILE".into(), f.to_string_lossy().into_owned());
+            }
+            if let Some(ref p) = s.provider {
+                env.insert("RPI_PROVIDER".into(), p.clone());
+            }
+            if let Some(ref m) = s.model {
+                env.insert("RPI_MODEL".into(), m.clone());
+            }
+            if let Some(ref l) = s.reasoning_level {
+                env.insert("RPI_REASONING_LEVEL".into(), l.clone());
             }
         }
         let ctx = BashSpawnContext {

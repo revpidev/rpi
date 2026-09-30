@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
@@ -667,31 +667,31 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                 stdout_terminal.store(terminal, Ordering::SeqCst);
                 // Per-event streaming face (execution.ts:914/929/972/1005
                 // fireUpdate): one frame per progress-bearing event.
-                if let Some(ref fields) = status_fields {
-                    if let Some(status) = &step_status {
-                        status(child_index, fields);
-                    }
+                if let Some(ref fields) = status_fields
+                    && let Some(status) = &step_status
+                {
+                    status(child_index, fields);
                 }
-                if let Some((text, details)) = frame {
-                    if let Some(sink) = &frame_sink {
-                        // V13-03 FR-A event-path signature gate: same
-                        // activity signature as the last PUSHED frame is
-                        // skipped, except for the 1s heartbeat fallback
-                        // (R3) and the must-push frames (R4: first frame,
-                        // terminal/drain frame).
-                        let signature = frame_signature(status_fields.as_ref(), &text);
-                        let must_push = last_pushed.is_none()
-                            || terminal
-                            || last_pushed
-                                .as_ref()
-                                .is_some_and(|(prev, _)| *prev != signature);
-                        let heartbeat = last_pushed.as_ref().is_some_and(|(_, at)| {
-                            at.elapsed() >= Duration::from_millis(ACTIVITY_TICK_MS)
-                        });
-                        if must_push || heartbeat {
-                            sink(&text, &details);
-                            last_pushed = Some((signature, std::time::Instant::now()));
-                        }
+                if let Some((text, details)) = frame
+                    && let Some(sink) = &frame_sink
+                {
+                    // V13-03 FR-A event-path signature gate: same
+                    // activity signature as the last PUSHED frame is
+                    // skipped, except for the 1s heartbeat fallback
+                    // (R3) and the must-push frames (R4: first frame,
+                    // terminal/drain frame).
+                    let signature = frame_signature(status_fields.as_ref(), &text);
+                    let must_push = last_pushed.is_none()
+                        || terminal
+                        || last_pushed
+                            .as_ref()
+                            .is_some_and(|(prev, _)| *prev != signature);
+                    let heartbeat = last_pushed.as_ref().is_some_and(|(_, at)| {
+                        at.elapsed() >= Duration::from_millis(ACTIVITY_TICK_MS)
+                    });
+                    if must_push || heartbeat {
+                        sink(&text, &details);
+                        last_pushed = Some((signature, std::time::Instant::now()));
                     }
                 }
             },
@@ -808,18 +808,17 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         let mut tick = tokio::time::interval(Duration::from_millis(ACTIVITY_TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // intervals fire immediately; upstream waits 1s
-                           // (the initial frame itself already fired before the
-                           // stdout reader was spawned — see above.)
+        // (the initial frame itself already fired before the
+        // stdout reader was spawned — see above.)
         let mut child_guard = child_handle.lock().await;
         loop {
             tokio::select! {
                 status = child_guard.wait() => break WaitOutcome::Exited(status),
                 _ = tick.tick() => {
-                    if let Some(probe) = &input.abort_probe {
-                        if probe() {
+                    if let Some(probe) = &input.abort_probe
+                        && probe() {
                             kill_child(&mut user_aborted);
                         }
-                    }
                     // #55 intercom coordination (upstream execution.ts
                     // :1054 arms detach on the contact_supervisor tool
                     // start; rpi detects the persisted ask on the activity
@@ -848,10 +847,10 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         // No streaming sink → no ticker; poll the probe on a plain interval.
         let mut child_guard = child_handle.lock().await;
         loop {
-            if let Some(probe) = &input.abort_probe {
-                if probe() {
-                    kill_child(&mut user_aborted);
-                }
+            if let Some(probe) = &input.abort_probe
+                && probe()
+            {
+                kill_child(&mut user_aborted);
             }
             if let Some(ask) = pending_ask(input) {
                 break WaitOutcome::Detached(ask);
@@ -1297,20 +1296,20 @@ fn synthesize_exit_from_parts(
     } else {
         None
     };
-    if error.is_none() {
-        if let Some(stream_error) = stream_error {
-            error = Some(stream_error.to_string());
-        }
+    if error.is_none()
+        && let Some(stream_error) = stream_error
+    {
+        error = Some(stream_error.to_string());
     }
-    if error.is_none() {
-        if let Some(tool_diagnostic) = tool_diagnostic_error {
-            error = Some(tool_diagnostic.to_string());
-        }
+    if error.is_none()
+        && let Some(tool_diagnostic) = tool_diagnostic_error
+    {
+        error = Some(tool_diagnostic.to_string());
     }
-    if error.is_none() {
-        if let Some(assistant_error) = &state.assistant_error {
-            error = Some(assistant_error.clone());
-        }
+    if error.is_none()
+        && let Some(assistant_error) = &state.assistant_error
+    {
+        error = Some(assistant_error.clone());
     }
     // Unexplained signal: a signal we did not order (timed_out covered above).
     if error.is_none() && process_signal.is_some() {

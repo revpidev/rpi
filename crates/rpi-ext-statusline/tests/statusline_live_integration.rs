@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Recorded host calls: `(method, args)` in order.
 static RECORDS: OnceLock<Mutex<Vec<(String, Value)>>> = OnceLock::new();
@@ -159,7 +159,7 @@ fn captured_stdins(log: &std::path::Path) -> Vec<Value> {
 fn live_tokens_lifecycle_over_the_carrier_seam() {
     let agent = std::env::temp_dir().join(format!("rpi-statusline-live-{}", std::process::id()));
     std::fs::create_dir_all(&agent).expect("mkdir");
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent);
 
     // liveTokens configured BEFORE install (load-time evaluation).
     let stdin_log = agent.join("stdin.log");

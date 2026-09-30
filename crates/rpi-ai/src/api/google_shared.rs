@@ -17,7 +17,7 @@
 //! - `map_stop_reason` takes the wire string (the SDK's `FinishReason` enum is
 //!   string-valued; the unknown-case `never` throw becomes an `Err`).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::api::constrained_sampling::{
     get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
@@ -27,7 +27,7 @@ use crate::types::{
     ToolResultContent, TranscriptContext, UserContent, UserContentBlock,
 };
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions, RetryError,
+    ProviderErrorInfo, ProviderRetryOptions, RetryError, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::transform_messages::transform_messages;
@@ -190,10 +190,10 @@ pub fn is_thinking_part(thought: Option<bool>) -> bool {
 /// streamed block (some backends only send it on the first delta). Does NOT
 /// merge or move signatures across distinct response parts.
 pub fn retain_thought_signature(existing: Option<&str>, incoming: Option<&str>) -> Option<String> {
-    if let Some(incoming) = incoming {
-        if !incoming.is_empty() {
-            return Some(incoming.to_owned());
-        }
+    if let Some(incoming) = incoming
+        && !incoming.is_empty()
+    {
+        return Some(incoming.to_owned());
     }
     existing.map(str::to_owned)
 }

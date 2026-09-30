@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi::core::prompt_templates::{
-    expand_prompt_template, load_prompt_templates, load_templates_from_dir,
-    LoadPromptTemplatesOptions,
+    LoadPromptTemplatesOptions, expand_prompt_template, load_prompt_templates,
+    load_templates_from_dir,
 };
 
 // ---------------------------------------------------------------------------

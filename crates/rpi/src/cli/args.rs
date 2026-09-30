@@ -263,11 +263,12 @@ pub fn parse_args(args: &[String]) -> Args {
             }
         } else if arg == "--print" || arg == "-p" {
             result.print = true;
-            if let Some(next) = args.get(i + 1) {
-                if !next.starts_with('@') && (!next.starts_with('-') || next.starts_with("---")) {
-                    result.messages.push(next.clone());
-                    i += 1;
-                }
+            if let Some(next) = args.get(i + 1)
+                && !next.starts_with('@')
+                && (!next.starts_with('-') || next.starts_with("---"))
+            {
+                result.messages.push(next.clone());
+                i += 1;
             }
         } else if arg == "--export" && i + 1 < args.len() {
             i += 1;
@@ -743,19 +744,23 @@ mod tests {
         let result = args(&["--use-theme"]);
         assert_eq!(result.use_theme, None);
         assert_eq!(result.diagnostics.len(), 1);
-        assert!(result.diagnostics[0]
-            .message
-            .contains("--use-theme requires a theme name"));
+        assert!(
+            result.diagnostics[0]
+                .message
+                .contains("--use-theme requires a theme name")
+        );
     }
 
     #[test]
     fn test_use_theme_dash_prefixed_value_is_error() {
         let result = args(&["--use-theme", "-other-flag"]);
         assert_eq!(result.use_theme, None);
-        assert!(result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("--use-theme requires a theme name")));
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("--use-theme requires a theme name"))
+        );
     }
 
     // --version flag

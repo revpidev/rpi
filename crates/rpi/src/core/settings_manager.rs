@@ -702,10 +702,10 @@ impl SettingsStorage for FileSettingsStorage {
 
         let next = f(current.as_deref())?;
         if let Some(next) = next {
-            if let Some(dir) = &dir {
-                if !dir.exists() {
-                    std::fs::create_dir_all(dir)?;
-                }
+            if let Some(dir) = &dir
+                && !dir.exists()
+            {
+                std::fs::create_dir_all(dir)?;
             }
             if guard.is_none() {
                 guard = Some(Self::acquire_lock_with_retry(path, true)?);
@@ -778,36 +778,37 @@ impl SettingsStorage for InMemorySettingsStorage {
 /// content read back during writes (settings-manager.ts:365,586).
 fn migrate_settings(fields: &mut Map<String, Value>) {
     // Migrate queueMode -> steeringMode (settings-manager.ts:382-386).
-    if fields.contains_key("queueMode") && !fields.contains_key("steeringMode") {
-        if let Some(value) = fields.shift_remove("queueMode") {
-            fields.insert("steeringMode".to_string(), value);
-        }
+    if fields.contains_key("queueMode")
+        && !fields.contains_key("steeringMode")
+        && let Some(value) = fields.shift_remove("queueMode")
+    {
+        fields.insert("steeringMode".to_string(), value);
     }
 
     // Migrate legacy websockets boolean -> transport enum
     // (settings-manager.ts:388-392).
-    if !fields.contains_key("transport") {
-        if let Some(Value::Bool(websockets)) = fields.get("websockets") {
-            let websockets = *websockets;
-            fields.shift_remove("websockets");
-            fields.insert(
-                "transport".to_string(),
-                Value::String(if websockets { "websocket" } else { "sse" }.to_string()),
-            );
-        }
+    if !fields.contains_key("transport")
+        && let Some(Value::Bool(websockets)) = fields.get("websockets")
+    {
+        let websockets = *websockets;
+        fields.shift_remove("websockets");
+        fields.insert(
+            "transport".to_string(),
+            Value::String(if websockets { "websocket" } else { "sse" }.to_string()),
+        );
     }
 
     // Migrate old skills object format to new array format
     // (settings-manager.ts:394-413).
     if let Some(Value::Object(skills_settings)) = fields.get("skills") {
         let skills_settings = skills_settings.clone();
-        if let Some(enable_skill_commands) = skills_settings.get("enableSkillCommands") {
-            if !fields.contains_key("enableSkillCommands") {
-                fields.insert(
-                    "enableSkillCommands".to_string(),
-                    enable_skill_commands.clone(),
-                );
-            }
+        if let Some(enable_skill_commands) = skills_settings.get("enableSkillCommands")
+            && !fields.contains_key("enableSkillCommands")
+        {
+            fields.insert(
+                "enableSkillCommands".to_string(),
+                enable_skill_commands.clone(),
+            );
         }
         match skills_settings.get("customDirectories") {
             Some(Value::Array(directories)) if !directories.is_empty() => {
@@ -1208,15 +1209,15 @@ impl SettingsManager {
         modified_fields: HashSet<String>,
         modified_nested_fields: HashMap<String, HashSet<String>>,
     ) {
-        if scope == SettingsScope::Project {
-            if let Err(error) = self.assert_project_trusted_for_write() {
-                self.errors.push(to_settings_error(
-                    scope,
-                    error,
-                    self.settings_paths.get(&scope).cloned(),
-                ));
-                return;
-            }
+        if scope == SettingsScope::Project
+            && let Err(error) = self.assert_project_trusted_for_write()
+        {
+            self.errors.push(to_settings_error(
+                scope,
+                error,
+                self.settings_paths.get(&scope).cloned(),
+            ));
+            return;
         }
         match self.persist_scoped_settings(
             scope,
@@ -1805,10 +1806,10 @@ impl SettingsManager {
     /// `externalEditor` setting → `VISUAL` → `EDITOR` → platform default
     /// (`notepad` on Windows, `nano` elsewhere).
     pub fn get_external_editor_command(&self) -> String {
-        if let Some(editor) = self.settings.get_str("externalEditor") {
-            if !editor.trim().is_empty() {
-                return editor.to_string();
-            }
+        if let Some(editor) = self.settings.get_str("externalEditor")
+            && !editor.trim().is_empty()
+        {
+            return editor.to_string();
         }
         if let Some(editor) = environment::external_editor_from_env() {
             return editor;
@@ -2646,10 +2647,10 @@ fn fill_random_bytes(bytes: &mut [u8; 16]) {
     #[cfg(unix)]
     {
         use std::io::Read;
-        if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-            if file.read_exact(bytes).is_ok() {
-                return;
-            }
+        if let Ok(mut file) = std::fs::File::open("/dev/urandom")
+            && file.read_exact(bytes).is_ok()
+        {
+            return;
         }
     }
     // Fallback: time/pid/counter mix (same approach as tools::random_hex_16).
@@ -2696,8 +2697,8 @@ mod tests {
                 .collect();
             for (name, value) in vars {
                 match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
+                    Some(v) => rpi_test_env::set_var(name, v),
+                    None => rpi_test_env::remove_var(name),
                 }
             }
             (lock, EnvGuard { saved })
@@ -2708,8 +2709,8 @@ mod tests {
         fn drop(&mut self) {
             for (name, value) in &self.saved {
                 match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
+                    Some(v) => rpi_test_env::set_var(name, v),
+                    None => rpi_test_env::remove_var(name),
                 }
             }
         }
@@ -3326,8 +3327,8 @@ mod tests {
             "vim"
         );
 
-        std::env::remove_var(environment::ENV_VISUAL);
-        std::env::set_var(environment::ENV_EDITOR, "emacs");
+        rpi_test_env::remove_var(environment::ENV_VISUAL);
+        rpi_test_env::set_var(environment::ENV_EDITOR, "emacs");
         assert_eq!(
             SettingsManager::in_memory(Settings::new(), SettingsManagerCreateOptions::default())
                 .get_external_editor_command(),

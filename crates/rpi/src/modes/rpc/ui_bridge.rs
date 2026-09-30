@@ -17,7 +17,7 @@ use rpi_ext_host::api::{
     UiDialogOptions, Unsubscribe, WidgetContent, WorkingIndicatorOptions,
 };
 use rpi_ext_host::types::ComponentTree;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::core::output_guard::RawStdout;
@@ -79,7 +79,7 @@ impl RpcUiBridge {
         }
         self.emit(frame);
 
-        let response = match timeout_ms {
+        match timeout_ms {
             Some(ms) if ms > 0 => {
                 match tokio::time::timeout(std::time::Duration::from_millis(ms), rx).await {
                     Ok(received) => received.ok(),
@@ -92,8 +92,7 @@ impl RpcUiBridge {
                 }
             }
             _ => rx.await.ok(),
-        };
-        response
+        }
     }
 }
 

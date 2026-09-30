@@ -23,7 +23,7 @@
 pub mod host_call;
 pub mod ui_dispatch;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
 use wasmtime::AsContextMut;
@@ -366,10 +366,8 @@ impl Drop for WasmGuest {
             .exited
             .as_ref()
             .is_none_or(|exited| exited.wait_exit(SHUTDOWN_GRACE));
-        if joined {
-            if let Some(join) = self.join.take() {
-                let _ = join.join();
-            }
+        if joined && let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }

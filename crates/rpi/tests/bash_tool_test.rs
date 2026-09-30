@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rpi::tools::bash::{
-    create_bash_tool, create_local_bash_operations, BashExecOptions, BashSpawnContext,
-    BashToolOptions,
+    BashExecOptions, BashSpawnContext, BashToolOptions, create_bash_tool,
+    create_local_bash_operations,
 };
-use rpi::tools::bash_executor::{execute_bash, BashExecutorOptions};
+use rpi::tools::bash_executor::{BashExecutorOptions, execute_bash};
 use rpi::tools::{SessionEnv, ToolContext};
 use rpi_agent::types::AgentTool;
 use tokio_util::sync::CancellationToken;
@@ -302,8 +302,8 @@ mod bash_tool_tests {
     #[tokio::test]
     async fn test_rpi_env_stripped_when_no_session() {
         // Set a RPI_ var in the process env — the tool should strip it.
-        std::env::set_var("RPI_SESSION_ID", "should_be_stripped");
-        std::env::set_var("RPI_MODEL", "should_be_stripped_too");
+        rpi_test_env::set_var("RPI_SESSION_ID", "should_be_stripped");
+        rpi_test_env::set_var("RPI_MODEL", "should_be_stripped_too");
 
         let ctx = ToolContext {
             cwd: PathBuf::from("."),
@@ -316,8 +316,8 @@ mod bash_tool_tests {
             "RPI_ vars should be stripped: {out}"
         );
 
-        std::env::remove_var("RPI_SESSION_ID");
-        std::env::remove_var("RPI_MODEL");
+        rpi_test_env::remove_var("RPI_SESSION_ID");
+        rpi_test_env::remove_var("RPI_MODEL");
     }
 
     #[tokio::test]
@@ -364,14 +364,14 @@ mod bash_tool_tests {
         };
         let tool = create_bash_tool(&ctx, BashToolOptions::default());
 
-        std::env::set_var("RPI_BASH_PROBE_VAR", "first");
+        rpi_test_env::set_var("RPI_BASH_PROBE_VAR", "first");
         let out1 = run_bash(&tool, "echo $RPI_BASH_PROBE_VAR", None)
             .await
             .unwrap();
         assert!(out1.contains("first"), "out1: {out1}");
 
-        std::env::set_var("RPI_BASH_PROBE_VAR", "second");
-        std::env::set_var("RPI_MODEL", "inherited-wrong");
+        rpi_test_env::set_var("RPI_BASH_PROBE_VAR", "second");
+        rpi_test_env::set_var("RPI_MODEL", "inherited-wrong");
         let out2 = run_bash(&tool, "echo $RPI_BASH_PROBE_VAR $RPI_MODEL", None)
             .await
             .unwrap();
@@ -402,8 +402,8 @@ mod bash_tool_tests {
             "model switch effective at the next command start: {out3}"
         );
 
-        std::env::remove_var("RPI_BASH_PROBE_VAR");
-        std::env::remove_var("RPI_MODEL");
+        rpi_test_env::remove_var("RPI_BASH_PROBE_VAR");
+        rpi_test_env::remove_var("RPI_MODEL");
     }
 
     #[tokio::test]

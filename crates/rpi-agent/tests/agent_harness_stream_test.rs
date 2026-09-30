@@ -19,10 +19,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::StreamExt;
 use rpi_agent::error::AgentError;
+use rpi_agent::harness::session::Session as SessionFacade;
 use rpi_agent::harness::session::memory_storage::{
     InMemorySessionStorage, InMemorySessionStorageOptions,
 };
-use rpi_agent::harness::session::Session as SessionFacade;
 use rpi_agent::harness::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions,
     AgentHarnessStreamOptionsPatch, BeforeProviderPayloadResult, BeforeProviderRequestResult,
@@ -43,10 +43,10 @@ use rpi_ai::types::{
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_tool_call, FauxAiProvider, FauxProvider, FauxProviderOptions,
-    FauxResponseStep,
+    FauxAiProvider, FauxProvider, FauxProviderOptions, FauxResponseStep, faux_assistant_message,
+    faux_tool_call,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -613,7 +613,9 @@ impl Provider for PayloadProbeProvider {
 #[tokio::test]
 async fn test_provider_payload_hook_chaining() {
     let faux = FauxProvider::new(FauxProviderOptions::default());
-    faux.set_responses(vec![faux_assistant_message("ok", Default::default()).into()]);
+    faux.set_responses(vec![
+        faux_assistant_message("ok", Default::default()).into(),
+    ]);
     let captured_payload: Arc<Mutex<Option<Option<Value>>>> = Arc::new(Mutex::new(None));
     let models = Models::new(None);
     models.set_provider(Arc::new(PayloadProbeProvider {

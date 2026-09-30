@@ -7,7 +7,7 @@
 //! directions of the parity matrix. The L0 boundary forbids a test-time
 //! dependency on the `rpi` crate, hence the vector file.
 
-use rpi_ext_mcp_adapter::truncate::{truncate_head, TruncateOptions, TruncatedBy};
+use rpi_ext_mcp_adapter::truncate::{TruncateOptions, TruncatedBy, truncate_head};
 use serde_json::Value;
 
 fn sha256_hex(data: &[u8]) -> String {

@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::I18n;
-use crate::state::row_intent::{sentinels_to_append, RowKind};
+use crate::state::row_intent::{RowKind, sentinels_to_append};
 use crate::tool::types::QuestionData;
 
 /// One row in a question's item list (upstream `WrappingSelectItem`).

@@ -21,8 +21,8 @@ use futures::future::BoxFuture;
 use sha2::{Digest, Sha256};
 
 use crate::config::{
-    build_target, write_install_manifest_for, InstallManifest, APP_NAME, SELF_UPDATE_DOWNLOAD_URL,
-    VERSION,
+    APP_NAME, InstallManifest, SELF_UPDATE_DOWNLOAD_URL, VERSION, build_target,
+    write_install_manifest_for,
 };
 use crate::core::session_manager::now_iso8601;
 use crate::core::version_check::rpi_user_agent;
@@ -576,8 +576,8 @@ mod tests {
 
     use super::*;
     use crate::config::{install_manifest_path_for, read_install_manifest_for};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

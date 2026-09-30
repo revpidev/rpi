@@ -9,7 +9,7 @@
 //! dependency boundary); this module is pure `serde` + `serde_json`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Tool / command identity — verbatim string boundaries.

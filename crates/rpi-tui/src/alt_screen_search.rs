@@ -328,13 +328,11 @@ impl AltScreenSearchIndex {
             Some(source) => source.len() != lines.len(),
             None => true,
         };
-        if !source_changed {
-            if let Some(source) = &self.source_lines {
-                for (index, line) in lines.iter().enumerate() {
-                    if &source[index] != line {
-                        source_changed = true;
-                        break;
-                    }
+        if !source_changed && let Some(source) = &self.source_lines {
+            for (index, line) in lines.iter().enumerate() {
+                if &source[index] != line {
+                    source_changed = true;
+                    break;
                 }
             }
         }

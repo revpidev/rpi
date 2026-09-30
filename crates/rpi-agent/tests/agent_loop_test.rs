@@ -12,24 +12,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
 use futures::StreamExt;
+use futures::future::BoxFuture;
+use rpi_agent::AgentError;
 use rpi_agent::agent_loop::{
-    agent_loop, agent_loop_continue, AgentContext, AgentEventStream, AgentLoopConfig,
-    AgentLoopTurnUpdate, BeforeToolCallResult, ConvertToLlmFn,
+    AgentContext, AgentEventStream, AgentLoopConfig, AgentLoopTurnUpdate, BeforeToolCallResult,
+    ConvertToLlmFn, agent_loop, agent_loop_continue,
 };
-use rpi_agent::messages::{convert_to_llm, AgentMessage, CustomMessage, CustomRole};
+use rpi_agent::messages::{AgentMessage, CustomMessage, CustomRole, convert_to_llm};
 use rpi_agent::stream_fn::StreamFn;
 use rpi_agent::types::{
     AgentEvent, AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode,
 };
-use rpi_agent::AgentError;
 use rpi_ai::types::{
     ApiKind, AssistantContent, AssistantMessage, DoneReason, ErrorReason, InputModality, Message,
     Model, ModelCost, StopReason, StreamEvent, StreamOptions, TextContent, ToolResultContent,
     Usage, UserContent, UserMessage, UserRole,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -2146,10 +2146,12 @@ async fn agent_loop_continue_allows_custom_message_as_last_message() {
     assert_eq!(messages.len(), 1);
     assert_eq!(message_roles(&messages), ["assistant"]);
     let llm_context = recorded_context(&state, 0);
-    assert!(llm_context
-        .messages
-        .iter()
-        .any(|m| matches!(m, Message::User(u) if matches!(&u.content, UserContent::Blocks(_)))));
+    assert!(
+        llm_context
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if matches!(&u.content, UserContent::Blocks(_))))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2842,7 +2844,7 @@ async fn event_stream_buffered_drain_is_linear_9055() {
 /// tail is materialized once at finalize, never rewritten per delta).
 #[tokio::test]
 async fn v1513_streaming_deltas_share_one_arc_end_to_end() {
-    use rpi_agent::agent_loop::{run_agent_loop, AgentEventSink};
+    use rpi_agent::agent_loop::{AgentEventSink, run_agent_loop};
 
     const DELTAS: usize = 64;
 

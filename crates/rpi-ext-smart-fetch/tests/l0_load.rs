@@ -76,9 +76,7 @@ async fn l0_load_capability_denied_and_full_surface() {
     std::fs::create_dir_all(sandbox.join("proj/.rpi")).unwrap();
     std::fs::create_dir_all(sandbox.join("agent")).unwrap();
     // Safety of set_var in tests: this is the only test in this binary.
-    unsafe {
-        std::env::set_var("RPI_CODING_AGENT_DIR", sandbox.join("agent"));
-    }
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", sandbox.join("agent"));
 
     // 1. Without the `tools` capability registerTool is denied → load fails.
     let denied_package = package("denied", r#"["session"]"#, &plugin);

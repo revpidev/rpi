@@ -30,7 +30,7 @@ use rpi_ai::types::{
     AssistantContent, AssistantMessage, AssistantRole, CacheRetention, Context, Model, StopReason,
     StreamEvent, StreamOptions, TextContent, Usage, UserContentBlock, UserMessage, UserRole,
 };
-use rpi_ai::utils::retry::{retry_assistant_call, RetryCallbacks, RetryPolicy};
+use rpi_ai::utils::retry::{RetryCallbacks, RetryPolicy, retry_assistant_call};
 use rpi_ai::utils::text::content_text_assistant;
 use rpi_ai::utils::uuid::uuidv7_now;
 use serde_json::Value;
@@ -38,16 +38,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::now_millis;
 use crate::error::AgentError;
-use crate::messages::{convert_to_llm, AgentMessage};
-use crate::session::{build_context_messages, session_entry_to_context_messages, SessionEntry};
+use crate::messages::{AgentMessage, convert_to_llm};
+use crate::session::{SessionEntry, build_context_messages, session_entry_to_context_messages};
 use crate::stream_fn::{BoxStream, StreamFn};
 use crate::types::ThinkingLevel;
 use utils::{
-    compute_file_lists, create_file_ops, extract_file_ops_from_message, format_file_operations,
-    serialize_conversation, FileOperations, SUMMARIZATION_SYSTEM_PROMPT,
+    FileOperations, SUMMARIZATION_SYSTEM_PROMPT, compute_file_lists, create_file_ops,
+    extract_file_ops_from_message, format_file_operations, serialize_conversation,
 };
 
-pub use rpi_ai::utils::estimate::{calculate_context_tokens, ContextUsageEstimate};
+pub use rpi_ai::utils::estimate::{ContextUsageEstimate, calculate_context_tokens};
 
 // ============================================================================
 // File Operation Tracking
@@ -74,22 +74,22 @@ pub(crate) fn extract_file_operations(
 ) -> FileOperations {
     let mut file_ops = create_file_ops();
 
-    if let Some(index) = prev_compaction_index {
-        if let SessionEntry::Compaction(prev) = &entries[index] {
-            // fromHook field kept for session file compatibility; only
-            // pi-generated compactions carry the default details shape.
-            if prev.from_hook != Some(true) {
-                if let Some(details) = &prev.details {
-                    if let Some(read_files) = details.get("readFiles").and_then(Value::as_array) {
-                        for f in read_files.iter().filter_map(Value::as_str) {
-                            file_ops.read.insert(f.to_owned());
-                        }
-                    }
-                    if let Some(modified) = details.get("modifiedFiles").and_then(Value::as_array) {
-                        for f in modified.iter().filter_map(Value::as_str) {
-                            file_ops.edited.insert(f.to_owned());
-                        }
-                    }
+    if let Some(index) = prev_compaction_index
+        && let SessionEntry::Compaction(prev) = &entries[index]
+    {
+        // fromHook field kept for session file compatibility; only
+        // pi-generated compactions carry the default details shape.
+        if prev.from_hook != Some(true)
+            && let Some(details) = &prev.details
+        {
+            if let Some(read_files) = details.get("readFiles").and_then(Value::as_array) {
+                for f in read_files.iter().filter_map(Value::as_str) {
+                    file_ops.read.insert(f.to_owned());
+                }
+            }
+            if let Some(modified) = details.get("modifiedFiles").and_then(Value::as_array) {
+                for f in modified.iter().filter_map(Value::as_str) {
+                    file_ops.edited.insert(f.to_owned());
                 }
             }
         }
@@ -199,13 +199,12 @@ pub const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = CompactionSettings {
 /// `getAssistantUsage` (compaction.ts:154-167): usage of an assistant
 /// message, skipping aborted/error/all-zero messages.
 fn get_assistant_usage(msg: &AgentMessage) -> Option<&Usage> {
-    if let AgentMessage::Assistant(assistant) = msg {
-        if assistant.stop_reason != StopReason::Aborted
-            && assistant.stop_reason != StopReason::Error
-            && calculate_context_tokens(&assistant.usage) > 0
-        {
-            return Some(&assistant.usage);
-        }
+    if let AgentMessage::Assistant(assistant) = msg
+        && assistant.stop_reason != StopReason::Aborted
+        && assistant.stop_reason != StopReason::Error
+        && calculate_context_tokens(&assistant.usage) > 0
+    {
+        return Some(&assistant.usage);
     }
     None
 }
@@ -214,10 +213,10 @@ fn get_assistant_usage(msg: &AgentMessage) -> Option<&Usage> {
 /// usage from session entries.
 pub fn get_last_assistant_usage(entries: &[SessionEntry]) -> Option<&Usage> {
     for entry in entries.iter().rev() {
-        if let SessionEntry::Message(m) = entry {
-            if let Some(usage) = get_assistant_usage(&m.message) {
-                return Some(usage);
-            }
+        if let SessionEntry::Message(m) = entry
+            && let Some(usage) = get_assistant_usage(&m.message)
+        {
+            return Some(usage);
         }
     }
     None
@@ -980,12 +979,12 @@ pub fn prepare_compaction(
 
     // Messages for the turn prefix summary (when splitting a turn).
     let mut turn_prefix_messages: Vec<AgentMessage> = Vec::new();
-    if cut_point.is_split_turn {
-        if let Some(turn_start) = cut_point.turn_start_index {
-            for entry in &path_entries[turn_start..cut_point.first_kept_entry_index] {
-                if let Some(msg) = get_message_from_entry_for_compaction(entry) {
-                    turn_prefix_messages.push(msg);
-                }
+    if cut_point.is_split_turn
+        && let Some(turn_start) = cut_point.turn_start_index
+    {
+        for entry in &path_entries[turn_start..cut_point.first_kept_entry_index] {
+            if let Some(msg) = get_message_from_entry_for_compaction(entry) {
+                turn_prefix_messages.push(msg);
             }
         }
     }
@@ -1123,8 +1122,9 @@ async fn generate_turn_prefix_summary(
     let max_tokens = summary_max_tokens(reserve_tokens, 0.5, model);
     let llm_messages = convert_to_llm(messages);
     let conversation_text = serialize_conversation(&llm_messages);
-    let prompt_text =
-        format!("<conversation>\n{conversation_text}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}");
+    let prompt_text = format!(
+        "<conversation>\n{conversation_text}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+    );
     let summarization_messages = vec![rpi_ai::types::Message::User(UserMessage {
         role: UserRole::User,
         content: rpi_ai::types::UserContent::Blocks(vec![UserContentBlock::Text(TextContent {

@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -39,10 +39,10 @@ use crate::harness::tools::tool_context::ToolContext;
 use crate::harness::tools::truncation_to_value;
 use crate::harness::types::{AgentHarnessTool, ExecutionErrorCode};
 use crate::harness::utils::shell_output::{
-    execute_shell_with_capture, ShellCaptureOptions, ShellCaptureProgress,
+    ShellCaptureOptions, ShellCaptureProgress, execute_shell_with_capture,
 };
 use crate::harness::utils::truncate::{
-    format_size, TruncatedBy, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, TruncationResult, format_size,
 };
 use crate::types::{AgentToolResult, AgentToolUpdateCallback};
 
@@ -466,13 +466,13 @@ impl<TContext: ToolContext> AgentHarnessTool<TContext> for BashTool<TContext> {
             }
             return Err(AgentError::Message(error.message.clone()));
         }
-        if let Some(exit_code) = capture_result.exit_code {
-            if exit_code != 0 {
-                return Err(AgentError::Message(append_status(
-                    &output_text,
-                    format!("Command exited with code {exit_code}"),
-                )));
-            }
+        if let Some(exit_code) = capture_result.exit_code
+            && exit_code != 0
+        {
+            return Err(AgentError::Message(append_status(
+                &output_text,
+                format!("Command exited with code {exit_code}"),
+            )));
         }
 
         Ok(AgentToolResult {
@@ -507,8 +507,8 @@ mod tests {
 
     use super::*;
     use crate::harness::env::nodejs::NodeExecutionEnv;
-    use crate::harness::tools::test_helpers::{text_output, TempDir, ToolEnv};
     use crate::harness::tools::ExecutionToolContext;
+    use crate::harness::tools::test_helpers::{TempDir, ToolEnv, text_output};
     use crate::harness::types::{ExecutionEnv, FileSystem, ShellExecResult};
 
     fn context(env: NodeExecutionEnv) -> ExecutionToolContext {
@@ -568,9 +568,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Command timed out after 0.01 seconds"));
+        assert!(
+            err.to_string()
+                .contains("Command timed out after 0.01 seconds")
+        );
     }
 
     #[tokio::test]
@@ -675,8 +676,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(text_output(&result)
-            .contains("Showing last 50.0KB of line 1 (line is 58.6KB). Full output:"));
+        assert!(
+            text_output(&result)
+                .contains("Showing last 50.0KB of line 1 (line is 58.6KB). Full output:")
+        );
     }
 
     #[tokio::test]

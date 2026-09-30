@@ -9,10 +9,10 @@
 use std::sync::Arc;
 
 use crate::api::openai_codex_responses::OpenAiCodexResponses;
-use crate::auth::oauth::openai_codex_oauth;
 use crate::auth::ProviderAuth;
+use crate::auth::oauth::openai_codex_oauth;
 use crate::generated::get_builtin_models;
-use crate::models::{create_provider, CreateProviderOptions, Provider, ProviderApi};
+use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `openaiCodexProvider()`.
 pub fn openai_codex_provider() -> Arc<dyn Provider> {

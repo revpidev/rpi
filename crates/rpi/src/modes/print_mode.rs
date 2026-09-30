@@ -45,7 +45,7 @@ pub struct PrintModeOptions {
 fn register_signal_handlers() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         for (kind, code) in [(SignalKind::terminate(), 143), (SignalKind::hangup(), 129)] {
             if let Ok(mut stream) = signal(kind) {
                 std::thread::spawn(move || {

@@ -86,12 +86,12 @@ impl RawStdout {
     /// already drains before returning, so this only flushes the writer.
     pub fn flush(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(error) = inner.out.flush() {
-            if inner.error.is_none() {
-                inner.error = Some(error);
-                drop(inner);
-                self.error_notify.notify_one();
-            }
+        if let Err(error) = inner.out.flush()
+            && inner.error.is_none()
+        {
+            inner.error = Some(error);
+            drop(inner);
+            self.error_notify.notify_one();
         }
     }
 

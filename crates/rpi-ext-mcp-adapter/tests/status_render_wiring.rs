@@ -12,7 +12,7 @@ use std::sync::Mutex as StdMutex;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
 use rpi_ext_mcp_adapter::{dispatch, install_for_test};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 进程内假宿主：记录 registerTool 的 definition 全量与 ui.setStatus 序列。
 struct FakeHost {
@@ -144,15 +144,15 @@ async fn status_bar_and_render_result_are_wired_to_the_host() {
     )
     .expect("config");
 
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
     let saved_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &dir);
+    rpi_test_env::set_var("HOME", &dir);
     // MCP_DIRECT_TOOLS 隔离（对齐上游 `__tests__/lifecycle-lazy-keep-alive-init.test.ts:90-95`）：
     // 子代理环境会注入 `MCP_DIRECT_TOOLS=__none__`（pi-subagents
     // child-launch.ts:159），本用例断言 direct 工具定义带 renderResult，
     // 必须清空该变量后恢复。
     let saved_direct_tools = std::env::var_os("MCP_DIRECT_TOOLS");
-    std::env::remove_var("MCP_DIRECT_TOOLS");
+    rpi_test_env::remove_var("MCP_DIRECT_TOOLS");
 
     let host = FakeHost::new(&dir.to_string_lossy());
     let host_ptr = Arc::into_raw(host.clone()) as PluginCookie;
@@ -264,14 +264,14 @@ async fn status_bar_and_render_result_are_wired_to_the_host() {
     );
 
     // 环境恢复。
-    std::env::remove_var("RPI_CODING_AGENT_DIR");
+    rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
     match saved_home {
-        Some(home) => std::env::set_var("HOME", home),
-        None => std::env::remove_var("HOME"),
+        Some(home) => rpi_test_env::set_var("HOME", home),
+        None => rpi_test_env::remove_var("HOME"),
     }
     match saved_direct_tools {
-        Some(value) => std::env::set_var("MCP_DIRECT_TOOLS", value),
-        None => std::env::remove_var("MCP_DIRECT_TOOLS"),
+        Some(value) => rpi_test_env::set_var("MCP_DIRECT_TOOLS", value),
+        None => rpi_test_env::remove_var("MCP_DIRECT_TOOLS"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Recorded host calls: `(method, args)` in order.
 static RECORDS: OnceLock<Mutex<Vec<(String, Value)>>> = OnceLock::new();
@@ -134,7 +134,7 @@ fn statusline_lifecycle_over_the_carrier_seam() {
     // Temp agent dir so settings.json is fully test-owned.
     let agent = std::env::temp_dir().join(format!("rpi-statusline-it-{}", std::process::id()));
     std::fs::create_dir_all(&agent).expect("mkdir");
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent);
     write_settings(json!({}));
 
     install_fake_ctx();
@@ -222,11 +222,13 @@ fn statusline_lifecycle_over_the_carrier_seam() {
         footer_args.pointer("/component/children/0/props/truncate"),
         Some(&json!(true))
     );
-    assert!(footer_args
-        .pointer("/component/children/0/props")
-        .expect("props")
-        .get("fg")
-        .is_none());
+    assert!(
+        footer_args
+            .pointer("/component/children/0/props")
+            .expect("props")
+            .get("fg")
+            .is_none()
+    );
     // stdin payload: CC field names, plugin-accumulated values.
     let stdin: Value =
         serde_json::from_str(&std::fs::read_to_string(&stdin_capture).expect("captured stdin"))

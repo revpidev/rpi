@@ -201,10 +201,10 @@ fn schema_allows_null(schema: &Value) -> bool {
     if object.get("const") == Some(&serde_json::json!(null)) {
         return true;
     }
-    if let Some(Value::Array(variants)) = object.get("enum") {
-        if variants.contains(&serde_json::json!(null)) {
-            return true;
-        }
+    if let Some(Value::Array(variants)) = object.get("enum")
+        && variants.contains(&serde_json::json!(null))
+    {
+        return true;
     }
     match object.get("anyOf") {
         Some(Value::Array(variants)) => variants.iter().any(schema_allows_null),
@@ -255,15 +255,15 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<(), String> {
     if !is_object_schema {
         return Ok(());
     }
-    if let Some(additional) = object.get("additionalProperties") {
-        if additional != &serde_json::json!(false) {
-            return Err("schema-valued or true additionalProperties is unsupported".to_owned());
-        }
+    if let Some(additional) = object.get("additionalProperties")
+        && additional != &serde_json::json!(false)
+    {
+        return Err("schema-valued or true additionalProperties is unsupported".to_owned());
     }
-    if let Some(properties) = object.get("properties") {
-        if !properties.is_object() {
-            return Err("object properties must be a schema map".to_owned());
-        }
+    if let Some(properties) = object.get("properties")
+        && !properties.is_object()
+    {
+        return Err("object properties must be a schema map".to_owned());
     }
     if let Some(required) = object.get("required") {
         let Some(entries) = required.as_array() else {
@@ -542,9 +542,11 @@ mod tests {
             json!({"type": "string"})
         );
         // Input schema is not mutated.
-        assert!(schema["properties"]["nested"]
-            .get("additionalProperties")
-            .is_none());
+        assert!(
+            schema["properties"]["nested"]
+                .get("additionalProperties")
+                .is_none()
+        );
     }
 
     /// Unsupported constructs: `$ref` / tuple items / object unions error

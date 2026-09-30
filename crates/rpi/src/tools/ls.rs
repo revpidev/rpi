@@ -18,12 +18,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rpi_agent::{AgentError, AgentTool, AgentToolResult, AgentToolUpdateCallback};
 use rpi_ai::types::{TextContent, ToolResultContent};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::path_utils::resolve_to_cwd;
-use crate::tools::truncate::{format_size, truncate_head, TruncateOptions, DEFAULT_MAX_BYTES};
 use crate::tools::ToolContext;
+use crate::tools::path_utils::resolve_to_cwd;
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, TruncateOptions, format_size, truncate_head};
 
 /// Default maximum number of entries (ls.ts:21).
 const DEFAULT_LIMIT: f64 = 500.0;

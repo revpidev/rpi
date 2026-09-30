@@ -17,24 +17,24 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 use rpi::core::agent_session_runtime::{
-    create_agent_session_runtime, AgentSessionRuntime, CreateAgentSessionRuntimeFactory,
-    CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    AgentSessionRuntime, CreateAgentSessionRuntimeFactory, CreateAgentSessionRuntimeResult,
+    CreateRuntimeOptions, create_agent_session_runtime,
 };
 use rpi::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::output_guard::RawStdout;
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
-use rpi::modes::print_mode::{run_print_mode, PrintModeOptions, PrintOutputMode};
+use rpi::modes::print_mode::{PrintModeOptions, PrintOutputMode, run_print_mode};
 use rpi::modes::rpc::run_rpc_mode;
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAiProvider, FauxAssistantOptions, FauxModelDefinition,
-    FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message,
 };
 
 const DEADLINE: Duration = Duration::from_secs(15);

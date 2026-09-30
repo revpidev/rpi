@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::AdapterError;
@@ -771,11 +771,11 @@ impl OAuthCredentialStore {
     /// plaintext file follows.
     pub fn remove_entry(&self, server_name: &str) -> Result<(), AdapterError> {
         let account = get_auth_entry_account(server_name);
-        if let Some(payload) = self.backend.read(&account)? {
-            if let Some(manifest) = parse_chunk_manifest(&payload) {
-                for chunk_account in get_chunk_accounts(&account, &manifest) {
-                    self.backend.remove(&chunk_account)?;
-                }
+        if let Some(payload) = self.backend.read(&account)?
+            && let Some(manifest) = parse_chunk_manifest(&payload)
+        {
+            for chunk_account in get_chunk_accounts(&account, &manifest) {
+                self.backend.remove(&chunk_account)?;
             }
         }
         self.backend.remove(&account)?;
@@ -831,12 +831,12 @@ impl OAuthCredentialStore {
         server_url: Option<&str>,
     ) -> Result<(), AdapterError> {
         let mut entry = self.get_entry(server_name)?.unwrap_or_default();
-        if let Some(url) = server_url {
-            if entry.server_url.as_deref() != Some(url) {
-                entry.client_info = None;
-                entry.code_verifier = None;
-                entry.oauth_state = None;
-            }
+        if let Some(url) = server_url
+            && entry.server_url.as_deref() != Some(url)
+        {
+            entry.client_info = None;
+            entry.code_verifier = None;
+            entry.oauth_state = None;
         }
         entry.tokens = Some(tokens);
         self.save_entry(server_name, entry, server_url)
@@ -850,12 +850,12 @@ impl OAuthCredentialStore {
         server_url: Option<&str>,
     ) -> Result<(), AdapterError> {
         let mut entry = self.get_entry(server_name)?.unwrap_or_default();
-        if let Some(url) = server_url {
-            if entry.server_url.as_deref() != Some(url) {
-                entry.tokens = None;
-                entry.code_verifier = None;
-                entry.oauth_state = None;
-            }
+        if let Some(url) = server_url
+            && entry.server_url.as_deref() != Some(url)
+        {
+            entry.tokens = None;
+            entry.code_verifier = None;
+            entry.oauth_state = None;
         }
         entry.client_info = Some(client_info);
         self.save_entry(server_name, entry, server_url)
@@ -869,12 +869,12 @@ impl OAuthCredentialStore {
         server_url: Option<&str>,
     ) -> Result<(), AdapterError> {
         let mut entry = self.get_entry(server_name)?.unwrap_or_default();
-        if let Some(url) = server_url {
-            if entry.server_url.as_deref() != Some(url) {
-                entry.tokens = None;
-                entry.client_info = None;
-                entry.oauth_state = None;
-            }
+        if let Some(url) = server_url
+            && entry.server_url.as_deref() != Some(url)
+        {
+            entry.tokens = None;
+            entry.client_info = None;
+            entry.oauth_state = None;
         }
         entry.code_verifier = Some(code_verifier);
         self.save_entry(server_name, entry, server_url)
@@ -888,12 +888,12 @@ impl OAuthCredentialStore {
         server_url: Option<&str>,
     ) -> Result<(), AdapterError> {
         let mut entry = self.get_entry(server_name)?.unwrap_or_default();
-        if let Some(url) = server_url {
-            if entry.server_url.as_deref() != Some(url) {
-                entry.tokens = None;
-                entry.client_info = None;
-                entry.code_verifier = None;
-            }
+        if let Some(url) = server_url
+            && entry.server_url.as_deref() != Some(url)
+        {
+            entry.tokens = None;
+            entry.client_info = None;
+            entry.code_verifier = None;
         }
         entry.oauth_state = Some(state);
         self.save_entry(server_name, entry, server_url)
@@ -1123,14 +1123,18 @@ mod tests {
         };
         cred_store.save_entry("srv", entry, None).unwrap();
 
-        assert!(cred_store
-            .get_for_url("srv", "https://old.test/mcp")
-            .unwrap()
-            .is_some());
-        assert!(cred_store
-            .get_for_url("srv", "https://new.test/mcp")
-            .unwrap()
-            .is_none());
+        assert!(
+            cred_store
+                .get_for_url("srv", "https://old.test/mcp")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cred_store
+                .get_for_url("srv", "https://new.test/mcp")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

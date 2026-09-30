@@ -685,19 +685,19 @@ pub fn merge_server_maps(
             }
             base_entry = Some(entry);
         }
-        if let (Some(existing), Some(base)) = (existing, base_entry.as_mut()) {
-            if let Some(Value::String(new_url)) = definition.get("url") {
-                // `definition.url !== existing.url` — plain strict-equality
-                // against the ORIGINAL entry (missing url ≠ any override
-                // url, so a command→url switch also strips auth).
-                let url_changed = existing.get("url") != Some(&Value::String(new_url.clone()));
-                if url_changed {
-                    for field in URL_BOUND_AUTH_FIELDS {
-                        base.shift_remove(field);
-                    }
-                    if base.get("oauth") != Some(&Value::Bool(false)) {
-                        base.shift_remove("oauth");
-                    }
+        if let (Some(existing), Some(base)) = (existing, base_entry.as_mut())
+            && let Some(Value::String(new_url)) = definition.get("url")
+        {
+            // `definition.url !== existing.url` — plain strict-equality
+            // against the ORIGINAL entry (missing url ≠ any override
+            // url, so a command→url switch also strips auth).
+            let url_changed = existing.get("url") != Some(&Value::String(new_url.clone()));
+            if url_changed {
+                for field in URL_BOUND_AUTH_FIELDS {
+                    base.shift_remove(field);
+                }
+                if base.get("oauth") != Some(&Value::Bool(false)) {
+                    base.shift_remove("oauth");
                 }
             }
         }

@@ -27,13 +27,13 @@ use std::sync::{Arc, Mutex};
 
 use rpi::core::agent_session::PromptOptions;
 use rpi::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::session_manager::SessionManager;
-use rpi::sdk::{create_agent_session, CreateAgentSessionOptions};
+use rpi::sdk::{CreateAgentSessionOptions, create_agent_session};
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAiProvider, FauxAssistantOptions, FauxProvider, FauxProviderOptions,
+    FauxAiProvider, FauxAssistantOptions, FauxProvider, FauxProviderOptions, faux_assistant_message,
 };
 use serde_json::Value;
 
@@ -303,11 +303,9 @@ async fn d1_upstream_to_rpi_prompt_continue_multiple_fixtures() {
         let before_lines = non_empty_lines(&original);
 
         let provider = FauxProvider::new(FauxProviderOptions::default());
-        provider.set_responses(vec![faux_assistant_message(
-            "rpi continued answer",
-            FauxAssistantOptions::default(),
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message("rpi continued answer", FauxAssistantOptions::default()).into(),
+        ]);
         let (model, model_runtime, services) =
             faux_services(cwd.clone(), agent_dir.clone(), provider).await;
 
@@ -472,11 +470,13 @@ async fn d2_rpi_generates_session_for_upstream() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
 
     let provider = FauxProvider::new(FauxProviderOptions::default());
-    provider.set_responses(vec![faux_assistant_message(
-        "Hello from rpi faux provider!",
-        FauxAssistantOptions::default(),
-    )
-    .into()]);
+    provider.set_responses(vec![
+        faux_assistant_message(
+            "Hello from rpi faux provider!",
+            FauxAssistantOptions::default(),
+        )
+        .into(),
+    ]);
     let (model, model_runtime, services) =
         faux_services(cwd.clone(), agent_dir.clone(), provider).await;
 

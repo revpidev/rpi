@@ -37,16 +37,16 @@ use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::{ColorFn, Text};
 use rpi_tui::tui::{Component, Container};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::render_utils::{render_tool_path, str_value};
 use crate::core::themes::Theme;
-use crate::modes::interactive::components::diff::{render_diff, RenderDiffOptions};
+use crate::modes::interactive::components::diff::{RenderDiffOptions, render_diff};
 use crate::modes::interactive::components::tool_execution::{
-    lock_recover, RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext,
-    ToolResultState,
+    RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
+    lock_recover,
 };
-use crate::tools::edit_diff::{compute_edits_diff, EditReplacement};
+use crate::tools::edit_diff::{EditReplacement, compute_edits_diff};
 
 /// `EditPreview` (edit.ts:27): `EditDiffResult | EditDiffError`
 /// (edit-diff.ts:505-512).
@@ -263,16 +263,17 @@ fn format_edit_result(
         .and_then(Value::as_str);
     // `if (resultDiff && resultDiff !== previewDiff)` (edit.ts:231-234): an
     // empty-string diff is falsy in JS.
-    if let Some(result_diff) = result_diff {
-        if !result_diff.is_empty() && preview_diff != Some(result_diff) {
-            return Some(render_diff(
-                result_diff,
-                theme,
-                RenderDiffOptions {
-                    file_path: raw_path,
-                },
-            ));
-        }
+    if let Some(result_diff) = result_diff
+        && !result_diff.is_empty()
+        && preview_diff != Some(result_diff)
+    {
+        return Some(render_diff(
+            result_diff,
+            theme,
+            RenderDiffOptions {
+                file_path: raw_path,
+            },
+        ));
     }
     None
 }
@@ -359,27 +360,29 @@ impl ToolDefinition for EditToolRenderer {
 
         // `context.argsComplete && previewInput && !preview && !previewPending`
         // (edit.ts:381): computed synchronously — see the module doc.
-        if context.args_complete && inner.preview.is_none() && !inner.preview_pending {
-            if let Some(input) = preview_input.as_ref() {
-                inner.preview_pending = true;
-                let request_key = args_key.clone();
-                let result =
-                    compute_edits_diff(&input.path, &input.replacements(), Path::new(&context.cwd));
-                // The requestKey race guard (edit.ts:385-388) is trivially
-                // satisfied while the lock is held (single-threaded render
-                // loop); kept for parity.
-                if inner.preview_args_key == request_key {
-                    let preview = match result.error {
-                        Some(error) => EditPreview::Error { error },
-                        None => EditPreview::Diff {
-                            diff: result.diff.unwrap_or_default(),
-                            first_changed_line: result.first_changed_line,
-                        },
-                    };
-                    set_edit_preview(&mut inner, preview, request_key.as_deref());
-                } else {
-                    inner.preview_pending = false;
-                }
+        if context.args_complete
+            && inner.preview.is_none()
+            && !inner.preview_pending
+            && let Some(input) = preview_input.as_ref()
+        {
+            inner.preview_pending = true;
+            let request_key = args_key.clone();
+            let result =
+                compute_edits_diff(&input.path, &input.replacements(), Path::new(&context.cwd));
+            // The requestKey race guard (edit.ts:385-388) is trivially
+            // satisfied while the lock is held (single-threaded render
+            // loop); kept for parity.
+            if inner.preview_args_key == request_key {
+                let preview = match result.error {
+                    Some(error) => EditPreview::Error { error },
+                    None => EditPreview::Diff {
+                        diff: result.diff.unwrap_or_default(),
+                        first_changed_line: result.first_changed_line,
+                    },
+                };
+                set_edit_preview(&mut inner, preview, request_key.as_deref());
+            } else {
+                inner.preview_pending = false;
             }
         }
 
@@ -407,28 +410,27 @@ impl ToolDefinition for EditToolRenderer {
         let mut inner = lock_recover(&state.inner);
         // Backfill the call preview from the settled result (edit.ts:400-411):
         // `details.diff` / `details.firstChangedLine` (camelCase, T06).
-        if !context.is_error {
-            if let Some(result_diff) = result
+        if !context.is_error
+            && let Some(result_diff) = result
                 .details
                 .as_ref()
                 .and_then(|d| d.get("diff"))
                 .and_then(Value::as_str)
-            {
-                let first_changed_line = result
-                    .details
-                    .as_ref()
-                    .and_then(|d| d.get("firstChangedLine"))
-                    .and_then(Value::as_u64)
-                    .map(|v| v as usize);
-                set_edit_preview(
-                    &mut inner,
-                    EditPreview::Diff {
-                        diff: result_diff.to_string(),
-                        first_changed_line,
-                    },
-                    args_key.as_deref(),
-                );
-            }
+        {
+            let first_changed_line = result
+                .details
+                .as_ref()
+                .and_then(|d| d.get("firstChangedLine"))
+                .and_then(Value::as_u64)
+                .map(|v| v as usize);
+            set_edit_preview(
+                &mut inner,
+                EditPreview::Diff {
+                    diff: result_diff.to_string(),
+                    first_changed_line,
+                },
+                args_key.as_deref(),
+            );
         }
         // `callComponent.settledError !== context.isError` (edit.ts:412-415).
         if inner.settled_error != context.is_error {
@@ -966,22 +968,26 @@ mod tests {
         assert_eq!(input.path, "b.txt");
         // An empty-string path is falsy in JS (`if (!path) return null`,
         // edit.ts:189) → no preview.
-        assert!(get_renderable_preview_input(&json!({
-            "path": "",
-            "edits": [{"oldText": "x", "newText": "y"}]
-        }))
-        .is_none());
+        assert!(
+            get_renderable_preview_input(&json!({
+                "path": "",
+                "edits": [{"oldText": "x", "newText": "y"}]
+            }))
+            .is_none()
+        );
         // Invalid inputs → None.
-        assert!(get_renderable_preview_input(
-            &json!({"edits": [{"oldText": "x", "newText": "y"}]})
-        )
-        .is_none());
+        assert!(
+            get_renderable_preview_input(&json!({"edits": [{"oldText": "x", "newText": "y"}]}))
+                .is_none()
+        );
         assert!(get_renderable_preview_input(&json!({"path": "a.txt", "edits": "nope"})).is_none());
         assert!(get_renderable_preview_input(&json!({"path": "a.txt", "edits": []})).is_none());
-        assert!(get_renderable_preview_input(
-            &json!({"path": "a.txt", "edits": [{"oldText": 1, "newText": "y"}]})
-        )
-        .is_none());
+        assert!(
+            get_renderable_preview_input(
+                &json!({"path": "a.txt", "edits": [{"oldText": 1, "newText": "y"}]})
+            )
+            .is_none()
+        );
         assert!(get_renderable_preview_input(&json!({"path": "a.txt", "oldText": "x"})).is_none());
         assert!(get_renderable_preview_input(&json!({})).is_none());
     }

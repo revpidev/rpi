@@ -5,7 +5,7 @@
 //! (ADR-0016: no workflowScript bridge); inline `[output=…]` agent-token
 //! config and `[--bg]` are P1 surfaces — `--fork` is kept.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tool;
 
@@ -126,8 +126,10 @@ mod tests {
         assert_eq!(run.task, "");
         assert!(!run.fork);
         assert!(parse_run_args("").is_err());
-        assert!(parse_run_args("worker do it --bg")
-            .unwrap_err()
-            .contains("--bg"));
+        assert!(
+            parse_run_args("worker do it --bg")
+                .unwrap_err()
+                .contains("--bg")
+        );
     }
 }

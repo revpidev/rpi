@@ -17,11 +17,11 @@ use rpi_ai::auth::FileCredentialStore;
 
 use crate::cli::args::parse_args;
 use crate::cli::auth_check::{
-    check_provider_auth, create_auth_check_model_runtime, get_provider_credential, AuthCheckResult,
+    AuthCheckResult, check_provider_auth, create_auth_check_model_runtime, get_provider_credential,
 };
 use crate::cli::auth_command::{
-    get_auth_command_name, get_auth_command_usage, is_auth_command_help, parse_auth_command,
-    print_auth_command_help, AuthCommand, AuthCommandKind,
+    AuthCommand, AuthCommandKind, get_auth_command_name, get_auth_command_usage,
+    is_auth_command_help, parse_auth_command, print_auth_command_help,
 };
 use crate::cli::credential_print::resolve_credential_for_print;
 use crate::config::APP_NAME;

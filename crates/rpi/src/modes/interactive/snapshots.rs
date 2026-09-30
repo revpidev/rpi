@@ -30,14 +30,14 @@ use rpi_tui::tui::Component as _;
 use rpi_tui::tui::RenderHandle;
 
 use crate::core::agent_session::ParsedSkillBlock;
-use crate::core::themes::{load_theme, Theme};
+use crate::core::themes::{Theme, load_theme};
 use crate::modes::interactive::components::{
-    render_diff, AssistantMessageComponent, BashExecutionComponent, BranchSummaryMessageComponent,
+    AssistantMessageComponent, BashExecutionComponent, BranchSummaryMessageComponent,
     BranchSummaryStatusIndicator, CompactionStatusIndicator, CompactionStatusReason,
     CompactionSummaryMessageComponent, CustomMessageComponent, RenderDiffOptions,
     RetryStatusIndicator, SharedStatusIndicator, SkillInvocationMessageComponent,
     ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, ToolResultState,
-    UserMessageComponent,
+    UserMessageComponent, render_diff,
 };
 use crate::modes::interactive::custom_editor::CustomEditor;
 use crate::modes::interactive::theme::markdown_theme;

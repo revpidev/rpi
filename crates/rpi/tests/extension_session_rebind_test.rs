@@ -21,10 +21,10 @@ use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::InlineExtension;
 use rpi_ext_host::types as ext;
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAiProvider, FauxAssistantOptions, FauxModelDefinition,
-    FauxProvider, FauxProviderOptions,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    faux_assistant_message,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -90,11 +90,9 @@ async fn fixture() -> Fixture {
                     }]),
                     ..Default::default()
                 });
-                provider.set_responses(vec![faux_assistant_message(
-                    "ok",
-                    FauxAssistantOptions::default(),
-                )
-                .into()]);
+                provider.set_responses(vec![
+                    faux_assistant_message("ok", FauxAssistantOptions::default()).into(),
+                ]);
                 let model = provider.get_model(None).expect("faux model");
                 let model_runtime = rpi::core::model_runtime::ModelRuntime::create(
                     rpi::core::model_runtime::CreateModelRuntimeOptions {
@@ -256,9 +254,11 @@ async fn new_session_preserves_extension_tools_and_rebinds_ui_bridge() {
         .expect("downcast to host adapter on the initial runner");
     host0.set_ui(Some(NullUiBridge::shared()), ext::ExtensionMode::Tui);
     assert!(host0.runtime().ui_bridge().is_some());
-    assert!(session0
-        .get_active_tool_names()
-        .contains(&"probe_tool".to_owned()));
+    assert!(
+        session0
+            .get_active_tool_names()
+            .contains(&"probe_tool".to_owned())
+    );
 
     // The production rebind (`rebind_session_ui`): bind_extensions, then
     // re-attach the UI bridge onto the NEW session's host through the same

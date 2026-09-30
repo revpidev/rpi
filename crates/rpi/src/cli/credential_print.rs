@@ -13,9 +13,9 @@ use rpi_ai::types::Model;
 
 use crate::cli::args::Args;
 use crate::cli::auth_command::{
-    get_auth_credential, validate_auth_command_args, AuthCommandError, AuthCommandKind,
+    AuthCommandError, AuthCommandKind, get_auth_credential, validate_auth_command_args,
 };
-use crate::core::model_resolver::{resolve_cli_model, ResolveCliModelOptions};
+use crate::core::model_resolver::{ResolveCliModelOptions, resolve_cli_model};
 use crate::core::model_runtime::{ModelRuntime, ModelRuntimeAuthOverrides};
 
 /// `DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS` (credential-print.ts:7):

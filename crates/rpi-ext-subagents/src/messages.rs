@@ -14,7 +14,7 @@
 //! title keeps upstream's icon and layout, per-line colors approximate the
 //! inline ANSI mix).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::runner::display::{format_duration, shorten_path};
 

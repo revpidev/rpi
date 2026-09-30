@@ -11,8 +11,8 @@
 //! decorator (TE11 FR-E.1), and [`UiPromptBridge`] is the `ui_prompt_*`
 //! event decorator (V14-11 FR-C, `ccfe79ed2`).
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::Value;
 

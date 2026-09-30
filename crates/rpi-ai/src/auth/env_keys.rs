@@ -88,31 +88,27 @@ pub fn find_env_keys(provider: &str, env: Option<&ProviderEnv>) -> Option<Vec<St
         .filter(|env_var| get_provider_env_value(env_var, env).is_some())
         .map(|env_var| (*env_var).to_owned())
         .collect();
-    if found.is_empty() {
-        None
-    } else {
-        Some(found)
-    }
+    if found.is_empty() { None } else { Some(found) }
 }
 
 /// `getEnvApiKey` — API key for a provider from known environment variables,
 /// e.g. OPENAI_API_KEY. Never returns keys for providers that require OAuth
 /// tokens.
 pub fn get_env_api_key(provider: &str, env: Option<&ProviderEnv>) -> Option<String> {
-    if let Some(env_keys) = find_env_keys(provider, env) {
-        if let Some(first) = env_keys.first() {
-            // Anthropic: ANTHROPIC_AUTH_TOKEN must reach requests as an
-            // Authorization: Bearer header, not as an api key — skip it.
-            let api_key_env = if provider == "anthropic" {
-                env_keys
-                    .iter()
-                    .find(|key| key.as_str() != ANTHROPIC_AUTH_TOKEN_ENV)
-            } else {
-                Some(first)
-            };
-            if let Some(api_key_env) = api_key_env {
-                return get_provider_env_value(api_key_env, env);
-            }
+    if let Some(env_keys) = find_env_keys(provider, env)
+        && let Some(first) = env_keys.first()
+    {
+        // Anthropic: ANTHROPIC_AUTH_TOKEN must reach requests as an
+        // Authorization: Bearer header, not as an api key — skip it.
+        let api_key_env = if provider == "anthropic" {
+            env_keys
+                .iter()
+                .find(|key| key.as_str() != ANTHROPIC_AUTH_TOKEN_ENV)
+        } else {
+            Some(first)
+        };
+        if let Some(api_key_env) = api_key_env {
+            return get_provider_env_value(api_key_env, env);
         }
     }
 
@@ -140,7 +136,7 @@ mod tests {
         fn set(entries: &[(&'static str, &str)]) -> Self {
             // Distinct names per test (process env is global).
             for (name, value) in entries {
-                std::env::set_var(name, value);
+                rpi_test_env::set_var(name, value);
             }
             Self(entries.iter().map(|(name, _)| *name).collect())
         }
@@ -149,7 +145,7 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             for name in &self.0 {
-                std::env::remove_var(name);
+                rpi_test_env::remove_var(name);
             }
         }
     }

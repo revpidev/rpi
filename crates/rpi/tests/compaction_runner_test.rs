@@ -15,8 +15,8 @@ use rpi_agent::types::ThinkingLevel;
 use rpi_agent::{Agent, AgentOptions, InitialAgentState, StreamFn};
 use rpi_ai::types::{AssistantMessage, StopReason, StreamEvent, Usage};
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAssistantOptions, FauxModelDefinition, FauxProvider,
-    FauxProviderOptions, FauxResponseStep,
+    FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    faux_assistant_message,
 };
 use serde_json::json;
 
@@ -1173,10 +1173,8 @@ async fn auto_compaction_cancelled_from_compaction_start_skips_summarization_977
     runner.set_emit_sink(Arc::new(move |event| {
         let is_start = matches!(event, CompactionEvent::CompactionStart { .. });
         record.lock().expect("events").push(event);
-        if is_start {
-            if let Some(token) = cell.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                token.cancel();
-            }
+        if is_start && let Some(token) = cell.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            token.cancel();
         }
     }));
 

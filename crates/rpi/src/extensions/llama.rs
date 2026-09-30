@@ -79,15 +79,15 @@ use rpi_ai::auth::{AuthResult, ModelsError};
 use tokio_util::sync::CancellationToken;
 
 pub use client::{
-    format_bytes, llama_inference_url, normalize_llama_server_url, LlamaClient, LlamaError,
-    LlamaModelInfo, LlamaProgress, LlamaProgressCallback,
+    LlamaClient, LlamaError, LlamaModelInfo, LlamaProgress, LlamaProgressCallback, format_bytes,
+    llama_inference_url, normalize_llama_server_url,
 };
 pub use huggingface::{
-    find_hugging_face_token, HuggingFaceClient, HuggingFaceModel, DEFAULT_HUGGING_FACE_URL,
+    DEFAULT_HUGGING_FACE_URL, HuggingFaceClient, HuggingFaceModel, find_hugging_face_token,
 };
 pub use provider::{
-    create_llama_provider, shared_llama_provider, LlamaProviderController, LlamaSetCatalogOptions,
-    LLAMA_PROVIDER_ID,
+    LLAMA_PROVIDER_ID, LlamaProviderController, LlamaSetCatalogOptions, create_llama_provider,
+    shared_llama_provider,
 };
 
 /// `LlamaManagerAction` (ui.ts:25).
@@ -757,10 +757,10 @@ pub async fn run_llama_manager(
             return Ok(());
         };
         catalog = refreshed;
-        if let Some(error) = action_error {
-            if !is_connection_error(&error) {
-                host.notify(&error.message, NotifyLevel::Error);
-            }
+        if let Some(error) = action_error
+            && !is_connection_error(&error)
+        {
+            host.notify(&error.message, NotifyLevel::Error);
         }
     }
 }

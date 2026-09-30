@@ -15,13 +15,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::Html;
-use axum::routing::{get, Router};
+use axum::routing::{Router, get};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -479,11 +479,13 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response
-            .text()
-            .await
-            .expect("body")
-            .contains("Missing code or state parameter."));
+        assert!(
+            response
+                .text()
+                .await
+                .expect("body")
+                .contains("Missing code or state parameter.")
+        );
         server.close().await;
     }
 
@@ -494,11 +496,13 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response
-            .text()
-            .await
-            .expect("body")
-            .contains("State mismatch."));
+        assert!(
+            response
+                .text()
+                .await
+                .expect("body")
+                .contains("State mismatch.")
+        );
         server.cancel_wait();
         assert_eq!(server.wait_for_code().await, None);
         server.close().await;
@@ -511,11 +515,13 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(response
-            .text()
-            .await
-            .expect("body")
-            .contains("Callback route not found."));
+        assert!(
+            response
+                .text()
+                .await
+                .expect("body")
+                .contains("Callback route not found.")
+        );
         server.close().await;
     }
 

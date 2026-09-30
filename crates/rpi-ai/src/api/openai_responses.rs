@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::api::anthropic_messages::resolve_cache_retention;
 use crate::api::constrained_sampling::create_grammar_tool_input_properties;
@@ -43,27 +43,27 @@ use crate::api::openai_completions::{
 };
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
 use crate::api::openai_responses_shared::{
-    convert_responses_messages, convert_responses_tools, ConvertResponsesMessagesOptions,
-    ConvertResponsesToolsOptions, ResponsesStreamOptions, ResponsesStreamProcessor,
+    ConvertResponsesMessagesOptions, ConvertResponsesToolsOptions, ResponsesStreamOptions,
+    ResponsesStreamProcessor, convert_responses_messages, convert_responses_tools,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
-use crate::models::{clamp_thinking_level, ProviderStreams};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
+use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantMessage, CacheRetention, DoneReason, ErrorReason, Model, ModelThinkingLevel,
     ProviderHeaders, ProviderResponse, SessionAffinityFormat, SimpleStreamOptions, StopReason,
     StreamEvent, StreamOptions, TranscriptContext, Usage,
 };
 use crate::utils::custom_fetch::send_provider_request;
-use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
+use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
     headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
     rpi_user_agent_headers,
 };
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions,
+    ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 
 // ---------------------------------------------------------------------------
@@ -315,10 +315,10 @@ pub fn build_params(
         "input": messages,
         "stream": true,
     });
-    if cache_retention != CacheRetention::None {
-        if let Some(key) = clamp_openai_prompt_cache_key(options.stream.session_id.as_deref()) {
-            params["prompt_cache_key"] = json!(key);
-        }
+    if cache_retention != CacheRetention::None
+        && let Some(key) = clamp_openai_prompt_cache_key(options.stream.session_id.as_deref())
+    {
+        params["prompt_cache_key"] = json!(key);
     }
     if let Some(retention) = get_prompt_cache_retention(compat, cache_retention) {
         params["prompt_cache_retention"] = json!(retention);
@@ -499,10 +499,10 @@ async fn run(
         &compat,
         &grammar_tool_input_properties,
     )?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_params) = on_payload(params.clone(), model).await {
-            params = next_params;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_params) = on_payload(params.clone(), model).await
+    {
+        params = next_params;
     }
 
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
@@ -815,7 +815,7 @@ impl ProviderStreams for OpenAiResponses {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::api::openai_completions::tests as common;
@@ -1076,12 +1076,16 @@ mod tests {
         assert_eq!(additional["tools"][0]["type"], json!("function"));
         assert_eq!(additional["tools"][0]["name"], json!("late_tool"));
         assert!(additional["tools"][0].get("defer_loading").is_none());
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("tool_search_call")));
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("tool_search_output")));
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("tool_search_call"))
+        );
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("tool_search_output"))
+        );
 
         // additional_tools unsupported + tool search supported: client
         // tool-search fallback.
@@ -1104,9 +1108,11 @@ mod tests {
         assert_eq!(search_output["call_id"], search_call["call_id"]);
         assert_eq!(search_output["tools"][0]["name"], json!("late_tool"));
         assert_eq!(search_output["tools"][0]["defer_loading"], json!(true));
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("additional_tools")));
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("additional_tools"))
+        );
 
         // Neither flag: every tool stays top-level, no replay items.
         let m = model(json!({}));
@@ -1116,12 +1122,16 @@ mod tests {
             vec!["base_tool", "late_tool"]
         );
         let input = params["input"].as_array().expect("input");
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("additional_tools")));
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("tool_search_output")));
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("additional_tools"))
+        );
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("tool_search_output"))
+        );
     }
 
     /// #9548 (transcript-tool-changes.test.ts:262, payload level): with a
@@ -1175,12 +1185,16 @@ mod tests {
         assert_eq!(top_level_tool_names(&params), vec!["late_tool"]);
         let input = params["input"].as_array().expect("input");
         // No anchored additions.
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("additional_tools")));
-        assert!(input
-            .iter()
-            .all(|item| item["type"] != json!("tool_search_call")));
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("additional_tools"))
+        );
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != json!("tool_search_call"))
+        );
         // Leading prompt + folded update = exactly two developer messages.
         let developer_count = input
             .iter()

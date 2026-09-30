@@ -19,10 +19,10 @@ use tokio::time::Duration;
 use crate::core::agent_session::AgentSession;
 use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::agent_session_services::{
-    create_agent_session_services, CreateAgentSessionServicesOptions,
+    CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use crate::core::session_manager::{NewSessionOptions, SessionManager};
-use crate::sdk::{create_agent_session, CreateAgentSessionOptions, NoTools};
+use crate::sdk::{CreateAgentSessionOptions, NoTools, create_agent_session};
 
 /// Serializes `std::env` mutations across interactive-mode tests: several
 /// test modules override `RPI_CODING_AGENT_DIR` / `RPI_EXPERIMENTAL`, and

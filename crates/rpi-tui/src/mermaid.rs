@@ -396,10 +396,10 @@ fn parse_graph(src: &str) -> Option<Graph> {
 }
 
 fn parse_subgraph_decl(rest: &str) -> (String, String) {
-    if let Some(q) = rest.strip_prefix('"') {
-        if let Some((label, _)) = q.split_once('"') {
-            return (label.to_string(), decode_html_entities(label));
-        }
+    if let Some(q) = rest.strip_prefix('"')
+        && let Some((label, _)) = q.split_once('"')
+    {
+        return (label.to_string(), decode_html_entities(label));
     }
     if let Some(open) = rest.find('[') {
         let id = rest[..open].trim();
@@ -714,18 +714,18 @@ fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '<' {
-            if let Some((name, end)) = html_tag_at(&chars, i) {
-                let lower = name.to_ascii_lowercase();
-                if lower == "br" {
-                    out.push(' ');
-                    i = end;
-                    continue;
-                }
-                if HTML_FORMAT_TAGS.contains(&lower.as_str()) {
-                    i = end;
-                    continue;
-                }
+        if chars[i] == '<'
+            && let Some((name, end)) = html_tag_at(&chars, i)
+        {
+            let lower = name.to_ascii_lowercase();
+            if lower == "br" {
+                out.push(' ');
+                i = end;
+                continue;
+            }
+            if HTML_FORMAT_TAGS.contains(&lower.as_str()) {
+                i = end;
+                continue;
             }
         }
         out.push(chars[i]);
@@ -770,11 +770,12 @@ fn parse_link(
 ) -> Option<(Head, Head, LineKind, Option<String>, usize)> {
     let mut i = skip_spaces(chars, start);
     let mut left = Head::None;
-    if let Some(&c) = chars.get(i) {
-        if matches!(c, 'o' | 'x') && matches!(chars.get(i + 1), Some('-' | '.' | '=')) {
-            left = if c == 'o' { Head::Circle } else { Head::Cross };
-            i += 1;
-        }
+    if let Some(&c) = chars.get(i)
+        && matches!(c, 'o' | 'x')
+        && matches!(chars.get(i + 1), Some('-' | '.' | '='))
+    {
+        left = if c == 'o' { Head::Circle } else { Head::Cross };
+        i += 1;
     }
     let op_start = i;
     while i < chars.len() && matches!(chars[i], '-' | '.' | '=' | '<' | '>') {
@@ -793,11 +794,11 @@ fn parse_link(
     } else {
         Head::None
     };
-    if right == Head::None {
-        if let Some((head, ni)) = trailing_head(chars, i) {
-            right = head;
-            i = ni;
-        }
+    if right == Head::None
+        && let Some((head, ni)) = trailing_head(chars, i)
+    {
+        right = head;
+        i = ni;
     }
 
     if chars.get(i) == Some(&'|') {
@@ -867,11 +868,7 @@ fn trailing_head(chars: &[char], i: usize) -> Option<(Head, usize)> {
 }
 
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn parse_state(src: &str) -> Option<Graph> {
@@ -1305,20 +1302,20 @@ fn char_byte(s: &str, char_pos: usize) -> usize {
 
 fn strip_cardinality_suffix(s: &str) -> (&str, String) {
     let t = s.trim_end();
-    if let Some(rest) = t.strip_suffix('"') {
-        if let Some(q) = rest.rfind('"') {
-            return (rest[..q].trim_end(), rest[q + 1..].to_string());
-        }
+    if let Some(rest) = t.strip_suffix('"')
+        && let Some(q) = rest.rfind('"')
+    {
+        return (rest[..q].trim_end(), rest[q + 1..].to_string());
     }
     (t, String::new())
 }
 
 fn strip_cardinality_prefix(s: &str) -> (&str, String) {
     let t = s.trim_start();
-    if let Some(rest) = t.strip_prefix('"') {
-        if let Some(q) = rest.find('"') {
-            return (rest[q + 1..].trim_start(), rest[..q].to_string());
-        }
+    if let Some(rest) = t.strip_prefix('"')
+        && let Some(q) = rest.find('"')
+    {
+        return (rest[q + 1..].trim_start(), rest[..q].to_string());
     }
     (t, String::new())
 }
@@ -1444,11 +1441,7 @@ fn split_er_relationship(st: &str) -> Option<(&str, Option<&str>)> {
         None => (st, None),
     };
     let has_op = rel.split_whitespace().any(|t| parse_er_op(t).is_some());
-    if has_op {
-        Some((rel, label))
-    } else {
-        None
-    }
+    if has_op { Some((rel, label)) } else { None }
 }
 
 fn parse_er_op(tok: &str) -> Option<(&'static str, &'static str, LineKind)> {
@@ -2025,10 +2018,10 @@ fn layout_canvas(
     };
     let (canvas_w, canvas_h) = plan.canvas;
 
-    if let Some(mw) = max_width {
-        if canvas_w > mw {
-            return Err(Oversize::Width);
-        }
+    if let Some(mw) = max_width
+        && canvas_w > mw
+    {
+        return Err(Oversize::Width);
     }
     if canvas_w.saturating_mul(canvas_h) > MAX_CANVAS_CELLS {
         return Err(Oversize::Cells);
@@ -3510,10 +3503,10 @@ fn layout_sequence(
     let bottom_top = y;
     let canvas_h = bottom_top + box_h;
 
-    if let Some(mw) = max_width {
-        if canvas_w > mw {
-            return Err(Oversize::Width);
-        }
+    if let Some(mw) = max_width
+        && canvas_w > mw
+    {
+        return Err(Oversize::Width);
     }
     if canvas_w.saturating_mul(canvas_h) > MAX_CANVAS_CELLS {
         return Err(Oversize::Cells);
@@ -5148,14 +5141,16 @@ mod tests {
             "no node swallows the arrow"
         );
         let idx = |id: &str| g.index[id];
-        assert!(g
-            .edges
-            .iter()
-            .any(|e| e.from == idx("A") && e.to == idx("B")));
-        assert!(g
-            .edges
-            .iter()
-            .any(|e| e.from == idx("B") && e.to == idx("C")));
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.from == idx("A") && e.to == idx("B"))
+        );
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.from == idx("B") && e.to == idx("C"))
+        );
     }
 
     #[test]

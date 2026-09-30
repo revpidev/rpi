@@ -2009,7 +2009,7 @@ mod tests {
 
     use rpi_ai::types::{AssistantRole, StopReason, Usage, UserRole};
     use serde::de::DeserializeOwned;
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
 
     use super::*;
     use crate::compaction::utils::create_file_ops;

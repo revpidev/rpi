@@ -423,15 +423,15 @@ impl Component for FooterComponent {
         let min_padding = 2;
 
         let mut right_side_without_provider = model_name;
-        if let Some(model) = &model {
-            if model.reasoning {
-                let thinking_level = self.session.thinking_level().as_str();
-                right_side_without_provider = if thinking_level == "off" {
-                    format!("{right_side_without_provider} • thinking off")
-                } else {
-                    format!("{right_side_without_provider} • {thinking_level}")
-                };
-            }
+        if let Some(model) = &model
+            && model.reasoning
+        {
+            let thinking_level = self.session.thinking_level().as_str();
+            right_side_without_provider = if thinking_level == "off" {
+                format!("{right_side_without_provider} • thinking off")
+            } else {
+                format!("{right_side_without_provider} • {thinking_level}")
+            };
         }
 
         let mut right_side = right_side_without_provider.clone();

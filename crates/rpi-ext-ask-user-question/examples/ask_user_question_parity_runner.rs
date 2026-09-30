@@ -11,14 +11,14 @@
 use std::fs;
 
 use rpi_ext_ask_user_question::parity::{
-    golden_frame_json, golden_renders, has_dialog_ui, labels_by_kind_json, meta,
-    normalize_question_params, question_params_schema, replay_keys_case, replay_preview_case,
-    replay_state_case, reserved_label_set, run_rpc_questionnaire, sentinels_to_append,
-    validate_questionnaire, DialogOutcome, DialogUi, HostUi, OptionData, QuestionData,
-    QuestionParams, QuestionnaireResult, RowKind, ValidationResult, MAX_HEADER_LENGTH,
-    MAX_LABEL_LENGTH, MAX_OPTIONS, MAX_QUESTIONS, MIN_OPTIONS, RESERVED_LABELS,
+    DialogOutcome, DialogUi, HostUi, MAX_HEADER_LENGTH, MAX_LABEL_LENGTH, MAX_OPTIONS,
+    MAX_QUESTIONS, MIN_OPTIONS, OptionData, QuestionData, QuestionParams, QuestionnaireResult,
+    RESERVED_LABELS, RowKind, ValidationResult, golden_frame_json, golden_renders, has_dialog_ui,
+    labels_by_kind_json, meta, normalize_question_params, question_params_schema, replay_keys_case,
+    replay_preview_case, replay_state_case, reserved_label_set, run_rpc_questionnaire,
+    sentinels_to_append, validate_questionnaire,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn parse_params(input: &Value) -> QuestionParams {
     serde_json::from_value(input.clone()).expect("fixture params")

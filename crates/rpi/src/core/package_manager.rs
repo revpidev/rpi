@@ -65,17 +65,17 @@ use crate::core::extension_registry::{
     self, ExtensionInstallInfo, ExtensionKind, GithubReleaseSource, IntegrityLevel, RegistryIndex,
     RegistrySource, RegistryTransport,
 };
-use crate::core::git_url::{parse_git_url, GitSource};
+use crate::core::git_url::{GitSource, parse_git_url};
 use crate::core::self_update::{parse_sha256_sidecar, sha256_hex};
 use crate::core::settings_manager::{
     PackageSource, PackageSourceFilter, Settings, SettingsManager,
 };
 use crate::core::skills::{
-    self, apply_patterns, collect_skill_entries, glob_match, is_enabled_by_overrides,
-    lexical_relative, match_candidates, matches_any_exact_pattern, matches_any_pattern,
-    split_patterns, SkillDiscoveryMode, SourceOrigin, SourceScope,
+    self, SkillDiscoveryMode, SourceOrigin, SourceScope, apply_patterns, collect_skill_entries,
+    glob_match, is_enabled_by_overrides, lexical_relative, match_candidates,
+    matches_any_exact_pattern, matches_any_pattern, split_patterns,
 };
-use crate::core::version_check::{is_newer_package_version, UpdateChannel};
+use crate::core::version_check::{UpdateChannel, is_newer_package_version};
 use crate::tools::path_utils::resolve_path;
 
 /// `NETWORK_TIMEOUT_MS` (package-manager.ts:38).
@@ -593,10 +593,10 @@ pub fn parse_source(source: &str) -> ParsedSource {
         return ParsedSource::GithubRelease(github);
     }
 
-    if let Some(registry) = extension_registry::parse_registry_source(source) {
-        if !Path::new(source).exists() {
-            return ParsedSource::Registry(registry);
-        }
+    if let Some(registry) = extension_registry::parse_registry_source(source)
+        && !Path::new(source).exists()
+    {
+        return ParsedSource::Registry(registry);
     }
 
     if is_local_path(source) {
@@ -689,8 +689,8 @@ where
     T: Send,
     F: FnOnce() -> Result<T, String> + Send,
 {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     if tasks.is_empty() {
         return Ok(Vec::new());
@@ -705,20 +705,22 @@ where
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= tasks.len() {
-                    return;
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= tasks.len() {
+                        return;
+                    }
+                    let task = tasks[index]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    let Some(task) = task else {
+                        continue;
+                    };
+                    let result = task();
+                    *results[index].lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
                 }
-                let task = tasks[index]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-                let Some(task) = task else {
-                    continue;
-                };
-                let result = task();
-                *results[index].lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
             });
         }
     });
@@ -2563,12 +2565,11 @@ impl DefaultPackageManager {
             else {
                 continue;
             };
-            if let ParsedSource::GithubRelease(other) = parse_source(marker.trim()) {
-                if other.owner.eq_ignore_ascii_case(&source.owner)
-                    && other.repo.eq_ignore_ascii_case(&source.repo)
-                {
-                    return Some(dir);
-                }
+            if let ParsedSource::GithubRelease(other) = parse_source(marker.trim())
+                && other.owner.eq_ignore_ascii_case(&source.owner)
+                && other.repo.eq_ignore_ascii_case(&source.repo)
+            {
+                return Some(dir);
             }
         }
         None
@@ -2958,10 +2959,10 @@ impl DefaultPackageManager {
         ] {
             for pkg in Self::packages_of(settings) {
                 let source_str = Self::package_source_string(&pkg);
-                if let Some(identity) = &identity {
-                    if &self.get_package_identity(source_str, Some(scope)) != identity {
-                        continue;
-                    }
+                if let Some(identity) = &identity
+                    && &self.get_package_identity(source_str, Some(scope)) != identity
+                {
+                    continue;
                 }
                 matched = true;
                 update_sources.push(ConfiguredUpdateSource {
@@ -2982,21 +2983,21 @@ impl DefaultPackageManager {
             }) {
                 continue;
             }
-            if let Some(identity) = &identity {
-                if &discovered_identity != identity {
-                    continue;
-                }
+            if let Some(identity) = &identity
+                && &discovered_identity != identity
+            {
+                continue;
             }
             matched = true;
             update_sources.push(discovered);
         }
 
-        if let Some(source) = source {
-            if !matched {
-                let mut configured = Self::packages_of(&global_settings);
-                configured.extend(Self::packages_of(&project_settings));
-                return Err(self.build_no_matching_package_message(source, &configured));
-            }
+        if let Some(source) = source
+            && !matched
+        {
+            let mut configured = Self::packages_of(&global_settings);
+            configured.extend(Self::packages_of(&project_settings));
+            return Err(self.build_no_matching_package_message(source, &configured));
         }
 
         self.update_configured_sources(&update_sources, channel)
@@ -3180,10 +3181,9 @@ impl DefaultPackageManager {
                             entry.scope,
                             !entry.tracked,
                             channel,
-                        ) {
-                            if first_error.is_none() {
-                                first_error = Some(error);
-                            }
+                        ) && first_error.is_none()
+                        {
+                            first_error = Some(error);
                         }
                     }
                     match first_error {
@@ -3197,10 +3197,10 @@ impl DefaultPackageManager {
                 let result = handle
                     .join()
                     .unwrap_or_else(|_| Err("update worker panicked".to_string()));
-                if let Err(error) = result {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
+                if let Err(error) = result
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
                 }
             }
             match first_error {
@@ -4330,26 +4330,26 @@ impl DefaultPackageManager {
         let entries = manifest
             .as_ref()
             .and_then(|m| resource_type.manifest_entries(m));
-        if let Some(entries) = entries {
-            if !entries.is_empty() {
-                let all_files =
-                    self.collect_files_from_manifest_entries(entries, package_root, resource_type);
-                let manifest_patterns: Vec<String> = entries
-                    .iter()
-                    .filter(|entry| is_override_pattern(entry))
-                    .cloned()
-                    .collect();
-                if manifest_patterns.is_empty() {
-                    return all_files;
-                }
-                let enabled = apply_patterns(&all_files, &manifest_patterns, package_root);
-                // Keep the walk order (upstream Set preserves insertion
-                // order; our matcher returns a set, so re-filter).
-                return all_files
-                    .into_iter()
-                    .filter(|file| enabled.contains(file))
-                    .collect();
+        if let Some(entries) = entries
+            && !entries.is_empty()
+        {
+            let all_files =
+                self.collect_files_from_manifest_entries(entries, package_root, resource_type);
+            let manifest_patterns: Vec<String> = entries
+                .iter()
+                .filter(|entry| is_override_pattern(entry))
+                .cloned()
+                .collect();
+            if manifest_patterns.is_empty() {
+                return all_files;
             }
+            let enabled = apply_patterns(&all_files, &manifest_patterns, package_root);
+            // Keep the walk order (upstream Set preserves insertion
+            // order; our matcher returns a set, so re-filter).
+            return all_files
+                .into_iter()
+                .filter(|file| enabled.contains(file))
+                .collect();
         }
 
         let convention_dir = package_root.join(resource_type.dir_name());
@@ -4589,33 +4589,29 @@ fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
 /// `index.wasm` (mirrors the ext-host loader's directory rules).
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
     let package_json_path = dir.join("package.json");
-    if package_json_path.exists() {
-        if let Some(manifest) = read_pi_manifest(dir) {
-            if let Some(entries) = &manifest.extensions {
-                if !entries.is_empty() {
-                    let resolved: Vec<PathBuf> = entries
-                        .iter()
-                        .map(|entry| resolve_path(entry, dir))
-                        .filter(|path| path.exists())
-                        .collect();
-                    if !resolved.is_empty() {
-                        return Some(resolved);
-                    }
-                }
-            }
+    if package_json_path.exists()
+        && let Some(manifest) = read_pi_manifest(dir)
+        && let Some(entries) = &manifest.extensions
+        && !entries.is_empty()
+    {
+        let resolved: Vec<PathBuf> = entries
+            .iter()
+            .map(|entry| resolve_path(entry, dir))
+            .filter(|path| path.exists())
+            .collect();
+        if !resolved.is_empty() {
+            return Some(resolved);
         }
     }
     let wasm_manifest_path = dir.join("rpi-extension.json");
-    if wasm_manifest_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&wasm_manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(wasm) = manifest.get("wasm").and_then(|w| w.as_str()) {
-                    let resolved = dir.join(wasm);
-                    if resolved.is_file() {
-                        return Some(vec![resolved]);
-                    }
-                }
-            }
+    if wasm_manifest_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&wasm_manifest_path)
+        && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(wasm) = manifest.get("wasm").and_then(|w| w.as_str())
+    {
+        let resolved = dir.join(wasm);
+        if resolved.is_file() {
+            return Some(vec![resolved]);
         }
     }
     let index_wasm = dir.join("index.wasm");
@@ -4653,10 +4649,10 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
             if name.ends_with(".ts") || name.ends_with(".js") || name.ends_with(".wasm") {
                 entries.push(path);
             }
-        } else if path.is_dir() {
-            if let Some(resolved) = resolve_extension_entries(&path) {
-                entries.extend(resolved);
-            }
+        } else if path.is_dir()
+            && let Some(resolved) = resolve_extension_entries(&path)
+        {
+            entries.extend(resolved);
         }
     }
     entries
@@ -4814,8 +4810,8 @@ mod tests {
     //! filters/manifests/dedupe and `listConfiguredPackages`.
 
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -5264,9 +5260,11 @@ mod tests {
         make_local_package(&package_dir);
         let mut manager = test_manager(&dirs, FakeRunner::ok());
 
-        assert!(manager
-            .add_source_to_settings("./project-local-pkg", true)
-            .unwrap());
+        assert!(
+            manager
+                .add_source_to_settings("./project-local-pkg", true)
+                .unwrap()
+        );
         let settings = manager.settings_manager.get_project_settings();
         let packages = settings
             .as_map()
@@ -5288,25 +5286,31 @@ mod tests {
             .add_source_to_settings("./remove-local-pkg", false)
             .unwrap();
         let with_trailing_slash = format!("{}/", package_dir.display());
-        assert!(manager
-            .remove_source_from_settings(&with_trailing_slash, false)
-            .unwrap());
-        assert!(DefaultPackageManager::packages_of(
-            &manager.settings_manager.get_global_settings()
-        )
-        .is_empty());
+        assert!(
+            manager
+                .remove_source_from_settings(&with_trailing_slash, false)
+                .unwrap()
+        );
+        assert!(
+            DefaultPackageManager::packages_of(&manager.settings_manager.get_global_settings())
+                .is_empty()
+        );
     }
 
     #[test]
     fn test_add_same_git_source_twice_returns_false() {
         let dirs = TestDirs::new();
         let mut manager = test_manager(&dirs, FakeRunner::ok());
-        assert!(manager
-            .add_source_to_settings("git:github.com/user/repo@v1", false)
-            .unwrap());
-        assert!(!manager
-            .add_source_to_settings("git:github.com/user/repo@v1", false)
-            .unwrap());
+        assert!(
+            manager
+                .add_source_to_settings("git:github.com/user/repo@v1", false)
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .add_source_to_settings("git:github.com/user/repo@v1", false)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -5316,9 +5320,11 @@ mod tests {
         manager
             .add_source_to_settings("git:github.com/user/repo@v1", false)
             .unwrap();
-        assert!(manager
-            .add_source_to_settings("git:github.com/user/repo@v2", false)
-            .unwrap());
+        assert!(
+            manager
+                .add_source_to_settings("git:github.com/user/repo@v2", false)
+                .unwrap()
+        );
         let packages =
             DefaultPackageManager::packages_of(&manager.settings_manager.get_global_settings());
         assert_eq!(
@@ -5344,9 +5350,11 @@ mod tests {
                 themes: None,
             })]);
 
-        assert!(manager
-            .add_source_to_settings("git:github.com/user/repo@v2", false)
-            .unwrap());
+        assert!(
+            manager
+                .add_source_to_settings("git:github.com/user/repo@v2", false)
+                .unwrap()
+        );
         let packages =
             DefaultPackageManager::packages_of(&manager.settings_manager.get_global_settings());
         assert_eq!(
@@ -5638,9 +5646,11 @@ mod tests {
             .map(|c| c.args)
             .collect();
         assert_eq!(git_args[0], vec!["fetch", "origin", "v1"]);
-        assert!(!git_args
-            .iter()
-            .any(|args| args.first().map(String::as_str) == Some("reset")));
+        assert!(
+            !git_args
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("reset"))
+        );
         // No dependency reinstall when HEAD did not move.
         assert!(runner.calls().iter().all(|c| c.command != "npm"));
     }
@@ -5989,9 +5999,11 @@ mod tests {
             .expect_err("install must fail");
         assert!(error.contains("simulated npm install failure"));
         let events = events.lock().unwrap();
-        assert!(events
-            .iter()
-            .any(|e| e.kind == ProgressKind::Start && e.action == ProgressAction::Install));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == ProgressKind::Start && e.action == ProgressAction::Install)
+        );
         assert!(events.iter().any(|e| e.kind == ProgressKind::Error));
     }
 
@@ -6529,9 +6541,11 @@ mod tests {
         let ParsedSource::Npm(npm) = parse_source("npm:left-pad") else {
             panic!("expected npm source");
         };
-        assert!(manager
-            .should_update_npm_source(&npm, SourceScope::User)
-            .unwrap());
+        assert!(
+            manager
+                .should_update_npm_source(&npm, SourceScope::User)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -6617,8 +6631,8 @@ mod update_tests {
     //! top-level + auto-discovered) backing `rpi config`.
 
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -6793,9 +6807,11 @@ mod update_tests {
         // short-circuits to true, so no `view` call is required. The
         // install must carry `--legacy-peer-deps` and the managed prefix.
         assert!(installs[0].args.contains(&"--legacy-peer-deps".to_string()));
-        assert!(installs[0]
-            .args
-            .contains(&dirs.agent_dir.join("npm").to_string_lossy().into_owned()));
+        assert!(
+            installs[0]
+                .args
+                .contains(&dirs.agent_dir.join("npm").to_string_lossy().into_owned())
+        );
     }
 
     #[test]
@@ -6881,17 +6897,23 @@ mod update_tests {
                 call.command == "git" && call.args.first().map(String::as_str) == Some("fetch")
             })
             .expect("git fetch");
-        assert!(fetch
-            .args
-            .contains(&"+refs/heads/main:refs/remotes/origin/main".to_string()));
+        assert!(
+            fetch
+                .args
+                .contains(&"+refs/heads/main:refs/remotes/origin/main".to_string())
+        );
         // HEAD moved → hard reset + clean + dependency install
         // (ensure_git_ref, package-manager.ts:1863-1889).
-        assert!(calls
-            .iter()
-            .any(|call| call.args.first().map(String::as_str) == Some("reset")));
-        assert!(calls
-            .iter()
-            .any(|call| call.args.first().map(String::as_str) == Some("clean")));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.first().map(String::as_str) == Some("reset"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.first().map(String::as_str) == Some("clean"))
+        );
     }
 
     #[test]
@@ -6933,9 +6955,11 @@ mod update_tests {
                 "v1.0".to_string()
             ]
         );
-        assert!(calls
-            .iter()
-            .any(|call| call.args.first().map(String::as_str) == Some("reset")));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.first().map(String::as_str) == Some("reset"))
+        );
     }
 
     #[test]
@@ -7206,8 +7230,8 @@ mod registry_tests {
     use super::*;
     use crate::core::extension_registry::GITHUB_INSTALL_MARKER_FILE;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -7591,10 +7615,11 @@ mod registry_tests {
         serve_registry_extension(&transport, "smartfetch", "1.0.0", false);
         let mut manager = registry_manager(&dirs, transport, None, false, true);
         manager.install_and_persist("smartfetch", false).unwrap();
-        assert!(dirs
-            .agent_dir
-            .join("extensions/smartfetch/rpi-extension.json")
-            .is_file());
+        assert!(
+            dirs.agent_dir
+                .join("extensions/smartfetch/rpi-extension.json")
+                .is_file()
+        );
     }
 
     #[test]
@@ -7649,10 +7674,11 @@ mod registry_tests {
         transport.insert(&mirror, archive);
         let mut manager = manager_ok(&dirs, transport.clone());
         manager.install_and_persist("subagents", false).unwrap();
-        assert!(dirs
-            .agent_dir
-            .join("extensions/subagents/rpi-extension.json")
-            .is_file());
+        assert!(
+            dirs.agent_dir
+                .join("extensions/subagents/rpi-extension.json")
+                .is_file()
+        );
         let calls = transport.calls();
         let github_pos = calls.iter().position(|url| url == &download).unwrap();
         let mirror_pos = calls.iter().position(|url| url == &mirror).unwrap();
@@ -7692,10 +7718,11 @@ mod registry_tests {
         serve_registry_extension(&transport, "subagents", "0.2.0", true);
         let mut manager = registry_manager(&dirs, transport, Some(Box::new(|_| true)), false, true);
         manager.install_and_persist("subagents", true).unwrap();
-        assert!(dirs
-            .cwd
-            .join(".rpi/extensions/subagents/rpi-extension.json")
-            .is_file());
+        assert!(
+            dirs.cwd
+                .join(".rpi/extensions/subagents/rpi-extension.json")
+                .is_file()
+        );
     }
 
     // ---- remove / update / list ----
@@ -8189,10 +8216,10 @@ mod registry_tests {
         let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = notes.clone();
         manager.set_progress_callback(Some(Box::new(move |event| {
-            if event.kind == ProgressKind::Start {
-                if let Some(message) = &event.message {
-                    sink.lock().unwrap().push(message.clone());
-                }
+            if event.kind == ProgressKind::Start
+                && let Some(message) = &event.message
+            {
+                sink.lock().unwrap().push(message.clone());
             }
         })));
 
@@ -8443,11 +8470,12 @@ mod registry_tests {
             Some("1.1.0")
         );
         // The marker survives the atomic replacement.
-        assert!(dirs
-            .agent_dir
-            .join("extensions/tools")
-            .join(GITHUB_INSTALL_MARKER_FILE)
-            .is_file());
+        assert!(
+            dirs.agent_dir
+                .join("extensions/tools")
+                .join(GITHUB_INSTALL_MARKER_FILE)
+                .is_file()
+        );
     }
 
     #[test]

@@ -36,15 +36,15 @@ use tokio::sync::oneshot;
 use crate::keys::{is_key_release, matches_key};
 use crate::terminal::{InputHandler, ResizeHandler, Terminal};
 use crate::terminal_colors::{
-    is_osc11_background_color_response, parse_osc11_background_color,
-    parse_terminal_color_scheme_report, RgbColor, TerminalColorScheme,
+    RgbColor, TerminalColorScheme, is_osc11_background_color_response,
+    parse_osc11_background_color, parse_terminal_color_scheme_report,
 };
-use crate::terminal_image::{get_capabilities, is_image_line, set_cell_dimensions, CellDimensions};
+use crate::terminal_image::{CellDimensions, get_capabilities, is_image_line, set_cell_dimensions};
 use crate::tui::{
-    composite_tui_line, lock_component, lock_shared, parse_size_value, same_component, Component,
-    OverlayAnchor, OverlayBounds, OverlayMargin, OverlayMarginSpec, OverlayOptions,
-    OverlayUnfocusOptions, SharedComponent, SharedTerminal, SizeValue, TerminalColorSchemeListener,
-    TuiInputListener, CURSOR_MARKER, SEGMENT_RESET,
+    CURSOR_MARKER, Component, OverlayAnchor, OverlayBounds, OverlayMargin, OverlayMarginSpec,
+    OverlayOptions, OverlayUnfocusOptions, SEGMENT_RESET, SharedComponent, SharedTerminal,
+    SizeValue, TerminalColorSchemeListener, TuiInputListener, composite_tui_line, lock_component,
+    lock_shared, parse_size_value, same_component,
 };
 use crate::utils::{normalize_terminal_output, slice_by_column, visible_width};
 
@@ -356,37 +356,35 @@ impl TuiBase {
                         || !self.is_component_mounted(blocked_by)
                     {
                         next_focus = self.resolve_blocked_overlay_focus_resume(&restore_state);
-                    } else if let Some(next) = next_focus.clone() {
-                        self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
-                            overlay_id: *overlay_id,
-                            component: overlay_component.clone(),
-                            blocked_by: next,
-                            resume: resume.clone(),
-                        };
+                    } else {
+                        if let Some(next) = next_focus.clone() {
+                            self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
+                                overlay_id: *overlay_id,
+                                component: overlay_component.clone(),
+                                blocked_by: next,
+                                resume: resume.clone(),
+                            };
+                        }
                     }
                 }
                 _ => {
                     let restore_overlay_id = restore_state.overlay_id();
                     if let (Some(prev_overlay_id), Some(next)) =
                         (previous_focused_overlay, next_focus.clone())
+                        && restore_overlay_id == Some(prev_overlay_id)
+                        && !self.is_overlay_focus_ancestor(prev_overlay_id, &next)
+                        && let Some(overlay_component) = self
+                            .overlay_stack
+                            .iter()
+                            .find(|entry| entry.id == prev_overlay_id)
+                            .map(|entry| entry.component.clone())
                     {
-                        if restore_overlay_id == Some(prev_overlay_id)
-                            && !self.is_overlay_focus_ancestor(prev_overlay_id, &next)
-                        {
-                            if let Some(overlay_component) = self
-                                .overlay_stack
-                                .iter()
-                                .find(|entry| entry.id == prev_overlay_id)
-                                .map(|entry| entry.component.clone())
-                            {
-                                self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
-                                    overlay_id: prev_overlay_id,
-                                    component: overlay_component,
-                                    blocked_by: next,
-                                    resume: OverlayBlockedFocusResume::RestoreOverlay,
-                                };
-                            }
-                        }
+                        self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
+                            overlay_id: prev_overlay_id,
+                            component: overlay_component,
+                            blocked_by: next,
+                            resume: OverlayBlockedFocusResume::RestoreOverlay,
+                        };
                     }
                 }
             }
@@ -411,18 +409,18 @@ impl TuiBase {
             }
         }
 
-        if let Some(previous) = &self.focused_component {
-            if let Some(focusable) = lock_component(previous).as_focusable_mut() {
-                focusable.set_focused(false);
-            }
+        if let Some(previous) = &self.focused_component
+            && let Some(focusable) = lock_component(previous).as_focusable_mut()
+        {
+            focusable.set_focused(false);
         }
 
         self.focused_component = next_focus;
 
-        if let Some(next) = &self.focused_component {
-            if let Some(focusable) = lock_component(next).as_focusable_mut() {
-                focusable.set_focused(true);
-            }
+        if let Some(next) = &self.focused_component
+            && let Some(focusable) = lock_component(next).as_focusable_mut()
+        {
+            focusable.set_focused(true);
         }
 
         let focused_overlay = self.focused_component.clone().and_then(|focused| {
@@ -746,26 +744,24 @@ impl TuiBase {
             blocked_by,
             ..
         } = &restore_state
+            && *overlay_id == entry_id
+            && self
+                .focused_component
+                .as_ref()
+                .is_some_and(|focused| same_component(focused, blocked_by))
         {
-            if *overlay_id == entry_id
-                && self
-                    .focused_component
-                    .as_ref()
-                    .is_some_and(|focused| same_component(focused, blocked_by))
-            {
-                if let Some(options) = options {
-                    self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
-                        overlay_id: entry_id,
-                        component: overlay_component.clone(),
-                        blocked_by: blocked_by.clone(),
-                        resume: OverlayBlockedFocusResume::FocusTarget(options.target),
-                    };
-                } else {
-                    self.clear_overlay_focus_restore();
-                }
-                self.request_render(false);
-                return;
+            if let Some(options) = options {
+                self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
+                    overlay_id: entry_id,
+                    component: overlay_component.clone(),
+                    blocked_by: blocked_by.clone(),
+                    resume: OverlayBlockedFocusResume::FocusTarget(options.target),
+                };
+            } else {
+                self.clear_overlay_focus_restore();
             }
+            self.request_render(false);
+            return;
         }
         self.clear_overlay_focus_restore_for(entry_id);
         if is_focused || options.is_some() {
@@ -1001,10 +997,10 @@ impl TuiBase {
                 lock_component(&entry.component).render(initial.width.max(0) as usize);
 
             // Apply maxHeight if specified.
-            if let Some(max_height) = initial.max_height {
-                if overlay_lines.len() as i32 > max_height {
-                    overlay_lines.truncate(max_height.max(0) as usize);
-                }
+            if let Some(max_height) = initial.max_height
+                && overlay_lines.len() as i32 > max_height
+            {
+                overlay_lines.truncate(max_height.max(0) as usize);
             }
 
             // Get final row/col with the actual overlay height.
@@ -1267,18 +1263,18 @@ impl TuiBase {
                 .iter()
                 .position(|entry| same_component(&entry.component, focused))
         });
-        if let Some(index) = focused_overlay_index {
-            if !self.is_overlay_visible(&self.overlay_stack[index]) {
-                // Focused overlay is no longer visible, redirect to the
-                // topmost visible overlay.
-                let top_visible = self.get_topmost_visible_overlay();
-                if let Some(top_index) = top_visible {
-                    let component = self.overlay_stack[top_index].component.clone();
-                    self.set_focus(Some(component));
-                } else {
-                    let pre_focus = self.overlay_stack[index].pre_focus.clone();
-                    self.set_focus_internal(pre_focus, OverlayFocusRestorePolicy::Preserve);
-                }
+        if let Some(index) = focused_overlay_index
+            && !self.is_overlay_visible(&self.overlay_stack[index])
+        {
+            // Focused overlay is no longer visible, redirect to the
+            // topmost visible overlay.
+            let top_visible = self.get_topmost_visible_overlay();
+            if let Some(top_index) = top_visible {
+                let component = self.overlay_stack[top_index].component.clone();
+                self.set_focus(Some(component));
+            } else {
+                let pre_focus = self.overlay_stack[index].pre_focus.clone();
+                self.set_focus_internal(pre_focus, OverlayFocusRestorePolicy::Preserve);
             }
         }
 
@@ -1346,13 +1342,13 @@ impl TuiBase {
 
         let rgb = parse_osc11_background_color(data);
         self.pending_osc11_background_replies -= 1;
-        if let Some(mut query) = self.pending_osc11_background_queries.pop_front() {
-            if !query.settled {
-                query.settled = true;
-                query.deadline = None;
-                if let Some(sender) = query.sender.take() {
-                    let _ = sender.send(rgb);
-                }
+        if let Some(mut query) = self.pending_osc11_background_queries.pop_front()
+            && !query.settled
+        {
+            query.settled = true;
+            query.deadline = None;
+            if let Some(sender) = query.sender.take() {
+                let _ = sender.send(rgb);
             }
         }
         true

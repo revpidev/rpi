@@ -875,11 +875,11 @@ impl KeybindingsManager {
 
     /// Re-read the config file and rebuild (keybindings.ts:354-357).
     pub fn reload(&mut self) {
-        if let Some(path) = &self.config_path {
-            if let Ok(user_bindings) = load_keybindings_from_file(path) {
-                self.user_bindings = user_bindings;
-                self.rebuild();
-            }
+        if let Some(path) = &self.config_path
+            && let Ok(user_bindings) = load_keybindings_from_file(path)
+        {
+            self.user_bindings = user_bindings;
+            self.rebuild();
         }
     }
 
@@ -1338,12 +1338,16 @@ mod tests {
         let conflicts = mgr.get_conflicts();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].key, "ctrl+x");
-        assert!(conflicts[0]
-            .keybindings
-            .contains(&"tui.editor.cursorUp".to_string()));
-        assert!(conflicts[0]
-            .keybindings
-            .contains(&"tui.editor.cursorDown".to_string()));
+        assert!(
+            conflicts[0]
+                .keybindings
+                .contains(&"tui.editor.cursorUp".to_string())
+        );
+        assert!(
+            conflicts[0]
+                .keybindings
+                .contains(&"tui.editor.cursorDown".to_string())
+        );
     }
 
     #[test]

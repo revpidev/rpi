@@ -313,10 +313,10 @@ impl<'de> serde::Deserialize<'de> for ColorValue {
         match value {
             serde_json::Value::String(s) => Ok(ColorValue::Str(s)),
             serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_u64() {
-                    if i <= 255 {
-                        return Ok(ColorValue::Index(i as u32));
-                    }
+                if let Some(i) = n.as_u64()
+                    && i <= 255
+                {
+                    return Ok(ColorValue::Index(i as u32));
                 }
                 // Out-of-range/fractional numbers pass through leniently
                 // (eb3e9feed: the unvalidated cast keeps them; resolveVarRefs
@@ -1063,25 +1063,23 @@ pub fn get_available_themes() -> Vec<ThemeInfo> {
 
     // Custom themes from global themes dir
     let themes_dir = config::get_global_themes_dir();
-    if themes_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&themes_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(theme_json) =
-                        parse_theme_json_content(&path.display().to_string(), &content)
-                    {
-                        if seen.insert(theme_json.name.clone()) {
-                            result.push(ThemeInfo {
-                                name: theme_json.name,
-                                path: Some(path),
-                            });
-                        }
-                    }
-                }
+    if themes_dir.exists()
+        && let Ok(entries) = std::fs::read_dir(&themes_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(theme_json) =
+                    parse_theme_json_content(&path.display().to_string(), &content)
+                && seen.insert(theme_json.name.clone())
+            {
+                result.push(ThemeInfo {
+                    name: theme_json.name,
+                    path: Some(path),
+                });
             }
         }
     }
@@ -1256,10 +1254,10 @@ pub fn get_color_fg_bg_background_index(colorfgbg: &str) -> Option<u32> {
     let parts: Vec<&str> = colorfgbg.split(';').collect();
     for part in parts.iter().rev() {
         let trimmed = part.trim();
-        if let Ok(bg) = trimmed.parse::<u32>() {
-            if bg <= 255 {
-                return Some(bg);
-            }
+        if let Ok(bg) = trimmed.parse::<u32>()
+            && bg <= 255
+        {
+            return Some(bg);
         }
     }
     None

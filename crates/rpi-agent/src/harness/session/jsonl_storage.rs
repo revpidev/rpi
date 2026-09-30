@@ -46,7 +46,7 @@ use crate::harness::types::{
     SessionError, SessionErrorCode, SessionMetadata, SessionStats, SessionStorage,
 };
 use crate::messages::AgentMessage;
-use crate::session::{LeafEntry, MessageEntry, SessionEntry, CURRENT_SESSION_VERSION};
+use crate::session::{CURRENT_SESSION_VERSION, LeafEntry, MessageEntry, SessionEntry};
 
 use super::repo_utils::{
     build_labels_by_id, generate_entry_id, get_file_system_result_or_throw, leaf_id_after_entry,
@@ -128,7 +128,7 @@ fn parse_header_line(line: &str, file_path: &str) -> Result<SessionHeaderLine, S
             return Err(invalid_session(
                 file_path,
                 "session header is missing timestamp",
-            ))
+            ));
         }
     }
     match object.get("cwd") {
@@ -137,22 +137,22 @@ fn parse_header_line(line: &str, file_path: &str) -> Result<SessionHeaderLine, S
     }
     // `parentSession !== undefined && typeof !== "string"` — absent only; a JSON
     // `null` fails the string check like upstream.
-    if let Some(parent_session) = object.get("parentSession") {
-        if !parent_session.is_string() {
-            return Err(invalid_session(
-                file_path,
-                "session header parentSession must be a string",
-            ));
-        }
+    if let Some(parent_session) = object.get("parentSession")
+        && !parent_session.is_string()
+    {
+        return Err(invalid_session(
+            file_path,
+            "session header parentSession must be a string",
+        ));
     }
     // `metadata !== undefined && (typeof !== "object" || === null || isArray)`.
-    if let Some(metadata) = object.get("metadata") {
-        if !metadata.is_object() {
-            return Err(invalid_session(
-                file_path,
-                "session header metadata must be an object",
-            ));
-        }
+    if let Some(metadata) = object.get("metadata")
+        && !metadata.is_object()
+    {
+        return Err(invalid_session(
+            file_path,
+            "session header metadata must be an object",
+        ));
     }
     // All fields are validated above; the typed parse cannot fail here.
     serde_json::from_value(value)
@@ -195,7 +195,7 @@ fn parse_entry_line(
                 file_path,
                 line_number,
                 "has invalid parentId",
-            ))
+            ));
         }
     }
     match object.get("timestamp") {
@@ -205,7 +205,7 @@ fn parse_entry_line(
                 file_path,
                 line_number,
                 "is missing timestamp",
-            ))
+            ));
         }
     }
     if object.get("type").and_then(Value::as_str) == Some("leaf") {
@@ -218,7 +218,7 @@ fn parse_entry_line(
                     file_path,
                     line_number,
                     "has invalid targetId",
-                ))
+                ));
             }
         }
     }
@@ -257,13 +257,13 @@ pub async fn load_jsonl_session_metadata(
         .await,
         format!("Failed to read session header {file_path}"),
     )?;
-    if let Some(line) = lines.first() {
-        if !line.trim().is_empty() {
-            return Ok(header_to_session_metadata(
-                &parse_header_line(line, file_path)?,
-                file_path,
-            ));
-        }
+    if let Some(line) = lines.first()
+        && !line.trim().is_empty()
+    {
+        return Ok(header_to_session_metadata(
+            &parse_header_line(line, file_path)?,
+            file_path,
+        ));
     }
     Err(invalid_session(file_path, "missing session header"))
 }
@@ -413,13 +413,13 @@ impl SessionStorage for JsonlSessionStorage {
     /// `getLeafId` (jsonl-storage.ts:247-252) — validates the leaf against `byId`.
     async fn get_leaf_id(&self) -> Result<Option<String>, SessionError> {
         let state = self.state.lock().await;
-        if let Some(id) = &state.current_leaf_id {
-            if !state.by_id.contains_key(id) {
-                return Err(SessionError::new(
-                    SessionErrorCode::InvalidSession,
-                    format!("Entry {id} not found"),
-                ));
-            }
+        if let Some(id) = &state.current_leaf_id
+            && !state.by_id.contains_key(id)
+        {
+            return Err(SessionError::new(
+                SessionErrorCode::InvalidSession,
+                format!("Entry {id} not found"),
+            ));
         }
         Ok(state.current_leaf_id.clone())
     }
@@ -430,13 +430,13 @@ impl SessionStorage for JsonlSessionStorage {
     /// (see header note).
     async fn set_leaf_id(&self, leaf_id: Option<String>) -> Result<(), SessionError> {
         let mut state = self.state.lock().await;
-        if let Some(id) = &leaf_id {
-            if !state.by_id.contains_key(id) {
-                return Err(SessionError::new(
-                    SessionErrorCode::NotFound,
-                    format!("Entry {id} not found"),
-                ));
-            }
+        if let Some(id) = &leaf_id
+            && !state.by_id.contains_key(id)
+        {
+            return Err(SessionError::new(
+                SessionErrorCode::NotFound,
+                format!("Entry {id} not found"),
+            ));
         }
         let entry = SessionEntry::Leaf(LeafEntry {
             id: generate_entry_id(&state.by_id),
@@ -633,7 +633,7 @@ mod tests {
         }
     }
     use crate::harness::session::repo_utils::test_support::{
-        assistant_message, assistant_message_with_usage, message_entry, usage, user_message, TestFs,
+        TestFs, assistant_message, assistant_message_with_usage, message_entry, usage, user_message,
     };
     use crate::harness::types::SessionEntryCursorOptions;
     use crate::session::{BranchSummaryEntry, CompactionEntry, LabelEntry, LeafEntry};
@@ -706,11 +706,13 @@ mod tests {
         assert_eq!(header["id"], "session-1");
         assert_eq!(header["cwd"], "/repo");
         assert_eq!(storage.get_leaf_id().await.expect("leaf"), None);
-        assert!(storage
-            .get_entries(SessionEntryCursorOptions::default())
-            .await
-            .expect("entries")
-            .is_empty());
+        assert!(
+            storage
+                .get_entries(SessionEntryCursorOptions::default())
+                .await
+                .expect("entries")
+                .is_empty()
+        );
         storage
             .append_entry(message_entry(
                 "user-1",
@@ -736,9 +738,11 @@ mod tests {
         write_raw(&file_path, "not json\n");
         let error = expect_err(JsonlSessionStorage::open(fs, &file_path).await, "open");
         assert_eq!(error.code, SessionErrorCode::InvalidSession);
-        assert!(error
-            .message
-            .contains("first line is not a valid session header"));
+        assert!(
+            error
+                .message
+                .contains("first line is not a valid session header")
+        );
     }
 
     #[tokio::test]
@@ -1113,11 +1117,13 @@ mod tests {
         let found = storage.find_entries("message").await.expect("find");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id(), "entry-1");
-        assert!(storage
-            .find_entries("session_info")
-            .await
-            .expect("find")
-            .is_empty());
+        assert!(
+            storage
+                .find_entries("session_info")
+                .await
+                .expect("find")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

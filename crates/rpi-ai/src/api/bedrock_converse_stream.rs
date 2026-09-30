@@ -60,11 +60,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::api::anthropic_messages::resolve_cache_retention;
 use crate::api::bedrock::event_stream::{EventStreamDecoder, EventStreamMessage};
-use crate::api::bedrock::sigv4::{self, extended_encode_uri_component, SigV4Credentials};
+use crate::api::bedrock::sigv4::{self, SigV4Credentials, extended_encode_uri_component};
 use crate::api::constrained_sampling::{
     get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
@@ -72,7 +72,7 @@ use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
     clamp_reasoning,
 };
-use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
+use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
 use crate::models::ProviderStreams;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantRole, CacheRetention,
@@ -87,7 +87,7 @@ use crate::utils::headers::{headers_to_record, provider_headers_to_header_map};
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions,
+    ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::transform_messages::transform_messages;
@@ -460,10 +460,10 @@ fn supports_thinking_signature(model: &Model) -> bool {
 
 /// `isGovCloudBedrockTarget`: GovCloud rejects the `thinking.display` field.
 pub fn is_gov_cloud_bedrock_target(model: &Model, options: &BedrockOptions) -> bool {
-    if let Some(region) = get_configured_bedrock_region(options) {
-        if region.to_lowercase().starts_with("us-gov-") {
-            return true;
-        }
+    if let Some(region) = get_configured_bedrock_region(options)
+        && region.to_lowercase().starts_with("us-gov-")
+    {
+        return true;
     }
     let id = model.id.to_lowercase();
     id.starts_with("us-gov.") || id.starts_with("arn:aws-us-gov:")
@@ -475,14 +475,13 @@ pub fn map_thinking_level_to_effort(model: &Model, level: Option<ThinkingLevel>)
     if level == Some(ThinkingLevel::Xhigh) && supports_native_xhigh_effort(model) {
         return "xhigh".to_owned();
     }
-    if let Some(level) = level {
-        if let Some(Some(mapped)) = model
+    if let Some(level) = level
+        && let Some(Some(mapped)) = model
             .thinking_level_map
             .as_ref()
             .and_then(|map| map.get(&level.to_model_level()))
-        {
-            return mapped.clone();
-        }
+    {
+        return mapped.clone();
     }
     match level {
         Some(ThinkingLevel::Minimal) | Some(ThinkingLevel::Low) => "low".to_owned(),
@@ -700,14 +699,13 @@ pub fn convert_messages(
                             if thinking.redacted.unwrap_or(false) {
                                 if let Some(redacted_content) =
                                     decode_redacted_content(thinking.thinking_signature.as_deref())
+                                    && !redacted_content.is_empty()
                                 {
-                                    if !redacted_content.is_empty() {
-                                        content_blocks.push(json!({
-                                            "reasoningContent": {
-                                                "redactedContent": redacted_content,
-                                            },
-                                        }));
-                                    }
+                                    content_blocks.push(json!({
+                                        "reasoningContent": {
+                                            "redactedContent": redacted_content,
+                                        },
+                                    }));
                                 }
                                 continue;
                             }
@@ -784,14 +782,11 @@ pub fn convert_messages(
     if cache_retention != CacheRetention::None
         && supports_prompt_caching(model, env)
         && !result.is_empty()
+        && let Some(last) = result.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(content) = last.get_mut("content").and_then(Value::as_array_mut)
     {
-        if let Some(last) = result.last_mut() {
-            if last.get("role").and_then(Value::as_str) == Some("user") {
-                if let Some(content) = last.get_mut("content").and_then(Value::as_array_mut) {
-                    content.push(cache_point_block(cache_retention));
-                }
-            }
-        }
+        content.push(cache_point_block(cache_retention));
     }
 
     Ok(result)
@@ -1427,35 +1422,35 @@ impl<'a> StreamProcessor<'a> {
                     Some(index)
                 }
             };
-            if let Some(index) = index {
-                if let AssistantContent::Text(text_block) = &mut self.output.content[index] {
-                    text_block.text.push_str(text);
-                    events.push(StreamEvent::TextDelta {
-                        content_index: index,
-                        delta: text.to_owned(),
-                        partial: Arc::new(self.output.clone()),
-                    });
-                }
+            if let Some(index) = index
+                && let AssistantContent::Text(text_block) = &mut self.output.content[index]
+            {
+                text_block.text.push_str(text);
+                events.push(StreamEvent::TextDelta {
+                    content_index: index,
+                    delta: text.to_owned(),
+                    partial: Arc::new(self.output.clone()),
+                });
             }
             return;
         }
 
         // Tool use input chunks.
         if let Some(tool_use) = delta.get("toolUse") {
-            if let Some(index) = block_index {
-                if matches!(self.output.content[index], AssistantContent::ToolCall(_)) {
-                    let input = tool_use.get("input").and_then(Value::as_str).unwrap_or("");
-                    let partial = self.partial_json.entry(index).or_default();
-                    partial.push_str(input);
-                    if let AssistantContent::ToolCall(call) = &mut self.output.content[index] {
-                        call.arguments = parse_streaming_json(Some(partial));
-                    }
-                    events.push(StreamEvent::ToolCallDelta {
-                        content_index: index,
-                        delta: input.to_owned(),
-                        partial: Arc::new(self.output.clone()),
-                    });
+            if let Some(index) = block_index
+                && matches!(self.output.content[index], AssistantContent::ToolCall(_))
+            {
+                let input = tool_use.get("input").and_then(Value::as_str).unwrap_or("");
+                let partial = self.partial_json.entry(index).or_default();
+                partial.push_str(input);
+                if let AssistantContent::ToolCall(call) = &mut self.output.content[index] {
+                    call.arguments = parse_streaming_json(Some(partial));
                 }
+                events.push(StreamEvent::ToolCallDelta {
+                    content_index: index,
+                    delta: input.to_owned(),
+                    partial: Arc::new(self.output.clone()),
+                });
             }
             return;
         }
@@ -1498,16 +1493,15 @@ impl<'a> StreamProcessor<'a> {
                 .get("signature")
                 .and_then(Value::as_str)
                 .filter(|signature| !signature.is_empty())
+                && let AssistantContent::Thinking(thinking) = &mut self.output.content[index]
             {
-                if let AssistantContent::Thinking(thinking) = &mut self.output.content[index] {
-                    // `thinkingSignature` holds either an Anthropic signature
-                    // or an opaque redacted payload, never both: mixing them
-                    // would corrupt whichever arrived first
-                    // (bedrock-converse-stream.ts:637, `d57e531f5`).
-                    if thinking.redacted != Some(true) {
-                        let current = thinking.thinking_signature.get_or_insert_with(String::new);
-                        current.push_str(signature);
-                    }
+                // `thinkingSignature` holds either an Anthropic signature
+                // or an opaque redacted payload, never both: mixing them
+                // would corrupt whichever arrived first
+                // (bedrock-converse-stream.ts:637, `d57e531f5`).
+                if thinking.redacted != Some(true) {
+                    let current = thinking.thinking_signature.get_or_insert_with(String::new);
+                    current.push_str(signature);
                 }
             }
             // Encrypted reasoning from non-Anthropic models on Bedrock (e.g.
@@ -1728,10 +1722,10 @@ async fn run(
         resolve_cache_retention(options.stream.cache_retention, options.stream.env.as_ref());
 
     let mut command_input = build_command_input(model, context, options, cache_retention)?;
-    if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_payload) = on_payload(command_input.clone(), model).await {
-            command_input = next_payload;
-        }
+    if let Some(on_payload) = &options.stream.on_payload
+        && let Some(next_payload) = on_payload(command_input.clone(), model).await
+    {
+        command_input = next_payload;
     }
 
     // `modelId` is an HTTP label: it goes to the path, not the body.
@@ -1990,10 +1984,10 @@ async fn run(
             }
         }
     }
-    if outcome.is_ok() {
-        if let Err(error) = decoder.finish() {
-            outcome = Err(error);
-        }
+    if outcome.is_ok()
+        && let Err(error) = decoder.finish()
+    {
+        outcome = Err(error);
     }
     // Terminal flush — a stream can settle without stopping every block, so
     // both the done and error paths finalize the scratch buffers first
@@ -2080,10 +2074,8 @@ pub fn stream(
                 output.error_message = Some(message);
                 // 70bbe47a9: structured provider-failure metadata; aborted
                 // turns emit no diagnostic.
-                if !aborted {
-                    if let Ok(guard) = failure.lock() {
-                        append_bedrock_failure_diagnostic(&mut output, &guard);
-                    }
+                if !aborted && let Ok(guard) = failure.lock() {
+                    append_bedrock_failure_diagnostic(&mut output, &guard);
                 }
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {

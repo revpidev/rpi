@@ -21,8 +21,8 @@ use std::sync::Arc;
 use rpi_agent::messages::CustomMessage;
 use rpi_ai::types::UserContent;
 use rpi_ai::types::UserContentBlock;
-use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use rpi_tui::components::r#box::Box as TuiBox;
+use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
 use rpi_tui::tui::{Component, Container};
@@ -104,18 +104,18 @@ impl CustomMessageComponent {
         self.container.add_child(StdBox::new(Spacer::new(1)));
 
         // Try custom renderer first (custom-message.ts:69-85).
-        if let Some(renderer) = &self.custom_renderer {
-            if let Some(component) = renderer(
+        if let Some(renderer) = &self.custom_renderer
+            && let Some(component) = renderer(
                 &self.message,
                 MessageRenderOptions {
                     expanded: self.expanded,
                     output_pad: self.output_pad,
                 },
                 &self.theme,
-            ) {
-                self.container.add_child(component);
-                return;
-            }
+            )
+        {
+            self.container.add_child(component);
+            return;
         }
 
         // Default rendering uses our box (custom-message.ts:88-111).
@@ -300,11 +300,13 @@ mod tests {
                 output_pad: 1
             }]
         );
-        assert!(component
-            .render(40)
-            .iter()
-            .map(|l| strip_ansi(l))
-            .any(|line| line.starts_with(" custom")));
+        assert!(
+            component
+                .render(40)
+                .iter()
+                .map(|l| strip_ansi(l))
+                .any(|line| line.starts_with(" custom"))
+        );
 
         component.set_output_pad(0);
         assert_eq!(
@@ -320,11 +322,13 @@ mod tests {
                 }
             ]
         );
-        assert!(component
-            .render(40)
-            .iter()
-            .map(|l| strip_ansi(l))
-            .any(|line| line.starts_with("custom")));
+        assert!(
+            component
+                .render(40)
+                .iter()
+                .map(|l| strip_ansi(l))
+                .any(|line| line.starts_with("custom"))
+        );
     }
 
     #[test]

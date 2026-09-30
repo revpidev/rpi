@@ -17,10 +17,10 @@ use std::sync::{Arc, Mutex};
 use rpi::core::agent_session::{AgentSessionEvent, SessionEvent};
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
-use rpi::sdk::{create_agent_session, CreateAgentSessionOptions};
+use rpi::sdk::{CreateAgentSessionOptions, create_agent_session};
 use rpi_agent::types::AgentEvent;
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAiProvider, FauxAssistantOptions, FauxProvider, FauxProviderOptions,
+    FauxAiProvider, FauxAssistantOptions, FauxProvider, FauxProviderOptions, faux_assistant_message,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -61,11 +61,13 @@ async fn sdk_quick_start_one_faux_round() {
     // registerNativeProvider / registerProvider (here FauxProvider scripts one
     // conversation round).
     let provider = FauxProvider::new(FauxProviderOptions::default());
-    provider.set_responses(vec![faux_assistant_message(
-        "There are 3 files in the current directory.",
-        FauxAssistantOptions::default(),
-    )
-    .into()]);
+    provider.set_responses(vec![
+        faux_assistant_message(
+            "There are 3 files in the current directory.",
+            FauxAssistantOptions::default(),
+        )
+        .into(),
+    ]);
 
     let model_runtime = ModelRuntime::create(CreateModelRuntimeOptions {
         credentials: None,
@@ -133,10 +135,14 @@ async fn sdk_quick_start_one_faux_round() {
     assert!(events
         .iter()
         .any(|e| matches!(e, AgentSessionEvent::Agent(boxed) if matches!(**boxed, AgentEvent::AgentStart))));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, AgentSessionEvent::AgentEnd(_))));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, AgentSessionEvent::Session(SessionEvent::AgentSettled))));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentSessionEvent::AgentEnd(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentSessionEvent::Session(SessionEvent::AgentSettled)))
+    );
 }

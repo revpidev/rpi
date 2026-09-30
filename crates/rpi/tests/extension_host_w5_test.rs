@@ -14,16 +14,16 @@ use std::sync::{Arc, Mutex};
 use rpi::core::agent_session::ExtensionBindings;
 use rpi::core::extension_actions::bind_session_actions;
 use rpi::core::extension_context::RuntimeCommandActions;
+use rpi_ext_host::ExtError;
 use rpi_ext_host::api::{CommandContextActions, CompactOptions, ExtensionApi, ExtensionContext};
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::InlineExtension;
 use rpi_ext_host::types as ext;
-use rpi_ext_host::ExtError;
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAiProvider, FauxAssistantOptions, FauxModelDefinition,
-    FauxProvider, FauxProviderOptions,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    faux_assistant_message,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Fixture helpers (following the W2/W3 pattern)
@@ -115,11 +115,9 @@ async fn runtime_fixture(event_log: Arc<Mutex<Vec<String>>>) -> RuntimeFixture {
                     }]),
                     ..Default::default()
                 });
-                provider.set_responses(vec![faux_assistant_message(
-                    "ok",
-                    FauxAssistantOptions::default(),
-                )
-                .into()]);
+                provider.set_responses(vec![
+                    faux_assistant_message("ok", FauxAssistantOptions::default()).into(),
+                ]);
                 let model = provider.get_model(None).expect("faux model");
                 let model_runtime = rpi::core::model_runtime::ModelRuntime::create(
                     rpi::core::model_runtime::CreateModelRuntimeOptions {

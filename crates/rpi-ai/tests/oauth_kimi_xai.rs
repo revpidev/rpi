@@ -32,7 +32,7 @@ use rpi_ai::auth::{
 };
 use rpi_ai::providers::kimi_coding::kimi_coding_provider;
 use rpi_ai::providers::xai::xai_provider;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 // ---------------------------------------------------------------------------
 // Factory wiring (the W4 `oauth: None` placeholder tests in the group files

@@ -377,10 +377,10 @@ fn map_with_session(
     with_session: Option<WithSessionFn>,
 ) -> Option<
     impl Fn(
-            crate::core::agent_session_runtime::ReplacedSessionContext,
-        ) -> futures::future::BoxFuture<'static, ()>
-        + Send
-        + Sync,
+        crate::core::agent_session_runtime::ReplacedSessionContext,
+    ) -> futures::future::BoxFuture<'static, ()>
+    + Send
+    + Sync,
 > {
     with_session.map(|with_session| {
         move |replaced: crate::core::agent_session_runtime::ReplacedSessionContext| {

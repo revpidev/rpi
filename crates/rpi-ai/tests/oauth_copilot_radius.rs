@@ -26,15 +26,15 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Json;
-use rpi_ai::auth::oauth::{create_radius_oauth, RadiusOAuthOptions};
+use rpi_ai::auth::oauth::{RadiusOAuthOptions, create_radius_oauth};
 use rpi_ai::auth::types::BoxFutureSend;
 use rpi_ai::auth::{
     AuthEvent, AuthInteraction, AuthPrompt, Credential, ModelsError, OAuthCredential,
 };
 use rpi_ai::models::Provider;
 use rpi_ai::providers::github_copilot::github_copilot_provider;
-use rpi_ai::providers::radius::{radius_provider, radius_provider_with, RadiusProviderOptions};
-use serde_json::{json, Map, Value};
+use rpi_ai::providers::radius::{RadiusProviderOptions, radius_provider, radius_provider_with};
+use serde_json::{Map, Value, json};
 
 /// A credential exactly as `GitHubCopilotOAuth::login`/`refresh` produces it
 /// (extras: `enterpriseUrl`, `availableModelIds`).

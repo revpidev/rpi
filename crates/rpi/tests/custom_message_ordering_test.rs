@@ -16,10 +16,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rpi_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
-    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
+    FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, faux_assistant_message, faux_tool_call,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 struct TempDir(std::path::PathBuf);
@@ -318,17 +318,17 @@ async fn trigger_turn_false_during_run_appends_after_tool_results() {
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let event_log = events.clone();
     let _unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
-        if let rpi::core::agent_session::AgentSessionEvent::Agent(agent_event) = event {
-            if let rpi_agent::types::AgentEvent::MessageStart { message } = agent_event.as_ref() {
-                let role = serde_json::to_value(message)
-                    .ok()
-                    .and_then(|v| v.get("role").and_then(Value::as_str).map(str::to_owned))
-                    .unwrap_or_default();
-                event_log
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(role);
-            }
+        if let rpi::core::agent_session::AgentSessionEvent::Agent(agent_event) = event
+            && let rpi_agent::types::AgentEvent::MessageStart { message } = agent_event.as_ref()
+        {
+            let role = serde_json::to_value(message)
+                .ok()
+                .and_then(|v| v.get("role").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            event_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(role);
         }
     }));
 

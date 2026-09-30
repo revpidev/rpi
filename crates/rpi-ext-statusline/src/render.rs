@@ -8,7 +8,7 @@
 //! sets NO `fg`/`dim`, so the script's own ANSI passes through verbatim
 //! (`component_tree.rs:110-142` only wraps when styling props are set).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Rendering lines cap (defensive; CC documents no cap).
 pub const MAX_LINES: usize = 8;

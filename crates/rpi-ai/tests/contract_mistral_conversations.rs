@@ -15,15 +15,15 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rpi_ai::api::mistral_conversations::{
-    stream as stream_mistral, MistralConversations, MistralOptions, MistralPromptMode,
-    MistralToolChoice,
+    MistralConversations, MistralOptions, MistralPromptMode, MistralToolChoice,
+    stream as stream_mistral,
 };
 use rpi_ai::models::ProviderStreams;
 use rpi_ai::types::{
     ApiKind, CacheRetention, Context, Message, Model, ProviderHeaders, SimpleStreamOptions,
     StopReason, StreamEvent, StreamOptions, ThinkingLevel,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -707,21 +707,25 @@ async fn mistral_http_transport_serializes_sdk_style_payloads_to_the_mistral_wir
     );
     let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
         system_prompt: Some("Be precise".to_owned()),
-        messages: vec![serde_json::from_value(json!({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "describe"},
-                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
-            ],
-            "timestamp": 1
-        }))
-        .expect("user")],
-        tools: Some(vec![serde_json::from_value(json!({
-            "name": "lookup",
-            "description": "Look something up",
-            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
-        }))
-        .expect("tool")]),
+        messages: vec![
+            serde_json::from_value(json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+                ],
+                "timestamp": 1
+            }))
+            .expect("user"),
+        ],
+        tools: Some(vec![
+            serde_json::from_value(json!({
+                "name": "lookup",
+                "description": "Look something up",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+            }))
+            .expect("tool"),
+        ]),
     });
 
     let captured_payload = Arc::new(Mutex::new(None::<Value>));
@@ -877,8 +881,8 @@ async fn mistral_http_transport_serializes_sdk_style_payloads_to_the_mistral_wir
 /// mistral-http-transport.test.ts: "serializes assistant thinking, tool
 /// calls, and tool results for replay".
 #[tokio::test]
-async fn mistral_http_transport_serializes_assistant_thinking_tool_calls_and_tool_results_for_replay(
-) {
+async fn mistral_http_transport_serializes_assistant_thinking_tool_calls_and_tool_results_for_replay()
+ {
     let (base_url, mut captured) = serve_responses(vec![ScriptedResponse::Full {
         status: 200,
         headers: Vec::new(),
@@ -1102,8 +1106,8 @@ async fn mistral_id_keyed_chunk_then_indexed_chunk_open_separate_blocks() {
 /// mistral-http-transport.test.ts: "honors case-insensitive header overrides
 /// and explicit affinity suppression".
 #[tokio::test]
-async fn mistral_http_transport_honors_case_insensitive_header_overrides_and_explicit_affinity_suppression(
-) {
+async fn mistral_http_transport_honors_case_insensitive_header_overrides_and_explicit_affinity_suppression()
+ {
     let (base_url, mut captured) = serve_responses(vec![ScriptedResponse::Full {
         status: 200,
         headers: Vec::new(),

@@ -9,7 +9,7 @@
 
 use rpi_ai::types::{Tool, ToolCall};
 use rpi_ext_ask_user_question::parity::question_params_schema;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn tool() -> Tool {
     Tool {

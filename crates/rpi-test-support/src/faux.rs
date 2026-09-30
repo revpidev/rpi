@@ -446,22 +446,22 @@ impl FauxProvider {
         let mut cache_read = 0u64;
         let mut cache_write = 0u64;
 
-        if let Some(session_id) = &options.session_id {
-            if options.cache_retention != Some(CacheRetention::None) {
-                let mut inner = self.lock();
-                match inner.prompt_cache.get(session_id) {
-                    Some(previous) => {
-                        let cached_chars = common_prefix_len(previous, &prompt_text);
-                        cache_read = estimate_tokens(&previous[..cached_chars]);
-                        cache_write = estimate_tokens(&prompt_text[cached_chars..]);
-                        input = prompt_tokens.saturating_sub(cache_read);
-                    }
-                    None => {
-                        cache_write = prompt_tokens;
-                    }
+        if let Some(session_id) = &options.session_id
+            && options.cache_retention != Some(CacheRetention::None)
+        {
+            let mut inner = self.lock();
+            match inner.prompt_cache.get(session_id) {
+                Some(previous) => {
+                    let cached_chars = common_prefix_len(previous, &prompt_text);
+                    cache_read = estimate_tokens(&previous[..cached_chars]);
+                    cache_write = estimate_tokens(&prompt_text[cached_chars..]);
+                    input = prompt_tokens.saturating_sub(cache_read);
                 }
-                inner.prompt_cache.insert(session_id.clone(), prompt_text);
+                None => {
+                    cache_write = prompt_tokens;
+                }
             }
+            inner.prompt_cache.insert(session_id.clone(), prompt_text);
         }
 
         Usage {
@@ -1002,25 +1002,27 @@ mod tests {
     #[tokio::test]
     async fn test_faux_streams_deterministic_event_sequence() {
         let provider = FauxProvider::new(FauxProviderOptions::default());
-        provider.set_responses(vec![faux_assistant_message(
-            vec![
-                faux_thinking("hmm"),
-                faux_text("hello world"),
-                faux_tool_call(
-                    "read",
-                    serde_json::json!({"path": "a.txt"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                    Some("call_1".to_owned()),
-                ),
-            ],
-            FauxAssistantOptions {
-                stop_reason: Some(StopReason::ToolUse),
-                ..Default::default()
-            },
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message(
+                vec![
+                    faux_thinking("hmm"),
+                    faux_text("hello world"),
+                    faux_tool_call(
+                        "read",
+                        serde_json::json!({"path": "a.txt"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                        Some("call_1".to_owned()),
+                    ),
+                ],
+                FauxAssistantOptions {
+                    stop_reason: Some(StopReason::ToolUse),
+                    ..Default::default()
+                },
+            )
+            .into(),
+        ]);
 
         let model = provider.get_model(None).unwrap();
         let stream = provider.stream_fn()(model, user_context("hi"), StreamOptions::default());
@@ -1033,11 +1035,9 @@ mod tests {
         assert!(types.contains(&"text_delta"));
         assert!(types.contains(&"toolcall_end"));
         // Deterministic: same script twice yields identical sequences.
-        provider.set_responses(vec![faux_assistant_message(
-            "hello world",
-            Default::default(),
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message("hello world", Default::default()).into(),
+        ]);
         let model = provider.get_model(None).unwrap();
         let s1 = collect(provider.stream_fn()(
             model.clone(),
@@ -1045,11 +1045,9 @@ mod tests {
             StreamOptions::default(),
         ))
         .await;
-        provider.set_responses(vec![faux_assistant_message(
-            "hello world",
-            Default::default(),
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message("hello world", Default::default()).into(),
+        ]);
         let s2 = collect(provider.stream_fn()(
             model,
             user_context("hi"),
@@ -1152,7 +1150,9 @@ mod tests {
     #[tokio::test]
     async fn test_faux_abort_before_start() {
         let provider = FauxProvider::new(FauxProviderOptions::default());
-        provider.set_responses(vec![faux_assistant_message("hi", Default::default()).into()]);
+        provider.set_responses(vec![
+            faux_assistant_message("hi", Default::default()).into(),
+        ]);
         let model = provider.get_model(None).unwrap();
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
@@ -1184,7 +1184,7 @@ mod tests {
         });
         let long_text = "abcd".repeat(100); // 400 chars = 100 tokens
         provider.set_responses(vec![
-            faux_assistant_message(long_text, Default::default()).into()
+            faux_assistant_message(long_text, Default::default()).into(),
         ]);
         let model = provider.get_model(None).unwrap();
         let started = std::time::Instant::now();
@@ -1205,11 +1205,9 @@ mod tests {
             tokens_per_second: Some(0.0),
             ..Default::default()
         });
-        provider.set_responses(vec![faux_assistant_message(
-            "x".repeat(400),
-            Default::default(),
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message("x".repeat(400), Default::default()).into(),
+        ]);
         let model = provider.get_model(None).unwrap();
         let started = std::time::Instant::now();
         let _ = collect(provider.stream_fn()(
@@ -1257,15 +1255,17 @@ mod tests {
     #[tokio::test]
     async fn test_faux_error_stop_reason_streams_error_event() {
         let provider = FauxProvider::new(FauxProviderOptions::default());
-        provider.set_responses(vec![faux_assistant_message(
-            "",
-            FauxAssistantOptions {
-                stop_reason: Some(StopReason::Error),
-                error_message: Some("boom".to_owned()),
-                ..Default::default()
-            },
-        )
-        .into()]);
+        provider.set_responses(vec![
+            faux_assistant_message(
+                "",
+                FauxAssistantOptions {
+                    stop_reason: Some(StopReason::Error),
+                    error_message: Some("boom".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .into(),
+        ]);
         let model = provider.get_model(None).unwrap();
         let events = collect(provider.stream_fn()(
             model,

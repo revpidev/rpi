@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Two fake hosts, switched by the cookie VALUE (0xA / 0xB — never
 /// dereferenced). Each has its own record buffer + canned replies.
@@ -135,7 +135,7 @@ fn resume_rebinds_second_host_and_revives_the_refresh_loop() {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&agent).expect("mkdir");
-    std::env::set_var("RPI_CODING_AGENT_DIR", &agent);
+    rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent);
     std::fs::write(
         agent.join("settings.json"),
         serde_json::to_string_pretty(&json!({"statusLine": {

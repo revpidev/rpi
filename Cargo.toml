@@ -16,11 +16,13 @@ members = [
     "crates/rpi-ext-todo",
     "crates/rpi-test-native-plugin",
     "crates/rpi-test-support",
+    "crates/rpi-test-env",
 ]
 
 [workspace.package]
 version = "0.1.5"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
@@ -35,6 +37,8 @@ rpi-ext-mcp-adapter = { path = "crates/rpi-ext-mcp-adapter" }
 rpi-ext-smart-fetch = { path = "crates/rpi-ext-smart-fetch" }
 rpi-ext-statusline = { path = "crates/rpi-ext-statusline" }
 rpi-test-support = { path = "crates/rpi-test-support" }
+# Test-only env-var helpers (edition-2024 unsafe centralization; dev-dep only).
+rpi-test-env = { path = "crates/rpi-test-env" }
 
 # External baseline (coding-standards appendix A).
 # rc: Arc<T> serializes transparently as T (V15-13 L3 — shared streaming

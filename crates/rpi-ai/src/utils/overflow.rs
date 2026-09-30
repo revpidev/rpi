@@ -88,46 +88,47 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u6
     // a zero/unknown window disables Cases 2-3 entirely.
     let context_window = context_window.filter(|window| *window > 0);
     // Case 1: error message patterns.
-    if message.stop_reason == StopReason::Error {
-        if let Some(error_message) = &message.error_message {
-            let is_non_overflow = non_overflow_patterns()
+    if message.stop_reason == StopReason::Error
+        && let Some(error_message) = &message.error_message
+    {
+        let is_non_overflow = non_overflow_patterns()
+            .iter()
+            .any(|pattern| pattern.is_match(error_message));
+        if !is_non_overflow {
+            if overflow_patterns()
                 .iter()
-                .any(|pattern| pattern.is_match(error_message));
-            if !is_non_overflow {
-                if overflow_patterns()
-                    .iter()
-                    .any(|pattern| pattern.is_match(error_message))
-                {
-                    return true;
-                }
-                // #9482: bodyless 400/413 is overflow only from Cerebras.
-                if message.provider == "cerebras"
-                    && cerebras_bodyless_overflow_pattern().is_match(error_message)
-                {
-                    return true;
-                }
+                .any(|pattern| pattern.is_match(error_message))
+            {
+                return true;
+            }
+            // #9482: bodyless 400/413 is overflow only from Cerebras.
+            if message.provider == "cerebras"
+                && cerebras_bodyless_overflow_pattern().is_match(error_message)
+            {
+                return true;
             }
         }
     }
 
     // Case 2: silent overflow (z.ai style) — successful but usage exceeds context.
-    if let Some(window) = context_window {
-        if message.stop_reason == StopReason::Stop {
-            let input_tokens = message.usage.input + message.usage.cache_read;
-            if input_tokens > window {
-                return true;
-            }
+    if let Some(window) = context_window
+        && message.stop_reason == StopReason::Stop
+    {
+        let input_tokens = message.usage.input + message.usage.cache_read;
+        if input_tokens > window {
+            return true;
         }
     }
 
     // Case 3: length-stop overflow (Xiaomi MiMo style) — server truncates
     // oversized input, leaving no room for output.
-    if let Some(window) = context_window {
-        if message.stop_reason == StopReason::Length && message.usage.output == 0 {
-            let input_tokens = message.usage.input + message.usage.cache_read;
-            if input_tokens as f64 >= window as f64 * 0.99 {
-                return true;
-            }
+    if let Some(window) = context_window
+        && message.stop_reason == StopReason::Length
+        && message.usage.output == 0
+    {
+        let input_tokens = message.usage.input + message.usage.cache_read;
+        if input_tokens as f64 >= window as f64 * 0.99 {
+            return true;
         }
     }
 

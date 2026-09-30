@@ -24,12 +24,12 @@ pub mod providers;
 
 pub use image_models::{get_image_model, get_image_models, get_image_providers};
 pub use images_api_registry::{
-    get_images_api_provider, register_images_api_provider, ImagesApiProvider, ImagesFunction,
-    RegisteredImagesApiProvider,
+    ImagesApiProvider, ImagesFunction, RegisteredImagesApiProvider, get_images_api_provider,
+    register_images_api_provider,
 };
 pub use images_models::{
-    create_images_models, create_images_provider, CreateImagesProviderOptions, ImagesModels,
-    ImagesProvider, ProviderImages,
+    CreateImagesProviderOptions, ImagesModels, ImagesProvider, ProviderImages,
+    create_images_models, create_images_provider,
 };
 pub use providers::{builtin_images_models, builtin_images_providers, openrouter_images};
 

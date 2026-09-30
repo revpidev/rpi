@@ -11,14 +11,14 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use rpi_agent::proxy::{stream_proxy, ProxyStreamOptions};
+use rpi_agent::proxy::{ProxyStreamOptions, stream_proxy};
 use rpi_ai::types::{
     ApiKind, AssistantContent, CacheRetention, Context, DoneReason, ErrorReason, InputModality,
     Message, Model, ModelCost, StopReason, StreamEvent, TextContent, ThinkingBudgets,
     ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Transport, Usage, UsageCost,
     UserContent, UserMessage, UserRole,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;

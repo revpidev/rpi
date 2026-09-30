@@ -126,7 +126,7 @@ impl Component for ExtensionEditorComponent {
         lines.push(String::new()); // Spacer(1)
         lines.extend(self.editor.render(width));
         lines.push(String::new()); // Spacer(1)
-                                   // Key hints (extension-editor.ts:83-90).
+        // Key hints (extension-editor.ts:83-90).
         let hint = format!(
             "{}  {}  {}  {}",
             key_hint(&self.theme, "tui.select.confirm", "submit"),
