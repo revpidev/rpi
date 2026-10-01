@@ -3,7 +3,10 @@
 
 The template is derived from the vendored built-in catalog
 (crates/rpi-ai/src/providers/data/*.json, read-only upstream data) so the
-model lists always match the shipped catalog. Only providers reachable
+model lists always match the shipped catalog. Schema v6 provider files key
+each entry as `<type>:<id>` and may mix chat/image/classifier entries; only
+chat entries are consumed here (the models.json template stays chat-only,
+matching the legacy keyed catalog face). Only providers reachable
 through models.json are included (the models.json `api` field can only select
 the four stream kinds registered in `ModelRuntime::api_streams`:
 openai-completions / openai-responses / anthropic-messages /
@@ -83,6 +86,7 @@ def main() -> None:
             "models": [
                 {k: m[k] for k in MODEL_FIELDS if k in m}
                 for m in sorted(models.values(), key=lambda m: m["id"])
+                if m.get("type", "chat") == "chat"
             ],
         }
 
