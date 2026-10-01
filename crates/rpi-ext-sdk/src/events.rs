@@ -956,4 +956,39 @@ mod tests {
             InputEventResult::Transform { ref text, .. } if text == "transformed: x"
         ));
     }
+
+    /// V16-03: the context/boundary event views round-trip the wire shape
+    /// (`continue` keyword field included).
+    #[test]
+    fn boundary_event_views_round_trip_the_wire_shape() {
+        fn round_trip<T>(payload: serde_json::Value)
+        where
+            T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            let parsed: T = serde_json::from_value(payload.clone())
+                .unwrap_or_else(|error| panic!("deserialize {payload}: {error}"));
+            let back = serde_json::to_value(&parsed).expect("serialize");
+            assert_eq!(back, payload, "round trip changed the wire shape");
+        }
+
+        round_trip::<ContextWithSystemEvent>(serde_json::json!({"messages": []}));
+        round_trip::<TurnEndEvent>(serde_json::json!({
+            "turnIndex": 1,
+            "message": {"role": "assistant"},
+            "toolResults": [],
+            "messageEntryId": "m1",
+            "toolResultEntryIds": ["t1"],
+            "outcome": "completed",
+            "entries": [],
+            "continue": true,
+            "context": {"canContinue": true},
+        }));
+        round_trip::<AgentBeforeSettleEvent>(serde_json::json!({
+            "outcome": "aborted",
+            "entries": [],
+            "continue": false,
+            "context": {},
+        }));
+        round_trip::<BoundaryResult>(serde_json::json!({"entries": [], "continue": false}));
+    }
 }

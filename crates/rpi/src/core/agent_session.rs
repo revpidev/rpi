@@ -1425,6 +1425,13 @@ impl AgentSession {
         if let Some(cache_warmer) = &self.inner.cache_warmer {
             cache_warmer.on_agent_settled();
         }
+        // `_isEmittingAgentSettled = true` before the dispatch
+        // (agent-session.ts:1047 @ 005af57d8); `finally` clears it. Work
+        // requested from settled handlers is queued and drained after every
+        // handler finished.
+        self.inner
+            .is_emitting_agent_settled
+            .store(true, Ordering::SeqCst);
         self.runner().emit("agent_settled").await;
         self.emit(AgentSessionEvent::Session(SessionEvent::AgentSettled));
         self.inner

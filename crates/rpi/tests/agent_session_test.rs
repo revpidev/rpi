@@ -2468,3 +2468,162 @@ async fn prepare_request_projection_overrides_direct_state_messages() {
         AgentMessage::User(_)
     ));
 }
+
+/// V16-03 FR-D R3 (R3.4.3): work requested while `agent_settled` handlers
+/// are running waits until every handler finished; the requested run must
+/// not re-enter the agent inside the same settlement notification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_settled_handlers_defer_requested_runs() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::sync::{mpsc, oneshot};
+
+    struct SettledGate {
+        entered: mpsc::UnboundedSender<()>,
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+        settled_dispatches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl rpi::core::extensions::ExtensionRunner for SettledGate {
+        fn has_handlers(&self, event_type: &str) -> bool {
+            event_type == "agent_settled"
+        }
+
+        async fn emit(&self, event_type: &str) {
+            if event_type != "agent_settled" {
+                return;
+            }
+            self.settled_dispatches.fetch_add(1, AtomicOrdering::SeqCst);
+            let _ = self.entered.send(());
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+    }
+
+    // Fixture: faux provider with two scripted assistant turns.
+    let tmp = TempDir::new();
+    let cwd = tmp.path().join("cwd");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let provider = FauxProvider::new(FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            input_limits: None,
+            cost: None,
+            context_window: Some(200_000),
+            max_tokens: Some(8192),
+        }]),
+        ..Default::default()
+    });
+    provider.set_responses(vec![assistant("one"), assistant("two")]);
+    let model = provider.get_model(None).expect("faux model");
+
+    let model_runtime = rpi::core::model_runtime::ModelRuntime::create(
+        rpi::core::model_runtime::CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: rpi::core::model_runtime::ModelsPathInput::Path(
+                agent_dir.join("models.json"),
+            ),
+            ..Default::default()
+        },
+    )
+    .await;
+    let ai_provider = Arc::new(FauxAiProvider::new(provider.clone()));
+    model_runtime
+        .register_native_provider(ai_provider.clone())
+        .await
+        .expect("register faux provider");
+    let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+        cwd: cwd.clone(),
+        agent_dir: Some(agent_dir.clone()),
+        settings_manager: None,
+        model_runtime: Some(model_runtime.clone()),
+        extension_flag_values: Vec::new(),
+        resource_loader_options: None,
+    })
+    .await
+    .expect("services");
+
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let settled_dispatches = Arc::new(AtomicUsize::new(0));
+    let runner_ref = rpi::core::extensions::new_extension_runner_ref(Arc::new(SettledGate {
+        entered: entered_tx,
+        release: Mutex::new(Some(release_rx)),
+        settled_dispatches: settled_dispatches.clone(),
+    }));
+
+    let session_manager = Arc::new(Mutex::new(
+        SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+            .expect("in-memory session"),
+    ));
+    let mut agent_options = rpi_agent::AgentOptions::new(provider.stream_fn());
+    agent_options.initial_state.model = Some(model);
+    let session = AgentSession::new(rpi::core::agent_session::AgentSessionConfig {
+        agent: Arc::new(rpi_agent::agent::Agent::new(agent_options)),
+        session_manager,
+        cwd: cwd.to_string_lossy().into_owned(),
+        scoped_models: Vec::new(),
+        resource_loader: services.resource_loader.clone(),
+        custom_tools: Vec::new(),
+        model_runtime,
+        initial_active_tool_names: None,
+        allowed_tool_names: None,
+        excluded_tool_names: None,
+        extension_runner_ref: runner_ref,
+        session_start_event: rpi::core::extensions::SessionStartEvent {
+            reason: rpi::core::extensions::SessionStartReason::Startup,
+            previous_session_file: None,
+        },
+        cache_warmer: None,
+    });
+
+    let run_session = session.clone();
+    let prompt_task = tokio::spawn(async move {
+        run_session
+            .prompt("go", PromptOptions::default())
+            .await
+            .expect("prompt");
+    });
+
+    entered_rx.recv().await.expect("agent_settled dispatched");
+    // The settled handler is running now: no re-entrant run yet, and the
+    // session observes idle (upstream contract).
+    assert_eq!(ai_provider.faux().call_count(), 1, "no re-entrant request");
+    assert!(session.is_idle(), "handler observes is_idle() == true");
+
+    // A request made from the settled handler is deferred until every
+    // settled handler finished.
+    session
+        .prompt("deferred", PromptOptions::default())
+        .await
+        .expect("deferred prompt accepted");
+    assert_eq!(
+        ai_provider.faux().call_count(),
+        1,
+        "deferred request did not start inside settlement"
+    );
+
+    release_tx.send(()).expect("release settled handler");
+    prompt_task.await.expect("prompt task");
+    session.wait_for_idle().await;
+
+    assert_eq!(
+        ai_provider.faux().call_count(),
+        2,
+        "deferred request ran after settlement"
+    );
+    assert!(settled_dispatches.load(AtomicOrdering::SeqCst) >= 2);
+}

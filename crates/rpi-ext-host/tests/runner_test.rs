@@ -2395,3 +2395,26 @@ async fn on_unsubscribe_after_invalidate_is_harmless() {
     emit_agent_end(&host).await;
     assert_eq!(*calls.lock().unwrap(), vec!["A"]);
 }
+
+/// V16-03 FR-B R1: the event table is additive 37→39 and the two new
+/// entries keep their upstream `on()` overload positions; the tail order
+/// matches the upstream overload sequence (`tool_call`/`tool_result` before
+/// `user_bash`/`input`).
+#[test]
+fn all_events_is_additive_39_in_upstream_order() {
+    let events: Vec<&str> = rpi_ext_host::types::ALL_EVENTS.to_vec();
+    assert_eq!(events.len(), 39, "V16-03 lands the 37→39 segment");
+    let index = |name: &str| {
+        events
+            .iter()
+            .position(|event| *event == name)
+            .unwrap_or_else(|| panic!("event {name} missing from ALL_EVENTS"))
+    };
+    assert_eq!(index("context_with_system"), index("context") + 1);
+    assert!(index("cache_warming_decision") > index("context_with_system"));
+    assert_eq!(index("agent_before_settle"), index("agent_end") + 1);
+    assert_eq!(index("agent_settled"), index("agent_before_settle") + 1);
+    assert!(index("tool_call") < index("user_bash"));
+    assert!(index("tool_result") < index("user_bash"));
+    assert_eq!(index("input"), events.len() - 1);
+}

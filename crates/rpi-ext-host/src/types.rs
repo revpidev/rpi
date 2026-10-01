@@ -124,10 +124,10 @@ pub const ALL_EVENTS: [&str; 39] = [
     EVENT_TOOL_EXECUTION_END,
     EVENT_MODEL_SELECT,
     EVENT_THINKING_LEVEL_SELECT,
-    EVENT_USER_BASH,
-    EVENT_INPUT,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
+    EVENT_USER_BASH,
+    EVENT_INPUT,
 ];
 
 /// `session_before_*` events carry a `{ cancel?: boolean }` result and
