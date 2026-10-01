@@ -174,7 +174,7 @@ pub struct AgentTurnContext {
     pub new_messages: Vec<AgentMessage>,
 }
 
-/// `AgentTurnDecision` (types.ts:149-150 @ 005af57d8): decision returned by
+/// `AgentTurnDecision` (types.ts:147 @ 005af57d8): decision returned by
 /// [`FinishTurnFn`]. `None` preserves normal scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentTurnDecision {
@@ -263,9 +263,9 @@ pub type PrepareRequestFn = Arc<
     dyn Fn(PrepareRequestContext) -> BoxFuture<'static, Option<AgentRequestUpdate>> + Send + Sync,
 >;
 
-/// `shouldStopAfterTurn` — returning `true` makes the loop emit `agent_end`
+/// `finish_turn` — returning `Some(End)` makes the loop emit `agent_end`
 /// and exit before polling steering/follow-up queues.
-/// `FinishTurn` (types.ts:152-156 @ 005af57d8): called after a completed
+/// `FinishTurn` (types.ts:155-158 @ 005af57d8): called after a completed
 /// assistant turn and all of its tool-result messages, but before
 /// `turn_end`. On a normal turn, [`AgentTurnDecision::Continue`] ensures one
 /// next provider request; [`AgentTurnDecision::End`] ends the run. Returning
@@ -280,7 +280,7 @@ pub type FinishTurnFn =
 /// using the current context/config (types.ts:224-230 @ 9841914).
 ///
 /// Terminal turns (stop / abort) never trigger it: the loop checks
-/// `shouldStopAfterTurn` and the queued-message gates first (#6879).
+/// `finish_turn` and the queued-message gates first (#6879).
 pub type PrepareNextTurnFn = Arc<
     dyn Fn(PrepareNextTurnContext) -> BoxFuture<'static, Option<AgentLoopTurnUpdate>> + Send + Sync,
 >;
