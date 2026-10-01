@@ -1148,7 +1148,7 @@ async fn reset_when_idle_clears_state_and_queues() {
 }
 
 // ---------------------------------------------------------------------------
-// finishTurn — upstream agent.test.ts:741
+// finishTurn — upstream agent.test.ts:915
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

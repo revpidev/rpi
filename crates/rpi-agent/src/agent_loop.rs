@@ -158,7 +158,7 @@ pub struct AfterToolCallContext {
     pub context: AgentContext,
 }
 
-/// `AgentTurnContext` (types.ts:136-147 @ 005af57d8): context passed to the
+/// `AgentTurnContext` (types.ts:135-144 @ 005af57d8): context passed to the
 /// completed-turn `finishTurn` callback.
 #[derive(Clone)]
 pub struct AgentTurnContext {
@@ -228,7 +228,7 @@ pub type TransformContextFn = Arc<
 /// available.
 pub type GetApiKeyFn = Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
-/// `PrepareRequestContext` (types.ts:183-187 @ 005af57d8): runtime state
+/// `PrepareRequestContext` (types.ts:173-177 @ 005af57d8): runtime state
 /// available immediately before a conversational provider request.
 #[derive(Clone)]
 pub struct PrepareRequestContext {
@@ -240,7 +240,7 @@ pub struct PrepareRequestContext {
     pub thinking_level: ModelThinkingLevel,
 }
 
-/// `AgentRequestUpdate` (types.ts:190-191 @ 005af57d8): replacement runtime
+/// `AgentRequestUpdate` (types.ts:180 @ 005af57d8): replacement runtime
 /// state for the provider request being prepared (`messages` excluded).
 #[derive(Clone, Default)]
 pub struct AgentRequestUpdate {
@@ -253,7 +253,7 @@ pub struct AgentRequestUpdate {
     pub thinking_level: Option<ModelThinkingLevel>,
 }
 
-/// `prepareRequest` (types.ts:267 @ 005af57d8): called immediately before
+/// `prepareRequest` (types.ts:271 @ 005af57d8): called immediately before
 /// every conversational provider request, including the first. Pending
 /// messages have already been appended and emitted when this callback runs.
 /// The returned context/model/thinking level replaces the runtime values for

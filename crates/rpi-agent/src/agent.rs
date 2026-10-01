@@ -53,7 +53,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub type AgentListener =
     Arc<dyn Fn(AgentEvent, CancellationToken) -> BoxFuture<'static, ()> + Send + Sync>;
 
-/// `finishTurn` (agent.ts:108 @ 005af57d8, agent-side variant). Receives the
+/// `finishTurn` (agent.ts:125 @ 005af57d8, agent-side variant). Receives the
 /// active run's abort signal as the second argument (upstream
 /// `this.signal`).
 pub type FinishTurnAgentFn = Arc<
@@ -241,7 +241,7 @@ impl PendingMessageQueue {
         !self.messages.is_empty()
     }
 
-    /// `peek()` (agent.ts:143-145 @ 005af57d8): the next batch a drain would
+    /// `peek()` (agent.ts:159-162 @ 005af57d8): the next batch a drain would
     /// deliver, without consuming it.
     fn peek(&self) -> Vec<AgentMessage> {
         if self.mode == QueueMode::All {
@@ -674,7 +674,7 @@ impl Agent {
         lock(&self.steering_queue).has_items() || lock(&self.follow_up_queue).has_items()
     }
 
-    /// `peekQueuedMessages` (agent.ts:327-333 @ 005af57d8): preview the next
+    /// `peekQueuedMessages` (agent.ts:330-334 @ 005af57d8): preview the next
     /// queued batch without consuming it. Steering first, then follow-up.
     pub fn peek_queued_messages(&self) -> Vec<AgentMessage> {
         let steering = lock(&self.steering_queue).peek();
