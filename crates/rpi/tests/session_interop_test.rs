@@ -241,9 +241,18 @@ fn d1_upstream_to_rpi_load_all_fixtures() {
                 message_entry_count
             );
         } else {
+            // `replacement: null` context edits omit their target from the
+            // canonical projection (V16-03).
+            let omitted = lines
+                .iter()
+                .filter(|v| {
+                    v.get("type").and_then(Value::as_str) == Some("context_edit")
+                        && v.get("replacement").is_some_and(Value::is_null)
+                })
+                .count();
             assert_eq!(
                 ctx.messages.len(),
-                message_entry_count,
+                message_entry_count - omitted,
                 "{scenario}: context messages == message entries"
             );
         }

@@ -658,20 +658,34 @@ pub fn get_latest_compaction_entry(entries: &[SessionEntry]) -> Option<&Compacti
     })
 }
 
-/// Message half of `buildSessionContext` (session-manager.ts:418-470) for an
-/// already path-ordered entry slice (root-first, as returned by `getBranch` —
-/// the shape `compaction.ts:736` passes in).
-///
-/// The last compaction on the path takes effect: output = the compaction
-/// entry + entries from `firstKeptEntryId` up to it + everything after it.
-/// For the `retainedTail` form (`firstKeptEntryId` absent) no earlier entries
-/// are walked — the compaction is a self-contained checkpoint.
-pub fn build_context_messages(entries: &[SessionEntry]) -> Vec<AgentMessage> {
+/// `ProjectedSessionEntry` over typed entries (session-manager.ts:194-199).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedSessionEntry {
+    /// Raw append-only entry that owns this projected contribution.
+    pub source_entry: SessionEntry,
+    /// Model-visible messages after context edits. Empty for state-only
+    /// entries and omissions.
+    pub messages: Vec<AgentMessage>,
+}
+
+/// `SessionProjection` over typed entries (session-manager.ts:201-207). The
+/// `rpi` main path keeps a `StoredEntry`-backed sibling in
+/// `core/session_manager.rs` for lossless raw-entry preservation; this typed
+/// form serves the compaction module (no raw-entry dependency).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionProjection {
+    pub entries: Vec<ProjectedSessionEntry>,
+    pub messages: Vec<AgentMessage>,
+}
+
+/// `buildContextEntries` (session-manager.ts:476-517) over typed entries:
+/// the active, compaction-aware entry list for a path-ordered slice.
+fn select_context_entries(entries: &[SessionEntry]) -> Vec<&SessionEntry> {
     let compaction_idx = entries
         .iter()
         .rposition(|entry| matches!(entry, SessionEntry::Compaction(_)));
 
-    let context_entries: Vec<&SessionEntry> = match compaction_idx {
+    match compaction_idx {
         None => entries.iter().collect(),
         Some(idx) => {
             let SessionEntry::Compaction(compaction) = &entries[idx] else {
@@ -691,12 +705,143 @@ pub fn build_context_messages(entries: &[SessionEntry]) -> Vec<AgentMessage> {
             context_entries.extend(entries[idx + 1..].iter());
             context_entries
         }
-    };
+    }
+}
 
-    context_entries
+/// Message half of `buildSessionContext` (session-manager.ts:418-470) for an
+/// already path-ordered entry slice (root-first, as returned by `getBranch` —
+/// the shape `compaction.ts:736` passes in).
+///
+/// The last compaction on the path takes effect: output = the compaction
+/// entry + entries from `firstKeptEntryId` up to it + everything after it.
+/// For the `retainedTail` form (`firstKeptEntryId` absent) no earlier entries
+/// are walked — the compaction is a self-contained checkpoint.
+pub fn build_context_messages(entries: &[SessionEntry]) -> Vec<AgentMessage> {
+    select_context_entries(entries)
         .iter()
         .flat_map(|entry| session_entry_to_context_messages(entry))
         .collect()
+}
+
+/// `projectContextEntry` (session-manager.ts:519-541) over typed entries.
+fn project_context_entry(
+    entry: &SessionEntry,
+    edit: Option<&ContextEditEntry>,
+) -> Vec<AgentMessage> {
+    let messages = session_entry_to_context_messages(entry);
+    let Some(edit) = edit else {
+        return messages;
+    };
+    let Some(replacement) = &edit.replacement else {
+        return Vec::new();
+    };
+    messages
+        .into_iter()
+        .map(|message| project_context_message(message, &replacement.content))
+        .collect()
+}
+
+/// Content application for one context message: only user/assistant/
+/// tool-result/custom messages are editable upstream; the rest pass through.
+fn project_context_message(
+    message: AgentMessage,
+    content: &ContextEditableContent,
+) -> AgentMessage {
+    let parse_blocks = |blocks: &Vec<Value>| -> Value { Value::Array(blocks.clone()) };
+    match message {
+        AgentMessage::User(mut user) => {
+            user.content = match content {
+                ContextEditableContent::Text(text) => {
+                    rpi_ai::types::UserContent::Text(text.clone())
+                }
+                ContextEditableContent::Blocks(blocks) => rpi_ai::types::UserContent::Blocks(
+                    serde_json::from_value(parse_blocks(blocks)).unwrap_or_default(),
+                ),
+            };
+            AgentMessage::User(user)
+        }
+        AgentMessage::Assistant(mut assistant) => {
+            assistant.content = match content {
+                ContextEditableContent::Text(text) => vec![rpi_ai::types::AssistantContent::Text(
+                    rpi_ai::types::TextContent {
+                        text: text.clone(),
+                        text_signature: None,
+                    },
+                )],
+                ContextEditableContent::Blocks(blocks) => {
+                    serde_json::from_value(parse_blocks(blocks)).unwrap_or_default()
+                }
+            };
+            AgentMessage::Assistant(assistant)
+        }
+        AgentMessage::ToolResult(mut result) => {
+            result.content = match content {
+                ContextEditableContent::Text(text) => vec![rpi_ai::types::ToolResultContent::Text(
+                    rpi_ai::types::TextContent {
+                        text: text.clone(),
+                        text_signature: None,
+                    },
+                )],
+                ContextEditableContent::Blocks(blocks) => {
+                    serde_json::from_value(parse_blocks(blocks)).unwrap_or_default()
+                }
+            };
+            AgentMessage::ToolResult(result)
+        }
+        AgentMessage::Custom(mut custom) => {
+            custom.content = match content {
+                ContextEditableContent::Text(text) => {
+                    rpi_ai::types::UserContent::Text(text.clone())
+                }
+                ContextEditableContent::Blocks(blocks) => rpi_ai::types::UserContent::Blocks(
+                    serde_json::from_value(parse_blocks(blocks)).unwrap_or_default(),
+                ),
+            };
+            AgentMessage::Custom(custom)
+        }
+        other => other,
+    }
+}
+
+/// `buildSessionProjection` (session-manager.ts:543-576) over typed entries.
+pub fn build_session_projection(entries: &[SessionEntry]) -> SessionProjection {
+    let context_entries = select_context_entries(entries);
+    let mut edits: std::collections::HashMap<String, ContextEditEntry> =
+        std::collections::HashMap::new();
+    for entry in &context_entries {
+        if let SessionEntry::ContextEdit(edit) = entry {
+            edits.insert(edit.target_id.clone(), edit.clone());
+        }
+    }
+    let projected: Vec<ProjectedSessionEntry> = context_entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, source_entry)| {
+            // buildContextEntries() may retain an older compaction entry
+            // because its raw ID lies inside the newest retained range. Only
+            // the newest compaction at index 0 contributes a checkpoint and
+            // summary (session-manager.ts:557-565).
+            let shadowed_compaction =
+                index > 0 && matches!(source_entry, SessionEntry::Compaction(_));
+            let messages = if shadowed_compaction {
+                Vec::new()
+            } else {
+                project_context_entry(source_entry, edits.get(source_entry.id()))
+            };
+            ProjectedSessionEntry {
+                source_entry: source_entry.clone(),
+                messages,
+            }
+        })
+        .collect();
+    let messages = projected
+        .iter()
+        .flat_map(|entry| entry.messages.iter().cloned())
+        .collect();
+    SessionProjection {
+        entries: projected,
+        messages,
+    }
 }
 
 #[cfg(test)]
@@ -721,6 +866,7 @@ mod tests {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

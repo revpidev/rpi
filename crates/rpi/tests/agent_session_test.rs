@@ -2375,3 +2375,96 @@ async fn second_navigation_while_first_pending_is_rejected_9179() {
         }
     }
 }
+
+/// V16-03 FR-A R3 (canonical projection authority): once
+/// `_installAgentRequestProjection` is in place, a direct
+/// `agent.setState(messages)` assignment no longer reaches the provider
+/// request — the SessionManager projection is rebuilt at request time.
+/// Upstream basis: agent-session.ts:754-800 @ 005af57d8.
+#[tokio::test]
+async fn prepare_request_projection_overrides_direct_state_messages() {
+    let fixture =
+        session_fixture(vec![assistant("ok")], FauxProviderOptions::default(), None).await;
+    let session = &fixture.session;
+
+    // Canonical session state: one persisted user message.
+    {
+        let manager = session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        manager
+            .append_message(AgentMessage::User(rpi_ai::types::UserMessage {
+                role: rpi_ai::types::UserRole::User,
+                content: rpi_ai::types::UserContent::Text("canonical".to_owned()),
+                timestamp: 1,
+            }))
+            .expect("append canonical");
+    }
+
+    // Direct assignment that must NOT become the request context.
+    session.agent().set_messages(vec![AgentMessage::Assistant(
+        rpi_ai::types::AssistantMessage {
+            role: rpi_ai::types::AssistantRole::Assistant,
+            content: vec![rpi_ai::types::AssistantContent::Text(
+                rpi_ai::types::TextContent {
+                    text: "bogus direct assignment".to_owned(),
+                    text_signature: None,
+                },
+            )],
+            api: "faux".into(),
+            provider: "faux".to_owned(),
+            model: "faux-1".to_owned(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: None,
+            thinking_level: None,
+            diagnostics: None,
+            usage: rpi_ai::types::Usage::default(),
+            stop_reason: rpi_ai::types::StopReason::Stop,
+            error_message: None,
+            timestamp: 2,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
+        },
+    )]);
+
+    let hook = session
+        .agent()
+        .prepare_request()
+        .expect("canonical request projection installed");
+    let state = session.agent().state();
+    let update = hook(
+        rpi_agent::PrepareRequestContext {
+            context: rpi_agent::AgentContext {
+                messages: state.messages.clone(),
+                tools: None,
+            },
+            model: state.model.clone(),
+            thinking_level: state.thinking_level,
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("prepare request update");
+
+    let messages = update.context.expect("replaced context").messages;
+    assert_eq!(messages.len(), 1, "projection only: {messages:?}");
+    match &messages[0] {
+        AgentMessage::User(user) => match &user.content {
+            rpi_ai::types::UserContent::Text(text) => assert_eq!(text, "canonical"),
+            other => panic!("expected text content, got {other:?}"),
+        },
+        other => panic!("expected canonical user message, got {other:?}"),
+    }
+
+    // Agent state itself keeps the direct assignment until `refreshContext`.
+    assert!(matches!(
+        session.agent().state().messages[0],
+        AgentMessage::Assistant(_)
+    ));
+    session.refresh_context();
+    assert!(matches!(
+        session.agent().state().messages[0],
+        AgentMessage::User(_)
+    ));
+}

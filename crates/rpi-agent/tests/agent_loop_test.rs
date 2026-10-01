@@ -74,6 +74,7 @@ fn test_config() -> AgentLoopConfig {
         transform_context: None,
         get_api_key: None,
         should_stop_after_turn: None,
+        prepare_request: None,
         prepare_next_turn: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
@@ -100,6 +101,7 @@ fn assistant_message(content: Vec<AssistantContent>, stop_reason: StopReason) ->
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason,
@@ -2980,4 +2982,95 @@ fn message_kinds(messages: &[AgentMessage]) -> Vec<&'static str> {
             _ => "other",
         })
         .collect()
+}
+
+/// V16-03 FR-D R5 (`prepareRequest`, agent-loop.ts:218-235 @ 005af57d8):
+/// the hook runs immediately before every conversational provider request,
+/// including the first, and its replacement context reaches the request.
+/// It does not poll queues (steering is polled by the loop's own gates).
+#[tokio::test]
+async fn prepare_request_runs_for_every_request_and_replaces_context() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let context = AgentContext {
+        messages: Vec::new(),
+        tools: None,
+    };
+    let (stream_fn, state) = mock_stream_fn(vec![text_assistant("one"), text_assistant("two")]);
+    let mut config = test_config();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = hook_calls.clone();
+    config.prepare_request = Some(Arc::new(
+        move |request: rpi_agent::PrepareRequestContext| {
+            let hook_calls = hook_calls_for_hook.clone();
+            Box::pin(async move {
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+                let mut messages = request.context.messages;
+                messages.push(user_message("hook injected"));
+                Some(rpi_agent::AgentRequestUpdate {
+                    context: Some(AgentContext {
+                        messages,
+                        tools: request.context.tools,
+                    }),
+                    ..Default::default()
+                })
+            })
+        },
+    ));
+
+    // One steering message after the first turn forces a second request.
+    let steering_polls = Arc::new(AtomicUsize::new(0));
+    let steering_polls_for_hook = steering_polls.clone();
+    config.get_steering_messages = Some(Arc::new(move || {
+        let polls = steering_polls_for_hook.clone();
+        Box::pin(async move {
+            if polls.fetch_add(1, Ordering::SeqCst) == 1 {
+                vec![user_message("steer")]
+            } else {
+                Vec::new()
+            }
+        })
+    }));
+
+    let stream = agent_loop(
+        vec![user_message("Hello")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (_events, _messages) = collect(stream).await;
+
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 2, "one call per request");
+    let calls = state.lock().expect("state");
+    assert_eq!(calls.calls.len(), 2, "two provider requests");
+    let render = |call: &RecordedCall| {
+        call.context
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => match &user.content {
+                    UserContent::Text(text) => Some(text.clone()),
+                    UserContent::Blocks(_) => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        render(&calls.calls[0])
+            .iter()
+            .any(|text| text == "hook injected"),
+        "first request carries the hook context"
+    );
+    assert!(
+        render(&calls.calls[1])
+            .iter()
+            .any(|text| text == "hook injected"),
+        "second request carries the hook context"
+    );
+    assert!(
+        render(&calls.calls[1]).iter().any(|text| text == "steer"),
+        "steering still delivers through the normal gate"
+    );
 }

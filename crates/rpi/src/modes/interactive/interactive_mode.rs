@@ -5955,6 +5955,7 @@ mod tests {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: rpi_ai::types::Usage::default(),
             stop_reason,
@@ -5988,6 +5989,7 @@ mod tests {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: rpi_ai::types::Usage::default(),
             stop_reason,
@@ -7634,6 +7636,7 @@ mod tests {
                         is_error: false,
                         details: None,
                         usage: None,
+                        nested_calls: None,
                         timestamp: 1_700_000_000_000,
                     },
                 ))

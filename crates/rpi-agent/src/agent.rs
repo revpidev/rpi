@@ -33,9 +33,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{
     AfterToolCallFn, AgentContext, AgentEventSink, AgentLoopConfig, AgentLoopTurnUpdate,
-    BeforeToolCallFn, ConvertToLlmFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext,
-    PrepareNextTurnFn, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn,
-    now_millis, run_agent_loop, run_agent_loop_continue, thinking_level_from_model_level,
+    AgentRequestUpdate, BeforeToolCallFn, ConvertToLlmFn, GetApiKeyFn, GetQueuedMessagesFn,
+    PrepareNextTurnContext, PrepareNextTurnFn, PrepareRequestContext, PrepareRequestFn,
+    ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn, now_millis,
+    run_agent_loop, run_agent_loop_continue, thinking_level_from_model_level,
 };
 use crate::error::AgentError;
 use crate::messages::AgentMessage;
@@ -57,6 +58,17 @@ pub type AgentListener =
 /// `this.signal`).
 pub type ShouldStopAfterTurnAgentFn = Arc<
     dyn Fn(ShouldStopAfterTurnContext, CancellationToken) -> BoxFuture<'static, bool> + Send + Sync,
+>;
+
+/// `prepareRequest` (agent-side variant; agent.ts). Receives the active run's
+/// abort signal as the second argument (upstream `this.signal`).
+pub type PrepareRequestAgentFn = Arc<
+    dyn Fn(
+            PrepareRequestContext,
+            CancellationToken,
+        ) -> BoxFuture<'static, Option<AgentRequestUpdate>>
+        + Send
+        + Sync,
 >;
 
 /// `prepareNextTurn` (signal-only variant, agent.ts:191-193).
@@ -161,6 +173,7 @@ pub struct AgentOptions {
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
     pub should_stop_after_turn: Option<ShouldStopAfterTurnAgentFn>,
+    pub prepare_request: Option<PrepareRequestAgentFn>,
     pub prepare_next_turn: Option<PrepareNextTurnSignalFn>,
     pub prepare_next_turn_with_context: Option<PrepareNextTurnWithContextFn>,
     pub steering_mode: Option<QueueMode>,
@@ -187,6 +200,7 @@ impl AgentOptions {
             before_tool_call: None,
             after_tool_call: None,
             should_stop_after_turn: None,
+            prepare_request: None,
             prepare_next_turn: None,
             prepare_next_turn_with_context: None,
             steering_mode: None,
@@ -367,6 +381,11 @@ pub struct Agent {
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
     pub should_stop_after_turn: Option<ShouldStopAfterTurnAgentFn>,
+    /// `prepareRequest` — interior-mutable because the session layer installs
+    /// the canonical-context projection after building the shared agent
+    /// (upstream assigns `this.agent.prepareRequest` post-construction,
+    /// agent-session.ts:754-755).
+    prepare_request: RwLock<Option<PrepareRequestAgentFn>>,
     /// `prepareNextTurn` (signal-only) / `prepareNextTurnWithContext` —
     /// interior-mutable because the session layer installs the next-turn
     /// refresh chain after building the shared agent (upstream assigns
@@ -444,6 +463,7 @@ impl Agent {
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             should_stop_after_turn: options.should_stop_after_turn,
+            prepare_request: RwLock::new(options.prepare_request),
             prepare_next_turn: RwLock::new(options.prepare_next_turn),
             prepare_next_turn_with_context: RwLock::new(options.prepare_next_turn_with_context),
             session_id: options.session_id,
@@ -493,6 +513,25 @@ impl Agent {
     /// agent-session.ts:537-540).
     pub fn prepare_next_turn_signal_only(&self) -> Option<PrepareNextTurnSignalFn> {
         self.prepare_next_turn
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Post-construction install/clear of the `prepareRequest` hook
+    /// (`this.agent.prepareRequest = ...`, agent-session.ts:754-755 @
+    /// 005af57d8).
+    pub fn set_prepare_request(&self, hook: Option<PrepareRequestAgentFn>) {
+        *self
+            .prepare_request
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    /// Current `prepareRequest` hook (cloned; the loop config wraps it with
+    /// the active run's signal).
+    pub fn prepare_request(&self) -> Option<PrepareRequestAgentFn> {
+        self.prepare_request
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -888,6 +927,25 @@ impl Agent {
                 _ => None,
             };
 
+        let prepare_request: Option<PrepareRequestFn> = match self.prepare_request() {
+            Some(agent_callback) => {
+                let active_run = self.active_run.clone();
+                Some(Arc::new(move |context: PrepareRequestContext| {
+                    let agent_callback = agent_callback.clone();
+                    let active_run = active_run.clone();
+                    Box::pin(async move {
+                        // Upstream reads `this.signal` at call time.
+                        let signal = lock(&active_run)
+                            .as_ref()
+                            .map(|run| run.signal.clone())
+                            .unwrap_or_default();
+                        agent_callback(context, signal).await
+                    })
+                }))
+            }
+            None => None,
+        };
+
         AgentLoopConfig {
             model,
             reasoning,
@@ -912,6 +970,7 @@ impl Agent {
                 .clone(),
             get_api_key: self.get_api_key.clone(),
             should_stop_after_turn,
+            prepare_request,
             prepare_next_turn,
             get_steering_messages: Some(get_steering_messages),
             get_follow_up_messages: Some(get_follow_up_messages),
@@ -994,6 +1053,7 @@ impl Agent {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: if aborted {

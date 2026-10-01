@@ -705,7 +705,7 @@ async fn session_manager_session_loads_in_harness_repo() {
     .expect("custom message");
     sm.append_compaction(
         "first-kept summary",
-        &u2,
+        Some(&u2),
         200,
         Some(json!({"readFiles": []})),
         Some(false),

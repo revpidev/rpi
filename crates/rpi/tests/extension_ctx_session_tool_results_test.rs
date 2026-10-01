@@ -185,6 +185,7 @@ fn append_tool_result(
             })],
             details,
             usage: None,
+            nested_calls: None,
             is_error,
             timestamp: 0,
         }))

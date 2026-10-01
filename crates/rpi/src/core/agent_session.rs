@@ -34,7 +34,10 @@ use rpi_agent::messages::{AgentMessage, BashExecutionMessage, CustomMessage, Cus
 use rpi_agent::session::SessionEntry;
 use rpi_agent::types::{AgentEvent, AgentTool, QueueMode, ThinkingLevel};
 use rpi_agent::{Agent, AgentError};
-use rpi_agent::{AgentContext, AgentLoopTurnUpdate, PrepareNextTurnContext};
+use rpi_agent::{
+    AgentContext, AgentLoopTurnUpdate, AgentRequestUpdate, PrepareNextTurnContext,
+    PrepareRequestContext,
+};
 use rpi_ai::models::{clamp_thinking_level, get_supported_thinking_levels, models_are_equal};
 use rpi_ai::models_json::OrderedMap;
 use rpi_ai::types::{
@@ -667,11 +670,28 @@ impl AgentSession {
                 }));
             }
         }
+        // V16-03 FR-A R5: the compaction runner persists restorative context
+        // omissions for discarded recovery attempts
+        // (`_omitRecoveryAttempt`, agent-session.ts:1202-1216 @ 005af57d8).
+        {
+            let weak = Arc::downgrade(&session.inner);
+            if let Ok(mut runner) = session.inner.compaction.try_lock() {
+                runner.set_omit_recovery(Arc::new(move |message: &AssistantMessage| {
+                    if let Some(inner) = weak.upgrade() {
+                        AgentSession { inner }.omit_recovery_attempt(message);
+                    }
+                }));
+            }
+        }
 
         // `_installAgentNextTurnRefresh()` (agent-session.ts:397, 563-580):
         // wrap the (optional) previous prepare chain with the threshold
         // compaction + state refresh (V14-01 FR-D).
         session.install_agent_next_turn_refresh();
+        // `_installAgentRequestProjection()` (agent-session.ts:398,
+        // 754-780 @ 005af57d8): a SessionManager projection becomes the
+        // provider-context authority before every conversational request.
+        session.install_agent_request_projection();
         // `_installAgentForcedPromptProjection()` (agent-session.ts:417 @
         // #9548).
         session.install_agent_forced_prompt_projection();
@@ -813,6 +833,153 @@ impl AgentSession {
 
     fn runner(&self) -> Arc<dyn ExtensionRunner> {
         read_runner(&self.inner.extension_runner_ref)
+    }
+
+    /// `_installAgentRequestProjection` (agent-session.ts:754-847 @
+    /// 005af57d8; virtual-model routing slice deferred to V16-12): installs
+    /// the canonical session projection as the provider context for every
+    /// conversational request. Direct `agent.state.messages` assignments are
+    /// superseded here (R3.1.2); recovery goes through the session append
+    /// APIs + [`Self::refresh_context`].
+    fn install_agent_request_projection(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let agent = self.inner.agent.clone();
+        let previous_prepare_request = agent.prepare_request();
+        agent.set_prepare_request(Some(Arc::new(
+            move |_request: PrepareRequestContext, signal: CancellationToken| {
+                let weak = weak.clone();
+                let previous = previous_prepare_request.clone();
+                Box::pin(async move {
+                    let inner = weak.upgrade()?;
+                    let session = AgentSession { inner };
+
+                    let projection =
+                        lock(&session.inner.session_manager).build_session_projection();
+                    let state = session.inner.agent.state();
+                    let canonical_context = AgentContext {
+                        messages: projection.messages.clone(),
+                        tools: Some(state.tools.clone()),
+                    };
+                    let previous_update = match previous.as_ref() {
+                        Some(previous) => {
+                            previous(
+                                PrepareRequestContext {
+                                    context: canonical_context.clone(),
+                                    model: state.model.clone(),
+                                    thinking_level: state.thinking_level,
+                                },
+                                signal.clone(),
+                            )
+                            .await
+                        }
+                        None => None,
+                    };
+                    let context = previous_update
+                        .as_ref()
+                        .and_then(|update| update.context.clone())
+                        .unwrap_or(canonical_context);
+                    let model = previous_update
+                        .as_ref()
+                        .and_then(|update| update.model.clone())
+                        .unwrap_or_else(|| state.model.clone());
+                    let thinking_level = previous_update
+                        .as_ref()
+                        .and_then(|update| update.thinking_level)
+                        .unwrap_or(state.thinking_level);
+                    Some(AgentRequestUpdate {
+                        context: Some(context),
+                        model: Some(model),
+                        thinking_level: Some(thinking_level),
+                    })
+                })
+            },
+        )));
+    }
+
+    /// `refreshContext` (agent-session.ts:1385-1387 @ 005af57d8): rebuild the
+    /// finalized agent transcript from the canonical session projection.
+    pub fn refresh_context(&self) {
+        let projection = lock(&self.inner.session_manager).build_session_projection();
+        self.inner.agent.set_messages(projection.messages);
+    }
+
+    /// `_findPersistedMessageEntryId` (agent-session.ts:1183-1201 @
+    /// 005af57d8): value-equality scan over the branch, then the
+    /// projected-index fallback.
+    fn find_persisted_message_entry_id(&self, message: &AgentMessage) -> Option<String> {
+        let session = lock(&self.inner.session_manager);
+        for entry in session.get_branch(None).iter().rev() {
+            if let Some(SessionEntry::Message(entry)) = entry.known()
+                && &entry.message == message
+            {
+                return Some(entry.id.clone());
+            }
+        }
+        let state_messages = self.inner.agent.state().messages;
+        let message_index = state_messages
+            .iter()
+            .position(|candidate| candidate == message)?;
+        let projection = session.build_session_projection();
+        let mut projected_index = 0usize;
+        for entry in &projection.entries {
+            for _ in 0..entry.messages.len() {
+                if projected_index == message_index {
+                    return Some(entry.source_entry.id().to_owned());
+                }
+                projected_index += 1;
+            }
+        }
+        None
+    }
+
+    /// `_omitRecoveryAttempt` (agent-session.ts:1202-1216 @ 005af57d8):
+    /// durably omit a discarded retry/recovery attempt (and the immediate
+    /// tool results of its turn) from the model projection while keeping the
+    /// raw transcript intact. Fail-soft: append failures are logged and do
+    /// not block recovery.
+    fn omit_recovery_attempt(&self, message: &AssistantMessage) {
+        let assistant = AgentMessage::Assistant(message.clone());
+        let assistant_entry_id = self.find_persisted_message_entry_id(&assistant);
+        let mut targets: Vec<String> = Vec::new();
+        if let Some(entry_id) = &assistant_entry_id {
+            targets.push(entry_id.clone());
+            // Immediate tool results of the same turn follow the assistant
+            // entry on the branch until the next non-tool-result message
+            // entry (metadata entries in between are skipped).
+            let session = lock(&self.inner.session_manager);
+            let branch = session.get_branch(None);
+            if let Some(index) = branch.iter().position(|entry| entry.id() == entry_id) {
+                for entry in &branch[index + 1..] {
+                    match entry.known() {
+                        Some(SessionEntry::Message(message)) => match &message.message {
+                            AgentMessage::ToolResult(_) => targets.push(entry.id().to_owned()),
+                            _ => break,
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        for target_id in targets {
+            let edit_id = lock(&self.inner.session_manager).append_context_edit(&target_id, None);
+            match edit_id {
+                Ok(edit_id) => {
+                    let entry = lock(&self.inner.session_manager)
+                        .get_entry(&edit_id)
+                        .and_then(|stored| stored.known().cloned());
+                    if let Some(entry) = entry {
+                        self.emit(AgentSessionEvent::Session(SessionEvent::EntryAppended {
+                            entry: Box::new(entry),
+                        }));
+                    }
+                }
+                Err(error) => tracing::warn!("recovery omission append failed: {error}"),
+            }
+        }
+        self.refresh_context();
     }
 
     /// Weak handle for the host-action bridge (T15 W3).
@@ -3250,6 +3417,11 @@ impl AgentSession {
             messages.pop();
             self.inner.agent.set_messages(messages);
         }
+
+        // Keep the failed attempt in raw history while durably omitting it
+        // from model projection (`_omitRecoveryAttempt`, agent-session.ts:3711
+        // @ 005af57d8).
+        self.omit_recovery_attempt(message);
 
         let token = CancellationToken::new();
         *lock(&self.inner.retry_abort) = Some(token.clone());

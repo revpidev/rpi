@@ -39,7 +39,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_loop::now_millis;
 use crate::error::AgentError;
 use crate::messages::{AgentMessage, convert_to_llm};
-use crate::session::{SessionEntry, build_context_messages, session_entry_to_context_messages};
+use crate::session::{
+    ProjectedSessionEntry, SessionEntry, SessionProjection, build_session_projection,
+    session_entry_to_context_messages,
+};
 use crate::stream_fn::{BoxStream, StreamFn};
 use crate::types::ThinkingLevel;
 use utils::{
@@ -105,23 +108,6 @@ pub(crate) fn extract_file_operations(
 // ============================================================================
 // Message Extraction
 // ============================================================================
-
-/// `getMessageFromEntryForCompaction` (compaction.ts:80-85): the context
-/// message an entry produces, `None` for compaction boundaries.
-fn get_message_from_entry_for_compaction(entry: &SessionEntry) -> Option<AgentMessage> {
-    if matches!(entry, SessionEntry::Compaction(_)) {
-        return None;
-    }
-    // #9548 (compaction.ts:93-99): system messages are prompt state, not
-    // conversation; the compaction entry carries their replay.
-    let message = session_entry_to_context_messages(entry)
-        .into_iter()
-        .next()?;
-    if matches!(message, AgentMessage::System(_)) {
-        return None;
-    }
-    Some(message)
-}
 
 /// Result from [`compact`] — the SessionManager adds id/parentId when saving
 /// (`CompactionResult`, compaction.ts:88-97). Serialized camelCase for the
@@ -313,9 +299,28 @@ fn estimate_user_content_chars(content: &rpi_ai::types::UserContent) -> usize {
 /// heuristic; do not "improve", ADR-0002 §4).
 pub fn estimate_tokens(message: &AgentMessage) -> u64 {
     let chars: usize = match message {
-        // #9548: system messages carry prompt/tool state; upstream's switch
-        // leaves them at 0 chars.
-        AgentMessage::System(_) => 0,
+        // Upstream counts the current prompt/tool state: content + sections +
+        // `toolsAdded` declarations (compaction.ts:302-312 @ 005af57d8, the
+        // R5 "effective system and tool context" fix).
+        AgentMessage::System(system) => {
+            let mut chars = match &system.content {
+                rpi_ai::types::SystemContent::Text(text) => char_len(text),
+                rpi_ai::types::SystemContent::Blocks(blocks) => {
+                    blocks.iter().map(|block| char_len(&block.text)).sum()
+                }
+            };
+            if let Some(sections) = &system.sections {
+                for section in sections.values() {
+                    if let Some(text) = section.as_str() {
+                        chars += char_len(text);
+                    }
+                }
+            }
+            if let Some(tools) = &system.tools_added {
+                chars += char_len(&safe_json_stringify(tools));
+            }
+            chars
+        }
         AgentMessage::User(user) => estimate_user_content_chars(&user.content),
         AgentMessage::Assistant(assistant) => assistant
             .content
@@ -662,6 +667,7 @@ async fn stream_final_message(
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Error,
@@ -689,6 +695,7 @@ fn aborted_summary_message(model: &Model) -> AssistantMessage {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Aborted,
@@ -914,9 +921,155 @@ pub struct CompactionPreparation {
     pub settings: CompactionSettings,
 }
 
-/// `prepareCompaction` (compaction.ts:710-789): repeated compactions start at
-/// the previous compaction's kept boundary and recalculate `tokensBefore`
-/// from the rebuilt session context (compaction.md §How It Works).
+/// `getMessagesFromProjectedEntryForCompaction` (compaction.ts:98-102 @
+/// 005af57d8): compaction boundaries contribute nothing; system messages are
+/// prompt state, not conversation.
+fn get_messages_from_projected_entry_for_compaction(
+    entry: &ProjectedSessionEntry,
+) -> Vec<AgentMessage> {
+    if matches!(entry.source_entry, SessionEntry::Compaction(_)) {
+        return Vec::new();
+    }
+    entry
+        .messages
+        .iter()
+        .filter(|message| !matches!(message, AgentMessage::System(_)))
+        .cloned()
+        .collect()
+}
+
+/// `isProjectedTurnStart` (compaction.ts:782-785 @ 005af57d8).
+fn is_projected_turn_start(entry: &ProjectedSessionEntry) -> bool {
+    if matches!(entry.source_entry, SessionEntry::Compaction(_)) {
+        return false;
+    }
+    entry.messages.iter().any(is_turn_start_message)
+}
+
+/// `findProjectedTurnStartIndex` (compaction.ts:787-793 @ 005af57d8).
+fn find_projected_turn_start_index(
+    entries: &[ProjectedSessionEntry],
+    entry_index: usize,
+    start_index: usize,
+) -> Option<usize> {
+    (start_index..=entry_index)
+        .rev()
+        .find(|&i| is_projected_turn_start(&entries[i]))
+}
+
+/// `findProjectedCutPoint` (compaction.ts:795-860 @ 005af57d8): the same cut
+/// logic as [`find_cut_point`] over projected entries, including the
+/// recovery-omission suffix rule that keeps omitted attempts (and their
+/// context edits) out of the retained history when they trail the last
+/// visible input.
+fn find_projected_cut_point(
+    entries: &[ProjectedSessionEntry],
+    start_index: usize,
+    end_index: usize,
+    keep_recent_tokens: u64,
+) -> CutPointResult {
+    let cut_points: Vec<usize> = (start_index..end_index)
+        .filter(|&i| {
+            let entry = &entries[i];
+            !matches!(entry.source_entry, SessionEntry::Compaction(_))
+                && entry.messages.iter().any(is_cut_point_message)
+        })
+        .collect();
+    if cut_points.is_empty() {
+        return CutPointResult {
+            first_kept_entry_index: start_index,
+            turn_start_index: None,
+            is_split_turn: false,
+        };
+    }
+
+    let mut accumulated_tokens: u64 = 0;
+    let mut exceeded_budget = false;
+    let mut cut_index = cut_points[0];
+    for i in (start_index..end_index).rev() {
+        let message_tokens: u64 = entries[i].messages.iter().map(estimate_tokens).sum();
+        if message_tokens == 0 {
+            continue;
+        }
+        accumulated_tokens += message_tokens;
+        if accumulated_tokens >= keep_recent_tokens {
+            exceeded_budget = true;
+            let fallback = *cut_points.last().unwrap_or(&cut_points[0]);
+            cut_index = cut_points
+                .iter()
+                .copied()
+                .find(|&candidate| candidate >= i)
+                .unwrap_or(fallback);
+            break;
+        }
+    }
+
+    // A recovery attempt and its omission edits are context-invisible after
+    // the last visible input. Advance only for a closed suffix containing an
+    // omitted assistant attempt; arbitrary metadata must not move the cut
+    // past unsent input (compaction.ts:825-849 @ 005af57d8).
+    let suffix = &entries[cut_index + 1..end_index];
+    let is_intrinsically_visible = |entry: &ProjectedSessionEntry| {
+        !matches!(entry.source_entry, SessionEntry::ContextEdit(_))
+            && !session_entry_to_context_messages(&entry.source_entry).is_empty()
+    };
+    let is_omitted = |entry: &ProjectedSessionEntry| {
+        is_intrinsically_visible(entry) && entry.messages.is_empty()
+    };
+    let omitted_suffix_ids: std::collections::HashSet<&str> = suffix
+        .iter()
+        .filter(|entry| is_omitted(entry))
+        .map(|entry| entry.source_entry.id())
+        .collect();
+    let has_external_replacement = suffix.iter().any(|entry| {
+        matches!(
+            &entry.source_entry,
+            SessionEntry::ContextEdit(edit)
+                if edit.replacement.is_some()
+                    && !omitted_suffix_ids.contains(edit.target_id.as_str())
+        )
+    });
+    let is_recovery_omission_suffix =
+        exceeded_budget && !has_external_replacement && suffix.iter().any(|entry| {
+            matches!(
+                &entry.source_entry,
+                SessionEntry::Message(message)
+                    if matches!(message.message, AgentMessage::Assistant(_)) && is_omitted(entry)
+            )
+        }) && suffix.iter().all(|entry| {
+            !matches!(entry.source_entry, SessionEntry::Compaction(_))
+                && (!is_intrinsically_visible(entry) || is_omitted(entry))
+        });
+    if is_recovery_omission_suffix {
+        cut_index += 1;
+    }
+
+    while cut_index > start_index {
+        let previous = &entries[cut_index - 1];
+        if matches!(previous.source_entry, SessionEntry::Compaction(_))
+            || !previous.messages.is_empty()
+        {
+            break;
+        }
+        cut_index -= 1;
+    }
+
+    let starts_turn = is_projected_turn_start(&entries[cut_index]);
+    let turn_start_index = if starts_turn {
+        None
+    } else {
+        find_projected_turn_start_index(entries, cut_index, start_index)
+    };
+    CutPointResult {
+        first_kept_entry_index: cut_index,
+        turn_start_index,
+        is_split_turn: !starts_turn && turn_start_index.is_some(),
+    }
+}
+
+/// `prepareCompaction` (compaction.ts:862-929 @ 005af57d8): preparation runs
+/// on the canonical projection, so omitted entries never enter the summary
+/// and replacements are summarized as edited.
 pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: &CompactionSettings,
@@ -925,42 +1078,43 @@ pub fn prepare_compaction(
         return None;
     }
 
-    let prev_compaction_index = path_entries
+    let projection = build_session_projection(path_entries);
+    let projected_entries = &projection.entries;
+    let source_entries: Vec<SessionEntry> = projected_entries
         .iter()
-        .rposition(|entry| matches!(entry, SessionEntry::Compaction(_)));
+        .map(|entry| entry.source_entry.clone())
+        .collect();
+    // The newest compaction is projected first. Older compaction entries can
+    // still occur in its retained raw range, but their projected contribution
+    // is empty (compaction.ts:872-878 @ 005af57d8).
+    let prev_compaction_index = projected_entries.iter().position(|entry| {
+        matches!(entry.source_entry, SessionEntry::Compaction(_)) && !entry.messages.is_empty()
+    });
 
     let mut previous_summary: Option<String> = None;
-    let mut boundary_start = 0;
+    let mut boundary_start = 0usize;
     if let Some(index) = prev_compaction_index {
-        let SessionEntry::Compaction(prev_compaction) = &path_entries[index] else {
-            // invariant: rposition matched a Compaction variant above.
-            unreachable!("compaction index must point at a compaction entry")
-        };
-        previous_summary = Some(prev_compaction.summary.clone());
-        boundary_start = path_entries
-            .iter()
-            .position(|entry| Some(entry.id()) == prev_compaction.first_kept_entry_id.as_deref())
-            .unwrap_or(index + 1);
+        if let SessionEntry::Compaction(prev) = &projected_entries[index].source_entry {
+            previous_summary = Some(prev.summary.clone());
+        }
+        // The canonical projection has already selected the previous
+        // compaction's retained tail.
+        boundary_start = index + 1;
     }
-    let boundary_end = path_entries.len();
-
-    let tokens_before = estimate_context_tokens(&build_context_messages(path_entries)).tokens;
-
-    let cut_point = find_cut_point(
-        path_entries,
+    let boundary_end = projected_entries.len();
+    let tokens_before = estimate_projected_context_tokens(&projection, path_entries).tokens;
+    let cut_point = find_projected_cut_point(
+        projected_entries,
         boundary_start,
         boundary_end,
         settings.keep_recent_tokens,
     );
 
-    // `firstKeptEntry?.id` missing → upstream returns undefined ("Session
-    // needs migration", compaction.ts:741-744). Rust entry ids are mandatory,
-    // but the index itself can fall outside an empty path.
-    let first_kept_entry_id = path_entries
+    let first_kept_entry_id = projected_entries
         .get(cut_point.first_kept_entry_index)?
+        .source_entry
         .id()
         .to_owned();
-
     let history_end = if cut_point.is_split_turn {
         cut_point
             .turn_start_index
@@ -969,32 +1123,31 @@ pub fn prepare_compaction(
         cut_point.first_kept_entry_index
     };
 
-    // Messages to summarize (discarded after the summary).
-    let mut messages_to_summarize: Vec<AgentMessage> = Vec::new();
-    for entry in &path_entries[boundary_start..history_end] {
-        if let Some(msg) = get_message_from_entry_for_compaction(entry) {
-            messages_to_summarize.push(msg);
+    let messages_to_summarize: Vec<AgentMessage> = projected_entries[boundary_start..history_end]
+        .iter()
+        .flat_map(get_messages_from_projected_entry_for_compaction)
+        .collect();
+    let turn_prefix_messages: Vec<AgentMessage> = if cut_point.is_split_turn {
+        match cut_point.turn_start_index {
+            Some(turn_start) => projected_entries[turn_start..cut_point.first_kept_entry_index]
+                .iter()
+                .flat_map(get_messages_from_projected_entry_for_compaction)
+                .collect(),
+            None => Vec::new(),
         }
-    }
-
-    // Messages for the turn prefix summary (when splitting a turn).
-    let mut turn_prefix_messages: Vec<AgentMessage> = Vec::new();
-    if cut_point.is_split_turn
-        && let Some(turn_start) = cut_point.turn_start_index
-    {
-        for entry in &path_entries[turn_start..cut_point.first_kept_entry_index] {
-            if let Some(msg) = get_message_from_entry_for_compaction(entry) {
-                turn_prefix_messages.push(msg);
-            }
-        }
-    }
+    } else {
+        Vec::new()
+    };
 
     if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
         return None;
     }
 
-    let mut file_ops =
-        extract_file_operations(&messages_to_summarize, path_entries, prev_compaction_index);
+    let mut file_ops = extract_file_operations(
+        &messages_to_summarize,
+        &source_entries,
+        prev_compaction_index,
+    );
 
     // Also extract file ops from the turn prefix when splitting.
     if cut_point.is_split_turn {
@@ -1013,6 +1166,78 @@ pub fn prepare_compaction(
         file_ops,
         settings: *settings,
     })
+}
+
+/// `estimateProjectedContextTokens` (compaction.ts:227-270 @ 005af57d8):
+/// estimate projected context without trusting usage captured before a later
+/// edit or compaction. Falls back to a pure message-size estimate when the
+/// usage anchor is invalidated.
+pub fn estimate_projected_context_tokens(
+    projection: &SessionProjection,
+    branch_entries: &[SessionEntry],
+) -> ContextUsageEstimate {
+    let estimate = estimate_context_tokens(&projection.messages);
+    if let Some(last_usage_index) = estimate.last_usage_index {
+        let mut projected_message_index = 0usize;
+        let mut usage_entry_id: Option<&str> = None;
+        for entry in &projection.entries {
+            let next_message_index = projected_message_index + entry.messages.len();
+            if last_usage_index < next_message_index {
+                usage_entry_id = Some(entry.source_entry.id());
+                break;
+            }
+            projected_message_index = next_message_index;
+        }
+
+        let usage_entry_index =
+            usage_entry_id.and_then(|id| branch_entries.iter().position(|entry| entry.id() == id));
+        let latest_invalidating_index = branch_entries.iter().rposition(|entry| {
+            matches!(
+                entry,
+                SessionEntry::ContextEdit(_) | SessionEntry::Compaction(_)
+            )
+        });
+        // JS compares `usageEntryIndex > latestInvalidatingEntryIndex` with -1
+        // sentinels: a missing usage entry (-1) never beats a missing
+        // invalidating entry (-1), so the fallback still applies.
+        let usage_trusted = match latest_invalidating_index {
+            None => usage_entry_index.is_some(),
+            Some(invalidating) => usage_entry_index
+                .map(|index| index > invalidating)
+                .unwrap_or(false),
+        };
+        if usage_trusted {
+            return estimate;
+        }
+    }
+
+    let current_system = {
+        let llm_messages: Vec<rpi_ai::types::Message> = projection
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::System(system) => {
+                    Some(rpi_ai::types::Message::System(system.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        rpi_ai::utils::transcript::get_current_system_message(&llm_messages)
+    };
+    let mut tokens = current_system
+        .map(|system| estimate_tokens(&AgentMessage::System(system)))
+        .unwrap_or(0);
+    for message in &projection.messages {
+        if !matches!(message, AgentMessage::System(_)) {
+            tokens += estimate_tokens(message);
+        }
+    }
+    ContextUsageEstimate {
+        tokens,
+        usage_tokens: 0,
+        trailing_tokens: tokens,
+        last_usage_index: None,
+    }
 }
 
 // ============================================================================

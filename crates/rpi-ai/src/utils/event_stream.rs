@@ -168,6 +168,7 @@ mod tests {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason,

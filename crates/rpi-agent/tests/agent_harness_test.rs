@@ -148,6 +148,7 @@ fn create_assistant_message(text: &str) -> AgentMessage {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: create_usage(100, 50, 0, 0),
         stop_reason: StopReason::Stop,

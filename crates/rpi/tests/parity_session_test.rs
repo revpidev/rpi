@@ -123,11 +123,22 @@ fn parity_fixture_sessions_load_and_export_lossless() {
         assert_eq!(entries.len(), lines.len() - 1, "{scenario}: entry count");
         assert_eq!(sm.get_tree().len(), 1, "{scenario}: single-root tree");
 
-        // Context contains exactly the message entries.
+        // Context contains exactly the message entries minus the ones a
+        // `replacement: null` context edit omits (V16-03 canonical
+        // projection).
+        let omitted = lines
+            .iter()
+            .filter(|l| {
+                serde_json::from_str::<Value>(l).ok().is_some_and(|v| {
+                    v.get("type").and_then(Value::as_str) == Some("context_edit")
+                        && v.get("replacement").is_some_and(Value::is_null)
+                })
+            })
+            .count();
         let ctx = sm.build_session_context();
         assert_eq!(
             ctx.messages.len(),
-            message_lines,
+            message_lines - omitted,
             "{scenario}: context messages"
         );
 

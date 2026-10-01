@@ -134,6 +134,7 @@ fn create_failure_message(model: &Model, error_message: &str, aborted: bool) -> 
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: if aborted {
@@ -1377,6 +1378,7 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
             transform_context: Some(transform_context),
             get_api_key: None,
             should_stop_after_turn: None,
+            prepare_request: None,
             prepare_next_turn: Some(prepare_next_turn),
             get_steering_messages: Some(get_steering_messages),
             get_follow_up_messages: Some(get_follow_up_messages),

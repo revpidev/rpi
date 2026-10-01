@@ -2645,6 +2645,7 @@ mod tests {
                 response_model: None,
                 response_id: None,
                 provider_thinking_level: None,
+                thinking_level: None,
                 diagnostics: None,
                 usage: rpi_ai::types::Usage {
                     input: 1,
@@ -2696,6 +2697,7 @@ mod tests {
                 })],
                 details: None,
                 usage: None,
+                nested_calls: None,
                 is_error: false,
                 timestamp: 1,
             }),

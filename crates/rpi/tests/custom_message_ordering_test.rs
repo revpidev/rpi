@@ -413,16 +413,20 @@ async fn trigger_turn_false_during_run_appends_after_tool_results() {
         ],
     );
 
-    // Provider-visible order (upstream intent 3): the queued message did
-    // NOT enter the in-flight run's request (agent-loop keeps its own
-    // context; the flush lands in session state at turn_end).
+    // Provider-visible order (canonical projection, V16-03): the flushed
+    // message joins the run's post-tool provider request because the
+    // SessionManager projection is the request-time authority; the
+    // tool-call/tool-result pairing stays intact.
     let seen = fixture
         .seen
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     assert_eq!(seen.len(), 1, "exactly one post-tool request: {seen:?}");
-    assert_eq!(seen[0], "system,user,assistant,toolResult", "request roles");
+    assert_eq!(
+        seen[0], "system,user,assistant,toolResult,user",
+        "request roles"
+    );
 
     // Second prompt (upstream intent 3): the queued message joins the
     // request built from session state, AFTER the tool result — the

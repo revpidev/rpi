@@ -118,6 +118,7 @@ fn assistant_response(model: &Model, stop_reason: StopReason) -> AssistantMessag
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: warm_usage(),
         stop_reason,

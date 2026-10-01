@@ -1149,6 +1149,12 @@ pub struct AssistantMessage {
     /// logic is V14-05 (4e69b0c28 split across tasks).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_thinking_level: Option<String>,
+    /// Pi thinking level the agent loop requested for this response. Absent
+    /// outside the agent loop and for legacy responses (R2.7.1,
+    /// types.ts:553-554 @ 005af57d8). The agent loop records it on every
+    /// finalized assistant message (agent-loop.ts:409).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ModelThinkingLevel>,
     /// Redacted provider/runtime diagnostics for failures and recoveries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Vec<AssistantMessageDiagnostic>>,
@@ -1177,6 +1183,39 @@ pub struct AssistantMessage {
     pub timestamp: i64,
 }
 
+/// A tool call that another tool made while it ran, for example from a
+/// codemode script (types.ts:570-581 @ 005af57d8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedToolCallRecord {
+    pub id: String,
+    pub name: String,
+    /// Omitted when over the size limits; `argumentsBytes` then gives their size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+    /// UTF-8 size of the arguments as JSON, set when `arguments` is omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments_bytes: Option<u64>,
+    /// `unfinished`: the call was still running when the calling tool finished.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Error text, truncated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Bounded record of the nested calls a tool made. Results are not recorded
+/// (types.ts:583-588 @ 005af57d8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedToolCalls {
+    pub calls: Vec<NestedToolCallRecord>,
+    /// False when calls were dropped, arguments omitted, or calls had not
+    /// finished.
+    pub complete: bool,
+}
+
 /// `ToolResultMessage`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1193,6 +1232,10 @@ pub struct ToolResultMessage {
     /// LLM context accounting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Calls this tool made to other tools. Kept for the session record; not
+    /// sent to the model (R3.4.6 payload note; writer is V16-06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested_calls: Option<NestedToolCalls>,
     pub is_error: bool,
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
@@ -2283,6 +2326,7 @@ mod tests {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -2855,6 +2899,7 @@ mod tests {
             })],
             details: Some(json!({"truncated": false})),
             usage: None,
+            nested_calls: None,
             is_error: false,
             timestamp: 3,
         };

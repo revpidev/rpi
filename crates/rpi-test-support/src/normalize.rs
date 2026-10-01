@@ -45,6 +45,7 @@ const ID_KEYS: &[&str] = &[
     "parentId",
     "fromId",
     "firstKeptEntryId",
+    "targetId",
     "toolCallId",
     "sessionId",
     "responseId",

@@ -65,6 +65,14 @@ pub(crate) fn thinking_level_from_model_level(level: ModelThinkingLevel) -> Opti
     ThinkingLevel::from_model_level(level)
 }
 
+/// `config.reasoning ?? "off"` recorded on every finalized assistant message
+/// (agent-loop.ts:409 @ 005af57d8; R2.7.1).
+fn recorded_thinking_level(reasoning: Option<ThinkingLevel>) -> ModelThinkingLevel {
+    reasoning
+        .map(ThinkingLevel::to_model_level)
+        .unwrap_or(ModelThinkingLevel::Off)
+}
+
 // ---------------------------------------------------------------------------
 // AgentContext (types.ts)
 // ---------------------------------------------------------------------------
@@ -207,6 +215,41 @@ pub type TransformContextFn = Arc<
 /// available.
 pub type GetApiKeyFn = Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
+/// `PrepareRequestContext` (types.ts:183-187 @ 005af57d8): runtime state
+/// available immediately before a conversational provider request.
+#[derive(Clone)]
+pub struct PrepareRequestContext {
+    /// Context for the provider request.
+    pub context: AgentContext,
+    /// Model for the provider request.
+    pub model: Model,
+    /// Thinking level for the provider request (`"off"` when none).
+    pub thinking_level: ModelThinkingLevel,
+}
+
+/// `AgentRequestUpdate` (types.ts:190-191 @ 005af57d8): replacement runtime
+/// state for the provider request being prepared (`messages` excluded).
+#[derive(Clone, Default)]
+pub struct AgentRequestUpdate {
+    /// Replacement context for the provider request.
+    pub context: Option<AgentContext>,
+    /// Replacement model for the provider request.
+    pub model: Option<Model>,
+    /// Replacement thinking level for the provider request (`"off"` clears
+    /// `config.reasoning`).
+    pub thinking_level: Option<ModelThinkingLevel>,
+}
+
+/// `prepareRequest` (types.ts:267 @ 005af57d8): called immediately before
+/// every conversational provider request, including the first. Pending
+/// messages have already been appended and emitted when this callback runs.
+/// The returned context/model/thinking level replaces the runtime values for
+/// this and later requests in the run. This hook does not poll queues.
+/// Contract: must not panic.
+pub type PrepareRequestFn = Arc<
+    dyn Fn(PrepareRequestContext) -> BoxFuture<'static, Option<AgentRequestUpdate>> + Send + Sync,
+>;
+
 /// `shouldStopAfterTurn` — returning `true` makes the loop emit `agent_end`
 /// and exit before polling steering/follow-up queues.
 pub type ShouldStopAfterTurnFn =
@@ -279,6 +322,8 @@ pub struct AgentLoopConfig {
     pub transform_context: Option<TransformContextFn>,
     pub get_api_key: Option<GetApiKeyFn>,
     pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
+    /// `prepareRequest` (agent-loop.ts:218-235 @ 005af57d8).
+    pub prepare_request: Option<PrepareRequestFn>,
     pub prepare_next_turn: Option<PrepareNextTurnFn>,
     pub get_steering_messages: Option<GetQueuedMessagesFn>,
     pub get_follow_up_messages: Option<GetQueuedMessagesFn>,
@@ -644,6 +689,34 @@ async fn run_loop(
                 .await;
                 current_context.messages.push(message.clone());
                 new_messages.push(message);
+            }
+
+            // `prepareRequest` (agent-loop.ts:218-235 @ 005af57d8): called
+            // immediately before every conversational provider request,
+            // including the first. The replacement context/model/thinking
+            // level applies to this and later requests in the run. This hook
+            // does not poll queues.
+            if let Some(prepare_request) = &config.prepare_request {
+                let request_update = prepare_request(PrepareRequestContext {
+                    context: current_context.clone(),
+                    model: config.model.clone(),
+                    thinking_level: config
+                        .reasoning
+                        .map(ThinkingLevel::to_model_level)
+                        .unwrap_or(ModelThinkingLevel::Off),
+                })
+                .await;
+                if let Some(update) = request_update {
+                    if let Some(context) = update.context {
+                        *current_context = context;
+                    }
+                    if let Some(model) = update.model {
+                        config.model = model;
+                    }
+                    if let Some(thinking_level) = update.thinking_level {
+                        config.reasoning = thinking_level_from_model_level(thinking_level);
+                    }
+                }
             }
 
             // Stream assistant response.
@@ -1040,10 +1113,15 @@ async fn stream_assistant_response(
                 })
                 .await;
             }
-            StreamEvent::Done { message, .. } => {
+            StreamEvent::Done { mut message, .. } => {
+                // `Object.assign(await response.result(), { thinkingLevel:
+                // config.reasoning ?? "off" })` (agent-loop.ts:409): record
+                // the requested level on every finalized response (R2.7.1).
+                message.thinking_level = Some(recorded_thinking_level(config.reasoning));
                 return finalize_streamed_message(context, message, added_partial, emit).await;
             }
-            StreamEvent::Error { error, .. } => {
+            StreamEvent::Error { mut error, .. } => {
+                error.thinking_level = Some(recorded_thinking_level(config.reasoning));
                 return finalize_streamed_message(context, error, added_partial, emit).await;
             }
             other => {
@@ -1077,6 +1155,7 @@ async fn stream_assistant_response(
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: Some(recorded_thinking_level(config.reasoning)),
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Error,
@@ -1736,6 +1815,7 @@ fn create_tool_result_message(finalized: &FinalizedToolCallOutcome) -> ToolResul
             Some(finalized.result.details.clone())
         },
         usage: finalized.result.usage.clone(),
+        nested_calls: None,
         is_error: finalized.is_error,
         timestamp: now_millis(),
     }

@@ -48,7 +48,14 @@ fn fixtures_dir() -> std::path::PathBuf {
 // Fixture / actual-line preparation
 // ---------------------------------------------------------------------------
 
-const DROPPED_EVENT_TYPES: &[&str] = &["message_update", "queue_update", "agent_settled"];
+const DROPPED_EVENT_TYPES: &[&str] = &[
+    "message_update",
+    "queue_update",
+    "agent_settled",
+    // V16-03: the session layer's restorative-omission bookkeeping
+    // (`_omitRecoveryAttempt` -> entry_appended) is not an Agent event.
+    "entry_appended",
+];
 const STRIPPED_KEYS: &[&str] = &["usage", "willRetry", "details"];
 
 fn strip_keys(value: &mut Value) {

@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rpi_agent::compaction::{
     CompactionResult, CompactionSettings, SummarizationArgs, calculate_context_tokens,
-    compact as run_compact, estimate_context_tokens, estimate_messages_tokens, prepare_compaction,
-    should_compact,
+    compact as run_compact, estimate_context_tokens, estimate_messages_tokens,
+    estimate_projected_context_tokens, prepare_compaction, should_compact,
 };
 use rpi_agent::session::{SessionEntry, get_latest_compaction_entry, parse_iso8601_ms};
 use rpi_agent::types::ThinkingLevel;
@@ -138,6 +138,36 @@ fn lock_abort(cell: &AbortTokenCell) -> std::sync::MutexGuard<'_, Option<Cancell
     cell.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `_findPersistedMessageEntryId` (agent-session.ts:1183-1201 @ 005af57d8):
+/// value-equality scan over the branch, then the projected-index fallback.
+fn find_persisted_message_entry_id(
+    path: &[SessionEntry],
+    state_messages: &[rpi_agent::AgentMessage],
+    projection: &rpi_agent::session::SessionProjection,
+    message: &rpi_agent::AgentMessage,
+) -> Option<String> {
+    for entry in path.iter().rev() {
+        if let SessionEntry::Message(entry) = entry
+            && &entry.message == message
+        {
+            return Some(entry.id.clone());
+        }
+    }
+    let message_index = state_messages
+        .iter()
+        .position(|candidate| candidate == message)?;
+    let mut projected_index = 0usize;
+    for entry in &projection.entries {
+        for _ in 0..entry.messages.len() {
+            if projected_index == message_index {
+                return Some(entry.source_entry.id().to_owned());
+            }
+            projected_index += 1;
+        }
+    }
+    None
+}
+
 pub struct CompactionRunner {
     agent: Arc<Agent>,
     session: Arc<Mutex<SessionManager>>,
@@ -161,6 +191,11 @@ pub struct CompactionRunner {
     /// (session replacement / reload) takes effect without rebuilding the
     /// runner. `None` in bare test fixtures = no extensions.
     extension_runner: Option<crate::core::extensions::ExtensionRunnerRef>,
+    /// `_omitRecoveryAttempt` callback (V16-03 FR-A R5): persists a
+    /// restorative `context_edit` omission for a discarded recovery attempt
+    /// before the post-run compaction, so the canonical projection no longer
+    /// contains it. Installed by `AgentSession`; `None` in bare fixtures.
+    omit_recovery: Option<Arc<dyn Fn(&AssistantMessage) + Send + Sync>>,
 }
 
 impl CompactionRunner {
@@ -188,6 +223,7 @@ impl CompactionRunner {
             active_token: AbortTokenCell::default(),
             auto_active_token: AbortTokenCell::default(),
             extension_runner: None,
+            omit_recovery: None,
         }
     }
 
@@ -198,6 +234,12 @@ impl CompactionRunner {
         runner_ref: crate::core::extensions::ExtensionRunnerRef,
     ) {
         self.extension_runner = Some(runner_ref);
+    }
+
+    /// V16-03 FR-A R5: install the recovery-omission callback
+    /// (`_omitRecoveryAttempt`, agent-session.ts:1202-1216 @ 005af57d8).
+    pub fn set_omit_recovery(&mut self, omit: Arc<dyn Fn(&AssistantMessage) + Send + Sync>) {
+        self.omit_recovery = Some(omit);
     }
 
     /// Current extension runner, if installed.
@@ -633,9 +675,67 @@ impl CompactionRunner {
             .as_ref()
             .map(|m| u64::from(m.max_tokens))
             .unwrap_or(0);
-        let context_overflow =
-            same_model && is_context_overflow(assistant_message, Some(context_window));
-        let recoverable_length = same_model && is_recoverable_length(assistant_message, max_tokens);
+        // Canonical projection checks (agent-session.ts:1980-1995 @
+        // 005af57d8): an assistant entry that a later context edit omitted, or
+        // whose usage a later edit/compaction invalidated, must not be
+        // trusted to trigger recovery.
+        let typed_projection = rpi_agent::session::build_session_projection(&path);
+        let state_messages = self.agent.state().messages;
+        let assistant_agent_message = rpi_agent::AgentMessage::Assistant(assistant_message.clone());
+        let assistant_entry_id = find_persisted_message_entry_id(
+            &path,
+            &state_messages,
+            &typed_projection,
+            &assistant_agent_message,
+        );
+        let assistant_is_projected = match &assistant_entry_id {
+            None => true,
+            Some(id) => typed_projection.entries.iter().any(|entry| {
+                entry.source_entry.id() == id
+                    && entry
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, rpi_agent::AgentMessage::Assistant(_)))
+            }),
+        };
+        let assistant_index = assistant_entry_id
+            .as_deref()
+            .and_then(|id| path.iter().position(|entry| entry.id() == id));
+        let entries_after_assistant: &[SessionEntry] = match assistant_index {
+            Some(index) => &path[index + 1..],
+            None => &[],
+        };
+        let has_post_assistant_context_edit = entries_after_assistant
+            .iter()
+            .any(|entry| matches!(entry, SessionEntry::ContextEdit(_)));
+        let latest_assistant_edit_omits = entries_after_assistant
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                SessionEntry::ContextEdit(edit)
+                    if Some(edit.target_id.as_str()) == assistant_entry_id.as_deref() =>
+                {
+                    Some(edit.replacement.is_none())
+                }
+                _ => None,
+            })
+            .unwrap_or(false);
+        let assistant_retained_for_explicit_recovery = assistant_entry_id.is_none()
+            || (!entries_after_assistant
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::Compaction(_)))
+                && !latest_assistant_edit_omits);
+        let assistant_usage_matches_projection =
+            assistant_is_projected && !has_post_assistant_context_edit;
+        let explicit_overflow = assistant_message.stop_reason == StopReason::Error
+            && is_context_overflow(assistant_message, None);
+        let context_overflow = same_model
+            && ((explicit_overflow && assistant_retained_for_explicit_recovery)
+                || (assistant_usage_matches_projection
+                    && is_context_overflow(assistant_message, Some(context_window))));
+        let recoverable_length = same_model
+            && assistant_is_projected
+            && is_recoverable_length(assistant_message, max_tokens);
         if context_overflow || recoverable_length {
             let will_retry = assistant_message.stop_reason != StopReason::Stop;
 
@@ -676,50 +776,53 @@ impl CompactionRunner {
             }
 
             self.overflow_recovery_attempted = true;
-            // Remove the error message from agent state (it IS saved to the
-            // session for history, but we don't want it in context for the
-            // retry).
-            let mut messages = self.agent.state().messages;
-            if matches!(messages.last(), Some(rpi_agent::AgentMessage::Assistant(_))) {
-                messages.pop();
-                self.agent.set_messages(messages);
+            // Keep the failed attempt in raw history while durably omitting
+            // it from the model projection (agent-session.ts:2966-2971 @
+            // 005af57d8 `_omitRecoveryAttempt`). Direct state truncation no
+            // longer reaches the provider context under the canonical
+            // projection.
+            if let Some(omit) = &self.omit_recovery {
+                omit(assistant_message);
             }
             return self
                 .run_auto_compaction(CompactionReason::Overflow, will_retry)
                 .await;
         }
 
-        // Case 2: threshold (agent-session.ts:2216-2243). For error messages
-        // or all-zero usage, estimate from the last valid response.
-        // This ensures sessions that hit persistent API errors (e.g. 529) or
-        // malformed zero-usage responses can still compact and do not reset
-        // context accounting (#8328).
+        // Case 2: threshold (agent-session.ts:2990-3025 @ 005af57d8). For
+        // error messages or all-zero usage, estimate from the last valid
+        // response. Edited context must not trust pre-edit usage.
+        let has_context_edits = typed_projection
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.source_entry, SessionEntry::ContextEdit(_)));
         let direct_context_tokens = calculate_context_tokens(&assistant_message.usage);
-        let context_tokens =
-            if assistant_message.stop_reason == StopReason::Error || direct_context_tokens == 0 {
-                let messages = self.agent.state().messages;
-                let estimate = estimate_context_tokens(&messages);
-                // Without provider usage, estimate.tokens is the pure
-                // message-size estimate. Only usage-backed estimates need
-                // the stale pre-compaction check (4495469a5: sessions whose
-                // providers report no streaming usage still compact on the
-                // pure estimate instead of giving up).
-                if let Some(last_usage_index) = estimate.last_usage_index {
-                    // Verify the usage source is post-compaction. Kept
-                    // pre-compaction messages have stale usage reflecting
-                    // the old (larger) context and would falsely trigger
-                    // compaction right after one just finished.
-                    if let (Some(ts), rpi_agent::AgentMessage::Assistant(usage_msg)) =
-                        (compaction_ts, &messages[last_usage_index])
-                        && usage_msg.timestamp <= ts
-                    {
-                        return false;
-                    }
+        let context_tokens = if has_context_edits {
+            estimate_projected_context_tokens(&typed_projection, &path).tokens
+        } else if assistant_message.stop_reason == StopReason::Error || direct_context_tokens == 0 {
+            let messages = self.agent.state().messages;
+            let estimate = estimate_context_tokens(&messages);
+            // Without provider usage, estimate.tokens is the pure
+            // message-size estimate. Only usage-backed estimates need
+            // the stale pre-compaction check (4495469a5: sessions whose
+            // providers report no streaming usage still compact on the
+            // pure estimate instead of giving up).
+            if let Some(last_usage_index) = estimate.last_usage_index {
+                // Verify the usage source is post-compaction. Kept
+                // pre-compaction messages have stale usage reflecting
+                // the old (larger) context and would falsely trigger
+                // compaction right after one just finished.
+                if let (Some(ts), rpi_agent::AgentMessage::Assistant(usage_msg)) =
+                    (compaction_ts, &messages[last_usage_index])
+                    && usage_msg.timestamp <= ts
+                {
+                    return false;
                 }
-                estimate.tokens
-            } else {
-                direct_context_tokens
-            };
+            }
+            estimate.tokens
+        } else {
+            direct_context_tokens
+        };
         if should_compact(context_tokens, context_window, &self.settings) {
             return self
                 .run_auto_compaction(CompactionReason::Threshold, false)

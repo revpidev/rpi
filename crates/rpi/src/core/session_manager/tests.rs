@@ -57,6 +57,7 @@ fn assistant_msg(text: &str) -> AgentMessage {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage {
             input: 1,
@@ -581,6 +582,7 @@ fn tool_result_msg(text: &str) -> AgentMessage {
         })],
         details: None,
         usage: None,
+        nested_calls: None,
         is_error: false,
         timestamp: 1,
     })
@@ -616,7 +618,9 @@ fn text_replacement(text: &str) -> ContextEditReplacement {
 fn context_edit_omits_target_only_from_model_projection() {
     let mut session = in_memory_session();
     session.append_message(user_msg("request")).expect("append");
-    let assistant_id = session.append_message(assistant_msg("partial")).expect("append");
+    let assistant_id = session
+        .append_message(assistant_msg("partial"))
+        .expect("append");
     let result_id = session
         .append_message(tool_result_msg("raw output"))
         .expect("append");
@@ -647,7 +651,9 @@ fn context_edit_omits_target_only_from_model_projection() {
     let raw = session.get_entry(&result_id).expect("entry");
     match raw.known() {
         Some(SessionEntry::Message(m)) => match &m.message {
-            AgentMessage::ToolResult(r) => assert_eq!(msg_text(&AgentMessage::ToolResult(r.clone())), "raw output"),
+            AgentMessage::ToolResult(r) => {
+                assert_eq!(msg_text(&AgentMessage::ToolResult(r.clone())), "raw output")
+            }
             other => panic!("expected toolResult, got {other:?}"),
         },
         other => panic!("expected message entry, got {other:?}"),
@@ -658,7 +664,9 @@ fn context_edit_omits_target_only_from_model_projection() {
 #[test]
 fn context_edit_replaces_only_content_and_latest_edit_wins() {
     let mut session = in_memory_session();
-    let target_id = session.append_message(assistant_msg("original")).expect("append");
+    let target_id = session
+        .append_message(assistant_msg("original"))
+        .expect("append");
     session
         .append_context_edit(
             &target_id,
@@ -703,23 +711,36 @@ fn context_edit_replaces_only_content_and_latest_edit_wins() {
 #[test]
 fn context_edit_normalizes_string_replacements_for_array_only_roles() {
     let mut session = in_memory_session();
-    let assistant_id = session.append_message(assistant_msg("original")).expect("append");
+    let assistant_id = session
+        .append_message(assistant_msg("original"))
+        .expect("append");
     let result_id = session
         .append_message(tool_result_msg("original result"))
         .expect("append");
     let assistant_edit_id = session
-        .append_context_edit(&assistant_id, Some(text_replacement("assistant replacement")))
+        .append_context_edit(
+            &assistant_id,
+            Some(text_replacement("assistant replacement")),
+        )
         .expect("edit");
     let result_edit_id = session
         .append_context_edit(&result_id, Some(text_replacement("result replacement")))
         .expect("edit");
 
-    let stored = session.get_entry(&assistant_edit_id).expect("entry").raw_value().clone();
+    let stored = session
+        .get_entry(&assistant_edit_id)
+        .expect("entry")
+        .raw_value()
+        .clone();
     assert_eq!(
         stored.get("replacement").and_then(|v| v.get("content")),
         Some(&json!([{ "type": "text", "text": "assistant replacement" }]))
     );
-    let stored = session.get_entry(&result_edit_id).expect("entry").raw_value().clone();
+    let stored = session
+        .get_entry(&result_edit_id)
+        .expect("entry")
+        .raw_value()
+        .clone();
     assert_eq!(
         stored.get("replacement").and_then(|v| v.get("content")),
         Some(&json!([{ "type": "text", "text": "result replacement" }]))
@@ -736,7 +757,12 @@ fn context_edit_normalizes_string_replacements_for_array_only_roles() {
 fn context_edit_projection_normalizes_imported_string_replacements() {
     let entries = vec![
         msg("1", None, assistant_msg("original")),
-        context_edit("2", Some("1"), "1", Some(text_replacement("imported replacement"))),
+        context_edit(
+            "2",
+            Some("1"),
+            "1",
+            Some(text_replacement("imported replacement")),
+        ),
     ];
     let messages = build_session_projection(&entries, None).messages;
     assert_eq!(messages.len(), 1);
@@ -747,14 +773,22 @@ fn context_edit_projection_normalizes_imported_string_replacements() {
 #[test]
 fn context_edit_keeps_edits_branch_relative() {
     let mut session = in_memory_session();
-    let target_id = session.append_message(user_msg("original")).expect("append");
+    let target_id = session
+        .append_message(user_msg("original"))
+        .expect("append");
     session
         .append_context_edit(&target_id, Some(text_replacement("edited")))
         .expect("edit");
-    assert_eq!(msg_text(&session.build_session_projection().messages[0]), "edited");
+    assert_eq!(
+        msg_text(&session.build_session_projection().messages[0]),
+        "edited"
+    );
 
     session.branch(&target_id).expect("branch");
-    assert_eq!(msg_text(&session.build_session_projection().messages[0]), "original");
+    assert_eq!(
+        msg_text(&session.build_session_projection().messages[0]),
+        "original"
+    );
 }
 
 /// upstream: uses a self-referencing compaction to retain no preceding
@@ -762,7 +796,9 @@ fn context_edit_keeps_edits_branch_relative() {
 #[test]
 fn retain_none_compaction_stores_own_id_as_first_kept() {
     let mut session = in_memory_session();
-    session.append_message(user_msg("discarded")).expect("append");
+    session
+        .append_message(user_msg("discarded"))
+        .expect("append");
     let compaction_id = session
         .append_compaction("exact handoff", None, 100, None, None, None)
         .expect("compaction");
@@ -771,7 +807,10 @@ fn retain_none_compaction_stores_own_id_as_first_kept() {
     let entry = session.get_entry(&compaction_id).expect("entry");
     match entry.known() {
         Some(SessionEntry::Compaction(c)) => {
-            assert_eq!(c.first_kept_entry_id.as_deref(), Some(compaction_id.as_str()))
+            assert_eq!(
+                c.first_kept_entry_id.as_deref(),
+                Some(compaction_id.as_str())
+            )
         }
         other => panic!("expected compaction, got {other:?}"),
     }
@@ -805,7 +844,9 @@ fn retain_none_compaction_stores_own_id_as_first_kept() {
 #[test]
 fn context_edit_applies_to_retained_pre_compaction_entries() {
     let mut session = in_memory_session();
-    session.append_message(user_msg("summarized")).expect("append");
+    session
+        .append_message(user_msg("summarized"))
+        .expect("append");
     let retained_id = session
         .append_message(user_msg("original retained"))
         .expect("append");
@@ -834,12 +875,18 @@ fn context_edit_applies_to_retained_pre_compaction_entries() {
 #[test]
 fn repeated_compaction_uses_only_newest_summary() {
     let mut session = in_memory_session();
-    session.append_message(user_msg("summarized first")).expect("append");
-    let retained_id = session.append_message(user_msg("retained")).expect("append");
+    session
+        .append_message(user_msg("summarized first"))
+        .expect("append");
+    let retained_id = session
+        .append_message(user_msg("retained"))
+        .expect("append");
     session
         .append_compaction("first summary", Some(&retained_id), 100, None, None, None)
         .expect("compaction");
-    session.append_message(assistant_msg("after first compaction")).expect("append");
+    session
+        .append_message(assistant_msg("after first compaction"))
+        .expect("append");
     session
         .append_compaction("second summary", Some(&retained_id), 80, None, None, None)
         .expect("compaction");
@@ -863,11 +910,15 @@ fn repeated_compaction_uses_only_newest_summary() {
 #[test]
 fn repeated_retain_none_compactions() {
     let mut session = in_memory_session();
-    session.append_message(user_msg("discarded")).expect("append");
+    session
+        .append_message(user_msg("discarded"))
+        .expect("append");
     session
         .append_compaction("first handoff", None, 100, None, None, None)
         .expect("compaction");
-    session.append_message(user_msg("also discarded")).expect("append");
+    session
+        .append_message(user_msg("also discarded"))
+        .expect("append");
     let second_id = session
         .append_compaction("second handoff", None, 50, None, None, None)
         .expect("compaction");
@@ -2366,6 +2417,7 @@ fn preserves_tool_and_summary_usage_across_a_file_backed_reload() {
             })],
             details: None,
             usage: Some(usage.clone()),
+            nested_calls: None,
             is_error: false,
             timestamp: 1,
         }))

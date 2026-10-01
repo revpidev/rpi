@@ -57,9 +57,7 @@ use rpi_agent::session::{
 // `rpi_agent::session` (T08): one implementation shared with the compaction
 // module (stale-usage timestamp guards, agent-session.ts:1974/2030).
 pub use rpi_agent::session::{parse_iso8601_ms, session_entry_to_context_messages};
-use rpi_ai::types::{
-    AssistantContent, TextContent, ToolResultContent, Usage, UserContent,
-};
+use rpi_ai::types::{AssistantContent, TextContent, ToolResultContent, Usage, UserContent};
 use rpi_ai::utils::uuid::{random_uuid, uuidv7_now};
 use serde_json::Value;
 
@@ -1026,9 +1024,7 @@ fn project_context_message(
 fn context_editable_user_content(content: &ContextEditableContent) -> UserContent {
     match content {
         ContextEditableContent::Text(text) => UserContent::Text(text.clone()),
-        ContextEditableContent::Blocks(blocks) => {
-            UserContent::Blocks(parse_context_blocks(blocks))
-        }
+        ContextEditableContent::Blocks(blocks) => UserContent::Blocks(parse_context_blocks(blocks)),
     }
 }
 
@@ -1058,8 +1054,8 @@ pub fn build_session_projection(
             // because its raw ID lies inside the newest retained range. Only
             // the newest compaction at index 0 contributes a checkpoint and
             // summary (session-manager.ts:557-565).
-            let shadowed_compaction = index > 0
-                && matches!(source_entry.known(), Some(SessionEntry::Compaction(_)));
+            let shadowed_compaction =
+                index > 0 && matches!(source_entry.known(), Some(SessionEntry::Compaction(_)));
             let messages = if shadowed_compaction {
                 Vec::new()
             } else {

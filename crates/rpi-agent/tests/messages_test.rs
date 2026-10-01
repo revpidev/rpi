@@ -43,6 +43,7 @@ fn assistant_msg(text: &str) -> AssistantMessage {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
@@ -324,6 +325,7 @@ fn convert_to_llm_passes_through_base_message_kinds() {
         })],
         details: None,
         usage: None,
+        nested_calls: None,
         is_error: false,
         timestamp: 3,
     });
