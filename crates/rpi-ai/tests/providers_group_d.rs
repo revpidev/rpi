@@ -93,7 +93,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.fireworks.ai/inference",
         "Fireworks API key",
         "FIREWORKS_API_KEY",
-        33, // 19451accd regen (models.dev snapshot 2026-09-20)
+        22, // 2026-10-01 v6 regen (models.dev + OpenRouter snapshot)
     ),
     spec(
         groq_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        22, // rc.13 catalog refresh
+        20, // 2026-10-01 v6 regen (Kimi K2.6 → K3; models.dev snapshot)
     ),
     spec(
         xai_provider,
@@ -336,11 +336,11 @@ fn xiaomi_catalog_splits_api_billing_only_models() {
     }
 }
 
-/// Upstream `together-models.test.ts`: the default Kimi K2.6 entry.
+/// Upstream `together-models.test.ts`: the default Kimi K3 entry.
 #[test]
-fn together_kimi_k2_6_catalog_entry() {
+fn together_kimi_k3_catalog_entry() {
     let provider = together_provider();
-    let model = get_model(&provider, "moonshotai/Kimi-K2.6");
+    let model = get_model(&provider, "moonshotai/Kimi-K3");
 
     assert_eq!(model.api.as_str(), ApiKind::OPENAI_COMPLETIONS);
     assert_eq!(model.provider, "together");
@@ -355,11 +355,11 @@ fn together_kimi_k2_6_catalog_entry() {
         ]))
     );
     assert_eq!(model.input, [InputModality::Text, InputModality::Image]);
-    assert_eq!(model.context_window, 262144);
-    assert_eq!(model.max_tokens, 131000);
-    assert_eq!(model.cost.rates.input, 1.2);
-    assert_eq!(model.cost.rates.output, 4.5);
-    assert_eq!(model.cost.rates.cache_read, 0.2);
+    assert_eq!(model.context_window, 1048576);
+    assert_eq!(model.max_tokens, 131072);
+    assert_eq!(model.cost.rates.input, 3.0);
+    assert_eq!(model.cost.rates.output, 15.0);
+    assert_eq!(model.cost.rates.cache_read, 0.3);
     assert_eq!(model.cost.rates.cache_write, 0.0);
     assert_eq!(
         model.compat,
@@ -428,50 +428,27 @@ fn together_reasoning_controls_match_api_surface() {
     assert_eq!(compat.supports_reasoning_effort, Some(false));
 }
 
-/// Upstream `fireworks-models.test.ts`: the default Kimi K2.6 entry uses the
-/// Anthropic-compatible Messages API with Fireworks-specific compat.
+/// Upstream `fireworks-models.test.ts`: non-GLM, non-Kimi-K3 models use the
+/// Anthropic-compatible Messages API.
 #[test]
-fn fireworks_kimi_k2_6_anthropic_catalog_entry() {
+fn fireworks_anthropic_catalog_entry() {
     let provider = fireworks_provider();
-    let model = get_model(&provider, "accounts/fireworks/models/kimi-k2p6");
+    let model = get_model(&provider, "accounts/fireworks/models/deepseek-v4p1-flash");
 
     assert_eq!(model.api.as_str(), ApiKind::ANTHROPIC_MESSAGES);
     assert_eq!(model.provider, "fireworks");
     assert_eq!(model.base_url, "https://api.fireworks.ai/inference");
     assert!(model.reasoning);
     assert_eq!(model.input, [InputModality::Text, InputModality::Image]);
-    assert_eq!(model.context_window, 262000);
-    assert_eq!(model.max_tokens, 262000);
-    assert_eq!(model.cost.rates.input, 0.95);
-    assert_eq!(model.cost.rates.output, 4.0);
-    assert_eq!(model.cost.rates.cache_read, 0.16);
-    assert_eq!(model.cost.rates.cache_write, 0.0);
-    assert_eq!(
-        model.compat,
-        Some(ModelCompat {
-            send_session_affinity_headers: Some(true),
-            supports_eager_tool_input_streaming: Some(false),
-            supports_cache_control_on_tools: Some(false),
-            supports_long_cache_retention: Some(false),
-            // rc.13 catalog refresh (upstream 6b94ae2ec/d92eb8d4b-era
-            // Fireworks compat updates); `supportsToolReferences` left the
-            // catalog with the #9548 rework (9e05370b2 — d92eb8d4b-era face,
-            // wire-side convergence V15-06, T-V15-02-1).
-            allow_empty_signature: Some(true),
-            ..ModelCompat::default()
-        })
-    );
 }
 
-/// Upstream `fireworks-models.test.ts` @ 9841914: the GLM 5.2 Fast router is
-/// aligned with the base model's config (both on openai-completions since
-/// 1e4fbe384). The Fire Pass turbo router entry and its assertions were
-/// dropped upstream with the catalog refresh.
+/// Upstream `fireworks-models.test.ts` @ 005af57d8: the GLM 5.3 Fast router
+/// is aligned with the base model's config (both on openai-completions).
 #[test]
 fn fireworks_router_models_align_with_base() {
     let provider = fireworks_provider();
-    let base = get_model(&provider, "accounts/fireworks/models/glm-5p2");
-    let fast = get_model(&provider, "accounts/fireworks/routers/glm-5p2-fast");
+    let base = get_model(&provider, "accounts/fireworks/models/glm-5p3");
+    let fast = get_model(&provider, "accounts/fireworks/routers/glm-5p3-fast");
     assert_eq!(fast.api, base.api);
     assert_eq!(fast.base_url, base.base_url);
     assert_eq!(fast.compat, base.compat);

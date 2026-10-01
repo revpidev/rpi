@@ -22,11 +22,12 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::models::{
-    InflightRefresh, ModelsPublication, Provider, RefreshModelsContext, merge_models, now_millis,
+    InflightRefresh, ModelsPublication, Provider, RefreshModelsContext, merge_any_models,
+    merge_models, now_millis,
 };
 use rpi_ai::models_store::ModelsStoreEntry;
 use rpi_ai::types::{
-    Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
+    AnyModel, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use tokio_util::sync::CancellationToken;
@@ -59,10 +60,32 @@ pub fn model_catalog_endpoint(settings_url: Option<&str>) -> Option<String> {
     )
 }
 
+/// `REMOTE_CATALOG_MODEL_TYPES` (remote-catalog-provider.ts:17-24 @
+/// 005af57d8): model types this client can consume, sent as `?types=` so the
+/// catalog server returns the full-type shard. A server that ignores the
+/// parameter still returns the chat-only shard, which this client handles
+/// unchanged.
+pub const REMOTE_CATALOG_MODEL_TYPES: [&str; 3] = ["chat", "image", "classifier"];
+
+/// `isSupportedModelType` (remote-catalog-provider.ts:26-33): entries with
+/// an unknown/unsupported `type` are ignored.
+fn is_supported_model_type(model: &serde_json::Value) -> bool {
+    match model.get("type") {
+        None => true,
+        Some(serde_json::Value::String(model_type)) => {
+            REMOTE_CATALOG_MODEL_TYPES.contains(&model_type.as_str())
+        }
+        Some(_) => false,
+    }
+}
+
 /// `remoteModels` (remote-catalog-provider.ts:32-41): the stored overlay is
 /// ignored when the local built-in catalog is newer or as-new (the
-/// `generatedAt` comparison).
-fn remote_models(entry: Option<&ModelsStoreEntry>, local_generated_at: Option<i64>) -> Vec<Model> {
+/// `generatedAt` comparison). Schema v6: the overlay carries every type.
+fn remote_models(
+    entry: Option<&ModelsStoreEntry>,
+    local_generated_at: Option<i64>,
+) -> Vec<AnyModel> {
     let Some(entry) = entry else {
         return Vec::new();
     };
@@ -74,11 +97,12 @@ fn remote_models(entry: Option<&ModelsStoreEntry>, local_generated_at: Option<i6
     entry.models.clone()
 }
 
-/// `parseCatalog` (remote-catalog-provider.ts:18-30): the catalog body is an
-/// array of models, `{ "models": [...] }`, or a keyed object; entries must
-/// be objects carrying `id`, and the provider id is stamped onto every
-/// model.
-fn parse_catalog(provider_id: &str, value: &serde_json::Value) -> Result<Vec<Model>, String> {
+/// `parseCatalog` (remote-catalog-provider.ts:18-33, v6): the catalog body
+/// is an array of models, `{ "models": [...] }`, or a keyed object; entries
+/// must be objects carrying `id`, an unknown `type` is ignored, and the
+/// provider id is stamped onto every model. Schema v6 returns `AnyModel`
+/// (chat/image/classifier).
+fn parse_catalog(provider_id: &str, value: &serde_json::Value) -> Result<Vec<AnyModel>, String> {
     let entries: Vec<&serde_json::Value> = if let Some(array) = value.as_array() {
         array.iter().collect()
     } else if let Some(models) = value.get("models").and_then(serde_json::Value::as_array) {
@@ -98,8 +122,11 @@ fn parse_catalog(provider_id: &str, value: &serde_json::Value) -> Result<Vec<Mod
         if !entry.is_object() || entry.get("id").is_none() {
             continue;
         }
-        if let Ok(mut model) = serde_json::from_value::<Model>(entry.clone()) {
-            model.provider = provider_id.to_owned();
+        if !is_supported_model_type(entry) {
+            continue;
+        }
+        if let Ok(mut model) = serde_json::from_value::<AnyModel>(entry.clone()) {
+            model.set_provider(provider_id);
             models.push(model);
         }
         // Entries failing typed deserialization are dropped; upstream keeps
@@ -179,7 +206,7 @@ pub struct RemoteCatalogProvider {
     inner: Arc<dyn Provider>,
     catalog_base_url: String,
     local_generated_at: Option<i64>,
-    dynamic_models: Arc<Mutex<Vec<Model>>>,
+    dynamic_models: Arc<Mutex<Vec<AnyModel>>>,
     inflight: InflightRefresh,
 }
 
@@ -216,7 +243,24 @@ impl Provider for RemoteCatalogProvider {
             .dynamic_models
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        merge_models(&self.inner.get_models(), &dynamic)
+        // Schema v6: `getModels` merges only the chat entries
+        // (remote-catalog-provider.ts:60-68).
+        let chat: Vec<Model> = dynamic
+            .iter()
+            .filter_map(AnyModel::as_chat)
+            .cloned()
+            .collect();
+        merge_models(&self.inner.get_models(), &chat)
+    }
+
+    /// `getAllModels` (remote-catalog-provider.ts:64-68): every model type,
+    /// keyed by `type\0id`.
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        let dynamic = self
+            .dynamic_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        merge_any_models(&self.inner.get_all_models(), &dynamic)
     }
 
     /// `refreshModels` (remote-catalog-provider.ts:55-121): restore the
@@ -242,7 +286,7 @@ impl Provider for RemoteCatalogProvider {
                         let mut dynamic = dynamic_models.lock().unwrap_or_else(|e| e.into_inner());
                         *dynamic = remote_models(stored.as_ref(), local_generated_at)
                             .into_iter()
-                            .filter(|model| model.provider == inner.id())
+                            .filter(|model| model.provider() == inner.id())
                             .collect();
                     }
 
@@ -271,6 +315,11 @@ impl Provider for RemoteCatalogProvider {
                         .filter(|stored| !stored.models.is_empty())
                         .and_then(|stored| stored.etag.clone());
                     let url = catalog_url(&catalog_base_url, inner.id())?;
+                    // Schema v6: request the full-type shard
+                    // (remote-catalog-provider.ts:102).
+                    let mut url = url;
+                    url.query_pairs_mut()
+                        .append_pair("types", &REMOTE_CATALOG_MODEL_TYPES.join(","));
                     // `fetchWithRetry` (46b53b995) wraps this management-plane
                     // GET; the factory rebuilds the request per attempt so
                     // headers are always set correctly.
@@ -813,11 +862,18 @@ mod tests {
             .await
             .expect("read")
             .expect("entry");
-        let ids: Vec<String> = stored.models.into_iter().map(|m| m.id).collect();
+        let ids: Vec<String> = stored
+            .models
+            .into_iter()
+            .map(|m| m.id().to_owned())
+            .collect();
         assert_eq!(ids, ["dynamic"]);
         let requests = server.requests();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].path, "/api/models/providers/test-provider");
+        assert_eq!(
+            requests[0].path,
+            "/api/models/providers/test-provider?types=chat%2Cimage%2Cclassifier"
+        );
         let ua = requests[0].user_agent.as_deref().expect("user-agent");
         assert!(
             ua.contains(&format!("rpi/{VERSION}")),
@@ -920,7 +976,11 @@ mod tests {
             .await
             .expect("read")
             .expect("entry");
-        let ids: Vec<String> = stored.models.into_iter().map(|m| m.id).collect();
+        let ids: Vec<String> = stored
+            .models
+            .into_iter()
+            .map(|m| m.id().to_owned())
+            .collect();
         assert_eq!(ids, ["dynamic"]);
         assert_eq!(stored.etag.as_deref(), Some("\"catalog-1\""));
         assert!(stored.checked_at >= checked_at);
@@ -1010,7 +1070,11 @@ mod tests {
             .expect("read")
             .expect("entry");
         assert_eq!(stored.etag.as_deref(), Some("\"catalog-1\""));
-        let ids: Vec<String> = stored.models.into_iter().map(|m| m.id).collect();
+        let ids: Vec<String> = stored
+            .models
+            .into_iter()
+            .map(|m| m.id().to_owned())
+            .collect();
         assert_eq!(ids, ["dynamic"]);
 
         provider
@@ -1066,7 +1130,7 @@ mod tests {
             .write(
                 "test-provider",
                 ModelsStoreEntry {
-                    models: vec![model("cached")],
+                    models: vec![AnyModel::Chat(model("cached"))],
                     last_modified: Some(now_millis()),
                     checked_at: Some(now_millis()),
                     etag: Some("\"catalog-1\"".to_owned()),
@@ -1131,7 +1195,7 @@ mod tests {
             .write(
                 "test-provider",
                 ModelsStoreEntry {
-                    models: vec![model("cached")],
+                    models: vec![AnyModel::Chat(model("cached"))],
                     last_modified: Some(now_millis()),
                     // Outside the 4h freshness window so the fetch runs.
                     checked_at: Some(now_millis() - REMOTE_CATALOG_REFRESH_INTERVAL_MS * 2),
@@ -1159,7 +1223,11 @@ mod tests {
             .await
             .expect("read")
             .expect("entry");
-        let ids: Vec<String> = stored.models.into_iter().map(|m| m.id).collect();
+        let ids: Vec<String> = stored
+            .models
+            .into_iter()
+            .map(|m| m.id().to_owned())
+            .collect();
         assert_eq!(ids, ["cached"]);
     }
 
@@ -1224,7 +1292,7 @@ mod tests {
     #[test]
     fn remote_models_honors_generated_at() {
         let entry = ModelsStoreEntry {
-            models: vec![model("m")],
+            models: vec![AnyModel::Chat(model("m"))],
             last_modified: Some(100),
             checked_at: None,
             etag: None,

@@ -24,7 +24,7 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("anthropic", "claude-opus-4-8"),
     ("openai", "gpt-5.5"),
     ("azure-openai-responses", "gpt-5.4"),
-    ("openai-codex", "gpt-5.5"),
+    ("openai-codex", "gpt-6.1-sol"),
     // `balanced` since 9767ba275 (select Radius models after catalog
     // discovery); post-login selection falls back to catalog order when the
     // account catalog lacks it (complete_provider_authentication).
@@ -47,11 +47,11 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("moonshotai", "kimi-k2.6"),
     ("moonshotai-cn", "kimi-k2.6"),
     ("huggingface", "moonshotai/Kimi-K2.6"),
-    ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
+    ("fireworks", "accounts/fireworks/models/kimi-k3"),
     ("baseten", "zai-org/GLM-5.2"),
-    ("together", "moonshotai/Kimi-K2.6"),
+    ("together", "moonshotai/Kimi-K3"),
     ("opencode", "kimi-k2.6"),
-    ("opencode-go", "kimi-k2.6"),
+    ("opencode-go", "kimi-k3"),
     ("kimi-coding", "kimi-for-coding"),
     ("meta", "muse-spark-1.3"),
     ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),

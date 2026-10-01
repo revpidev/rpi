@@ -4290,7 +4290,7 @@ mod fireworks_mid_convo_tools_tests {
     fn fireworks_catalog_model() -> Model {
         let mut model = crate::generated::get_builtin_model(
             "fireworks",
-            "accounts/fireworks/models/deepseek-v4-flash-0731",
+            "accounts/fireworks/models/deepseek-v4p1-flash",
         )
         .expect("catalog model")
         .clone();

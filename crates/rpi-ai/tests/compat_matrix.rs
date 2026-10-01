@@ -484,7 +484,9 @@ fn test_catalog_openrouter_cache_control_baked() {
     );
 
     // Plain "anthropic/..." ids resolve through detection as well.
-    let plain = get_builtin_model("openrouter", "anthropic/claude-3-haiku").expect("plain");
+    // (2026-10-01 v6 snapshot: `claude-3-haiku` left the OpenRouter
+    // catalog; the current Claude line id covers the same detection face.)
+    let plain = get_builtin_model("openrouter", "anthropic/claude-fable-5").expect("plain");
     assert_eq!(
         get_compat(plain).cache_control_format,
         Some(CacheControlFormat::Anthropic)

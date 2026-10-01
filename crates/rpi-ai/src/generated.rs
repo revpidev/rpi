@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use crate::types::Model;
+use crate::types::{AnyModel, ClassifierModel, ImageModel, Model, ModelType, is_model_type};
 
 include!(concat!(env!("OUT_DIR"), "/models_generated.rs"));
 
@@ -40,6 +40,11 @@ pub enum CatalogError {
         provider: &'static str,
         #[source]
         source: serde_json::Error,
+    },
+    #[error("invalid catalog shape for provider {provider}: {message}")]
+    ProviderShape {
+        provider: &'static str,
+        message: &'static str,
     },
 }
 
@@ -56,11 +61,15 @@ pub struct CatalogManifest {
 }
 
 /// Parsed built-in catalog: provider id → models in upstream catalog order
-/// (vendored JSONs are written key-sorted by the upstream generator, and
-/// `BTreeMap` iteration preserves that order).
+/// (schema v6 vendored JSONs are written in the generator's insertion order;
+/// `serde_json` `preserve_order` keeps that order at parse time).
+///
+/// `models` is chat-only (the v6 `getBuiltinModels` face); `all_models`
+/// carries every type (chat/image/classifier) for the v6 getters.
 pub struct BuiltinCatalog {
     providers: Vec<&'static str>,
     models: BTreeMap<&'static str, Vec<Model>>,
+    all_models: BTreeMap<&'static str, Vec<AnyModel>>,
     manifest: CatalogManifest,
 }
 
@@ -73,17 +82,61 @@ impl BuiltinCatalog {
         &self.providers
     }
 
-    /// `all.ts` `getBuiltinModels(provider)`.
+    /// `all.ts` `getBuiltinModels(provider)` — chat-only (schema v6 keeps
+    /// the legacy getter chat-only; see the image/classifier getters below).
     pub fn models(&self, provider: &str) -> &[Model] {
         self.models.get(provider).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// `all.ts` `getBuiltinModel(provider, modelId)`.
+    /// Schema v6 all-type read — every `AnyModel` for the provider.
+    pub fn all_models(&self, provider: &str) -> &[AnyModel] {
+        self.all_models
+            .get(provider)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Schema v6 `getBuiltinImageModels(provider)`.
+    pub fn image_models(&self, provider: &str) -> Vec<&ImageModel> {
+        self.all_models(provider)
+            .iter()
+            .filter_map(|model| match model {
+                AnyModel::Image(image) => Some(image),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Schema v6 `getBuiltinClassifierModels(provider)`.
+    pub fn classifier_models(&self, provider: &str) -> Vec<&ClassifierModel> {
+        self.all_models(provider)
+            .iter()
+            .filter_map(|model| match model {
+                AnyModel::Classifier(classifier) => Some(classifier),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `all.ts` `getBuiltinModel(provider, modelId)` — chat-only, matching
+    /// the legacy lookup face (typed per-type getters arrive with V16-06).
     pub fn model(&self, provider: &str, model_id: &str) -> Option<&Model> {
         self.models
             .get(provider)?
             .iter()
             .find(|model| model.id == model_id)
+    }
+
+    /// Schema v6 typed lookup (`getBuiltinImageModel` / classifier analogue).
+    pub fn any_model(
+        &self,
+        provider: &str,
+        model_type: ModelType,
+        model_id: &str,
+    ) -> Option<&AnyModel> {
+        self.all_models(provider)
+            .iter()
+            .find(|model| model.model_type() == model_type && model.id() == model_id)
     }
 
     pub fn manifest(&self) -> &CatalogManifest {
@@ -105,24 +158,49 @@ fn load_catalog() -> Result<BuiltinCatalog, CatalogError> {
         serde_json::from_str(CATALOG_MANIFEST_JSON).map_err(CatalogError::Manifest)?;
     let mut providers = Vec::with_capacity(CATALOG_PROVIDER_DATA.len());
     let mut models = BTreeMap::new();
+    let mut all_models = BTreeMap::new();
     for (provider, json) in CATALOG_PROVIDER_DATA {
-        // Catalog files group models by API (`{ "<api>": { "<id>": Model } }`);
-        // upstream flattens the groups (`flattenModelCatalog`). Both levels
-        // are key-sorted upstream, so BTreeMap keeps the upstream order.
-        let groups: BTreeMap<String, BTreeMap<String, Model>> = serde_json::from_str(json)
+        // Catalog files group models by API
+        // (`{ "<api>": { "<type>:<id>": AnyModel } }`, schema v6 composite
+        // keys — chat/image/classifier kept distinct); upstream flattens the
+        // groups (`flattenModelCatalog`). The whole file is parsed as
+        // `serde_json::Value` so the generator's insertion order is kept
+        // (`preserve_order`); the v6 generator no longer key-sorts.
+        let root: serde_json::Value = serde_json::from_str(json)
             .map_err(|source| CatalogError::ProviderData { provider, source })?;
+        let Some(groups) = root.as_object() else {
+            return Err(CatalogError::ProviderShape {
+                provider,
+                message: "top level is not an object",
+            });
+        };
+        let mut all = Vec::new();
+        for group in groups.values() {
+            let Some(entries) = group.as_object() else {
+                return Err(CatalogError::ProviderShape {
+                    provider,
+                    message: "api group is not an object",
+                });
+            };
+            for entry in entries.values() {
+                let model: AnyModel = serde_json::from_value(entry.clone())
+                    .map_err(|source| CatalogError::ProviderData { provider, source })?;
+                all.push(model);
+            }
+        }
+        let chat: Vec<Model> = all
+            .iter()
+            .filter(|model| is_model_type(model, ModelType::Chat))
+            .filter_map(|model| model.as_chat().cloned())
+            .collect();
         providers.push(*provider);
-        models.insert(
-            *provider,
-            groups
-                .into_values()
-                .flat_map(BTreeMap::into_values)
-                .collect(),
-        );
+        models.insert(*provider, chat);
+        all_models.insert(*provider, all);
     }
     Ok(BuiltinCatalog {
         providers,
         models,
+        all_models,
         manifest,
     })
 }
@@ -139,10 +217,32 @@ pub fn get_builtin_providers() -> &'static [&'static str] {
         .unwrap_or(&[])
 }
 
-/// `getBuiltinModels(provider)`; empty for unknown providers.
+/// `getBuiltinModels(provider)`; empty for unknown providers. Chat-only
+/// (schema v6 keeps the legacy getter chat-only).
 pub fn get_builtin_models(provider: &str) -> &'static [Model] {
     builtin_catalog()
         .map(|catalog| catalog.models(provider))
+        .unwrap_or(&[])
+}
+
+/// Schema v6 `getBuiltinImageModels(provider)`.
+pub fn get_builtin_image_models(provider: &str) -> Vec<&'static ImageModel> {
+    builtin_catalog()
+        .map(|catalog| catalog.image_models(provider))
+        .unwrap_or_default()
+}
+
+/// Schema v6 `getBuiltinClassifierModels(provider)`.
+pub fn get_builtin_classifier_models(provider: &str) -> Vec<&'static ClassifierModel> {
+    builtin_catalog()
+        .map(|catalog| catalog.classifier_models(provider))
+        .unwrap_or_default()
+}
+
+/// Schema v6 all-type read (chat + image + classifier), catalog order.
+pub fn get_builtin_all_models(provider: &str) -> &'static [AnyModel] {
+    builtin_catalog()
+        .map(|catalog| catalog.all_models(provider))
         .unwrap_or(&[])
 }
 
@@ -196,19 +296,65 @@ mod tests {
     fn test_catalog_loads_all_vendored_providers() {
         let catalog = builtin_catalog().expect("vendored catalog parses");
         assert_eq!(catalog.providers().len(), CATALOG_PROVIDER_DATA.len());
-        assert_eq!(catalog.providers().len(), 41);
+        assert_eq!(catalog.providers().len(), 42);
         let total: usize = catalog
             .providers()
             .iter()
             .map(|provider| catalog.models(provider).len())
             .sum();
-        // Pin-aligned regen @ 19451accd rules (models.dev + Radius public
-        // catalog snapshot 2026-09-23; +radius +meta vs the rc.13 snapshot).
-        assert_eq!(total, 1502);
+        // Schema v6 regen @ 005af57d8 rules (models.dev + OpenRouter +
+        // NVIDIA + Vercel AI Gateway snapshot 2026-10-01; +typesafe.json vs
+        // the 2026-09-23 schemaVersion 3 snapshot).
+        assert_eq!(total, 1529);
+        let images: usize = catalog
+            .providers()
+            .iter()
+            .map(|provider| catalog.image_models(provider).len())
+            .sum();
+        let classifiers: usize = catalog
+            .providers()
+            .iter()
+            .map(|provider| catalog.classifier_models(provider).len())
+            .sum();
+        assert_eq!(images, 57);
+        assert_eq!(classifiers, 15);
         // Radius ships its static public catalog since 4d38031fb; the
         // gateway overlay lives in `providers::radius`.
         assert!(catalog.providers().contains(&"radius"));
         assert!(catalog.providers().contains(&"meta"));
+        // v6 new provider: classifier-only static catalog.
+        assert!(catalog.providers().contains(&"typesafe"));
+    }
+
+    #[test]
+    fn test_v6_type_faces() {
+        // OpenRouter carries the `openrouter-images` api group (57 image
+        // models) and `typesafe-system-one` classifiers.
+        let openrouter = builtin_catalog().expect("catalog");
+        assert!(
+            openrouter
+                .all_models("openrouter")
+                .iter()
+                .any(|model| model.api().as_str() == "openrouter-images")
+        );
+        let flux = openrouter
+            .any_model(
+                "openrouter",
+                ModelType::Image,
+                "black-forest-labs/flux.2-flex",
+            )
+            .expect("flux image model");
+        assert_eq!(flux.model_type(), ModelType::Image);
+        assert!(flux.as_chat().is_none());
+        assert_eq!(flux.merge_key(), "image\0black-forest-labs/flux.2-flex");
+        let chat = openrouter
+            .any_model("openrouter", ModelType::Chat, "x-ai/grok-4.7")
+            .expect("grok chat model");
+        assert_eq!(chat.merge_key(), "chat\0x-ai/grok-4.7");
+        let classifier = openrouter
+            .any_model("openrouter", ModelType::Classifier, "~typesafe/jev-latest")
+            .expect("jev classifier");
+        assert_eq!(classifier.model_type(), ModelType::Classifier);
     }
 
     #[test]
@@ -223,7 +369,7 @@ mod tests {
     #[test]
     fn test_generated_at_matches_manifest() {
         let catalog = builtin_catalog().expect("catalog");
-        assert_eq!(catalog.manifest().schema_version, 3);
+        assert_eq!(catalog.manifest().schema_version, 6);
         assert_eq!(catalog.manifest().files.len(), CATALOG_PROVIDER_DATA.len());
         // 2026-07-30T01:56:27.841Z per the vendored manifest; exact value is
         // asserted against the manifest string itself, not hardcoded here.

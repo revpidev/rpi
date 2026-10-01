@@ -1656,6 +1656,213 @@ pub struct Model {
     pub compat: Option<ModelCompat>,
 }
 
+/// `ModelType` (types.ts:1158-1165 @ 005af57d8, schema v6): what a catalog
+/// entry is for. Chat is the default and omits `type` in catalog data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelType {
+    /// Chat model — usable with `stream()` and friends.
+    #[default]
+    Chat,
+    /// Image-generation model — usable with `generateImages()` only.
+    Image,
+    /// Structured classifier model — usable with `classify()` only.
+    Classifier,
+}
+
+impl ModelType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelType::Chat => "chat",
+            ModelType::Image => "image",
+            ModelType::Classifier => "classifier",
+        }
+    }
+}
+
+/// `ImageModel` (types.ts:1143-1156 @ 005af57d8): image-generation catalog
+/// entry. Parsed through [`AnyModel`]; `AnyModel` dispatch tries this shape
+/// before the classifier and chat shapes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageModel {
+    #[serde(rename = "type", default = "image_model_type")]
+    pub model_type: ModelType,
+    pub id: String,
+    pub name: String,
+    pub api: ApiKind,
+    pub provider: String,
+    pub base_url: String,
+    pub input: Vec<InputModality>,
+    /// Provider input limits and cache-safe preprocessing metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
+    pub cost: ModelCost,
+    /// Output modalities. Always includes `"image"`; `"text"` means the
+    /// model can also return text blocks.
+    pub output: Vec<InputModality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// `ClassifierModel` (types.ts:1150-1155 @ 005af57d8): structured classifier
+/// catalog entry. Parsed through [`AnyModel`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierModel {
+    #[serde(rename = "type", default = "classifier_model_type")]
+    pub model_type: ModelType,
+    pub id: String,
+    pub name: String,
+    pub api: ApiKind,
+    pub provider: String,
+    pub base_url: String,
+    pub input: Vec<InputModality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
+    pub cost: ModelCost,
+    pub context_window: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// `AnyModel` (types.ts:1167-1168 @ 005af57d8): anything a provider can
+/// list. Deserialization dispatches on the raw `type` field (missing =
+/// chat), so each variant is unambiguous; unknown types are rejected and
+/// skipped by callers (catalog/remote parse).
+///
+/// The chat variant is intentionally much larger than the image/classifier
+/// variants (upstream `AnyModel` is a plain TS union); boxing would force
+/// allocations through the hot chat path, so the size difference is
+/// accepted here.
+fn image_model_type() -> ModelType {
+    ModelType::Image
+}
+
+fn classifier_model_type() -> ModelType {
+    ModelType::Classifier
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum AnyModel {
+    Image(ImageModel),
+    Classifier(ClassifierModel),
+    Chat(Model),
+}
+
+impl<'de> Deserialize<'de> for AnyModel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value.get("type").and_then(Value::as_str) {
+            None | Some("chat") => serde_json::from_value(value)
+                .map(AnyModel::Chat)
+                .map_err(serde::de::Error::custom),
+            Some("image") => serde_json::from_value(value)
+                .map(AnyModel::Image)
+                .map_err(serde::de::Error::custom),
+            Some("classifier") => serde_json::from_value(value)
+                .map(AnyModel::Classifier)
+                .map_err(serde::de::Error::custom),
+            Some(other) => Err(serde::de::Error::custom(format!(
+                "unknown model type {other:?}"
+            ))),
+        }
+    }
+}
+
+impl AnyModel {
+    /// `getModelType` (utils/model-operations.ts @ 005af57d8).
+    pub fn model_type(&self) -> ModelType {
+        match self {
+            AnyModel::Image(_) => ModelType::Image,
+            AnyModel::Classifier(_) => ModelType::Classifier,
+            AnyModel::Chat(_) => ModelType::Chat,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            AnyModel::Image(model) => &model.id,
+            AnyModel::Classifier(model) => &model.id,
+            AnyModel::Chat(model) => &model.id,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            AnyModel::Image(model) => &model.name,
+            AnyModel::Classifier(model) => &model.name,
+            AnyModel::Chat(model) => &model.name,
+        }
+    }
+
+    pub fn provider(&self) -> &str {
+        match self {
+            AnyModel::Image(model) => &model.provider,
+            AnyModel::Classifier(model) => &model.provider,
+            AnyModel::Chat(model) => &model.provider,
+        }
+    }
+
+    pub fn api(&self) -> &ApiKind {
+        match self {
+            AnyModel::Image(model) => &model.api,
+            AnyModel::Classifier(model) => &model.api,
+            AnyModel::Chat(model) => &model.api,
+        }
+    }
+
+    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ 005af57d8):
+    /// the same upstream id may appear once per type.
+    pub fn merge_key(&self) -> String {
+        format!("{}\0{}", self.model_type().as_str(), self.id())
+    }
+
+    pub fn as_chat(&self) -> Option<&Model> {
+        match self {
+            AnyModel::Chat(model) => Some(model),
+            _ => None,
+        }
+    }
+
+    pub fn into_chat(self) -> Option<Model> {
+        match self {
+            AnyModel::Chat(model) => Some(model),
+            _ => None,
+        }
+    }
+
+    /// Stamp the owning provider id (remote catalog parse / hydration).
+    pub fn set_provider(&mut self, provider: &str) {
+        match self {
+            AnyModel::Image(model) => model.provider = provider.to_owned(),
+            AnyModel::Classifier(model) => model.provider = provider.to_owned(),
+            AnyModel::Chat(model) => model.provider = provider.to_owned(),
+        }
+    }
+}
+
+impl From<Model> for AnyModel {
+    fn from(model: Model) -> Self {
+        AnyModel::Chat(model)
+    }
+}
+
+/// `isModelType` (utils/model-operations.ts @ 005af57d8).
+pub fn is_model_type(model: &AnyModel, model_type: ModelType) -> bool {
+    model.model_type() == model_type
+}
+
+/// `getModelType` free-function form (utils/model-operations.ts).
+pub fn get_model_type(model: &AnyModel) -> ModelType {
+    model.model_type()
+}
+
 /// `OpenAICompletionsCompat.maxTokensField`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaxTokensField {

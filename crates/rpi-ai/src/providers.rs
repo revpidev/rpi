@@ -389,11 +389,13 @@ mod tests {
                 spec.id
             );
         }
-        // Since V15-15 every catalog provider is registered (the last
-        // gap — `meta`, catalog shipped with the 4d38031fb-era generation
-        // — registered with b73412a37).
-        assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len());
+        // Since V15-15 every registered provider has a catalog entry. The
+        // v6 catalog additionally carries `typesafe` (classifier-only); its
+        // provider spec + system-one adapter land with V16-06/V16-07
+        // (02 §1.2), so it is the one catalog-only provider for now.
+        assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len() + 1);
         assert!(catalog.providers().contains(&"meta"));
+        assert!(catalog.providers().contains(&"typesafe"));
     }
 
     #[test]

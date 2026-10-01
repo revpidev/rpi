@@ -479,7 +479,11 @@ async fn persists_and_restores_loaded_models_for_cache_only_startup_refreshes() 
         .await
         .expect("read")
         .expect("entry");
-    let cached_ids: Vec<String> = cached.models.iter().map(|model| model.id.clone()).collect();
+    let cached_ids: Vec<String> = cached
+        .models
+        .iter()
+        .map(|model| model.id().to_owned())
+        .collect();
     assert_eq!(cached_ids, ["loaded"]);
 
     // Cache-only startup (allowNetwork: false) restores from the store.

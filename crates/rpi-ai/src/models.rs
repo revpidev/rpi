@@ -42,8 +42,8 @@ use crate::models_store::{
     InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ProviderModelsStore,
 };
 use crate::types::{
-    Context, Model, ModelThinkingLevel, ProviderHeaders, SimpleStreamOptions, StreamOptions,
-    TranscriptContext,
+    AnyModel, Context, Model, ModelThinkingLevel, ProviderHeaders, SimpleStreamOptions,
+    StreamOptions, TranscriptContext,
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::merge_headers;
@@ -133,6 +133,15 @@ pub trait Provider: Send + Sync {
     /// Current known models, sync. Must not panic; `Models` treats a panicking
     /// implementation as having no models.
     fn get_models(&self) -> Vec<Model>;
+
+    /// `getAllModels?` (models.ts:174 @ 005af57d8 / schema v6): every model
+    /// type known to the provider (chat + image + classifier). Defaults to
+    /// the chat-only [`Provider::get_models`] wrapped as [`AnyModel::Chat`],
+    /// so existing providers need no change and chat reads keep their
+    /// current behavior (red line).
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        self.get_models().into_iter().map(AnyModel::Chat).collect()
+    }
 
     /// `filterModels` — optional provider policy for credential-specific
     /// model availability (models.ts:111). `get_models` remains the complete
@@ -418,6 +427,24 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
     merged
 }
 
+/// `mergeModels` for schema v6 (`remote-catalog-provider.ts:26-30 @
+/// 005af57d8`): the merge key is `type\0id`, so the same upstream id may
+/// appear once per type. Same-key models replace the baseline entry; new
+/// keys append.
+pub fn merge_any_models(baseline: &[AnyModel], dynamic: &[AnyModel]) -> Vec<AnyModel> {
+    let mut merged: Vec<AnyModel> = baseline.to_vec();
+    for model in dynamic {
+        match merged
+            .iter_mut()
+            .find(|entry| entry.model_type() == model.model_type() && entry.id() == model.id())
+        {
+            Some(entry) => *entry = model.clone(),
+            None => merged.push(model.clone()),
+        }
+    }
+    merged
+}
+
 /// Unix epoch milliseconds (`Date.now()`).
 pub fn now_millis() -> i64 {
     SystemTime::now()
@@ -582,6 +609,7 @@ impl Provider for CreatedProvider {
                 let restored: Vec<Model> = stored
                     .models
                     .iter()
+                    .filter_map(AnyModel::as_chat)
                     .filter(|model| model.provider == id)
                     .cloned()
                     .collect();
@@ -620,7 +648,7 @@ impl Provider for CreatedProvider {
                 .publish
                 .publish(ModelsPublication {
                     persist: Some(Some(ModelsStoreEntry {
-                        models: refreshed,
+                        models: refreshed.into_iter().map(AnyModel::Chat).collect(),
                         last_modified: None,
                         checked_at: Some(now_millis()),
                         etag: None,
@@ -903,6 +931,23 @@ impl Models {
             None => providers
                 .values()
                 .flat_map(|provider| provider.get_models())
+                .collect(),
+        }
+    }
+
+    /// `getAllModels` (models.ts:446 @ 005af57d8 / schema v6) — every model
+    /// type from one provider or all. `get_models` stays chat-only (red
+    /// line).
+    pub fn get_all_models(&self, provider: Option<&str>) -> Vec<AnyModel> {
+        let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
+        match provider {
+            Some(id) => providers
+                .get(id)
+                .map(|provider| provider.get_all_models())
+                .unwrap_or_default(),
+            None => providers
+                .values()
+                .flat_map(|provider| provider.get_all_models())
                 .collect(),
         }
     }
@@ -1738,7 +1783,9 @@ mod tests {
 
     use super::*;
     use crate::auth::{ApiKeyAuth, ApiKeyCredential, AuthEvent, AuthPrompt, ModelAuth};
-    use crate::types::{ApiKind, DoneReason, ModelThinkingLevel, StopReason, StreamEvent, Usage};
+    use crate::types::{
+        ApiKind, DoneReason, ModelThinkingLevel, ModelType, StopReason, StreamEvent, Usage,
+    };
 
     fn model(provider: &str, api: &str) -> Model {
         serde_json::from_value(json!({
@@ -2450,6 +2497,46 @@ mod tests {
         assert_eq!(merged[1].provider, "p");
     }
 
+    #[test]
+    fn test_merge_any_models_keys_by_type_and_id() {
+        // Schema v6: the same upstream id may appear once per type
+        // (`type\0id` merge key).
+        let chat = AnyModel::Chat(model_with_id("p", "same"));
+        let image: AnyModel = serde_json::from_value(serde_json::json!({
+            "type": "image",
+            "id": "same",
+            "name": "Image Same",
+            "api": "openrouter-images",
+            "provider": "p",
+            "baseUrl": "https://example.test",
+            "input": ["text"],
+            "output": ["image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }))
+        .expect("image model");
+        let baseline = vec![chat.clone(), image.clone()];
+        // Re-publishing the chat type replaces only the chat entry.
+        let merged = merge_any_models(&baseline, std::slice::from_ref(&chat));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].model_type(), ModelType::Chat);
+        assert_eq!(merged[1].model_type(), ModelType::Image);
+        // Unknown types are rejected at parse time (callers skip them).
+        let unknown = serde_json::from_value::<AnyModel>(serde_json::json!({
+            "type": "video",
+            "id": "v",
+            "name": "V",
+            "api": "openai-completions",
+            "provider": "p",
+            "baseUrl": "https://example.test",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1,
+            "maxTokens": 1
+        }));
+        assert!(unknown.is_err(), "unknown model type must be rejected");
+    }
+
     /// Fetch-based refreshable provider replicating the
     /// `createProvider.fetchModels` refresh body (models.ts:596-616; the
     /// constructor hook itself lands with T15, see module docs).
@@ -2528,6 +2615,7 @@ mod tests {
                             let restored: Vec<Model> = stored
                                 .models
                                 .iter()
+                                .filter_map(AnyModel::as_chat)
                                 .filter(|m| m.provider == id)
                                 .cloned()
                                 .collect();
@@ -2561,7 +2649,7 @@ mod tests {
                             .publish
                             .publish(ModelsPublication {
                                 persist: Some(Some(ModelsStoreEntry {
-                                    models: refreshed,
+                                    models: refreshed.into_iter().map(AnyModel::Chat).collect(),
                                     last_modified: None,
                                     checked_at: Some(now_millis()),
                                     etag: None,
@@ -2638,7 +2726,7 @@ mod tests {
             .write(
                 "fetchy",
                 ModelsStoreEntry {
-                    models: vec![model_with_id("fetchy", "cached")],
+                    models: vec![AnyModel::Chat(model_with_id("fetchy", "cached"))],
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
@@ -3206,7 +3294,7 @@ mod tests {
             .write(
                 "dynamic",
                 ModelsStoreEntry {
-                    models: vec![model_with_id("dynamic", "cached")],
+                    models: vec![AnyModel::Chat(model_with_id("dynamic", "cached"))],
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
@@ -3316,7 +3404,7 @@ mod tests {
     async fn lets_providers_choose_persistent_deletion_and_ephemeral_publication_atomically() {
         let entry: Arc<Mutex<Option<ModelsStoreEntry>>> =
             Arc::new(Mutex::new(Some(ModelsStoreEntry {
-                models: vec![model_with_id("dynamic", "stored")],
+                models: vec![AnyModel::Chat(model_with_id("dynamic", "stored"))],
                 last_modified: None,
                 checked_at: Some(now_millis()),
                 etag: None,
@@ -3382,8 +3470,8 @@ mod tests {
                             .stored
                             .as_ref()
                             .and_then(|s| s.models.first())
-                            .map(|m| &m.id),
-                        Some(&"stored".to_string())
+                            .map(|m| m.id()),
+                        Some("stored")
                     );
 
                     // Publish a deletion.
@@ -3788,7 +3876,7 @@ mod tests {
                         .publish
                         .publish(ModelsPublication {
                             persist: Some(Some(ModelsStoreEntry {
-                                models: vec![model_with_id("dynamic", "fresh")],
+                                models: vec![AnyModel::Chat(model_with_id("dynamic", "fresh"))],
                                 last_modified: None,
                                 checked_at: Some(now_millis()),
                                 etag: None,
@@ -3987,7 +4075,7 @@ mod tests {
                         .publish
                         .publish(ModelsPublication {
                             persist: Some(Some(ModelsStoreEntry {
-                                models: vec![model_with_id("dynamic", &value)],
+                                models: vec![AnyModel::Chat(model_with_id("dynamic", &value))],
                                 last_modified: None,
                                 checked_at: Some(now_millis()),
                                 etag: None,
@@ -4047,8 +4135,8 @@ mod tests {
             stored
                 .as_ref()
                 .and_then(|s| s.models.first())
-                .map(|m| &m.id),
-            Some(&"generation-2".to_string())
+                .map(|m| m.id()),
+            Some("generation-2")
         );
     }
 
@@ -4314,7 +4402,7 @@ mod tests {
                 .write(
                     "p",
                     ModelsStoreEntry {
-                        models: vec![model_with_id("p", "existing")],
+                        models: vec![AnyModel::Chat(model_with_id("p", "existing"))],
                         ..Default::default()
                     },
                     None,
@@ -4353,7 +4441,7 @@ mod tests {
                 .write(
                     "p",
                     ModelsStoreEntry {
-                        models: vec![model_with_id("p", "to-delete")],
+                        models: vec![AnyModel::Chat(model_with_id("p", "to-delete"))],
                         ..Default::default()
                     },
                     None,
@@ -4389,7 +4477,7 @@ mod tests {
             };
 
             let entry = ModelsStoreEntry {
-                models: vec![model_with_id("p", "written")],
+                models: vec![AnyModel::Chat(model_with_id("p", "written"))],
                 ..Default::default()
             };
             let applied = handle
@@ -4402,7 +4490,7 @@ mod tests {
 
             assert!(applied);
             let read = store.read("p", None).await.expect("read").expect("entry");
-            assert_eq!(read.models[0].id, "written");
+            assert_eq!(read.models[0].id(), "written");
         }
 
         // Gate 1: supersede generation before publish → returns false, update
@@ -4486,7 +4574,7 @@ mod tests {
             let applied = handle
                 .publish(ModelsPublication {
                     persist: Some(Some(ModelsStoreEntry {
-                        models: vec![model_with_id("p", "gate2")],
+                        models: vec![AnyModel::Chat(model_with_id("p", "gate2"))],
                         ..Default::default()
                     })),
                     update: Some(Box::new(move || {
@@ -4503,7 +4591,7 @@ mod tests {
             );
             // Persist already happened (the write completed before the bump).
             let read = inner.read("p", None).await.expect("read").expect("entry");
-            assert_eq!(read.models[0].id, "gate2");
+            assert_eq!(read.models[0].id(), "gate2");
         }
     }
 
@@ -4589,7 +4677,7 @@ mod tests {
             handle1
                 .publish(ModelsPublication {
                     persist: Some(Some(ModelsStoreEntry {
-                        models: vec![model_with_id("p", "first")],
+                        models: vec![AnyModel::Chat(model_with_id("p", "first"))],
                         ..Default::default()
                     })),
                     update: Some(Box::new(move || {
@@ -4610,7 +4698,7 @@ mod tests {
             handle2
                 .publish(ModelsPublication {
                     persist: Some(Some(ModelsStoreEntry {
-                        models: vec![model_with_id("p", "second")],
+                        models: vec![AnyModel::Chat(model_with_id("p", "second"))],
                         ..Default::default()
                     })),
                     update: Some(Box::new(move || {
@@ -4650,7 +4738,7 @@ mod tests {
 
         // Store should have the second entry (last writer wins).
         let entry = store.read("p", None).await.expect("read").expect("entry");
-        assert_eq!(entry.models[0].id, "second");
+        assert_eq!(entry.models[0].id(), "second");
     }
 
     /// Login credential write race: when the modify is queued behind a

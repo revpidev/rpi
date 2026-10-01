@@ -30,8 +30,8 @@ use rpi_ai::auth::{
 use rpi_ai::models::{Provider, ProviderStreams, RefreshModelsContext, now_millis};
 use rpi_ai::models_store::ModelsStoreEntry;
 use rpi_ai::types::{
-    ApiKind, InputModality, MaxTokensField, Model, ModelCompat, ProviderEnv, SimpleStreamOptions,
-    StreamOptions, TranscriptContext,
+    AnyModel, ApiKind, InputModality, MaxTokensField, Model, ModelCompat, ProviderEnv,
+    SimpleStreamOptions, StreamOptions, TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use tokio_util::sync::CancellationToken;
@@ -280,6 +280,7 @@ impl Provider for LlamaProvider {
                 *lock(&this.models) = stored
                     .models
                     .iter()
+                    .filter_map(AnyModel::as_chat)
                     .filter(|model| {
                         model.provider == LLAMA_PROVIDER_ID
                             && model.api.as_str() == ApiKind::OPENAI_COMPLETIONS
@@ -320,7 +321,7 @@ impl Provider for LlamaProvider {
                     .publish
                     .publish(rpi_ai::models::ModelsPublication {
                         persist: Some(Some(ModelsStoreEntry {
-                            models,
+                            models: models.into_iter().map(AnyModel::Chat).collect(),
                             last_modified: None,
                             checked_at: Some(now_millis()),
                             etag: None,
@@ -782,7 +783,7 @@ mod tests {
             .write(
                 LLAMA_PROVIDER_ID,
                 ModelsStoreEntry {
-                    models: vec![pi_model.clone()],
+                    models: vec![AnyModel::Chat(pi_model.clone())],
                     last_modified: None,
                     checked_at: None,
                     etag: None,

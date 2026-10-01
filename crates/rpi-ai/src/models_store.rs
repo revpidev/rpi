@@ -10,13 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use super::error::AiError;
 use crate::auth::types::AuthOperationOptions;
-use crate::types::Model;
+use crate::types::AnyModel;
 
 /// `ModelsStoreEntry`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsStoreEntry {
-    pub models: Vec<Model>,
+    /// Schema v6: the stored overlay carries every model type; chat entries
+    /// deserialize as [`AnyModel::Chat`] (legacy chat-only files load
+    /// unchanged).
+    pub models: Vec<AnyModel>,
     /// Unix timestamp from the remote catalog's Last-Modified header.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<i64>,

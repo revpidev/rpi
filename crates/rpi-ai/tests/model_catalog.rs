@@ -53,7 +53,7 @@ fn test_vendored_files_match_manifest_sha256() {
     )
     .expect("manifest json");
     let files = manifest["files"].as_object().expect("files");
-    assert_eq!(files.len(), 41);
+    assert_eq!(files.len(), 42);
     for (name, hash) in files {
         let bytes = std::fs::read(data_dir().join(name)).expect("vendored file");
         assert_eq!(
@@ -131,19 +131,28 @@ fn test_catalog_field_by_field_roundtrip() {
         let groups = json.as_object().expect("groups");
 
         // Upstream flattenModelCatalog order: groups in file order, models in
-        // group order (both key-sorted by the generator).
+        // group order (both key-sorted by the generator, schema v6
+        // `type:id` composite keys).
         let expected: Vec<(&str, &serde_json::Value)> = groups
             .values()
             .flat_map(|group| {
                 group
                     .as_object()
                     .expect("model group")
-                    .iter()
-                    .map(|(id, model)| (id.as_str(), model))
+                    .values()
+                    .map(|model| {
+                        (
+                            model
+                                .get("id")
+                                .and_then(|id| id.as_str())
+                                .expect("model id"),
+                            model,
+                        )
+                    })
             })
             .collect();
 
-        let models = catalog.models(provider);
+        let models = catalog.all_models(provider);
         assert_eq!(
             models.len(),
             expected.len(),
@@ -151,10 +160,11 @@ fn test_catalog_field_by_field_roundtrip() {
         );
         for (model, (expected_id, expected_value)) in models.iter().zip(&expected) {
             assert_eq!(
-                model.id, *expected_id,
+                model.id(),
+                *expected_id,
                 "model order diverges for {provider}"
             );
-            assert_eq!(model.provider, provider);
+            assert_eq!(model.provider(), provider);
             let mut expected_value = (*expected_value).clone();
             if provider == "radius"
                 && let serde_json::Value::Object(map) = &mut expected_value
@@ -172,6 +182,16 @@ fn test_catalog_field_by_field_roundtrip() {
                     );
                 }
             }
+            // Schema v6 emits an explicit `"type":"chat"` on every chat
+            // entry; rpi's typed chat [`Model`] has no type field (chat is
+            // the default and upstream `type?: "chat"` is optional) and
+            // drops the tag on parse. Semantically identical — normalized
+            // here; image/classifier keep their `type`.
+            if let serde_json::Value::Object(map) = &mut expected_value
+                && map.get("type") == Some(&serde_json::Value::String("chat".to_owned()))
+            {
+                map.remove("type");
+            }
             let actual = normalize_numbers(&serde_json::to_value(model).expect("serialize model"));
             assert_eq!(
                 &actual,
@@ -181,7 +201,7 @@ fn test_catalog_field_by_field_roundtrip() {
             total += 1;
         }
     }
-    assert_eq!(total, 1502);
+    assert_eq!(total, 1601);
 }
 
 /// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
@@ -228,10 +248,10 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-09-23T13:54:06.091Z); update on catalog refresh.
+    // (2026-10-01T06:35:52.320Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_790_171_646_091)
+        Some(1_790_836_552_320)
     );
 }
 
@@ -340,13 +360,13 @@ fn test_baseten_env_key_resolution() {
 #[test]
 fn test_baseten_deprecated_models_filtered() {
     let models = get_builtin_models("baseten");
-    // 21 models = upstream catalog after deprecated filtering (rc.13 regen;
-    // models.dev added DeepSeek-V4.1-Flash since the previous vendored
+    // 22 models = upstream catalog after deprecated filtering (2026-10-01
+    // v6 regen; models.dev added one model since the previous vendored
     // snapshot).
     assert_eq!(
         models.len(),
-        21,
-        "Baseten should have 21 non-deprecated models"
+        22,
+        "Baseten should have 22 non-deprecated models"
     );
     // No model name or id contains "deprecated".
     for model in models.iter() {
@@ -519,11 +539,12 @@ fn test_correction_fireworks_kimi_k3_compat() {
     assert_eq!(compat.send_session_affinity_headers, Some(true));
 }
 
-/// 4. Fireworks GLM 5.2: session affinity + no long cache retention
-///    (b9497c8c1, #7676).
+/// 4. Fireworks GLM 5.3: session affinity + no long cache retention
+///    (b9497c8c1, #7676; id renamed glm-5p2 → glm-5p3 in the 2026-10-01
+///    snapshot).
 #[test]
-fn test_correction_fireworks_glm52_session_affinity() {
-    let model = get_model("fireworks", "accounts/fireworks/models/glm-5p2");
+fn test_correction_fireworks_glm53_session_affinity() {
+    let model = get_model("fireworks", "accounts/fireworks/models/glm-5p3");
     assert_eq!(model.api.as_str(), "openai-completions");
     let compat = model.compat.as_ref().expect("compat");
     assert_eq!(compat.send_session_affinity_headers, Some(true));

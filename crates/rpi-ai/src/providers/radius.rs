@@ -40,7 +40,9 @@ use crate::models::{
     RefreshModelsContext, create_provider, now_millis,
 };
 use crate::models_store::ModelsStoreEntry;
-use crate::types::{Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext};
+use crate::types::{
+    AnyModel, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
+};
 use crate::utils::event_stream::AssistantMessageEventStream;
 
 use super::radius_config::{
@@ -205,6 +207,7 @@ impl Provider for RadiusProvider {
                         stored
                             .models
                             .iter()
+                            .filter_map(AnyModel::as_chat)
                             .filter(|model| model.provider == id)
                             .cloned()
                             .collect::<Vec<_>>()
@@ -246,7 +249,11 @@ impl Provider for RadiusProvider {
                                 .publish
                                 .publish(ModelsPublication {
                                     persist: Some(Some(ModelsStoreEntry {
-                                        models: legacy,
+                                        models: legacy
+                                            .iter()
+                                            .cloned()
+                                            .map(AnyModel::Chat)
+                                            .collect(),
                                         last_modified: None,
                                         checked_at: Some(now_millis()),
                                         etag: None,
@@ -291,7 +298,7 @@ impl Provider for RadiusProvider {
                         .publish
                         .publish(ModelsPublication {
                             persist: Some(Some(ModelsStoreEntry {
-                                models: refreshed,
+                                models: refreshed.iter().cloned().map(AnyModel::Chat).collect(),
                                 last_modified: None,
                                 checked_at: Some(now_millis()),
                                 etag: None,
@@ -517,7 +524,7 @@ mod tests {
             .write(
                 "radius",
                 crate::models_store::ModelsStoreEntry {
-                    models: vec![radius_model("stored")],
+                    models: vec![AnyModel::Chat(radius_model("stored"))],
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
@@ -563,7 +570,7 @@ mod tests {
             .write(
                 "radius",
                 crate::models_store::ModelsStoreEntry {
-                    models: stored_models,
+                    models: stored_models.into_iter().map(AnyModel::Chat).collect(),
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
@@ -581,9 +588,9 @@ mod tests {
             .await
             .expect("refresh");
         let models = provider.get_models();
-        // Baseline (30, catalog snapshot 2026-09-23) + organization-only;
+        // Baseline (28, catalog snapshot 2026-10-01) + organization-only;
         // `balanced` is replaced, not duplicated.
-        assert_eq!(models.len(), 30 + 1);
+        assert_eq!(models.len(), 28 + 1);
         assert_eq!(
             models.iter().filter(|model| model.id == "balanced").count(),
             1
@@ -637,7 +644,10 @@ mod tests {
             .expect("entry");
         assert_eq!(stored.models.len(), 1);
         assert!(stored.checked_at.is_some());
-        assert_eq!(stored.models[0].base_url, "https://radius.pi.dev/api");
+        assert_eq!(
+            stored.models[0].as_chat().expect("chat model").base_url,
+            "https://radius.pi.dev/api"
+        );
     }
 
     #[tokio::test]
@@ -683,7 +693,7 @@ mod tests {
             .write(
                 "radius",
                 crate::models_store::ModelsStoreEntry {
-                    models: vec![radius_model("radius-large")],
+                    models: vec![AnyModel::Chat(radius_model("radius-large"))],
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
@@ -722,7 +732,7 @@ mod tests {
             .write(
                 "radius",
                 crate::models_store::ModelsStoreEntry {
-                    models: vec![radius_model("stored")],
+                    models: vec![AnyModel::Chat(radius_model("stored"))],
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,

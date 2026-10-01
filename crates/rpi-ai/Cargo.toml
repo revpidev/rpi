@@ -7,7 +7,11 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
+# Schema v6 catalog order: the upstream generator writes entries in
+# insertion order (not key-sorted); preserve_order keeps that order when
+# the vendored JSON is parsed (feature unification already enables it via
+# wasmtime, declared here so `cargo test -p rpi-ai` alone is deterministic).
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
