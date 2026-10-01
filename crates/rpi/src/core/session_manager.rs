@@ -48,15 +48,18 @@ use std::path::{Path, PathBuf};
 
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::session::{
-    BranchSummaryEntry, CURRENT_SESSION_VERSION, CompactionEntry, CustomEntry, CustomMessageEntry,
-    FileEntry, LabelEntry, MessageEntry, ModelChangeEntry, SessionEntry, SessionHeader,
-    SessionInfoEntry, ThinkingLevelChangeEntry,
+    BranchSummaryEntry, CURRENT_SESSION_VERSION, CompactionEntry, ContextEditEntry,
+    ContextEditReplacement, ContextEditableContent, CustomEntry, CustomMessageEntry, FileEntry,
+    LabelEntry, MessageEntry, ModelChangeEntry, SessionEntry, SessionHeader, SessionInfoEntry,
+    ThinkingLevelChangeEntry,
 };
 // Entry → context-message conversion and the ISO 8601 parse live in
 // `rpi_agent::session` (T08): one implementation shared with the compaction
 // module (stale-usage timestamp guards, agent-session.ts:1974/2030).
 pub use rpi_agent::session::{parse_iso8601_ms, session_entry_to_context_messages};
-use rpi_ai::types::Usage;
+use rpi_ai::types::{
+    AssistantContent, TextContent, ToolResultContent, Usage, UserContent,
+};
 use rpi_ai::utils::uuid::{random_uuid, uuidv7_now};
 use serde_json::Value;
 
@@ -929,21 +932,170 @@ pub fn build_context_entries(entries: &[StoredEntry], leaf_id: Option<&str>) -> 
     context_entries
 }
 
-/// `buildSessionContext` (session-manager.ts:461-470).
-pub fn build_session_context(entries: &[StoredEntry], leaf_id: Option<&str>) -> SessionContext {
+/// `ProjectedSessionEntry` (session-manager.ts:194-199): the raw append-only
+/// entry that owns this projected contribution plus the model-visible
+/// messages after context edits (empty for state-only entries and
+/// omissions).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedSessionEntry {
+    pub source_entry: StoredEntry,
+    pub messages: Vec<AgentMessage>,
+}
+
+/// `SessionProjection` (session-manager.ts:201-207): provenance-preserving,
+/// compaction-aware model context.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionProjection {
+    pub entries: Vec<ProjectedSessionEntry>,
+    pub messages: Vec<AgentMessage>,
+    pub thinking_level: String,
+    pub model: Option<SessionModel>,
+}
+
+/// Interprets raw replacement blocks against the target message role, falling
+/// back to an empty list for malformed hand-edited entries (projection is
+/// infallible upstream; a JS array cannot fail this way).
+fn parse_context_blocks<T: serde::de::DeserializeOwned>(blocks: &[Value]) -> Vec<T> {
+    serde_json::from_value::<Vec<T>>(Value::Array(blocks.to_vec())).unwrap_or_default()
+}
+
+/// `projectContextEntry` (session-manager.ts:519-541): applies the latest
+/// context edit to one source entry's contribution. `None` replacement omits
+/// the target from model context; a value replaces only its content.
+fn project_context_entry(
+    entry: &StoredEntry,
+    edit: Option<&ContextEditEntry>,
+) -> Vec<AgentMessage> {
+    let Some(typed) = entry.known() else {
+        return Vec::new();
+    };
+    let messages = session_entry_to_context_messages(typed);
+    let Some(edit) = edit else {
+        return messages;
+    };
+    let Some(replacement) = &edit.replacement else {
+        return Vec::new();
+    };
+    messages
+        .into_iter()
+        .map(|message| project_context_message(message, &replacement.content))
+        .collect()
+}
+
+/// Content application for one context message. Only user/assistant/
+/// tool-result/custom messages are editable upstream; the rest pass through.
+fn project_context_message(
+    message: AgentMessage,
+    content: &ContextEditableContent,
+) -> AgentMessage {
+    match message {
+        AgentMessage::User(mut user) => {
+            user.content = context_editable_user_content(content);
+            AgentMessage::User(user)
+        }
+        AgentMessage::Assistant(mut assistant) => {
+            assistant.content = match content {
+                ContextEditableContent::Text(text) => vec![AssistantContent::Text(TextContent {
+                    text: text.clone(),
+                    text_signature: None,
+                })],
+                ContextEditableContent::Blocks(blocks) => parse_context_blocks(blocks),
+            };
+            AgentMessage::Assistant(assistant)
+        }
+        AgentMessage::ToolResult(mut result) => {
+            result.content = match content {
+                ContextEditableContent::Text(text) => vec![ToolResultContent::Text(TextContent {
+                    text: text.clone(),
+                    text_signature: None,
+                })],
+                ContextEditableContent::Blocks(blocks) => parse_context_blocks(blocks),
+            };
+            AgentMessage::ToolResult(result)
+        }
+        AgentMessage::Custom(mut custom) => {
+            custom.content = context_editable_user_content(content);
+            AgentMessage::Custom(custom)
+        }
+        other => other,
+    }
+}
+
+/// String replacements keep their `string` shape for user/custom targets
+/// (upstream returns `replacement.content` unchanged).
+fn context_editable_user_content(content: &ContextEditableContent) -> UserContent {
+    match content {
+        ContextEditableContent::Text(text) => UserContent::Text(text.clone()),
+        ContextEditableContent::Blocks(blocks) => {
+            UserContent::Blocks(parse_context_blocks(blocks))
+        }
+    }
+}
+
+/// `buildSessionProjection` (session-manager.ts:543-576).
+///
+/// Edits are collected from the compaction-aware context entries so that a
+/// later path edit to a summarized entry is ignored (the entry is not part of
+/// the context), exactly like upstream. Latest edit wins per target.
+pub fn build_session_projection(
+    entries: &[StoredEntry],
+    leaf_id: Option<&str>,
+) -> SessionProjection {
     let path = build_session_path(entries, leaf_id, true);
     let (thinking_level, model) = get_session_context_settings(&path);
-    let messages = build_context_entries(entries, leaf_id)
-        .iter()
-        .flat_map(|e| match e.known() {
-            Some(typed) => session_entry_to_context_messages(typed),
-            None => Vec::new(),
+    let context_entries = build_context_entries(entries, leaf_id);
+    let mut edits: HashMap<String, ContextEditEntry> = HashMap::new();
+    for entry in &context_entries {
+        if let Some(SessionEntry::ContextEdit(edit)) = entry.known() {
+            edits.insert(edit.target_id.clone(), edit.clone());
+        }
+    }
+    let projected: Vec<ProjectedSessionEntry> = context_entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, source_entry)| {
+            // buildContextEntries() may retain an older compaction entry
+            // because its raw ID lies inside the newest retained range. Only
+            // the newest compaction at index 0 contributes a checkpoint and
+            // summary (session-manager.ts:557-565).
+            let shadowed_compaction = index > 0
+                && matches!(source_entry.known(), Some(SessionEntry::Compaction(_)));
+            let messages = if shadowed_compaction {
+                Vec::new()
+            } else {
+                project_context_entry(
+                    &source_entry,
+                    source_entry
+                        .known()
+                        .map(SessionEntry::id)
+                        .and_then(|id| edits.get(id)),
+                )
+            };
+            ProjectedSessionEntry {
+                source_entry,
+                messages,
+            }
         })
         .collect();
-    SessionContext {
+    let messages = projected
+        .iter()
+        .flat_map(|entry| entry.messages.iter().cloned())
+        .collect();
+    SessionProjection {
+        entries: projected,
         messages,
         thinking_level,
         model,
+    }
+}
+
+/// `buildSessionContext` (session-manager.ts:461-470).
+pub fn build_session_context(entries: &[StoredEntry], leaf_id: Option<&str>) -> SessionContext {
+    let projection = build_session_projection(entries, leaf_id);
+    SessionContext {
+        messages: projection.messages,
+        thinking_level: projection.thinking_level,
+        model: projection.model,
     }
 }
 
@@ -1411,14 +1563,17 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
-    /// `appendCompaction` (session-manager.ts:1112-1142 @ #9548). The main
-    /// path writes only the `firstKeptEntryId` form (ADR-0003 §1) and
-    /// snapshots the current prompt/tool state (`systemMessage`) at the
-    /// compaction boundary.
+    /// `appendCompaction` (session-manager.ts:1240-1270 @ 005af57d8). The main
+    /// path writes the `firstKeptEntryId` form (ADR-0003 §1) and snapshots the
+    /// current prompt/tool state (`systemMessage`) at the compaction boundary.
+    ///
+    /// `first_kept_entry_id = None` is the retain-none form:
+    /// `firstKeptEntryId: null` stores the compaction's own id as the retained
+    /// boundary (R3.1.3, session-manager.ts:1253).
     pub fn append_compaction(
         &mut self,
         summary: &str,
-        first_kept_entry_id: &str,
+        first_kept_entry_id: Option<&str>,
         tokens_before: u64,
         details: Option<Value>,
         from_hook: Option<bool>,
@@ -1442,12 +1597,16 @@ impl SessionManager {
                 .collect();
             rpi_ai::utils::transcript::get_current_system_message(&llm_messages)
         };
+        let id = self.next_entry_id();
+        let first_kept = first_kept_entry_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| id.clone());
         let entry = FileEntry::Compaction(CompactionEntry {
-            id: self.next_entry_id(),
+            id,
             parent_id: self.leaf_id.clone(),
             timestamp: timestamp.clone(),
             summary: summary.to_owned(),
-            first_kept_entry_id: Some(first_kept_entry_id.to_owned()),
+            first_kept_entry_id: Some(first_kept),
             tokens_before,
             retained_tail: None,
             details,
@@ -1567,6 +1726,65 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
+    /// `appendContextEdit` (session-manager.ts:1360-1406): append a
+    /// branch-local edit to an earlier model-visible entry. The target must be
+    /// on the active branch and contribute editable content; a string
+    /// replacement for an assistant/tool-result target is normalized to a
+    /// single text block (R3.1.5).
+    pub fn append_context_edit(
+        &mut self,
+        target_id: &str,
+        replacement: Option<ContextEditReplacement>,
+    ) -> Result<String, RpiError> {
+        let Some(&target_index) = self.by_id.get(target_id) else {
+            return Err(RpiError::Session(format!("Entry {target_id} not found")));
+        };
+        if !self
+            .get_branch(None)
+            .iter()
+            .any(|entry| entry.id() == target_id)
+        {
+            return Err(RpiError::Session(format!(
+                "Entry {target_id} is not on the active branch"
+            )));
+        }
+        let target = StoredEntry::from_record(&self.records[target_index]);
+        let target_role = match target.as_ref().and_then(StoredEntry::known) {
+            Some(SessionEntry::Message(message)) => match &message.message {
+                AgentMessage::User(_) => Some("user"),
+                AgentMessage::Assistant(_) => Some("assistant"),
+                AgentMessage::ToolResult(_) => Some("toolResult"),
+                _ => None,
+            },
+            Some(SessionEntry::CustomMessage(_)) => Some("custom"),
+            _ => None,
+        };
+        let Some(target_role) = target_role else {
+            return Err(RpiError::Session(format!(
+                "Entry {target_id} does not contribute editable model content"
+            )));
+        };
+        let normalized = replacement.map(|replacement| match (target_role, replacement.content) {
+            ("assistant" | "toolResult", ContextEditableContent::Text(text)) => {
+                ContextEditReplacement {
+                    content: ContextEditableContent::Blocks(vec![serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                    })]),
+                }
+            }
+            (_, content) => ContextEditReplacement { content },
+        });
+        let entry = FileEntry::ContextEdit(ContextEditEntry {
+            id: self.next_entry_id(),
+            parent_id: self.leaf_id.clone(),
+            timestamp: now_iso8601(),
+            target_id: target_id.to_owned(),
+            replacement: normalized,
+        });
+        self.append_entry(entry)
+    }
+
     // -----------------------------------------------------------------------
     // Tree traversal (session-manager.ts:1191-1348)
     // -----------------------------------------------------------------------
@@ -1675,26 +1893,25 @@ impl SessionManager {
         }
     }
 
-    /// `buildSessionContext` — what gets sent to the LLM.
+    /// `buildSessionContext` — what gets sent to the LLM. The projection is
+    /// the single authority for provider context (canonical session context,
+    /// R3.1.2): direct `Agent::set_messages` assignments are superseded here.
     pub fn build_session_context(&self) -> SessionContext {
-        let entries = self.get_entries();
-        let path = match &self.leaf_id {
-            None => Vec::new(),
-            Some(id) => build_session_path(&entries, Some(id), true),
-        };
-        let (thinking_level, model) = get_session_context_settings(&path);
-        let messages = self
-            .build_context_entries()
-            .iter()
-            .flat_map(|e| match e.known() {
-                Some(typed) => session_entry_to_context_messages(typed),
-                None => Vec::new(),
-            })
-            .collect();
+        let projection = self.build_session_projection();
         SessionContext {
-            messages,
-            thinking_level,
-            model,
+            messages: projection.messages,
+            thinking_level: projection.thinking_level,
+            model: projection.model,
+        }
+    }
+
+    /// `buildSessionProjection` (session-manager.ts:1493-1495): provenance-
+    /// preserving, compaction-aware model context with context edits applied.
+    pub fn build_session_projection(&self) -> SessionProjection {
+        let entries = self.get_entries();
+        match &self.leaf_id {
+            None => build_session_projection(&entries, None),
+            Some(id) => build_session_projection(&entries, Some(id)),
         }
     }
 

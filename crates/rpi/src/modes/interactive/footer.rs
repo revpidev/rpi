@@ -889,7 +889,7 @@ mod tests {
                 .append_message(assistant_message(usage(1500, 0, 0, 0, 0.0)))
                 .expect("append");
             manager
-                .append_compaction("summary", "kept", 1234, None, None, None)
+                .append_compaction("summary", Some("kept"), 1234, None, None, None)
                 .expect("append compaction");
         }
         let footer = FooterComponent::new(

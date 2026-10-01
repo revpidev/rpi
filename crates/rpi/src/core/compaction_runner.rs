@@ -527,7 +527,7 @@ impl CompactionRunner {
     ) -> Result<CompactionResult, RpiError> {
         self.session_mut().append_compaction(
             &result.summary,
-            &result.first_kept_entry_id,
+            Some(&result.first_kept_entry_id),
             result.tokens_before,
             result.details.clone(),
             Some(from_extension),

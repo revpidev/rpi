@@ -259,7 +259,7 @@ async fn check_compaction_stale_message_before_compaction_boundary_is_ignored() 
     fixture
         .runner
         .session_mut()
-        .append_compaction("summary", "nonexistent-kept-id", 10, None, None, None)
+        .append_compaction("summary", Some("nonexistent-kept-id"), 10, None, None, None)
         .expect("append compaction");
     // Timestamp 1 is necessarily older than the just-written compaction entry.
     let stale = assistant("old", StopReason::Stop, 99999, 1);
@@ -451,7 +451,7 @@ async fn check_compaction_threshold_stale_usage_anchor_is_ignored() {
     fixture
         .runner
         .session_mut()
-        .append_compaction("summary", "nonexistent-kept-id", 10, None, None, None)
+        .append_compaction("summary", Some("nonexistent-kept-id"), 10, None, None, None)
         .expect("append compaction");
     let mut error = assistant("", StopReason::Error, 0, now_ms());
     error.error_message = Some("boom".to_owned());

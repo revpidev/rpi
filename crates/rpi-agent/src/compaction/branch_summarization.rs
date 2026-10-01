@@ -209,12 +209,14 @@ fn get_message_from_entry(entry: &SessionEntry) -> Option<AgentMessage> {
         SessionEntry::Compaction(c) => Some(AgentMessage::CompactionSummary(
             create_compaction_summary_message(&c.summary, c.tokens_before, &c.timestamp),
         )),
-        // These don't contribute to conversation content.
+        // `context_edit` is applied when the projection runs, not when
+        // entries are converted for summarization.
         SessionEntry::ThinkingLevelChange(_)
         | SessionEntry::ModelChange(_)
         | SessionEntry::ActiveToolsChange(_)
         | SessionEntry::Usage(_)
         | SessionEntry::Custom(_)
+        | SessionEntry::ContextEdit(_)
         | SessionEntry::Label(_)
         | SessionEntry::SessionInfo(_)
         | SessionEntry::Leaf(_) => None,

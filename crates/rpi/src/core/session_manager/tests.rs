@@ -10,10 +10,12 @@
 //! tests.
 
 use rpi_agent::messages::AgentMessage;
-use rpi_agent::session::{CompactionEntry, SessionEntry};
+use rpi_agent::session::{
+    CompactionEntry, ContextEditEntry, ContextEditReplacement, ContextEditableContent, SessionEntry,
+};
 use rpi_ai::types::{
-    AssistantContent, AssistantMessage, AssistantRole, StopReason, TextContent, Usage, UserContent,
-    UserContentBlock, UserMessage, UserRole,
+    AssistantContent, AssistantMessage, AssistantRole, StopReason, TextContent, ToolResultContent,
+    ToolResultMessage, ToolResultRole, Usage, UserContent, UserContentBlock, UserMessage, UserRole,
 };
 use serde_json::{Value, json};
 
@@ -166,7 +168,11 @@ fn msg_text(message: &AgentMessage) -> String {
             AssistantContent::Text(t) => t.text.clone(),
             _ => panic!("expected text block"),
         },
-        _ => panic!("expected user/assistant message"),
+        AgentMessage::ToolResult(r) => match &r.content[0] {
+            ToolResultContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text block"),
+        },
+        _ => panic!("expected user/assistant/toolResult message"),
     }
 }
 
@@ -558,6 +564,380 @@ fn retained_tail_compaction_form_is_self_contained_checkpoint() {
     assert_eq!(msg_text(&ctx.messages[1]), "latest request");
     assert_eq!(msg_text(&ctx.messages[2]), "latest reply");
     assert_eq!(msg_text(&ctx.messages[3]), "after compaction");
+}
+
+// ===========================================================================
+// session-context-edit.test.ts (V16-03 FR-A R1-R4)
+// ===========================================================================
+
+fn tool_result_msg(text: &str) -> AgentMessage {
+    AgentMessage::ToolResult(ToolResultMessage {
+        role: ToolResultRole::ToolResult,
+        tool_call_id: "call-1".to_owned(),
+        tool_name: "read".to_owned(),
+        content: vec![ToolResultContent::Text(TextContent {
+            text: text.to_owned(),
+            text_signature: None,
+        })],
+        details: None,
+        usage: None,
+        is_error: false,
+        timestamp: 1,
+    })
+}
+
+fn in_memory_session() -> SessionManager {
+    SessionManager::in_memory(None, NewSessionOptions::default()).expect("in-memory session")
+}
+
+fn context_edit(
+    id: &str,
+    parent_id: Option<&str>,
+    target_id: &str,
+    replacement: Option<ContextEditReplacement>,
+) -> StoredEntry {
+    known(SessionEntry::ContextEdit(ContextEditEntry {
+        id: id.to_owned(),
+        parent_id: parent_id.map(str::to_owned),
+        timestamp: TS.to_owned(),
+        target_id: target_id.to_owned(),
+        replacement,
+    }))
+}
+
+fn text_replacement(text: &str) -> ContextEditReplacement {
+    ContextEditReplacement {
+        content: ContextEditableContent::Text(text.to_owned()),
+    }
+}
+
+/// upstream: omits a target only from model projection.
+#[test]
+fn context_edit_omits_target_only_from_model_projection() {
+    let mut session = in_memory_session();
+    session.append_message(user_msg("request")).expect("append");
+    let assistant_id = session.append_message(assistant_msg("partial")).expect("append");
+    let result_id = session
+        .append_message(tool_result_msg("raw output"))
+        .expect("append");
+    session
+        .append_context_edit(&assistant_id, None)
+        .expect("edit");
+    session.append_context_edit(&result_id, None).expect("edit");
+
+    let branch_messages = session
+        .get_branch(None)
+        .iter()
+        .filter(|entry| entry.type_tag() == "message")
+        .count();
+    assert_eq!(branch_messages, 3);
+    let roles: Vec<&str> = session
+        .build_session_projection()
+        .messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::User(_) => "user",
+            AgentMessage::Assistant(_) => "assistant",
+            AgentMessage::ToolResult(_) => "toolResult",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(roles, ["user"]);
+    // Raw history is unchanged: the tool result entry still carries its content.
+    let raw = session.get_entry(&result_id).expect("entry");
+    match raw.known() {
+        Some(SessionEntry::Message(m)) => match &m.message {
+            AgentMessage::ToolResult(r) => assert_eq!(msg_text(&AgentMessage::ToolResult(r.clone())), "raw output"),
+            other => panic!("expected toolResult, got {other:?}"),
+        },
+        other => panic!("expected message entry, got {other:?}"),
+    }
+}
+
+/// upstream: replaces only content and lets the latest edit win.
+#[test]
+fn context_edit_replaces_only_content_and_latest_edit_wins() {
+    let mut session = in_memory_session();
+    let target_id = session.append_message(assistant_msg("original")).expect("append");
+    session
+        .append_context_edit(
+            &target_id,
+            Some(ContextEditReplacement {
+                content: ContextEditableContent::Blocks(vec![json!({
+                    "type": "text",
+                    "text": "first"
+                })]),
+            }),
+        )
+        .expect("edit");
+    session.append_context_edit(&target_id, None).expect("edit");
+    session
+        .append_context_edit(
+            &target_id,
+            Some(ContextEditReplacement {
+                content: ContextEditableContent::Blocks(vec![json!({
+                    "type": "text",
+                    "text": "restored"
+                })]),
+            }),
+        )
+        .expect("edit");
+
+    let projected = session.build_session_projection().messages;
+    assert_eq!(projected.len(), 1);
+    assert_eq!(msg_text(&projected[0]), "restored");
+    match &projected[0] {
+        AgentMessage::Assistant(a) => assert_eq!(a.usage.total_tokens, 2),
+        other => panic!("expected assistant, got {other:?}"),
+    }
+    // Raw transcript still holds the original content.
+    let raw = session.get_entry(&target_id).expect("entry");
+    match raw.known() {
+        Some(SessionEntry::Message(m)) => assert_eq!(msg_text(&m.message), "original"),
+        other => panic!("expected message entry, got {other:?}"),
+    }
+}
+
+/// upstream: normalizes string replacements for array-only assistant and
+/// tool-result roles (R3.1.5).
+#[test]
+fn context_edit_normalizes_string_replacements_for_array_only_roles() {
+    let mut session = in_memory_session();
+    let assistant_id = session.append_message(assistant_msg("original")).expect("append");
+    let result_id = session
+        .append_message(tool_result_msg("original result"))
+        .expect("append");
+    let assistant_edit_id = session
+        .append_context_edit(&assistant_id, Some(text_replacement("assistant replacement")))
+        .expect("edit");
+    let result_edit_id = session
+        .append_context_edit(&result_id, Some(text_replacement("result replacement")))
+        .expect("edit");
+
+    let stored = session.get_entry(&assistant_edit_id).expect("entry").raw_value().clone();
+    assert_eq!(
+        stored.get("replacement").and_then(|v| v.get("content")),
+        Some(&json!([{ "type": "text", "text": "assistant replacement" }]))
+    );
+    let stored = session.get_entry(&result_edit_id).expect("entry").raw_value().clone();
+    assert_eq!(
+        stored.get("replacement").and_then(|v| v.get("content")),
+        Some(&json!([{ "type": "text", "text": "result replacement" }]))
+    );
+
+    let projected = session.build_session_projection().messages;
+    assert_eq!(msg_text(&projected[0]), "assistant replacement");
+    assert_eq!(msg_text(&projected[1]), "result replacement");
+}
+
+/// upstream: normalizes imported string replacements while projecting
+/// array-only roles (hand-edited JSONL bypasses append normalization).
+#[test]
+fn context_edit_projection_normalizes_imported_string_replacements() {
+    let entries = vec![
+        msg("1", None, assistant_msg("original")),
+        context_edit("2", Some("1"), "1", Some(text_replacement("imported replacement"))),
+    ];
+    let messages = build_session_projection(&entries, None).messages;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(msg_text(&messages[0]), "imported replacement");
+}
+
+/// upstream: keeps edits branch-relative.
+#[test]
+fn context_edit_keeps_edits_branch_relative() {
+    let mut session = in_memory_session();
+    let target_id = session.append_message(user_msg("original")).expect("append");
+    session
+        .append_context_edit(&target_id, Some(text_replacement("edited")))
+        .expect("edit");
+    assert_eq!(msg_text(&session.build_session_projection().messages[0]), "edited");
+
+    session.branch(&target_id).expect("branch");
+    assert_eq!(msg_text(&session.build_session_projection().messages[0]), "original");
+}
+
+/// upstream: uses a self-referencing compaction to retain no preceding
+/// entries (R3.1.3 retain-none).
+#[test]
+fn retain_none_compaction_stores_own_id_as_first_kept() {
+    let mut session = in_memory_session();
+    session.append_message(user_msg("discarded")).expect("append");
+    let compaction_id = session
+        .append_compaction("exact handoff", None, 100, None, None, None)
+        .expect("compaction");
+    session.append_message(user_msg("after")).expect("append");
+
+    let entry = session.get_entry(&compaction_id).expect("entry");
+    match entry.known() {
+        Some(SessionEntry::Compaction(c)) => {
+            assert_eq!(c.first_kept_entry_id.as_deref(), Some(compaction_id.as_str()))
+        }
+        other => panic!("expected compaction, got {other:?}"),
+    }
+    let projection = session.build_session_projection();
+    let roles: Vec<&str> = projection
+        .messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::CompactionSummary(_) => "compactionSummary",
+            AgentMessage::User(_) => "user",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(roles, ["compactionSummary", "user"]);
+    let summaries: Vec<String> = projection
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::CompactionSummary(c) => Some(c.summary.clone()),
+            AgentMessage::User(u) => Some(match &u.content {
+                UserContent::Text(text) => text.clone(),
+                UserContent::Blocks(_) => String::new(),
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries, ["exact handoff", "after"]);
+}
+
+/// upstream: applies post-compaction edits to retained pre-compaction entries.
+#[test]
+fn context_edit_applies_to_retained_pre_compaction_entries() {
+    let mut session = in_memory_session();
+    session.append_message(user_msg("summarized")).expect("append");
+    let retained_id = session
+        .append_message(user_msg("original retained"))
+        .expect("append");
+    session
+        .append_compaction("summary", Some(&retained_id), 100, None, None, None)
+        .expect("compaction");
+    session
+        .append_context_edit(&retained_id, Some(text_replacement("edited retained")))
+        .expect("edit");
+
+    let projection = session.build_session_projection();
+    let rendered: Vec<String> = projection
+        .messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::CompactionSummary(c) => c.summary.clone(),
+            other => msg_text(other),
+        })
+        .collect();
+    assert_eq!(rendered, ["summary", "edited retained"]);
+}
+
+/// upstream: uses only the newest summary when a repeated compaction retains
+/// entries before the older compaction (shadowed compaction contributes no
+/// messages).
+#[test]
+fn repeated_compaction_uses_only_newest_summary() {
+    let mut session = in_memory_session();
+    session.append_message(user_msg("summarized first")).expect("append");
+    let retained_id = session.append_message(user_msg("retained")).expect("append");
+    session
+        .append_compaction("first summary", Some(&retained_id), 100, None, None, None)
+        .expect("compaction");
+    session.append_message(assistant_msg("after first compaction")).expect("append");
+    session
+        .append_compaction("second summary", Some(&retained_id), 80, None, None, None)
+        .expect("compaction");
+    session
+        .append_message(user_msg(&"new tail ".repeat(100)))
+        .expect("append");
+
+    let summaries: Vec<String> = session
+        .build_session_projection()
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::CompactionSummary(c) => Some(c.summary.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries, ["second summary"]);
+}
+
+/// upstream: supports repeated retain-none compactions.
+#[test]
+fn repeated_retain_none_compactions() {
+    let mut session = in_memory_session();
+    session.append_message(user_msg("discarded")).expect("append");
+    session
+        .append_compaction("first handoff", None, 100, None, None, None)
+        .expect("compaction");
+    session.append_message(user_msg("also discarded")).expect("append");
+    let second_id = session
+        .append_compaction("second handoff", None, 50, None, None, None)
+        .expect("compaction");
+
+    let entry = session.get_entry(&second_id).expect("entry");
+    match entry.known() {
+        Some(SessionEntry::Compaction(c)) => {
+            assert_eq!(c.first_kept_entry_id.as_deref(), Some(second_id.as_str()))
+        }
+        other => panic!("expected compaction, got {other:?}"),
+    }
+    let summaries: Vec<String> = session
+        .build_session_projection()
+        .messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::CompactionSummary(c) => c.summary.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(summaries, ["second handoff"]);
+}
+
+/// V16-03 red line: JSONL without `context_edit` entries replays unchanged;
+/// a file carrying the new entry replays with projection applied; the entry
+/// round-trips with the upstream wire shape (`type: "context_edit"`,
+/// camelCase `targetId`, `replacement: null`).
+#[test]
+fn context_edit_jsonl_additive_and_old_sessions_unchanged() {
+    let tmp = TempDir::new();
+    let file = tmp.path().join("old.jsonl");
+    let content = format!(
+        "{}\n{}\n{}\n",
+        header_line("sess-1", "/tmp"),
+        user_line("1", "", "hello"),
+        user_line("2", "1", "world"),
+    );
+    std::fs::write(&file, content).expect("write old file");
+    let sm = SessionManager::open(&file, Some(tmp.path()), None).expect("open");
+    let ctx = sm.build_session_context();
+    assert_eq!(ctx.messages.len(), 2);
+    assert_eq!(msg_text(&ctx.messages[0]), "hello");
+
+    let edited_file = tmp.path().join("edited.jsonl");
+    let content = format!(
+        "{}\n{}\n{}\n{}\n",
+        header_line("sess-2", "/tmp"),
+        user_line("1", "", "hello"),
+        user_line("2", "1", "world"),
+        "{\"type\":\"context_edit\",\"id\":\"3\",\"parentId\":\"2\",\"timestamp\":\"2025-01-01T00:00:03.000Z\",\"targetId\":\"1\",\"replacement\":null}",
+    );
+    std::fs::write(&edited_file, content).expect("write edited file");
+    let sm = SessionManager::open(&edited_file, Some(tmp.path()), None).expect("open");
+    let ctx = sm.build_session_context();
+    assert_eq!(ctx.messages.len(), 1);
+    assert_eq!(msg_text(&ctx.messages[0]), "world");
+
+    let edit = SessionEntry::ContextEdit(ContextEditEntry {
+        id: "3".to_owned(),
+        parent_id: Some("2".to_owned()),
+        timestamp: TS.to_owned(),
+        target_id: "1".to_owned(),
+        replacement: None,
+    });
+    let line = serde_json::to_value(&edit).expect("serialize");
+    assert_eq!(line["type"], "context_edit");
+    assert_eq!(line["targetId"], "1");
+    assert!(line["replacement"].is_null());
+    let parsed: SessionEntry = serde_json::from_value(line).expect("deserialize");
+    assert_eq!(parsed, edit);
 }
 
 // ===========================================================================
@@ -1365,7 +1745,7 @@ fn append_compaction_integrates_into_tree() {
     let compaction_id = session
         .append_compaction(
             "summary",
-            &id1,
+            Some(&id1),
             1000,
             None,
             Some(false),
@@ -1993,7 +2373,7 @@ fn preserves_tool_and_summary_usage_across_a_file_backed_reload() {
     session
         .append_compaction(
             "summary",
-            &root_id,
+            Some(&root_id),
             100,
             None,
             Some(false),
@@ -3303,7 +3683,7 @@ fn fork_remaps_compaction_boundary_pointing_at_removed_label() {
     let label_id = session.get_leaf_id().expect("label leaf").to_owned();
     let kept_id = session.append_message(user_msg("kept")).expect("append");
     let compaction_id = session
-        .append_compaction("summary", &label_id, 100, None, None, None)
+        .append_compaction("summary", Some(&label_id), 100, None, None, None)
         .expect("compaction (boundary = label)");
     let leaf_id = session.append_message(user_msg("after")).expect("append");
 
@@ -3346,7 +3726,7 @@ fn fork_keeps_compaction_boundary_when_not_labelled() {
     let id1 = session.append_message(user_msg("1")).expect("append");
     let id2 = session.append_message(assistant_msg("2")).expect("append");
     session
-        .append_compaction("summary", &id1, 1000, None, None, None)
+        .append_compaction("summary", Some(&id1), 1000, None, None, None)
         .expect("compaction");
     session.append_message(user_msg("3")).expect("append");
 

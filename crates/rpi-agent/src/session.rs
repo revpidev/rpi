@@ -221,6 +221,47 @@ pub struct SessionInfoEntry {
     pub name: Option<String>,
 }
 
+/// Content that an append-only context edit may replace without changing
+/// message metadata (session-manager.ts:161-166).
+///
+/// Upstream types this as the union of user/assistant/tool-result/custom
+/// message content; Rust needs one wire shape. `Text` keeps string
+/// replacements verbatim (assistant/tool-result targets normalize a string to
+/// a single text block during projection); `Blocks` carries the raw block
+/// array and is interpreted against the target message's role when the
+/// projection runs (`projectContextEntry`, session-manager.ts:519-541).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContextEditableContent {
+    /// `content: "string"`.
+    Text(String),
+    /// `content: [...]` — text/image/thinking/toolCall blocks.
+    Blocks(Vec<Value>),
+}
+
+/// `replacement` of a [`ContextEditEntry`]: `null` omits the target from
+/// model context; a value replaces only the target's content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextEditReplacement {
+    pub content: ContextEditableContent,
+}
+
+/// `ContextEditEntry` (session-manager.ts:171-181): append-only change to one
+/// earlier entry's contribution to model context. The raw transcript is
+/// untouched; projection applies the latest edit per target (latest wins).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextEditEntry {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp: String,
+    pub target_id: String,
+    /// `null` (JSON) omits the target from model context. Upstream always
+    /// serializes the key (including `null`), so there is no
+    /// `skip_serializing_if` here.
+    pub replacement: Option<ContextEditReplacement>,
+}
+
 /// Harness-only `LeafEntry` — leaf moves are recorded by appending a `leaf`
 /// record (parentId points at the old leaf, targetId at the new leaf) rather
 /// than mutating in place; loaders replay all entries in order to rebuild the
@@ -257,6 +298,7 @@ pub enum SessionEntry {
     BranchSummary(BranchSummaryEntry),
     Custom(CustomEntry),
     CustomMessage(CustomMessageEntry),
+    ContextEdit(ContextEditEntry),
     Label(LabelEntry),
     SessionInfo(SessionInfoEntry),
     Leaf(LeafEntry),
@@ -298,6 +340,7 @@ pub enum FileEntry {
     BranchSummary(BranchSummaryEntry),
     Custom(CustomEntry),
     CustomMessage(CustomMessageEntry),
+    ContextEdit(ContextEditEntry),
     Label(LabelEntry),
     SessionInfo(SessionInfoEntry),
     Leaf(LeafEntry),
@@ -319,6 +362,7 @@ impl FileEntry {
             FileEntry::BranchSummary(e) => Some(SessionEntry::BranchSummary(e)),
             FileEntry::Custom(e) => Some(SessionEntry::Custom(e)),
             FileEntry::CustomMessage(e) => Some(SessionEntry::CustomMessage(e)),
+            FileEntry::ContextEdit(e) => Some(SessionEntry::ContextEdit(e)),
             FileEntry::Label(e) => Some(SessionEntry::Label(e)),
             FileEntry::SessionInfo(e) => Some(SessionEntry::SessionInfo(e)),
             FileEntry::Leaf(e) => Some(SessionEntry::Leaf(e)),
@@ -339,6 +383,7 @@ impl SessionEntry {
             SessionEntry::BranchSummary(_) => "branch_summary",
             SessionEntry::Custom(_) => "custom",
             SessionEntry::CustomMessage(_) => "custom_message",
+            SessionEntry::ContextEdit(_) => "context_edit",
             SessionEntry::Label(_) => "label",
             SessionEntry::SessionInfo(_) => "session_info",
             SessionEntry::Leaf(_) => "leaf",
@@ -357,6 +402,7 @@ impl SessionEntry {
             SessionEntry::BranchSummary(e) => &e.id,
             SessionEntry::Custom(e) => &e.id,
             SessionEntry::CustomMessage(e) => &e.id,
+            SessionEntry::ContextEdit(e) => &e.id,
             SessionEntry::Label(e) => &e.id,
             SessionEntry::SessionInfo(e) => &e.id,
             SessionEntry::Leaf(e) => &e.id,
@@ -375,6 +421,7 @@ impl SessionEntry {
             SessionEntry::BranchSummary(e) => e.parent_id.as_deref(),
             SessionEntry::Custom(e) => e.parent_id.as_deref(),
             SessionEntry::CustomMessage(e) => e.parent_id.as_deref(),
+            SessionEntry::ContextEdit(e) => e.parent_id.as_deref(),
             SessionEntry::Label(e) => e.parent_id.as_deref(),
             SessionEntry::SessionInfo(e) => e.parent_id.as_deref(),
             SessionEntry::Leaf(e) => e.parent_id.as_deref(),
@@ -393,6 +440,7 @@ impl SessionEntry {
             SessionEntry::BranchSummary(e) => &e.timestamp,
             SessionEntry::Custom(e) => &e.timestamp,
             SessionEntry::CustomMessage(e) => &e.timestamp,
+            SessionEntry::ContextEdit(e) => &e.timestamp,
             SessionEntry::Label(e) => &e.timestamp,
             SessionEntry::SessionInfo(e) => &e.timestamp,
             SessionEntry::Leaf(e) => &e.timestamp,

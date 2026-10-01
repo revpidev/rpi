@@ -7292,7 +7292,7 @@ mod tests {
             manager
                 .append_compaction(
                     "compacted history",
-                    "kept-id",
+                    Some("kept-id"),
                     1234,
                     None,
                     None,
@@ -7353,7 +7353,7 @@ mod tests {
             manager
                 .append_compaction(
                     "compacted history",
-                    "kept-id",
+                    Some("kept-id"),
                     1234,
                     None,
                     None,
