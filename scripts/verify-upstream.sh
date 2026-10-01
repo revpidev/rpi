@@ -1,39 +1,50 @@
 #!/usr/bin/env bash
-# Verifies that external/pi is exactly at the upstream pin recorded in
-# UPSTREAM.md (coding-standards §15.2, ADR-0002 §1).
+# Verifies that external/ submodules are exactly at the upstream pins recorded
+# in UPSTREAM.md (coding-standards §15.2, ADR-0002 §1).
 #
-# Checks:
-#   1. HEAD of external/pi equals the pinned commit from UPSTREAM.md.
-#   2. external/pi has no local modifications (it is a read-only reference).
+# Checks, for external/pi and each plugin reference submodule listed in
+# UPSTREAM.md's plugin pin table:
+#   1. HEAD equals the pinned commit from UPSTREAM.md.
+#   2. The submodule has no local modifications (read-only references).
 #
 # Exit code 0 on success, 1 with a diagnostic on failure.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+check_pin() {
+    local dir="$1" expected="$2"
+    if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "error: $dir is not a git checkout (submodule not initialized?)" >&2
+        exit 1
+    fi
+    local actual
+    actual=$(git -C "$dir" rev-parse HEAD)
+    echo "$dir HEAD: $actual"
+    echo "$dir pin:  $expected"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "error: upstream pin mismatch — $dir must stay at the pinned commit" >&2
+        exit 1
+    fi
+    if [[ -n "$(git -C "$dir" status --porcelain)" ]]; then
+        echo "error: $dir has local modifications (it is a read-only reference)" >&2
+        exit 1
+    fi
+}
+
 EXPECTED=$(grep -E '^\| Git commit \|' UPSTREAM.md | grep -oE '[0-9a-f]{40}' | head -1)
 if [[ -z "$EXPECTED" ]]; then
     echo "error: could not parse pinned commit from UPSTREAM.md" >&2
     exit 1
 fi
+check_pin external/pi "$EXPECTED"
 
-if [[ ! -d external/pi/.git ]] && ! git -C external/pi rev-parse --git-dir >/dev/null 2>&1; then
-    echo "error: external/pi is not a git checkout (submodule not initialized?)" >&2
-    exit 1
-fi
+# Plugin reference pins: one `| \`external/<name>\` | \`<sha>\` |` row per
+# submodule in UPSTREAM.md's plugin pin table.
+while IFS='|' read -r _ dir sha _; do
+    dir=$(echo "$dir" | tr -d ' `')
+    sha=$(echo "$sha" | grep -oE '[0-9a-f]{40}' | head -1)
+    check_pin "$dir" "$sha"
+done < <(grep -E '^\| `external/' UPSTREAM.md)
 
-ACTUAL=$(git -C external/pi rev-parse HEAD)
-echo "external/pi HEAD: $ACTUAL"
-echo "UPSTREAM.md pin:  $EXPECTED"
-
-if [[ "$ACTUAL" != "$EXPECTED" ]]; then
-    echo "error: upstream pin mismatch — external/pi must stay at the pinned commit" >&2
-    exit 1
-fi
-
-if [[ -n "$(git -C external/pi status --porcelain)" ]]; then
-    echo "error: external/pi has local modifications (it is a read-only reference)" >&2
-    exit 1
-fi
-
-echo "ok: upstream pin verified"
+echo "ok: upstream pins verified"
