@@ -73,7 +73,7 @@ fn test_config() -> AgentLoopConfig {
         convert_to_llm: identity_converter(),
         transform_context: None,
         get_api_key: None,
-        should_stop_after_turn: None,
+        finish_turn: None,
         prepare_request: None,
         prepare_next_turn: None,
         get_steering_messages: None,
@@ -1354,7 +1354,7 @@ async fn uses_prepare_next_turn_snapshot_before_continuing() {
 // abort (#8936) — upstream intents from agent-loop.ts @ 9841914.
 // ---------------------------------------------------------------------------
 
-/// FR-A R2: a terminal turn (`should_stop_after_turn` = true) never invokes
+/// FR-A R2: a terminal turn (`finish_turn` = true) never invokes
 /// `prepare_next_turn` — compaction and other prepare-time side effects
 /// vanish from stopped turns (56700d42e, #6879).
 #[tokio::test]
@@ -1378,7 +1378,9 @@ async fn prepare_next_turn_skipped_on_stop_terminal_turn() {
             })
         })
     });
-    config.should_stop_after_turn = Some(Arc::new(|_hook_context| Box::pin(async move { true })));
+    config.finish_turn = Some(Arc::new(|_hook_context| {
+        Box::pin(async move { Some(rpi_agent::AgentTurnDecision::End) })
+    }));
 
     let (stream_fn, state) = mock_stream_fn(vec![text_assistant("done")]);
     let stream = agent_loop(
@@ -1701,7 +1703,7 @@ async fn parallel_preflight_abort_skips_prepared_tools() {
 }
 
 #[tokio::test]
-async fn stops_after_turn_when_should_stop_after_turn_returns_true() {
+async fn stops_after_turn_when_finish_turn_returns_true() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());
     let context = AgentContext {
@@ -1735,7 +1737,7 @@ async fn stops_after_turn_when_should_stop_after_turn_returns_true() {
             })
         })
     });
-    config.should_stop_after_turn = Some({
+    config.finish_turn = Some({
         let callback_tool_result_ids = callback_tool_result_ids.clone();
         let callback_context_roles = callback_context_roles.clone();
         Arc::new(move |hook_context| {
@@ -1753,7 +1755,7 @@ async fn stops_after_turn_when_should_stop_after_turn_returns_true() {
                         .iter()
                         .map(|r| (*r).to_owned())
                         .collect();
-                true
+                Some(rpi_agent::AgentTurnDecision::End)
             })
         })
     });
@@ -3072,5 +3074,149 @@ async fn prepare_request_runs_for_every_request_and_replaces_context() {
     assert!(
         render(&calls.calls[1]).iter().any(|text| text == "steer"),
         "steering still delivers through the normal gate"
+    );
+}
+
+/// V16-03 FR-D R1 (`finishTurn` continuation, agent-loop.ts:255-275 @
+/// 005af57d8): `{action: "continue"}` ensures one next provider request;
+/// since no tool result/steering/follow-up scheduling satisfies it, the loop
+/// runs one context-only turn.
+#[tokio::test]
+async fn finish_turn_continue_runs_one_context_only_turn() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let context = AgentContext {
+        messages: Vec::new(),
+        tools: None,
+    };
+    let (stream_fn, state) = mock_stream_fn(vec![text_assistant("one"), text_assistant("two")]);
+    let mut config = test_config();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = calls.clone();
+    config.finish_turn = Some(Arc::new(move |_turn: rpi_agent::AgentTurnContext| {
+        let calls = calls_for_hook.clone();
+        Box::pin(async move {
+            // Continue once, then preserve normal scheduling.
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Some(rpi_agent::AgentTurnDecision::Continue)
+            } else {
+                None
+            }
+        })
+    }));
+
+    let stream = agent_loop(
+        vec![user_message("Hello")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (events, messages) = collect(stream).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "hook ran once per turn");
+    assert_eq!(state.lock().expect("state").calls.len(), 2);
+    assert_eq!(message_roles(&messages), ["user", "assistant", "assistant"]);
+    let turn_ends = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+        .count();
+    assert_eq!(turn_ends, 2, "context-only continuation still ends a turn");
+}
+
+/// V16-03 FR-D R1: `{action: "end"}` ends the run without polling steering
+/// or follow-up queues (agent-loop.ts:259-263).
+#[tokio::test]
+async fn finish_turn_end_exits_before_polling_queues() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let context = AgentContext {
+        messages: Vec::new(),
+        tools: None,
+    };
+    let (stream_fn, state) = mock_stream_fn(vec![text_assistant("one")]);
+    let mut config = test_config();
+    config.finish_turn = Some(Arc::new(|_turn: rpi_agent::AgentTurnContext| {
+        Box::pin(async move { Some(rpi_agent::AgentTurnDecision::End) })
+    }));
+    let steering_polls = Arc::new(AtomicUsize::new(0));
+    let steering_polls_for_hook = steering_polls.clone();
+    config.get_steering_messages = Some(Arc::new(move || {
+        let polls = steering_polls_for_hook.clone();
+        Box::pin(async move {
+            polls.fetch_add(1, Ordering::SeqCst);
+            vec![user_message("must not be consumed")]
+        })
+    }));
+
+    let stream = agent_loop(
+        vec![user_message("Hello")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (_events, _messages) = collect(stream).await;
+
+    assert_eq!(
+        steering_polls.load(Ordering::SeqCst),
+        1,
+        "only the loop-entry poll runs; end does not poll again"
+    );
+    assert_eq!(state.lock().expect("state").calls.len(), 1);
+}
+
+/// V16-03 FR-D R1: error/aborted responses still invoke `finishTurn` but
+/// ignore its decision (agent-loop.ts:245-252 @ 005af57d8).
+#[tokio::test]
+async fn finish_turn_runs_on_error_but_decision_is_ignored() {
+    let context = AgentContext {
+        messages: Vec::new(),
+        tools: None,
+    };
+    let (stream_fn, state) = mock_stream_fn(vec![assistant_message(vec![], StopReason::Error)]);
+    let mut config = test_config();
+    let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_calls_for_hook = hook_calls.clone();
+    config.finish_turn = Some(Arc::new(move |_turn: rpi_agent::AgentTurnContext| {
+        let calls = hook_calls_for_hook.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Ignored for terminal responses: the run must still exit.
+            Some(rpi_agent::AgentTurnDecision::Continue)
+        })
+    }));
+
+    let stream = agent_loop(
+        vec![user_message("Hello")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (events, _messages) = collect(stream).await;
+
+    assert_eq!(
+        hook_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "finishTurn observes the failed turn"
+    );
+    assert_eq!(
+        state.lock().expect("state").calls.len(),
+        1,
+        "no retry request"
+    );
+    assert_eq!(
+        event_types(&events),
+        [
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_end",
+            "message_start",
+            "message_end",
+            "turn_end",
+            "agent_end",
+        ]
     );
 }

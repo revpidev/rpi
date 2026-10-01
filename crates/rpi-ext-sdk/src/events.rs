@@ -376,6 +376,14 @@ pub struct ContextEvent {
     pub messages: Value,
 }
 
+/// `context_with_system` payload (V16-03): the full transcript including
+/// system messages, after the `context` phase and prompt/tool restoration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWithSystemEvent {
+    pub messages: Value,
+}
+
 /// `context` result.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -482,13 +490,52 @@ pub struct TurnStartEvent {
     pub timestamp: i64,
 }
 
-/// `turn_end` payload (`message`/`toolResults` as JSON).
+/// `turn_end` payload (`message`/`toolResults` as JSON) plus the boundary
+/// state added at dispatch time (V16-03; types.ts:1015-1022 @ 005af57d8).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnEndEvent {
     pub turn_index: u32,
     pub message: Value,
     pub tool_results: Value,
+    pub message_entry_id: String,
+    pub tool_result_entry_ids: Vec<String>,
+    pub outcome: AgentActivityOutcome,
+    pub entries: Value,
+    #[serde(rename = "continue")]
+    pub continue_: bool,
+    pub context: Value,
+}
+
+/// `agent_before_settle` payload (V16-03; types.ts:980-983 @ 005af57d8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBeforeSettleEvent {
+    pub outcome: AgentActivityOutcome,
+    pub entries: Value,
+    #[serde(rename = "continue")]
+    pub continue_: bool,
+    pub context: Value,
+}
+
+/// `AgentActivityOutcome` (types.ts:919 @ 005af57d8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentActivityOutcome {
+    Completed,
+    Aborted,
+    Error,
+}
+
+/// `BoundaryResult` (types.ts:975-978 @ 005af57d8): what a boundary handler
+/// may return. Entries stay raw JSON until the host applies them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundaryResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Value>,
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    pub continue_: Option<bool>,
 }
 
 /// `message_start` / `message_end` shared payload (`message` as JSON).
@@ -718,6 +765,7 @@ mod tests {
         exported::<SessionTreeEvent>();
         exported::<ExtensionBranchSummary>();
         exported::<ContextEvent>();
+        exported::<ContextWithSystemEvent>();
         exported::<ContextEventResult>();
         exported::<CacheWarmingDecisionEvent>();
         exported::<CacheWarmingDecisionEventResult>();
@@ -732,6 +780,9 @@ mod tests {
         exported::<AgentEndEvent>();
         exported::<TurnStartEvent>();
         exported::<TurnEndEvent>();
+        exported::<AgentBeforeSettleEvent>();
+        exported::<AgentActivityOutcome>();
+        exported::<BoundaryResult>();
         exported::<MessageEvent>();
         exported::<MessageUpdateEvent>();
         exported::<MessageEndEventResult>();

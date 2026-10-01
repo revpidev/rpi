@@ -36,16 +36,16 @@ pub mod stream_fn;
 pub mod types;
 
 pub use agent::{
-    Agent, AgentListener, AgentOptions, AgentState, InitialAgentState, PrepareRequestAgentFn,
-    PromptInput, ShouldStopAfterTurnAgentFn,
+    Agent, AgentListener, AgentOptions, AgentState, FinishTurnAgentFn, InitialAgentState,
+    PrepareRequestAgentFn, PromptInput,
 };
 pub use agent_loop::{
     AfterToolCallContext, AfterToolCallFn, AfterToolCallResult, AgentContext, AgentEventSink,
-    AgentEventStream, AgentLoopConfig, AgentLoopTurnUpdate, AgentRequestUpdate,
-    BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, ConvertToLlmFn, GetApiKeyFn,
-    GetQueuedMessagesFn, PrepareNextTurnContext, PrepareNextTurnFn, PrepareRequestContext,
-    PrepareRequestFn, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn,
-    agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue,
+    AgentEventStream, AgentLoopConfig, AgentLoopTurnUpdate, AgentRequestUpdate, AgentTurnContext,
+    AgentTurnDecision, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult,
+    ConvertToLlmFn, FinishTurnFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext,
+    PrepareNextTurnFn, PrepareRequestContext, PrepareRequestFn, TransformContextFn, agent_loop,
+    agent_loop_continue, run_agent_loop, run_agent_loop_continue,
 };
 pub use compaction::{
     CompactionDetails, CompactionPreparation, CompactionResult, CompactionSettings, CutPointResult,

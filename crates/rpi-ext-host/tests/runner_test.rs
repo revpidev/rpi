@@ -1105,6 +1105,224 @@ async fn runner_context_transforms_chain() {
     assert_eq!(result[1]["tag"], "a");
 }
 
+/// System message JSON used by the V16-03 context-handler tests.
+fn system_message(content: &str, timestamp: i64) -> Value {
+    json!({"role": "system", "content": content, "timestamp": timestamp})
+}
+
+fn user_message_json(content: &str, timestamp: i64) -> Value {
+    json!({"role": "user", "content": content, "timestamp": timestamp})
+}
+
+/// V16-03 FR-C R1: `context` handlers never see system messages; when they
+/// change the conversation the replayed prompt/tool checkpoint is re-attached
+/// as one leading system message (runner.ts:1187-1317 @ 005af57d8).
+#[tokio::test]
+async fn runner_context_hides_system_messages_and_restores_prompt() {
+    let host = host_with(vec![inline_ext("ext-a", |api| {
+        api.on(
+            ext::EVENT_CONTEXT,
+            json_handler(|event| {
+                let messages = event["messages"].as_array().unwrap();
+                assert!(
+                    !messages.iter().any(|message| message["role"] == "system"),
+                    "context handlers must not see system messages"
+                );
+                assert_eq!(messages.len(), 2);
+                // Changed conversation: drop the assistant tail.
+                Ok(json!({"messages": [messages[0].clone(), messages[1].clone()]}))
+            }),
+        )
+        .unwrap();
+    })])
+    .await;
+
+    let result = host
+        .emit_context(json!([
+            system_message("PROMPT", 0),
+            user_message_json("one", 1),
+            user_message_json("tail", 2),
+        ]))
+        .await;
+    let messages = result.as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "PROMPT");
+    assert_eq!(messages[1]["content"], "one");
+    assert_eq!(messages[2]["content"], "tail");
+}
+
+/// V16-03 FR-C R1: an unchanged conversation keeps every system message in
+/// place (mid-conversation system support keeps its cached prefix,
+/// runner.ts:1288-1310).
+#[tokio::test]
+async fn runner_context_unchanged_keeps_mid_conversation_system_messages() {
+    let host = host_with(vec![inline_ext("ext-a", |api| {
+        api.on(
+            ext::EVENT_CONTEXT,
+            json_handler(|event| Ok(json!({"messages": event["messages"].clone()}))),
+        )
+        .unwrap();
+    })])
+    .await;
+
+    let input = json!([
+        system_message("PROMPT", 0),
+        user_message_json("one", 1),
+        system_message("MID", 2),
+        user_message_json("two", 3),
+    ]);
+    let result = host.emit_context(input.clone()).await;
+    assert_eq!(result, input);
+}
+
+/// V16-03 FR-C R1: a system message a handler adds stays after the replayed
+/// head; `getCurrentSystemMessage` keeps both (runner.ts:1306-1316).
+#[tokio::test]
+async fn runner_context_keeps_system_messages_added_by_a_handler() {
+    let host = host_with(vec![inline_ext("ext-a", |api| {
+        api.on(
+            ext::EVENT_CONTEXT,
+            json_handler(|event| {
+                let mut messages = vec![system_message("ephemeral reminder", 0)];
+                messages.extend(event["messages"].as_array().unwrap().iter().cloned());
+                Ok(json!({"messages": messages}))
+            }),
+        )
+        .unwrap();
+    })])
+    .await;
+
+    let result = host
+        .emit_context(json!([
+            system_message("PROMPT", 0),
+            user_message_json("one", 1),
+        ]))
+        .await;
+    let messages = result.as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "PROMPT");
+    assert_eq!(messages[1]["role"], "system");
+    assert_eq!(messages[1]["content"], "ephemeral reminder");
+    assert_eq!(messages[2]["content"], "one");
+}
+
+/// V16-03 FR-B R2: `context_with_system` runs after every `context` handler
+/// on the restored transcript and its output is sent verbatim
+/// (runner.ts:1320-1354 @ 005af57d8).
+#[tokio::test]
+async fn runner_context_with_system_runs_after_context_verbatim() {
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let seen_for_context = seen.clone();
+    let seen_for_final = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let seen_for_final_hook = seen_for_final.clone();
+    let host = host_with(vec![inline_ext("ext-a", move |api| {
+        let seen_for_final = seen_for_final_hook.clone();
+        let seen_for_context = seen_for_context.clone();
+        // Registered first, runs second: `context_with_system` observes the
+        // output of the `context` phase.
+        api.on(
+            ext::EVENT_CONTEXT_WITH_SYSTEM,
+            json_handler(move |event| {
+                let messages = event["messages"].as_array().unwrap().clone();
+                assert_eq!(messages[0]["role"], "system");
+                seen_for_final
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(event.clone());
+                let mut replaced = messages;
+                replaced.push(user_message_json("with-system tail", 9));
+                Ok(json!({"messages": replaced}))
+            }),
+        )
+        .unwrap();
+        api.on(
+            ext::EVENT_CONTEXT,
+            json_handler(move |event| {
+                let messages = event["messages"].as_array().unwrap().clone();
+                seen_for_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(event.clone());
+                // Slice from the last visible message.
+                Ok(json!({"messages": [messages[messages.len() - 1].clone()]}))
+            }),
+        )
+        .unwrap();
+    })])
+    .await;
+
+    let result = host
+        .emit_context(json!([
+            system_message("PROMPT", 0),
+            user_message_json("one", 1),
+            user_message_json("two", 2),
+        ]))
+        .await;
+    let messages = result.as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "PROMPT");
+    assert_eq!(messages[1]["content"], "two");
+    assert_eq!(messages[2]["content"], "with-system tail");
+
+    // The `context_with_system` handler saw the restored transcript (system
+    // first, then the sliced message).
+    let seen_final = seen_for_final
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(seen_final.len(), 1);
+    assert_eq!(seen_final[0]["messages"][0]["role"], "system");
+    assert_eq!(seen_final[0]["messages"][1]["content"], "two");
+}
+
+/// V16-03 FR-B R2: dropping the leading system message is reported but the
+/// handler output is honored (runner.ts:1329-1341).
+#[tokio::test]
+async fn runner_context_with_system_reports_leading_system_drop() {
+    let host = host_with(vec![inline_ext("ext-a", |api| {
+        api.on(
+            ext::EVENT_CONTEXT_WITH_SYSTEM,
+            json_handler(|event| {
+                let messages: Vec<Value> = event["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message["role"] != "system")
+                    .cloned()
+                    .collect();
+                Ok(json!({"messages": messages}))
+            }),
+        )
+        .unwrap();
+    })])
+    .await;
+    let errors = collect_errors(&host);
+
+    let result = host
+        .emit_context(json!([
+            system_message("PROMPT", 0),
+            user_message_json("one", 1),
+        ]))
+        .await;
+    let messages = result.as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+
+    let errors = errors.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(errors.len(), 1, "one warning: {errors:?}");
+    assert_eq!(errors[0].event, "context_with_system");
+    assert!(
+        errors[0]
+            .error
+            .starts_with("Handler removed the leading system message"),
+        "message: {}",
+        errors[0].error
+    );
+}
+
 // ---------------------------------------------------------------------------
 // before_provider_request (runner.ts:1003-1035)
 // ---------------------------------------------------------------------------

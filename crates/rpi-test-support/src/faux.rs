@@ -895,6 +895,10 @@ pub struct FauxAiProvider {
     /// assert the agent path forwards the session thinking level into the
     /// provider request (sdk.rs `stream_simple` wiring).
     reasoning_seen: Arc<Mutex<Vec<Option<rpi_ai::types::ThinkingLevel>>>>,
+    /// Transcript contexts seen at the `stream_simple` boundary, in call
+    /// order. Lets tests assert the request-time context transform pipeline
+    /// (`context` / `context_with_system` handlers, V16-03).
+    contexts_seen: Arc<Mutex<Vec<rpi_ai::types::TranscriptContext>>>,
 }
 
 impl FauxAiProvider {
@@ -908,6 +912,7 @@ impl FauxAiProvider {
             },
             faux,
             reasoning_seen: Arc::new(Mutex::new(Vec::new())),
+            contexts_seen: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -919,6 +924,11 @@ impl FauxAiProvider {
     /// Reasoning levels received by [`Self::stream_simple`], in call order.
     pub fn reasoning_seen(&self) -> &Arc<Mutex<Vec<Option<rpi_ai::types::ThinkingLevel>>>> {
         &self.reasoning_seen
+    }
+
+    /// Transcript contexts received by [`Self::stream_simple`], in call order.
+    pub fn contexts_seen(&self) -> &Arc<Mutex<Vec<rpi_ai::types::TranscriptContext>>> {
+        &self.contexts_seen
     }
 }
 
@@ -979,6 +989,10 @@ impl rpi_ai::models::Provider for FauxAiProvider {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(options.as_ref().and_then(|simple| simple.reasoning));
+        self.contexts_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(context.clone());
         Ok(self.stream(model, context, options.map(|simple| simple.stream)))
     }
 }

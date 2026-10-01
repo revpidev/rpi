@@ -408,6 +408,24 @@ impl NativeExtensionHost {
         self.core().emit_context(messages).await
     }
 
+    /// `emitBoundary` passthrough (V16-03 FR-D): the chained
+    /// `{entries, continue, context}` dispatch used by the host for
+    /// `turn_end` / `agent_before_settle`.
+    pub async fn emit_boundary(
+        &self,
+        event_type: &str,
+        base_event: Value,
+        build_context: &(
+             dyn Fn(Vec<Value>) -> crate::api::BoxFuture<'static, Result<Value, String>>
+                 + Send
+                 + Sync
+         ),
+    ) -> crate::types::BoundaryDispatchResult {
+        self.core()
+            .emit_boundary(event_type, base_event, build_context)
+            .await
+    }
+
     /// `cache_warming_decision` (#9668, c596d09d9): typed passthrough to the
     /// runner's override aggregation.
     pub async fn emit_cache_warming_decision(

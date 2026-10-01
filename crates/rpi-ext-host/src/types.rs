@@ -55,6 +55,7 @@ pub const EVENT_SESSION_SHUTDOWN: &str = "session_shutdown";
 pub const EVENT_SESSION_BEFORE_TREE: &str = "session_before_tree";
 pub const EVENT_SESSION_TREE: &str = "session_tree";
 pub const EVENT_CONTEXT: &str = "context";
+pub const EVENT_CONTEXT_WITH_SYSTEM: &str = "context_with_system";
 pub const EVENT_CACHE_WARMING_DECISION: &str = "cache_warming_decision";
 pub const EVENT_BEFORE_PROVIDER_REQUEST: &str = "before_provider_request";
 pub const EVENT_BEFORE_PROVIDER_HEADERS: &str = "before_provider_headers";
@@ -62,6 +63,7 @@ pub const EVENT_AFTER_PROVIDER_RESPONSE: &str = "after_provider_response";
 pub const EVENT_BEFORE_AGENT_START: &str = "before_agent_start";
 pub const EVENT_AGENT_START: &str = "agent_start";
 pub const EVENT_AGENT_END: &str = "agent_end";
+pub const EVENT_AGENT_BEFORE_SETTLE: &str = "agent_before_settle";
 pub const EVENT_AGENT_SETTLED: &str = "agent_settled";
 pub const EVENT_UI_PROMPT_START: &str = "ui_prompt_start";
 pub const EVENT_UI_PROMPT_END: &str = "ui_prompt_end";
@@ -80,10 +82,13 @@ pub const EVENT_INPUT: &str = "input";
 pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
 
-/// All 37 event names, in the upstream `ExtensionAPI.on()` overload order
-/// (types.ts:1259-1303 + #9668 `cache_warming_decision` at :1294-1297,
-/// c596d09d9 — inserted between `context` and `before_provider_request`).
-pub const ALL_EVENTS: [&str; 37] = [
+/// All 39 event names, in the upstream `ExtensionAPI.on()` overload order
+/// (types.ts:1545-1625 @ 005af57d8 + #9668 `cache_warming_decision` —
+/// inserted between `context_with_system` and `before_provider_request`).
+/// V16-03 adds `context_with_system` and `agent_before_settle`; the remaining
+/// two (`provider_stream_event`, `mcp_servers_change`) and the version-level
+/// ABI minor bump land in V16-06.
+pub const ALL_EVENTS: [&str; 39] = [
     EVENT_PROJECT_TRUST,
     EVENT_RESOURCES_DISCOVER,
     EVENT_SESSION_START,
@@ -97,6 +102,7 @@ pub const ALL_EVENTS: [&str; 37] = [
     EVENT_SESSION_BEFORE_TREE,
     EVENT_SESSION_TREE,
     EVENT_CONTEXT,
+    EVENT_CONTEXT_WITH_SYSTEM,
     EVENT_CACHE_WARMING_DECISION,
     EVENT_BEFORE_PROVIDER_REQUEST,
     EVENT_BEFORE_PROVIDER_HEADERS,
@@ -104,6 +110,7 @@ pub const ALL_EVENTS: [&str; 37] = [
     EVENT_BEFORE_AGENT_START,
     EVENT_AGENT_START,
     EVENT_AGENT_END,
+    EVENT_AGENT_BEFORE_SETTLE,
     EVENT_AGENT_SETTLED,
     EVENT_UI_PROMPT_START,
     EVENT_UI_PROMPT_END,
@@ -496,10 +503,25 @@ pub struct SessionTreeEvent {
 // Agent events (types.ts:659-779)
 // ============================================================================
 
-/// `ContextEvent` (types.ts:664-667).
+/// `ContextEvent` (types.ts:664-669 @ 005af57d8).
+///
+/// `messages` holds the conversation without system messages. The prompt
+/// and tool state belong to pi: it restores them after each handler, so a
+/// handler cannot drop them and does not need to preserve them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextEvent {
+    pub messages: Vec<AgentMessage>,
+}
+
+/// `ContextWithSystemEvent` (types.ts:671-677 @ 005af57d8): fired before
+/// each LLM call, after every `context` handler has run and pi has restored
+/// the prompt and tool state. `messages` is the full transcript including
+/// system messages, and the result is sent as returned: the handler owns
+/// the prompt and tool declarations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWithSystemEvent {
     pub messages: Vec<AgentMessage>,
 }
 
@@ -637,13 +659,98 @@ pub struct TurnStartEvent {
     pub timestamp: i64,
 }
 
-/// `TurnEndEvent` (types.ts:729-734).
+/// `AgentActivityOutcome` (types.ts:919 @ 005af57d8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentActivityOutcome {
+    Completed,
+    Aborted,
+    Error,
+}
+
+/// `SessionBoundaryDraft` (types.ts:924-957 @ 005af57d8): the structural
+/// entries an `{entries, continue}` boundary result may append. Drafts cross
+/// the JSON ABI untyped; the host parses this shape when applying them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum SessionBoundaryDraft {
+    /// `CustomEntryDraft` — display/state entry, not model context.
+    Custom {
+        custom_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<Value>,
+    },
+    /// `CustomMessageEntryDraft` — participates in model context.
+    CustomMessage {
+        custom_type: String,
+        content: Value,
+        display: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+    },
+    /// `ContextEditEntryDraft` — `null` replacement omits the target.
+    ContextEdit {
+        target_id: String,
+        replacement: Option<Value>,
+    },
+    /// `CompactionEntryDraft` — null `firstKeptEntryId` is the retain-none
+    /// form (stores the compaction's own id).
+    Compaction {
+        summary: String,
+        first_kept_entry_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+    },
+}
+
+/// `BoundaryResult` (types.ts:975-978 @ 005af57d8): what a `turn_end` /
+/// `agent_before_settle` handler may return. Entries stay raw JSON until the
+/// host applies them (invalid previews are repaired, not silently dropped).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundaryResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Vec<Value>>,
+    #[serde(rename = "continue", default, skip_serializing_if = "Option::is_none")]
+    pub continue_: Option<bool>,
+}
+
+/// `BoundaryDispatchResult` (runner.ts:214-219 @ 005af57d8). `valid` is
+/// false when the final preview request failed: the caller then discards
+/// the drafts and the continuation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundaryDispatchResult {
+    pub entries: Vec<Value>,
+    pub continue_: bool,
+    pub context: Value,
+    pub valid: bool,
+}
+
+/// `TurnEndEvent` (types.ts:1015-1022 @ 005af57d8, `BoundaryState` included
+/// at dispatch time).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnEndEvent {
     pub turn_index: u32,
     pub message: AgentMessage,
     pub tool_results: Vec<rpi_ai::types::ToolResultMessage>,
+    pub message_entry_id: String,
+    pub tool_result_entry_ids: Vec<String>,
+    pub outcome: AgentActivityOutcome,
+}
+
+/// `AgentBeforeSettleEvent` (types.ts:980-983 @ 005af57d8): fired before
+/// final settlement. May append entries and ensure one next provider request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBeforeSettleEvent {
+    pub outcome: AgentActivityOutcome,
 }
 
 /// `MessageStartEvent` / `MessageEndEvent` shared shape (types.ts:737-740,

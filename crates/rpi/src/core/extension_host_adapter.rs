@@ -642,6 +642,23 @@ impl ExtensionRunner for ExtensionHostAdapter {
         serde_json::from_value(result).unwrap_or(messages)
     }
 
+    fn emit_boundary(
+        &self,
+        event_type: &str,
+        base_event: serde_json::Value,
+        build_context: crate::core::extensions::BoundaryContextBuilder,
+    ) -> futures::future::BoxFuture<'static, Option<rpi_ext_host::types::BoundaryDispatchResult>>
+    {
+        let host = self.host.clone();
+        let event_type = event_type.to_owned();
+        Box::pin(async move {
+            Some(
+                host.emit_boundary(&event_type, base_event, &*build_context)
+                    .await,
+            )
+        })
+    }
+
     async fn emit_cache_warming_decision(
         &self,
         event: rpi_ext_host::types::CacheWarmingDecisionEvent,

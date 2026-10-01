@@ -158,9 +158,10 @@ pub struct AfterToolCallContext {
     pub context: AgentContext,
 }
 
-/// `ShouldStopAfterTurnContext`.
+/// `AgentTurnContext` (types.ts:136-147 @ 005af57d8): context passed to the
+/// completed-turn `finishTurn` callback.
 #[derive(Clone)]
-pub struct ShouldStopAfterTurnContext {
+pub struct AgentTurnContext {
     /// The assistant message that completed the turn.
     pub message: AssistantMessage,
     /// Tool result messages passed to the preceding `turn_end` event.
@@ -173,9 +174,21 @@ pub struct ShouldStopAfterTurnContext {
     pub new_messages: Vec<AgentMessage>,
 }
 
-/// `PrepareNextTurnContext extends ShouldStopAfterTurnContext` (identical
+/// `AgentTurnDecision` (types.ts:149-150 @ 005af57d8): decision returned by
+/// [`FinishTurnFn`]. `None` preserves normal scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTurnDecision {
+    /// Ensures one next provider request (tool-result/steering/follow-up
+    /// scheduling can satisfy it; otherwise the loop continues once with the
+    /// current context).
+    Continue,
+    /// Ends the run without polling queues or preparing another request.
+    End,
+}
+
+/// `PrepareNextTurnContext extends AgentTurnContext` (identical
 /// fields upstream).
-pub type PrepareNextTurnContext = ShouldStopAfterTurnContext;
+pub type PrepareNextTurnContext = AgentTurnContext;
 
 /// `AgentLoopTurnUpdate` — replacement runtime state applied before starting
 /// another provider request.
@@ -252,8 +265,14 @@ pub type PrepareRequestFn = Arc<
 
 /// `shouldStopAfterTurn` — returning `true` makes the loop emit `agent_end`
 /// and exit before polling steering/follow-up queues.
-pub type ShouldStopAfterTurnFn =
-    Arc<dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<'static, bool> + Send + Sync>;
+/// `FinishTurn` (types.ts:152-156 @ 005af57d8): called after a completed
+/// assistant turn and all of its tool-result messages, but before
+/// `turn_end`. On a normal turn, [`AgentTurnDecision::Continue`] ensures one
+/// next provider request; [`AgentTurnDecision::End`] ends the run. Returning
+/// `None` preserves normal scheduling. Error and aborted responses remain
+/// hard exits but still invoke this callback (their decision is ignored).
+pub type FinishTurnFn =
+    Arc<dyn Fn(AgentTurnContext) -> BoxFuture<'static, Option<AgentTurnDecision>> + Send + Sync>;
 
 /// `prepareNextTurn` — called after `turn_end` when the loop will
 /// continue, immediately before the next turn starts. Return replacement
@@ -321,7 +340,7 @@ pub struct AgentLoopConfig {
     pub convert_to_llm: ConvertToLlmFn,
     pub transform_context: Option<TransformContextFn>,
     pub get_api_key: Option<GetApiKeyFn>,
-    pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
+    pub finish_turn: Option<FinishTurnFn>,
     /// `prepareRequest` (agent-loop.ts:218-235 @ 005af57d8).
     pub prepare_request: Option<PrepareRequestFn>,
     pub prepare_next_turn: Option<PrepareNextTurnFn>,
@@ -615,6 +634,10 @@ async fn run_loop(
     // `prepare_next_turn` hook, set after each `turn_end`. `None` on the
     // first iteration — the entry points already emitted `turn_start`.
     let mut last_completed_turn: Option<(AssistantMessage, Vec<ToolResultMessage>)> = None;
+    // `explicitContinuation` (agent-loop.ts:167): set by
+    // `finishTurn { action: "continue" }`; when no natural request was
+    // selected the loop runs one context-only turn.
+    let mut explicit_continuation = false;
     // Check for steering messages at start (user may have typed while waiting).
     let mut pending_messages: Vec<AgentMessage> = match &config.get_steering_messages {
         Some(get_steering) => get_steering().await,
@@ -630,7 +653,7 @@ async fn run_loop(
         while has_more_tool_calls || !pending_messages.is_empty() {
             // Only prepare for a turn the loop will actually start
             // (agent-loop.ts:178-199 @ 9841914, #6879): reaching this point
-            // means `should_stop_after_turn` did not exit and either tool
+            // means `finish_turn` did not exit and either tool
             // results or queued messages keep the loop going. Terminal
             // turns never trigger prepare, so compaction and other
             // prepare-time side effects vanish from them.
@@ -726,8 +749,20 @@ async fn run_loop(
             new_messages.push(AgentMessage::Assistant(message.clone()));
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                // Error and aborted responses remain hard exits; `finishTurn`
+                // still runs (extension boundaries observe the turn) but its
+                // decision is ignored (agent-loop.ts:245-252 @ 005af57d8).
+                if let Some(finish_turn) = &config.finish_turn {
+                    let turn = AgentTurnContext {
+                        message: message.clone(),
+                        tool_results: Vec::new(),
+                        context: current_context.clone(),
+                        new_messages: new_messages.clone(),
+                    };
+                    let _ = finish_turn(turn).await;
+                }
                 emit(AgentEvent::TurnEnd {
-                    message: AgentMessage::Assistant(message),
+                    message: AgentMessage::Assistant(message.clone()),
                     tool_results: Vec::new(),
                 })
                 .await;
@@ -779,38 +814,45 @@ async fn run_loop(
                 }
             }
 
+            // `lastCompletedTurn = { message, toolResults, ... }`
+            // (agent-loop.ts:249-255) and `finishTurn` run after the
+            // assistant message and all tool results, before `turn_end`.
+            last_completed_turn = Some((message.clone(), tool_results.clone()));
+            let decision = match &config.finish_turn {
+                Some(finish_turn) => {
+                    finish_turn(AgentTurnContext {
+                        message: message.clone(),
+                        tool_results: tool_results.clone(),
+                        context: current_context.clone(),
+                        new_messages: new_messages.clone(),
+                    })
+                    .await
+                }
+                None => None,
+            };
+
             emit(AgentEvent::TurnEnd {
                 message: AgentMessage::Assistant(message.clone()),
                 tool_results: tool_results.clone(),
             })
             .await;
 
-            // `lastCompletedTurn = { message, toolResults, ... }`
-            // (agent-loop.ts:249-255): consumed by `prepare_next_turn` at
-            // the top of the next iteration — after the stop checks below,
-            // so aborted/stopped turns never prepare.
-            last_completed_turn = Some((message.clone(), tool_results.clone()));
-
-            if let Some(should_stop_after_turn) = &config.should_stop_after_turn {
-                let stop_context = ShouldStopAfterTurnContext {
-                    message: message.clone(),
-                    tool_results: tool_results.clone(),
-                    context: current_context.clone(),
-                    new_messages: new_messages.clone(),
-                };
-                if should_stop_after_turn(stop_context).await {
-                    emit(AgentEvent::AgentEnd {
-                        messages: new_messages.clone(),
-                    })
-                    .await;
-                    return;
-                }
+            if decision == Some(AgentTurnDecision::End) {
+                emit(AgentEvent::AgentEnd {
+                    messages: new_messages.clone(),
+                })
+                .await;
+                return;
             }
+            explicit_continuation = decision == Some(AgentTurnDecision::Continue);
 
             pending_messages = match &config.get_steering_messages {
                 Some(get_steering) => get_steering().await,
                 None => Vec::new(),
             };
+            if has_more_tool_calls || !pending_messages.is_empty() {
+                explicit_continuation = false;
+            }
         }
 
         // Agent would stop here. Check for follow-up messages.
@@ -820,7 +862,16 @@ async fn run_loop(
         };
         if !follow_up_messages.is_empty() {
             // Set as pending so the inner loop processes them.
+            explicit_continuation = false;
             pending_messages = follow_up_messages;
+            continue;
+        }
+
+        // No natural request was selected, so fulfill the continuation
+        // decision with one context-only turn (agent-loop.ts:309-314 @
+        // 005af57d8).
+        if explicit_continuation {
+            explicit_continuation = false;
             continue;
         }
 

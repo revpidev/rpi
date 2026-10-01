@@ -1152,7 +1152,7 @@ async fn reset_when_idle_clears_state_and_queues() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn forwards_should_stop_after_turn_through_agent_options() {
+async fn forwards_finish_turn_through_agent_options() {
     let tool = TestTool::new(
         "noop",
         Arc::new(|_params, _on_update| {
@@ -1211,7 +1211,7 @@ async fn forwards_should_stop_after_turn_through_agent_options() {
     };
     let cb_saw = saw_abort_signal.clone();
     let cb_roles = callback_context_roles.clone();
-    options.should_stop_after_turn = Some(Arc::new(move |context, signal| {
+    options.finish_turn = Some(Arc::new(move |context, signal| {
         let cb_saw = cb_saw.clone();
         let cb_roles = cb_roles.clone();
         Box::pin(async move {
@@ -1222,7 +1222,7 @@ async fn forwards_should_stop_after_turn_through_agent_options() {
                 .iter()
                 .map(|m| role_str(m).to_owned())
                 .collect();
-            true
+            Some(rpi_agent::AgentTurnDecision::End)
         })
     }));
 
@@ -1253,4 +1253,41 @@ fn role_str(message: &AgentMessage) -> &'static str {
         AgentMessage::CompactionSummary(_) => "compactionSummary",
         AgentMessage::System(_) => "system",
     }
+}
+
+/// V16-03 FR-D R5: `peekQueuedMessages` (agent.ts:327-333 @ 005af57d8)
+/// previews the next queued batch without consuming it; steering first,
+/// then follow-up.
+#[tokio::test]
+async fn peek_queued_messages_previews_without_consuming() {
+    let agent = Agent::new(AgentOptions::new(unused_stream_fn()));
+
+    assert!(agent.peek_queued_messages().is_empty());
+
+    agent.steer(user_message("steering one"));
+    agent.steer(user_message("steering two"));
+    agent.follow_up(user_message("follow-up"));
+
+    // One-at-a-time default: the next steering message only.
+    let peeked = agent.peek_queued_messages();
+    assert_eq!(peeked.len(), 1);
+    assert_eq!(role_str(&peeked[0]), "user");
+    assert_eq!(
+        agent.peek_queued_messages().len(),
+        1,
+        "peek is non-destructive"
+    );
+    assert!(agent.has_queued_messages());
+
+    agent.set_steering_mode(rpi_agent::types::QueueMode::All);
+    assert_eq!(
+        agent.peek_queued_messages().len(),
+        2,
+        "all mode previews the batch"
+    );
+
+    // Drain steering; the preview falls through to the follow-up queue.
+    agent.clear_steering_queue();
+    assert_eq!(agent.peek_queued_messages().len(), 1, "follow-up preview");
+    assert!(agent.has_queued_messages(), "peek still consumed nothing");
 }

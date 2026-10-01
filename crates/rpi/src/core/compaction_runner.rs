@@ -138,6 +138,11 @@ fn lock_abort(cell: &AbortTokenCell) -> std::sync::MutexGuard<'_, Option<Cancell
     cell.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `_omitRecoveryAttempt` callback (agent-session.ts:1202-1216 @ 005af57d8):
+/// persists a restorative `context_edit` omission for a discarded recovery
+/// attempt before the post-run compaction.
+pub type OmitRecoveryFn = Arc<dyn Fn(&AssistantMessage) + Send + Sync>;
+
 /// `_findPersistedMessageEntryId` (agent-session.ts:1183-1201 @ 005af57d8):
 /// value-equality scan over the branch, then the projected-index fallback.
 fn find_persisted_message_entry_id(
@@ -195,7 +200,7 @@ pub struct CompactionRunner {
     /// restorative `context_edit` omission for a discarded recovery attempt
     /// before the post-run compaction, so the canonical projection no longer
     /// contains it. Installed by `AgentSession`; `None` in bare fixtures.
-    omit_recovery: Option<Arc<dyn Fn(&AssistantMessage) + Send + Sync>>,
+    omit_recovery: Option<OmitRecoveryFn>,
 }
 
 impl CompactionRunner {
@@ -238,7 +243,7 @@ impl CompactionRunner {
 
     /// V16-03 FR-A R5: install the recovery-omission callback
     /// (`_omitRecoveryAttempt`, agent-session.ts:1202-1216 @ 005af57d8).
-    pub fn set_omit_recovery(&mut self, omit: Arc<dyn Fn(&AssistantMessage) + Send + Sync>) {
+    pub fn set_omit_recovery(&mut self, omit: OmitRecoveryFn) {
         self.omit_recovery = Some(omit);
     }
 

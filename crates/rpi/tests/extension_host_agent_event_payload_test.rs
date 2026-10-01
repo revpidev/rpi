@@ -143,6 +143,7 @@ const AGENT_EVENTS: [&str; 8] = [
 struct Fixture {
     session: rpi::core::agent_session::AgentSession,
     records: Records,
+    provider: Arc<FauxAiProvider>,
     _tmp: TempDir,
 }
 
@@ -183,8 +184,9 @@ async fn fixture(responses: Vec<FauxResponseStep>, host: NativeExtensionHost) ->
         },
     )
     .await;
+    let ai_provider = Arc::new(FauxAiProvider::new(provider.clone()));
     model_runtime
-        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .register_native_provider(ai_provider.clone())
         .await
         .expect("register faux provider");
 
@@ -228,6 +230,7 @@ async fn fixture(responses: Vec<FauxResponseStep>, host: NativeExtensionHost) ->
     Fixture {
         session: created.session,
         records: Arc::new(Mutex::new(Vec::new())),
+        provider: ai_provider,
         _tmp: tmp,
     }
 }
@@ -508,8 +511,9 @@ async fn ctx_session_file_round_trip() {
         },
     )
     .await;
+    let ai_provider = Arc::new(FauxAiProvider::new(provider.clone()));
     model_runtime
-        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .register_native_provider(ai_provider.clone())
         .await
         .expect("register faux provider");
     let services = rpi::core::agent_session_services::create_agent_session_services(
@@ -637,8 +641,9 @@ async fn fixture_with_settings(
         },
     )
     .await;
+    let ai_provider = Arc::new(FauxAiProvider::new(provider.clone()));
     model_runtime
-        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .register_native_provider(ai_provider.clone())
         .await
         .expect("register faux provider");
 
@@ -682,6 +687,7 @@ async fn fixture_with_settings(
     Fixture {
         session: created.session,
         records: Arc::new(Mutex::new(Vec::new())),
+        provider: ai_provider,
         _tmp: tmp,
     }
 }
@@ -834,4 +840,271 @@ async fn session_compact_failed_emits_only_with_handlers() {
         records_of(&records, "session_compact_failed").is_empty(),
         "no dispatch without handlers"
     );
+}
+
+// ---------------------------------------------------------------------------
+// V16-03 FR-B/FR-C: context pipeline and system messages
+// (9789-context-handler-system-messages.test.ts intents @ 005af57d8)
+// ---------------------------------------------------------------------------
+
+/// #9789/#9822: a `context` handler that slices the conversation must not
+/// drop the prompt/tool checkpoint — the restored system message leads the
+/// request and the tool declarations survive
+/// (runner.ts:1187-1317 @ 005af57d8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_handler_slice_keeps_prompt_and_tools() {
+    let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_for_factory = seen.clone();
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        let seen = seen_for_factory.clone();
+        api.on(
+            "context",
+            Arc::new(move |payload: Value, _ctx| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    let messages = payload["messages"].as_array().cloned().unwrap_or_default();
+                    for message in &messages {
+                        assert_ne!(message["role"], "system", "handlers see no system messages");
+                    }
+                    seen.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(messages.clone());
+                    // Slice from the compaction summary / last visible
+                    // message, exactly like the reported regression.
+                    let last = messages.last().cloned().unwrap_or(Value::Null);
+                    Ok(json!({"messages": [last]}))
+                })
+            }),
+        )
+        .expect("register context handler");
+        Box::pin(async { Ok(()) })
+    });
+    let host = NativeExtensionHost::new("/context-cwd");
+    let errors = host
+        .load_inline(&[InlineExtension::Anonymous(factory)])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let fixture = fixture(vec![text_step("done")], host).await;
+    run_prompt(&fixture).await;
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(!seen.is_empty(), "context handler ran");
+    assert!(
+        !seen
+            .last()
+            .expect("last observation")
+            .iter()
+            .any(|message| message["role"] == "system")
+    );
+
+    let contexts = fixture
+        .provider
+        .contexts_seen()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let context = contexts.last().expect("provider request");
+    assert_eq!(context.messages[0].role(), rpi_ai::types::Role::System);
+    let tools = rpi_ai::utils::transcript::get_current_tools(&context.messages);
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["updating"],
+        "active tool declarations survive the slice"
+    );
+}
+
+/// `context_with_system` runs after `context` on the restored transcript and
+/// its output is sent verbatim — stripping a tool from `toolsAdded` removes
+/// it from the provider request (runner.ts:1320-1354 @ 005af57d8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_with_system_output_is_sent_verbatim() {
+    let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_for_factory = seen.clone();
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        let seen = seen_for_factory.clone();
+        api.on(
+            "context_with_system",
+            Arc::new(move |payload: Value, _ctx| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    let mut messages = payload["messages"].as_array().cloned().unwrap_or_default();
+                    seen.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(messages.clone());
+                    if let Some(first) = messages.first_mut()
+                        && let Some(tools) =
+                            first.get_mut("toolsAdded").and_then(Value::as_array_mut)
+                    {
+                        tools.retain(|tool| tool["name"] != "updating");
+                    }
+                    Ok(json!({"messages": messages}))
+                })
+            }),
+        )
+        .expect("register context_with_system handler");
+        Box::pin(async { Ok(()) })
+    });
+    let host = NativeExtensionHost::new("/context-system-cwd");
+    let errors = host
+        .load_inline(&[InlineExtension::Anonymous(factory)])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let fixture = fixture(vec![text_step("done")], host).await;
+    run_prompt(&fixture).await;
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let input = seen.last().expect("context_with_system ran");
+    assert_eq!(
+        input[0]["role"], "system",
+        "full transcript including system"
+    );
+
+    let contexts = fixture
+        .provider
+        .contexts_seen()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let context = contexts.last().expect("provider request");
+    let tools = rpi_ai::utils::transcript::get_current_tools(&context.messages);
+    assert!(
+        tools.is_empty(),
+        "verbatim output drops the stripped tool: {tools:?}"
+    );
+    // The session's executable loadout is untouched.
+    assert!(
+        fixture
+            .session
+            .get_active_tool_names()
+            .iter()
+            .any(|name| name == "updating")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V16-03 FR-D: boundary cluster (turn_end / agent_before_settle drafts)
+// ---------------------------------------------------------------------------
+
+/// FR-D R3/R4: a `turn_end` handler returning `{entries, continue: true}`
+/// persists the structural entry and forces one next provider request
+/// (agent-session.ts:834-850, runner.ts:1020-1078 @ 005af57d8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turn_end_boundary_persists_entries_and_continues() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_factory = calls.clone();
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        let calls = calls_for_factory.clone();
+        api.on(
+            "turn_end",
+            Arc::new(move |_payload: Value, _ctx| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok(json!({
+                            "entries": [
+                                {
+                                    "type": "custom",
+                                    "customType": "boundary-note",
+                                    "data": {"source": "turn-end"}
+                                },
+                                {
+                                    "type": "custom_message",
+                                    "customType": "boundary-context",
+                                    "content": "runnable context",
+                                    "display": false
+                                }
+                            ],
+                            "continue": true
+                        }))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                })
+            }),
+        )
+        .expect("register turn_end handler");
+        Box::pin(async { Ok(()) })
+    });
+    let host = NativeExtensionHost::new("/boundary-cwd");
+    let errors = host
+        .load_inline(&[InlineExtension::Anonymous(factory)])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let fixture = fixture(vec![text_step("one"), text_step("two")], host).await;
+    run_prompt(&fixture).await;
+
+    let calls = fixture.provider.faux().call_count();
+    assert_eq!(
+        calls, 2,
+        "boundary continue forced one context-only request"
+    );
+
+    let branch = fixture
+        .session
+        .session_manager()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_branch(None);
+    let note = branch.iter().find(|entry| {
+        entry.raw_value().get("customType").and_then(Value::as_str) == Some("boundary-note")
+    });
+    let note = note.expect("boundary custom entry persisted");
+    assert_eq!(note.raw_value()["data"]["source"], "turn-end");
+}
+
+/// FR-D R4: an `agent_before_settle` handler appends a draft and the entry
+/// lands in the session before settlement
+/// (agent-session.ts:1820-1843 @ 005af57d8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_before_settle_boundary_persists_entries() {
+    let factory: ExtensionFactory = Arc::new(|api| {
+        api.on(
+            "agent_before_settle",
+            Arc::new(move |payload: Value, _ctx| {
+                Box::pin(async move {
+                    // Boundary state rides the payload.
+                    assert!(payload.get("entries").is_some());
+                    assert!(payload.get("context").is_some());
+                    assert_eq!(payload["outcome"], "completed");
+                    Ok(json!({
+                        "entries": [{
+                            "type": "custom_message",
+                            "customType": "settle-note",
+                            "content": "settled",
+                            "display": false
+                        }]
+                    }))
+                })
+            }),
+        )
+        .expect("register agent_before_settle handler");
+        Box::pin(async { Ok(()) })
+    });
+    let host = NativeExtensionHost::new("/before-settle-cwd");
+    let errors = host
+        .load_inline(&[InlineExtension::Anonymous(factory)])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let fixture = fixture(vec![text_step("done")], host).await;
+    run_prompt(&fixture).await;
+
+    let branch = fixture
+        .session
+        .session_manager()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_branch(None);
+    let note = branch.iter().find(|entry| {
+        entry.raw_value().get("customType").and_then(Value::as_str) == Some("settle-note")
+    });
+    assert!(note.is_some(), "agent_before_settle draft persisted");
 }

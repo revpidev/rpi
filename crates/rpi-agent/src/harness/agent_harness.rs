@@ -1377,7 +1377,7 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
             convert_to_llm: Arc::new(|messages| Box::pin(async move { convert_to_llm(&messages) })),
             transform_context: Some(transform_context),
             get_api_key: None,
-            should_stop_after_turn: None,
+            finish_turn: None,
             prepare_request: None,
             prepare_next_turn: Some(prepare_next_turn),
             get_steering_messages: Some(get_steering_messages),

@@ -254,6 +254,17 @@ pub struct ExtensionErrorInfo {
     pub error: String,
 }
 
+/// `emitBoundary` context builder (V16-03): rebuilds the boundary preview
+/// from the current draft list. `Arc`-wrapped so async trait dispatch stays
+/// `Send + 'static`.
+pub type BoundaryContextBuilder = Arc<
+    dyn Fn(
+            Vec<serde_json::Value>,
+        ) -> futures::future::BoxFuture<'static, Result<serde_json::Value, String>>
+        + Send
+        + Sync,
+>;
+
 /// `ProjectTrustEventDecision` (extensions/types.ts): `"yes" | "no" |
 /// "undecided"`. `Undecided` falls through to the next handler
 /// (runner.ts:216-218); the first yes/no wins.
@@ -466,6 +477,19 @@ pub trait ExtensionRunner: Send + Sync {
     /// `context` transform hook (sdk.ts `transformContext`).
     async fn emit_context(&self, messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
         messages
+    }
+
+    /// `emitBoundary` (runner.ts:1020-1078 @ 005af57d8): the chained
+    /// `{entries, continue, context}` dispatch used for `turn_end` and
+    /// `agent_before_settle`. Default = no handlers, no dispatch.
+    fn emit_boundary(
+        &self,
+        _event_type: &str,
+        _base_event: serde_json::Value,
+        _build_context: BoundaryContextBuilder,
+    ) -> futures::future::BoxFuture<'static, Option<rpi_ext_host::types::BoundaryDispatchResult>>
+    {
+        Box::pin(async { None })
     }
 
     /// `cache_warming_decision` (#9668, c596d09d9): returns the effective

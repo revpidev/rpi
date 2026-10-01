@@ -33,16 +33,52 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::{Map, Value, json};
 
+use crate::api::BoxFuture;
 use crate::api::{
     EventHandler, ExtensionContext, ExtensionRuntime, HostActions, InsertionMap, LoadedExtension,
     Unsubscribe,
 };
 use crate::types::{
-    DiagnosticKind, EVENT_BEFORE_AGENT_START, EVENT_CONTEXT, EVENT_INPUT, EVENT_MESSAGE_END,
-    EVENT_TOOL_CALL, EVENT_TOOL_RESULT, EVENT_USER_BASH, ExtensionError, ExtensionFlag,
-    ExtensionShortcut, HostDiagnostic, RegisteredCommand, RegisteredTool, ResolvedCommand,
-    is_session_before_event,
+    BoundaryDispatchResult, BoundaryResult, DiagnosticKind, EVENT_AGENT_BEFORE_SETTLE,
+    EVENT_BEFORE_AGENT_START, EVENT_CONTEXT, EVENT_CONTEXT_WITH_SYSTEM, EVENT_INPUT,
+    EVENT_MESSAGE_END, EVENT_TOOL_CALL, EVENT_TOOL_RESULT, EVENT_TURN_END, EVENT_USER_BASH,
+    ExtensionError, ExtensionFlag, ExtensionShortcut, HostDiagnostic, RegisteredCommand,
+    RegisteredTool, ResolvedCommand, is_session_before_event,
 };
+
+/// `restoreSystemMessages` (runner.ts:275-297 @ 005af57d8): re-attach the
+/// prompt and tool state after a `context` handler changed the conversation.
+/// The replayed prompt/tool checkpoint becomes one leading system message so
+/// pruning, windowing, or slicing from a compaction summary cannot drop it.
+fn restore_system_messages(current: &Value, returned: &Value) -> Value {
+    let head = current_system_message_value(current);
+    let mut restored: Vec<Value> = Vec::new();
+    if let Some(head) = head {
+        restored.push(head);
+    }
+    if let Some(items) = returned.as_array() {
+        restored.extend(items.iter().cloned());
+    }
+    Value::Array(restored)
+}
+
+/// `getCurrentSystemMessage` over the JSON transcript: the replayed prompt
+/// and tool declarations as one `system` message.
+fn current_system_message_value(messages: &Value) -> Option<Value> {
+    let typed: Vec<rpi_agent::messages::AgentMessage> =
+        serde_json::from_value(messages.clone()).ok()?;
+    let llm_messages: Vec<rpi_ai::types::Message> = typed
+        .iter()
+        .filter_map(|message| match message {
+            rpi_agent::messages::AgentMessage::System(system) => {
+                Some(rpi_ai::types::Message::System(system.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let head = rpi_ai::utils::transcript::get_current_system_message(&llm_messages)?;
+    serde_json::to_value(rpi_agent::messages::AgentMessage::System(head)).ok()
+}
 
 fn read<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     m.read().unwrap_or_else(|e| e.into_inner())
@@ -590,6 +626,18 @@ impl ExtensionRunnerCore {
     /// `session_before_*` events the last non-null result is returned and
     /// `cancel: true` short-circuits immediately.
     pub async fn emit(&self, event_type: &str, payload: Value) -> Option<Value> {
+        // `ExtensionRunner.emit()` refuses the boundary events; they are
+        // dispatched through `emit_boundary` with the chained
+        // `{entries, continue, context}` state (runner.ts:172-189 @
+        // 005af57d8).
+        if matches!(event_type, EVENT_TURN_END | EVENT_AGENT_BEFORE_SETTLE) {
+            self.emit_error(ExtensionError::new(
+                "<boundary>",
+                event_type,
+                format!("{event_type} must be dispatched through emit_boundary"),
+            ));
+            return None;
+        }
         let session_before = is_session_before_event(event_type);
         let mut payload = payload;
         // Every upstream event object carries its `type` tag; stamp it so
@@ -617,6 +665,91 @@ impl ExtensionRunnerCore {
         }
 
         result
+    }
+
+    /// `emitBoundary` (runner.ts:1020-1078 @ 005af57d8): chained
+    /// `{entries, continue}` state over the boundary handlers. After every
+    /// handler the caller rebuilds the boundary context preview; a failed
+    /// rebuild invalidates the dispatch (drafts and continuation are
+    /// discarded, but the last preview still rides the result).
+    pub async fn emit_boundary(
+        &self,
+        event_type: &str,
+        base_event: Value,
+        build_context: &(
+             dyn Fn(Vec<Value>) -> BoxFuture<'static, Result<Value, String>> + Send + Sync
+         ),
+    ) -> BoundaryDispatchResult {
+        let mut entries: Vec<Value> = Vec::new();
+        let mut should_continue = false;
+        let mut context = match build_context(entries.clone()).await {
+            Ok(context) => context,
+            Err(error) => {
+                self.emit_error(ExtensionError::new(
+                    "<boundary>",
+                    event_type,
+                    format!("Invalid boundary entries: {error}"),
+                ));
+                Value::Null
+            }
+        };
+        let mut valid = true;
+
+        for (path, handler) in self.handlers_for(event_type) {
+            let ctx = self.create_context();
+            let mut event = base_event.clone();
+            if let Value::Object(map) = &mut event {
+                map.insert("entries".to_owned(), Value::Array(entries.clone()));
+                map.insert("continue".to_owned(), Value::Bool(should_continue));
+                map.insert("context".to_owned(), context.clone());
+            }
+            match handler(event, ctx).await {
+                Ok(handler_result) => {
+                    if let Ok(result) = serde_json::from_value::<BoundaryResult>(handler_result) {
+                        if let Some(new_entries) = result.entries {
+                            entries = new_entries;
+                        }
+                        if let Some(new_continue) = result.continue_ {
+                            should_continue = new_continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.emit_error(ExtensionError::new(&path, event_type, error));
+                }
+            }
+
+            match build_context(entries.clone()).await {
+                Ok(preview) => {
+                    context = preview;
+                    valid = true;
+                }
+                Err(error) => {
+                    valid = false;
+                    self.emit_error(ExtensionError::new(
+                        &path,
+                        event_type,
+                        format!("Invalid boundary entries: {error}"),
+                    ));
+                }
+            }
+        }
+
+        if valid {
+            BoundaryDispatchResult {
+                entries,
+                continue_: should_continue,
+                context,
+                valid: true,
+            }
+        } else {
+            BoundaryDispatchResult {
+                entries: Vec::new(),
+                continue_: false,
+                context,
+                valid: false,
+            }
+        }
     }
 
     /// `emitCacheWarmingDecision` (#9668, c596d09d9; runner.ts:921-941):
@@ -843,26 +976,102 @@ impl ExtensionRunnerCore {
         Ok(None)
     }
 
-    /// `emitContext` (runner.ts:971-1001): chained `messages` replacement.
+    /// `emitContext` (runner.ts:1247-1355 @ 005af57d8): the two-phase
+    /// request-time transform. `context` handlers see the conversation only
+    /// and pi restores the prompt/tool state after each; then
+    /// `context_with_system` handlers see the full transcript and their
+    /// output is used as returned.
     pub async fn emit_context(&self, messages: Value) -> Value {
         let mut current_messages = messages;
 
+        // Phase 1: `context` handlers never see system messages. An unchanged
+        // conversation keeps every system message in place so models with
+        // mid-conversation support keep their cached prefix; a changed one
+        // gets the replayed prompt/tool checkpoint as one leading system
+        // message (runner.ts:1187-1317).
         for (path, handler) in self.handlers_for(EVENT_CONTEXT) {
             let ctx = self.create_context();
+            let visible_messages: Vec<Value> = current_messages
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|message| {
+                            message.get("role").and_then(Value::as_str) != Some("system")
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let visible_snapshot = Value::Array(visible_messages.clone());
             let event = serde_json::json!({
                 "type": EVENT_CONTEXT,
-                "messages": current_messages,
+                "messages": visible_messages,
             });
             match handler(event, ctx).await {
                 Ok(handler_result) => {
-                    if let Some(messages) = handler_result.get("messages")
-                        && !messages.is_null()
-                    {
-                        current_messages = messages.clone();
+                    // rpi ABI note: handlers return the replacement list;
+                    // in-place mutation of `event.messages` cannot cross the
+                    // by-value JSON boundary (upstream also accepts it).
+                    let Some(returned) = handler_result
+                        .get("messages")
+                        .filter(|messages| !messages.is_null())
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    if returned == visible_snapshot {
+                        continue;
                     }
+                    current_messages = restore_system_messages(&current_messages, &returned);
                 }
                 Err(error) => {
                     self.emit_error(ExtensionError::new(&path, EVENT_CONTEXT, error));
+                }
+            }
+        }
+
+        // Phase 2: `context_with_system` handlers see the restored full
+        // transcript; their output is sent verbatim (runner.ts:1320-1354).
+        for (path, handler) in self.handlers_for(EVENT_CONTEXT_WITH_SYSTEM) {
+            let ctx = self.create_context();
+            let had_leading_system_message = current_messages
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("system");
+            let event = serde_json::json!({
+                "type": EVENT_CONTEXT_WITH_SYSTEM,
+                "messages": current_messages.clone(),
+            });
+            match handler(event, ctx).await {
+                Ok(handler_result) => {
+                    if let Some(returned) = handler_result
+                        .get("messages")
+                        .filter(|messages| !messages.is_null())
+                    {
+                        current_messages = returned.clone();
+                    }
+                    // Providers read the prompt and initial tools from the
+                    // leading system message. Losing it is never intended;
+                    // report it but honor the handler's output.
+                    let still_leading_system = current_messages
+                        .as_array()
+                        .and_then(|items| items.first())
+                        .and_then(|message| message.get("role"))
+                        .and_then(Value::as_str)
+                        == Some("system");
+                    if had_leading_system_message && !still_leading_system {
+                        self.emit_error(ExtensionError::new(
+                            &path,
+                            EVENT_CONTEXT_WITH_SYSTEM,
+                            "Handler removed the leading system message; the request has no prompt or initial tool declarations. Keep it at index 0 or replace a dropped prefix with getCurrentSystemMessage().".to_owned(),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.emit_error(ExtensionError::new(&path, EVENT_CONTEXT_WITH_SYSTEM, error));
                 }
             }
         }

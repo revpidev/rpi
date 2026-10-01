@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use futures::future::BoxFuture;
 use rpi_agent::compaction::branch_summarization::{
     CollectEntriesResult, GenerateBranchSummaryOptions, collect_entries_for_branch_summary,
     generate_branch_summary,
@@ -35,8 +36,8 @@ use rpi_agent::session::SessionEntry;
 use rpi_agent::types::{AgentEvent, AgentTool, QueueMode, ThinkingLevel};
 use rpi_agent::{Agent, AgentError};
 use rpi_agent::{
-    AgentContext, AgentLoopTurnUpdate, AgentRequestUpdate, PrepareNextTurnContext,
-    PrepareRequestContext,
+    AgentContext, AgentLoopTurnUpdate, AgentRequestUpdate, AgentTurnContext, AgentTurnDecision,
+    PrepareNextTurnContext, PrepareRequestContext,
 };
 use rpi_ai::models::{clamp_thinking_level, get_supported_thinking_levels, models_are_equal};
 use rpi_ai::models_json::OrderedMap;
@@ -49,6 +50,7 @@ use rpi_ai::utils::retry::{RetryPolicy, is_retryable_assistant_error};
 use rpi_ai::utils::text::content_text_user;
 use rpi_ext_host::types as ext;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -57,14 +59,14 @@ use crate::core::auth_guidance::{
 };
 use crate::core::compaction_runner::{CompactionEvent, CompactionRunner};
 use crate::core::extensions::{
-    ExtensionMode, ExtensionRunner, ExtensionRunnerRef, InputEventResult, InputSource,
-    SessionStartEvent, SessionStartReason, StreamingBehavior, read_runner,
+    ExtensionErrorInfo, ExtensionMode, ExtensionRunner, ExtensionRunnerRef, InputEventResult,
+    InputSource, SessionStartEvent, SessionStartReason, StreamingBehavior, read_runner,
 };
 use crate::core::model_resolver::ScopedModel;
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::prompt_templates::expand_prompt_template;
 use crate::core::resource_loader::DefaultResourceLoader;
-use crate::core::session_manager::{SessionManager, StoredEntry};
+use crate::core::session_manager::{NewSessionOptions, SessionManager, StoredEntry};
 use crate::core::settings_manager::{RetryConfig, SettingsManager};
 use crate::core::skills::strip_frontmatter;
 use crate::core::system_prompt::{BuildSystemPromptOptions, build_system_prompt};
@@ -397,6 +399,11 @@ fn builtin_tool_guidelines(name: &str) -> &'static [&'static str] {
 // AgentSession
 // ============================================================================
 
+/// `_deferredSettledActions` entries (agent-session.ts:418 @ 005af57d8):
+/// work requested from `agent_settled` handlers, run after every settled
+/// handler finished.
+type DeferredSettledAction = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
+
 struct AgentSessionInner {
     agent: Arc<Agent>,
     session_manager: Arc<Mutex<SessionManager>>,
@@ -449,6 +456,22 @@ struct AgentSessionInner {
     /// `turn_start` / `turn_end` extension event payloads (HR-B,
     /// rpi-statusline 03-realtime-token-count §1.3).
     turn_index: AtomicU32,
+
+    /// `_boundaryDispatchedMessages` (agent-session.ts:413 @ 005af57d8):
+    /// assistant messages whose `turn_end` boundary already ran inside
+    /// `finishTurn`; the event-time fallback skips them.
+    boundary_dispatched_messages: Mutex<Vec<AssistantMessage>>,
+    /// `_lastActivityOutcome` (agent-session.ts:418): the outcome carried by
+    /// `turn_end` / `agent_before_settle` boundary payloads.
+    last_activity_outcome: Mutex<ext::AgentActivityOutcome>,
+    /// `_isBeforeSettle` / `_abortDuringBeforeSettle` (agent-session.ts:415-416).
+    is_before_settle: AtomicBool,
+    abort_during_before_settle: AtomicBool,
+    /// `_isEmittingAgentSettled` / `_deferredSettledActions`
+    /// (agent-session.ts:417-418): runs requested from `agent_settled`
+    /// handlers wait until every settled handler finished.
+    is_emitting_agent_settled: AtomicBool,
+    deferred_settled_actions: Mutex<Vec<DeferredSettledAction>>,
 
     retry_attempt: Mutex<u32>,
     retry_abort: Mutex<Option<CancellationToken>>,
@@ -583,6 +606,12 @@ impl AgentSession {
             pending_custom_messages: Mutex::new(Vec::new()),
             last_assistant_message: Mutex::new(None),
             turn_index: AtomicU32::new(0),
+            boundary_dispatched_messages: Mutex::new(Vec::new()),
+            last_activity_outcome: Mutex::new(ext::AgentActivityOutcome::Completed),
+            is_before_settle: AtomicBool::new(false),
+            abort_during_before_settle: AtomicBool::new(false),
+            is_emitting_agent_settled: AtomicBool::new(false),
+            deferred_settled_actions: Mutex::new(Vec::new()),
             retry_attempt: Mutex::new(0),
             retry_abort: Mutex::new(None),
             bash_tokens: Mutex::new(Vec::new()),
@@ -692,6 +721,9 @@ impl AgentSession {
         // 754-780 @ 005af57d8): a SessionManager projection becomes the
         // provider-context authority before every conversational request.
         session.install_agent_request_projection();
+        // `_installAgentBoundaryHooks()` (agent-session.ts:398, 852-862):
+        // `turn_end` boundary dispatch runs inside `finishTurn`.
+        session.install_agent_boundary_hooks();
         // `_installAgentForcedPromptProjection()` (agent-session.ts:417 @
         // #9548).
         session.install_agent_forced_prompt_projection();
@@ -950,12 +982,12 @@ impl AgentSession {
             let branch = session.get_branch(None);
             if let Some(index) = branch.iter().position(|entry| entry.id() == entry_id) {
                 for entry in &branch[index + 1..] {
-                    match entry.known() {
-                        Some(SessionEntry::Message(message)) => match &message.message {
-                            AgentMessage::ToolResult(_) => targets.push(entry.id().to_owned()),
-                            _ => break,
-                        },
-                        _ => {}
+                    if let Some(SessionEntry::Message(message)) = entry.known() {
+                        if matches!(message.message, AgentMessage::ToolResult(_)) {
+                            targets.push(entry.id().to_owned());
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
@@ -980,6 +1012,375 @@ impl AgentSession {
             }
         }
         self.refresh_context();
+    }
+
+    // ==================================================================
+    // Boundary cluster (agent-session.ts:852-1010 @ 005af57d8)
+    // ==================================================================
+
+    /// `_installAgentBoundaryHooks` (agent-session.ts:852-862):
+    /// `turn_end` boundary dispatch happens inside `finishTurn`, before the
+    /// loop emits its internal `turn_end` event.
+    fn install_agent_boundary_hooks(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let agent = self.inner.agent.clone();
+        let previous = agent.finish_turn();
+        agent.set_finish_turn(Some(Arc::new(
+            move |turn: AgentTurnContext, signal: CancellationToken| {
+                let weak = weak.clone();
+                let previous = previous.clone();
+                Box::pin(async move {
+                    let inner = weak.upgrade()?;
+                    let session = AgentSession { inner };
+                    lock(&session.inner.boundary_dispatched_messages).push(turn.message.clone());
+                    let extension_continue = session
+                        .dispatch_turn_end_boundary(&turn.message, &turn.tool_results)
+                        .await;
+                    let previous_decision = match previous.as_ref() {
+                        Some(previous) => previous(turn, signal).await,
+                        None => None,
+                    };
+                    if previous_decision == Some(AgentTurnDecision::End) {
+                        return Some(AgentTurnDecision::End);
+                    }
+                    if extension_continue || previous_decision == Some(AgentTurnDecision::Continue)
+                    {
+                        return Some(AgentTurnDecision::Continue);
+                    }
+                    None
+                })
+            },
+        )));
+    }
+
+    /// `_dispatchTurnEndBoundary` (agent-session.ts:834-850): records the
+    /// activity outcome, resolves the persisted entry ids, and runs the
+    /// `{entries, continue}` boundary chain.
+    async fn dispatch_turn_end_boundary(
+        &self,
+        message: &AssistantMessage,
+        tool_results: &[rpi_ai::types::ToolResultMessage],
+    ) -> bool {
+        *lock(&self.inner.last_activity_outcome) = match message.stop_reason {
+            StopReason::Aborted => ext::AgentActivityOutcome::Aborted,
+            StopReason::Error => ext::AgentActivityOutcome::Error,
+            _ => ext::AgentActivityOutcome::Completed,
+        };
+        let runner = self.runner();
+        if !runner.has_handlers("turn_end") {
+            return false;
+        }
+        let assistant_message = AgentMessage::Assistant(message.clone());
+        let Some(message_entry_id) = self.find_persisted_message_entry_id(&assistant_message)
+        else {
+            runner.emit_error(ExtensionErrorInfo {
+                extension_path: "<boundary>".to_owned(),
+                event: "turn_end".to_owned(),
+                error: "turn_end could not resolve the persisted assistant entry ID".to_owned(),
+            });
+            return false;
+        };
+        let tool_result_entry_ids: Vec<String> = tool_results
+            .iter()
+            .filter_map(|result| {
+                self.find_persisted_message_entry_id(&AgentMessage::ToolResult(result.clone()))
+            })
+            .collect();
+        let mut base_event = serde_json::to_value(ext::TurnEndEvent {
+            turn_index: self.inner.turn_index.load(Ordering::SeqCst),
+            message: assistant_message,
+            tool_results: tool_results.to_vec(),
+            message_entry_id,
+            tool_result_entry_ids,
+            outcome: *lock(&self.inner.last_activity_outcome),
+        })
+        .unwrap_or(Value::Null);
+        // Upstream base events carry their `type` tag; the typed struct has
+        // none, so stamp it like the generic emit path does.
+        if let Value::Object(map) = &mut base_event {
+            map.insert("type".to_owned(), Value::String("turn_end".to_owned()));
+        }
+
+        let weak = Arc::downgrade(&self.inner);
+        let build_context: crate::core::extensions::BoundaryContextBuilder =
+            Arc::new(move |drafts: Vec<Value>| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let inner = weak.upgrade().ok_or_else(|| "session dropped".to_owned())?;
+                    AgentSession { inner }
+                        .build_boundary_context(drafts, "turn_end")
+                        .await
+                })
+            });
+        let Some(boundary) = runner
+            .emit_boundary("turn_end", base_event, build_context)
+            .await
+        else {
+            return false;
+        };
+        self.commit_boundary_drafts(boundary.entries);
+        let can_continue = self
+            .build_boundary_context(Vec::new(), "turn_end")
+            .await
+            .ok()
+            .and_then(|context| context.get("canContinue").and_then(Value::as_bool))
+            .unwrap_or(false);
+        if boundary.continue_ && !can_continue {
+            self.report_invalid_boundary_continuation("turn_end");
+            return false;
+        }
+        boundary.continue_
+    }
+
+    /// `_runBeforeSettleBoundary` (agent-session.ts:1820-1843 @ 005af57d8).
+    async fn run_before_settle_boundary(&self) -> bool {
+        let runner = self.runner();
+        if !runner.has_handlers("agent_before_settle") {
+            return self.inner.agent.has_queued_messages();
+        }
+        self.inner.is_before_settle.store(true, Ordering::SeqCst);
+        self.inner
+            .abort_during_before_settle
+            .store(false, Ordering::SeqCst);
+        let base_event = serde_json::json!({
+            "type": "agent_before_settle",
+            "outcome": *lock(&self.inner.last_activity_outcome),
+        });
+        let weak = Arc::downgrade(&self.inner);
+        let build_context: crate::core::extensions::BoundaryContextBuilder =
+            Arc::new(move |drafts: Vec<Value>| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let inner = weak.upgrade().ok_or_else(|| "session dropped".to_owned())?;
+                    AgentSession { inner }
+                        .build_boundary_context(drafts, "agent_before_settle")
+                        .await
+                })
+            });
+        let result = runner
+            .emit_boundary("agent_before_settle", base_event, build_context)
+            .await;
+        self.inner.is_before_settle.store(false, Ordering::SeqCst);
+        let Some(result) = result else {
+            return false;
+        };
+        self.commit_boundary_drafts(result.entries);
+        self.flush_pending_custom_messages();
+        if self.inner.abort_during_before_settle.load(Ordering::SeqCst) {
+            return false;
+        }
+        let should_continue = result.continue_ || self.inner.agent.has_queued_messages();
+        if should_continue {
+            let can_continue = self
+                .build_boundary_context(Vec::new(), "agent_before_settle")
+                .await
+                .ok()
+                .and_then(|context| context.get("canContinue").and_then(Value::as_bool))
+                .unwrap_or(false);
+            if !can_continue {
+                if result.continue_ {
+                    self.report_invalid_boundary_continuation("agent_before_settle");
+                }
+                return false;
+            }
+        }
+        should_continue
+    }
+
+    /// `_buildBoundaryContext` (agent-session.ts:963-991): builds the
+    /// preview context from a temporary session manager with the drafts
+    /// applied, plus the pending queue/custom messages and the
+    /// runnable-continuation predicate.
+    async fn build_boundary_context(
+        &self,
+        drafts: Vec<Value>,
+        boundary: &str,
+    ) -> Result<Value, String> {
+        let (header, branch_entries) = {
+            let session = lock(&self.inner.session_manager);
+            (session.get_header().cloned(), session.get_branch(None))
+        };
+        let mut preview_entries: Vec<rpi_agent::session::FileEntry> = Vec::new();
+        if let Some(header) = header {
+            preview_entries.push(rpi_agent::session::FileEntry::Session(header));
+        }
+        for entry in branch_entries {
+            if let Some(typed) = entry.known()
+                && let Ok(value) = serde_json::to_value(typed)
+                && let Ok(file_entry) = serde_json::from_value(value)
+            {
+                preview_entries.push(file_entry);
+            }
+        }
+        let mut manager = SessionManager::in_memory_with_entries(
+            Some(std::path::Path::new(&self.inner.cwd)),
+            NewSessionOptions::default(),
+            Some(preview_entries),
+        )
+        .map_err(|error| error.to_string())?;
+        self.apply_boundary_drafts(&mut manager, &drafts)
+            .map_err(|error| error.to_string())?;
+        let projection = manager.build_session_projection();
+        let pending_messages = self.get_pending_boundary_messages();
+        let llm_messages = (self.inner.agent.convert_to_llm)(projection.messages.clone()).await;
+        let final_role = llm_messages.last().map(rpi_ai::types::Message::role);
+        let has_non_system_context = llm_messages
+            .iter()
+            .any(|message| message.role() != rpi_ai::types::Role::System);
+        let context_can_continue =
+            has_non_system_context && final_role != Some(rpi_ai::types::Role::Assistant);
+        let pending_custom_context = !lock(&self.inner.pending_custom_messages).is_empty();
+        let has_queued = self.inner.agent.has_queued_messages();
+        let can_continue = context_can_continue
+            || pending_custom_context
+            || if boundary == "turn_end" {
+                has_queued
+            } else {
+                final_role == Some(rpi_ai::types::Role::Assistant) && has_queued
+            };
+        let context_entries: Vec<Value> = projection
+            .entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "sourceEntry": entry.source_entry.raw_value(),
+                    "messages": entry.messages,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "contextEntries": context_entries,
+            "contextMessages": projection.messages,
+            "llmMessages": llm_messages,
+            "pendingMessages": pending_messages,
+            "canContinue": can_continue,
+        }))
+    }
+
+    /// `_getPendingBoundaryMessages` (agent-session.ts:960-962).
+    fn get_pending_boundary_messages(&self) -> Vec<AgentMessage> {
+        let mut pending = self.inner.agent.peek_queued_messages();
+        pending.extend(lock(&self.inner.pending_custom_messages).iter().cloned());
+        pending
+    }
+
+    /// `_applyBoundaryDrafts` (agent-session.ts:907-953): applies drafts to a
+    /// session manager. Compaction drafts compute `tokensBefore` from the
+    /// projected context at that point.
+    fn apply_boundary_drafts(
+        &self,
+        manager: &mut SessionManager,
+        drafts: &[Value],
+    ) -> Result<Vec<SessionEntry>, RpiError> {
+        let mut appended = Vec::new();
+        for draft in drafts {
+            let draft: ext::SessionBoundaryDraft = serde_json::from_value(draft.clone())
+                .map_err(|error| RpiError::Session(format!("Invalid boundary draft: {error}")))?;
+            let entry_id = match draft {
+                ext::SessionBoundaryDraft::Custom { custom_type, data } => {
+                    manager.append_custom_entry(&custom_type, data)?
+                }
+                ext::SessionBoundaryDraft::CustomMessage {
+                    custom_type,
+                    content,
+                    display,
+                    details,
+                } => {
+                    let content: rpi_ai::types::UserContent = serde_json::from_value(content)
+                        .map_err(|error| {
+                            RpiError::Session(format!("Invalid custom message content: {error}"))
+                        })?;
+                    manager.append_custom_message_entry(&custom_type, content, display, details)?
+                }
+                ext::SessionBoundaryDraft::ContextEdit {
+                    target_id,
+                    replacement,
+                } => {
+                    let replacement = match replacement {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(
+                            serde_json::from_value::<rpi_agent::session::ContextEditReplacement>(
+                                value,
+                            )
+                            .map_err(|error| {
+                                RpiError::Session(format!(
+                                    "Invalid context edit replacement: {error}"
+                                ))
+                            })?,
+                        ),
+                    };
+                    manager.append_context_edit(&target_id, replacement)?
+                }
+                ext::SessionBoundaryDraft::Compaction {
+                    summary,
+                    first_kept_entry_id,
+                    details,
+                    usage,
+                } => {
+                    let branch: Vec<SessionEntry> = manager
+                        .get_branch(None)
+                        .into_iter()
+                        .filter_map(|entry| entry.known().cloned())
+                        .collect();
+                    let projection = rpi_agent::session::build_session_projection(&branch);
+                    let tokens_before = rpi_agent::compaction::estimate_projected_context_tokens(
+                        &projection,
+                        &branch,
+                    )
+                    .tokens;
+                    manager.append_compaction(
+                        &summary,
+                        first_kept_entry_id.as_deref(),
+                        tokens_before,
+                        details,
+                        Some(true),
+                        usage,
+                    )?
+                }
+            };
+            if let Some(entry) = manager
+                .get_entry(&entry_id)
+                .and_then(|entry| entry.known().cloned())
+            {
+                appended.push(entry);
+            }
+        }
+        Ok(appended)
+    }
+
+    /// `_commitBoundaryDrafts` (agent-session.ts:993-998): persist the
+    /// accepted drafts on the real session, refresh the finalized context,
+    /// and announce each appended entry.
+    fn commit_boundary_drafts(&self, drafts: Vec<Value>) {
+        if drafts.is_empty() {
+            return;
+        }
+        let appended = {
+            let mut manager = lock(&self.inner.session_manager);
+            self.apply_boundary_drafts(&mut manager, &drafts)
+        };
+        match appended {
+            Ok(appended) => {
+                self.refresh_context();
+                for entry in appended {
+                    self.emit(AgentSessionEvent::Session(SessionEvent::EntryAppended {
+                        entry: Box::new(entry),
+                    }));
+                }
+            }
+            Err(error) => {
+                tracing::warn!("boundary draft commit failed: {error}");
+            }
+        }
+    }
+
+    /// `_reportInvalidBoundaryContinuation` (agent-session.ts:1000-1006).
+    fn report_invalid_boundary_continuation(&self, event: &str) {
+        self.runner().emit_error(ExtensionErrorInfo {
+            extension_path: "<boundary>".to_owned(),
+            event: event.to_owned(),
+            error: format!("{event} requested continuation without runnable model context"),
+        });
     }
 
     /// Weak handle for the host-action bridge (T15 W3).
@@ -1026,6 +1427,20 @@ impl AgentSession {
         }
         self.runner().emit("agent_settled").await;
         self.emit(AgentSessionEvent::Session(SessionEvent::AgentSettled));
+        self.inner
+            .is_emitting_agent_settled
+            .store(false, Ordering::SeqCst);
+        // `_deferredSettledActions` (agent-session.ts:1046-1062 @ 005af57d8):
+        // runs requested from settled handlers execute after every handler
+        // finished, then the idle wait resolves.
+        let deferred: Vec<_> = std::mem::take(&mut *lock(&self.inner.deferred_settled_actions));
+        if deferred.is_empty() {
+            self.resolve_idle_wait_if_idle();
+            return;
+        }
+        for action in deferred {
+            action().await;
+        }
         self.resolve_idle_wait_if_idle();
     }
 
@@ -1218,16 +1633,25 @@ impl AgentSession {
                 tool_results,
             } => {
                 let turn_index = self.inner.turn_index.load(Ordering::SeqCst);
-                if runner.has_handlers("turn_end") {
-                    let payload = serde_json::to_value(ext::TurnEndEvent {
-                        turn_index,
-                        message: message.clone(),
-                        tool_results: tool_results.clone(),
-                    })
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                    runner.emit_event("turn_end", payload).await;
+                // The boundary normally already ran inside `finishTurn`
+                // (`_boundaryDispatchedMessages`); the event-time fallback
+                // covers messages that bypassed the hook
+                // (agent-session.ts:1261-1265 @ 005af57d8).
+                if let AgentMessage::Assistant(assistant) = message {
+                    let already_dispatched = {
+                        let mut dispatched = lock(&self.inner.boundary_dispatched_messages);
+                        dispatched
+                            .iter()
+                            .position(|candidate| candidate == assistant)
+                            .map(|index| dispatched.remove(index))
+                            .is_some()
+                    };
+                    if !already_dispatched {
+                        self.dispatch_turn_end_boundary(assistant, tool_results)
+                            .await;
+                    }
                 }
-                // agent-session.ts:748: `_turnIndex++` after the emit (HR-B).
+                // agent-session.ts:1266: `_turnIndex++` after the dispatch (HR-B).
                 self.inner
                     .turn_index
                     .store(turn_index + 1, Ordering::SeqCst);
@@ -2106,7 +2530,40 @@ impl AgentSession {
     /// `_runAgentPrompt` (agent-session.ts:1061-1073 @ de2de549b: resets
     /// `_agentRunAbortRequested` at entry and finalizes cancelled retries in
     /// the `finally` block).
-    async fn run_agent_prompt(&self, messages: Vec<AgentMessage>) -> Result<(), RpiError> {
+    /// Boxed entry point for the recursive prompt loop: the concrete
+    /// `BoxFuture` type gives the compiler a `Send` obligation to check
+    /// against, which an `async fn` calling itself cannot provide.
+    fn run_agent_prompt(
+        &self,
+        messages: Vec<AgentMessage>,
+    ) -> BoxFuture<'static, Result<(), RpiError>> {
+        let session = AgentSession {
+            inner: self.inner.clone(),
+        };
+        Box::pin(async move { session.run_agent_prompt_inner(messages).await })
+    }
+
+    async fn run_agent_prompt_inner(&self, messages: Vec<AgentMessage>) -> Result<(), RpiError> {
+        // Requests made from `agent_settled` handlers wait until every
+        // settled handler finished (agent-session.ts:1896 / :2242 @
+        // 005af57d8; rpi adapts the two upstream deferral points to the
+        // single run entry point).
+        if self.inner.is_emitting_agent_settled.load(Ordering::SeqCst) {
+            let weak = Arc::downgrade(&self.inner);
+            lock(&self.inner.deferred_settled_actions).push(Box::new(move || {
+                Box::pin(async move {
+                    if let Some(inner) = weak.upgrade() {
+                        let session = AgentSession { inner };
+                        // The boxed entry point breaks the async-Send
+                        // inference cycle while keeping the future Send.
+                        if let Err(error) = session.run_agent_prompt(messages).await {
+                            tracing::warn!("deferred prompt failed: {error}");
+                        }
+                    }
+                }) as BoxFuture<'static, ()>
+            }));
+            return Ok(());
+        }
         self.inner
             .agent_run_abort_requested
             .store(false, Ordering::SeqCst);
@@ -2117,10 +2574,25 @@ impl AgentSession {
                 .prompt(messages)
                 .await
                 .map_err(agent_error_to_rpi)?;
-            while self.handle_post_agent_run().await {
-                // `if (this._agentRunAbortRequested) break`
-                // (agent-session.ts:1216) — an abort that lands after the
-                // continuation decision must not start another run.
+            while !self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
+                if self.handle_post_agent_run().await {
+                    if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    self.inner
+                        .agent
+                        .continue_run()
+                        .await
+                        .map_err(agent_error_to_rpi)?;
+                    continue;
+                }
+                // `_runBeforeSettleBoundary` (agent-session.ts:1820-1843):
+                // extension-provided entries may guarantee one more run.
+                if self.inner.agent_run_abort_requested.load(Ordering::SeqCst)
+                    || !self.run_before_settle_boundary().await
+                {
+                    break;
+                }
                 if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
                     break;
                 }
@@ -2794,6 +3266,13 @@ impl AgentSession {
         if self.inner.is_agent_run_active.load(Ordering::SeqCst) {
             self.inner
                 .agent_run_abort_requested
+                .store(true, Ordering::SeqCst);
+        }
+        // `if (this._isBeforeSettle) this._abortDuringBeforeSettle = true`
+        // (agent-session.ts:2368 @ 005af57d8).
+        if self.inner.is_before_settle.load(Ordering::SeqCst) {
+            self.inner
+                .abort_during_before_settle
                 .store(true, Ordering::SeqCst);
         }
         self.abort_retry();

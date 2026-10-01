@@ -33,10 +33,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{
     AfterToolCallFn, AgentContext, AgentEventSink, AgentLoopConfig, AgentLoopTurnUpdate,
-    AgentRequestUpdate, BeforeToolCallFn, ConvertToLlmFn, GetApiKeyFn, GetQueuedMessagesFn,
-    PrepareNextTurnContext, PrepareNextTurnFn, PrepareRequestContext, PrepareRequestFn,
-    ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn, now_millis,
-    run_agent_loop, run_agent_loop_continue, thinking_level_from_model_level,
+    AgentRequestUpdate, AgentTurnContext, AgentTurnDecision, BeforeToolCallFn, ConvertToLlmFn,
+    FinishTurnFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext, PrepareNextTurnFn,
+    PrepareRequestContext, PrepareRequestFn, TransformContextFn, now_millis, run_agent_loop,
+    run_agent_loop_continue, thinking_level_from_model_level,
 };
 use crate::error::AgentError;
 use crate::messages::AgentMessage;
@@ -53,11 +53,13 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub type AgentListener =
     Arc<dyn Fn(AgentEvent, CancellationToken) -> BoxFuture<'static, ()> + Send + Sync>;
 
-/// `shouldStopAfterTurn` (agent.ts:108, agent-side variant). Receives the
+/// `finishTurn` (agent.ts:108 @ 005af57d8, agent-side variant). Receives the
 /// active run's abort signal as the second argument (upstream
 /// `this.signal`).
-pub type ShouldStopAfterTurnAgentFn = Arc<
-    dyn Fn(ShouldStopAfterTurnContext, CancellationToken) -> BoxFuture<'static, bool> + Send + Sync,
+pub type FinishTurnAgentFn = Arc<
+    dyn Fn(AgentTurnContext, CancellationToken) -> BoxFuture<'static, Option<AgentTurnDecision>>
+        + Send
+        + Sync,
 >;
 
 /// `prepareRequest` (agent-side variant; agent.ts). Receives the active run's
@@ -172,7 +174,7 @@ pub struct AgentOptions {
     pub on_response: Option<rpi_ai::types::OnResponseCallback>,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
-    pub should_stop_after_turn: Option<ShouldStopAfterTurnAgentFn>,
+    pub finish_turn: Option<FinishTurnAgentFn>,
     pub prepare_request: Option<PrepareRequestAgentFn>,
     pub prepare_next_turn: Option<PrepareNextTurnSignalFn>,
     pub prepare_next_turn_with_context: Option<PrepareNextTurnWithContextFn>,
@@ -199,7 +201,7 @@ impl AgentOptions {
             on_response: None,
             before_tool_call: None,
             after_tool_call: None,
-            should_stop_after_turn: None,
+            finish_turn: None,
             prepare_request: None,
             prepare_next_turn: None,
             prepare_next_turn_with_context: None,
@@ -237,6 +239,15 @@ impl PendingMessageQueue {
 
     fn has_items(&self) -> bool {
         !self.messages.is_empty()
+    }
+
+    /// `peek()` (agent.ts:143-145 @ 005af57d8): the next batch a drain would
+    /// deliver, without consuming it.
+    fn peek(&self) -> Vec<AgentMessage> {
+        if self.mode == QueueMode::All {
+            return self.messages.clone();
+        }
+        self.messages.first().cloned().into_iter().collect()
     }
 
     fn drain(&mut self) -> Vec<AgentMessage> {
@@ -380,7 +391,11 @@ pub struct Agent {
     pub on_response: Option<rpi_ai::types::OnResponseCallback>,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
-    pub should_stop_after_turn: Option<ShouldStopAfterTurnAgentFn>,
+    /// `finishTurn` — interior-mutable because the session installs the
+    /// boundary-dispatch chain after building the shared agent (upstream
+    /// assigns `this.agent.finishTurn` post-construction,
+    /// agent-session.ts:852-862 @ 005af57d8).
+    finish_turn: RwLock<Option<FinishTurnAgentFn>>,
     /// `prepareRequest` — interior-mutable because the session layer installs
     /// the canonical-context projection after building the shared agent
     /// (upstream assigns `this.agent.prepareRequest` post-construction,
@@ -462,7 +477,7 @@ impl Agent {
             on_response: options.on_response,
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
-            should_stop_after_turn: options.should_stop_after_turn,
+            finish_turn: RwLock::new(options.finish_turn),
             prepare_request: RwLock::new(options.prepare_request),
             prepare_next_turn: RwLock::new(options.prepare_next_turn),
             prepare_next_turn_with_context: RwLock::new(options.prepare_next_turn_with_context),
@@ -513,6 +528,22 @@ impl Agent {
     /// agent-session.ts:537-540).
     pub fn prepare_next_turn_signal_only(&self) -> Option<PrepareNextTurnSignalFn> {
         self.prepare_next_turn
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Post-construction install/clear of the `finishTurn` hook
+    /// (`this.agent.finishTurn = ...`, agent-session.ts:852-862 @
+    /// 005af57d8).
+    pub fn set_finish_turn(&self, hook: Option<FinishTurnAgentFn>) {
+        *self.finish_turn.write().unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    /// Current `finishTurn` hook (cloned; the loop config wraps it with the
+    /// active run's signal).
+    pub fn finish_turn(&self) -> Option<FinishTurnAgentFn> {
+        self.finish_turn
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -641,6 +672,17 @@ impl Agent {
     /// Returns true when either queue still contains pending messages.
     pub fn has_queued_messages(&self) -> bool {
         lock(&self.steering_queue).has_items() || lock(&self.follow_up_queue).has_items()
+    }
+
+    /// `peekQueuedMessages` (agent.ts:327-333 @ 005af57d8): preview the next
+    /// queued batch without consuming it. Steering first, then follow-up.
+    pub fn peek_queued_messages(&self) -> Vec<AgentMessage> {
+        let steering = lock(&self.steering_queue).peek();
+        if steering.is_empty() {
+            lock(&self.follow_up_queue).peek()
+        } else {
+            steering
+        }
     }
 
     /// Active abort signal for the current run, if any.
@@ -907,25 +949,29 @@ impl Agent {
             }
         };
 
-        let should_stop_after_turn: Option<ShouldStopAfterTurnFn> =
-            match self.should_stop_after_turn.clone() {
-                Some(agent_callback) => {
-                    let active_run = self.active_run.clone();
-                    Some(Arc::new(move |context: ShouldStopAfterTurnContext| {
-                        let agent_callback = agent_callback.clone();
-                        let active_run = active_run.clone();
-                        Box::pin(async move {
-                            // Upstream reads `this.signal` at call time (agent.ts:461).
-                            let signal = lock(&active_run)
-                                .as_ref()
-                                .map(|run| run.signal.clone())
-                                .unwrap_or_default();
-                            agent_callback(context, signal).await
-                        })
-                    }))
-                }
-                _ => None,
-            };
+        let finish_turn: Option<FinishTurnFn> = match self
+            .finish_turn
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(agent_callback) => {
+                let active_run = self.active_run.clone();
+                Some(Arc::new(move |context: AgentTurnContext| {
+                    let agent_callback = agent_callback.clone();
+                    let active_run = active_run.clone();
+                    Box::pin(async move {
+                        // Upstream reads `this.signal` at call time (agent.ts:461).
+                        let signal = lock(&active_run)
+                            .as_ref()
+                            .map(|run| run.signal.clone())
+                            .unwrap_or_default();
+                        agent_callback(context, signal).await
+                    })
+                }))
+            }
+            _ => None,
+        };
 
         let prepare_request: Option<PrepareRequestFn> = match self.prepare_request() {
             Some(agent_callback) => {
@@ -969,7 +1015,7 @@ impl Agent {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
             get_api_key: self.get_api_key.clone(),
-            should_stop_after_turn,
+            finish_turn,
             prepare_request,
             prepare_next_turn,
             get_steering_messages: Some(get_steering_messages),
