@@ -28,6 +28,20 @@ async fn run_bash(
     command: &str,
     timeout: Option<f64>,
 ) -> Result<String, String> {
+    match run_bash_result(tool, command, timeout).await {
+        Ok((text, _is_error, _structured)) => Ok(text),
+        Err(e) => Err(e),
+    }
+}
+
+/// Helper: run a bash tool command and return the result even when the
+/// command exited non-zero (which is now an error *result*, matching
+/// bash.ts:386-407).
+async fn run_bash_result(
+    tool: &Arc<dyn AgentTool>,
+    command: &str,
+    timeout: Option<f64>,
+) -> Result<(String, bool, Option<serde_json::Value>), String> {
     let mut params = serde_json::json!({ "command": command });
     if let Some(t) = timeout {
         params["timeout"] = serde_json::json!(t);
@@ -46,7 +60,11 @@ async fn run_bash(
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            Ok(text)
+            Ok((
+                text,
+                result.is_error == Some(true),
+                result.structured_content,
+            ))
         }
         Err(e) => Err(format!("{e}")),
     }
@@ -65,8 +83,65 @@ mod bash_tool_tests {
     #[tokio::test]
     async fn test_exit_1_error() {
         let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
-        let err = run_bash(&tool, "exit 1", None).await.unwrap_err();
-        assert!(err.contains("Command exited with code 1"), "got: {err}");
+        // bash.ts:386-407: a non-zero exit is an error result with the
+        // structured result attached (V16-07 FR-D R2).
+        let (text, is_error, structured) = run_bash_result(&tool, "exit 1", None).await.unwrap();
+        assert!(text.contains("Command exited with code 1"), "got: {text}");
+        assert!(is_error);
+        assert_eq!(structured.unwrap()["exit_code"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn structured_output_schema_is_declared() {
+        let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
+        let schema = tool.output_schema().expect("bash outputSchema");
+        let required = schema["required"].as_array().expect("required");
+        assert!(required.contains(&serde_json::json!("output")));
+        assert!(required.contains(&serde_json::json!("truncated")));
+        assert!(required.contains(&serde_json::json!("exit_code")));
+        assert!(required.contains(&serde_json::json!("wall_time_seconds")));
+    }
+
+    #[tokio::test]
+    async fn structured_output_reports_output_and_empty_string() {
+        let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
+        let (_, _, structured) = run_bash_result(&tool, "printf 'hello'", None).await.unwrap();
+        let structured = structured.expect("structured content");
+        assert_eq!(structured["output"], serde_json::json!("hello"));
+        assert_eq!(structured["truncated"], serde_json::json!(false));
+        assert_eq!(structured["exit_code"], serde_json::json!(0));
+        assert!(structured["wall_time_seconds"].as_f64().unwrap_or(-1.0) >= 0.0);
+
+        let (_, _, structured) = run_bash_result(&tool, "true", None).await.unwrap();
+        let structured = structured.expect("structured content");
+        assert_eq!(structured["output"], serde_json::json!(""));
+    }
+
+    /// FR-D R2: >1 MiB keeps the first/last 512 KiB with an omission marker
+    /// and a `full_output_path`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_output_truncates_to_head_and_tail() {
+        let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
+        let (_, is_error, structured) = run_bash_result(
+            &tool,
+            "yes a | head -c 2000000",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!is_error);
+        let structured = structured.expect("structured content");
+        assert_eq!(structured["truncated"], serde_json::json!(true));
+        let output = structured["output"].as_str().expect("output");
+        assert!(output.contains("bytes omitted"), "omission marker");
+        assert!(
+            output.len() <= 1024 * 1024 + 64,
+            "head/tail budget: {}",
+            output.len()
+        );
+        assert!(output.starts_with('a'), "keeps the head");
+        assert!(structured["full_output_path"].is_string());
     }
 
     /// stdout and stderr are merged into a single output stream (bash.ts:124-125).
@@ -510,17 +585,23 @@ mod bash_tool_tests {
     async fn test_signal_killed_commands_rejected_with_partial_output() {
         let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
         for (signal, exit_code) in [("KILL", 137), ("TERM", 143)] {
-            let err = run_bash(
+            let (text, is_error, structured) = run_bash_result(
                 &tool,
                 &format!("printf 'before-kill\\n'; kill -{signal} $$"),
                 None,
             )
             .await
-            .unwrap_err();
-            assert!(err.contains("before-kill"), "partial output lost: {err}");
+            .unwrap();
+            assert!(text.contains("before-kill"), "partial output lost: {text}");
+            assert!(is_error);
             assert!(
-                err.contains(&format!("Command exited with code {exit_code}")),
-                "signal {signal}: {err}"
+                text.contains(&format!("Command exited with code {exit_code}")),
+                "signal {signal}: {text}"
+            );
+            assert_eq!(
+                structured.expect("structured")["exit_code"],
+                serde_json::json!(exit_code),
+                "signal {signal}"
             );
         }
     }

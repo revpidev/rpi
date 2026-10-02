@@ -10,10 +10,16 @@ use crate::types::{Model, ModelCostRates, Usage, UsageCost};
 
 /// `calculateCost` — fills and returns `usage.cost`.
 pub fn calculate_cost(model: &Model, usage: &mut Usage) -> UsageCost {
+    calculate_cost_for(&model.cost, usage)
+}
+
+/// `calculateCost` against a bare `ModelCost` (schema-v6 image/classifier
+/// entries carry the same cost shape).
+pub fn calculate_cost_for(cost: &crate::types::ModelCost, usage: &mut Usage) -> UsageCost {
     let input_tokens = usage.input + usage.cache_read + usage.cache_write;
-    let mut rates: &ModelCostRates = &model.cost.rates;
+    let mut rates: &ModelCostRates = &cost.rates;
     let mut matched_threshold: i64 = -1;
-    for tier in model.cost.tiers.as_deref().unwrap_or(&[]) {
+    for tier in cost.tiers.as_deref().unwrap_or(&[]) {
         if input_tokens > tier.input_tokens_above
             && tier.input_tokens_above as i64 > matched_threshold
         {

@@ -1260,6 +1260,11 @@ pub struct ToolLoadoutEntry {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    /// `outputSchema` — the schema of `structuredContent` in successful
+    /// results (rpi additive for `prepareLoadout` renderers such as
+    /// codemode; upstream `AgentTool` carries it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
 }
 
 /// `ToolLoadout` (types.ts:539-550 @ a13d35a74): the tools of a session as a

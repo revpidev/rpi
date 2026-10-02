@@ -42,8 +42,11 @@ use crate::models_store::{
     InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ProviderModelsStore,
 };
 use crate::types::{
-    AnyModel, Context, Model, ModelThinkingLevel, ProviderHeaders, SimpleStreamOptions,
-    StreamOptions, TranscriptContext,
+    AnyModel, AssistantImages, ClassifierContext, ClassifierModel, ClassifierOptions,
+    ClassifierResult, Context, ImageModel, ImagesContext, ImagesOptions, Model,
+    ModelThinkingLevel, ProviderClassifier, ProviderEnv, ProviderHeaders,
+    ProviderImageGenerator, SimpleStreamOptions, StreamOptions, TranscriptContext,
+    classifier_error_result, image_error_result,
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::merge_headers;
@@ -180,6 +183,43 @@ pub trait Provider: Send + Sync {
         context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String>;
+
+    /// `generateImages?` (models.ts:221-226 @ a13d35a74): present when the
+    /// provider supports dedicated image models. Never rejects: the
+    /// implementation returns an error `AssistantImages` itself; a `None`
+    /// here is wrapped by [`Models::generate_images`] as a provider error.
+    fn generate_images(
+        &self,
+        _model: &ImageModel,
+        _context: &ImagesContext,
+        _options: Option<&ImagesOptions>,
+    ) -> Option<BoxFuture<'static, AssistantImages>> {
+        None
+    }
+
+    /// `classify?` (models.ts:228-233): present when the provider supports
+    /// structured classifiers. `None` is wrapped by [`Models::classify`] as
+    /// a provider error.
+    fn classify(
+        &self,
+        _model: &ClassifierModel,
+        _context: &ClassifierContext,
+        _options: Option<&ClassifierOptions>,
+    ) -> Option<BoxFuture<'static, ClassifierResult>> {
+        None
+    }
+
+    /// The image generator registered for `api`, if any (support probe for
+    /// [`Models::generate_images`] before auth resolution).
+    fn image_generator(&self, _api: &str) -> Option<Arc<dyn ProviderImageGenerator>> {
+        None
+    }
+
+    /// The classifier registered for `api`, if any (support probe for
+    /// [`Models::classify`]).
+    fn classifier(&self, _api: &str) -> Option<Arc<dyn ProviderClassifier>> {
+        None
+    }
 }
 
 /// `ModelsPublication` (models.ts:39-44 @ 4181f66) — the provider-owned
@@ -497,8 +537,18 @@ pub struct CreateProviderOptions {
     pub headers: Option<ProviderHeaders>,
     /// Required — every provider has auth semantics.
     pub auth: ProviderAuth,
-    /// Static baseline model list.
+    /// Static baseline model list (chat models; the legacy getter face).
     pub models: Vec<Model>,
+    /// Schema-v6 all-type baseline (chat + image + classifier), in catalog
+    /// order. Empty means "chat only" (the schema-v6 default for providers
+    /// without image/classifier entries).
+    pub all_models: Vec<AnyModel>,
+    /// Classifier API implementations by api id (`classifiers`,
+    /// models.ts:1023).
+    pub classifiers: std::collections::HashMap<String, Arc<dyn ProviderClassifier>>,
+    /// Image-generation API implementations by api id (`images`,
+    /// models.ts:1021).
+    pub images: std::collections::HashMap<String, Arc<dyn ProviderImageGenerator>>,
     pub api: ProviderApi,
     /// Optional dynamic catalog fetcher. When present, `createProvider`
     /// builds a `refresh_models` that restores `context.stored` then fetches
@@ -515,6 +565,12 @@ struct CreatedProvider {
     headers: Option<ProviderHeaders>,
     auth: ProviderAuth,
     models: Vec<Model>,
+    /// Schema-v6 all-type baseline (empty = derive from `models`).
+    all_models: Vec<AnyModel>,
+    /// Classifier API implementations by api id.
+    classifiers: std::collections::HashMap<String, Arc<dyn ProviderClassifier>>,
+    /// Image-generation API implementations by api id.
+    images: std::collections::HashMap<String, Arc<dyn ProviderImageGenerator>>,
     api: ProviderApi,
     /// Dynamic overlay (models.ts:764-774): merged over `models` in
     /// `get_models`. Updated atomically by `refresh_models`.
@@ -582,6 +638,67 @@ impl Provider for CreatedProvider {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         merge_models(&self.models, &dynamic)
+    }
+
+    /// Schema-v6 all-type read (`getAllModels?`, models.ts:174 @ a13d35a74):
+    /// the static all-type baseline when the provider declared one, with the
+    /// dynamic chat overlay merged on top; chat-only providers keep the
+    /// legacy default.
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        if self.all_models.is_empty() {
+            return self.get_models().into_iter().map(AnyModel::Chat).collect();
+        }
+        let dynamic: Vec<AnyModel> = self
+            .dynamic_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .map(AnyModel::Chat)
+            .collect();
+        merge_any_models(&self.all_models, &dynamic)
+    }
+
+    fn generate_images(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: Option<&ImagesOptions>,
+    ) -> Option<BoxFuture<'static, AssistantImages>> {
+        let implementation = self.image_generator(model.api.as_str())?;
+        let model = model.clone();
+        let context = context.clone();
+        let options = options.cloned();
+        Some(Box::pin(async move {
+            implementation
+                .generate_images(&model, &context, options.as_ref())
+                .await
+        }))
+    }
+
+    fn classify(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        options: Option<&ClassifierOptions>,
+    ) -> Option<BoxFuture<'static, ClassifierResult>> {
+        let implementation = self.classifier(model.api.as_str())?;
+        let model = model.clone();
+        let context = context.clone();
+        let options = options.cloned();
+        Some(Box::pin(async move {
+            implementation
+                .classify(&model, &context, options.as_ref())
+                .await
+        }))
+    }
+
+    fn image_generator(&self, api: &str) -> Option<Arc<dyn ProviderImageGenerator>> {
+        self.images.get(api).cloned()
+    }
+
+    fn classifier(&self, api: &str) -> Option<Arc<dyn ProviderClassifier>> {
+        self.classifiers.get(api).cloned()
     }
 
     fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
@@ -709,6 +826,9 @@ pub fn create_provider(input: CreateProviderOptions) -> Arc<dyn Provider> {
         headers: input.headers,
         auth: input.auth,
         models: input.models,
+        all_models: input.all_models,
+        classifiers: input.classifiers,
+        images: input.images,
         api: input.api,
         dynamic_models: Arc::new(Mutex::new(Vec::new())),
         fetch_models: input.fetch_models,
@@ -723,6 +843,16 @@ pub struct CreateModelsOptions {
     /// Persistent model storage for dynamic provider overlays
     /// (`modelsStore`, models.ts:198-226). Defaults to in-memory.
     pub models_store: Option<Arc<dyn ModelsStore>>,
+}
+
+/// Resolved request auth for the non-chat model runtimes (image/classifier);
+/// the image/classifier counterpart of the `(Model, StreamOptions)` tuple
+/// `apply_auth` returns.
+struct ResolvedRequestAuth {
+    api_key: Option<String>,
+    headers: Option<ProviderHeaders>,
+    env: Option<ProviderEnv>,
+    base_url: Option<String>,
 }
 
 /// `Models` — runtime collection of providers plus auth application and
@@ -1577,7 +1707,19 @@ impl Models {
         model: &Model,
         overrides: Option<&AuthResolutionOverrides>,
     ) -> Result<Option<AuthResult>, ModelsError> {
-        let Some(provider) = self.get_provider(&model.provider) else {
+        self.get_auth_for_headers(&model.provider, model.headers.as_ref(), overrides)
+            .await
+    }
+
+    /// `getAuth` for a non-chat model (image/classifier entries carry the
+    /// same optional static `headers` map).
+    pub async fn get_auth_for_headers(
+        &self,
+        provider_id: &str,
+        model_headers: Option<&std::collections::BTreeMap<String, String>>,
+        overrides: Option<&AuthResolutionOverrides>,
+    ) -> Result<Option<AuthResult>, ModelsError> {
+        let Some(provider) = self.get_provider(provider_id) else {
             return Ok(None);
         };
         let result = resolve_provider_auth(
@@ -1591,7 +1733,7 @@ impl Models {
         let Some(mut result) = result else {
             return Ok(None);
         };
-        if let Some(model_headers) = &model.headers {
+        if let Some(model_headers) = model_headers {
             let model_headers: ProviderHeaders = model_headers
                 .iter()
                 .map(|(k, v)| (k.clone(), Some(v.clone())))
@@ -1669,6 +1811,182 @@ impl Models {
         };
 
         Ok((request_model, request_options))
+    }
+
+    /// Resolved request auth for a non-chat model (image/classifier): the
+    /// four-level credential resolution (stored credentials / OAuth / runtime
+    /// API keys / `models.json` headers) plus request-option overrides.
+    async fn resolve_request_auth(
+        &self,
+        provider_id: &str,
+        model_headers: Option<&std::collections::BTreeMap<String, String>>,
+        api_key: Option<String>,
+        headers: Option<ProviderHeaders>,
+        env: Option<ProviderEnv>,
+    ) -> Result<ResolvedRequestAuth, ModelsError> {
+        if self.get_provider(provider_id).is_none() {
+            return Err(ModelsError::new(
+                ModelsErrorCode::Provider,
+                format!("Unknown provider: {provider_id}"),
+            ));
+        }
+        let resolution = self
+            .get_auth_for_headers(
+                provider_id,
+                model_headers,
+                Some(&AuthResolutionOverrides {
+                    api_key: api_key.clone(),
+                    env: env.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let Some(resolution) = resolution else {
+            return Err(ModelsError::new(
+                ModelsErrorCode::Auth,
+                format!("Provider is not configured: {provider_id}"),
+            ));
+        };
+        let auth = resolution.auth;
+        let env = match (resolution.env, env) {
+            (None, None) => None,
+            (a, b) => {
+                let mut merged = a.unwrap_or_default();
+                merged.extend(b.unwrap_or_default());
+                Some(merged)
+            }
+        };
+        Ok(ResolvedRequestAuth {
+            api_key: api_key.or(auth.api_key),
+            headers: merge_headers(auth.headers.as_ref(), headers.as_ref()),
+            env,
+            base_url: auth.base_url,
+        })
+    }
+
+    /// `generateImages` (models.ts:948-965 @ a13d35a74): resolve the model
+    /// through its owning provider with request-time authentication. Never
+    /// rejects: unknown providers, unconfigured auth, and providers without
+    /// an image implementation return an error `AssistantImages`.
+    pub async fn generate_images(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: Option<&ImagesOptions>,
+    ) -> AssistantImages {
+        let aborted = options
+            .and_then(|options| options.signal.as_ref())
+            .is_some_and(CancellationToken::is_cancelled);
+        match self.generate_images_inner(model, context, options).await {
+            Ok(result) => result,
+            Err(error) => image_error_result(model, &error, aborted),
+        }
+    }
+
+    async fn generate_images_inner(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: Option<&ImagesOptions>,
+    ) -> Result<AssistantImages, String> {
+        let provider = self.get_provider(&model.provider).ok_or_else(|| {
+            format!("Unknown provider: {}", model.provider)
+        })?;
+        let implementation = provider.image_generator(model.api.as_str()).ok_or_else(|| {
+            format!(
+                "Provider {} has no image generation implementation for \"{}\"",
+                model.provider, model.api
+            )
+        })?;
+        let auth = self
+            .resolve_request_auth(
+                &model.provider,
+                model.headers.as_ref(),
+                options.and_then(|options| options.api_key.clone()),
+                options.and_then(|options| options.headers.clone()),
+                options.and_then(|options| options.env.clone()),
+            )
+            .await
+            .map_err(|error| error.message.clone())?;
+        let request_model = match auth.base_url {
+            Some(base_url) => ImageModel {
+                base_url,
+                ..model.clone()
+            },
+            None => model.clone(),
+        };
+        let request_options = {
+            let mut options = options.cloned().unwrap_or_default();
+            options.api_key = auth.api_key;
+            options.headers = auth.headers;
+            options.env = auth.env;
+            options
+        };
+        Ok(implementation
+            .generate_images(&request_model, context, Some(&request_options))
+            .await)
+    }
+
+    /// `classify` (models.ts:966-983 @ a13d35a74): resolve the classifier
+    /// through its owning provider with request-time authentication. Never
+    /// rejects.
+    pub async fn classify(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        options: Option<&ClassifierOptions>,
+    ) -> ClassifierResult {
+        let aborted = options
+            .and_then(|options| options.signal.as_ref())
+            .is_some_and(CancellationToken::is_cancelled);
+        match self.classify_inner(model, context, options).await {
+            Ok(result) => result,
+            Err(error) => classifier_error_result(model, &error, aborted),
+        }
+    }
+
+    async fn classify_inner(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        options: Option<&ClassifierOptions>,
+    ) -> Result<ClassifierResult, String> {
+        let provider = self.get_provider(&model.provider).ok_or_else(|| {
+            format!("Unknown provider: {}", model.provider)
+        })?;
+        let implementation = provider.classifier(model.api.as_str()).ok_or_else(|| {
+            format!(
+                "Provider {} has no classifier implementation for \"{}\"",
+                model.provider, model.api
+            )
+        })?;
+        let auth = self
+            .resolve_request_auth(
+                &model.provider,
+                model.headers.as_ref(),
+                options.and_then(|options| options.api_key.clone()),
+                options.and_then(|options| options.headers.clone()),
+                options.and_then(|options| options.env.clone()),
+            )
+            .await
+            .map_err(|error| error.message.clone())?;
+        let request_model = match auth.base_url {
+            Some(base_url) => ClassifierModel {
+                base_url,
+                ..model.clone()
+            },
+            None => model.clone(),
+        };
+        let request_options = {
+            let mut options = options.cloned().unwrap_or_default();
+            options.api_key = auth.api_key;
+            options.headers = auth.headers;
+            options.env = auth.env;
+            options
+        };
+        Ok(implementation
+            .classify(&request_model, context, Some(&request_options))
+            .await)
     }
 
     /// `stream` — resolves auth lazily behind the returned stream, then

@@ -10,8 +10,9 @@ use crate::api::google_generative_ai::GoogleGenerativeAi;
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::openai_responses::OpenAiResponses;
 use crate::api::session_affinity::with_opencode_session_header;
+use crate::api::typesafe_system_one::{TYPESAFE_SYSTEM_ONE_API, typesafe_system_one_api};
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
+use crate::generated::{get_builtin_all_models, get_builtin_models};
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
@@ -32,6 +33,11 @@ pub fn opencode_provider() -> Arc<dyn Provider> {
             oauth: None,
         },
         models: get_builtin_models("opencode").to_vec(),
+        all_models: get_builtin_all_models("opencode").to_vec(),
+        classifiers: HashMap::from([(
+            TYPESAFE_SYSTEM_ONE_API.to_owned(),
+            typesafe_system_one_api(),
+        )]),
         api: ProviderApi::Map(api_map()),
         ..Default::default()
     })

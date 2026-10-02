@@ -68,8 +68,8 @@ use rpi_ai::models_json::{
 };
 use rpi_ai::models_store::{InMemoryModelsStore, JsonFileModelsStore, ModelsStore};
 use rpi_ai::types::{
-    ApiKind, AssistantMessage, Context, ErrorReason, Model, ModelCompat, ModelCost, ModelCostRates,
-    ProviderEnv, ProviderHeaders, SimpleStreamOptions, StreamEvent, StreamOptions,
+    AnyModel, ApiKind, AssistantMessage, Context, ErrorReason, Model, ModelCompat, ModelCost,
+    ModelCostRates, ProviderEnv, ProviderHeaders, SimpleStreamOptions, StreamEvent, StreamOptions,
     TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
@@ -1949,6 +1949,66 @@ impl ModelRuntime {
 
     pub fn get_models(&self, provider_id: Option<&str>) -> Vec<Model> {
         self.models.get_models(provider_id)
+    }
+
+    /// `getAllModels` (model-registry.ts / schema v6): every model type from
+    /// one provider or all.
+    pub fn get_all_models(&self, provider_id: Option<&str>) -> Vec<AnyModel> {
+        self.models.get_all_models(provider_id)
+    }
+
+    /// `getModelsOfType` (model-registry.ts:150-152 @ a13d35a74).
+    pub fn get_models_of_type(
+        &self,
+        model_type: rpi_ai::types::ModelType,
+        provider_id: Option<&str>,
+    ) -> Vec<AnyModel> {
+        self.models.get_models_of_type(model_type, provider_id)
+    }
+
+    /// `getModelOfType` (model-registry.ts:163-170).
+    pub fn get_model_of_type(
+        &self,
+        model_type: rpi_ai::types::ModelType,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<AnyModel> {
+        self.models
+            .get_model_of_type(model_type, provider_id, model_id)
+    }
+
+    /// `getAvailableOfType` (model-registry.ts:155-161): models of one type
+    /// whose providers have complete auth configuration.
+    pub async fn get_available_of_type(
+        &self,
+        model_type: rpi_ai::types::ModelType,
+        provider_id: Option<&str>,
+    ) -> Result<Vec<AnyModel>, ModelsError> {
+        self.models
+            .get_available_of_type(model_type, provider_id)
+            .await
+    }
+
+    /// `classify` (model-registry.ts:173-179 @ a13d35a74): structured
+    /// classification with request-time authentication. Never rejects.
+    pub async fn classify(
+        &self,
+        model: &rpi_ai::types::ClassifierModel,
+        context: &rpi_ai::types::ClassifierContext,
+        options: Option<&rpi_ai::types::ClassifierOptions>,
+    ) -> rpi_ai::types::ClassifierResult {
+        self.models.classify(model, context, options).await
+    }
+
+    /// `generateImages` (model-registry.ts:182-188): image generation with
+    /// request-time authentication. Never rejects.
+    pub async fn generate_images(
+        &self,
+        model: &rpi_ai::types::ImageModel,
+        context: &rpi_ai::types::ImagesContext,
+        options: Option<&rpi_ai::types::ImagesOptions>,
+    ) -> rpi_ai::types::AssistantImages {
+        self.models.generate_images(model, context, options).await
     }
 
     pub fn get_model(&self, provider_id: &str, model_id: &str) -> Option<Model> {

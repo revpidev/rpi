@@ -16,6 +16,7 @@ path = "src/bin/rpi_rpc.rs"
 [dependencies]
 rpi-ai.workspace = true
 rpi-agent.workspace = true
+rpi-codemode.workspace = true
 rpi-tui.workspace = true
 rpi-ext-host.workspace = true
 anyhow.workspace = true

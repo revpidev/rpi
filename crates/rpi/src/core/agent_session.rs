@@ -2370,7 +2370,7 @@ impl AgentSession {
                     exposure: ext::ToolExposure::Direct,
                     namespace: None,
                     annotations: None,
-                    output_schema: None,
+                    output_schema: tool.output_schema().cloned(),
                     default_active: None,
                     prepare_loadout: None,
                 },
@@ -2425,7 +2425,7 @@ impl AgentSession {
                     exposure: ext::ToolExposure::Direct,
                     namespace: None,
                     annotations: None,
-                    output_schema: None,
+                    output_schema: tool.output_schema().cloned(),
                     default_active: None,
                     prepare_loadout: None,
                 },
@@ -2655,6 +2655,7 @@ impl AgentSession {
             "name": name,
             "description": entry.description,
             "parameters": entry.parameters,
+            "outputSchema": entry.output_schema,
             "promptGuidelines": if entry.prompt_guidelines.is_empty() {
                 None
             } else {
@@ -2757,6 +2758,9 @@ impl AgentSession {
                     name: name.to_owned(),
                     description,
                     parameters,
+                    output_schema: definitions
+                        .get(name)
+                        .and_then(|entry| entry.output_schema.clone()),
                 })
             };
 

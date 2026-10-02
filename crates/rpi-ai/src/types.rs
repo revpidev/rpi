@@ -1012,6 +1012,209 @@ impl fmt::Debug for ImagesOptions {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Classifiers (classifier subsystem: `types.ts` Classifier*,
+// `api/system-one-shared.ts`; V16-07 FR-F)
+// ---------------------------------------------------------------------------
+
+/// `ClassifierChoiceQuestion` (types.ts:633-637 @ a13d35a74).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierChoiceQuestion {
+    pub instructions: String,
+    pub criteria: std::collections::BTreeMap<String, String>,
+}
+
+/// `ClassifierScoreQuestion` (types.ts:639-642).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierScoreQuestion {
+    pub instructions: String,
+    pub criteria: Vec<String>,
+}
+
+/// `ClassifierBoolQuestion` (types.ts:644-647).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierBoolQuestion {
+    pub instructions: String,
+    pub criteria: ClassifierBoolCriteria,
+}
+
+/// `{ true: string, false: string }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassifierBoolCriteria {
+    #[serde(rename = "true")]
+    pub yes: String,
+    #[serde(rename = "false")]
+    pub no: String,
+}
+
+/// `ClassifierQuestion` (types.ts:649): tagged by `type`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ClassifierQuestion {
+    Choice(ClassifierChoiceQuestion),
+    Score(ClassifierScoreQuestion),
+    Bool(ClassifierBoolQuestion),
+}
+
+/// `ClassifierContext` (types.ts:651-654).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierContext {
+    pub state: serde_json::Map<String, Value>,
+    pub questions: std::collections::BTreeMap<String, ClassifierQuestion>,
+}
+
+/// `ClassifierChoiceAnswer` (types.ts:656-661).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierChoiceAnswer {
+    pub choice: String,
+    pub probabilities: std::collections::BTreeMap<String, f64>,
+    pub confidence: f64,
+}
+
+/// `ClassifierScoreAnswer` (types.ts:663-667).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierScoreAnswer {
+    pub score: f64,
+    pub confidence: f64,
+}
+
+/// `ClassifierBoolAnswer` (types.ts:669-672): the wire form is `noul`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierBoolAnswer {
+    pub probability: f64,
+}
+
+/// `ClassifierAnswer` (types.ts:674) — tagged by `type`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ClassifierAnswer {
+    Choice(ClassifierChoiceAnswer),
+    Score(ClassifierScoreAnswer),
+    Bool(ClassifierBoolAnswer),
+}
+
+/// `ClassifierStopReason = "stop" | "error" | "aborted"` (types.ts:675).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassifierStopReason {
+    Stop,
+    Error,
+    Aborted,
+}
+
+/// `ClassifierResult` (types.ts:677-690).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierResult {
+    pub api: ApiKind,
+    pub provider: String,
+    pub model: String,
+    pub answers: std::collections::BTreeMap<String, ClassifierAnswer>,
+    /// Token usage and its cost at the model's catalog price, when the
+    /// service reports token counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    pub stop_reason: ClassifierStopReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: i64,
+}
+
+/// `ClassifierOptions.onPayload` (types.ts:324-331) for classifier requests.
+pub type ClassifierOnPayloadCallback = Arc<
+    dyn Fn(
+            Value,
+            &ClassifierModel,
+        ) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `ClassifierOptions.onResponse`.
+pub type ClassifierOnResponseCallback = Arc<
+    dyn Fn(ProviderResponse, &ClassifierModel) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `ClassifierOptions` (types.ts:324-333): request options plus
+/// `temperature`.
+#[derive(Clone, Default)]
+pub struct ClassifierOptions {
+    pub signal: Option<CancellationToken>,
+    pub api_key: Option<String>,
+    pub fetch: Option<FetchFn>,
+    pub env: Option<ProviderEnv>,
+    pub on_payload: Option<ClassifierOnPayloadCallback>,
+    pub on_response: Option<ClassifierOnResponseCallback>,
+    pub headers: Option<ProviderHeaders>,
+    pub timeout_ms: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub max_retry_delay_ms: Option<u64>,
+    /// Divides the answer logits by this value before they are normalized
+    /// into probabilities. Must be positive when present.
+    pub temperature: Option<f64>,
+}
+
+impl fmt::Debug for ClassifierOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClassifierOptions")
+            .field("signal", &self.signal)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("fetch", &self.fetch.as_ref().map(|_| "<callback>"))
+            .field("env", &self.env)
+            .field(
+                "on_payload",
+                &self.on_payload.as_ref().map(|_| "<callback>"),
+            )
+            .field(
+                "on_response",
+                &self.on_response.as_ref().map(|_| "<callback>"),
+            )
+            .field(
+                "headers",
+                &self.headers.as_ref().map(|h| h.keys().collect::<Vec<_>>()),
+            )
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .field("max_retry_delay_ms", &self.max_retry_delay_ms)
+            .field("temperature", &self.temperature)
+            .finish()
+    }
+}
+
+/// `ProviderClassifier` (types.ts:316-322): the uniform contract of a
+/// classifier API implementation.
+pub trait ProviderClassifier: Send + Sync {
+    fn classify(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        options: Option<&ClassifierOptions>,
+    ) -> Pin<Box<dyn Future<Output = ClassifierResult> + Send + 'static>>;
+}
+
+/// `Provider.generateImages` for the unified schema-v6 `ImageModel`
+/// (models.ts:221-226 @ a13d35a74). The older image subsystem's
+/// `images_models::ProviderImages` stays as is; this trait is the unified
+/// runtime's contract.
+pub trait ProviderImageGenerator: Send + Sync {
+    fn generate_images(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: Option<&ImagesOptions>,
+    ) -> Pin<Box<dyn Future<Output = AssistantImages> + Send + 'static>>;
+}
+
 /// `StopReason = "pending" | "stop" | "length" | "toolUse" | "error" |
 /// "aborted" | "deferred"`.
 ///
@@ -2332,6 +2535,107 @@ pub struct VercelGatewayRouting {
     /// Provider slugs to try in order.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order: Option<Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// Model type guards and error results (`utils/model-operations.ts` @
+// a13d35a74; V16-06/V16-07 R2.5.2/R2.5.3)
+// ---------------------------------------------------------------------------
+fn assert_model_type(
+    model: &AnyModel,
+    expected: ModelType,
+) -> Result<&AnyModel, crate::auth::ModelsError> {
+    if model.model_type() != expected {
+        return Err(crate::auth::ModelsError::new(
+            crate::auth::ModelsErrorCode::Provider,
+            format!(
+                "Model {}/{} is not a {} model",
+                model.provider(),
+                model.id(),
+                expected.as_str()
+            ),
+        ));
+    }
+    Ok(model)
+}
+
+/// `assertImageModel` (utils/model-operations.ts:20-22): a non-image model
+/// reaching image generation is a caller error.
+pub fn assert_image_model(model: &AnyModel) -> Result<&ImageModel, crate::auth::ModelsError> {
+    assert_model_type(model, ModelType::Image)?;
+    match model {
+        AnyModel::Image(image) => Ok(image),
+        _ => Err(crate::auth::ModelsError::new(
+            crate::auth::ModelsErrorCode::Provider,
+            "Model is not an image model".to_owned(),
+        )),
+    }
+}
+
+/// `assertClassifierModel` (utils/model-operations.ts:24-26).
+pub fn assert_classifier_model(
+    model: &AnyModel,
+) -> Result<&ClassifierModel, crate::auth::ModelsError> {
+    assert_model_type(model, ModelType::Classifier)?;
+    match model {
+        AnyModel::Classifier(classifier) => Ok(classifier),
+        _ => Err(crate::auth::ModelsError::new(
+            crate::auth::ModelsErrorCode::Provider,
+            "Model is not a classifier model".to_owned(),
+        )),
+    }
+}
+
+/// `imageErrorResult` (utils/model-operations.ts:28-39): the never-reject
+/// failure shape.
+pub fn image_error_result(model: &ImageModel, error: &str, aborted: bool) -> AssistantImages {
+    AssistantImages {
+        // The unified runtime resolves models as `ApiKind`; the legacy
+        // `AssistantImages` carries `ImagesApiKind` (same open-string shape).
+        api: model.api.as_str().into(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        output: Vec::new(),
+        response_id: None,
+        usage: None,
+        stop_reason: if aborted {
+            ImagesStopReason::Aborted
+        } else {
+            ImagesStopReason::Error
+        },
+        error_message: Some(error.to_owned()),
+        timestamp: now_millis(),
+    }
+}
+
+/// `classifierErrorResult` (utils/model-operations.ts:41-52).
+pub fn classifier_error_result(
+    model: &ClassifierModel,
+    error: &str,
+    aborted: bool,
+) -> ClassifierResult {
+    ClassifierResult {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        answers: std::collections::BTreeMap::new(),
+        usage: None,
+        stop_reason: if aborted {
+            ClassifierStopReason::Aborted
+        } else {
+            ClassifierStopReason::Error
+        },
+        error_message: Some(error.to_owned()),
+        timestamp: now_millis(),
+    }
+}
+
+/// Unix timestamp in milliseconds (`Date.now()` upstream).
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

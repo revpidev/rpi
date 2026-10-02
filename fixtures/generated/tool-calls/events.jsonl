@@ -24,7 +24,7 @@
 {"type":"tool_execution_start","toolCallId":"fixture-tool-call-2","toolName":"bash","args":{"command":"echo fixture-bash-output"}}
 {"type":"tool_execution_update","toolCallId":"fixture-tool-call-2","toolName":"bash","args":{"command":"echo fixture-bash-output"},"partialResult":{"content":[]}}
 {"type":"tool_execution_update","toolCallId":"fixture-tool-call-2","toolName":"bash","args":{"command":"echo fixture-bash-output"},"partialResult":{"content":[{"type":"text","text":"fixture-bash-output\n"}],"details":{}}}
-{"type":"tool_execution_end","toolCallId":"fixture-tool-call-2","toolName":"bash","result":{"content":[{"type":"text","text":"fixture-bash-output\n"}]},"isError":false}
+{"type":"tool_execution_end","toolCallId":"fixture-tool-call-2","toolName":"bash","result":{"content":[{"type":"text","text":"fixture-bash-output\n"}],"structuredContent":{"output":"fixture-bash-output\n","truncated":false,"exit_code":0,"wall_time_seconds":0.0}},"isError":false}
 {"type":"tool_execution_end","toolCallId":"fixture-tool-call-1","toolName":"read","result":{"content":[{"type":"text","text":"fixture note content\n"}]},"isError":false}
 {"type":"message_start","message":{"role":"toolResult","toolCallId":"fixture-tool-call-1","toolName":"read","content":[{"type":"text","text":"fixture note content\n"}],"isError":false,"timestamp":1790171897328}}
 {"type":"message_end","message":{"role":"toolResult","toolCallId":"fixture-tool-call-1","toolName":"read","content":[{"type":"text","text":"fixture note content\n"}],"isError":false,"timestamp":1790171897328}}

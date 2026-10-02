@@ -131,6 +131,11 @@ pub trait AgentTool: Send + Sync {
     fn description(&self) -> &str;
     /// JSON Schema of the tool parameters (TypeBox upstream).
     fn parameters(&self) -> &Value;
+    /// JSON Schema of `structuredContent` in successful results
+    /// (types.ts:590 @ a13d35a74). Default: no structured output.
+    fn output_schema(&self) -> Option<&Value> {
+        None
+    }
     /// Optional provider-side constrained sampling config (from `Tool`).
     fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
         None

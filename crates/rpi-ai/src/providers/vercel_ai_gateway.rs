@@ -4,8 +4,9 @@
 use std::sync::Arc;
 
 use crate::api::anthropic_messages::AnthropicMessages;
+use crate::api::typesafe_system_one::{TYPESAFE_SYSTEM_ONE_API, typesafe_system_one_api};
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
+use crate::generated::{get_builtin_all_models, get_builtin_models};
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `vercelAIGatewayProvider()`.
@@ -23,6 +24,11 @@ pub fn vercel_ai_gateway_provider() -> Arc<dyn Provider> {
             oauth: None,
         },
         models: get_builtin_models("vercel-ai-gateway").to_vec(),
+        all_models: get_builtin_all_models("vercel-ai-gateway").to_vec(),
+        classifiers: std::collections::HashMap::from([(
+            TYPESAFE_SYSTEM_ONE_API.to_owned(),
+            typesafe_system_one_api(),
+        )]),
         api: ProviderApi::Single(Arc::new(AnthropicMessages)),
         ..Default::default()
     })

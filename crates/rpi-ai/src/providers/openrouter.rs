@@ -20,9 +20,11 @@ use std::sync::Arc;
 
 use crate::api::anthropic_messages::AnthropicMessages;
 use crate::api::openai_completions::OpenAiCompletions;
+use crate::api::openrouter_images::openrouter_images_v6_api;
+use crate::api::typesafe_system_one::{TYPESAFE_SYSTEM_ONE_API, typesafe_system_one_api};
 use crate::auth::oauth::openrouter_oauth;
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
+use crate::generated::{get_builtin_all_models, get_builtin_models};
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
@@ -43,6 +45,15 @@ pub fn openrouter_provider() -> Arc<dyn Provider> {
             oauth: Some(openrouter_oauth()),
         },
         models: get_builtin_models("openrouter").to_vec(),
+        all_models: get_builtin_all_models("openrouter").to_vec(),
+        classifiers: HashMap::from([(
+            TYPESAFE_SYSTEM_ONE_API.to_owned(),
+            typesafe_system_one_api(),
+        )]),
+        images: HashMap::from([(
+            "openrouter-images".to_owned(),
+            openrouter_images_v6_api(),
+        )]),
         api: ProviderApi::Map(api_map()),
         ..Default::default()
     })

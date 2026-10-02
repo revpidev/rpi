@@ -59,6 +59,43 @@ pub struct OutputSnapshot {
     pub full_output_path: Option<PathBuf>,
 }
 
+// ---------------------------------------------------------------------------
+
+/// The complete output of an accumulator (`FullOutput`,
+/// output-accumulator.ts:19-24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullOutput {
+    pub content: String,
+    /// Whether `content` omits part of the output.
+    pub truncated: bool,
+}
+
+/// The length of the longest valid UTF-8 prefix of `bytes` (an incomplete
+/// trailing sequence is dropped, mirroring `TextDecoder` with `stream: true`).
+fn utf8_prefix_len(bytes: &[u8]) -> usize {
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let width = if byte < 0x80 {
+            1
+        } else if byte & 0xe0 == 0xc0 {
+            2
+        } else if byte & 0xf0 == 0xe0 {
+            3
+        } else if byte & 0xf8 == 0xf0 {
+            4
+        } else {
+            // Invalid lead byte: include it (lossy decode replaces it).
+            1
+        };
+        if index + width > bytes.len() {
+            return index;
+        }
+        index += width;
+    }
+    bytes.len()
+}
+
 /// Incrementally tracks streaming output with bounded memory.
 ///
 /// Appends decode chunks with a streaming UTF-8 decoder, keeps only a decoded
@@ -246,6 +283,70 @@ impl OutputAccumulator {
     /// Port of `getLastLineBytes` (output-accumulator.ts:144-146).
     pub fn last_line_bytes(&self) -> usize {
         self.current_line_bytes
+    }
+
+    /// The complete output, for callers that can take more than the display
+    /// snapshot (structured tool results). Output longer than `max_bytes`
+    /// keeps its first and last `max_bytes / 2` bytes around an omission
+    /// marker.
+    ///
+    /// Port of `readFullOutput` (output-accumulator.ts:152-186).
+    pub fn read_full_output(&self, max_bytes: usize) -> FullOutput {
+        let Some(path) = &self.temp_file_path else {
+            let mut bytes = Vec::with_capacity(
+                self.raw_chunks.iter().map(Vec::len).sum(),
+            );
+            for chunk in &self.raw_chunks {
+                bytes.extend_from_slice(chunk);
+            }
+            return FullOutput {
+                content: String::from_utf8_lossy(&bytes).into_owned(),
+                truncated: false,
+            };
+        };
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return FullOutput {
+                content: String::new(),
+                truncated: false,
+            };
+        };
+        let size = metadata.len() as usize;
+        if size <= max_bytes {
+            let content = std::fs::read(path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            return FullOutput {
+                content,
+                truncated: false,
+            };
+        }
+        let head_bytes = max_bytes / 2;
+        let tail_bytes = max_bytes - head_bytes;
+        let mut head = vec![0u8; head_bytes];
+        let mut tail = vec![0u8; tail_bytes];
+        use std::io::{Read, Seek, SeekFrom};
+        if let Ok(mut file) = std::fs::File::open(path) {
+            let _ = file.read_exact(&mut head);
+            let _ = file.seek(SeekFrom::Start((size - tail_bytes) as u64));
+            let _ = file.read_exact(&mut tail);
+        }
+        // Cut at character boundaries: the head drops an incomplete trailing
+        // sequence and the tail skips leading continuation bytes.
+        let head_len = utf8_prefix_len(&head);
+        let tail_start = tail
+            .iter()
+            .position(|byte| (byte & 0xc0) != 0x80)
+            .unwrap_or(tail.len());
+        let omitted = size - head_bytes - tail_bytes;
+        let content = format!(
+            "{}\n\n[... {omitted} bytes omitted ...]\n\n{}",
+            String::from_utf8_lossy(&head[..head_len]),
+            String::from_utf8_lossy(&tail[tail_start..])
+        );
+        FullOutput {
+            content,
+            truncated: true,
+        }
     }
 
     // -------------------------------------------------------------------

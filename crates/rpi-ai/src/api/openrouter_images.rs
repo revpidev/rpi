@@ -39,8 +39,9 @@ use serde_json::{Value, json};
 
 use crate::images::images_models::{ProviderImages, now_ms};
 use crate::types::{
-    AssistantImages, ImageContent, ImagesContext, ImagesModel, ImagesOptions, ImagesOutputContent,
-    ImagesOutputModality, ImagesStopReason, ProviderHeaders, TextContent, Usage, UsageCost,
+    AssistantImages, ImageContent, ImageModel, ImagesContext, ImagesModel, ImagesOptions,
+    ImagesOutputContent, ImagesOutputModality, ImagesStopReason, ProviderHeaders,
+    ProviderImageGenerator, TextContent, Usage, UsageCost,
 };
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
@@ -73,6 +74,55 @@ impl ProviderImages for OpenRouterImages {
 /// the statically-linked adapter.
 pub fn openrouter_images_api() -> Arc<dyn ProviderImages> {
     Arc::new(OpenRouterImages)
+}
+
+/// The schema-v6 unified runtime adapter (V16-07 FR-G): maps the unified
+/// `ImageModel` onto the legacy subsystem model, then reuses the same wire
+/// implementation. Auth/baseUrl/headers are applied by `Models::generate_images`
+/// before the call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenRouterImagesV6;
+
+impl ProviderImageGenerator for OpenRouterImagesV6 {
+    fn generate_images(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: Option<&ImagesOptions>,
+    ) -> Pin<Box<dyn Future<Output = AssistantImages> + Send + 'static>> {
+        let model = images_model_from_v6(model);
+        let context = context.clone();
+        let options = options.cloned();
+        Box::pin(async move { generate_images(&model, &context, options.as_ref()).await })
+    }
+}
+
+/// `openrouterImagesV6Api()` — the unified-runtime image implementation.
+pub fn openrouter_images_v6_api() -> Arc<dyn ProviderImageGenerator> {
+    Arc::new(OpenRouterImagesV6)
+}
+
+/// Maps a schema-v6 `ImageModel` onto the legacy subsystem's `ImagesModel`
+/// (the wire implementation only reads these fields).
+fn images_model_from_v6(model: &ImageModel) -> ImagesModel {
+    ImagesModel {
+        id: model.id.clone(),
+        name: model.name.clone(),
+        api: model.api.as_str().into(),
+        provider: model.provider.clone(),
+        base_url: model.base_url.clone(),
+        input: model.input.clone(),
+        output: model
+            .output
+            .iter()
+            .map(|modality| match modality {
+                crate::types::InputModality::Text => ImagesOutputModality::Text,
+                crate::types::InputModality::Image => ImagesOutputModality::Image,
+            })
+            .collect(),
+        cost: model.cost.clone(),
+        headers: model.headers.clone(),
+    }
 }
 
 /// `generateImages` (openrouter-images): never rejects.

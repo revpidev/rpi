@@ -241,10 +241,17 @@ fn test_compat_keys_roundtrip_without_loss() {
 
 #[test]
 fn test_catalog_accessors_and_generated_at() {
-    // Every registry provider with a catalog entry yields models.
+    // Every registry provider with a catalog entry yields models; classifier-
+    // only providers (typesafe) have no chat models but carry schema-v6
+    // entries (V16-07 wired their spec + system-one adapter).
     for spec in rpi_ai::providers::BUILTIN_PROVIDERS {
         if spec.in_catalog {
-            assert!(!get_builtin_models(spec.id).is_empty(), "{}", spec.id);
+            assert!(
+                !get_builtin_models(spec.id).is_empty()
+                    || !rpi_ai::generated::get_builtin_all_models(spec.id).is_empty(),
+                "{}",
+                spec.id
+            );
         }
     }
     // Pinned to the vendored .manifest.json generatedAt

@@ -51,6 +51,7 @@ pub mod qwen_token_plan_individual;
 pub mod radius;
 pub mod radius_config;
 pub mod together;
+pub mod typesafe;
 pub mod vercel_ai_gateway;
 pub mod xai;
 pub mod xiaomi;
@@ -248,6 +249,13 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
         factory: Some(together::together_provider),
     },
     BuiltinProviderSpec {
+        // Classifier-only provider (schema v6): `typesafeProvider()` @
+        // a13d35a74; upstream order = between together and vercel-ai-gateway.
+        id: "typesafe",
+        in_catalog: true,
+        factory: Some(typesafe::typesafe_provider),
+    },
+    BuiltinProviderSpec {
         id: "vercel-ai-gateway",
         in_catalog: true,
         factory: Some(vercel_ai_gateway::vercel_ai_gateway_provider),
@@ -324,7 +332,7 @@ mod tests {
     use crate::generated::{builtin_catalog, get_builtin_models};
 
     /// Upstream `builtinProviders()` order, transcribed from `all.ts` @ 4181f66.
-    const UPSTREAM_ORDER: [&str; 41] = [
+    const UPSTREAM_ORDER: [&str; 42] = [
         "amazon-bedrock",
         "ant-ling",
         "anthropic",
@@ -358,6 +366,7 @@ mod tests {
         "qwen-token-plan-individual",
         "radius",
         "together",
+        "typesafe",
         "vercel-ai-gateway",
         "xai",
         "xiaomi",
@@ -384,16 +393,16 @@ mod tests {
                 spec.id
             );
             assert!(
-                !get_builtin_models(spec.id).is_empty(),
+                !get_builtin_models(spec.id).is_empty() || spec.id == "typesafe",
                 "no catalog models for {}",
                 spec.id
             );
         }
-        // Since V15-15 every registered provider has a catalog entry. The
-        // v6 catalog additionally carries `typesafe` (classifier-only); its
-        // provider spec + system-one adapter land with V16-06/V16-07
-        // (02 §1.2), so it is the one catalog-only provider for now.
-        assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len() + 1);
+        // Since V15-15 every registered provider has a catalog entry; the v6
+        // catalog additionally carries `typesafe` (classifier-only), whose
+        // provider spec + system-one adapter landed with V16-07 (02 §1.2) —
+        // the two sides now match one-to-one.
+        assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len());
         assert!(catalog.providers().contains(&"meta"));
         assert!(catalog.providers().contains(&"typesafe"));
     }
@@ -412,7 +421,7 @@ mod tests {
         // Group C wave: 10 factories; group D wave: 12 more; group A wave:
         // 8 more; group B wave (this): 8 more. Other waves add their own ids
         // here as they land.
-        const PORTED: [&str; 41] = [
+        const PORTED: [&str; 42] = [
             "amazon-bedrock",
             "ant-ling",
             "anthropic",
@@ -446,6 +455,7 @@ mod tests {
             "qwen-token-plan-individual",
             "radius",
             "together",
+            "typesafe",
             "vercel-ai-gateway",
             "xai",
             "xiaomi",

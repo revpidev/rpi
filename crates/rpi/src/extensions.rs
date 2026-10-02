@@ -16,7 +16,9 @@
 //! - The manager UI mounts its native TUI view through the interactive
 //!   bridge's L0 escape hatch (`InteractiveUiBridge::interactive_ui`).
 
+pub mod codemode;
 pub mod llama;
+pub mod tool_search;
 
 #[cfg(test)]
 mod tests {

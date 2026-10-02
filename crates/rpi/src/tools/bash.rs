@@ -25,6 +25,9 @@ use crate::tools::{SessionEnv, ToolContext};
 pub const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 pub const MAX_TIMEOUT_SECONDS: f64 = MAX_TIMEOUT_MS as f64 / 1000.0;
 const BASH_UPDATE_THROTTLE_MS: u64 = 100;
+/// Output limit of `structuredContent.output`, which programmatic callers
+/// such as codemode scripts receive (bash.ts:24).
+const STRUCTURED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const EXIT_STDIO_GRACE_MS: u64 = 100;
 /// P1-2: bounded wait for a killed child to actually exit. The kill is
 /// fire-and-forget on every platform (upstream shell.ts:216-240); if the
@@ -595,6 +598,26 @@ impl AgentTool for BashTool {
         &self.parameters_value
     }
 
+    /// `bashOutputSchema` (bash.ts:54-63): the programmatic result shape
+    /// scripts receive (V16-07 FR-D R2).
+    fn output_schema(&self) -> Option<&Value> {
+        static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        Some(SCHEMA.get_or_init(|| {
+            json!({
+                "type": "object",
+                "properties": {
+                    "output": { "type": "string", "description": "Combined stdout and stderr, possibly truncated" },
+                    "truncated": { "type": "boolean" },
+                    "full_output_path": { "type": "string", "description": "Full output, when truncated" },
+                    "exit_code": { "type": "number" },
+                    "wall_time_seconds": { "type": "number" },
+                },
+                "required": ["output", "truncated", "exit_code", "wall_time_seconds"],
+                "additionalProperties": false,
+            })
+        }))
+    }
+
     fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
         // bash.ts:243 (`fcff255b0`): strict-prefer by default, no gate.
         crate::tools::builtin_strict_prefer_sampling()
@@ -609,6 +632,7 @@ impl AgentTool for BashTool {
     ) -> Result<AgentToolResult, AgentError> {
         let command = params.get("command").and_then(|v| v.as_str()).unwrap_or("");
         let timeout = params.get("timeout").and_then(|v| v.as_f64());
+        let started = std::time::Instant::now();
         let resolved = match &self.command_prefix {
             Some(p) => format!("{p}\n{command}"),
             None => command.to_string(),
@@ -689,19 +713,22 @@ impl AgentTool for BashTool {
         if let Some(h) = update_handle {
             let _ = h.await;
         }
-        let (snapshot, last_lb, details) = {
+        let (snapshot, last_lb, details, full_output) = {
             let mut a = accumulator.lock().unwrap_or_else(|e| e.into_inner());
             a.finish();
             let lb = a.last_line_bytes();
             let snap = a.snapshot(true);
+            let full = a.read_full_output(STRUCTURED_OUTPUT_MAX_BYTES);
             a.close_temp_file();
             let det = if snap.truncation.truncated {
                 make_details(&snap)
             } else {
                 Value::Null
             };
-            (snap, lb, det)
+            (snap, lb, det, full)
         };
+        let wall_time_seconds =
+            ((started.elapsed().as_millis() as f64 / 100.0).round()) / 10.0;
         match exec_result {
             Ok(exit_code) => {
                 let (text, _) = format_output(&snapshot, last_lb, "(no output)");
@@ -715,11 +742,34 @@ impl AgentTool for BashTool {
                         "Command terminated without an exit code",
                     )));
                 };
+                // bash.ts:386-407: the structured result is returned for
+                // programmatic callers (codemode scripts) on every exit code;
+                // a non-zero code is an error result for the model.
+                let mut structured = json!({
+                    "output": full_output.content,
+                    "truncated": full_output.truncated,
+                    "exit_code": code,
+                    "wall_time_seconds": wall_time_seconds,
+                });
+                if full_output.truncated
+                    && let Some(path) = &snapshot.full_output_path
+                {
+                    structured["full_output_path"] =
+                        Value::String(path.to_string_lossy().into_owned());
+                }
                 if code != 0 {
-                    return Err(AgentError::Message(append_status(
-                        &text,
-                        &format!("Command exited with code {code}"),
-                    )));
+                    let text = append_status(&text, &format!("Command exited with code {code}"));
+                    return Ok(AgentToolResult {
+                        content: vec![ToolResultContent::Text(TextContent {
+                            text,
+                            text_signature: None,
+                        })],
+                        details,
+                        structured_content: Some(structured),
+                        usage: None,
+                        is_error: Some(true),
+                        terminate: None,
+                    });
                 }
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
@@ -727,7 +777,10 @@ impl AgentTool for BashTool {
                         text_signature: None,
                     })],
                     details,
-                    ..Default::default()
+                    structured_content: Some(structured),
+                    usage: None,
+                    is_error: None,
+                    terminate: None,
                 })
             }
             Err(e) => {

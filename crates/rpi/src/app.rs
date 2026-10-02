@@ -932,8 +932,26 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                     rpi_ext_host::host::NativeExtensionHost::new(&cwd.to_string_lossy());
                 // Built-in hidden extensions (extensions/index.ts
                 // `builtInExtensions`) load as inline factories — trust
-                // independent, like upstream.
-                let builtin_extensions = vec![crate::extensions::llama::inline_extension()];
+                // independent, like upstream. V16-07 adds codemode and
+                // tool_search; their `defaultTools`/`--tools` activation and
+                // `replaceable`/`builtin` governance are V16-13's scope.
+                let codemode_settings: crate::extensions::codemode::CodemodeSettingsFn = {
+                    let loader = services.resource_loader.clone();
+                    std::sync::Arc::new(move || {
+                        let loader = loader.lock().unwrap_or_else(|e| e.into_inner());
+                        crate::extensions::codemode::tool::settings_from_manager(
+                            loader.settings_manager(),
+                        )
+                    })
+                };
+                let builtin_extensions = vec![
+                    crate::extensions::llama::inline_extension(),
+                    crate::extensions::codemode::inline_extension(
+                        codemode_settings,
+                        services.model_runtime.clone(),
+                    ),
+                    crate::extensions::tool_search::inline_extension(),
+                ];
                 let mut project_trust_diagnostics: Vec<AgentSessionRuntimeDiagnostic> = Vec::new();
 
                 // Two-phase trust resolution (main.ts:626-662 +

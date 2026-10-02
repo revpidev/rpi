@@ -303,7 +303,16 @@ fn fixture_bash_tool() -> FixtureTool {
                         ..Default::default()
                     });
                 }
-                text_tool_result("fixture-bash-output\n")
+                // Upstream v1.0.0 bash returns the structured result too; the
+                // shared fixture records it (V16-07 structured results).
+                let mut result = text_tool_result("fixture-bash-output\n").expect("result");
+                result.structured_content = Some(json!({
+                    "output": "fixture-bash-output\n",
+                    "truncated": false,
+                    "exit_code": 0,
+                    "wall_time_seconds": 0.0,
+                }));
+                Ok(result)
             })
         }),
     }
