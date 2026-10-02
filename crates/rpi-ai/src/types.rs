@@ -791,7 +791,7 @@ pub struct UsageCost {
 }
 
 impl Usage {
-    /// `combineUsage` (usage-totals.ts:7-28 @ a13d35a74): field-wise sum;
+    /// `combineUsage` (usage-totals.ts:31 @ a13d35a74): field-wise sum;
     /// optional splits stay `None` when both sides are `None`.
     pub fn combined(&self, other: &Usage) -> Usage {
         Usage {

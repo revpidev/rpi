@@ -124,7 +124,7 @@ pub struct AfterToolCallResult {
     pub details: Option<Value>,
     /// Replaces the machine-readable `structuredContent`; `Some(None)`-style
     /// clearing follows `content` replacement (see
-    /// `finalize_executed_tool_call`, types.ts:1419-1435 @ a13d35a74).
+    /// `finalize_executed_tool_call`, agent-loop.ts:878-888 @ a13d35a74).
     pub structured_content: Option<Value>,
     /// Replaces the tool result error flag.
     pub is_error: Option<bool>,
@@ -1275,7 +1275,8 @@ struct FinalizedToolCallOutcome {
     is_error: bool,
 }
 
-/// `AgentToolCallOutcome` (types.ts:430-436 @ a13d35a74): the final outcome
+/// `AgentToolCallOutcome` (packages/agent/src/types.ts:449-453 @
+/// a13d35a74): the final outcome
 /// of a tool call after hooks ran. Nested calls (`ctx.executeTool()`) return
 /// this shape too.
 #[derive(Debug, Clone)]
@@ -1286,7 +1287,7 @@ pub struct AgentToolCallOutcome {
 }
 
 /// Options for [`run_tool_call`] (`RunToolCallOptions`,
-/// agent-loop.ts:794-802 @ a13d35a74).
+/// agent-loop.ts:790-802 @ a13d35a74).
 pub struct RunToolCallOptions {
     /// Tools the call resolves against.
     pub tools: Vec<Arc<dyn AgentTool>>,
@@ -1933,7 +1934,7 @@ async fn finalize_executed_tool_call(
         };
         match after_tool_call(after_context, signal.clone().unwrap_or_default()).await {
             Ok(Some(after_result)) => {
-                // Upstream `finalizeExecutedToolCall` (agent-loop.ts:733-741):
+                // Upstream `finalizeExecutedToolCall` (agent-loop.ts:878-888):
                 // structured content not replaced along with the content may
                 // no longer match it, so replacing `content` without
                 // restating it drops the structured content.
@@ -2008,7 +2009,7 @@ fn create_tool_result_message(
     finalized: &FinalizedToolCallOutcome,
     nested: Option<&crate::nested_tool_calls::NestedCallSummary>,
 ) -> ToolResultMessage {
-    // `_handleAgentEvent` (agent-session.ts:1075-1085 @ a13d35a74): the
+    // `_handleAgentEvent` (agent-session.ts:1074-1086 @ a13d35a74): the
     // bounded nested-call record rides the message, and the nested usage is
     // combined into the message usage. Nested results never enter the
     // transcript themselves.

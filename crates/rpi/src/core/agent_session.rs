@@ -661,7 +661,7 @@ impl NestedToolCallHost for SessionNestedHost {
             return;
         };
         // `await this._extensionRunner.emit(event); this._emit(event)`
-        // (agent-session.ts:727-731 @ a13d35a74).
+        // (agent-session.ts:729-732 @ a13d35a74).
         let (event_name, payload, agent_event) = match event {
             NestedToolExecutionEvent::Start {
                 tool_call_id,
@@ -745,7 +745,7 @@ impl NestedToolCallHost for SessionNestedHost {
 }
 
 /// A declared tool whose model-facing description a `prepareLoadout` hook
-/// replaced (`{...tool, description}` upstream, agent-session.ts:1559-1562).
+/// replaced (`{...tool, description}` upstream, agent-session.ts:1566-1569).
 /// Everything else delegates to the wrapped tool, including execution.
 struct DescriptionOverrideTool {
     inner: Arc<dyn AgentTool>,
@@ -988,7 +988,7 @@ impl AgentSession {
         // 1720-1738 @ a13d35a74): `prepareLoadout` hidden declarations are
         // removed from the declarations every request carries.
         session.install_hidden_declarations_projection();
-        // `_nestedToolCalls` lookup (agent-session.ts:1075-1085 @
+        // `_nestedToolCalls` lookup (agent-session.ts:1074-1086 @
         // a13d35a74): finished model-issued calls take their bounded
         // nested-call record onto the result message (V16-06 FR-E).
         session.install_nested_call_summary();
@@ -1721,7 +1721,7 @@ impl AgentSession {
 
     /// `_handleAgentEvent` (agent-session.ts:595-666).
     async fn handle_agent_event(&self, event: AgentEvent) {
-        // `_nestedToolCalls.clear()` on `agent_end` (agent-session.ts:1082-1084).
+        // `_nestedToolCalls.clear()` on `agent_end` (agent-session.ts:1085).
         if matches!(event, AgentEvent::AgentEnd { .. }) {
             self.clear_nested_tool_calls();
         }
@@ -2437,7 +2437,7 @@ impl AgentSession {
         *lock(&self.inner.tool_definitions) = definitions;
         *lock(&self.inner.tool_registry) = registry;
 
-        // Active-set computation (agent-session.ts:3518-3546). Names may be
+        // Active-set computation (agent-session.ts:3519-3546). Names may be
         // non-declarable when explicitly activated (a `codemode` tool named
         // in `--tools`/`defaultTools` is declared to the model); `hidden` is
         // always filtered by `_applyToolLoadout`.
@@ -2451,7 +2451,7 @@ impl AgentSession {
             .collect();
         if self.inner.allowed_tool_names.is_some() {
             // Naming a tool activates it even when it is not active by
-            // default (agent-session.ts:3524-3528).
+            // default (agent-session.ts:3525-3529).
             for name in &registry_names {
                 if self.is_allowed_tool(name) && Self::is_declarable(&definitions_snapshot, name) {
                     next_active.push(name.clone());
@@ -2475,7 +2475,7 @@ impl AgentSession {
             }
         } else if options.active_tool_names.is_none() {
             // Pending tools that are registered now become active
-            // (agent-session.ts:3539-3544).
+            // (agent-session.ts:3534-3539).
             for name in &registry_names {
                 if !previous_activated_on_registration.contains(name)
                     && Self::is_activated_on_registration(&definitions_snapshot, name)
@@ -2500,7 +2500,7 @@ impl AgentSession {
         )
     }
 
-    /// `_isActivatedOnRegistration` (agent-session.ts:3553-3556): whether
+    /// `_isActivatedOnRegistration` (agent-session.ts:3554-3557): whether
     /// registering the tool activates it, which declares it to the model.
     fn is_activated_on_registration(
         definitions: &OrderedMap<ToolDefinitionEntry>,
@@ -2513,7 +2513,7 @@ impl AgentSession {
             )
     }
 
-    /// `_getCallableTools` (agent-session.ts:1510-1523 @ a13d35a74): the
+    /// `_getCallableTools` (agent-session.ts:1515-1524 @ a13d35a74): the
     /// active `direct` tools plus every registered `codemode`/`deferred`
     /// tool. `hidden` and `model-only` tools are not callable through
     /// `ctx.executeTool()`.
@@ -2537,7 +2537,7 @@ impl AgentSession {
             .collect()
     }
 
-    /// `getCallableToolNames` (agent-session.ts:1457-1459).
+    /// `getCallableToolNames` (agent-session.ts:1458-1460).
     pub fn get_callable_tool_names(&self) -> Vec<String> {
         self.callable_tools()
             .iter()
@@ -2546,7 +2546,7 @@ impl AgentSession {
     }
 
     /// Install the nested-call summary lookup on the shared agent
-    /// (`_handleAgentEvent`'s `takeRecord`, agent-session.ts:1075-1085 @
+    /// (`_handleAgentEvent`'s `takeRecord`, agent-session.ts:1074-1086 @
     /// a13d35a74; V16-06 FR-E). The loop calls it for each finished
     /// model-issued tool call.
     fn install_nested_call_summary(&self) {
@@ -2575,7 +2575,7 @@ impl AgentSession {
         runner
     }
 
-    /// `_executeNestedToolCall` (agent-session.ts:697-735 @ a13d35a74): run
+    /// `_executeNestedToolCall` (agent-session.ts:702-735 @ a13d35a74): run
     /// a call a tool made through `ctx.executeTool()` against the callable
     /// tools, through the same pipeline and hooks as model-issued calls.
     pub async fn execute_nested_tool_call(
@@ -2592,7 +2592,7 @@ impl AgentSession {
     }
 
     /// Clear the nested-call scopes at `agent_end` (`_nestedToolCalls.clear()`,
-    /// agent-session.ts:1082-1084).
+    /// agent-session.ts:1085).
     fn clear_nested_tool_calls(&self) {
         let runner = lock(&self.inner.nested_tool_calls).clone();
         if let Some(runner) = runner {
@@ -2623,7 +2623,8 @@ impl AgentSession {
         self.refresh_tool_registry(RefreshToolRegistryOptions::default());
     }
 
-    /// `getAllTools` (agent-session.ts:906-913) — `ToolInfo[]` JSON.
+    /// `getAllTools` (agent-session.ts:1465-1476; `ToolInfo` =
+    /// core/extensions/types.ts:2067) — `ToolInfo[]` JSON.
     pub fn get_all_tools(&self) -> Vec<serde_json::Value> {
         let definitions = lock(&self.inner.tool_definitions);
         definitions
@@ -2636,7 +2637,7 @@ impl AgentSession {
             .collect()
     }
 
-    /// `getToolDefinition` (agent-session.ts:915-917 @ a13d35a74): the
+    /// `getToolDefinition` (agent-session.ts:1478 @ a13d35a74): the
     /// `ToolInfo` JSON for one registered tool, or `None`.
     pub fn get_tool_definition(&self, name: &str) -> Option<serde_json::Value> {
         let definitions = lock(&self.inner.tool_definitions);
@@ -2645,7 +2646,8 @@ impl AgentSession {
             .map(|entry| Self::tool_info_json(name, entry))
     }
 
-    /// `ToolInfo` shape (agent-session.ts:906-913 @ a13d35a74): name,
+    /// `ToolInfo` shape (agent-session.ts:1465-1476 @ a13d35a74; `ToolInfo` =
+    /// core/extensions/types.ts:2067): name,
     /// description, parameters, promptGuidelines, exposure, namespace,
     /// annotations, sourceInfo.
     fn tool_info_json(name: &str, entry: &ToolDefinitionEntry) -> serde_json::Value {
@@ -2704,7 +2706,7 @@ impl AgentSession {
         commands
     }
 
-    /// `setActiveToolsByName` (agent-session.ts:1488-1494 @ a13d35a74).
+    /// `setActiveToolsByName` (agent-session.ts:1488-1496 @ a13d35a74).
     pub fn set_active_tools_by_name(&self, tool_names: Vec<String>) {
         let tools = self.apply_tool_loadout(tool_names);
         let valid_names: Vec<String> = tools.iter().map(|tool| tool.name().to_owned()).collect();
@@ -2715,7 +2717,7 @@ impl AgentSession {
         self.rebuild_system_prompt(&valid_names);
     }
 
-    /// `_applyToolLoadout` (agent-session.ts:1497-1569 @ a13d35a74): the
+    /// `_applyToolLoadout` (agent-session.ts:1528-1569 @ a13d35a74): the
     /// active tools are the registered, non-hidden ones; active tools with a
     /// `prepareLoadout` hook can replace declared descriptions and hide
     /// declarations from requests (the hidden projection lives on the agent
@@ -2964,7 +2966,7 @@ impl AgentSession {
         messages: Option<&[AgentMessage]>,
     ) -> Option<rpi_ai::types::SystemMessage> {
         // `options.selectedTools = this._applyToolLoadout(options.selectedTools)
-        // .map(t => t.name)` (agent-session.ts:1673-1676 @ a13d35a74): the
+        // .map(t => t.name)` (agent-session.ts:1693 @ a13d35a74): the
         // prompt's selected tools are executable through the loadout hooks
         // (description replacements + hidden declarations), and the agent
         // tools are set from the same declared list.
@@ -2975,7 +2977,7 @@ impl AgentSession {
         options.selected_tools = Some(valid_tool_names);
         // `options.toolSnippets = Object.fromEntries(Object.entries(...)
         // .filter(([name]) => !this._hiddenDeclarations.has(name)))`
-        // (agent-session.ts:1676-1679): the prompt's tool list matches the
+        // (agent-session.ts:1694-1697): the prompt's tool list matches the
         // declarations the request carries.
         let hidden = lock(&self.inner.hidden_declarations).clone();
         if let Some(snippets) = options.tool_snippets.as_mut() {

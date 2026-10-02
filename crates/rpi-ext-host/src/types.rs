@@ -456,7 +456,7 @@ pub struct TreePreparation {
     pub label: Option<String>,
 }
 
-// `RegisteredMcpServer` (types.ts:670-688) is carried as JSON: the shape is
+// `RegisteredMcpServer` (core/mcp-servers.ts:265) is carried as JSON: the shape is
 // owned by the MCP server registration surface (V16-08).
 
 /// `McpServersChangeEvent` (types.ts:710-714 @ a13d35a74): fired when an
@@ -617,7 +617,7 @@ pub struct AfterProviderResponseEvent {
     pub headers: HashMap<String, String>,
 }
 
-/// `ProviderStreamEvent` (types.ts:889-895 @ a13d35a74): a parsed provider
+/// `ProviderStreamEvent` (types.ts:890-896 @ a13d35a74): a parsed provider
 /// stream event before Pi normalizes it. Notification only — never
 /// persisted; handlers run in stream order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -872,7 +872,7 @@ pub struct MessageEndEventResult {
     pub message: Option<AgentMessage>,
 }
 
-/// `ToolExecutionStartEvent` (types.ts:756-761 @ a13d35a74).
+/// `ToolExecutionStartEvent` (types.ts:1044-1050 @ a13d35a74).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionStartEvent {
@@ -884,7 +884,7 @@ pub struct ToolExecutionStartEvent {
     pub parent_tool_call_id: Option<String>,
 }
 
-/// `ToolExecutionUpdateEvent` (types.ts:764-770 @ a13d35a74).
+/// `ToolExecutionUpdateEvent` (types.ts:1054-1061 @ a13d35a74).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionUpdateEvent {
@@ -897,7 +897,7 @@ pub struct ToolExecutionUpdateEvent {
     pub parent_tool_call_id: Option<String>,
 }
 
-/// `ToolExecutionEndEvent` (types.ts:773-779 @ a13d35a74).
+/// `ToolExecutionEndEvent` (types.ts:1065-1072 @ a13d35a74).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionEndEvent {
@@ -1004,7 +1004,7 @@ pub struct ToolCallEvent {
     pub input: Value,
     /// Set when another tool (for example a codemode script) issued this
     /// call. Nested ids are `<parent id>/<n>` and never appear as tool calls
-    /// or tool results in the transcript (types.ts:843-850 @ a13d35a74).
+    /// or tool results in the transcript (types.ts:1141-1151 @ a13d35a74).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
 }
@@ -1044,7 +1044,7 @@ pub struct ToolResultEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
     /// Set when another tool (for example a codemode script) issued this
-    /// call (types.ts:1183-1219 @ a13d35a74).
+    /// call (types.ts:1215-1230 @ a13d35a74).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
 }
@@ -1059,7 +1059,7 @@ pub struct ToolResultEventResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
     /// Replacing `content` without this field drops the structured content
-    /// (types.ts:1419-1435 @ a13d35a74).
+    /// (types.ts:1425-1437 @ a13d35a74).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

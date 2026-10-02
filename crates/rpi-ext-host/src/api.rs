@@ -518,7 +518,7 @@ pub struct ExecResult {
     pub killed: bool,
 }
 
-/// `ExecuteToolOptions` (types.ts:367-373 @ a13d35a74) for
+/// `ExecuteToolOptions` (types.ts:368-373 @ a13d35a74) for
 /// [`ExtensionContext::execute_tool`]. `on_update` and the cancellation
 /// signal cannot cross a JSON ABI boundary; wasm guests use the host-call
 /// form documented in `docs/extension-abi.md`.
@@ -530,7 +530,8 @@ pub struct ExecuteToolOptions {
     pub signal: Option<CancellationToken>,
 }
 
-/// `AgentToolCallOutcome` (types.ts:430-436 @ a13d35a74) carried over the
+/// `AgentToolCallOutcome` (packages/agent/src/types.ts:449-453 @ a13d35a74)
+/// carried over the
 /// host boundary: the tool call JSON, its result, and the error flag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -681,7 +682,7 @@ pub trait HostActions: Send + Sync {
     async fn remove_runtime_api_key(&self, provider_id: &str) -> Result<(), String>;
 
     /// Backs `ExtensionToolContext.executeTool()` (types.ts:390-394 @
-    /// a13d35a74; `_executeNestedToolCall`, agent-session.ts:697-735): run
+    /// a13d35a74; `_executeNestedToolCall`, agent-session.ts:702-735): run
     /// another tool through the same validation, hooks, and permission
     /// checks as model-issued calls. Never rejects for tool failures — they
     /// come back as `is_error: true`. Default: unbound (the action surface
@@ -1539,7 +1540,7 @@ pub struct ExtensionContext {
     /// the current value through `ctx.getSystemPrompt()`
     /// (runner.ts:1075-1082).
     system_prompt_override: Option<Arc<RwLock<String>>>,
-    /// `createToolContext` binding (runner.ts:950-980 @ a13d35a74): set for a
+    /// `createToolContext` binding (runner.ts:952-980 @ a13d35a74): set for a
     /// tool's execution context; `ctx.executeTool()` is only available then.
     /// The signal is the calling tool's default signal.
     tool_call: Option<ToolCallBinding>,
@@ -1564,7 +1565,7 @@ impl ExtensionContext {
     }
 
     /// Context bound to one tool execution (`createToolContext`,
-    /// runner.ts:950-980 @ a13d35a74): the calling id and signal back
+    /// runner.ts:952-980 @ a13d35a74): the calling id and signal back
     /// `ctx.executeTool()` (V16-06 FR-E).
     pub(crate) fn for_tool(
         runtime: ExtensionRuntime,

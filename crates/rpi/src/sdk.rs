@@ -843,7 +843,7 @@ fn after_tool_call_with_image_normalization(
                 }
 
                 // `structuredContent: hookResult ? hookResult.structuredContent
-                // : result.structuredContent` (agent-session.ts:528 @
+                // : result.structuredContent` (agent-session.ts:692 @
                 // a13d35a74): without a hook patch the executed result's
                 // structured content survives image normalization; with one,
                 // the patch decides (null when a handler replaced `content`

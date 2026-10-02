@@ -265,7 +265,7 @@ impl ExtensionRunnerCore {
         ExtensionContext::new(self.runtime.clone(), self.cwd.clone())
     }
 
-    /// `createToolContext` (runner.ts:950-980 @ a13d35a74): the context a
+    /// `createToolContext` (runner.ts:952-980 @ a13d35a74): the context a
     /// tool's `execute` receives; carries the calling id and signal so
     /// `ctx.executeTool()` can run nested calls under it (V16-06 FR-E).
     pub fn create_tool_context(

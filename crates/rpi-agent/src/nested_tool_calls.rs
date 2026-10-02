@@ -27,7 +27,7 @@ use crate::types::{
 /// Limits of the nested-call record on a tool result: arguments over the
 /// per-call or total size are omitted, calls beyond the count are dropped,
 /// and the record is marked incomplete when any of that happens
-/// (`NESTED_CALL_LIMITS`, nested-tool-calls.ts:27-32).
+/// (`NESTED_CALL_LIMITS`, nested-tool-calls.ts:26-31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NestedCallLimits {
     pub max_calls: usize,
@@ -44,7 +44,7 @@ pub const NESTED_CALL_LIMITS: NestedCallLimits = NestedCallLimits {
 };
 
 /// What the nested calls of one model-issued tool call leave on its tool
-/// result message (`NestedCallSummary`, nested-tool-calls.ts:37-43).
+/// result message (`NestedCallSummary`, nested-tool-calls.ts:36-42).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NestedCallSummary {
     /// Becomes `nestedCalls`. `None` when no nested call was made.
@@ -53,7 +53,7 @@ pub struct NestedCallSummary {
     pub usage: Option<Usage>,
 }
 
-/// `tool_execution_*` events of nested calls (nested-tool-calls.ts:139-161).
+/// `tool_execution_*` events of nested calls (nested-tool-calls.ts:111-128).
 #[derive(Debug, Clone)]
 pub enum NestedToolExecutionEvent {
     Start {
@@ -79,7 +79,7 @@ pub enum NestedToolExecutionEvent {
 }
 
 /// The session-side backing of a [`NestedCallRunner`]
-/// (`NestedToolCallHost`, nested-tool-calls.ts:163-175).
+/// (`NestedToolCallHost`, nested-tool-calls.ts:130-143).
 #[async_trait::async_trait]
 pub trait NestedToolCallHost: Send + Sync {
     /// Tools nested calls resolve against.
@@ -100,7 +100,7 @@ pub trait NestedToolCallHost: Send + Sync {
     async fn emit(&self, event: NestedToolExecutionEvent);
 }
 
-/// `NestedCallRecorder` (nested-tool-calls.ts:50-100): collects the nested
+/// `NestedCallRecorder` (nested-tool-calls.ts:47-101): collects the nested
 /// calls of one model-issued tool call, including calls made by nested
 /// tools.
 #[derive(Debug)]
@@ -164,7 +164,7 @@ impl NestedCallRecorder {
         Some(index)
     }
 
-    /// Mark the call finished (`finish`, nested-tool-calls.ts:81-88).
+    /// Mark the call finished (`finish`, nested-tool-calls.ts:79-85).
     pub fn finish(&mut self, index: Option<usize>, is_error: bool, error_text: &str) {
         let Some(index) = index else {
             return;
@@ -203,7 +203,7 @@ impl NestedCallRecorder {
     }
 
     /// Copy of the record so far, or `None` when no nested call was made
-    /// (`snapshot`, nested-tool-calls.ts:93-99).
+    /// (`snapshot`, nested-tool-calls.ts:96-100).
     pub fn snapshot(&self) -> Option<NestedToolCalls> {
         if self.calls.is_empty() && self.complete {
             return None;
@@ -226,7 +226,7 @@ struct ScopeState {
     holds_queue: bool,
 }
 
-/// `NestedToolCallOptions` (nested-tool-calls.ts:102-108).
+/// `NestedToolCallOptions` (nested-tool-calls.ts:103-108).
 #[derive(Default)]
 pub struct NestedToolCallOptions {
     /// Defaults to the calling tool's signal.
@@ -236,7 +236,7 @@ pub struct NestedToolCallOptions {
     pub on_update: Option<AgentToolUpdateCallback>,
 }
 
-/// `NestedToolCallRunner` (nested-tool-calls.ts:189-285): runs nested calls
+/// `NestedToolCallRunner` (nested-tool-calls.ts:160-261): runs nested calls
 /// on behalf of a model-issued call, serializing exclusive ones.
 pub struct NestedCallRunner {
     host: Arc<dyn NestedToolCallHost>,
@@ -428,7 +428,7 @@ impl NestedCallRunner {
     }
 
     /// Remove and return the record of the nested calls a model-issued call
-    /// made (`takeRecord`, nested-tool-calls.ts:279-285).
+    /// made (`takeRecord`, nested-tool-calls.ts:251-256).
     pub fn take_record(&self, tool_call_id: &str) -> Option<NestedCallSummary> {
         let scope = self
             .scopes
@@ -442,7 +442,7 @@ impl NestedCallRunner {
         })
     }
 
-    /// Drop every scope (`clear`, nested-tool-calls.ts:287-289).
+    /// Drop every scope (`clear`, nested-tool-calls.ts:258-260).
     pub fn clear(&self) {
         self.scopes
             .lock()
@@ -464,7 +464,7 @@ fn error_tool_result(message: String) -> AgentToolResult {
     }
 }
 
-/// `textOf` (nested-tool-calls.ts:184-187): join the text blocks of a result.
+/// `textOf` (nested-tool-calls.ts:153-158): join the text blocks of a result.
 fn text_of(result: &AgentToolResult) -> String {
     result
         .content

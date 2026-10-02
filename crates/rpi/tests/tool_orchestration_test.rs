@@ -468,7 +468,11 @@ async fn orchestrator_exposure_loadout_and_nested_calls() {
         ]
     );
     assert!(nested.complete);
-    // Results are never stored in the record.
+    // Results are never stored in the record: only the error text of the
+    // failed call may appear, never the nested tools' result content.
+    let serialized = serde_json::to_string(&nested).unwrap();
+    assert!(!serialized.contains("helped"), "{serialized}");
+    assert!(!serialized.contains("echo: hi"), "{serialized}");
     assert!(
         nested
             .calls
