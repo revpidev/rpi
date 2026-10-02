@@ -3196,6 +3196,7 @@ dependencies = [
 name = "rpi-codemode"
 version = "0.1.5"
 dependencies = [
+ "chrono",
  "futures",
  "rpi-test-env",
  "serde",

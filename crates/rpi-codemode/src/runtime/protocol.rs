@@ -49,4 +49,10 @@ pub enum HostToWorker {
         ok: bool,
         payload: Option<String>,
     },
+    /// The host abandoned the execution (timeout or abort): stop waiting for
+    /// replies so the worker thread and its VM are released. The interrupt
+    /// flag alone only stops wasm execution, not a worker blocked on
+    /// `recv()` while an in-flight tool holds a sender clone (V16-07 review
+    /// O-C).
+    Abort,
 }

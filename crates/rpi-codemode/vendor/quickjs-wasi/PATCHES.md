@@ -23,3 +23,14 @@ sandbox drives the module through the `qjs_*` C ABI exported by the binary
 Node/Bun glue.
 
 `LICENSE` next to this file is the package's MIT license text.
+
+## rpi host shims (`random_get`)
+
+The rpi host (`crates/rpi-codemode/src/runtime/worker.rs`) implements the
+module's WASI `random_get` import with `RandomState` (`std`'s SipHash-1-3 over
+OS-seeded, per-thread keys). That is **not a CSPRNG**; the upstream
+quickjs-wasi wrapper uses `crypto.getRandomValues` instead. In 3.6.2 the
+import is consumed once per VM by WASI libc init, while `Math.random()` seeds
+from `clock_time_get`, so no script-visible capability depends on these bytes.
+If a future extension path consumes `random_get`, replace the body with an OS
+entropy source (for example the `getrandom` crate) before shipping it.

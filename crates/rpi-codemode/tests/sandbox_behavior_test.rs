@@ -654,3 +654,29 @@ async fn memory_limit_fails_runaway_allocations_inside_the_script() {
     assert!(error.contains("out of memory"), "{value}");
     assert!(value["n"].as_u64().unwrap_or(999) < 512, "{value}");
 }
+
+#[tokio::test]
+async fn date_uses_the_host_timezone_like_upstream() {
+    use chrono::{Offset as _, TimeZone as _};
+
+    let sandbox = sandbox_with(vec![], vec![], 10_000);
+    let result = sandbox
+        .execute(
+            "return new Date(0).getTimezoneOffset()",
+            CodemodeExecuteOptions {
+                timeout_ms: Some(CodemodeTimeout::Infinite),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("execution");
+    let observed = ok_value(result).as_i64().expect("number");
+    // `getTimezoneOffset()` is minutes west of UTC; the host hook returns
+    // seconds east (upstream's `timezoneOffset: "host"` default).
+    let offset_seconds = chrono::Local
+        .timestamp_opt(0, 0)
+        .single()
+        .map(|time| time.offset().fix().local_minus_utc())
+        .unwrap_or(0);
+    assert_eq!(observed, i64::from(-offset_seconds / 60));
+}

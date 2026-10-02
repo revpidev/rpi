@@ -12,6 +12,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use chrono::Offset as _;
 use serde_json::Value;
 use wasmtime::{AsContextMut, Caller, Engine, Extern, Instance, Linker, Memory, Module, Store};
 
@@ -147,6 +148,25 @@ pub fn run_worker(input: WorkerInput) {
     }
 }
 
+/// UTC offset (seconds east) of `tz` at the instant split across `hi`:`lo`
+/// (seconds since the epoch, high word first; the wasm ABI passes a 64-bit
+/// value as two `i32`s). `0` when the instant is outside chrono's range.
+fn timezone_offset_seconds_at<Tz: chrono::TimeZone>(tz: &Tz, hi: i32, lo: i32) -> i32 {
+    let seconds = ((hi as i64) << 32) | (lo as u32 as i64);
+    match tz.timestamp_opt(seconds, 0).single() {
+        Some(time) => time.offset().fix().local_minus_utc(),
+        None => 0,
+    }
+}
+
+/// [`timezone_offset_seconds_at`] for the host timezone, matching upstream's
+/// default `timezoneOffset: "host"` (`new Date(timeSecs * 1000)` in
+/// quickjs-wasi's shim, negated to an east-of-UTC offset). `Date` is plain
+/// JavaScript, so scripts observe this value (V16-07 review O-D).
+fn host_timezone_offset_seconds(hi: i32, lo: i32) -> i32 {
+    timezone_offset_seconds_at(&chrono::Local, hi, lo)
+}
+
 fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), String> {
     quickjs::initialize(&mut vm.store, &vm.funcs)?;
     if let Some(limit) = input.memory_limit_bytes {
@@ -245,7 +265,12 @@ fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), 
         let Ok(message) = input.replies.recv() else {
             break;
         };
-        let HostToWorker::Result { id, ok, payload } = message;
+        let HostToWorker::Result { id, ok, payload } = message else {
+            // The host abandoned the execution (timeout/abort): no reply can
+            // ever arrive, so release the thread and VM instead of blocking
+            // on `recv()` forever (V16-07 review O-C).
+            break;
+        };
         let id_value = vm.new_number(f64::from(id));
         let ok_value = vm.boolean(ok);
         let has_payload = payload.is_some();
@@ -275,7 +300,7 @@ fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), 
 }
 
 /// Run queued jobs, then fail a script that waits on nothing that can ever
-/// resume it (`drain` in worker.ts:145-148).
+/// resume it (`drain` in worker.ts:118-122).
 fn drain(vm: &mut QuickJsVm<WorkerHost>, api: u32, stalled: u32) -> Result<(), Thrown> {
     let _ = vm.store.set_fuel(FUEL_BUDGET);
     vm.execute_pending_jobs()?;
@@ -301,7 +326,7 @@ fn crash_from(vm: &mut QuickJsVm<WorkerHost>, thrown: Thrown) -> Result<(), Stri
 
 // ---------------------------------------------------------------------------
 // Imports: `env.*` (QuickJS host hooks) and a minimal `wasi_snapshot_preview1`
-// (the worker discards engine output, worker.ts:39-51).
+// (the worker discards engine output, worker.ts:32-44).
 // ---------------------------------------------------------------------------
 
 fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
@@ -322,7 +347,8 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
             "env",
             "host_promise_rejection",
             |mut caller: Caller<'_, WorkerHost>, promise: i32, reason: i32, _handled: i32| {
-                // No handler: free the heap-allocated values (wasi-shim.ts:21-24).
+                // No handler: free the heap-allocated values
+                // (quickjs-wasi src/index.ts:1041-1046).
                 if let Some(qjs) = quickjs::caller_instance(&caller) {
                     quickjs::free_value(&mut caller, &qjs.funcs, promise as u32);
                     quickjs::free_value(&mut caller, &qjs.funcs, reason as u32);
@@ -351,12 +377,12 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
         .func_wrap(
             "env",
             "host_get_timezone_offset",
-            |_: Caller<'_, WorkerHost>, _hi: i32, _lo: i32| -> i32 {
-                // The codemode sandbox has no clock surface of its own; report
-                // UTC (documented difference from the upstream host-timezone
-                // default, which no codemode script can observe through the
-                // tool-only capability set).
-                0
+            |_: Caller<'_, WorkerHost>, hi: i32, lo: i32| -> i32 {
+                // Host local time, like upstream's default `timezoneOffset:
+                // "host"` (V16-07 review O-D). `Date()` and
+                // `getTimezoneOffset()` are plain JavaScript and need no
+                // capability, so scripts do observe this value.
+                host_timezone_offset_seconds(hi, lo)
             },
         )
         .map_err(|error| error.to_string())?;
@@ -373,7 +399,7 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
              -> i32 {
                 // Engine diagnostics belong to the host application (a TUI):
                 // discard every byte but report it as written so libc does not
-                // retry (worker.ts:39-51).
+                // retry (worker.ts:32-44).
                 if fd != 1 && fd != 2 {
                     return 8; // BADF
                 }
@@ -490,6 +516,13 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
             "wasi_snapshot_preview1",
             "random_get",
             |mut caller: Caller<'_, WorkerHost>, buf: i32, len: i32| -> i32 {
+                // `RandomState` (SipHash-1-3 with per-thread, OS-seeded keys)
+                // is not a CSPRNG. In quickjs-wasi 3.6.2 this import is
+                // consumed once per VM by WASI libc init (`Math.random()`
+                // seeds from `clock_time_get` instead), while the upstream
+                // shim would use `crypto.getRandomValues`; the tradeoff and
+                // the replacement path are documented in
+                // `vendor/quickjs-wasi/PATCHES.md`.
                 let Some(memory) = caller_memory(&mut caller) else {
                     return 8;
                 };
@@ -523,7 +556,7 @@ fn caller_memory<W>(caller: &mut Caller<'_, W>) -> Option<Memory> {
     }
 }
 
-/// The generic `bridge` host function (worker.ts:82-137).
+/// The generic `bridge` host function (worker.ts:65-100).
 fn host_call(
     mut caller: Caller<'_, WorkerHost>,
     name_ptr: u32,
@@ -701,4 +734,24 @@ fn throw_host_error(caller: &mut Caller<'_, WorkerHost>, qjs: &QjsInstance, mess
 /// increment the epoch backstop on timeout).
 pub fn engine_handle() -> &'static Engine {
     engine()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timezone_offset_combines_the_split_seconds_and_uses_the_zone() {
+        let east = chrono::FixedOffset::east_opt(8 * 3600).expect("offset");
+        assert_eq!(timezone_offset_seconds_at(&east, 0, 0), 8 * 3600);
+        // -1 second since the epoch: hi = -1, lo = -1 in the wasm split.
+        assert_eq!(timezone_offset_seconds_at(&east, -1, -1), 8 * 3600);
+        // 2^33 + 1 seconds: hi = 2, lo = 1.
+        assert_eq!(timezone_offset_seconds_at(&east, 2, 1), 8 * 3600);
+        let west = chrono::FixedOffset::west_opt(5 * 3600).expect("offset");
+        assert_eq!(timezone_offset_seconds_at(&west, 0, 0), -5 * 3600);
+        // An instant beyond chrono's representable range falls back to UTC
+        // instead of panicking.
+        assert_eq!(timezone_offset_seconds_at(&east, i32::MAX, i32::MAX), 0);
+    }
 }

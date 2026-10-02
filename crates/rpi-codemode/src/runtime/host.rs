@@ -22,7 +22,24 @@ use crate::types::{
     CodemodeTimeout, CodemodeTool, CodemodeToolContext, RESERVED_GLOBALS,
 };
 
-/// One in-flight call as the host tracks it (`PendingCall`, host.ts:68-72).
+/// Number of live `run_worker` threads. Test-only: the V16-07 O-C regression
+/// test asserts it returns to its previous value after the host abandons an
+/// execution whose tool never resolves.
+#[cfg(test)]
+static LIVE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Decrements [`LIVE_WORKERS`] when a worker thread exits (test builds).
+#[cfg(test)]
+struct WorkerThreadGuard;
+
+#[cfg(test)]
+impl Drop for WorkerThreadGuard {
+    fn drop(&mut self) {
+        LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One in-flight call as the host tracks it (`PendingCall`, host.ts:63-67).
 struct PendingCall {
     /// Tool calls get a record; globals are tracked for the reply only.
     index: Option<usize>,
@@ -221,7 +238,13 @@ impl CodemodeSandbox {
             events: events_tx,
             replies: replies_rx,
         };
-        let handle = std::thread::spawn(move || run_worker(worker_input));
+        #[cfg(test)]
+        LIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
+        let handle = std::thread::spawn(move || {
+            #[cfg(test)]
+            let _guard = WorkerThreadGuard;
+            run_worker(worker_input)
+        });
 
         let calls = Arc::new(Mutex::new(CallTable::default()));
         let mut output: Vec<CodemodeOutputItem> = Vec::new();
@@ -234,6 +257,8 @@ impl CodemodeSandbox {
         };
 
         let outcome: CodemodeResult;
+        // Set when the host gives up on the execution (abort or timeout).
+        let mut abandoned = false;
         loop {
             let timeout_sleep = async {
                 match deadline {
@@ -247,6 +272,7 @@ impl CodemodeSandbox {
                 biased;
                 _ = abort.cancelled() => {
                     interrupt.store(true, Ordering::SeqCst);
+                    abandoned = true;
                     outcome = CodemodeResult::Err {
                         error: CodemodeError {
                             kind: CodemodeErrorKind::Aborted,
@@ -261,6 +287,7 @@ impl CodemodeSandbox {
                 }
                 _ = timeout_sleep => {
                     interrupt.store(true, Ordering::SeqCst);
+                    abandoned = true;
                     outcome = CodemodeResult::Err {
                         error: CodemodeError {
                             kind: CodemodeErrorKind::Timeout,
@@ -385,8 +412,15 @@ impl CodemodeSandbox {
             }
         }
 
+        // A host that abandons an execution must wake a worker blocked on
+        // `replies.recv()`: dropping `replies_tx` is not enough while an
+        // in-flight tool task still holds a sender clone, and the interrupt
+        // flag is only observed while wasm runs (V16-07 review O-C).
+        if abandoned {
+            let _ = replies_tx.send(HostToWorker::Abort);
+        }
         // Already cancelled by finish(): the record keeps "cancelled" and the
-        // worker is gone or going (host.ts:247-250).
+        // worker is gone or going (host.ts:242-253).
         abort.cancel();
         drop(replies_tx);
         drop(handle);
@@ -422,7 +456,7 @@ fn serialize_store(store: Option<&Value>) -> serde_json::Map<String, Value> {
     serialized
 }
 
-/// `parseStoreWrites` (host.ts:53-61): entries of `[key, json]` (set) and
+/// `parseStoreWrites` (host.ts:49-56): entries of `[key, json]` (set) and
 /// `[key]` (delete).
 fn parse_store_writes(json: Option<&str>) -> CodemodeStoreWrites {
     let mut writes = CodemodeStoreWrites::default();
@@ -443,7 +477,7 @@ fn parse_store_writes(json: Option<&str>) -> CodemodeStoreWrites {
             writes.delete.push(key.to_owned());
         } else if let Some(Value::String(value)) = entry.get(1) {
             // The worker sends `[key, json]` where `json` is the value's JSON
-            // text; `parseStoreWrites` parses it back (host.ts:53-61).
+            // text; `parseStoreWrites` parses it back (host.ts:49-56).
             if let Ok(parsed) = serde_json::from_str::<Value>(value) {
                 writes.set.insert(key.to_owned(), parsed);
             }
@@ -452,7 +486,7 @@ fn parse_store_writes(json: Option<&str>) -> CodemodeStoreWrites {
     writes
 }
 
-/// `handleDone` error branch (host.ts:216-220): `{name?, message, stack?}`.
+/// `handleDone` error branch (host.ts:201-208): `{name?, message, stack?}`.
 fn parse_script_error(error: Option<&str>) -> CodemodeError {
     let parsed = error
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
@@ -527,7 +561,7 @@ fn complete_call(
                     table.records[index].duration_ms = duration;
                     // A call cut off by finish() keeps `cancelled`, even when
                     // the tool surfaces its own cancellation as an error
-                    // (host.ts:243-250).
+                    // (host.ts:242-253).
                     match result {
                         Ok(value) if !execution.is_cancelled() => {
                             table.records[index].status = CodemodeCallStatus::Ok;
@@ -563,7 +597,7 @@ fn complete_call(
                     }
                 }
             }
-            // After finish(), no reply is needed (host.ts:247-250).
+            // After finish(), no reply is needed (host.ts:242-253).
             None => return,
         }
     }
@@ -588,4 +622,75 @@ fn finish_calls(calls: &Arc<Mutex<CallTable>>) -> Vec<CodemodeCall> {
     }
     table.by_id.clear();
     table.records.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tool that reports its invocation and then never settles, ignoring
+    /// the cancellation signal.
+    fn hanging_tool(called: tokio::sync::mpsc::UnboundedSender<()>) -> CodemodeTool {
+        CodemodeTool {
+            name: "hang".to_owned(),
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            spread: false,
+            signature: None,
+            execute: Arc::new(move |_args, _ctx| {
+                let called = called.clone();
+                Box::pin(async move {
+                    let _ = called.send(());
+                    std::future::pending::<Result<Value, String>>().await
+                })
+            }),
+        }
+    }
+
+    /// V16-07 review O-C: a worker blocked on `replies.recv()` while an
+    /// in-flight tool never resolves must still exit when the host abandons
+    /// the execution. Without the `HostToWorker::Abort` message the thread
+    /// (and its VM) outlived the sandbox.
+    #[tokio::test]
+    async fn abandoning_an_execution_releases_a_worker_blocked_on_a_hanging_tool() {
+        let (called_tx, mut called_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sandbox = Arc::new(
+            CodemodeSandbox::new(CodemodeSandboxOptions {
+                tools: vec![hanging_tool(called_tx)],
+                timeout_ms: CodemodeTimeout::Milliseconds(60_000),
+                ..Default::default()
+            })
+            .expect("sandbox"),
+        );
+        let before = LIVE_WORKERS.load(Ordering::SeqCst);
+        let running = {
+            let sandbox = sandbox.clone();
+            tokio::spawn(async move {
+                sandbox
+                    .execute(
+                        "await tools.hang(); return 'never'",
+                        CodemodeExecuteOptions::default(),
+                    )
+                    .await
+                    .expect("execution")
+            })
+        };
+        called_rx.recv().await.expect("tool invoked");
+        sandbox.close().await;
+        let result = running.await.expect("join");
+        let CodemodeResult::Err { error, .. } = result else {
+            panic!("expected aborted, got {result:?}");
+        };
+        assert_eq!(error.kind, CodemodeErrorKind::Aborted);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while LIVE_WORKERS.load(Ordering::SeqCst) > before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker thread leaked after the host abandoned the execution"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }

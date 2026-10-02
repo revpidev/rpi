@@ -67,6 +67,11 @@ jsonschema = "0.33"
 regex = "1"
 url = "2"
 httpdate = "1"
+# V16-07 O-D: host timezone for the codemode `Date` surface. Already in the
+# lock via oauth2; clock-only keeps the feature set minimal. chrono is the
+# workspace's only general date/time library (httpdate/toml_datetime/filetime
+# are wire-format or filesystem-specific).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs2 = "0.4"
 # default-features = false: only the PKCE helpers are used; pulls in neither
 # reqwest nor an HTTP client of its own.
