@@ -15,14 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::Value;
 use wasmtime::{AsContextMut, Caller, Engine, Extern, Instance, Linker, Memory, Module, Store};
 
-use crate::quickjs::{
-    self, HostQjs, QjsFuncs, QjsInstance, QuickJsVm, Thrown,
-};
+use crate::quickjs::{self, HostQjs, QjsFuncs, QjsInstance, QuickJsVm, Thrown};
 use crate::runtime::prelude::PRELUDE_SOURCE;
 use crate::runtime::protocol::{CallTarget, HostToWorker, WorkerToHost};
-use crate::wasm::{
-    FUEL_BUDGET, MAX_STACK_SIZE, WASM_MEMORY_LIMIT_BYTES, compiled_module, engine,
-};
+use crate::wasm::{FUEL_BUDGET, MAX_STACK_SIZE, WASM_MEMORY_LIMIT_BYTES, compiled_module, engine};
 
 /// Everything one execution needs to start.
 pub struct WorkerInput {
@@ -147,11 +143,7 @@ pub fn run_worker(input: WorkerInput) {
     };
 
     if let Err(message) = run_script(&mut vm, input) {
-        let _ = vm
-            .store
-            .data()
-            .events
-            .send(WorkerToHost::Crash { message });
+        let _ = vm.store.data().events.send(WorkerToHost::Crash { message });
     }
 }
 
@@ -317,9 +309,13 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
         .func_wrap("env", "host_call", host_call)
         .map_err(|error| error.to_string())?;
     linker
-        .func_wrap("env", "host_interrupt", |caller: Caller<'_, WorkerHost>| -> i32 {
-            i32::from(caller.data().interrupt.load(Ordering::SeqCst))
-        })
+        .func_wrap(
+            "env",
+            "host_interrupt",
+            |caller: Caller<'_, WorkerHost>| -> i32 {
+                i32::from(caller.data().interrupt.load(Ordering::SeqCst))
+            },
+        )
         .map_err(|error| error.to_string())?;
     linker
         .func_wrap(
@@ -335,15 +331,21 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     linker
-        .func_wrap("env", "host_module_normalize", |_: Caller<'_, WorkerHost>, _base: i32, name: i32| -> i32 {
-            // No module loader: pass the specifier through unchanged.
-            name
-        })
+        .func_wrap(
+            "env",
+            "host_module_normalize",
+            |_: Caller<'_, WorkerHost>, _base: i32, name: i32| -> i32 {
+                // No module loader: pass the specifier through unchanged.
+                name
+            },
+        )
         .map_err(|error| error.to_string())?;
     linker
-        .func_wrap("env", "host_module_load", |_: Caller<'_, WorkerHost>, _name: i32, _out_len: i32| -> i32 {
-            0
-        })
+        .func_wrap(
+            "env",
+            "host_module_load",
+            |_: Caller<'_, WorkerHost>, _name: i32, _out_len: i32| -> i32 { 0 },
+        )
         .map_err(|error| error.to_string())?;
     linker
         .func_wrap(
@@ -363,7 +365,12 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_write",
-            |mut caller: Caller<'_, WorkerHost>, fd: i32, iovs: i32, iovs_len: i32, written: i32| -> i32 {
+            |mut caller: Caller<'_, WorkerHost>,
+             fd: i32,
+             iovs: i32,
+             iovs_len: i32,
+             written: i32|
+             -> i32 {
                 // Engine diagnostics belong to the host application (a TUI):
                 // discard every byte but report it as written so libc does not
                 // retry (worker.ts:39-51).
@@ -393,9 +400,13 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     linker
-        .func_wrap("wasi_snapshot_preview1", "fd_close", |_: Caller<'_, WorkerHost>, _fd: i32| -> i32 {
-            52 // NOSYS
-        })
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_close",
+            |_: Caller<'_, WorkerHost>, _fd: i32| -> i32 {
+                52 // NOSYS
+            },
+        )
         .map_err(|error| error.to_string())?;
     linker
         .func_wrap(
@@ -430,7 +441,12 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_seek",
-            |_: Caller<'_, WorkerHost>, _fd: i32, _offset: i64, _whence: i32, _result: i32| -> i32 {
+            |_: Caller<'_, WorkerHost>,
+             _fd: i32,
+             _offset: i64,
+             _whence: i32,
+             _result: i32|
+             -> i32 {
                 52 // NOSYS
             },
         )
@@ -439,7 +455,11 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
         .func_wrap(
             "wasi_snapshot_preview1",
             "clock_time_get",
-            |mut caller: Caller<'_, WorkerHost>, clock_id: i32, _precision: i64, result: i32| -> i32 {
+            |mut caller: Caller<'_, WorkerHost>,
+             clock_id: i32,
+             _precision: i64,
+             result: i32|
+             -> i32 {
                 if clock_id != 0 && clock_id != 1 {
                     return 52; // NOSYS
                 }
@@ -451,8 +471,13 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
                     .map(|duration| duration.as_nanos() as u64)
                     .unwrap_or(0);
                 if quickjs::write_u32(&mut caller, &memory, result as u32, nanos as u32).is_err()
-                    || quickjs::write_u32(&mut caller, &memory, result as u32 + 4, (nanos >> 32) as u32)
-                        .is_err()
+                    || quickjs::write_u32(
+                        &mut caller,
+                        &memory,
+                        result as u32 + 4,
+                        (nanos >> 32) as u32,
+                    )
+                    .is_err()
                 {
                     return 8;
                 }
@@ -544,12 +569,17 @@ fn host_call(
     };
     match kind.as_str() {
         "call" | "global" => {
-            let id = quickjs::to_f64(&mut caller, &qjs.funcs, args.get(1).copied().unwrap_or(0)) as u32;
-            let target_name =
-                match quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, args.get(2).copied().unwrap_or(0)) {
-                    Ok(name) => name,
-                    Err(_) => return 0,
-                };
+            let id =
+                quickjs::to_f64(&mut caller, &qjs.funcs, args.get(1).copied().unwrap_or(0)) as u32;
+            let target_name = match quickjs::read_string_value(
+                &mut caller,
+                &qjs.funcs,
+                &qjs.memory,
+                args.get(2).copied().unwrap_or(0),
+            ) {
+                Ok(name) => name,
+                Err(_) => return 0,
+            };
             let args_json = match args.get(3).copied() {
                 Some(value) if !quickjs::is_undefined(&mut caller, &qjs.funcs, value) => {
                     quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, value).ok()
@@ -569,29 +599,45 @@ fn host_call(
             });
         }
         "output" => {
-            let output_kind =
-                match quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, args.get(1).copied().unwrap_or(0)) {
-                    Ok(kind) => kind,
+            let output_kind = match quickjs::read_string_value(
+                &mut caller,
+                &qjs.funcs,
+                &qjs.memory,
+                args.get(1).copied().unwrap_or(0),
+            ) {
+                Ok(kind) => kind,
+                Err(_) => return 0,
+            };
+            let item = if output_kind == "image" {
+                let data = match quickjs::read_string_value(
+                    &mut caller,
+                    &qjs.funcs,
+                    &qjs.memory,
+                    args.get(2).copied().unwrap_or(0),
+                ) {
+                    Ok(data) => data,
                     Err(_) => return 0,
                 };
-            let item = if output_kind == "image" {
-                let data =
-                    match quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, args.get(2).copied().unwrap_or(0)) {
-                        Ok(data) => data,
-                        Err(_) => return 0,
-                    };
-                let mime_type =
-                    match quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, args.get(3).copied().unwrap_or(0)) {
-                        Ok(mime) => mime,
-                        Err(_) => return 0,
-                    };
+                let mime_type = match quickjs::read_string_value(
+                    &mut caller,
+                    &qjs.funcs,
+                    &qjs.memory,
+                    args.get(3).copied().unwrap_or(0),
+                ) {
+                    Ok(mime) => mime,
+                    Err(_) => return 0,
+                };
                 crate::types::CodemodeOutputItem::Image { data, mime_type }
             } else {
-                let text =
-                    match quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, args.get(2).copied().unwrap_or(0)) {
-                        Ok(text) => text,
-                        Err(_) => return 0,
-                    };
+                let text = match quickjs::read_string_value(
+                    &mut caller,
+                    &qjs.funcs,
+                    &qjs.memory,
+                    args.get(2).copied().unwrap_or(0),
+                ) {
+                    Ok(text) => text,
+                    Err(_) => return 0,
+                };
                 crate::types::CodemodeOutputItem::Text { text }
             };
             let _ = caller.data().events.send(WorkerToHost::Output(item));
@@ -605,9 +651,13 @@ fn host_call(
                     }
                     _ => None,
                 };
-                let writes =
-                    quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, args.get(3).copied().unwrap_or(0))
-                        .unwrap_or_else(|_| "[]".to_owned());
+                let writes = quickjs::read_string_value(
+                    &mut caller,
+                    &qjs.funcs,
+                    &qjs.memory,
+                    args.get(3).copied().unwrap_or(0),
+                )
+                .unwrap_or_else(|_| "[]".to_owned());
                 let _ = caller.data().events.send(WorkerToHost::Done {
                     ok: true,
                     value,
@@ -615,9 +665,13 @@ fn host_call(
                     error: None,
                 });
             } else {
-                let error =
-                    quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, args.get(2).copied().unwrap_or(0))
-                        .unwrap_or_else(|_| "{\"message\":\"unknown script error\"}".to_owned());
+                let error = quickjs::read_string_value(
+                    &mut caller,
+                    &qjs.funcs,
+                    &qjs.memory,
+                    args.get(2).copied().unwrap_or(0),
+                )
+                .unwrap_or_else(|_| "{\"message\":\"unknown script error\"}".to_owned());
                 let _ = caller.data().events.send(WorkerToHost::Done {
                     ok: false,
                     value: None,

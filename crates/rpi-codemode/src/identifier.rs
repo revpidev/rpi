@@ -26,7 +26,10 @@ mod tests {
 
     #[test]
     fn matches_upstream_identifier_mapping() {
-        assert_eq!(to_codemode_identifier("mcp__docs__search"), "mcp__docs__search");
+        assert_eq!(
+            to_codemode_identifier("mcp__docs__search"),
+            "mcp__docs__search"
+        );
         assert_eq!(to_codemode_identifier("my-tool"), "my_tool");
         assert_eq!(to_codemode_identifier("a.b.c"), "a_b_c");
         assert_eq!(to_codemode_identifier("9lives"), "_lives");

@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
-use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::cloudflare_workers_ai_system_one::{
     CLOUDFLARE_WORKERS_AI_SYSTEM_ONE_API, cloudflare_workers_ai_system_one_api,
 };
+use crate::api::openai_completions::OpenAiCompletions;
 use crate::auth::ProviderAuth;
 use crate::auth::cloudflare_auth::cloudflare_workers_ai_auth;
 use crate::generated::{get_builtin_all_models, get_builtin_models};
@@ -60,7 +60,8 @@ impl ProviderClassifier for CloudflareClassifier {
         model: &ClassifierModel,
         context: &ClassifierContext,
         options: Option<&ClassifierOptions>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>>
+    {
         let model = resolve_cloudflare_classifier(model, options.and_then(|o| o.env.as_ref()));
         let context = context.clone();
         let options = options.cloned();
@@ -123,10 +124,7 @@ mod tests {
                 _ => None,
             })
             .expect("classifier catalog entry");
-        let env = ProviderEnv::from([(
-            "CLOUDFLARE_ACCOUNT_ID".to_owned(),
-            "account".to_owned(),
-        )]);
+        let env = ProviderEnv::from([("CLOUDFLARE_ACCOUNT_ID".to_owned(), "account".to_owned())]);
         let resolved = resolve_cloudflare_classifier(classifier, Some(&env));
         assert!(
             resolved.base_url.contains("/accounts/account/ai"),

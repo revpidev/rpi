@@ -10,8 +10,8 @@ use futures::future::BoxFuture;
 use rpi_agent::types::AgentToolResult;
 use rpi_ai::types::{AssistantImages, ClassifierResult, ToolResultContent, Usage};
 use rpi_codemode::{
-    CodemodeErrorKind, CodemodeExecuteOptions, CodemodeOutputItem, CodemodeResult,
-    CodemodeSandbox, CodemodeSandboxOptions, CodemodeTimeout, CodemodeTool, CodemodeToolContext,
+    CodemodeErrorKind, CodemodeExecuteOptions, CodemodeOutputItem, CodemodeResult, CodemodeSandbox,
+    CodemodeSandboxOptions, CodemodeTimeout, CodemodeTool, CodemodeToolContext,
     parse_codemode_source, render_tool_sample, to_codemode_identifier,
 };
 use rpi_ext_host::api::{ExecuteToolOptions, ExtensionApi, ExtensionContext};
@@ -481,12 +481,11 @@ fn truncate_output(
             text.push_str(&format!("\n\n[Could not save the full output: {error}]"));
         }
     }
-    let mut output: Vec<ToolResultContent> = vec![ToolResultContent::Text(
-        rpi_ai::types::TextContent {
+    let mut output: Vec<ToolResultContent> =
+        vec![ToolResultContent::Text(rpi_ai::types::TextContent {
             text,
             text_signature: None,
-        },
-    )];
+        })];
     output.extend(
         items
             .into_iter()
@@ -604,9 +603,10 @@ fn create_discovery_globals(
                         .iter()
                         .filter(|tool| match &namespace {
                             None => true,
-                            Some(query) => tool.namespace.as_ref().is_some_and(|namespace| {
-                                is_namespace_name(&namespace.name, query)
-                            }),
+                            Some(query) => tool
+                                .namespace
+                                .as_ref()
+                                .is_some_and(|namespace| is_namespace_name(&namespace.name, query)),
                         })
                         .map(|tool| {
                             create_tool_search_document(
@@ -646,9 +646,9 @@ fn create_discovery_globals(
                         .and_then(|array| array.first())
                         .and_then(Value::as_str)
                         .ok_or_else(|| "describeTool() expects a tool name".to_owned())?;
-                    let tool = tools
-                        .iter()
-                        .find(|tool| tool.name == name || to_codemode_identifier(&tool.name) == name);
+                    let tool = tools.iter().find(|tool| {
+                        tool.name == name || to_codemode_identifier(&tool.name) == name
+                    });
                     Ok(tool
                         .and_then(|tool| samples.get(&tool.name).cloned())
                         .map(Value::String)
@@ -748,118 +748,117 @@ fn create_model_globals(
         let limit = limit.clone();
         let call_count = call_count.clone();
         let tool_call_id = tool_call_id.clone();
-        Arc::new(
-            move |name, model_type, args, check, run| {
-                let models = models.clone();
-                let calls = calls.clone();
-                let publish = publish.clone();
-                let add_usage = add_usage.clone();
-                let limit = limit.clone();
-                let count = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                let record_id = format!("{tool_call_id}/{name}/{count}");
-                Box::pin(async move {
-                    let list_hint = format!(
-                        "List the {model_type} models you can use with models.getAvailableOfType(\"{model_type}\")."
-                    );
-                    let model = args.first().cloned().unwrap_or(Value::Null);
-                    let fail_first = |detail: &str| {
-                        let undefined_hint = " models.getModelOfType() returns undefined for an unknown provider or id.";
-                        format!(
-                            "{name}() expects {} model as its first argument, got {detail}.{undefined_hint} {list_hint}",
-                            with_article(model_type)
+        Arc::new(move |name, model_type, args, check, run| {
+            let models = models.clone();
+            let calls = calls.clone();
+            let publish = publish.clone();
+            let add_usage = add_usage.clone();
+            let limit = limit.clone();
+            let count = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let record_id = format!("{tool_call_id}/{name}/{count}");
+            Box::pin(async move {
+                let list_hint = format!(
+                    "List the {model_type} models you can use with models.getAvailableOfType(\"{model_type}\")."
+                );
+                let model = args.first().cloned().unwrap_or(Value::Null);
+                let fail_first = |detail: &str| {
+                    let undefined_hint =
+                        " models.getModelOfType() returns undefined for an unknown provider or id.";
+                    format!(
+                        "{name}() expects {} model as its first argument, got {detail}.{undefined_hint} {list_hint}",
+                        with_article(model_type)
+                    )
+                };
+                let (Some(provider), Some(id)) = model
+                    .as_object()
+                    .map(|object| {
+                        (
+                            object.get("provider").and_then(Value::as_str),
+                            object.get("id").and_then(Value::as_str),
                         )
-                    };
-                    let (Some(provider), Some(id)) = model
-                        .as_object()
-                        .map(|object| {
-                            (
-                                object.get("provider").and_then(Value::as_str),
-                                object.get("id").and_then(Value::as_str),
-                            )
-                        })
-                        .unwrap_or((None, None))
-                    else {
-                        return Err(fail_first(&describe_value(&model)));
-                    };
-                    let ref_name = format!("{provider}/{id}");
-                    let Some(resolved) =
-                        models.get_model_of_type(model_type_of(model_type), provider, id)
-                    else {
-                        let actual_type = MODEL_TYPES
-                            .iter()
-                            .filter(|other| **other != model_type)
-                            .find(|other| {
-                                models
-                                    .get_model_of_type(model_type_of(other), provider, id)
-                                    .is_some()
-                            });
-                        return Err(match actual_type {
-                            Some(actual) => format!(
-                                "\"{ref_name}\" is {} model, not {} model. {list_hint}",
-                                with_article(actual),
-                                with_article(model_type)
-                            ),
-                            None => {
-                                format!("Unknown {model_type} model \"{ref_name}\". {list_hint}")
-                            }
+                    })
+                    .unwrap_or((None, None))
+                else {
+                    return Err(fail_first(&describe_value(&model)));
+                };
+                let ref_name = format!("{provider}/{id}");
+                let Some(resolved) =
+                    models.get_model_of_type(model_type_of(model_type), provider, id)
+                else {
+                    let actual_type = MODEL_TYPES
+                        .iter()
+                        .filter(|other| **other != model_type)
+                        .find(|other| {
+                            models
+                                .get_model_of_type(model_type_of(other), provider, id)
+                                .is_some()
                         });
-                    };
-                    let checked = check(args.get(1).unwrap_or(&Value::Null))?;
-
-                    let index = {
-                        let mut calls = calls.lock().unwrap_or_else(|error| error.into_inner());
-                        calls.push(NestedCall {
-                            id: record_id.clone(),
-                            name: name.to_owned(),
-                            args: ref_name.clone(),
-                            status: "running",
-                            duration_ms: None,
-                            error: None,
-                            cost: None,
-                        });
-                        calls.len() - 1
-                    };
-                    publish();
-                    let started = Instant::now();
-                    let permit = limit
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| "model call limiter closed".to_owned())?;
-                    let result = run(resolved, checked).await;
-                    drop(permit);
-                    let duration = started.elapsed().as_secs_f64() * 1000.0;
-                    let status = result
-                        .get("stopReason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("error")
-                        .to_owned();
-                    let error_message = result
-                        .get("errorMessage")
-                        .and_then(Value::as_str)
-                        .map(|error| truncate_text(error, ERROR_PREVIEW_CHARS));
-                    let usage: Option<Usage> = result
-                        .get("usage")
-                        .and_then(|usage| serde_json::from_value(usage.clone()).ok());
-                    {
-                        let mut calls = calls.lock().unwrap_or_else(|error| error.into_inner());
-                        let record = &mut calls[index];
-                        record.duration_ms = Some(duration);
-                        record.status = match status.as_str() {
-                            "stop" => "ok",
-                            "aborted" => "cancelled",
-                            _ => "error",
-                        };
-                        record.error = error_message;
-                        if let Some(usage) = &usage {
-                            record.cost = Some(usage.cost.total);
-                            add_usage(usage.clone());
+                    return Err(match actual_type {
+                        Some(actual) => format!(
+                            "\"{ref_name}\" is {} model, not {} model. {list_hint}",
+                            with_article(actual),
+                            with_article(model_type)
+                        ),
+                        None => {
+                            format!("Unknown {model_type} model \"{ref_name}\". {list_hint}")
                         }
+                    });
+                };
+                let checked = check(args.get(1).unwrap_or(&Value::Null))?;
+
+                let index = {
+                    let mut calls = calls.lock().unwrap_or_else(|error| error.into_inner());
+                    calls.push(NestedCall {
+                        id: record_id.clone(),
+                        name: name.to_owned(),
+                        args: ref_name.clone(),
+                        status: "running",
+                        duration_ms: None,
+                        error: None,
+                        cost: None,
+                    });
+                    calls.len() - 1
+                };
+                publish();
+                let started = Instant::now();
+                let permit = limit
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| "model call limiter closed".to_owned())?;
+                let result = run(resolved, checked).await;
+                drop(permit);
+                let duration = started.elapsed().as_secs_f64() * 1000.0;
+                let status = result
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_owned();
+                let error_message = result
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .map(|error| truncate_text(error, ERROR_PREVIEW_CHARS));
+                let usage: Option<Usage> = result
+                    .get("usage")
+                    .and_then(|usage| serde_json::from_value(usage.clone()).ok());
+                {
+                    let mut calls = calls.lock().unwrap_or_else(|error| error.into_inner());
+                    let record = &mut calls[index];
+                    record.duration_ms = Some(duration);
+                    record.status = match status.as_str() {
+                        "stop" => "ok",
+                        "aborted" => "cancelled",
+                        _ => "error",
+                    };
+                    record.error = error_message;
+                    if let Some(usage) = &usage {
+                        record.cost = Some(usage.cost.total);
+                        add_usage(usage.clone());
                     }
-                    publish();
-                    Ok(result)
-                })
-            },
-        )
+                }
+                publish();
+                Ok(result)
+            })
+        })
     };
 
     let mut globals = Vec::new();
@@ -1093,7 +1092,9 @@ pub async fn execute_codemode(
     let add_usage: Arc<dyn Fn(Usage) + Send + Sync> = {
         let model_usage = model_usage.clone();
         Arc::new(move |usage: Usage| {
-            let mut current = model_usage.lock().unwrap_or_else(|error| error.into_inner());
+            let mut current = model_usage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             *current = Some(match current.take() {
                 Some(existing) => existing.combined(&usage),
                 None => usage,
@@ -1134,8 +1135,7 @@ pub async fn execute_codemode(
                     let name = name.clone();
                     Box::pin(async move {
                         let index = {
-                            let mut calls =
-                                calls.lock().unwrap_or_else(|error| error.into_inner());
+                            let mut calls = calls.lock().unwrap_or_else(|error| error.into_inner());
                             calls.push(NestedCall {
                                 id: format!("{tool_call_id}/?"),
                                 name: name.clone(),
@@ -1178,8 +1178,7 @@ pub async fn execute_codemode(
                             None
                         };
                         {
-                            let mut calls =
-                                calls.lock().unwrap_or_else(|error| error.into_inner());
+                            let mut calls = calls.lock().unwrap_or_else(|error| error.into_inner());
                             let record = &mut calls[index];
                             record.id = call_id;
                             record.duration_ms = Some(duration);
@@ -1321,14 +1320,17 @@ pub async fn execute_codemode(
     let wall_time = started.elapsed().as_secs_f64();
     let header = format!(
         "{}\nWall time {wall_time:.1} seconds\nOutput:\n",
-        if ok { "Script completed" } else { "Script failed" }
+        if ok {
+            "Script completed"
+        } else {
+            "Script failed"
+        }
     );
-    let mut content: Vec<ToolResultContent> = vec![ToolResultContent::Text(
-        rpi_ai::types::TextContent {
+    let mut content: Vec<ToolResultContent> =
+        vec![ToolResultContent::Text(rpi_ai::types::TextContent {
             text: header,
             text_signature: None,
-        },
-    )];
+        })];
     content.extend(items);
     let usage = model_usage
         .lock()

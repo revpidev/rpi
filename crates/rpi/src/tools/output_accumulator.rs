@@ -293,9 +293,7 @@ impl OutputAccumulator {
     /// Port of `readFullOutput` (output-accumulator.ts:152-186).
     pub fn read_full_output(&self, max_bytes: usize) -> FullOutput {
         let Some(path) = &self.temp_file_path else {
-            let mut bytes = Vec::with_capacity(
-                self.raw_chunks.iter().map(Vec::len).sum(),
-            );
+            let mut bytes = Vec::with_capacity(self.raw_chunks.iter().map(Vec::len).sum());
             for chunk in &self.raw_chunks {
                 bytes.extend_from_slice(chunk);
             }

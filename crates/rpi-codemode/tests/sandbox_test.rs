@@ -26,7 +26,12 @@ async fn returns_the_scripts_return_value_after_a_json_round_trip() {
         .await
         .expect("execution");
     match result {
-        rpi_codemode::CodemodeResult::Ok { value, output, calls, .. } => {
+        rpi_codemode::CodemodeResult::Ok {
+            value,
+            output,
+            calls,
+            ..
+        } => {
             assert_eq!(value, Some(serde_json::json!({ "a": 1, "b": [true, "x"] })));
             assert!(output.is_empty());
             assert!(calls.is_empty());
@@ -56,7 +61,10 @@ async fn supports_top_level_await() {
 #[tokio::test]
 async fn empty_script_returns_null() {
     let sandbox = sandbox();
-    let result = sandbox.execute("", timeout(10_000)).await.expect("execution");
+    let result = sandbox
+        .execute("", timeout(10_000))
+        .await
+        .expect("execution");
     match result {
         rpi_codemode::CodemodeResult::Ok { value, .. } => assert_eq!(value, None),
         other => panic!("expected ok, got {other:?}"),
@@ -78,8 +86,14 @@ async fn tools_are_callable_and_recorded() {
             signature: None,
             execute: Arc::new(|args, _ctx| {
                 Box::pin(async move {
-                    let a = args.get("a").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                    let b = args.get("b").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let a = args
+                        .get("a")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let b = args
+                        .get("b")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
                     Ok(serde_json::json!({ "sum": a + b }))
                 })
             }),
@@ -95,8 +109,17 @@ async fn tools_are_callable_and_recorded() {
     match result {
         rpi_codemode::CodemodeResult::Ok { value, calls, .. } => {
             assert_eq!(value, Some(serde_json::json!(13)));
-            let names: Vec<_> = calls.iter().map(|call| (call.name.as_str(), call.status)).collect();
-            assert_eq!(names, vec![("add", rpi_codemode::CodemodeCallStatus::Ok), ("add", rpi_codemode::CodemodeCallStatus::Ok)]);
+            let names: Vec<_> = calls
+                .iter()
+                .map(|call| (call.name.as_str(), call.status))
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    ("add", rpi_codemode::CodemodeCallStatus::Ok),
+                    ("add", rpi_codemode::CodemodeCallStatus::Ok)
+                ]
+            );
         }
         other => panic!("expected ok, got {other:?}"),
     }
@@ -111,7 +134,11 @@ async fn timeout_interrupts_a_synchronous_loop() {
         .expect("execution");
     match result {
         rpi_codemode::CodemodeResult::Err { error, .. } => {
-            assert_eq!(error.kind, rpi_codemode::CodemodeErrorKind::Timeout, "{error:?}");
+            assert_eq!(
+                error.kind,
+                rpi_codemode::CodemodeErrorKind::Timeout,
+                "{error:?}"
+            );
         }
         other => panic!("expected timeout, got {other:?}"),
     }
@@ -136,7 +163,10 @@ async fn collects_text_output_and_console() {
                     rpi_codemode::CodemodeOutputItem::Image { .. } => panic!("unexpected image"),
                 })
                 .collect();
-            assert_eq!(texts, vec!["hello 1 {\"a\":1}", "{\"json\":true}", "undefined"]);
+            assert_eq!(
+                texts,
+                vec!["hello 1 {\"a\":1}", "{\"json\":true}", "undefined"]
+            );
         }
         other => panic!("expected ok, got {other:?}"),
     }
@@ -157,9 +187,16 @@ async fn store_writes_and_snapshot() {
         .await
         .expect("execution");
     match result {
-        rpi_codemode::CodemodeResult::Ok { value, store_writes, .. } => {
+        rpi_codemode::CodemodeResult::Ok {
+            value,
+            store_writes,
+            ..
+        } => {
             assert_eq!(value, Some(serde_json::json!([41, 42])));
-            assert_eq!(store_writes.set.get("counter"), Some(&serde_json::json!(42)));
+            assert_eq!(
+                store_writes.set.get("counter"),
+                Some(&serde_json::json!(42))
+            );
             assert_eq!(store_writes.delete, vec!["old".to_owned()]);
         }
         other => panic!("expected ok, got {other:?}"),

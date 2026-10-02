@@ -28,7 +28,10 @@ fn cloudflare_error_message(errors: Option<&Value>) -> String {
             .iter()
             .filter_map(|error| {
                 if is_record(error) {
-                    error.get("message").and_then(Value::as_str).map(str::to_owned)
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
                 } else {
                     None
                 }
@@ -69,7 +72,9 @@ fn output(body: &Value) -> Result<Value, String> {
     if run.get("state").and_then(Value::as_str) != Some("Completed") {
         return Err(format!(
             "{LABEL} run did not complete (state: {})",
-            run.get("state").map(Value::to_string).unwrap_or_else(|| "undefined".to_owned())
+            run.get("state")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "undefined".to_owned())
         ));
     }
     let Some(result) = run.get("result") else {
@@ -99,7 +104,8 @@ impl ProviderClassifier for CloudflareWorkersAiSystemOne {
         model: &ClassifierModel,
         context: &ClassifierContext,
         options: Option<&ClassifierOptions>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>>
+    {
         let model = model.clone();
         let context = context.clone();
         let options = options.cloned();

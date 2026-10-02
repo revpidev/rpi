@@ -189,9 +189,10 @@ mod tests {
                 timeout_ms: Some(10)
             }
         );
-        let parsed =
-            parse_codemode_source("  // @options:{\"max_output_tokens\":0,\"timeout_ms\":1500}\r\ntext(1)")
-                .expect("crlf options");
+        let parsed = parse_codemode_source(
+            "  // @options:{\"max_output_tokens\":0,\"timeout_ms\":1500}\r\ntext(1)",
+        )
+        .expect("crlf options");
         assert_eq!(
             parsed.options,
             CodemodeSourceOptions {

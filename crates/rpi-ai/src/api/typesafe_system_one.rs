@@ -49,7 +49,8 @@ impl ProviderClassifier for TypesafeSystemOne {
         model: &ClassifierModel,
         context: &ClassifierContext,
         options: Option<&ClassifierOptions>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>>
+    {
         let model = model.clone();
         let context = context.clone();
         let options = options.cloned();

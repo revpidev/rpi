@@ -50,10 +50,7 @@ pub fn openrouter_provider() -> Arc<dyn Provider> {
             TYPESAFE_SYSTEM_ONE_API.to_owned(),
             typesafe_system_one_api(),
         )]),
-        images: HashMap::from([(
-            "openrouter-images".to_owned(),
-            openrouter_images_v6_api(),
-        )]),
+        images: HashMap::from([("openrouter-images".to_owned(), openrouter_images_v6_api())]),
         api: ProviderApi::Map(api_map()),
         ..Default::default()
     })

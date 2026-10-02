@@ -39,10 +39,8 @@ fn description_and_script_call_text_match_upstream_byte_for_byte() {
     // Both sides render `<packageDir>/docs/codemode.md`; the fixture was
     // generated with this directory.
     rpi_test_env::set_var("RPI_PACKAGE_DIR", "/tmp/rpi-codemode-docs");
-    let fixture: Value = serde_json::from_str(include_str!(
-        "fixtures/codemode-description.json"
-    ))
-    .expect("fixture parses");
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/codemode-description.json"))
+        .expect("fixture parses");
 
     for case in fixture["cases"].as_array().expect("cases") {
         let name = case["name"].as_str().expect("case name");
@@ -71,7 +69,10 @@ fn description_and_script_call_text_match_upstream_byte_for_byte() {
         if let Some(namespaces) = options_value.get("namespaces").and_then(Value::as_array) {
             let mut map: HashMap<String, ToolNamespace> = HashMap::new();
             for entry in namespaces {
-                let tool = entry.get("tool").and_then(Value::as_str).unwrap_or_default();
+                let tool = entry
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let namespace = entry.get("namespace").expect("namespace");
                 map.insert(
                     tool.to_owned(),
@@ -110,7 +111,10 @@ fn description_and_script_call_text_match_upstream_byte_for_byte() {
         );
     }
 
-    for case in fixture["describeOutputs"].as_array().expect("describeOutputs") {
+    for case in fixture["describeOutputs"]
+        .as_array()
+        .expect("describeOutputs")
+    {
         let schema = case.get("outputSchema");
         let actual = rpi::extensions::codemode::description::describe_output(schema);
         assert_eq!(

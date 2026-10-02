@@ -259,7 +259,11 @@ pub fn undefined<W>(store: &mut impl AsContextMut<Data = W>, funcs: &QjsFuncs) -
 }
 
 pub fn boolean<W>(store: &mut impl AsContextMut<Data = W>, funcs: &QjsFuncs, value: bool) -> u32 {
-    let result = if value { &funcs.get_true } else { &funcs.get_false };
+    let result = if value {
+        &funcs.get_true
+    } else {
+        &funcs.get_false
+    };
     result.call(store, ()).unwrap_or(0) as u32
 }
 
@@ -485,7 +489,11 @@ pub fn set_memory_limit<W>(store: &mut impl AsContextMut<Data = W>, funcs: &QjsF
     let _ = funcs.set_memory_limit.call(store, bytes);
 }
 
-pub fn set_max_stack_size<W>(store: &mut impl AsContextMut<Data = W>, funcs: &QjsFuncs, bytes: i32) {
+pub fn set_max_stack_size<W>(
+    store: &mut impl AsContextMut<Data = W>,
+    funcs: &QjsFuncs,
+    bytes: i32,
+) {
     let _ = funcs.set_max_stack_size.call(store, bytes);
 }
 
@@ -493,10 +501,7 @@ pub fn set_interrupt_handler<W>(store: &mut impl AsContextMut<Data = W>, funcs: 
     let _ = funcs.set_interrupt_handler.call(store, 1);
 }
 
-pub fn set_promise_rejection_handler<W>(
-    store: &mut impl AsContextMut<Data = W>,
-    funcs: &QjsFuncs,
-) {
+pub fn set_promise_rejection_handler<W>(store: &mut impl AsContextMut<Data = W>, funcs: &QjsFuncs) {
     let _ = funcs.set_promise_rejection_handler.call(store, 1);
 }
 
@@ -541,8 +546,8 @@ pub struct QuickJsVm<W: 'static> {
 impl<W: 'static> QuickJsVm<W> {
     /// Evaluate `code` (`qjs_eval`).
     pub fn eval(&mut self, code: &str, filename: &str) -> Result<u32, Thrown> {
-        let (code_ptr, code_len) = write_string(&mut self.store, &self.funcs, &self.memory, code)
-            .map_err(Thrown::Trap)?;
+        let (code_ptr, code_len) =
+            write_string(&mut self.store, &self.funcs, &self.memory, code).map_err(Thrown::Trap)?;
         let (name_ptr, _) = write_string(&mut self.store, &self.funcs, &self.memory, filename)
             .map_err(Thrown::Trap)?;
         let result = self.funcs.eval.call(

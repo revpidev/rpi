@@ -496,8 +496,7 @@ fn fail_call(
             && let Some(index) = pending.index
         {
             table.records[index].status = CodemodeCallStatus::Error;
-            table.records[index].duration_ms =
-                pending.started_at.elapsed().as_secs_f64() * 1000.0;
+            table.records[index].duration_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
         }
     }
     let _ = replies.send(HostToWorker::Result {

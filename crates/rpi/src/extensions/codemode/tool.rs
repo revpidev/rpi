@@ -10,15 +10,15 @@ use std::sync::Arc;
 
 use rpi_ext_host::api::ExtensionApi;
 use rpi_ext_host::types::{
-    ToolDefinition, ToolExposure, ToolLoadout, ToolLoadoutChanges, ToolNamespace,
-    ToolExecuteRequest,
+    ToolDefinition, ToolExecuteRequest, ToolExposure, ToolLoadout, ToolLoadoutChanges,
+    ToolNamespace,
 };
 use serde_json::{Value, json};
 
 use crate::extensions::codemode::description::{
     CodemodeDescriptionOptions, create_codemode_description, describe_script_call,
 };
-use crate::extensions::codemode::execute::{execute_codemode, CodemodeToolOptions};
+use crate::extensions::codemode::execute::{CodemodeToolOptions, execute_codemode};
 
 pub const CODEMODE_TOOL_NAME: &str = "codemode";
 
@@ -159,7 +159,11 @@ pub fn get_codemode_callable_tools(tools: &[ToolInfo]) -> Vec<ToolInfo> {
 /// The callable set of the current session (`ctx.tools` upstream): active
 /// `direct` tools plus every `codemode`/`deferred` tool.
 pub fn callable_tools(api: &ExtensionApi) -> Vec<ToolInfo> {
-    let active: HashSet<String> = api.get_active_tools().unwrap_or_default().into_iter().collect();
+    let active: HashSet<String> = api
+        .get_active_tools()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     get_codemode_callable_tools(&parse_tool_infos(api))
         .into_iter()
         .filter(|tool| match tool.exposure {
@@ -185,7 +189,10 @@ fn loadout_tool_info(entry: &rpi_ext_host::types::ToolLoadoutEntry) -> ToolInfo 
 
 /// How the codemode tool presents tools that are both declared and callable
 /// from scripts (`prepareCodemodeLoadout`, tool.ts:376-404).
-fn prepare_codemode_loadout(loadout: &ToolLoadout, options: &CodemodeToolOptions) -> ToolLoadoutChanges {
+fn prepare_codemode_loadout(
+    loadout: &ToolLoadout,
+    options: &CodemodeToolOptions,
+) -> ToolLoadoutChanges {
     let mode = (options.get_mode)();
     let is_direct = |name: &str| loadout.get_exposure(name) == ToolExposure::Direct;
     let callable: Vec<ToolInfo> = loadout
@@ -233,15 +240,18 @@ fn prepare_codemode_loadout(loadout: &ToolLoadout, options: &CodemodeToolOptions
                 namespaces,
                 deferred,
                 inline_budget: Some(
-                    (options.get_inline_budget)().map(|budget| budget as usize).unwrap_or(
-                        DEFAULT_CODEMODE_INLINE_BUDGET,
-                    ),
+                    (options.get_inline_budget)()
+                        .map(|budget| budget as usize)
+                        .unwrap_or(DEFAULT_CODEMODE_INLINE_BUDGET),
                 ),
             },
         ),
     );
-    let declared_names: HashSet<&str> =
-        loadout.declared.iter().map(|tool| tool.name.as_str()).collect();
+    let declared_names: HashSet<&str> = loadout
+        .declared
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
     let hidden_declarations = if mode == CodemodeMode::Only {
         callable
             .iter()

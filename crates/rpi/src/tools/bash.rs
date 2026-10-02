@@ -727,8 +727,7 @@ impl AgentTool for BashTool {
             };
             (snap, lb, det, full)
         };
-        let wall_time_seconds =
-            ((started.elapsed().as_millis() as f64 / 100.0).round()) / 10.0;
+        let wall_time_seconds = ((started.elapsed().as_millis() as f64 / 100.0).round()) / 10.0;
         match exec_result {
             Ok(exit_code) => {
                 let (text, _) = format_output(&snapshot, last_lb, "(no output)");

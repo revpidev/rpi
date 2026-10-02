@@ -66,9 +66,10 @@ pub fn tokenize(text: &str) -> Vec<String> {
     static NON_ALNUM: OnceLock<regex::Regex> = OnceLock::new();
     let lower_upper = SPLIT_LOWER_UPPER
         .get_or_init(|| regex::Regex::new(r"([a-z0-9])([A-Z])").expect("valid regex"));
-    let acronym =
-        SPLIT_ACRONYM.get_or_init(|| regex::Regex::new(r"([A-Z]+)([A-Z][a-z])").expect("valid regex"));
-    let non_alnum = NON_ALNUM.get_or_init(|| regex::Regex::new(r"[^a-z0-9]+").expect("valid regex"));
+    let acronym = SPLIT_ACRONYM
+        .get_or_init(|| regex::Regex::new(r"([A-Z]+)([A-Z][a-z])").expect("valid regex"));
+    let non_alnum =
+        NON_ALNUM.get_or_init(|| regex::Regex::new(r"[^a-z0-9]+").expect("valid regex"));
     let split = lower_upper.replace_all(text, "$1 $2");
     let split = acronym.replace_all(&split, "$1 $2");
     let lowered = split.to_lowercase();
@@ -214,8 +215,8 @@ impl Bm25Ranker {
                 if count == 0 {
                     continue;
                 }
-                let norm = self.k1
-                    * (1.0 - self.b + (self.b * lengths[index] as f64) / average_length);
+                let norm =
+                    self.k1 * (1.0 - self.b + (self.b * lengths[index] as f64) / average_length);
                 score += idf.get(term).copied().unwrap_or(0.0)
                     * ((count as f64 * (self.k1 + 1.0)) / (count as f64 + norm));
             }
@@ -226,7 +227,11 @@ impl Bm25Ranker {
                 });
             }
         }
-        matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        matches.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         matches.truncate(limit);
         matches
     }
@@ -273,10 +278,7 @@ fn parse_searchable_tools(api: &ExtensionApi) -> Vec<SearchableTool> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            let parameters = object
-                .get("parameters")
-                .cloned()
-                .unwrap_or(Value::Null);
+            let parameters = object.get("parameters").cloned().unwrap_or(Value::Null);
             let exposure = object
                 .get("exposure")
                 .and_then(|value| serde_json::from_value::<ToolExposure>(value.clone()).ok())
@@ -303,9 +305,7 @@ pub fn search_and_load(api: &ExtensionApi, query: &str, limit: usize) -> Vec<(St
     let active_set: HashSet<&str> = active.iter().map(String::as_str).collect();
     let candidates: Vec<SearchableTool> = parse_searchable_tools(api)
         .into_iter()
-        .filter(|tool| {
-            is_searchable(tool.exposure) && !active_set.contains(tool.name.as_str())
-        })
+        .filter(|tool| is_searchable(tool.exposure) && !active_set.contains(tool.name.as_str()))
         .collect();
     let documents: Vec<ToolSearchDocument> = candidates
         .iter()
@@ -343,7 +343,9 @@ pub fn create_tool_search_tool_definition(api: ExtensionApi) -> ToolDefinition {
         name: TOOL_SEARCH_TOOL_NAME.to_owned(),
         label: TOOL_SEARCH_TOOL_NAME.to_owned(),
         description: TOOL_SEARCH_DESCRIPTION.to_owned(),
-        prompt_snippet: Some("Search for tools that are not loaded yet and load the matches".to_owned()),
+        prompt_snippet: Some(
+            "Search for tools that are not loaded yet and load the matches".to_owned(),
+        ),
         prompt_guidelines: None,
         parameters: tool_search_schema(),
         constrained_sampling: None,
@@ -498,7 +500,11 @@ mod tests {
             "Documentation tools",
             "Prefer search before fetch",
         ] {
-            assert!(document.text.contains(needle), "{needle}: {}", document.text);
+            assert!(
+                document.text.contains(needle),
+                "{needle}: {}",
+                document.text
+            );
         }
     }
 }

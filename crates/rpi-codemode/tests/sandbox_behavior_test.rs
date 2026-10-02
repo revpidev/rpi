@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rpi_codemode::{
-    CodemodeCallStatus, CodemodeErrorKind, CodemodeExecuteOptions, CodemodeResult,
-    CodemodeSandbox, CodemodeSandboxOptions, CodemodeTimeout, CodemodeTool, CodemodeToolContext,
+    CodemodeCallStatus, CodemodeErrorKind, CodemodeExecuteOptions, CodemodeResult, CodemodeSandbox,
+    CodemodeSandboxOptions, CodemodeTimeout, CodemodeTool, CodemodeToolContext,
 };
 
 fn sandbox_with(
@@ -44,7 +44,9 @@ fn timeout(ms: u64) -> CodemodeExecuteOptions {
 
 fn ok_value(result: CodemodeResult) -> serde_json::Value {
     match result {
-        CodemodeResult::Ok { value: Some(value), .. } => value,
+        CodemodeResult::Ok {
+            value: Some(value), ..
+        } => value,
         other => panic!("expected ok with a value, got {other:?}"),
     }
 }
@@ -161,7 +163,11 @@ async fn guard_names_close_matches_and_in_checks_still_work() {
     );
     async fn attempt(sandbox: &CodemodeSandbox, expression: &str) -> serde_json::Value {
         let code = format!("return {expression};");
-        match sandbox.execute(&code, timeout(10_000)).await.expect("execution") {
+        match sandbox
+            .execute(&code, timeout(10_000))
+            .await
+            .expect("execution")
+        {
             CodemodeResult::Ok {
                 value: Some(value), ..
             } => value,
@@ -190,7 +196,11 @@ async fn guard_names_close_matches_and_in_checks_still_work() {
             .contains("Available: echo, web_search.")
     );
     assert_eq!(
-        attempt(&sandbox, "['echo' in tools, 'nothing' in tools, String(tools.toString), JSON.stringify(tools)]").await,
+        attempt(
+            &sandbox,
+            "['echo' in tools, 'nothing' in tools, String(tools.toString), JSON.stringify(tools)]"
+        )
+        .await,
         serde_json::json!([true, false, "undefined", "{}"])
     );
 }
@@ -351,7 +361,11 @@ async fn scripts_waiting_on_an_unsettleable_promise_fail() {
         panic!("expected error");
     };
     assert_eq!(error.kind, CodemodeErrorKind::Script);
-    assert!(error.message.contains("can never settle"), "{}", error.message);
+    assert!(
+        error.message.contains("can never settle"),
+        "{}",
+        error.message
+    );
 
     // Returning while a call is still pending is not a stall.
     let returned = sandbox
@@ -408,7 +422,12 @@ async fn close_aborts_in_flight_executions_and_rejects_new_ones() {
     assert_eq!(error.kind, CodemodeErrorKind::Aborted);
     assert_eq!(error.message, "Sandbox closed");
     assert_eq!(calls[0].status, CodemodeCallStatus::Cancelled);
-    assert!(sandbox.execute("return 1", Default::default()).await.is_err());
+    assert!(
+        sandbox
+            .execute("return 1", Default::default())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -447,7 +466,10 @@ async fn globals_spread_and_namespaces() {
     );
     assert_eq!(
         seen.lock().unwrap().clone(),
-        vec![serde_json::json!(["classifier", null, 3]), serde_json::json!([])]
+        vec![
+            serde_json::json!(["classifier", null, 3]),
+            serde_json::json!([])
+        ]
     );
 }
 
@@ -457,7 +479,15 @@ fn rejects_invalid_and_reserved_global_names() {
         name: name.to_owned(),
         ..echo()
     };
-    for name in ["a.b.c", "a.", ".a", "tools.x", "store.x", "a.not-valid", "not-valid"] {
+    for name in [
+        "a.b.c",
+        "a.",
+        ".a",
+        "tools.x",
+        "store.x",
+        "a.not-valid",
+        "not-valid",
+    ] {
         let error = CodemodeSandbox::new(CodemodeSandboxOptions {
             globals: vec![global(name)],
             ..Default::default()
@@ -496,7 +526,13 @@ async fn store_rejects_invalid_keys_values_and_oversized_writes() {
         .expect("execution");
     assert_eq!(
         ok_value(result),
-        serde_json::json!(["TypeError", "TypeError", "TypeError", "RangeError", "RangeError"])
+        serde_json::json!([
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "RangeError",
+            "RangeError"
+        ])
     );
 
     let result = sandbox
@@ -507,11 +543,17 @@ async fn store_rejects_invalid_keys_values_and_oversized_writes() {
         panic!("expected error");
     };
     assert!(
-        error.message.contains("store(\"img\") value has 307202 characters of JSON"),
+        error
+            .message
+            .contains("store(\"img\") value has 307202 characters of JSON"),
         "{}",
         error.message
     );
-    assert!(error.message.contains("Show images with image()"), "{}", error.message);
+    assert!(
+        error.message.contains("Show images with image()"),
+        "{}",
+        error.message
+    );
 }
 
 #[tokio::test]
@@ -554,8 +596,18 @@ async fn escape_hatches_are_absent_and_eval_stays_inside_the_vm() {
     assert_eq!(
         ok_value(result),
         serde_json::json!([
-            "undefined", "undefined", "undefined", "undefined", "undefined", "undefined",
-            "undefined", "undefined", "function", "undefined", "undefined", true
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "function",
+            "undefined",
+            "undefined",
+            true
         ])
     );
 

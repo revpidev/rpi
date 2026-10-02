@@ -568,7 +568,10 @@ fn object_type(object: &serde_json::Map<String, Value>, context: &mut SchemaCont
     if members.is_empty() {
         return "{}".to_owned();
     }
-    if !names.iter().any(|name| !description_of(&properties[name]).is_empty()) {
+    if !names
+        .iter()
+        .any(|name| !description_of(&properties[name]).is_empty())
+    {
         return format!("{{ {} }}", members.join(" "));
     }
 
@@ -626,7 +629,10 @@ mod tests {
     #[test]
     fn renders_primitives_literals_and_unions() {
         assert_eq!(schema_to_type(&json!({ "type": "string" }), None), "string");
-        assert_eq!(schema_to_type(&json!({ "type": "integer" }), None), "number");
+        assert_eq!(
+            schema_to_type(&json!({ "type": "integer" }), None),
+            "number"
+        );
         assert_eq!(
             schema_to_type(&json!({ "type": ["string", "null"] }), None),
             "string | null"
@@ -637,7 +643,10 @@ mod tests {
             "\"a\" | 1 | null"
         );
         assert_eq!(
-            schema_to_type(&json!({ "anyOf": [{ "type": "string" }, { "type": "number" }] }), None),
+            schema_to_type(
+                &json!({ "anyOf": [{ "type": "string" }, { "type": "number" }] }),
+                None
+            ),
             "string | number"
         );
         assert_eq!(
@@ -651,7 +660,10 @@ mod tests {
             ),
             "(string | number) & 1"
         );
-        assert_eq!(schema_to_type(&json!({ "$ref": "#/defs/x" }), None), "unknown");
+        assert_eq!(
+            schema_to_type(&json!({ "$ref": "#/defs/x" }), None),
+            "unknown"
+        );
         assert_eq!(schema_to_type(&json!(true), None), "unknown");
         assert_eq!(schema_to_type(&json!(false), None), "never");
     }
@@ -671,7 +683,10 @@ mod tests {
             "{ city: string; \"max-lines\"?: number; }"
         );
         assert_eq!(
-            schema_to_type(&json!({ "type": "object", "additionalProperties": { "type": "number" } }), None),
+            schema_to_type(
+                &json!({ "type": "object", "additionalProperties": { "type": "number" } }),
+                None
+            ),
             "{ [key: string]: number; }"
         );
         assert_eq!(
@@ -752,7 +767,10 @@ mod tests {
     #[test]
     fn renders_arrays_and_tuples() {
         assert_eq!(
-            schema_to_type(&json!({ "type": "array", "items": { "type": "string" } }), None),
+            schema_to_type(
+                &json!({ "type": "array", "items": { "type": "string" } }),
+                None
+            ),
             "Array<string>"
         );
         assert_eq!(
@@ -762,7 +780,10 @@ mod tests {
             ),
             "[string, number]"
         );
-        assert_eq!(schema_to_type(&json!({ "type": "array" }), None), "unknown[]");
+        assert_eq!(
+            schema_to_type(&json!({ "type": "array" }), None),
+            "unknown[]"
+        );
     }
 
     #[test]
@@ -810,7 +831,8 @@ mod tests {
 
     #[test]
     fn renders_mcp_call_tool_result_output_schemas() {
-        let input_schema = json!({ "type": "object", "properties": {}, "additionalProperties": false });
+        let input_schema =
+            json!({ "type": "object", "properties": {}, "additionalProperties": false });
         assert_eq!(
             render_tool_signature(
                 &CodemodeToolInfo {
@@ -849,7 +871,9 @@ mod tests {
             "plain(args: {}): Promise<CallToolResult>;"
         );
         assert_eq!(
-            mcp_structured_content_schema(Some(&json!({ "type": "object", "properties": { "content": { "type": "array" } } }))),
+            mcp_structured_content_schema(Some(
+                &json!({ "type": "object", "properties": { "content": { "type": "array" } } })
+            )),
             None
         );
     }
@@ -873,7 +897,9 @@ mod tests {
             CodemodeToolInfo {
                 name: "read".to_owned(),
                 description: Some("Read a file.\nSecond line.".to_owned()),
-                input_schema: Some(json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] })),
+                input_schema: Some(
+                    json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+                ),
                 output_schema: Some(json!({ "type": "string" })),
                 signature: None,
             },

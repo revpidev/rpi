@@ -8,18 +8,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rpi_ai::api::cloudflare_workers_ai_system_one::cloudflare_workers_ai_system_one_api;
 use rpi_ai::api::typesafe_system_one::typesafe_system_one_api;
-use rpi_ai::auth::types::{
-    ApiKeyAuth, AuthContext, AuthResult, ModelAuth, ProviderAuth,
-};
 use rpi_ai::auth::ModelsError;
+use rpi_ai::auth::types::{ApiKeyAuth, AuthContext, AuthResult, ModelAuth, ProviderAuth};
 use rpi_ai::models::{CreateProviderOptions, Models, ProviderApi, create_provider};
 use rpi_ai::types::{
-    AnyModel, ApiKind, AssistantImages, ClassifierAnswer, ClassifierContext, ClassifierModel,
-    ClassifierOptions, ClassifierQuestion, ClassifierResult, ClassifierStopReason,
-    ClassifierChoiceQuestion, ClassifierScoreQuestion, ClassifierBoolQuestion,
-    ClassifierBoolCriteria, ImagesContext, ImagesInputContent, ImageModel,
-    InputModality, ModelCost, ModelCostRates, ProviderImageGenerator, TextContent,
-    assert_classifier_model, assert_image_model,
+    AnyModel, ApiKind, AssistantImages, ClassifierAnswer, ClassifierBoolCriteria,
+    ClassifierBoolQuestion, ClassifierChoiceQuestion, ClassifierContext, ClassifierModel,
+    ClassifierOptions, ClassifierQuestion, ClassifierResult, ClassifierScoreQuestion,
+    ClassifierStopReason, ImageModel, ImagesContext, ImagesInputContent, InputModality, ModelCost,
+    ModelCostRates, ProviderImageGenerator, TextContent, assert_classifier_model,
+    assert_image_model,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -174,9 +172,12 @@ fn classifier_context() -> ClassifierContext {
         "q1".to_owned(),
         ClassifierQuestion::Choice(ClassifierChoiceQuestion {
             instructions: "Pick".to_owned(),
-            criteria: [("a".to_owned(), "first".to_owned()), ("b".to_owned(), "second".to_owned())]
-                .into_iter()
-                .collect(),
+            criteria: [
+                ("a".to_owned(), "first".to_owned()),
+                ("b".to_owned(), "second".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
         }),
     );
     questions.insert(
@@ -197,7 +198,10 @@ fn classifier_context() -> ClassifierContext {
         }),
     );
     ClassifierContext {
-        state: json!({ "files": 2 }).as_object().cloned().unwrap_or_default(),
+        state: json!({ "files": 2 })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
         questions,
     }
 }
@@ -254,7 +258,11 @@ async fn classify_maps_bool_to_noul_prices_usage_and_applies_auth() {
     };
     options.api_key = None;
     let result: ClassifierResult = models
-        .classify(&classifier_model(&base_url, "typesafe-system-one"), &classifier_context(), Some(&options))
+        .classify(
+            &classifier_model(&base_url, "typesafe-system-one"),
+            &classifier_context(),
+            Some(&options),
+        )
         .await;
 
     assert_eq!(result.stop_reason, ClassifierStopReason::Stop);
@@ -310,10 +318,7 @@ async fn classify_retries_twice_by_default_and_returns_an_error_result() {
         .await;
     assert_eq!(result.stop_reason, ClassifierStopReason::Error);
     let message = result.error_message.expect("error message");
-    assert!(
-        message.contains("System One API error (500)"),
-        "{message}"
-    );
+    assert!(message.contains("System One API error (500)"), "{message}");
     // `maxRetries ?? 2` → three attempts.
     for _ in 0..3 {
         requests.recv().await.expect("request");
@@ -505,14 +510,15 @@ impl ProviderImageGenerator for RecordingGenerator {
         model: &ImageModel,
         _context: &ImagesContext,
         options: Option<&rpi_ai::types::ImagesOptions>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AssistantImages> + Send + 'static>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AssistantImages> + Send + 'static>>
+    {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.api_key.lock().unwrap() = options.and_then(|options| options.api_key.clone());
         *self.base_url.lock().unwrap() = Some(model.base_url.clone());
         let model = model.clone();
-        Box::pin(async move {
-            rpi_ai::types::image_error_result(&model, "generator failure", false)
-        })
+        Box::pin(
+            async move { rpi_ai::types::image_error_result(&model, "generator failure", false) },
+        )
     }
 }
 
@@ -584,9 +590,7 @@ async fn generate_images_resolves_auth_and_never_rejects() {
     // A request-time base URL override (auth resolution) reaches the
     // implementation.
     model.base_url = "https://override.invalid".to_owned();
-    let _ = models
-        .generate_images(&model, &context, None)
-        .await;
+    let _ = models.generate_images(&model, &context, None).await;
     assert_eq!(
         base_url_seen.lock().unwrap().as_deref(),
         Some("https://override.invalid")
@@ -624,7 +628,11 @@ fn type_guards_reject_mismatched_models() {
     }))
     .expect("chat");
     let error = assert_image_model(&chat).expect_err("not an image model");
-    assert!(error.message.contains("is not a image model"), "{}", error.message);
+    assert!(
+        error.message.contains("is not a image model"),
+        "{}",
+        error.message
+    );
     let error = assert_classifier_model(&chat).expect_err("not a classifier");
     assert!(error.message.contains("is not a classifier model"));
 }

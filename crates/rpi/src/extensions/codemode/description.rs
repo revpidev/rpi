@@ -21,7 +21,10 @@ const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The inpu
 
 /// `CODEMODE_DOCS_PATH` (tool.ts:107): the reference model-facing doc.
 pub fn codemode_docs_path() -> String {
-    get_docs_path().join("codemode.md").to_string_lossy().into_owned()
+    get_docs_path()
+        .join("codemode.md")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// One line per global; the details live in the docs path (tool.ts:117-128).
@@ -104,11 +107,16 @@ fn select_catalog(groups: &[CatalogGroup], budget: Option<usize>) -> HashSet<Str
         .collect();
     let mut shown = HashSet::new();
     let mut remaining = budget;
-    let mut active: Vec<usize> = (0..queues.len()).filter(|index| !queues[*index].is_empty()).collect();
+    let mut active: Vec<usize> = (0..queues.len())
+        .filter(|index| !queues[*index].is_empty())
+        .collect();
     while !active.is_empty() {
         let mut next_active = Vec::new();
         for index in active {
-            let next = queues[index].first().map(|entry| entry.cost).unwrap_or(usize::MAX);
+            let next = queues[index]
+                .first()
+                .map(|entry| entry.cost)
+                .unwrap_or(usize::MAX);
             if next > remaining {
                 continue;
             }
@@ -235,12 +243,19 @@ pub fn describe_output(schema: Option<&serde_json::Value>) -> String {
     if let Some(object) = object
         && object.get("type").and_then(serde_json::Value::as_str) == Some("object")
         && mcp_structured_content_schema(schema).is_none()
-        && let Some(properties) = object.get("properties").and_then(serde_json::Value::as_object)
+        && let Some(properties) = object
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
     {
         let required: HashSet<&str> = object
             .get("required")
             .and_then(serde_json::Value::as_array)
-            .map(|values| values.iter().filter_map(serde_json::Value::as_str).collect())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect()
+            })
             .unwrap_or_default();
         let fields: Vec<String> = properties
             .keys()

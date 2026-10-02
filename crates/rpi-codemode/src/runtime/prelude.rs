@@ -17,7 +17,8 @@
 //! deliberate re-port.
 
 /// sha256 of the upstream `PRELUDE_SOURCE` text (v1.0.0 `prelude-source.ts`).
-pub const PRELUDE_SOURCE_SHA256: &str = "1aa3d42c6e8c2fc93a4101dd43e1dc5f51bfff5d3b86e7224b1987631399913d";
+pub const PRELUDE_SOURCE_SHA256: &str =
+    "1aa3d42c6e8c2fc93a4101dd43e1dc5f51bfff5d3b86e7224b1987631399913d";
 
 /// The prelude evaluated with the filename `codemode-prelude.js` (the
 /// prelude filters its own frames by that name).

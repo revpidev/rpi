@@ -16,8 +16,8 @@ use url::Url;
 use crate::api::http_client::adapter_client_builder;
 use crate::types::{
     ClassifierAnswer, ClassifierBoolAnswer, ClassifierChoiceAnswer, ClassifierContext,
-    ClassifierModel, ClassifierOptions, ClassifierQuestion, ClassifierResult, ClassifierScoreAnswer,
-    ClassifierStopReason, ProviderHeaders, ProviderResponse, Usage,
+    ClassifierModel, ClassifierOptions, ClassifierQuestion, ClassifierResult,
+    ClassifierScoreAnswer, ClassifierStopReason, ProviderHeaders, ProviderResponse, Usage,
 };
 use crate::utils::cost::calculate_cost_for;
 use crate::utils::custom_fetch::send_provider_request;
@@ -337,13 +337,12 @@ async fn classify_inner(
                             headers: headers_to_record(response.headers()),
                         };
                         if status.is_success() {
-                            let body = response.text().await.map_err(|error| {
-                                ProviderErrorInfo {
+                            let body =
+                                response.text().await.map_err(|error| ProviderErrorInfo {
                                     status: None,
                                     headers: None,
                                     message: error.to_string(),
-                                }
-                            })?;
+                                })?;
                             let parsed = serde_json::from_str::<Value>(&body).map_err(|error| {
                                 ProviderErrorInfo {
                                     status: None,
@@ -366,10 +365,7 @@ async fn classify_inner(
                             Err(ProviderErrorInfo {
                                 status: Some(status),
                                 headers: Some(response_headers),
-                                message: format_provider_error(
-                                    &normalized,
-                                    Some(&error_context),
-                                ),
+                                message: format_provider_error(&normalized, Some(&error_context)),
                             })
                         }
                     }

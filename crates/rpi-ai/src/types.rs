@@ -1130,10 +1130,7 @@ pub struct ClassifierResult {
 
 /// `ClassifierOptions.onPayload` (types.ts:324-331) for classifier requests.
 pub type ClassifierOnPayloadCallback = Arc<
-    dyn Fn(
-            Value,
-            &ClassifierModel,
-        ) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>>
+    dyn Fn(Value, &ClassifierModel) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>>
         + Send
         + Sync,
 >;

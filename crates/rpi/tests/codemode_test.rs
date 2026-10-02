@@ -26,7 +26,8 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("rpi-codemode-test-{}-{id}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rpi-codemode-test-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         TempDir(dir)
     }
@@ -146,12 +147,11 @@ fn tools_extension() -> InlineExtension {
                 "mcp__dev__search",
                 "Search the dev docs index.",
                 None,
-                Arc::new(|_request, _ctx| {
-                    Box::pin(async move { Ok(text_result("found")) })
-                }),
+                Arc::new(|_request, _ctx| Box::pin(async move { Ok(text_result("found")) })),
             );
             deferred.exposure = ext::ToolExposure::Deferred;
-            api.register_tool(deferred).map_err(|error| error.to_string())?;
+            api.register_tool(deferred)
+                .map_err(|error| error.to_string())?;
             Ok(())
         }) as _
     });
@@ -259,13 +259,11 @@ async fn session_fixture(initial_mode: CodemodeMode) -> Fixture {
     .await
     .expect("create session");
     bind_session_actions(&host, &created.session).await;
-    created
-        .session
-        .set_active_tools_by_name(vec![
-            "codemode".to_owned(),
-            "echo".to_owned(),
-            "stats".to_owned(),
-        ]);
+    created.session.set_active_tools_by_name(vec![
+        "codemode".to_owned(),
+        "echo".to_owned(),
+        "stats".to_owned(),
+    ]);
 
     Fixture {
         session: created.session,
@@ -296,7 +294,9 @@ fn codemode_result(session: &AgentSession) -> rpi_agent::types::AgentToolResult 
         .into_iter()
         .rev()
         .find_map(|message| match message {
-            rpi_agent::messages::AgentMessage::ToolResult(result) if result.tool_name == "codemode" => {
+            rpi_agent::messages::AgentMessage::ToolResult(result)
+                if result.tool_name == "codemode" =>
+            {
                 Some(rpi_agent::types::AgentToolResult {
                     content: result.content,
                     details: result.details.unwrap_or(Value::Null),
@@ -348,7 +348,10 @@ async fn runs_nested_calls_in_parallel_and_returns_only_the_script_result() {
     assert_eq!(result.is_error, None);
     let text = result_text(&result);
     let (header, rest) = text.split_once("Output:\n").expect("header");
-    assert!(header.starts_with("Script completed\nWall time "), "{header}");
+    assert!(
+        header.starts_with("Script completed\nWall time "),
+        "{header}"
+    );
     assert_eq!(
         rest.trim_start_matches('\n'),
         "files 2\necho,stats,mcp__dev__search\n{\"a\":\"echo: one\",\"b\":\"echo: two\",\"names\":[\"a\",\"b\"]}"
@@ -363,7 +366,10 @@ async fn runs_nested_calls_in_parallel_and_returns_only_the_script_result() {
             )
         })
         .collect();
-    assert_eq!(statuses, vec![("echo", "ok"), ("echo", "ok"), ("stats", "ok")]);
+    assert_eq!(
+        statuses,
+        vec![("echo", "ok"), ("echo", "ok"), ("stats", "ok")]
+    );
     // Nested calls never become transcript tool results.
     let tool_results = fixture
         .session
@@ -388,10 +394,7 @@ async fn presents_callable_tools_per_codemode_mode() {
                     .map(|tool| (tool.name.clone(), tool.description.clone()))
                     .collect(),
             );
-            faux_assistant_message(
-                faux_text("ok"),
-                FauxAssistantOptions::default(),
-            )
+            faux_assistant_message(faux_text("ok"), FauxAssistantOptions::default())
         })),
         FauxResponseStep::Message(Box::new(faux_assistant_message(
             faux_text("done"),
@@ -412,33 +415,31 @@ async fn presents_callable_tools_per_codemode_mode() {
             .unwrap_or_default()
     };
     let echo = description("echo");
-    assert!(echo.contains("Codemode: `tools.echo(args)` resolves to a string."), "{echo}");
+    assert!(
+        echo.contains("Codemode: `tools.echo(args)` resolves to a string."),
+        "{echo}"
+    );
     assert!(!echo.contains("codemode tool declaration:"), "{echo}");
     let codemode = description("codemode");
     assert!(!codemode.contains("### `echo`"), "{codemode}");
 
     // only: codemode lists echo, which stays active but is left out of requests.
     fixture.settings.lock().unwrap().mode = CodemodeMode::Only;
-    fixture
-        .session
-        .set_active_tools_by_name(vec![
-            "codemode".to_owned(),
-            "echo".to_owned(),
-            "stats".to_owned(),
-        ]);
+    fixture.session.set_active_tools_by_name(vec![
+        "codemode".to_owned(),
+        "echo".to_owned(),
+        "stats".to_owned(),
+    ]);
     let requests_for_second = requests.clone();
     fixture.provider.set_responses(vec![
         FauxResponseStep::Factory(Box::new(move |context, _options, _state, _model| {
             let tools = rpi_ai::utils::transcript::get_current_tools(&context.messages);
-            requests_for_second
-                .lock()
-                .unwrap()
-                .push(
-                    tools
-                        .iter()
-                        .map(|tool| (tool.name.clone(), tool.description.clone()))
-                        .collect(),
-                );
+            requests_for_second.lock().unwrap().push(
+                tools
+                    .iter()
+                    .map(|tool| (tool.name.clone(), tool.description.clone()))
+                    .collect(),
+            );
             faux_assistant_message(faux_text("ok"), FauxAssistantOptions::default())
         })),
         FauxResponseStep::Message(Box::new(faux_assistant_message(
@@ -471,13 +472,21 @@ async fn keeps_store_values_across_calls() {
         "const next = (load(\"count\") ?? 0) + 1;\nstore(\"count\", next);\nreturn next;",
     )
     .await;
-    assert!(result_text(&first).trim_end().ends_with('1'), "{}", result_text(&first));
+    assert!(
+        result_text(&first).trim_end().ends_with('1'),
+        "{}",
+        result_text(&first)
+    );
     let second = run(
         &fixture,
         "const next = (load(\"count\") ?? 0) + 1;\nstore(\"count\", next);\nreturn next;",
     )
     .await;
-    assert!(result_text(&second).trim_end().ends_with('2'), "{}", result_text(&second));
+    assert!(
+        result_text(&second).trim_end().ends_with('2'),
+        "{}",
+        result_text(&second)
+    );
 
     let entries = fixture
         .session
@@ -496,7 +505,11 @@ async fn keeps_store_values_across_calls() {
 #[tokio::test]
 async fn applies_the_timeout_option_and_rejects_invalid_options() {
     let fixture = session_fixture(CodemodeMode::On).await;
-    let timed_out = run(&fixture, "// @options: {\"timeout_ms\": 200}\nwhile (true) {}").await;
+    let timed_out = run(
+        &fixture,
+        "// @options: {\"timeout_ms\": 200}\nwhile (true) {}",
+    )
+    .await;
     assert_eq!(timed_out.is_error, Some(true));
     assert!(
         result_text(&timed_out).contains("Script error:\nScript timed out"),
@@ -523,7 +536,10 @@ async fn reports_script_failures_with_partial_output_and_calls() {
     assert_eq!(result.is_error, Some(true));
     let text = result_text(&result);
     assert!(text.starts_with("Script failed\n"), "{text}");
-    assert!(text.contains("partial\nScript error:\nError: boom"), "{text}");
+    assert!(
+        text.contains("partial\nScript error:\nError: boom"),
+        "{text}"
+    );
     assert!(text.contains("codemode.js:3"), "{text}");
     assert!(
         text.contains("Tool calls made before the failure (they are not undone): echo (ok)"),

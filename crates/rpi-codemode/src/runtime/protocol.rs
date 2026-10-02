@@ -35,7 +35,9 @@ pub enum WorkerToHost {
         error: Option<String>,
     },
     /// The VM failed outside the script's control, for example a wasm trap.
-    Crash { message: String },
+    Crash {
+        message: String,
+    },
 }
 
 /// Host → worker (`HostToWorkerMessage`).

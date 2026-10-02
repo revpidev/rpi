@@ -43,10 +43,9 @@ use crate::models_store::{
 };
 use crate::types::{
     AnyModel, AssistantImages, ClassifierContext, ClassifierModel, ClassifierOptions,
-    ClassifierResult, Context, ImageModel, ImagesContext, ImagesOptions, Model,
-    ModelThinkingLevel, ProviderClassifier, ProviderEnv, ProviderHeaders,
-    ProviderImageGenerator, SimpleStreamOptions, StreamOptions, TranscriptContext,
-    classifier_error_result, image_error_result,
+    ClassifierResult, Context, ImageModel, ImagesContext, ImagesOptions, Model, ModelThinkingLevel,
+    ProviderClassifier, ProviderEnv, ProviderHeaders, ProviderImageGenerator, SimpleStreamOptions,
+    StreamOptions, TranscriptContext, classifier_error_result, image_error_result,
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::merge_headers;
@@ -1889,15 +1888,17 @@ impl Models {
         context: &ImagesContext,
         options: Option<&ImagesOptions>,
     ) -> Result<AssistantImages, String> {
-        let provider = self.get_provider(&model.provider).ok_or_else(|| {
-            format!("Unknown provider: {}", model.provider)
-        })?;
-        let implementation = provider.image_generator(model.api.as_str()).ok_or_else(|| {
-            format!(
-                "Provider {} has no image generation implementation for \"{}\"",
-                model.provider, model.api
-            )
-        })?;
+        let provider = self
+            .get_provider(&model.provider)
+            .ok_or_else(|| format!("Unknown provider: {}", model.provider))?;
+        let implementation = provider
+            .image_generator(model.api.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "Provider {} has no image generation implementation for \"{}\"",
+                    model.provider, model.api
+                )
+            })?;
         let auth = self
             .resolve_request_auth(
                 &model.provider,
@@ -1951,9 +1952,9 @@ impl Models {
         context: &ClassifierContext,
         options: Option<&ClassifierOptions>,
     ) -> Result<ClassifierResult, String> {
-        let provider = self.get_provider(&model.provider).ok_or_else(|| {
-            format!("Unknown provider: {}", model.provider)
-        })?;
+        let provider = self
+            .get_provider(&model.provider)
+            .ok_or_else(|| format!("Unknown provider: {}", model.provider))?;
         let implementation = provider.classifier(model.api.as_str()).ok_or_else(|| {
             format!(
                 "Provider {} has no classifier implementation for \"{}\"",

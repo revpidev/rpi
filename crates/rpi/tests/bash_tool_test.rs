@@ -105,7 +105,9 @@ mod bash_tool_tests {
     #[tokio::test]
     async fn structured_output_reports_output_and_empty_string() {
         let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
-        let (_, _, structured) = run_bash_result(&tool, "printf 'hello'", None).await.unwrap();
+        let (_, _, structured) = run_bash_result(&tool, "printf 'hello'", None)
+            .await
+            .unwrap();
         let structured = structured.expect("structured content");
         assert_eq!(structured["output"], serde_json::json!("hello"));
         assert_eq!(structured["truncated"], serde_json::json!(false));
@@ -123,13 +125,9 @@ mod bash_tool_tests {
     #[tokio::test]
     async fn structured_output_truncates_to_head_and_tail() {
         let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
-        let (_, is_error, structured) = run_bash_result(
-            &tool,
-            "yes a | head -c 2000000",
-            None,
-        )
-        .await
-        .unwrap();
+        let (_, is_error, structured) = run_bash_result(&tool, "yes a | head -c 2000000", None)
+            .await
+            .unwrap();
         assert!(!is_error);
         let structured = structured.expect("structured content");
         assert_eq!(structured["truncated"], serde_json::json!(true));
