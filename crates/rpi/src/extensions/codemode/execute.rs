@@ -27,9 +27,9 @@ use crate::extensions::tool_search::{
 
 const ARGS_PREVIEW_CHARS: usize = 200;
 const ERROR_PREVIEW_CHARS: usize = 500;
-/// `models.*` calls one script may have in flight (execute.ts:42).
+/// `models.*` calls one script may have in flight (execute.ts:50-51).
 const MAX_CONCURRENT_MODEL_CALLS: usize = 4;
-/// Heap limit for the QuickJS VM (execute.ts:48).
+/// Heap limit for the QuickJS VM (execute.ts:52-57).
 const CODEMODE_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 const CHARS_PER_TOKEN: usize = 4;
@@ -123,7 +123,7 @@ fn to_provider(value: Option<&Value>) -> Result<Option<String>, String> {
 }
 
 /// Catalog entry for scripts; `headers` is dropped because models.json
-/// headers can carry credentials (execute.ts:62-66).
+/// headers can carry credentials (execute.ts:91-96).
 fn to_model_info(model: &rpi_ai::types::AnyModel) -> Value {
     let mut info = serde_json::to_value(model).unwrap_or(Value::Null);
     if let Some(object) = info.as_object_mut() {
@@ -169,7 +169,7 @@ fn describe_value(value: &Value) -> String {
 
 const CLASSIFIER_CONTEXT_SHAPE: &str = "{ state: { ... }, questions: { <id>: { type: \"choice\", instructions, criteria: { <label>: <meaning> } } | { type: \"score\", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: \"bool\", instructions, criteria: { true: <meaning>, false: <meaning> } } } }";
 
-/// Check a script's classifier context (execute.ts:86-126).
+/// Check a script's classifier context (execute.ts:122-157).
 fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierContext, String> {
     let fail = |problem: &str| {
         format!(
@@ -298,7 +298,7 @@ fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierCo
     })
 }
 
-/// Check a script's image context (execute.ts:129-151).
+/// Check a script's image context (execute.ts:159-183).
 fn check_images_context(value: &Value) -> Result<rpi_ai::types::ImagesContext, String> {
     let docs = crate::extensions::codemode::description::codemode_docs_path();
     let fail = |problem: &str| {
@@ -432,7 +432,7 @@ fn spill_output(text: &str) -> Result<std::path::PathBuf, String> {
     Ok(path)
 }
 
-/// `truncateOutput` (execute.ts:284-320).
+/// `truncateOutput` (execute.ts:272-300).
 fn truncate_output(
     items: Vec<ToolResultContent>,
     max_tokens: usize,
@@ -495,7 +495,7 @@ fn truncate_output(
 }
 
 /// Values of `load()`: the `codemode-store` entries on the branch, applied
-/// from the root (execute.ts:225-236).
+/// from the root (execute.ts:219-230).
 fn read_codemode_store(entries: &[SessionEntryInfo]) -> Value {
     let mut store: serde_json::Map<String, Value> = serde_json::Map::new();
     for entry in entries {
@@ -519,7 +519,7 @@ fn read_codemode_store(entries: &[SessionEntryInfo]) -> Value {
     Value::Object(store)
 }
 
-/// `isNamespaceName` (execute.ts:435-441).
+/// `isNamespaceName` (execute.ts:436-445).
 fn namespace_suffix(name: &str) -> Option<&str> {
     name.rfind("__")
         .map(|index| &name[index + 2..])
@@ -548,7 +548,7 @@ fn sample_map(tools: &[ToolInfo]) -> HashMap<String, String> {
 }
 
 /// `searchTools()`, `describeTool()`, and `describeNamespace()`
-/// (execute.ts:443-517).
+/// (execute.ts:447-517).
 fn create_discovery_globals(
     tools: &[ToolInfo],
     samples: &HashMap<String, String>,
@@ -1035,7 +1035,7 @@ fn create_model_globals(
     globals
 }
 
-/// Execute one codemode script (execute.ts:353-433).
+/// Execute one codemode script (execute.ts:316-434).
 pub async fn execute_codemode(
     request: ToolExecuteRequest,
     ctx: ExtensionContext,
@@ -1350,7 +1350,7 @@ pub async fn execute_codemode(
     })
 }
 
-/// The value a script receives for a nested call (execute.ts:322-332).
+/// The value a script receives for a nested call (execute.ts:302-313).
 fn to_script_value(
     output_schema: Option<&Value>,
     name: &str,

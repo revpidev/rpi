@@ -23,7 +23,7 @@ pub struct CodemodeToolContext {
 /// The future an injected tool/global returns.
 pub type CodemodeToolFuture = BoxFuture<'static, Result<Value, String>>;
 
-/// A function a script can call (`CodemodeTool`, types.ts:20-48). Tool and
+/// A function a script can call (`CodemodeTool`, types.ts:14-41). Tool and
 /// global registrations share the shape; `spread` and `signature` are global
 /// rendering concerns.
 #[derive(Clone)]
@@ -80,7 +80,7 @@ pub struct CodemodeToolInfo {
     pub description: Option<String>,
     pub input_schema: Option<CodemodeJsonSchema>,
     pub output_schema: Option<CodemodeJsonSchema>,
-    /// Globals only: explicit TypeScript signature (declarations.ts:127-134).
+    /// Globals only: explicit TypeScript signature (declarations.ts:132-147).
     pub signature: Option<String>,
 }
 
@@ -95,7 +95,7 @@ pub enum CodemodeOutputItem {
     Image { data: String, mime_type: String },
 }
 
-/// `CodemodeCallStatus` (types.ts:57).
+/// `CodemodeCallStatus` (types.ts:49).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CodemodeCallStatus {
@@ -104,7 +104,7 @@ pub enum CodemodeCallStatus {
     Cancelled,
 }
 
-/// `CodemodeCall` (types.ts:59-63).
+/// `CodemodeCall` (types.ts:51-55).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodemodeCall {
@@ -113,7 +113,7 @@ pub struct CodemodeCall {
     pub duration_ms: f64,
 }
 
-/// `CodemodeErrorKind` (types.ts:65-74).
+/// `CodemodeErrorKind` (types.ts:57-65).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CodemodeErrorKind {
@@ -129,7 +129,7 @@ pub enum CodemodeErrorKind {
     Sandbox,
 }
 
-/// `CodemodeError` (types.ts:76-81).
+/// `CodemodeError` (types.ts:67-73).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
 #[error("{message}")]
 pub struct CodemodeError {
@@ -150,7 +150,7 @@ pub struct CodemodeStoreWrites {
     pub delete: Vec<String>,
 }
 
-/// `CodemodeResult` (types.ts:93-102). `output` is kept for failed
+/// `CodemodeResult` (types.ts:82-90). `output` is kept for failed
 /// executions too, up to the failure. `value: None` is the script's
 /// `undefined` (no `return`, or `exit()`); `Some(Value::Null)` is an explicit
 /// `return null`.
@@ -192,7 +192,7 @@ impl CodemodeTimeout {
     }
 }
 
-/// `CodemodeSandboxOptions` (types.ts:104-134).
+/// `CodemodeSandboxOptions` (types.ts:92-125).
 #[derive(Default)]
 pub struct CodemodeSandboxOptions {
     pub tools: Vec<CodemodeTool>,
@@ -209,7 +209,7 @@ pub struct CodemodeSandboxOptions {
     pub memory_limit_bytes: Option<u64>,
 }
 
-/// `CodemodeExecuteOptions` (types.ts:136-149).
+/// `CodemodeExecuteOptions` (types.ts:127-136).
 #[derive(Default)]
 pub struct CodemodeExecuteOptions {
     pub signal: Option<CancellationToken>,
@@ -228,7 +228,7 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 pub const MAX_STORE_VALUE_CHARS: usize = 256 * 1024;
 pub const MAX_STORE_TOTAL_CHARS: usize = 1024 * 1024;
 
-/// Globals a host may not shadow (`RESERVED_GLOBALS`, host.ts:26-36).
+/// Globals a host may not shadow (`RESERVED_GLOBALS`, host.ts:24-35).
 pub const RESERVED_GLOBALS: [&str; 9] = [
     "tools",
     "ALL_TOOLS",

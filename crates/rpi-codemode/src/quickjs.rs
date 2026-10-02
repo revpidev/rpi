@@ -380,7 +380,7 @@ fn finish_call<W>(
 
 /// Read `name`/`message`/`stack` off a thrown value and build the
 /// `{name?, message, stack}` JSON text (`describeException`,
-/// runtime/worker.ts:53-58).
+/// runtime/worker.ts:46-50).
 pub fn describe_exception<W>(
     store: &mut impl AsContextMut<Data = W>,
     funcs: &QjsFuncs,

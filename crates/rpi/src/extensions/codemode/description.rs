@@ -174,9 +174,6 @@ pub fn create_codemode_description(
         });
     }
     let mut ordered: Vec<CatalogGroup> = std::mem::take(&mut groups);
-    for group in ordered.iter_mut().skip(1) {
-        let _ = group;
-    }
     ordered.sort_by(|a, b| match (&a.namespace, &b.namespace) {
         (None, _) => std::cmp::Ordering::Less,
         (_, None) => std::cmp::Ordering::Greater,

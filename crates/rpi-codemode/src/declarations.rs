@@ -20,7 +20,7 @@ const MAX_REF_EXPANSIONS: usize = 32;
 
 /// TypeScript types for MCP results, from the MCP `CallToolResult` schema,
 /// so `CallToolResult<T>` declarations can refer to them
-/// (declarations.ts:18-85).
+/// (declarations.ts:18-93).
 pub const MCP_TYPESCRIPT_PREAMBLE: &str = r#"type Role = "user" | "assistant";
 type MetaObject = Record<string, unknown>;
 type Annotations = {
@@ -98,7 +98,7 @@ type CallToolResult<TStructured = { [key: string]: unknown }> = {
   [key: string]: unknown;
 };"#;
 
-/// `RenderDeclarationsOptions` (declarations.ts:87-90) collapsed to the two
+/// `RenderDeclarationsOptions` (declarations.ts:95-98) collapsed to the two
 /// slices.
 #[derive(Default)]
 pub struct RenderDeclarationsOptions<'a> {
@@ -180,7 +180,7 @@ pub fn render_tool_signature(tool: &CodemodeToolInfo, input_max_chars: Option<us
 }
 
 /// A tool's sample: the description followed by the tool's declaration
-/// (declarations.ts:147-155).
+/// (declarations.ts:149-159).
 pub fn render_tool_sample(tool: &CodemodeToolInfo) -> String {
     let declaration = format!(
         "declare const tools: {{ {} }};",
@@ -195,7 +195,7 @@ pub fn render_tool_sample(tool: &CodemodeToolInfo) -> String {
 /// The `structuredContent` schema of an MCP `CallToolResult` output schema
 /// (detected by a `content` array of objects, boolean `isError`, and object
 /// `_meta`), `Some(true)` when it declares none, or `None` when the schema
-/// is not a `CallToolResult` (declarations.ts:157-172).
+/// is not a `CallToolResult` (declarations.ts:161-175).
 pub fn mcp_structured_content_schema(schema: Option<&Value>) -> Option<Value> {
     let schema = schema?;
     let schema = schema.as_object()?;
@@ -336,7 +336,7 @@ fn union(types: Vec<String>) -> String {
 }
 
 /// Convert a JSON Schema to a TypeScript type expression
-/// (declarations.ts:211-308).
+/// (declarations.ts:221-308).
 pub fn schema_to_type(schema: &Value, max_chars: Option<usize>) -> String {
     let mut context = SchemaContext {
         root: schema,

@@ -12,7 +12,7 @@ use serde_json::Value;
 /// `CODEMODE_OPTIONS_PREFIX` (source.ts:11).
 pub const CODEMODE_OPTIONS_PREFIX: &str = "// @options:";
 
-/// `CODEMODE_SOURCE_GRAMMAR` (source.ts:29-35). Kept verbatim for the
+/// `CODEMODE_SOURCE_GRAMMAR` (source.ts:18-30). Kept verbatim for the
 /// constrained-sampling surface; rpi's providers do not currently consume a
 /// Lark grammar (see V16-07 §8-4 `[N/A]`).
 pub const CODEMODE_SOURCE_GRAMMAR: &str = r#"
@@ -28,12 +28,12 @@ SOURCE: /[\s\S]+/
 const SUPPORTED_FIELDS: [&str; 2] = ["max_output_tokens", "timeout_ms"];
 const SUPPORTED_FIELDS_TEXT: &str = "`max_output_tokens` and `timeout_ms`";
 /// Largest delay `setTimeout` supports, which bounds `timeout_ms`
-/// (source.ts:22).
+/// (source.ts:15-16).
 const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 /// `Number.MAX_SAFE_INTEGER`.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
-/// `CodemodeSourceOptions` (source.ts:37-44).
+/// `CodemodeSourceOptions` (source.ts:32-37).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CodemodeSourceOptions {
     /// Token budget for the script's output.
@@ -43,7 +43,7 @@ pub struct CodemodeSourceOptions {
     pub timeout_ms: Option<u64>,
 }
 
-/// `ParsedCodemodeSource` (source.ts:46-51).
+/// `ParsedCodemodeSource` (source.ts:39-43).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCodemodeSource {
     /// The script with the options line replaced by an empty line, so line
@@ -52,7 +52,7 @@ pub struct ParsedCodemodeSource {
     pub options: CodemodeSourceOptions,
 }
 
-/// `CodemodeSourceError` (source.ts:53-58).
+/// `CodemodeSourceError` (source.ts:45-50).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct CodemodeSourceError {
@@ -67,7 +67,7 @@ impl CodemodeSourceError {
     }
 }
 
-/// `isSafeInteger` + `value >= 0` (source.ts:60-62).
+/// `isSafeInteger` + `value >= 0` (source.ts:52-54).
 fn is_safe_non_negative_integer(value: &Value) -> Option<u64> {
     let number = value.as_f64()?;
     if number.is_finite() && number.fract() == 0.0 && (0.0..=MAX_SAFE_INTEGER).contains(&number) {

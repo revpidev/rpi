@@ -23,21 +23,21 @@ pub struct ToolSearchDocument {
     pub text: String,
 }
 
-/// `ToolSearchMatch` (tool.ts:26-29).
+/// `ToolSearchMatch` (tool.ts:29-32).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSearchMatch {
     pub name: String,
     pub score: f64,
 }
 
-/// `STOP_WORDS` (tool.ts:37-59).
+/// `STOP_WORDS` (tool.ts:39-61).
 const STOP_WORDS: [&str; 21] = [
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on",
     "or", "that", "the", "this", "to", "with",
 ];
 
 /// Naive singular form, so `issues` matches `issue` and `searches` matches
-/// `search` (tool.ts:62-67).
+/// `search` (tool.ts:63-69).
 fn stem(term: &str) -> String {
     if term.len() > 4 && term.ends_with("ies") {
         return format!("{}y", &term[..term.len() - 3]);
@@ -58,7 +58,7 @@ fn stem(term: &str) -> String {
 }
 
 /// Lowercase terms, split at camelCase boundaries and non-alphanumerics,
-/// without stop words (tool.ts:69-79).
+/// without stop words (tool.ts:71-80).
 pub fn tokenize(text: &str) -> Vec<String> {
     use std::sync::OnceLock;
     static SPLIT_LOWER_UPPER: OnceLock<regex::Regex> = OnceLock::new();
@@ -80,7 +80,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Schema descriptions and property names, recursively (tool.ts:86-104).
+/// Schema descriptions and property names, recursively (tool.ts:86-101).
 fn schema_text(schema: &Value, parts: &mut Vec<String>) {
     let Some(object) = schema.as_object() else {
         return;
@@ -108,7 +108,7 @@ fn schema_text(schema: &Value, parts: &mut Vec<String>) {
 
 /// Search text of a tool: the name, the name with `_` as spaces, the
 /// description, schema descriptions and property names, and the namespace
-/// with its description and instructions (tool.ts:110-124).
+/// with its description and instructions (tool.ts:103-116).
 pub fn create_tool_search_document(
     name: &str,
     description: &str,
@@ -137,7 +137,7 @@ pub fn create_tool_search_document(
 }
 
 /// Okapi BM25 with the usual parameters. Ties keep document order
-/// (tool.ts:119-180).
+/// (tool.ts:118-157).
 pub struct Bm25Ranker {
     k1: f64,
     b: f64,
@@ -237,7 +237,7 @@ impl Bm25Ranker {
     }
 }
 
-/// `toolSearchSchema` (tool.ts:182-189).
+/// `toolSearchSchema` (tool.ts:159-167).
 pub fn tool_search_schema() -> Value {
     json!({
         "type": "object",
@@ -250,7 +250,7 @@ pub fn tool_search_schema() -> Value {
     })
 }
 
-/// `TOOL_SEARCH_DESCRIPTION` (tool.ts:220-222).
+/// `TOOL_SEARCH_DESCRIPTION` (tool.ts:220).
 pub const TOOL_SEARCH_DESCRIPTION: &str = "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nSome of the tools, such as tools of MCP servers, may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search`.";
 
 /// `isSearchable` (tool.ts:192-194).
@@ -299,7 +299,7 @@ fn parse_searchable_tools(api: &ExtensionApi) -> Vec<SearchableTool> {
 }
 
 /// Rank the searchable tools that are not active yet and activate the
-/// matches, so the next model call declares them (tool.ts:196-209).
+/// matches, so the next model call declares them (tool.ts:196-214).
 pub fn search_and_load(api: &ExtensionApi, query: &str, limit: usize) -> Vec<(String, String)> {
     let active = api.get_active_tools().unwrap_or_default();
     let active_set: HashSet<&str> = active.iter().map(String::as_str).collect();
@@ -337,7 +337,7 @@ pub fn search_and_load(api: &ExtensionApi, query: &str, limit: usize) -> Vec<(St
         .collect()
 }
 
-/// `createToolSearchToolDefinition` (tool.ts:225-247).
+/// `createToolSearchToolDefinition` (tool.ts:222-247).
 pub fn create_tool_search_tool_definition(api: ExtensionApi) -> ToolDefinition {
     ToolDefinition {
         name: TOOL_SEARCH_TOOL_NAME.to_owned(),

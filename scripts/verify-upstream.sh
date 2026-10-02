@@ -47,4 +47,9 @@ while IFS='|' read -r _ dir sha _; do
     check_pin "$dir" "$sha"
 done < <(grep -E '^\| `external/' UPSTREAM.md)
 
+# Codemode/tool_search source comments cite upstream line ranges; the pin
+# check above only compares commits, so verify the anchors still point at the
+# pinned lines (V16-07 review O-E).
+bash scripts/verify-upstream-anchors.sh
+
 echo "ok: upstream pins verified"
