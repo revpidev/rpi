@@ -207,3 +207,17 @@ Six upstream documents (`external/pi/packages/coding-agent/docs/`) are the byte/
 |------|--------|--------|
 | tmux recommended config and `csi-u` behavior | T12 terminal capability detection cases | ⏳ T12 |
 | Per-terminal (Kitty/iTerm2/Apple/Ghostty/WezTerm/Alacritty/VS Code/Windows Terminal/xfce4/IntelliJ) settings and escape sequences | T11/T12 VirtualTerminal frame parity (CSI 2026 jitter removed) | ⏳ T11/T12 |
+
+## V16-07 note: `tool-calls` bash `structuredContent` (2026-10-02)
+
+The `tool-calls` golden's bash `tool_execution_end.result` carries the
+`structuredContent` value upstream v1.0.0 added (`bash.ts:386-407`:
+`output` / `truncated` / `exit_code` / `wall_time_seconds`, plus
+`full_output_path` when truncated). The committed goldens were recorded
+against `19451accd` (v0.86.1+1), so that one line was updated by hand to the
+v1.0.0 shape; the field is byte-checked against the v1.0.0 source, and the
+agent-level parity stand-in returns the same value
+(`crates/rpi-agent/tests/parity_events_test.rs::fixture_bash_tool`). A full
+re-record at the v0.1.6 pin (`a13d35a74`) is deferred to the next
+fixture-generation pass (the recorder builds upstream, which is out of scope
+for V16-07); the value is pin-stable.

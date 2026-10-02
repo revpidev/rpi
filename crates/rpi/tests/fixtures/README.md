@@ -5,15 +5,18 @@
 `packages/coding-agent/src/extensions/codemode/tool.ts`
 (`createCodemodeDescription` / `describeScriptCall` / `describeOutput`).
 
-Generation method (no upstream file is modified): the needed sources are
-copied to a temp directory, the `@earendil-works/pi-codemode` imports are
-rewritten to the copied `packages/codemode/src` files, a `getDocsPath()` stub
-reads `PI_PACKAGE_DIR`, and Node's built-in type stripping runs the driver:
+Regenerate with Node's built-in type stripping (Node 22.18+/24):
 
 ```bash
-PI_PACKAGE_DIR=/tmp/rpi-codemode-docs node --experimental-strip-types gen.mjs
+node --experimental-strip-types crates/rpi/tests/fixtures/gen-codemode-description.mjs
 ```
 
-The test sets `RPI_PACKAGE_DIR=/tmp/rpi-codemode-docs` so both sides render
-the same `codemode.md` path, then asserts the ported Rust renderer produces
-byte-identical description text (V16-07 FR-H R1 hard-parity surface).
+The generator is self-contained. It never modifies an upstream file: it
+copies the needed sources to a temp directory, rewrites the
+`@earendil-works/pi-codemode` imports to the copied
+`packages/codemode/src` files, stubs `getDocsPath()` to read
+`PI_PACKAGE_DIR` (`/tmp/rpi-codemode-docs`), runs the upstream functions and
+writes the fixture. The Rust test
+(`crates/rpi/tests/codemode_parity_test.rs`) sets the same
+`RPI_PACKAGE_DIR`, then asserts the ported renderer produces byte-identical
+text (V16-07 FR-H R1 hard-parity surface).
