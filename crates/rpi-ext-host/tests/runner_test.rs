@@ -1116,7 +1116,7 @@ fn user_message_json(content: &str, timestamp: i64) -> Value {
 
 /// V16-03 FR-C R1: `context` handlers never see system messages; when they
 /// change the conversation the replayed prompt/tool checkpoint is re-attached
-/// as one leading system message (runner.ts:1187-1317 @ 005af57d8).
+/// as one leading system message (runner.ts:1187-1317 @ a13d35a74).
 #[tokio::test]
 async fn runner_context_hides_system_messages_and_restores_prompt() {
     let host = host_with(vec![inline_ext("ext-a", |api| {
@@ -1210,7 +1210,7 @@ async fn runner_context_keeps_system_messages_added_by_a_handler() {
 
 /// V16-03 FR-B R2: `context_with_system` runs after every `context` handler
 /// on the restored transcript and its output is sent verbatim
-/// (runner.ts:1320-1354 @ 005af57d8).
+/// (runner.ts:1320-1354 @ a13d35a74).
 #[tokio::test]
 async fn runner_context_with_system_runs_after_context_verbatim() {
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));

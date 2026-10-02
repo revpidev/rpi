@@ -2986,7 +2986,7 @@ fn message_kinds(messages: &[AgentMessage]) -> Vec<&'static str> {
         .collect()
 }
 
-/// V16-03 FR-D R5 (`prepareRequest`, agent-loop.ts:218-235 @ 005af57d8):
+/// V16-03 FR-D R5 (`prepareRequest`, agent-loop.ts:218-235 @ a13d35a74):
 /// the hook runs immediately before every conversational provider request,
 /// including the first, and its replacement context reaches the request.
 /// It does not poll queues (steering is polled by the loop's own gates).
@@ -3078,7 +3078,7 @@ async fn prepare_request_runs_for_every_request_and_replaces_context() {
 }
 
 /// V16-03 FR-D R1 (`finishTurn` continuation, agent-loop.ts:255-275 @
-/// 005af57d8): `{action: "continue"}` ensures one next provider request;
+/// a13d35a74): `{action: "continue"}` ensures one next provider request;
 /// since no tool result/steering/follow-up scheduling satisfies it, the loop
 /// runs one context-only turn.
 #[tokio::test]
@@ -3167,7 +3167,7 @@ async fn finish_turn_end_exits_before_polling_queues() {
 }
 
 /// V16-03 FR-D R1: error/aborted responses still invoke `finishTurn` but
-/// ignore its decision (agent-loop.ts:245-252 @ 005af57d8).
+/// ignore its decision (agent-loop.ts:245-252 @ a13d35a74).
 #[tokio::test]
 async fn finish_turn_runs_on_error_but_decision_is_ignored() {
     let context = AgentContext {

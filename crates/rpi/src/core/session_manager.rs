@@ -1559,7 +1559,7 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
-    /// `appendCompaction` (session-manager.ts:1240-1270 @ 005af57d8). The main
+    /// `appendCompaction` (session-manager.ts:1240-1270 @ a13d35a74). The main
     /// path writes the `firstKeptEntryId` form (ADR-0003 §1) and snapshots the
     /// current prompt/tool state (`systemMessage`) at the compaction boundary.
     ///

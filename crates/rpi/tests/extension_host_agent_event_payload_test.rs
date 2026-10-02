@@ -844,13 +844,13 @@ async fn session_compact_failed_emits_only_with_handlers() {
 
 // ---------------------------------------------------------------------------
 // V16-03 FR-B/FR-C: context pipeline and system messages
-// (9789-context-handler-system-messages.test.ts intents @ 005af57d8)
+// (9789-context-handler-system-messages.test.ts intents @ a13d35a74)
 // ---------------------------------------------------------------------------
 
 /// #9789/#9822: a `context` handler that slices the conversation must not
 /// drop the prompt/tool checkpoint — the restored system message leads the
 /// request and the tool declarations survive
-/// (runner.ts:1187-1317 @ 005af57d8).
+/// (runner.ts:1187-1317 @ a13d35a74).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn context_handler_slice_keeps_prompt_and_tools() {
     let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -919,7 +919,7 @@ async fn context_handler_slice_keeps_prompt_and_tools() {
 
 /// `context_with_system` runs after `context` on the restored transcript and
 /// its output is sent verbatim — stripping a tool from `toolsAdded` removes
-/// it from the provider request (runner.ts:1320-1354 @ 005af57d8).
+/// it from the provider request (runner.ts:1320-1354 @ a13d35a74).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn context_with_system_output_is_sent_verbatim() {
     let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -992,7 +992,7 @@ async fn context_with_system_output_is_sent_verbatim() {
 
 /// FR-D R3/R4: a `turn_end` handler returning `{entries, continue: true}`
 /// persists the structural entry and forces one next provider request
-/// (agent-session.ts:834-850, runner.ts:1020-1078 @ 005af57d8).
+/// (agent-session.ts:840-856, runner.ts:1020-1078 @ a13d35a74).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn turn_end_boundary_persists_entries_and_continues() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1062,7 +1062,7 @@ async fn turn_end_boundary_persists_entries_and_continues() {
 
 /// FR-D R4: an `agent_before_settle` handler appends a draft and the entry
 /// lands in the session before settlement
-/// (agent-session.ts:1820-1843 @ 005af57d8).
+/// (agent-session.ts:1846-1869 @ a13d35a74).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_before_settle_boundary_persists_entries() {
     let factory: ExtensionFactory = Arc::new(|api| {

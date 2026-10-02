@@ -1151,7 +1151,7 @@ pub struct AssistantMessage {
     pub provider_thinking_level: Option<String>,
     /// Pi thinking level the agent loop requested for this response. Absent
     /// outside the agent loop and for legacy responses (R2.7.1,
-    /// types.ts:553-554 @ 005af57d8). The agent loop records it on every
+    /// types.ts:553-554 @ a13d35a74). The agent loop records it on every
     /// finalized assistant message (agent-loop.ts:409).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ModelThinkingLevel>,
@@ -1184,7 +1184,7 @@ pub struct AssistantMessage {
 }
 
 /// A tool call that another tool made while it ran, for example from a
-/// codemode script (types.ts:570-581 @ 005af57d8).
+/// codemode script (types.ts:570-581 @ a13d35a74).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedToolCallRecord {
@@ -1206,7 +1206,7 @@ pub struct NestedToolCallRecord {
 }
 
 /// Bounded record of the nested calls a tool made. Results are not recorded
-/// (types.ts:583-588 @ 005af57d8).
+/// (types.ts:583-588 @ a13d35a74).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedToolCalls {
@@ -1699,7 +1699,7 @@ pub struct Model {
     pub compat: Option<ModelCompat>,
 }
 
-/// `ModelType` (types.ts:1158-1165 @ 005af57d8, schema v6): what a catalog
+/// `ModelType` (types.ts:1158-1165 @ a13d35a74, schema v6): what a catalog
 /// entry is for. Chat is the default and omits `type` in catalog data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1723,7 +1723,7 @@ impl ModelType {
     }
 }
 
-/// `ImageModel` (types.ts:1143-1156 @ 005af57d8): image-generation catalog
+/// `ImageModel` (types.ts:1143-1156 @ a13d35a74): image-generation catalog
 /// entry. Parsed through [`AnyModel`]; `AnyModel` dispatch tries this shape
 /// before the classifier and chat shapes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1748,7 +1748,7 @@ pub struct ImageModel {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
-/// `ClassifierModel` (types.ts:1150-1155 @ 005af57d8): structured classifier
+/// `ClassifierModel` (types.ts:1150-1155 @ a13d35a74): structured classifier
 /// catalog entry. Parsed through [`AnyModel`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1769,7 +1769,7 @@ pub struct ClassifierModel {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
-/// `AnyModel` (types.ts:1167-1168 @ 005af57d8): anything a provider can
+/// `AnyModel` (types.ts:1167-1168 @ a13d35a74): anything a provider can
 /// list. Deserialization dispatches on the raw `type` field (missing =
 /// chat), so each variant is unambiguous; unknown types are rejected and
 /// skipped by callers (catalog/remote parse).
@@ -1819,7 +1819,7 @@ impl<'de> Deserialize<'de> for AnyModel {
 }
 
 impl AnyModel {
-    /// `getModelType` (utils/model-operations.ts @ 005af57d8).
+    /// `getModelType` (utils/model-operations.ts @ a13d35a74).
     pub fn model_type(&self) -> ModelType {
         match self {
             AnyModel::Image(_) => ModelType::Image,
@@ -1860,7 +1860,7 @@ impl AnyModel {
         }
     }
 
-    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ 005af57d8):
+    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ a13d35a74):
     /// the same upstream id may appear once per type.
     pub fn merge_key(&self) -> String {
         format!("{}\0{}", self.model_type().as_str(), self.id())
@@ -1896,7 +1896,7 @@ impl From<Model> for AnyModel {
     }
 }
 
-/// `isModelType` (utils/model-operations.ts @ 005af57d8).
+/// `isModelType` (utils/model-operations.ts @ a13d35a74).
 pub fn is_model_type(model: &AnyModel, model_type: ModelType) -> bool {
     model.model_type() == model_type
 }

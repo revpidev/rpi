@@ -1,6 +1,6 @@
 //! V16-03 FR-A R5/R7: context-edit-aware accounting and compaction
 //! preparation. Ports the compaction intents of upstream
-//! `test/session-context-edit.test.ts` @ 005af57d8 (`estimateProjectedContextTokens`,
+//! `test/session-context-edit.test.ts` @ a13d35a74 (`estimateProjectedContextTokens`,
 //! `prepareCompaction` over the canonical projection).
 
 use std::path::PathBuf;

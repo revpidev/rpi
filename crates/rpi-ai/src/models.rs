@@ -134,7 +134,7 @@ pub trait Provider: Send + Sync {
     /// implementation as having no models.
     fn get_models(&self) -> Vec<Model>;
 
-    /// `getAllModels?` (models.ts:174 @ 005af57d8 / schema v6): every model
+    /// `getAllModels?` (models.ts:174 @ a13d35a74 / schema v6): every model
     /// type known to the provider (chat + image + classifier). Defaults to
     /// the chat-only [`Provider::get_models`] wrapped as [`AnyModel::Chat`],
     /// so existing providers need no change and chat reads keep their
@@ -428,7 +428,7 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
 }
 
 /// `mergeModels` for schema v6 (`remote-catalog-provider.ts:26-30 @
-/// 005af57d8`): the merge key is `type\0id`, so the same upstream id may
+/// a13d35a74`): the merge key is `type\0id`, so the same upstream id may
 /// appear once per type. Same-key models replace the baseline entry; new
 /// keys append.
 pub fn merge_any_models(baseline: &[AnyModel], dynamic: &[AnyModel]) -> Vec<AnyModel> {
@@ -935,7 +935,7 @@ impl Models {
         }
     }
 
-    /// `getAllModels` (models.ts:446 @ 005af57d8 / schema v6) — every model
+    /// `getAllModels` (models.ts:446 @ a13d35a74 / schema v6) — every model
     /// type from one provider or all. `get_models` stays chat-only (red
     /// line).
     pub fn get_all_models(&self, provider: Option<&str>) -> Vec<AnyModel> {

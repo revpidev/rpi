@@ -83,7 +83,7 @@ pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
 
 /// All 39 event names, in the upstream `ExtensionAPI.on()` overload order
-/// (types.ts:1545-1625 @ 005af57d8 + #9668 `cache_warming_decision` —
+/// (types.ts:1545-1625 @ a13d35a74 + #9668 `cache_warming_decision` —
 /// inserted between `context_with_system` and `before_provider_request`).
 /// V16-03 adds `context_with_system` and `agent_before_settle`; the remaining
 /// two (`provider_stream_event`, `mcp_servers_change`) and the version-level
@@ -503,7 +503,7 @@ pub struct SessionTreeEvent {
 // Agent events (types.ts:659-779)
 // ============================================================================
 
-/// `ContextEvent` (types.ts:664-669 @ 005af57d8).
+/// `ContextEvent` (types.ts:664-669 @ a13d35a74).
 ///
 /// `messages` holds the conversation without system messages. The prompt
 /// and tool state belong to pi: it restores them after each handler, so a
@@ -514,7 +514,7 @@ pub struct ContextEvent {
     pub messages: Vec<AgentMessage>,
 }
 
-/// `ContextWithSystemEvent` (types.ts:671-677 @ 005af57d8): fired before
+/// `ContextWithSystemEvent` (types.ts:671-677 @ a13d35a74): fired before
 /// each LLM call, after every `context` handler has run and pi has restored
 /// the prompt and tool state. `messages` is the full transcript including
 /// system messages, and the result is sent as returned: the handler owns
@@ -659,7 +659,7 @@ pub struct TurnStartEvent {
     pub timestamp: i64,
 }
 
-/// `AgentActivityOutcome` (types.ts:919 @ 005af57d8).
+/// `AgentActivityOutcome` (types.ts:922 @ a13d35a74).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentActivityOutcome {
@@ -668,7 +668,7 @@ pub enum AgentActivityOutcome {
     Error,
 }
 
-/// `SessionBoundaryDraft` (types.ts:924-957 @ 005af57d8): the structural
+/// `SessionBoundaryDraft` (types.ts:924-957 @ a13d35a74): the structural
 /// entries an `{entries, continue}` boundary result may append. Drafts cross
 /// the JSON ABI untyped; the host parses this shape when applying them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -709,7 +709,7 @@ pub enum SessionBoundaryDraft {
     },
 }
 
-/// `BoundaryResult` (types.ts:975-978 @ 005af57d8): what a `turn_end` /
+/// `BoundaryResult` (types.ts:975-978 @ a13d35a74): what a `turn_end` /
 /// `agent_before_settle` handler may return. Entries stay raw JSON until the
 /// host applies them (invalid previews are repaired, not silently dropped).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -721,7 +721,7 @@ pub struct BoundaryResult {
     pub continue_: Option<bool>,
 }
 
-/// `BoundaryDispatchResult` (runner.ts:214-219 @ 005af57d8). `valid` is
+/// `BoundaryDispatchResult` (runner.ts:214-219 @ a13d35a74). `valid` is
 /// false when the final preview request failed: the caller then discards
 /// the drafts and the continuation.
 #[derive(Debug, Clone, PartialEq)]
@@ -732,7 +732,7 @@ pub struct BoundaryDispatchResult {
     pub valid: bool,
 }
 
-/// `TurnEndEvent` (types.ts:1015-1022 @ 005af57d8, `BoundaryState` included
+/// `TurnEndEvent` (types.ts:1015-1022 @ a13d35a74, `BoundaryState` included
 /// at dispatch time).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -745,7 +745,7 @@ pub struct TurnEndEvent {
     pub outcome: AgentActivityOutcome,
 }
 
-/// `AgentBeforeSettleEvent` (types.ts:980-983 @ 005af57d8): fired before
+/// `AgentBeforeSettleEvent` (types.ts:980-983 @ a13d35a74): fired before
 /// final settlement. May append entries and ensure one next provider request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

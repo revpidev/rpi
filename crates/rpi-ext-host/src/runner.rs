@@ -46,7 +46,7 @@ use crate::types::{
     RegisteredTool, ResolvedCommand, is_session_before_event,
 };
 
-/// `restoreSystemMessages` (runner.ts:275-297 @ 005af57d8): re-attach the
+/// `restoreSystemMessages` (runner.ts:284-293 @ a13d35a74): re-attach the
 /// prompt and tool state after a `context` handler changed the conversation.
 /// The replayed prompt/tool checkpoint becomes one leading system message so
 /// pruning, windowing, or slicing from a compaction summary cannot drop it.
@@ -629,7 +629,7 @@ impl ExtensionRunnerCore {
         // `ExtensionRunner.emit()` refuses the boundary events; they are
         // dispatched through `emit_boundary` with the chained
         // `{entries, continue, context}` state (runner.ts:172-189 @
-        // 005af57d8).
+        // a13d35a74).
         if matches!(event_type, EVENT_TURN_END | EVENT_AGENT_BEFORE_SETTLE) {
             self.emit_error(ExtensionError::new(
                 "<boundary>",
@@ -667,7 +667,7 @@ impl ExtensionRunnerCore {
         result
     }
 
-    /// `emitBoundary` (runner.ts:1020-1078 @ 005af57d8): chained
+    /// `emitBoundary` (runner.ts:1020-1078 @ a13d35a74): chained
     /// `{entries, continue}` state over the boundary handlers. After every
     /// handler the caller rebuilds the boundary context preview; a failed
     /// rebuild invalidates the dispatch (drafts and continuation are
@@ -976,7 +976,7 @@ impl ExtensionRunnerCore {
         Ok(None)
     }
 
-    /// `emitContext` (runner.ts:1247-1355 @ 005af57d8): the two-phase
+    /// `emitContext` (runner.ts:1247-1355 @ a13d35a74): the two-phase
     /// request-time transform. `context` handlers see the conversation only
     /// and pi restores the prompt/tool state after each; then
     /// `context_with_system` handlers see the full transcript and their

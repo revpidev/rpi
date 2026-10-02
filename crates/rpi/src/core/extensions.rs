@@ -479,7 +479,7 @@ pub trait ExtensionRunner: Send + Sync {
         messages
     }
 
-    /// `emitBoundary` (runner.ts:1020-1078 @ 005af57d8): the chained
+    /// `emitBoundary` (runner.ts:1020-1078 @ a13d35a74): the chained
     /// `{entries, continue, context}` dispatch used for `turn_end` and
     /// `agent_before_settle`. Default = no handlers, no dispatch.
     fn emit_boundary(

@@ -61,7 +61,7 @@ pub fn model_catalog_endpoint(settings_url: Option<&str>) -> Option<String> {
 }
 
 /// `REMOTE_CATALOG_MODEL_TYPES` (remote-catalog-provider.ts:17-24 @
-/// 005af57d8): model types this client can consume, sent as `?types=` so the
+/// a13d35a74): model types this client can consume, sent as `?types=` so the
 /// catalog server returns the full-type shard. A server that ignores the
 /// parameter still returns the chat-only shard, which this client handles
 /// unchanged.

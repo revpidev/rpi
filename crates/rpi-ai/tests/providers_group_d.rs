@@ -442,7 +442,7 @@ fn fireworks_anthropic_catalog_entry() {
     assert_eq!(model.input, [InputModality::Text, InputModality::Image]);
 }
 
-/// Upstream `fireworks-models.test.ts` @ 005af57d8: the GLM 5.3 Fast router
+/// Upstream `fireworks-models.test.ts` @ a13d35a74: the GLM 5.3 Fast router
 /// is aligned with the base model's config (both on openai-completions).
 #[test]
 fn fireworks_router_models_align_with_base() {

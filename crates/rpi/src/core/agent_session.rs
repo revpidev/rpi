@@ -399,7 +399,7 @@ fn builtin_tool_guidelines(name: &str) -> &'static [&'static str] {
 // AgentSession
 // ============================================================================
 
-/// `_deferredSettledActions` entries (agent-session.ts:418 @ 005af57d8):
+/// `_deferredSettledActions` entries (agent-session.ts:418 @ a13d35a74):
 /// work requested from `agent_settled` handlers, run after every settled
 /// handler finished.
 type DeferredSettledAction = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
@@ -457,7 +457,7 @@ struct AgentSessionInner {
     /// rpi-statusline 03-realtime-token-count §1.3).
     turn_index: AtomicU32,
 
-    /// `_boundaryDispatchedMessages` (agent-session.ts:413 @ 005af57d8):
+    /// `_boundaryDispatchedMessages` (agent-session.ts:413 @ a13d35a74):
     /// assistant messages whose `turn_end` boundary already ran inside
     /// `finishTurn`; the event-time fallback skips them.
     boundary_dispatched_messages: Mutex<Vec<AssistantMessage>>,
@@ -701,7 +701,7 @@ impl AgentSession {
         }
         // V16-03 FR-A R5: the compaction runner persists restorative context
         // omissions for discarded recovery attempts
-        // (`_omitRecoveryAttempt`, agent-session.ts:1202-1216 @ 005af57d8).
+        // (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ a13d35a74).
         {
             let weak = Arc::downgrade(&session.inner);
             if let Ok(mut runner) = session.inner.compaction.try_lock() {
@@ -718,10 +718,10 @@ impl AgentSession {
         // compaction + state refresh (V14-01 FR-D).
         session.install_agent_next_turn_refresh();
         // `_installAgentRequestProjection()` (agent-session.ts:398,
-        // 754-780 @ 005af57d8): a SessionManager projection becomes the
+        // 760-786 @ a13d35a74): a SessionManager projection becomes the
         // provider-context authority before every conversational request.
         session.install_agent_request_projection();
-        // `_installAgentBoundaryHooks()` (agent-session.ts:398, 852-862):
+        // `_installAgentBoundaryHooks()` (agent-session.ts:398, 858-868):
         // `turn_end` boundary dispatch runs inside `finishTurn`.
         session.install_agent_boundary_hooks();
         // `_installAgentForcedPromptProjection()` (agent-session.ts:417 @
@@ -867,8 +867,8 @@ impl AgentSession {
         read_runner(&self.inner.extension_runner_ref)
     }
 
-    /// `_installAgentRequestProjection` (agent-session.ts:754-847 @
-    /// 005af57d8; virtual-model routing slice deferred to V16-12): installs
+    /// `_installAgentRequestProjection` (agent-session.ts:760-853 @
+    /// a13d35a74; virtual-model routing slice deferred to V16-12): installs
     /// the canonical session projection as the provider context for every
     /// conversational request. Direct `agent.state.messages` assignments are
     /// superseded here (R3.1.2); recovery goes through the session append
@@ -928,15 +928,15 @@ impl AgentSession {
         )));
     }
 
-    /// `refreshContext` (agent-session.ts:1385-1387 @ 005af57d8): rebuild the
+    /// `refreshContext` (agent-session.ts:1391-1393 @ a13d35a74): rebuild the
     /// finalized agent transcript from the canonical session projection.
     pub fn refresh_context(&self) {
         let projection = lock(&self.inner.session_manager).build_session_projection();
         self.inner.agent.set_messages(projection.messages);
     }
 
-    /// `_findPersistedMessageEntryId` (agent-session.ts:1183-1201 @
-    /// 005af57d8): value-equality scan over the branch, then the
+    /// `_findPersistedMessageEntryId` (agent-session.ts:1189-1207 @
+    /// a13d35a74): value-equality scan over the branch, then the
     /// projected-index fallback.
     fn find_persisted_message_entry_id(&self, message: &AgentMessage) -> Option<String> {
         let session = lock(&self.inner.session_manager);
@@ -964,7 +964,7 @@ impl AgentSession {
         None
     }
 
-    /// `_omitRecoveryAttempt` (agent-session.ts:1202-1216 @ 005af57d8):
+    /// `_omitRecoveryAttempt` (agent-session.ts:1208-1222 @ a13d35a74):
     /// durably omit a discarded retry/recovery attempt (and the immediate
     /// tool results of its turn) from the model projection while keeping the
     /// raw transcript intact. Fail-soft: append failures are logged and do
@@ -1015,7 +1015,7 @@ impl AgentSession {
     }
 
     // ==================================================================
-    // Boundary cluster (agent-session.ts:852-1010 @ 005af57d8)
+    // Boundary cluster (agent-session.ts:858-1016 @ a13d35a74)
     // ==================================================================
 
     /// `_installAgentBoundaryHooks` (agent-session.ts:852-862):
@@ -1132,7 +1132,7 @@ impl AgentSession {
         boundary.continue_
     }
 
-    /// `_runBeforeSettleBoundary` (agent-session.ts:1820-1843 @ 005af57d8).
+    /// `_runBeforeSettleBoundary` (agent-session.ts:1846-1869 @ a13d35a74).
     async fn run_before_settle_boundary(&self) -> bool {
         let runner = self.runner();
         if !runner.has_handlers("agent_before_settle") {
@@ -1426,7 +1426,7 @@ impl AgentSession {
             cache_warmer.on_agent_settled();
         }
         // `_isEmittingAgentSettled = true` before the dispatch
-        // (agent-session.ts:1047 @ 005af57d8); `finally` clears it. Work
+        // (agent-session.ts:1053 @ a13d35a74); `finally` clears it. Work
         // requested from settled handlers is queued and drained after every
         // handler finished.
         self.inner
@@ -1437,7 +1437,7 @@ impl AgentSession {
         self.inner
             .is_emitting_agent_settled
             .store(false, Ordering::SeqCst);
-        // `_deferredSettledActions` (agent-session.ts:1046-1062 @ 005af57d8):
+        // `_deferredSettledActions` (agent-session.ts:1052-1068 @ a13d35a74):
         // runs requested from settled handlers execute after every handler
         // finished, then the idle wait resolves.
         let deferred: Vec<_> = std::mem::take(&mut *lock(&self.inner.deferred_settled_actions));
@@ -1643,7 +1643,7 @@ impl AgentSession {
                 // The boundary normally already ran inside `finishTurn`
                 // (`_boundaryDispatchedMessages`); the event-time fallback
                 // covers messages that bypassed the hook
-                // (agent-session.ts:1261-1265 @ 005af57d8).
+                // (agent-session.ts:1267-1271 @ a13d35a74).
                 if let AgentMessage::Assistant(assistant) = message {
                     let already_dispatched = {
                         let mut dispatched = lock(&self.inner.boundary_dispatched_messages);
@@ -2552,8 +2552,8 @@ impl AgentSession {
 
     async fn run_agent_prompt_inner(&self, messages: Vec<AgentMessage>) -> Result<(), RpiError> {
         // Requests made from `agent_settled` handlers wait until every
-        // settled handler finished (agent-session.ts:1896 / :2242 @
-        // 005af57d8; rpi adapts the two upstream deferral points to the
+        // settled handler finished (agent-session.ts:1922 / :2268 @
+        // a13d35a74; rpi adapts the two upstream deferral points to the
         // single run entry point).
         if self.inner.is_emitting_agent_settled.load(Ordering::SeqCst) {
             let weak = Arc::downgrade(&self.inner);
@@ -3276,7 +3276,7 @@ impl AgentSession {
                 .store(true, Ordering::SeqCst);
         }
         // `if (this._isBeforeSettle) this._abortDuringBeforeSettle = true`
-        // (agent-session.ts:2368 @ 005af57d8).
+        // (agent-session.ts:2394 @ a13d35a74).
         if self.inner.is_before_settle.load(Ordering::SeqCst) {
             self.inner
                 .abort_during_before_settle
@@ -3905,8 +3905,8 @@ impl AgentSession {
         }
 
         // Keep the failed attempt in raw history while durably omitting it
-        // from model projection (`_omitRecoveryAttempt`, agent-session.ts:3711
-        // @ 005af57d8).
+        // from model projection (`_omitRecoveryAttempt`, agent-session.ts:3738
+        // @ a13d35a74).
         self.omit_recovery_attempt(message);
 
         let token = CancellationToken::new();

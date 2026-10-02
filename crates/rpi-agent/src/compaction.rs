@@ -300,7 +300,7 @@ fn estimate_user_content_chars(content: &rpi_ai::types::UserContent) -> usize {
 pub fn estimate_tokens(message: &AgentMessage) -> u64 {
     let chars: usize = match message {
         // Upstream counts the current prompt/tool state: content + sections +
-        // `toolsAdded` declarations (compaction.ts:302-312 @ 005af57d8, the
+        // `toolsAdded` declarations (compaction.ts:302-312 @ a13d35a74, the
         // R5 "effective system and tool context" fix).
         AgentMessage::System(system) => {
             let mut chars = match &system.content {
@@ -922,7 +922,7 @@ pub struct CompactionPreparation {
 }
 
 /// `getMessagesFromProjectedEntryForCompaction` (compaction.ts:98-102 @
-/// 005af57d8): compaction boundaries contribute nothing; system messages are
+/// a13d35a74): compaction boundaries contribute nothing; system messages are
 /// prompt state, not conversation.
 fn get_messages_from_projected_entry_for_compaction(
     entry: &ProjectedSessionEntry,
@@ -938,7 +938,7 @@ fn get_messages_from_projected_entry_for_compaction(
         .collect()
 }
 
-/// `isProjectedTurnStart` (compaction.ts:782-785 @ 005af57d8).
+/// `isProjectedTurnStart` (compaction.ts:782-785 @ a13d35a74).
 fn is_projected_turn_start(entry: &ProjectedSessionEntry) -> bool {
     if matches!(entry.source_entry, SessionEntry::Compaction(_)) {
         return false;
@@ -946,7 +946,7 @@ fn is_projected_turn_start(entry: &ProjectedSessionEntry) -> bool {
     entry.messages.iter().any(is_turn_start_message)
 }
 
-/// `findProjectedTurnStartIndex` (compaction.ts:787-793 @ 005af57d8).
+/// `findProjectedTurnStartIndex` (compaction.ts:787-793 @ a13d35a74).
 fn find_projected_turn_start_index(
     entries: &[ProjectedSessionEntry],
     entry_index: usize,
@@ -957,7 +957,7 @@ fn find_projected_turn_start_index(
         .find(|&i| is_projected_turn_start(&entries[i]))
 }
 
-/// `findProjectedCutPoint` (compaction.ts:795-860 @ 005af57d8): the same cut
+/// `findProjectedCutPoint` (compaction.ts:795-860 @ a13d35a74): the same cut
 /// logic as [`find_cut_point`] over projected entries, including the
 /// recovery-omission suffix rule that keeps omitted attempts (and their
 /// context edits) out of the retained history when they trail the last
@@ -1007,7 +1007,7 @@ fn find_projected_cut_point(
     // A recovery attempt and its omission edits are context-invisible after
     // the last visible input. Advance only for a closed suffix containing an
     // omitted assistant attempt; arbitrary metadata must not move the cut
-    // past unsent input (compaction.ts:825-849 @ 005af57d8).
+    // past unsent input (compaction.ts:825-849 @ a13d35a74).
     let suffix = &entries[cut_index + 1..end_index];
     let is_intrinsically_visible = |entry: &ProjectedSessionEntry| {
         !matches!(entry.source_entry, SessionEntry::ContextEdit(_))
@@ -1067,7 +1067,7 @@ fn find_projected_cut_point(
     }
 }
 
-/// `prepareCompaction` (compaction.ts:862-929 @ 005af57d8): preparation runs
+/// `prepareCompaction` (compaction.ts:862-929 @ a13d35a74): preparation runs
 /// on the canonical projection, so omitted entries never enter the summary
 /// and replacements are summarized as edited.
 pub fn prepare_compaction(
@@ -1086,7 +1086,7 @@ pub fn prepare_compaction(
         .collect();
     // The newest compaction is projected first. Older compaction entries can
     // still occur in its retained raw range, but their projected contribution
-    // is empty (compaction.ts:872-878 @ 005af57d8).
+    // is empty (compaction.ts:872-878 @ a13d35a74).
     let prev_compaction_index = projected_entries.iter().position(|entry| {
         matches!(entry.source_entry, SessionEntry::Compaction(_)) && !entry.messages.is_empty()
     });
@@ -1168,7 +1168,7 @@ pub fn prepare_compaction(
     })
 }
 
-/// `estimateProjectedContextTokens` (compaction.ts:227-270 @ 005af57d8):
+/// `estimateProjectedContextTokens` (compaction.ts:227-270 @ a13d35a74):
 /// estimate projected context without trusting usage captured before a later
 /// edit or compaction. Falls back to a pure message-size estimate when the
 /// usage anchor is invalidated.

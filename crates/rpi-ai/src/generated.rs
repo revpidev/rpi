@@ -302,7 +302,7 @@ mod tests {
             .iter()
             .map(|provider| catalog.models(provider).len())
             .sum();
-        // Schema v6 regen @ 005af57d8 rules (models.dev + OpenRouter +
+        // Schema v6 regen @ a13d35a74 rules (models.dev + OpenRouter +
         // NVIDIA + Vercel AI Gateway snapshot 2026-10-01; +typesafe.json vs
         // the 2026-09-23 schemaVersion 3 snapshot).
         assert_eq!(total, 1529);
