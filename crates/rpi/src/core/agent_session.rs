@@ -487,6 +487,11 @@ struct AgentSessionInner {
     tool_registry: Mutex<OrderedMap<Arc<dyn AgentTool>>>,
     /// `ToolDefinitionEntry` registry (agent-session.ts:2460 `_toolDefinitions`).
     tool_definitions: Mutex<OrderedMap<ToolDefinitionEntry>>,
+    /// `_hiddenDeclarations` (agent-session.ts:452-453 @ a13d35a74): declared
+    /// tools whose declarations requests leave out, from `prepareLoadout`
+    /// hooks. They stay active and callable, and the transcript still
+    /// declares them, so the active set survives `/tree` and resume.
+    hidden_declarations: Mutex<HashSet<String>>,
     /// `_customTools` (agent-session.ts:345) — SDK-provided tools.
     custom_tools: Vec<Arc<dyn AgentTool>>,
     session_env_cell: Arc<std::sync::RwLock<crate::tools::SessionEnv>>,
@@ -531,14 +536,87 @@ pub struct RefreshToolRegistryOptions {
 
 /// Tool definition metadata entry (`ToolDefinitionEntry`,
 /// agent-session.ts:2458-2503) — drives `getAllTools` and the system
-/// prompt's snippet/guideline sections.
-#[derive(Debug, Clone)]
+/// prompt's snippet/guideline sections. The V16-06 orchestration fields
+/// mirror the `ToolDefinition` additions (exposure / namespace /
+/// annotations / outputSchema / defaultActive / prepareLoadout).
+#[derive(Clone)]
 pub struct ToolDefinitionEntry {
     pub description: String,
     pub parameters: serde_json::Value,
     pub prompt_snippet: Option<String>,
     pub prompt_guidelines: Vec<String>,
     pub source_info: crate::core::skills::SourceInfo,
+    pub exposure: ext::ToolExposure,
+    pub namespace: Option<ext::ToolNamespace>,
+    pub annotations: Option<ext::ToolAnnotations>,
+    pub output_schema: Option<serde_json::Value>,
+    pub default_active: Option<bool>,
+    pub prepare_loadout: Option<ext::PrepareLoadoutFn>,
+}
+
+impl std::fmt::Debug for ToolDefinitionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolDefinitionEntry")
+            .field("description", &self.description)
+            .field("exposure", &self.exposure)
+            .field("source_info", &self.source_info)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A declared tool whose model-facing description a `prepareLoadout` hook
+/// replaced (`{...tool, description}` upstream, agent-session.ts:1559-1562).
+/// Everything else delegates to the wrapped tool, including execution.
+struct DescriptionOverrideTool {
+    inner: Arc<dyn AgentTool>,
+    description: String,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for DescriptionOverrideTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters(&self) -> &Value {
+        self.inner.parameters()
+    }
+
+    fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
+        self.inner.constrained_sampling()
+    }
+
+    fn execution_mode(&self) -> Option<rpi_agent::types::ToolExecutionMode> {
+        self.inner.execution_mode()
+    }
+
+    fn replay(&self) -> Option<rpi_agent::types::ReplayPolicy> {
+        self.inner.replay()
+    }
+
+    fn prepare_arguments(&self, args: Value) -> Value {
+        self.inner.prepare_arguments(args)
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: Value,
+        signal: CancellationToken,
+        on_update: Option<rpi_agent::types::AgentToolUpdateCallback>,
+    ) -> Result<rpi_agent::types::AgentToolResult, AgentError> {
+        self.inner
+            .execute(tool_call_id, params, signal, on_update)
+            .await
+    }
 }
 
 impl AgentSession {
@@ -634,6 +712,7 @@ impl AgentSession {
             }),
             tool_registry: Mutex::new(OrderedMap::default()),
             tool_definitions: Mutex::new(OrderedMap::default()),
+            hidden_declarations: Mutex::new(HashSet::new()),
             custom_tools: config.custom_tools.clone(),
             session_env_cell: Arc::new(std::sync::RwLock::new(crate::tools::SessionEnv {
                 session_id: String::new(),
@@ -724,6 +803,10 @@ impl AgentSession {
         // `_installAgentBoundaryHooks()` (agent-session.ts:398, 858-868):
         // `turn_end` boundary dispatch runs inside `finishTurn`.
         session.install_agent_boundary_hooks();
+        // `_installHiddenDeclarationsProjection()` (agent-session.ts:490,
+        // 1720-1738 @ a13d35a74): `prepareLoadout` hidden declarations are
+        // removed from the declarations every request carries.
+        session.install_hidden_declarations_projection();
         // `_installAgentForcedPromptProjection()` (agent-session.ts:417 @
         // #9548).
         session.install_agent_forced_prompt_projection();
@@ -1707,12 +1790,14 @@ impl AgentSession {
                 tool_call_id,
                 tool_name,
                 args,
+                parent_tool_call_id,
             } => {
                 if runner.has_handlers("tool_execution_start") {
                     let payload = serde_json::to_value(ext::ToolExecutionStartEvent {
                         tool_call_id: tool_call_id.clone(),
                         tool_name: tool_name.clone(),
                         args: args.clone(),
+                        parent_tool_call_id: parent_tool_call_id.clone(),
                     })
                     .unwrap_or_else(|_| serde_json::json!({}));
                     runner.emit_event("tool_execution_start", payload).await;
@@ -1723,6 +1808,7 @@ impl AgentSession {
                 tool_name,
                 args,
                 partial_result,
+                parent_tool_call_id,
             } => {
                 if runner.has_handlers("tool_execution_update") {
                     let payload = serde_json::to_value(ext::ToolExecutionUpdateEvent {
@@ -1730,6 +1816,7 @@ impl AgentSession {
                         tool_name: tool_name.clone(),
                         args: args.clone(),
                         partial_result: partial_result.clone(),
+                        parent_tool_call_id: parent_tool_call_id.clone(),
                     })
                     .unwrap_or_else(|_| serde_json::json!({}));
                     runner.emit_event("tool_execution_update", payload).await;
@@ -1740,6 +1827,7 @@ impl AgentSession {
                 tool_name,
                 result,
                 is_error,
+                parent_tool_call_id,
             } => {
                 if runner.has_handlers("tool_execution_end") {
                     let payload = serde_json::to_value(ext::ToolExecutionEndEvent {
@@ -1747,6 +1835,7 @@ impl AgentSession {
                         tool_name: tool_name.clone(),
                         result: result.clone(),
                         is_error: *is_error,
+                        parent_tool_call_id: parent_tool_call_id.clone(),
                     })
                     .unwrap_or_else(|_| serde_json::json!({}));
                     runner.emit_event("tool_execution_end", payload).await;
@@ -2052,8 +2141,17 @@ impl AgentSession {
     /// computation and system-prompt rebuild.
     fn refresh_tool_registry(&self, options: RefreshToolRegistryOptions) {
         self.sync_session_env();
-        let previous_registry_names: HashSet<String> =
-            lock(&self.inner.tool_registry).keys().cloned().collect();
+        // Tools that were already activated on registration. A tool whose
+        // exposure changes to `direct`/`model-only` (for example from
+        // `hidden`) is activated like a new tool (agent-session.ts:3449-3452).
+        let previous_activated_on_registration: HashSet<String> = {
+            let definitions = lock(&self.inner.tool_definitions);
+            definitions
+                .keys()
+                .filter(|name| Self::is_activated_on_registration(&definitions, name))
+                .cloned()
+                .collect()
+        };
         let previous_active_tool_names = self.get_active_tool_names();
 
         let mut definitions: OrderedMap<ToolDefinitionEntry> = OrderedMap::default();
@@ -2080,12 +2178,23 @@ impl AgentSession {
                         &format!("<builtin:{name}>"),
                         "builtin",
                     ),
+                    exposure: ext::ToolExposure::Direct,
+                    namespace: None,
+                    annotations: None,
+                    output_schema: None,
+                    default_active: None,
+                    prepare_loadout: None,
                 },
             );
             registry.insert(name, tool);
         }
         // Extension tools (override built-ins by name, agent-session.ts:2514-2517).
-        for entry in self.runner().extension_tool_entries() {
+        let extension_entries = self.runner().extension_tool_entries();
+        let wrapped_extension_names: Vec<String> = extension_entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        for entry in extension_entries {
             if !self.is_allowed_tool(&entry.name) {
                 continue;
             }
@@ -2099,6 +2208,12 @@ impl AgentSession {
                         entry.prompt_guidelines.as_deref(),
                     ),
                     source_info: entry.source_info,
+                    exposure: entry.exposure,
+                    namespace: entry.namespace,
+                    annotations: entry.annotations,
+                    output_schema: entry.output_schema,
+                    default_active: entry.default_active,
+                    prepare_loadout: entry.prepare_loadout,
                 },
             );
             registry.insert(entry.name.clone(), entry.tool);
@@ -2118,15 +2233,26 @@ impl AgentSession {
                     prompt_snippet: None,
                     prompt_guidelines: Vec::new(),
                     source_info: Self::synthetic_tool_source_info(&format!("<sdk:{name}>"), "sdk"),
+                    exposure: ext::ToolExposure::Direct,
+                    namespace: None,
+                    annotations: None,
+                    output_schema: None,
+                    default_active: None,
+                    prepare_loadout: None,
                 },
             );
             registry.insert(name, tool);
         }
 
+        let registry_names: Vec<String> = registry.keys().cloned().collect();
         *lock(&self.inner.tool_definitions) = definitions;
         *lock(&self.inner.tool_registry) = registry;
 
-        // Active-set computation (agent-session.ts:2518-2543).
+        // Active-set computation (agent-session.ts:3518-3546). Names may be
+        // non-declarable when explicitly activated (a `codemode` tool named
+        // in `--tools`/`defaultTools` is declared to the model); `hidden` is
+        // always filtered by `_applyToolLoadout`.
+        let definitions_snapshot = lock(&self.inner.tool_definitions).clone();
         let mut next_active: Vec<String> = options
             .active_tool_names
             .clone()
@@ -2135,26 +2261,36 @@ impl AgentSession {
             .filter(|name| self.is_allowed_tool(name))
             .collect();
         if self.inner.allowed_tool_names.is_some() {
-            for name in lock(&self.inner.tool_registry).keys() {
-                if self.is_allowed_tool(name) {
+            // Naming a tool activates it even when it is not active by
+            // default (agent-session.ts:3524-3528).
+            for name in &registry_names {
+                if self.is_allowed_tool(name) && Self::is_declarable(&definitions_snapshot, name) {
                     next_active.push(name.clone());
                 }
             }
         } else if options.include_all_extension_tools {
             // `wrappedExtensionTools` = extension + SDK custom tools
             // (built-ins are never auto-activated here).
-            let definitions = lock(&self.inner.tool_definitions);
-            for name in definitions.keys() {
-                if definitions
-                    .get(name)
-                    .is_some_and(|entry| entry.source_info.source != "builtin")
-                {
+            for name in &wrapped_extension_names {
+                if Self::is_activated_on_registration(&definitions_snapshot, name) {
                     next_active.push(name.clone());
                 }
             }
+            // SDK custom tools are always `direct` and active by default.
+            for tool in &self.inner.custom_tools {
+                let name = tool.name();
+                if self.is_allowed_tool(name) && !wrapped_extension_names.iter().any(|n| n == name)
+                {
+                    next_active.push(name.to_owned());
+                }
+            }
         } else if options.active_tool_names.is_none() {
-            for name in lock(&self.inner.tool_registry).keys() {
-                if !previous_registry_names.contains(name) {
+            // Pending tools that are registered now become active
+            // (agent-session.ts:3539-3544).
+            for name in &registry_names {
+                if !previous_activated_on_registration.contains(name)
+                    && Self::is_activated_on_registration(&definitions_snapshot, name)
+                {
                     next_active.push(name.clone());
                 }
             }
@@ -2164,6 +2300,60 @@ impl AgentSession {
         let mut seen: HashSet<String> = HashSet::new();
         next_active.retain(|name| seen.insert(name.clone()));
         self.set_active_tools_by_name(next_active);
+    }
+
+    /// `_isDeclarable` (agent-session.ts:3548-3551): whether activating the
+    /// tool declares it to the model.
+    fn is_declarable(definitions: &OrderedMap<ToolDefinitionEntry>, name: &str) -> bool {
+        matches!(
+            definitions.get(name).map(|entry| entry.exposure),
+            Some(ext::ToolExposure::Direct | ext::ToolExposure::ModelOnly)
+        )
+    }
+
+    /// `_isActivatedOnRegistration` (agent-session.ts:3553-3556): whether
+    /// registering the tool activates it, which declares it to the model.
+    fn is_activated_on_registration(
+        definitions: &OrderedMap<ToolDefinitionEntry>,
+        name: &str,
+    ) -> bool {
+        Self::is_declarable(definitions, name)
+            && !matches!(
+                definitions.get(name).and_then(|entry| entry.default_active),
+                Some(false)
+            )
+    }
+
+    /// `_getCallableTools` (agent-session.ts:1510-1523 @ a13d35a74): the
+    /// active `direct` tools plus every registered `codemode`/`deferred`
+    /// tool. `hidden` and `model-only` tools are not callable through
+    /// `ctx.executeTool()`.
+    fn callable_tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        let active: HashSet<String> = self.get_active_tool_names().into_iter().collect();
+        let definitions = lock(&self.inner.tool_definitions);
+        let registry = lock(&self.inner.tool_registry);
+        registry
+            .keys()
+            .filter(|name| {
+                let exposure = definitions
+                    .get(name)
+                    .map(|entry| entry.exposure)
+                    .unwrap_or(ext::ToolExposure::Direct);
+                matches!(
+                    exposure,
+                    ext::ToolExposure::Codemode | ext::ToolExposure::Deferred
+                ) || (exposure == ext::ToolExposure::Direct && active.contains(*name))
+            })
+            .filter_map(|name| registry.get(name).cloned())
+            .collect()
+    }
+
+    /// `getCallableToolNames` (agent-session.ts:1457-1459).
+    pub fn get_callable_tool_names(&self) -> Vec<String> {
+        self.callable_tools()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect()
     }
 
     /// Refresh the shared `RPI_*` session env cell (requirements §3.3: bash
@@ -2194,21 +2384,41 @@ impl AgentSession {
         let definitions = lock(&self.inner.tool_definitions);
         definitions
             .keys()
-            .map(|name| {
-                let entry = definitions.get(name).expect("key from the same map");
-                serde_json::json!({
-                    "name": name,
-                    "description": entry.description,
-                    "parameters": entry.parameters,
-                    "promptGuidelines": if entry.prompt_guidelines.is_empty() {
-                        None
-                    } else {
-                        Some(entry.prompt_guidelines.clone())
-                    },
-                    "sourceInfo": entry.source_info,
-                })
+            .filter_map(|name| {
+                definitions
+                    .get(name)
+                    .map(|entry| Self::tool_info_json(name, entry))
             })
             .collect()
+    }
+
+    /// `getToolDefinition` (agent-session.ts:915-917 @ a13d35a74): the
+    /// `ToolInfo` JSON for one registered tool, or `None`.
+    pub fn get_tool_definition(&self, name: &str) -> Option<serde_json::Value> {
+        let definitions = lock(&self.inner.tool_definitions);
+        definitions
+            .get(name)
+            .map(|entry| Self::tool_info_json(name, entry))
+    }
+
+    /// `ToolInfo` shape (agent-session.ts:906-913 @ a13d35a74): name,
+    /// description, parameters, promptGuidelines, exposure, namespace,
+    /// annotations, sourceInfo.
+    fn tool_info_json(name: &str, entry: &ToolDefinitionEntry) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "description": entry.description,
+            "parameters": entry.parameters,
+            "promptGuidelines": if entry.prompt_guidelines.is_empty() {
+                None
+            } else {
+                Some(entry.prompt_guidelines.clone())
+            },
+            "exposure": entry.exposure,
+            "namespace": entry.namespace,
+            "annotations": entry.annotations,
+            "sourceInfo": entry.source_info,
+        })
     }
 
     /// `getCommands` (agent-session.ts:2332-2355): extension commands (with
@@ -2250,18 +2460,10 @@ impl AgentSession {
         commands
     }
 
-    /// `setActiveToolsByName` (agent-session.ts:926-941).
+    /// `setActiveToolsByName` (agent-session.ts:1488-1494 @ a13d35a74).
     pub fn set_active_tools_by_name(&self, tool_names: Vec<String>) {
-        let registry = lock(&self.inner.tool_registry);
-        let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
-        let mut valid_names: Vec<String> = Vec::new();
-        for name in &tool_names {
-            if let Some(tool) = registry.get(name) {
-                tools.push(tool.clone());
-                valid_names.push(name.clone());
-            }
-        }
-        drop(registry);
+        let tools = self.apply_tool_loadout(tool_names);
+        let valid_names: Vec<String> = tools.iter().map(|tool| tool.name().to_owned()).collect();
         self.inner.agent.set_tools(tools);
 
         // #9548: rebuilding only refreshes the base options — the live
@@ -2269,11 +2471,155 @@ impl AgentSession {
         self.rebuild_system_prompt(&valid_names);
     }
 
+    /// `_applyToolLoadout` (agent-session.ts:1497-1569 @ a13d35a74): the
+    /// active tools are the registered, non-hidden ones; active tools with a
+    /// `prepareLoadout` hook can replace declared descriptions and hide
+    /// declarations from requests (the hidden projection lives on the agent
+    /// transform chain).
+    fn apply_tool_loadout(&self, tool_names: Vec<String>) -> Vec<Arc<dyn AgentTool>> {
+        let (tools, loadout, hooks) = {
+            let definitions = lock(&self.inner.tool_definitions);
+            let registry = lock(&self.inner.tool_registry);
+            let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for name in tool_names {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let Some(entry) = definitions.get(&name) else {
+                    continue;
+                };
+                // `hidden` tools are unreachable even when named.
+                if entry.exposure == ext::ToolExposure::Hidden {
+                    continue;
+                }
+                if let Some(tool) = registry.get(&name) {
+                    tools.push(tool.clone());
+                }
+            }
+
+            let entry_of = |name: &str| -> Option<ext::ToolLoadoutEntry> {
+                let description = definitions
+                    .get(name)
+                    .map(|entry| entry.description.clone())
+                    .or_else(|| registry.get(name).map(|tool| tool.description().to_owned()))?;
+                let parameters = definitions
+                    .get(name)
+                    .map(|entry| entry.parameters.clone())
+                    .or_else(|| registry.get(name).map(|tool| tool.parameters().clone()))?;
+                Some(ext::ToolLoadoutEntry {
+                    name: name.to_owned(),
+                    description,
+                    parameters,
+                })
+            };
+
+            let declared: Vec<ext::ToolLoadoutEntry> = tools
+                .iter()
+                .filter_map(|tool| entry_of(tool.name()))
+                .collect();
+            let active: HashSet<String> = tools.iter().map(|tool| tool.name().to_owned()).collect();
+            let exposure_of = |name: &str| {
+                definitions
+                    .get(name)
+                    .map(|entry| entry.exposure)
+                    .unwrap_or(ext::ToolExposure::Direct)
+            };
+            let callable: Vec<ext::ToolLoadoutEntry> = registry
+                .keys()
+                .filter(|name| {
+                    let exposure = exposure_of(name);
+                    matches!(
+                        exposure,
+                        ext::ToolExposure::Codemode | ext::ToolExposure::Deferred
+                    ) || (exposure == ext::ToolExposure::Direct && active.contains(*name))
+                })
+                .filter_map(|name| entry_of(name))
+                .collect();
+            let registered: Vec<ext::ToolLoadoutEntry> =
+                registry.keys().filter_map(|name| entry_of(name)).collect();
+            let mut exposures = HashMap::new();
+            let mut namespaces = HashMap::new();
+            for (name, entry) in definitions.iter() {
+                exposures.insert(name.clone(), entry.exposure);
+                if let Some(namespace) = &entry.namespace {
+                    namespaces.insert(name.clone(), namespace.clone());
+                }
+            }
+            let mut hooks: Vec<(String, String, ext::PrepareLoadoutFn)> = Vec::new();
+            for tool in &tools {
+                if let Some(entry) = definitions.get(tool.name())
+                    && let Some(apply) = &entry.prepare_loadout
+                {
+                    hooks.push((
+                        tool.name().to_owned(),
+                        entry.source_info.path.to_string_lossy().into_owned(),
+                        apply.clone(),
+                    ));
+                }
+            }
+            (
+                tools,
+                ext::ToolLoadout {
+                    declared,
+                    callable,
+                    registered,
+                    exposures,
+                    namespaces,
+                },
+                hooks,
+            )
+        };
+
+        let mut descriptions: HashMap<String, String> = HashMap::new();
+        let mut hidden: HashSet<String> = HashSet::new();
+        for (name, path, apply) in hooks {
+            match apply(&loadout) {
+                Ok(Some(changes)) => {
+                    if let Some(replacements) = changes.descriptions {
+                        descriptions.extend(replacements);
+                    }
+                    if let Some(names) = changes.hidden_declarations {
+                        hidden.extend(names);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // `emitError({extensionPath, event: "prepare_loadout",
+                    // error})` (agent-session.ts:1556-1564): the failing hook
+                    // is skipped, later hooks still run.
+                    tracing::warn!("prepareLoadout hook for tool {name} failed: {error}");
+                    self.runner()
+                        .emit_error(crate::core::extensions::ExtensionErrorInfo {
+                            extension_path: path,
+                            event: "prepare_loadout".to_owned(),
+                            error,
+                        });
+                }
+            }
+        }
+        *lock(&self.inner.hidden_declarations) = hidden;
+
+        tools
+            .into_iter()
+            .map(|tool| match descriptions.get(tool.name()) {
+                Some(description) if description != tool.description() => {
+                    Arc::new(DescriptionOverrideTool {
+                        inner: tool,
+                        description: description.clone(),
+                    }) as Arc<dyn AgentTool>
+                }
+                _ => tool,
+            })
+            .collect()
+    }
+
     /// `_rebuildSystemPrompt` (agent-session.ts:1113-1137 @ #9548): rebuild
     /// the **base** prompt options from the resource loader + tool registry.
     /// Returns the built prompt text (rendered exactly as the transcript's
     /// system message replays it) for callers that display it.
     fn rebuild_system_prompt(&self, tool_names: &[String]) -> String {
+        let hidden = lock(&self.inner.hidden_declarations).clone();
         let (valid, tool_snippets, tool_guidelines) = {
             let definitions = lock(&self.inner.tool_definitions);
             let valid: Vec<String> = tool_names
@@ -2294,7 +2640,11 @@ impl AgentSession {
             let mut tool_snippets: HashMap<String, String> = HashMap::new();
             let mut tool_guidelines: HashMap<String, Vec<String>> = HashMap::new();
             for (name, entry) in definitions.iter() {
-                if let Some(snippet) = &entry.prompt_snippet {
+                // Hidden tools are only callable through another tool, so
+                // their snippets stay out of the prompt (agent-session.ts:1658).
+                if let Some(snippet) = &entry.prompt_snippet
+                    && !hidden.contains(name)
+                {
                     tool_snippets.insert(name.clone(), snippet.clone());
                 }
                 if !entry.prompt_guidelines.is_empty() {
@@ -2426,6 +2776,67 @@ impl AgentSession {
                 timestamp: now_millis(),
             },
         )
+    }
+
+    /// `_installHiddenDeclarationsProjection` (agent-session.ts:1720-1738 @
+    /// a13d35a74): remove the declarations that `prepareLoadout` hooks hide
+    /// from every request. The whole transcript is filtered with the
+    /// current set, so the projected declarations stay consistent across
+    /// requests and only change when the loadout does. Chained after the
+    /// previous transform (the extension `context` emit) and before the
+    /// forced-prompt projection.
+    fn install_hidden_declarations_projection(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let agent = self.inner.agent.clone();
+        let previous = agent.transform_context();
+        agent.set_transform_context(Some(Arc::new(
+            move |messages: Vec<AgentMessage>, signal: CancellationToken| {
+                let weak = weak.clone();
+                let previous = previous.clone();
+                Box::pin(async move {
+                    let transformed = match previous {
+                        Some(previous) => previous(messages, signal).await,
+                        None => messages,
+                    };
+                    let Some(inner) = weak.upgrade() else {
+                        return transformed;
+                    };
+                    let hidden = lock(&inner.hidden_declarations).clone();
+                    if hidden.is_empty() {
+                        return transformed;
+                    }
+                    transformed
+                        .into_iter()
+                        .map(|message| match message {
+                            AgentMessage::System(mut system) => {
+                                if system.tools_added.is_none() && system.tools_removed.is_none() {
+                                    return AgentMessage::System(system);
+                                }
+                                if let Some(added) = &system.tools_added {
+                                    let filtered: Vec<rpi_ai::types::Tool> = added
+                                        .iter()
+                                        .filter(|tool| !hidden.contains(&tool.name))
+                                        .cloned()
+                                        .collect();
+                                    system.tools_added = (!filtered.is_empty()).then_some(filtered);
+                                }
+                                if let Some(removed) = &system.tools_removed {
+                                    let filtered: Vec<rpi_ai::types::ToolReference> = removed
+                                        .iter()
+                                        .filter(|tool| !hidden.contains(&tool.name))
+                                        .cloned()
+                                        .collect();
+                                    system.tools_removed =
+                                        (!filtered.is_empty()).then_some(filtered);
+                                }
+                                AgentMessage::System(system)
+                            }
+                            other => other,
+                        })
+                        .collect()
+                })
+            },
+        )));
     }
 
     /// `_installAgentForcedPromptProjection` (agent-session.ts:1175-1192 @

@@ -1269,6 +1269,8 @@ async fn fail_tool_calls_from_truncated_message(
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             args: Value::Object(tool_call.arguments.clone()),
+
+            parent_tool_call_id: None,
         })
         .await;
         let finalized = FinalizedToolCallOutcome {
@@ -1346,6 +1348,8 @@ async fn execute_tool_calls_sequential(
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             args: Value::Object(tool_call.arguments.clone()),
+
+            parent_tool_call_id: None,
         })
         .await;
 
@@ -1452,6 +1456,8 @@ async fn execute_tool_calls_parallel(
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             args: Value::Object(tool_call.arguments.clone()),
+
+            parent_tool_call_id: None,
         })
         .await;
 
@@ -1716,6 +1722,8 @@ async fn execute_prepared_tool_call(
                 tool_name: tool_name.clone(),
                 args: args.clone(),
                 partial_result: serde_json::to_value(&partial_result).unwrap_or(Value::Null),
+
+                parent_tool_call_id: None,
             };
             let mut update = emit(event);
             // Upstream emits the update synchronously (`emitEvent` enqueues
@@ -1845,6 +1853,8 @@ async fn emit_tool_execution_end(finalized: &FinalizedToolCallOutcome, emit: &Ag
         tool_name: finalized.tool_call.name.clone(),
         result: serde_json::to_value(&finalized.result).unwrap_or(Value::Null),
         is_error: finalized.is_error,
+
+        parent_tool_call_id: None,
     })
     .await;
 }

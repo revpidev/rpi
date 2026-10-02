@@ -311,6 +311,13 @@ pub struct ExtensionToolEntry {
     pub prompt_snippet: Option<String>,
     pub prompt_guidelines: Option<Vec<String>>,
     pub source_info: crate::core::skills::SourceInfo,
+    /// V16-06 orchestration metadata (mirrors `ToolDefinition`).
+    pub exposure: rpi_ext_host::types::ToolExposure,
+    pub namespace: Option<rpi_ext_host::types::ToolNamespace>,
+    pub annotations: Option<rpi_ext_host::types::ToolAnnotations>,
+    pub output_schema: Option<serde_json::Value>,
+    pub default_active: Option<bool>,
+    pub prepare_loadout: Option<rpi_ext_host::types::PrepareLoadoutFn>,
     /// Executable wrapper (host tool definition, wrapper.ts — post-#9548:
     /// the `addedToolNames` attachment is gone; tool changes ride transcript
     /// system messages).

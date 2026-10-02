@@ -147,6 +147,9 @@ impl ToolDefinition for HostToolRenderDefinition {
             details: result.details.clone().unwrap_or(serde_json::Value::Null),
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         };
         let tree = render(
             agent_result,

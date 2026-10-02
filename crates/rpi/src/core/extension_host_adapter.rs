@@ -762,6 +762,12 @@ impl ExtensionRunner for ExtensionHostAdapter {
                     prompt_snippet: definition.prompt_snippet.clone(),
                     prompt_guidelines: definition.prompt_guidelines.clone(),
                     source_info: convert_source_info(&registered.source_info),
+                    exposure: definition.exposure,
+                    namespace: definition.namespace.clone(),
+                    annotations: definition.annotations.clone(),
+                    output_schema: definition.output_schema.clone(),
+                    default_active: definition.default_active,
+                    prepare_loadout: definition.prepare_loadout.clone(),
                     tool: Arc::new(HostToolAdapter {
                         host: self.host.clone(),
                         definition,

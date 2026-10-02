@@ -68,6 +68,13 @@ fn dialog_extension(dialogs: usize) -> InlineExtension {
             execute,
             render_call: None,
             render_result: None,
+
+            exposure: Default::default(),
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
         })
         .expect("register dialog_asker");
         Box::pin(async { Ok(()) })

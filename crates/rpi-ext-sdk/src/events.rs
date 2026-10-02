@@ -302,6 +302,14 @@ pub struct SessionShutdownEvent {
     pub target_session_file: Option<String>,
 }
 
+/// `mcp_servers_change` payload (V16-06): every registered server after
+/// the change (`RegisteredMcpServer[]` JSON; shape owned by V16-08).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServersChangeEvent {
+    pub servers: Vec<Value>,
+}
+
 /// `TreePreparation` (`entries_to_summarize` as JSON).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -430,6 +438,17 @@ pub struct BeforeProviderHeadersEvent {
 pub struct AfterProviderResponseEvent {
     pub status: u32,
     pub headers: std::collections::HashMap<String, String>,
+}
+
+/// `provider_stream_event` payload (V16-06): a parsed provider stream event
+/// before normalization. Notification only; handlers run in stream order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderStreamEvent {
+    pub provider: String,
+    pub api: String,
+    pub model: String,
+    pub data: Value,
 }
 
 /// `before_agent_start` payload (`systemPromptOptions` as JSON).
@@ -572,6 +591,8 @@ pub struct ToolExecutionStartEvent {
     pub tool_call_id: String,
     pub tool_name: String,
     pub args: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `tool_execution_update` payload.
@@ -582,6 +603,8 @@ pub struct ToolExecutionUpdateEvent {
     pub tool_name: String,
     pub args: Value,
     pub partial_result: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `tool_execution_end` payload.
@@ -592,6 +615,8 @@ pub struct ToolExecutionEndEvent {
     pub tool_name: String,
     pub result: Value,
     pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 // ============================================================================
@@ -677,6 +702,8 @@ pub struct ToolCallEvent {
     pub tool_call_id: String,
     pub tool_name: String,
     pub input: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `tool_call` result (#7715 `terminate` included).
@@ -703,7 +730,11 @@ pub struct ToolResultEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `tool_result` result — a partial patch; each present field replaces.
@@ -714,6 +745,8 @@ pub struct ToolResultEventResult {
     pub content: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -759,6 +792,7 @@ mod tests {
         exported::<SessionCompactFailedEvent>();
         exported::<SessionShutdownEvent>();
         exported::<SessionShutdownReason>();
+        exported::<McpServersChangeEvent>();
         exported::<TreePreparation>();
         exported::<SessionBeforeTreeEvent>();
         exported::<SessionBeforeTreeResult>();
@@ -773,6 +807,7 @@ mod tests {
         exported::<BeforeProviderRequestEvent>();
         exported::<BeforeProviderHeadersEvent>();
         exported::<AfterProviderResponseEvent>();
+        exported::<ProviderStreamEvent>();
         exported::<BeforeAgentStartEvent>();
         exported::<BeforeAgentStartEventResult>();
         exported::<BeforeAgentStartMessage>();

@@ -506,6 +506,7 @@ impl From<AgentSessionEvent> for UiCommand {
                     tool_call_id,
                     tool_name,
                     args,
+                    ..
                 } => UiCommand::ToolExecutionStart {
                     tool_call_id,
                     tool_name,
@@ -6357,6 +6358,8 @@ mod tests {
                     tool_call_id: "c1".to_string(),
                     tool_name: "read".to_string(),
                     args: serde_json::json!({}),
+
+                    parent_tool_call_id: None,
                 })),
                 "tool_execution_start",
             ),
@@ -6366,6 +6369,8 @@ mod tests {
                     tool_name: "read".to_string(),
                     args: serde_json::json!({}),
                     partial_result: serde_json::json!({}),
+
+                    parent_tool_call_id: None,
                 })),
                 "tool_execution_update",
             ),
@@ -6375,6 +6380,8 @@ mod tests {
                     tool_name: "read".to_string(),
                     result: serde_json::json!({}),
                     is_error: false,
+
+                    parent_tool_call_id: None,
                 })),
                 "tool_execution_end",
             ),

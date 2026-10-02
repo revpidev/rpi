@@ -522,6 +522,9 @@ async fn l0_load_capability_denied_and_full_surface() {
             }),
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         },
         rpi_ext_host::types::ToolRenderResultOptions {
             expanded: false,
@@ -559,6 +562,9 @@ async fn l0_load_capability_denied_and_full_surface() {
             }),
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         },
         rpi_ext_host::types::ToolRenderResultOptions {
             expanded: false,
@@ -606,7 +612,10 @@ async fn l0_load_capability_denied_and_full_surface() {
             }),
             usage: None,
             terminate: None,
-        },
+
+            structured_content: None,
+            is_error: None,
+},
         rpi_ext_host::types::ToolRenderResultOptions {
             expanded: true,
             is_partial: false,

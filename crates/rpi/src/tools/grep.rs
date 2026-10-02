@@ -498,6 +498,9 @@ impl AgentTool for GrepTool {
                 details: Value::Null,
                 usage: None,
                 terminate: None,
+
+                structured_content: None,
+                is_error: None,
             });
         }
 
@@ -638,6 +641,9 @@ impl AgentTool for GrepTool {
             },
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         })
     }
 }

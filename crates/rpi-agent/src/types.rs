@@ -91,10 +91,20 @@ pub struct AgentToolResult {
     /// of failing the whole tool result.
     #[serde(default)]
     pub details: Value,
+    /// Machine-readable result matching the tool's `outputSchema`, for
+    /// programmatic callers (types.ts:424-440 @ a13d35a74). Not sent to the
+    /// model; `content` remains the model-facing result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     /// Usage from the final tool execution itself, if available. Not used for
     /// main LLM context accounting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Report a failure without throwing. The model sees `content` as an
+    /// error result, like a thrown error, but `details` and
+    /// `structured_content` are kept for the UI and programmatic callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
     /// Hint that the agent should stop after the current tool batch. Early
     /// termination only happens when every finalized tool result in the batch
     /// sets this to true. Runtime-only; never written to the transcript.
@@ -201,18 +211,30 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool_name: String,
         args: Value,
+        /// Set when another tool (for example a codemode script) made this
+        /// call (types.ts:1040-1048 @ a13d35a74).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
     },
     ToolExecutionUpdate {
         tool_call_id: String,
         tool_name: String,
         args: Value,
         partial_result: Value,
+        /// Set when another tool (for example a codemode script) made this
+        /// call.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
     },
     ToolExecutionEnd {
         tool_call_id: String,
         tool_name: String,
         result: Value,
         is_error: bool,
+        /// Set when another tool (for example a codemode script) made this
+        /// call.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
     },
 }
 
@@ -322,6 +344,8 @@ mod tests {
                     tool_call_id: "c".into(),
                     tool_name: "t".into(),
                     args: json!({}),
+
+                    parent_tool_call_id: None,
                 },
                 "tool_execution_start",
             ),
@@ -331,6 +355,8 @@ mod tests {
                     tool_name: "t".into(),
                     args: json!({}),
                     partial_result: json!({}),
+
+                    parent_tool_call_id: None,
                 },
                 "tool_execution_update",
             ),
@@ -340,6 +366,8 @@ mod tests {
                     tool_name: "t".into(),
                     result: json!({}),
                     is_error: false,
+
+                    parent_tool_call_id: None,
                 },
                 "tool_execution_end",
             ),
@@ -388,6 +416,8 @@ mod tests {
             tool_name: "bash".to_owned(),
             result: json!({"content": []}),
             is_error: true,
+
+            parent_tool_call_id: None,
         };
         assert_eq!(
             to_json(&end),
@@ -413,6 +443,9 @@ mod tests {
             details: json!({"lines": 1}),
             usage: None,
             terminate: Some(false),
+
+            structured_content: None,
+            is_error: None,
         };
         assert_eq!(
             to_json(&result),

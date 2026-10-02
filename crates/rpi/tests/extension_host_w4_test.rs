@@ -417,6 +417,13 @@ async fn w4_tool_render_override_and_inheritance() {
                 }))
             })),
             render_result: None,
+
+            exposure: Default::default(),
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })
@@ -501,6 +508,13 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
                 Ok(json!({"type": "text", "props": {"text": text}}))
             })),
             render_result: None,
+
+            exposure: Default::default(),
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })
@@ -562,6 +576,13 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
                 let text = format!("EXT-RESULT:{}", ctx.tool_call_id);
                 Ok(json!({"type": "text", "props": {"text": text}}))
             })),
+
+            exposure: Default::default(),
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })

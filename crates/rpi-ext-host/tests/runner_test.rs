@@ -67,6 +67,13 @@ fn minimal_tool(name: &str, label: &str) -> ToolDefinition {
         }),
         render_call: None,
         render_result: None,
+
+        exposure: Default::default(),
+        namespace: None,
+        annotations: None,
+        output_schema: None,
+        default_active: None,
+        prepare_loadout: None,
     }
 }
 
@@ -2396,14 +2403,18 @@ async fn on_unsubscribe_after_invalidate_is_harmless() {
     assert_eq!(*calls.lock().unwrap(), vec!["A"]);
 }
 
-/// V16-03 FR-B R1: the event table is additive 37→39 and the two new
-/// entries keep their upstream `on()` overload positions; the tail order
-/// matches the upstream overload sequence (`tool_call`/`tool_result` before
-/// `user_bash`/`input`).
+/// V16-03 FR-B R1 + V16-06 FR-F R3: the event table is additive 37→41 and
+/// the four new entries keep their upstream `on()` overload positions; the
+/// tail order matches the upstream overload sequence
+/// (`tool_call`/`tool_result` before `user_bash`/`input`).
 #[test]
-fn all_events_is_additive_39_in_upstream_order() {
+fn all_events_is_additive_41_in_upstream_order() {
     let events: Vec<&str> = rpi_ext_host::types::ALL_EVENTS.to_vec();
-    assert_eq!(events.len(), 39, "V16-03 lands the 37→39 segment");
+    assert_eq!(
+        events.len(),
+        41,
+        "V16-06 lands the version-level 39→41 segment"
+    );
     let index = |name: &str| {
         events
             .iter()
@@ -2414,7 +2425,23 @@ fn all_events_is_additive_39_in_upstream_order() {
     assert!(index("cache_warming_decision") > index("context_with_system"));
     assert_eq!(index("agent_before_settle"), index("agent_end") + 1);
     assert_eq!(index("agent_settled"), index("agent_before_settle") + 1);
-    assert!(index("tool_call") < index("user_bash"));
+    assert_eq!(index("tool_call") + 1, index("tool_result"));
     assert!(index("tool_result") < index("user_bash"));
     assert_eq!(index("input"), events.len() - 1);
+    // V16-06: `mcp_servers_change` after `session_shutdown`,
+    // `provider_stream_event` after `after_provider_response` (upstream
+    // `on()` overload order, types.ts:1545-1625 @ a13d35a74).
+    assert_eq!(index("mcp_servers_change"), index("session_shutdown") + 1);
+    assert_eq!(
+        index("session_before_tree"),
+        index("mcp_servers_change") + 1
+    );
+    assert_eq!(
+        index("provider_stream_event"),
+        index("after_provider_response") + 1
+    );
+    assert_eq!(
+        index("before_agent_start"),
+        index("provider_stream_event") + 1
+    );
 }

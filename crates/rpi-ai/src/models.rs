@@ -952,11 +952,109 @@ impl Models {
         }
     }
 
+    /// `getModelsOfType` (models.ts:446-477 @ a13d35a74): every model of
+    /// one type from one provider or all.
+    pub fn get_models_of_type(
+        &self,
+        model_type: crate::types::ModelType,
+        provider: Option<&str>,
+    ) -> Vec<AnyModel> {
+        self.get_all_models(provider)
+            .into_iter()
+            .filter(|model| model.model_type() == model_type)
+            .collect()
+    }
+
+    /// `getModelOfType` (models.ts:446-477 @ a13d35a74): sync runtime
+    /// lookup of one model of one type against last-known lists.
+    pub fn get_model_of_type(
+        &self,
+        model_type: crate::types::ModelType,
+        provider: &str,
+        id: &str,
+    ) -> Option<AnyModel> {
+        self.get_models_of_type(model_type, Some(provider))
+            .into_iter()
+            .find(|model| model.id() == id)
+    }
+
     /// `getModel` — sync runtime model lookup.
     pub fn get_model(&self, provider: &str, id: &str) -> Option<Model> {
         self.get_models(Some(provider))
             .into_iter()
             .find(|model| model.id == id)
+    }
+
+    /// `getAuthenticatedProviders` (models.ts:678-691 @ a13d35a74): the
+    /// providers with complete auth configuration, plus the credential the
+    /// availability filter needs.
+    async fn get_authenticated_providers(
+        &self,
+        provider_id: Option<&str>,
+    ) -> Result<Vec<(Arc<dyn Provider>, Option<Credential>)>, ModelsError> {
+        let providers: Vec<Arc<dyn Provider>> = match provider_id {
+            Some(id) => self.get_provider(id).into_iter().collect(),
+            None => self.get_providers(),
+        };
+        let mut authenticated = Vec::new();
+        for provider in providers {
+            let credential = self
+                .credentials
+                .read(provider.id(), None)
+                .await
+                .map_err(|error| {
+                    ModelsError::with_cause(
+                        ModelsErrorCode::Auth,
+                        format!("Credential store read failed for {}", provider.id()),
+                        &error.message,
+                    )
+                })?;
+            if self.get_provider_auth(provider.id(), None).await?.is_some() {
+                authenticated.push((provider, credential));
+            }
+        }
+        Ok(authenticated)
+    }
+
+    /// `getAvailableOfType` (models.ts:708-717 @ a13d35a74): models of one
+    /// type whose providers have complete auth configuration.
+    pub async fn get_available_of_type(
+        &self,
+        model_type: crate::types::ModelType,
+        provider_id: Option<&str>,
+    ) -> Result<Vec<AnyModel>, ModelsError> {
+        Ok(self
+            .get_all_available(provider_id)
+            .await?
+            .into_iter()
+            .filter(|model| model.model_type() == model_type)
+            .collect())
+    }
+
+    /// `getAllAvailable` (models.ts:719-735 @ a13d35a74): models of every
+    /// type whose providers have complete auth configuration. Providers
+    /// without a `filterAllModels` hook apply `filterModels` to their chat
+    /// models and pass the other types through (upstream fallback).
+    pub async fn get_all_available(
+        &self,
+        provider_id: Option<&str>,
+    ) -> Result<Vec<AnyModel>, ModelsError> {
+        let providers = self.get_authenticated_providers(provider_id).await?;
+        let mut available = Vec::new();
+        for (provider, credential) in providers {
+            let models = provider.get_all_models();
+            let available_chat = provider.get_models();
+            let filtered_chat = provider.filter_models(available_chat, credential.as_ref());
+            let available_ids: std::collections::HashSet<&str> = filtered_chat
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect();
+            available.extend(models.into_iter().filter(|model| match model {
+                AnyModel::Chat(chat) => available_ids.contains(chat.id.as_str()),
+                _ => true,
+            }));
+        }
+        Ok(available)
     }
 
     /// `login` (models.ts:565-615 @ 4181f66): run the provider's auth-method
@@ -1657,6 +1755,22 @@ impl Models {
         options: Option<ModelsSimpleStreamOptions>,
     ) -> Option<crate::types::AssistantMessage> {
         self.stream_simple(model, context, options).result().await
+    }
+}
+
+/// `assertChatModel` (utils/model-operations.ts:26-30 @ a13d35a74): reject
+/// non-chat models at the chat stream entry with a `ModelsError`.
+pub fn assert_chat_model(model: &AnyModel) -> Result<&Model, ModelsError> {
+    match model {
+        AnyModel::Chat(chat) => Ok(chat),
+        other => Err(ModelsError::new(
+            ModelsErrorCode::Provider,
+            format!(
+                "Model {}/{} is not a chat model",
+                other.provider(),
+                other.id()
+            ),
+        )),
     }
 }
 

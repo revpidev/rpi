@@ -330,6 +330,13 @@ async fn w6_native_and_wasm_gate_behave_identically() {
             }),
             render_call: None,
             render_result: None,
+
+            exposure: Default::default(),
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })

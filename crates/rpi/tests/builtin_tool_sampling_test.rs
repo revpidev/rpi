@@ -98,6 +98,13 @@ async fn extension_registration_overrides_sampling() {
             }),
             render_call: None,
             render_result: None,
+
+            exposure: Default::default(),
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
         })
         .expect("registerTool");
         api.register_tool(rpi_ext_host::types::ToolDefinition {
@@ -116,6 +123,13 @@ async fn extension_registration_overrides_sampling() {
             }),
             render_call: None,
             render_result: None,
+
+            exposure: Default::default(),
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
         })
         .expect("registerTool");
         Box::pin(async { Ok(()) })

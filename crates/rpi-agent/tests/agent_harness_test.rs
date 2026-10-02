@@ -319,6 +319,9 @@ impl AgentHarnessTool<()> for CalculateTool {
             details: Value::Null,
             usage: self.usage.clone(),
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         })
     }
 }
@@ -379,6 +382,9 @@ impl AgentHarnessTool<()> for GetCurrentTimeTool {
             details: json!({ "utcTimestamp": 0 }),
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         })
     }
 }
@@ -436,6 +442,9 @@ impl AgentHarnessTool<()> for NamedTool {
             details: Value::Null,
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         })
     }
 }
@@ -1430,6 +1439,9 @@ impl AgentHarnessTool<TestContext> for ContextTool {
             details: Value::Null,
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         })
     }
 }

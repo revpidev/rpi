@@ -2195,8 +2195,15 @@ fn parse_model_and_context(
     model: Value,
     context: Value,
 ) -> Result<(rpi_ai::types::Model, rpi_ai::types::Context), ExtError> {
-    let model = serde_json::from_value(model)
+    // `assertChatModel` (utils/model-operations.ts:26-30 @ a13d35a74): a
+    // non-chat model reaching the chat stream entry is a caller error; the
+    // `type` discriminator is lost when deserializing straight into `Model`,
+    // so parse the union first and narrow.
+    let model: rpi_ai::types::AnyModel = serde_json::from_value(model)
         .map_err(|error| ExtError::Call(format!("invalid model: {error}")))?;
+    let model = rpi_ai::models::assert_chat_model(&model)
+        .cloned()
+        .map_err(|error| ExtError::Call(error.message))?;
     let context = serde_json::from_value(context)
         .map_err(|error| ExtError::Call(format!("invalid context: {error}")))?;
     Ok((model, context))

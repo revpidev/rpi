@@ -641,9 +641,10 @@ async fn ignores_settled_parallel_tool_update_while_another_tool_is_running() {
             loop {
                 let settled_ended = events.lock().unwrap().iter().any(|e| {
                     matches!(
-                        e,
-                        AgentEvent::ToolExecutionEnd { tool_call_id, .. } if tool_call_id == "call-1"
-                    )
+                                            e,
+                                            AgentEvent::ToolExecutionEnd { tool_call_id, ..
+                    } if tool_call_id == "call-1"
+                                        )
                 });
                 if settled_ended {
                     break;

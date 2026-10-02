@@ -168,6 +168,9 @@ impl rpi_agent::harness::AgentHarnessTool<()> for CalculateTool {
             details: Value::Null,
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         })
     }
 }

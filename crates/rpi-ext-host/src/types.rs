@@ -52,6 +52,7 @@ pub const EVENT_SESSION_BEFORE_COMPACT: &str = "session_before_compact";
 pub const EVENT_SESSION_COMPACT: &str = "session_compact";
 pub const EVENT_SESSION_COMPACT_FAILED: &str = "session_compact_failed";
 pub const EVENT_SESSION_SHUTDOWN: &str = "session_shutdown";
+pub const EVENT_MCP_SERVERS_CHANGE: &str = "mcp_servers_change";
 pub const EVENT_SESSION_BEFORE_TREE: &str = "session_before_tree";
 pub const EVENT_SESSION_TREE: &str = "session_tree";
 pub const EVENT_CONTEXT: &str = "context";
@@ -60,6 +61,7 @@ pub const EVENT_CACHE_WARMING_DECISION: &str = "cache_warming_decision";
 pub const EVENT_BEFORE_PROVIDER_REQUEST: &str = "before_provider_request";
 pub const EVENT_BEFORE_PROVIDER_HEADERS: &str = "before_provider_headers";
 pub const EVENT_AFTER_PROVIDER_RESPONSE: &str = "after_provider_response";
+pub const EVENT_PROVIDER_STREAM_EVENT: &str = "provider_stream_event";
 pub const EVENT_BEFORE_AGENT_START: &str = "before_agent_start";
 pub const EVENT_AGENT_START: &str = "agent_start";
 pub const EVENT_AGENT_END: &str = "agent_end";
@@ -82,13 +84,14 @@ pub const EVENT_INPUT: &str = "input";
 pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
 
-/// All 39 event names, in the upstream `ExtensionAPI.on()` overload order
+/// All 41 event names, in the upstream `ExtensionAPI.on()` overload order
 /// (types.ts:1545-1625 @ a13d35a74 + #9668 `cache_warming_decision` —
 /// inserted between `context_with_system` and `before_provider_request`).
-/// V16-03 adds `context_with_system` and `agent_before_settle`; the remaining
-/// two (`provider_stream_event`, `mcp_servers_change`) and the version-level
-/// ABI minor bump land in V16-06.
-pub const ALL_EVENTS: [&str; 39] = [
+/// V16-03 added `context_with_system` and `agent_before_settle`; V16-06 added
+/// the remaining two (`provider_stream_event` after `after_provider_response`,
+/// `mcp_servers_change` after `session_shutdown`) and the version-level ABI
+/// minor bump (V16-06 FR-F/FR-H).
+pub const ALL_EVENTS: [&str; 41] = [
     EVENT_PROJECT_TRUST,
     EVENT_RESOURCES_DISCOVER,
     EVENT_SESSION_START,
@@ -99,6 +102,7 @@ pub const ALL_EVENTS: [&str; 39] = [
     EVENT_SESSION_COMPACT,
     EVENT_SESSION_COMPACT_FAILED,
     EVENT_SESSION_SHUTDOWN,
+    EVENT_MCP_SERVERS_CHANGE,
     EVENT_SESSION_BEFORE_TREE,
     EVENT_SESSION_TREE,
     EVENT_CONTEXT,
@@ -107,6 +111,7 @@ pub const ALL_EVENTS: [&str; 39] = [
     EVENT_BEFORE_PROVIDER_REQUEST,
     EVENT_BEFORE_PROVIDER_HEADERS,
     EVENT_AFTER_PROVIDER_RESPONSE,
+    EVENT_PROVIDER_STREAM_EVENT,
     EVENT_BEFORE_AGENT_START,
     EVENT_AGENT_START,
     EVENT_AGENT_END,
@@ -451,6 +456,21 @@ pub struct TreePreparation {
     pub label: Option<String>,
 }
 
+// `RegisteredMcpServer` (types.ts:670-688) is carried as JSON: the shape is
+// owned by the MCP server registration surface (V16-08).
+
+/// `McpServersChangeEvent` (types.ts:710-714 @ a13d35a74): fired when an
+/// extension registers or unregisters an MCP server after the extensions are
+/// bound. Registered while loading → read with `pi.getMcpServers()` on
+/// `session_start`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServersChangeEvent {
+    /// Every registered server after the change (`RegisteredMcpServer[]`
+    /// JSON).
+    pub servers: Vec<Value>,
+}
+
 /// `SessionBeforeTreeEvent` (types.ts:633-637). `signal` dropped (see
 /// header).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -595,6 +615,22 @@ pub struct BeforeProviderHeadersEvent {
 pub struct AfterProviderResponseEvent {
     pub status: u32,
     pub headers: HashMap<String, String>,
+}
+
+/// `ProviderStreamEvent` (types.ts:889-895 @ a13d35a74): a parsed provider
+/// stream event before Pi normalizes it. Notification only — never
+/// persisted; handlers run in stream order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderStreamEvent {
+    /// Provider id (`ProviderId` upstream).
+    pub provider: String,
+    /// API id (`Api` upstream).
+    pub api: String,
+    /// Model id.
+    pub model: String,
+    /// The raw parsed stream event (`unknown` upstream).
+    pub data: Value,
 }
 
 /// `BeforeAgentStartEvent` (types.ts:693-703). `system_prompt_options` is
@@ -836,16 +872,19 @@ pub struct MessageEndEventResult {
     pub message: Option<AgentMessage>,
 }
 
-/// `ToolExecutionStartEvent` (types.ts:756-761).
+/// `ToolExecutionStartEvent` (types.ts:756-761 @ a13d35a74).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionStartEvent {
     pub tool_call_id: String,
     pub tool_name: String,
     pub args: Value,
+    /// Set when another tool (for example a codemode script) made this call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
-/// `ToolExecutionUpdateEvent` (types.ts:764-770).
+/// `ToolExecutionUpdateEvent` (types.ts:764-770 @ a13d35a74).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionUpdateEvent {
@@ -853,9 +892,12 @@ pub struct ToolExecutionUpdateEvent {
     pub tool_name: String,
     pub args: Value,
     pub partial_result: Value,
+    /// Set when another tool (for example a codemode script) made this call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
-/// `ToolExecutionEndEvent` (types.ts:773-779).
+/// `ToolExecutionEndEvent` (types.ts:773-779 @ a13d35a74).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionEndEvent {
@@ -863,6 +905,9 @@ pub struct ToolExecutionEndEvent {
     pub tool_name: String,
     pub result: Value,
     pub is_error: bool,
+    /// Set when another tool (for example a codemode script) made this call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 // ============================================================================
@@ -957,6 +1002,11 @@ pub struct ToolCallEvent {
     pub tool_call_id: String,
     pub tool_name: String,
     pub input: Value,
+    /// Set when another tool (for example a codemode script) issued this
+    /// call. Nested ids are `<parent id>/<n>` and never appear as tool calls
+    /// or tool results in the transcript (types.ts:843-850 @ a13d35a74).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `ToolCallEventResult` (types.ts:1071-1080 @ 4181f66). `terminate` added
@@ -986,8 +1036,17 @@ pub struct ToolResultEvent {
     pub is_error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// Machine-readable result for tools that declare an `outputSchema`.
+    /// Handlers that redact `content` should also replace this; replacing
+    /// `content` alone drops it (runner.ts:1189-1193 @ a13d35a74).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Set when another tool (for example a codemode script) issued this
+    /// call (types.ts:1183-1219 @ a13d35a74).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `ToolResultEventResult` (types.ts:1079-1084) — a partial patch; each
@@ -999,6 +1058,10 @@ pub struct ToolResultEventResult {
     pub content: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// Replacing `content` without this field drops the structured content
+    /// (types.ts:1419-1435 @ a13d35a74).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1124,6 +1187,135 @@ pub type ToolExecuteFn = Arc<
 /// `prepareArguments` shim (types.ts:462).
 pub type PrepareArgumentsFn = Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
 
+/// `ToolExposure` (types.ts:494-509 @ a13d35a74): how the model reaches a
+/// tool. Default: `direct`.
+///
+/// `direct` and `model-only` tools are activated when registered; the others
+/// are not. The active tool set (`getActiveTools`/`setActiveTools`) is the
+/// set declared to the model; explicitly naming a `codemode`/`deferred` tool
+/// activates it, `hidden` stays unreachable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolExposure {
+    /// Declared to the model and callable.
+    #[default]
+    #[serde(rename = "direct")]
+    Direct,
+    /// Declared to the model but not callable (invocation is rejected).
+    #[serde(rename = "model-only")]
+    ModelOnly,
+    /// Callable whenever registered, not declared unless explicitly activated.
+    /// `codemode-deferred` is the v0.99.2 alias for this variant.
+    #[serde(rename = "codemode", alias = "codemode-deferred")]
+    Codemode,
+    /// Like `codemode`, but codemode tools do not list it; tool search can.
+    #[serde(rename = "deferred")]
+    Deferred,
+    /// Registered but unreachable; activating it has no effect (the only way
+    /// to retract a tool).
+    #[serde(rename = "hidden")]
+    Hidden,
+}
+
+/// `ToolAnnotations` (types.ts:511-525 @ a13d35a74): MCP-style hints from
+/// the tool author, not verified. Permission extensions may use them to
+/// decide which calls to confirm.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    /// The tool does not modify its environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    /// The tool may delete or overwrite data. Meaningful when not read-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    /// Repeating a call with the same arguments has no further effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    /// The tool reaches an open world of external entities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
+/// `ToolNamespace` (types.ts:527-537 @ a13d35a74): a group of related tools,
+/// such as the tools of one MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolNamespace {
+    /// For example `mcp__docs`.
+    pub name: String,
+    /// Short summary shown with the group in model-facing listings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Longer usage guidance (such as MCP server instructions); not part of
+    /// tool listings, returned by `describeNamespace()`-style queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// One tool as [`ToolLoadout`] exposes it (`AgentTool[]` upstream): the
+/// fields a `prepareLoadout` hook reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLoadoutEntry {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+/// `ToolLoadout` (types.ts:539-550 @ a13d35a74): the tools of a session as a
+/// `prepareLoadout` hook sees them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLoadout {
+    /// Tools declared to the model (the active tools), in order, with their
+    /// original descriptions.
+    pub declared: Vec<ToolLoadoutEntry>,
+    /// Tools callable through `ctx.executeTool()`.
+    pub callable: Vec<ToolLoadoutEntry>,
+    /// Every registered tool.
+    pub registered: Vec<ToolLoadoutEntry>,
+    /// Exposure by tool name (`getExposure` upstream).
+    pub exposures: HashMap<String, ToolExposure>,
+    /// Namespace by tool name (`getNamespace` upstream).
+    pub namespaces: HashMap<String, ToolNamespace>,
+}
+
+impl ToolLoadout {
+    /// `loadout.getExposure(name)`.
+    pub fn get_exposure(&self, name: &str) -> ToolExposure {
+        self.exposures
+            .get(name)
+            .copied()
+            .unwrap_or(ToolExposure::Direct)
+    }
+
+    /// `loadout.getNamespace(name)`.
+    pub fn get_namespace(&self, name: &str) -> Option<&ToolNamespace> {
+        self.namespaces.get(name)
+    }
+}
+
+/// `ToolLoadoutChanges` (types.ts:551-562 @ a13d35a74): what a
+/// `prepareLoadout` hook changes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLoadoutChanges {
+    /// Model-facing descriptions of declared tools, by tool name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub descriptions: Option<HashMap<String, String>>,
+    /// Declared tools whose declarations requests leave out. They stay active
+    /// and callable, and the transcript still declares them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden_declarations: Option<Vec<String>>,
+}
+
+/// `ToolDefinition.prepareLoadout` (types.ts:613-615 @ a13d35a74): called
+/// whenever the active tool set changes; returns replacement descriptions
+/// and hidden declarations. A `Err` is reported like an upstream handler
+/// throw (extension error, loadout keeps the previous values).
+pub type PrepareLoadoutFn =
+    Arc<dyn Fn(&ToolLoadout) -> Result<Option<ToolLoadoutChanges>, String> + Send + Sync>;
+
 /// `ToolDefinition` (types.ts:443-492).
 ///
 /// Render placeholder decision: `render_call` / `render_result` are typed
@@ -1142,6 +1334,23 @@ pub struct ToolDefinition {
     /// `false | ConstrainedSamplingConfig` upstream; `Some(Value::Bool(false))`
     /// explicitly disables, `None` leaves the provider default.
     pub constrained_sampling: Option<Value>,
+    /// JSON Schema of `structuredContent` in successful results (types.ts:590).
+    pub output_schema: Option<Value>,
+    /// How the model reaches the tool (types.ts:595).
+    pub exposure: ToolExposure,
+    /// Group the tool belongs to, for example its MCP server (types.ts:598).
+    pub namespace: Option<ToolNamespace>,
+    /// Hints about what the tool does, for example from an MCP server
+    /// (types.ts:601).
+    pub annotations: Option<ToolAnnotations>,
+    /// Whether registering the tool activates it (types.ts:605). `None`
+    /// defaults to true for `direct`/`model-only`; other exposures are never
+    /// activated on registration; `Some(false)` defers activation until the
+    /// tool is named.
+    pub default_active: Option<bool>,
+    /// Adjust how the loadout is presented to the model while this tool is
+    /// active (types.ts:615).
+    pub prepare_loadout: Option<PrepareLoadoutFn>,
     /// `"default" | "self"` (types.ts:458).
     pub render_shell: Option<String>,
     pub prepare_arguments: Option<PrepareArgumentsFn>,

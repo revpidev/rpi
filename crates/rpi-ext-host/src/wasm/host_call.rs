@@ -391,6 +391,13 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         None
                     },
                     name,
+
+                    exposure: Default::default(),
+                    namespace: None,
+                    annotations: None,
+                    output_schema: None,
+                    default_active: None,
+                    prepare_loadout: None,
                 })
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)

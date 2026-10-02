@@ -293,6 +293,9 @@ impl AgentTool for ReadTool {
                 details: Value::Null,
                 usage: None,
                 terminate: None,
+
+                structured_content: None,
+                is_error: None,
             });
         }
 
@@ -418,6 +421,9 @@ impl AgentTool for ReadTool {
             details,
             usage: None,
             terminate: None,
+
+            structured_content: None,
+            is_error: None,
         })
     }
 }

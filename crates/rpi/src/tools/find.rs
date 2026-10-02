@@ -365,6 +365,9 @@ fn assemble_result(
         },
         usage: None,
         terminate: None,
+
+        structured_content: None,
+        is_error: None,
     }
 }
 
@@ -377,6 +380,9 @@ fn no_files_found() -> AgentToolResult {
         details: Value::Null,
         usage: None,
         terminate: None,
+
+        structured_content: None,
+        is_error: None,
     }
 }
 
