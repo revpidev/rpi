@@ -312,14 +312,12 @@ impl NestedCallRunner {
             })
             .await;
 
+        // `queueTail` upstream: exclusive nested calls run one at a time.
+        // `acquire_owned` only fails when the semaphore is closed, which
+        // never happens (the runner owns it): degrade to no permit rather
+        // than unwrap.
         let permit = if exclusive {
-            Some(
-                self.exclusive
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("exclusive semaphore never closes"),
-            )
+            self.exclusive.clone().acquire_owned().await.ok()
         } else {
             None
         };
