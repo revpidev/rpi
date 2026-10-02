@@ -181,6 +181,15 @@ impl ToolContext {
         )
         .map(|_| ())
     }
+
+    /// `ctx.executeTool(name, args)` (V16-06 FR-E): run another tool through
+    /// the host's full tool pipeline. Only available while this tool
+    /// executes; tool failures come back inside the outcome (`isError`),
+    /// while transport/capability failures return `Err`. `onUpdate`/`signal`
+    /// are native-carrier options and are not portable over the JSON ABI.
+    pub fn execute_tool(&self, name: &str, args: Value) -> Result<Value, String> {
+        host_call("executeTool", json!({"name": name, "args": args}))
+    }
 }
 
 type ContextToolHandler =

@@ -790,6 +790,35 @@ pub struct UsageCost {
     pub total: f64,
 }
 
+impl Usage {
+    /// `combineUsage` (usage-totals.ts:7-28 @ a13d35a74): field-wise sum;
+    /// optional splits stay `None` when both sides are `None`.
+    pub fn combined(&self, other: &Usage) -> Usage {
+        Usage {
+            input: self.input + other.input,
+            output: self.output + other.output,
+            cache_read: self.cache_read + other.cache_read,
+            cache_write: self.cache_write + other.cache_write,
+            cache_write1h: match (self.cache_write1h, other.cache_write1h) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+            },
+            reasoning: match (self.reasoning, other.reasoning) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+            },
+            total_tokens: self.total_tokens + other.total_tokens,
+            cost: UsageCost {
+                input: self.cost.input + other.cost.input,
+                output: self.cost.output + other.cost.output,
+                cache_read: self.cost.cache_read + other.cost.cache_read,
+                cache_write: self.cost.cache_write + other.cost.cache_write,
+                total: self.cost.total + other.cost.total,
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Images (image generation subsystem: `images.ts` / `images-models.ts` /
 // `image-models.ts` / `images-api-registry.ts` / `api/openrouter-images.ts`)

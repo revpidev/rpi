@@ -45,7 +45,9 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         // ADR-0015 additions: unregisterTool (registry removal) and
         // toolUpdate (partial-result report) belong to the same capability
         // as registerTool — they write/affect only this extension's tools.
-        "registerTool" | "unregisterTool" | "toolUpdate" => Requires(Capability::Tools),
+        "registerTool" | "unregisterTool" | "toolUpdate" | "executeTool" => {
+            Requires(Capability::Tools)
+        }
         "registerCommand" | "registerShortcut" | "registerFlag" => Requires(Capability::Commands),
         "registerMessageRenderer" | "registerEntryRenderer" | "registerMarkdownTransformer" => {
             Requires(Capability::Ui)
@@ -141,6 +143,37 @@ pub(super) fn block_on<R: Send + 'static>(
     });
     rx.recv()
         .map_err(|_| ("internal", "host runtime dropped the response".to_owned()))
+}
+
+// ============================================================================
+// Current tool call (V16-06 FR-E)
+// ============================================================================
+
+thread_local! {
+    /// The `toolExecute` call currently being forwarded on this thread. The
+    /// `executeTool` host call made by the guest/plugin resolves its caller
+    /// id from the top of this stack (nested calls push their own ids while
+    /// they run).
+    static CURRENT_TOOL_CALL_IDS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Push the id of a tool execution that is about to be forwarded to the
+/// guest/plugin (popped when the forward returns).
+pub(crate) fn push_current_tool_call(tool_call_id: String) {
+    CURRENT_TOOL_CALL_IDS.with(|ids| ids.borrow_mut().push(tool_call_id));
+}
+
+/// Pop the id pushed by [`push_current_tool_call`].
+pub(crate) fn pop_current_tool_call() {
+    CURRENT_TOOL_CALL_IDS.with(|ids| {
+        ids.borrow_mut().pop();
+    });
+}
+
+/// The top of the current-tool stack, or `None` outside a tool execution.
+fn current_tool_call_id() -> Option<String> {
+    CURRENT_TOOL_CALL_IDS.with(|ids| ids.borrow().last().cloned())
 }
 
 pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> CallResult {
@@ -254,6 +287,15 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     constrained_sampling: definition.get("constrainedSampling").cloned(),
                     render_shell: str_arg(&definition, "renderShell").map(str::to_owned),
                     prepare_arguments: None,
+                    exposure: definition
+                        .get("exposure")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                    namespace: definition
+                        .get("namespace")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok()),
                     execution_mode: definition.get("executionMode").and_then(Value::as_str).map(
                         |mode| match mode {
                             "sequential" => rpi_agent::types::ToolExecutionMode::Sequential,
@@ -319,6 +361,17 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                                     })
                                 })
                             };
+                            // V16-06 FR-E (native carrier): a native plugin
+                            // calls `executeTool` synchronously on this same
+                            // thread while its dispatch is running, so the
+                            // current-tool stack lives here. Wasm guests push
+                            // in their dispatch loop instead (the forward runs
+                            // on the host runtime, not the guest thread).
+                            let is_native =
+                                matches!(forward, crate::wasm::DispatchTarget::Native(_));
+                            if is_native {
+                                push_current_tool_call(tool_call_id.clone());
+                            }
                             let result = forward
                                 .dispatch(
                                     json!({
@@ -330,6 +383,9 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                                     false,
                                 )
                                 .await;
+                            if is_native {
+                                pop_current_tool_call();
+                            }
                             if let Some(watcher) = abort_watcher {
                                 watcher.abort();
                             }
@@ -392,11 +448,12 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     },
                     name,
 
-                    exposure: Default::default(),
-                    namespace: None,
-                    annotations: None,
-                    output_schema: None,
-                    default_active: None,
+                    annotations: definition
+                        .get("annotations")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok()),
+                    output_schema: definition.get("outputSchema").cloned(),
+                    default_active: definition.get("defaultActive").and_then(Value::as_bool),
                     prepare_loadout: None,
                 })
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
@@ -414,6 +471,37 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .unregister_tool(name)
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(json!(removed))
+        }
+
+        // V16-06 FR-E: `executeTool(name, args?)` — the calling tool runs
+        // another tool through the session's nested-call pipeline. The
+        // caller id comes from the in-flight `toolExecute` forward on this
+        // thread; `onUpdate`/`signal` are native-carrier options and are not
+        // portable over this boundary (see docs/extension-abi.md).
+        "executeTool" => {
+            let name = str_arg(&args, "name")
+                .ok_or_else(|| ("invalidRequest", "executeTool: missing name".to_owned()))?
+                .to_owned();
+            let call_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+            let Some(caller_id) = current_tool_call_id() else {
+                return Err((
+                    "invalidRequest",
+                    "executeTool: only available during a tool execution".to_owned(),
+                ));
+            };
+            let actions = state
+                .api
+                .runtime()
+                .require_actions()
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            let handle = state.async_handle.clone();
+            let outcome = block_on(&handle, async move {
+                actions
+                    .execute_tool(&caller_id, &name, call_args, None)
+                    .await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))?;
+            serde_json::to_value(&outcome).map_err(|e| ("internal", format!("executeTool: {e}")))
         }
 
         // ADR-0015: `toolUpdate(toolCallId, update)` — guest/plugin reports a

@@ -5415,4 +5415,208 @@ mod tests {
                 .is_empty()
         );
     }
+
+    // ====================================================================
+    // V16-06 FR-G: type accessors + chat guard
+    // ====================================================================
+
+    /// All-type provider for accessor tests: chat + image + classifier.
+    struct AllTypesProvider {
+        models: Vec<AnyModel>,
+        auth: ProviderAuth,
+    }
+
+    impl Provider for AllTypesProvider {
+        fn id(&self) -> &str {
+            "all-types"
+        }
+
+        fn name(&self) -> &str {
+            "All Types"
+        }
+
+        fn base_url(&self) -> Option<&str> {
+            None
+        }
+
+        fn headers(&self) -> Option<&ProviderHeaders> {
+            None
+        }
+
+        fn auth(&self) -> &ProviderAuth {
+            &self.auth
+        }
+
+        fn get_models(&self) -> Vec<Model> {
+            self.models
+                .iter()
+                .filter_map(|model| match model {
+                    AnyModel::Chat(chat) => Some(chat.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn get_all_models(&self) -> Vec<AnyModel> {
+            self.models.clone()
+        }
+
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &crate::types::TranscriptContext,
+            _options: Option<StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            AssistantMessageEventStream::new()
+        }
+
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &crate::types::TranscriptContext,
+            _options: Option<SimpleStreamOptions>,
+        ) -> Result<AssistantMessageEventStream, String> {
+            Ok(AssistantMessageEventStream::new())
+        }
+    }
+
+    fn all_types_provider(auth: ProviderAuth) -> Arc<dyn Provider> {
+        let chat = model("all-types", ApiKind::ANTHROPIC_MESSAGES);
+        let image: AnyModel = serde_json::from_value(json!({
+            "type": "image",
+            "id": "img-1",
+            "name": "Image One",
+            "api": "openrouter-images",
+            "provider": "all-types",
+            "baseUrl": "https://example.test",
+            "input": ["text"],
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "output": ["image"]
+        }))
+        .expect("image model");
+        let classifier: AnyModel = serde_json::from_value(json!({
+            "type": "classifier",
+            "id": "jev-1",
+            "name": "Jev One",
+            "api": "openai-completions",
+            "provider": "all-types",
+            "baseUrl": "https://example.test",
+            "input": ["text"],
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "contextWindow": 8192
+        }))
+        .expect("classifier model");
+        Arc::new(AllTypesProvider {
+            models: vec![AnyModel::Chat(chat), image, classifier],
+            auth,
+        })
+    }
+
+    #[test]
+    fn get_models_of_type_filters_by_type_and_keeps_chat_only_reads() {
+        let models = Models::new(None);
+        models.set_provider(all_types_provider(ProviderAuth {
+            api_key: Some(Arc::new(StaticKeyAuth)),
+            oauth: None,
+        }));
+
+        // `get_models` stays chat-only (red line).
+        let chat: Vec<String> = models
+            .get_models(None)
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(chat, vec!["m".to_owned()]);
+
+        let all: Vec<AnyModel> = models.get_all_models(None);
+        assert_eq!(all.len(), 3);
+
+        let images = models.get_models_of_type(ModelType::Image, None);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].id(), "img-1");
+        let classifiers = models.get_models_of_type(ModelType::Classifier, None);
+        assert_eq!(classifiers.len(), 1);
+        assert_eq!(classifiers[0].id(), "jev-1");
+        assert_eq!(
+            models
+                .get_models_of_type(ModelType::Chat, None)
+                .into_iter()
+                .map(|model| model.id().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["m".to_owned()]
+        );
+
+        assert_eq!(
+            models
+                .get_model_of_type(ModelType::Image, "all-types", "img-1")
+                .map(|model| model.id().to_owned()),
+            Some("img-1".to_owned())
+        );
+        assert!(
+            models
+                .get_model_of_type(ModelType::Image, "all-types", "m")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_accessors_gate_on_auth_and_filter_chat_models() {
+        let models = Models::new(None);
+        models.set_provider(all_types_provider(ProviderAuth {
+            api_key: Some(Arc::new(StaticKeyAuth)),
+            oauth: None,
+        }));
+        let available = models.get_all_available(None).await.expect("available");
+        assert_eq!(available.len(), 3);
+        let images = models
+            .get_available_of_type(ModelType::Image, None)
+            .await
+            .expect("available images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].id(), "img-1");
+
+        // No configured auth → no available models of any type.
+        let models = Models::new(None);
+        models.set_provider(all_types_provider(ProviderAuth {
+            api_key: None,
+            oauth: None,
+        }));
+        assert!(
+            models
+                .get_all_available(None)
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+        assert!(
+            models
+                .get_available_of_type(ModelType::Image, None)
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn assert_chat_model_rejects_non_chat_models() {
+        let chat = AnyModel::Chat(model("all-types", ApiKind::ANTHROPIC_MESSAGES));
+        let chat = assert_chat_model(&chat).expect("chat accepted");
+        assert_eq!(chat.id, "m");
+
+        let image: AnyModel = serde_json::from_value(json!({
+            "type": "image",
+            "id": "img-1",
+            "name": "Image One",
+            "api": "openrouter-images",
+            "provider": "all-types",
+            "baseUrl": "https://example.test",
+            "input": ["text"],
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "output": ["image"]
+        }))
+        .expect("image model");
+        let error = assert_chat_model(&image).expect_err("image rejected");
+        assert_eq!(error.code, ModelsErrorCode::Provider);
+        assert!(error.message.contains("is not a chat model"));
+    }
 }

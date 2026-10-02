@@ -34,9 +34,9 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_loop::{
     AfterToolCallFn, AgentContext, AgentEventSink, AgentLoopConfig, AgentLoopTurnUpdate,
     AgentRequestUpdate, AgentTurnContext, AgentTurnDecision, BeforeToolCallFn, ConvertToLlmFn,
-    FinishTurnFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext, PrepareNextTurnFn,
-    PrepareRequestContext, PrepareRequestFn, TransformContextFn, now_millis, run_agent_loop,
-    run_agent_loop_continue, thinking_level_from_model_level,
+    FinishTurnFn, GetApiKeyFn, GetQueuedMessagesFn, NestedCallSummaryFn, PrepareNextTurnContext,
+    PrepareNextTurnFn, PrepareRequestContext, PrepareRequestFn, TransformContextFn, now_millis,
+    run_agent_loop, run_agent_loop_continue, thinking_level_from_model_level,
 };
 use crate::error::AgentError;
 use crate::messages::AgentMessage;
@@ -174,6 +174,9 @@ pub struct AgentOptions {
     pub on_response: Option<rpi_ai::types::OnResponseCallback>,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
+    /// V16-06 FR-E: bounded nested-call record lookup (session-installed;
+    /// see [`crate::agent_loop::NestedCallSummaryFn`]).
+    pub nested_call_summary: Option<NestedCallSummaryFn>,
     pub finish_turn: Option<FinishTurnAgentFn>,
     pub prepare_request: Option<PrepareRequestAgentFn>,
     pub prepare_next_turn: Option<PrepareNextTurnSignalFn>,
@@ -201,6 +204,7 @@ impl AgentOptions {
             on_response: None,
             before_tool_call: None,
             after_tool_call: None,
+            nested_call_summary: None,
             finish_turn: None,
             prepare_request: None,
             prepare_next_turn: None,
@@ -391,6 +395,9 @@ pub struct Agent {
     pub on_response: Option<rpi_ai::types::OnResponseCallback>,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
+    /// `nestedCallSummary` — interior-mutable because the session installs
+    /// its runner after building the shared agent (V16-06 FR-E).
+    nested_call_summary: RwLock<Option<NestedCallSummaryFn>>,
     /// `finishTurn` — interior-mutable because the session installs the
     /// boundary-dispatch chain after building the shared agent (upstream
     /// assigns `this.agent.finishTurn` post-construction,
@@ -477,6 +484,7 @@ impl Agent {
             on_response: options.on_response,
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
+            nested_call_summary: RwLock::new(options.nested_call_summary),
             finish_turn: RwLock::new(options.finish_turn),
             prepare_request: RwLock::new(options.prepare_request),
             prepare_next_turn: RwLock::new(options.prepare_next_turn),
@@ -582,6 +590,15 @@ impl Agent {
             .transform_context
             .write()
             .unwrap_or_else(|e| e.into_inner()) = transform;
+    }
+
+    /// Install the nested-call summary hook (V16-06 FR-E); the session
+    /// replaces it on the shared agent without rebuilding the loop config.
+    pub fn set_nested_call_summary(&self, summary: Option<NestedCallSummaryFn>) {
+        *self
+            .nested_call_summary
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = summary;
     }
 
     /// Current agent state (snapshot copy). `system_prompt` is derived at
@@ -1022,6 +1039,11 @@ impl Agent {
             get_follow_up_messages: Some(get_follow_up_messages),
             before_tool_call: self.before_tool_call.clone(),
             after_tool_call: self.after_tool_call.clone(),
+            nested_call_summary: self
+                .nested_call_summary
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
 

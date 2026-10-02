@@ -30,6 +30,7 @@ pub mod compaction;
 pub mod error;
 pub mod harness;
 pub mod messages;
+pub mod nested_tool_calls;
 pub mod proxy;
 pub mod session;
 pub mod stream_fn;
@@ -41,11 +42,12 @@ pub use agent::{
 };
 pub use agent_loop::{
     AfterToolCallContext, AfterToolCallFn, AfterToolCallResult, AgentContext, AgentEventSink,
-    AgentEventStream, AgentLoopConfig, AgentLoopTurnUpdate, AgentRequestUpdate, AgentTurnContext,
-    AgentTurnDecision, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult,
-    ConvertToLlmFn, FinishTurnFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext,
-    PrepareNextTurnFn, PrepareRequestContext, PrepareRequestFn, TransformContextFn, agent_loop,
-    agent_loop_continue, run_agent_loop, run_agent_loop_continue,
+    AgentEventStream, AgentLoopConfig, AgentLoopTurnUpdate, AgentRequestUpdate,
+    AgentToolCallOutcome, AgentTurnContext, AgentTurnDecision, BeforeToolCallContext,
+    BeforeToolCallFn, BeforeToolCallResult, ConvertToLlmFn, FinishTurnFn, GetApiKeyFn,
+    GetQueuedMessagesFn, NestedCallSummaryFn, PrepareNextTurnContext, PrepareNextTurnFn,
+    PrepareRequestContext, PrepareRequestFn, RunToolCallOptions, TransformContextFn, agent_loop,
+    agent_loop_continue, run_agent_loop, run_agent_loop_continue, run_tool_call,
 };
 pub use compaction::{
     CompactionDetails, CompactionPreparation, CompactionResult, CompactionSettings, CutPointResult,

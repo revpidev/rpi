@@ -44,7 +44,10 @@ use tokio_util::sync::CancellationToken;
 use crate::error::AgentError;
 use crate::messages::AgentMessage;
 use crate::stream_fn::StreamFn;
-use crate::types::{AgentEvent, AgentTool, AgentToolCall, AgentToolResult, ToolExecutionMode};
+use crate::types::{
+    AgentEvent, AgentTool, AgentToolCall, AgentToolResult, AgentToolUpdateCallback,
+    ToolExecutionMode,
+};
 
 /// Current time as Unix milliseconds (upstream `Date.now()`).
 pub(crate) fn now_millis() -> i64 {
@@ -119,6 +122,10 @@ pub struct AfterToolCallResult {
     pub content: Option<Vec<ToolResultContent>>,
     /// Replaces the tool result details value in full.
     pub details: Option<Value>,
+    /// Replaces the machine-readable `structuredContent`; `Some(None)`-style
+    /// clearing follows `content` replacement (see
+    /// `finalize_executed_tool_call`, types.ts:1419-1435 @ a13d35a74).
+    pub structured_content: Option<Value>,
     /// Replaces the tool result error flag.
     pub is_error: Option<bool>,
     /// Usage from the final tool execution itself, if available. Not used for
@@ -312,6 +319,13 @@ pub type AfterToolCallFn = Arc<
         + Sync,
 >;
 
+/// `nestedCallSummary` — session hook returning the bounded record of the
+/// nested calls (`ctx.executeTool()`) one model-issued tool call made, once
+/// that call finished. The record is written to the tool result message's
+/// `nestedCalls` and its usage folded into the message usage (V16-06 FR-E).
+pub type NestedCallSummaryFn =
+    Arc<dyn Fn(&str) -> Option<crate::nested_tool_calls::NestedCallSummary> + Send + Sync>;
+
 /// `AgentEventSink` — shared event sink. `Fn` (not `FnMut`) so parallel tool
 /// tasks can each hold a clone, mirroring the single upstream `emit` closure.
 pub type AgentEventSink = Arc<dyn Fn(AgentEvent) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -348,6 +362,9 @@ pub struct AgentLoopConfig {
     pub get_follow_up_messages: Option<GetQueuedMessagesFn>,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
+    /// V16-06 FR-E: bounded nested-call record lookup for finished
+    /// model-issued tool calls (session-owned runner).
+    pub nested_call_summary: Option<NestedCallSummaryFn>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,6 +1275,85 @@ struct FinalizedToolCallOutcome {
     is_error: bool,
 }
 
+/// `AgentToolCallOutcome` (types.ts:430-436 @ a13d35a74): the final outcome
+/// of a tool call after hooks ran. Nested calls (`ctx.executeTool()`) return
+/// this shape too.
+#[derive(Debug, Clone)]
+pub struct AgentToolCallOutcome {
+    pub tool_call: AgentToolCall,
+    pub result: AgentToolResult,
+    pub is_error: bool,
+}
+
+/// Options for [`run_tool_call`] (`RunToolCallOptions`,
+/// agent-loop.ts:794-802 @ a13d35a74).
+pub struct RunToolCallOptions {
+    /// Tools the call resolves against.
+    pub tools: Vec<Arc<dyn AgentTool>>,
+    /// The assistant message that issued the call.
+    pub assistant_message: AssistantMessage,
+    /// Current agent context at the time the call is prepared.
+    pub context: AgentContext,
+    pub before_tool_call: Option<BeforeToolCallFn>,
+    pub after_tool_call: Option<AfterToolCallFn>,
+    pub signal: Option<CancellationToken>,
+    /// Receives partial results of the nested tool (in addition to the
+    /// `tool_execution_update` events the caller emits).
+    pub on_update: Option<AgentToolUpdateCallback>,
+}
+
+/// `runToolCall` (agent-loop.ts:810-820 @ a13d35a74): run one tool call
+/// through the full pipeline (schema validation, `beforeToolCall`,
+/// execution, `afterToolCall`). Used by the loop's batch runners and by the
+/// session for nested `ctx.executeTool()` calls; callers emit the
+/// `tool_execution_*` events.
+///
+/// Never panics; tool failures come back as `is_error: true` results.
+pub async fn run_tool_call(
+    tool_call: AgentToolCall,
+    options: RunToolCallOptions,
+) -> AgentToolCallOutcome {
+    let context = AgentContext {
+        messages: options.context.messages,
+        tools: Some(options.tools),
+    };
+    let preparation = prepare_tool_call(
+        &context,
+        &options.assistant_message,
+        &tool_call,
+        &options.before_tool_call,
+        &options.signal,
+    )
+    .await;
+    let preparation = match preparation {
+        Preparation::Immediate { result, is_error } => {
+            return AgentToolCallOutcome {
+                tool_call,
+                result,
+                is_error,
+            };
+        }
+        Preparation::Prepared(prepared) => prepared,
+    };
+    let executed =
+        execute_prepared_tool_call_with_sink(&preparation, &options.signal, options.on_update)
+            .await;
+    let finalized = finalize_executed_tool_call(
+        &context,
+        &options.assistant_message,
+        &preparation,
+        executed,
+        &options.after_tool_call,
+        &options.signal,
+    )
+    .await;
+    AgentToolCallOutcome {
+        tool_call: finalized.tool_call,
+        result: finalized.result,
+        is_error: finalized.is_error,
+    }
+}
+
 /// `failToolCallsFromTruncatedMessage` (agent-loop.ts:381-406).
 async fn fail_tool_calls_from_truncated_message(
     tool_calls: &[AgentToolCall],
@@ -1282,7 +1378,7 @@ async fn fail_tool_calls_from_truncated_message(
             is_error: true,
         };
         emit_tool_execution_end(&finalized, emit).await;
-        let tool_result_message = create_tool_result_message(&finalized);
+        let tool_result_message = create_tool_result_message(&finalized, None);
         emit_tool_result_message(&tool_result_message, emit).await;
         messages.push(tool_result_message);
     }
@@ -1357,7 +1453,7 @@ async fn execute_tool_calls_sequential(
             current_context,
             assistant_message,
             tool_call,
-            config,
+            &config.before_tool_call,
             signal,
         )
         .await;
@@ -1412,7 +1508,11 @@ async fn execute_tool_calls_sequential(
         };
 
         emit_tool_execution_end(&finalized, emit).await;
-        let tool_result_message = create_tool_result_message(&finalized);
+        let summary = config
+            .nested_call_summary
+            .as_ref()
+            .and_then(|summary| summary(&finalized.tool_call.id));
+        let tool_result_message = create_tool_result_message(&finalized, summary.as_ref());
         emit_tool_result_message(&tool_result_message, emit).await;
         finalized_calls.push(finalized);
         messages.push(tool_result_message);
@@ -1465,7 +1565,7 @@ async fn execute_tool_calls_parallel(
             current_context,
             assistant_message,
             tool_call,
-            config,
+            &config.before_tool_call,
             signal,
         )
         .await;
@@ -1565,7 +1665,11 @@ async fn execute_tool_calls_parallel(
     let finalized_calls: Vec<FinalizedToolCallOutcome> = slots.into_iter().flatten().collect();
     let mut messages: Vec<ToolResultMessage> = Vec::new();
     for finalized in &finalized_calls {
-        let tool_result_message = create_tool_result_message(finalized);
+        let summary = config
+            .nested_call_summary
+            .as_ref()
+            .and_then(|summary| summary(&finalized.tool_call.id));
+        let tool_result_message = create_tool_result_message(finalized, summary.as_ref());
         emit_tool_result_message(&tool_result_message, emit).await;
         messages.push(tool_result_message);
     }
@@ -1608,7 +1712,7 @@ async fn prepare_tool_call(
     current_context: &AgentContext,
     assistant_message: &AssistantMessage,
     tool_call: &AgentToolCall,
-    config: &AgentLoopConfig,
+    before_tool_call: &Option<BeforeToolCallFn>,
     signal: &Option<CancellationToken>,
 ) -> Preparation {
     let Some(tool) = current_context
@@ -1640,7 +1744,7 @@ async fn prepare_tool_call(
         }
     };
 
-    if let Some(before_tool_call) = &config.before_tool_call {
+    if let Some(before_tool_call) = before_tool_call {
         let before_context = BeforeToolCallContext {
             assistant_message: assistant_message.clone(),
             tool_call: tool_call.clone(),
@@ -1698,50 +1802,81 @@ async fn prepare_tool_call(
 /// Update settle semantics: updates emitted after `execute` returns are
 /// ignored; already-queued update events are awaited before returning.
 /// `Err` from `execute` becomes an error result.
+/// Build the loop's `tool_execution_update` emit sink, parking genuinely
+/// async emits in `update_events` for the caller to settle.
+fn emit_tool_update_sink(
+    prepared: &PreparedToolCall,
+    emit: &AgentEventSink,
+    update_events: Arc<Mutex<Vec<BoxFuture<'static, ()>>>>,
+) -> crate::types::AgentToolUpdateCallback {
+    let emit = emit.clone();
+    let tool_call_id = prepared.tool_call.id.clone();
+    let tool_name = prepared.tool_call.name.clone();
+    let args = Value::Object(prepared.tool_call.arguments.clone());
+    Box::new(move |partial_result: AgentToolResult| {
+        let event = AgentEvent::ToolExecutionUpdate {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            args: args.clone(),
+            partial_result: serde_json::to_value(&partial_result).unwrap_or(Value::Null),
+            parent_tool_call_id: None,
+        };
+        let mut update = emit(event);
+        // Upstream emits the update synchronously (`emitEvent` enqueues
+        // into the event stream before returning). The Rust sink returns
+        // a future, and parking it in the settle list until `execute`
+        // returns batches every partial frame of a long tool call into
+        // one post-execute avalanche — live progress never reaches the
+        // UI while the tool runs. Poll once with a noop waker instead:
+        // sinks whose first step is a synchronous enqueue (the stream
+        // sink) complete here, frame by frame; genuinely async sinks
+        // (the Agent barrier) park pending in the settle list and keep
+        // the original await-before-return semantics.
+        {
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            if update.as_mut().poll(&mut cx).is_pending() {
+                lock(&update_events).push(update);
+            }
+        }
+    })
+}
+
 async fn execute_prepared_tool_call(
     prepared: &PreparedToolCall,
     signal: &Option<CancellationToken>,
     emit: &AgentEventSink,
 ) -> ExecutedToolCallOutcome {
-    let accepting_updates = Arc::new(AtomicBool::new(true));
     let update_events: Arc<Mutex<Vec<BoxFuture<'static, ()>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = emit_tool_update_sink(prepared, emit, update_events.clone());
+    let outcome = execute_prepared_tool_call_with_sink(prepared, signal, Some(sink)).await;
+    // Await already-queued update events (upstream `Promise.all(updateEvents)`;
+    // awaited sequentially here to keep event order deterministic).
+    let queued = std::mem::take(&mut *lock(&update_events));
+    for update in queued {
+        update.await;
+    }
+    outcome
+}
 
+/// Like [`execute_prepared_tool_call`] but with a caller-provided update
+/// sink (used by [`run_tool_call`] for nested `ctx.executeTool()` calls,
+/// which emit their own `tool_execution_update` events). Updates emitted
+/// after `execute` returns are ignored (settle semantics).
+async fn execute_prepared_tool_call_with_sink(
+    prepared: &PreparedToolCall,
+    signal: &Option<CancellationToken>,
+    sink: Option<crate::types::AgentToolUpdateCallback>,
+) -> ExecutedToolCallOutcome {
+    let accepting_updates = Arc::new(AtomicBool::new(true));
     let on_update: crate::types::AgentToolUpdateCallback = {
         let accepting_updates = accepting_updates.clone();
-        let update_events = update_events.clone();
-        let emit = emit.clone();
-        let tool_call_id = prepared.tool_call.id.clone();
-        let tool_name = prepared.tool_call.name.clone();
-        let args = Value::Object(prepared.tool_call.arguments.clone());
         Box::new(move |partial_result: AgentToolResult| {
             if !accepting_updates.load(Ordering::SeqCst) {
                 return;
             }
-            let event = AgentEvent::ToolExecutionUpdate {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                args: args.clone(),
-                partial_result: serde_json::to_value(&partial_result).unwrap_or(Value::Null),
-
-                parent_tool_call_id: None,
-            };
-            let mut update = emit(event);
-            // Upstream emits the update synchronously (`emitEvent` enqueues
-            // into the event stream before returning). The Rust sink returns
-            // a future, and parking it in the settle list until `execute`
-            // returns batches every partial frame of a long tool call into
-            // one post-execute avalanche — live progress never reaches the
-            // UI while the tool runs. Poll once with a noop waker instead:
-            // sinks whose first step is a synchronous enqueue (the stream
-            // sink) complete here, frame by frame; genuinely async sinks
-            // (the Agent barrier) park pending in the settle list and keep
-            // the original await-before-return semantics.
-            {
-                let waker = futures::task::noop_waker();
-                let mut cx = std::task::Context::from_waker(&waker);
-                if update.as_mut().poll(&mut cx).is_pending() {
-                    lock(&update_events).push(update);
-                }
+            if let Some(sink) = &sink {
+                sink(partial_result);
             }
         })
     };
@@ -1756,18 +1891,15 @@ async fn execute_prepared_tool_call(
         )
         .await;
     accepting_updates.store(false, Ordering::SeqCst);
-    // Await already-queued update events (upstream `Promise.all(updateEvents)`;
-    // awaited sequentially here to keep event order deterministic).
-    let queued = std::mem::take(&mut *lock(&update_events));
-    for update in queued {
-        update.await;
-    }
 
     match result {
-        Ok(result) => ExecutedToolCallOutcome {
-            result,
-            is_error: false,
-        },
+        Ok(result) => {
+            // Upstream `executePreparedToolCall`: `isError: result.isError
+            // === true` — a tool may report a data-carrying failure without
+            // throwing (V16-06 FR-C R2).
+            let is_error = result.is_error.unwrap_or(false);
+            ExecutedToolCallOutcome { result, is_error }
+        }
         Err(error) => ExecutedToolCallOutcome {
             result: create_error_tool_result(error.to_string()),
             is_error: true,
@@ -1801,12 +1933,24 @@ async fn finalize_executed_tool_call(
         };
         match after_tool_call(after_context, signal.clone().unwrap_or_default()).await {
             Ok(Some(after_result)) => {
+                // Upstream `finalizeExecutedToolCall` (agent-loop.ts:733-741):
+                // structured content not replaced along with the content may
+                // no longer match it, so replacing `content` without
+                // restating it drops the structured content.
+                let structured_content = after_result.structured_content.clone().or_else(|| {
+                    if after_result.content.is_some() {
+                        None
+                    } else {
+                        result.structured_content.clone()
+                    }
+                });
                 if let Some(content) = after_result.content {
                     result.content = content;
                 }
                 if let Some(details) = after_result.details {
                     result.details = details;
                 }
+                result.structured_content = structured_content;
                 if let Some(usage) = after_result.usage {
                     result.usage = Some(usage);
                 }
@@ -1860,7 +2004,26 @@ async fn emit_tool_execution_end(finalized: &FinalizedToolCallOutcome, emit: &Ag
 }
 
 /// `createToolResultMessage` (agent-loop.ts:773-787).
-fn create_tool_result_message(finalized: &FinalizedToolCallOutcome) -> ToolResultMessage {
+fn create_tool_result_message(
+    finalized: &FinalizedToolCallOutcome,
+    nested: Option<&crate::nested_tool_calls::NestedCallSummary>,
+) -> ToolResultMessage {
+    // `_handleAgentEvent` (agent-session.ts:1075-1085 @ a13d35a74): the
+    // bounded nested-call record rides the message, and the nested usage is
+    // combined into the message usage. Nested results never enter the
+    // transcript themselves.
+    let nested_calls = nested.and_then(|summary| summary.calls.clone());
+    let usage = match (
+        finalized.result.usage.clone(),
+        nested.and_then(|summary| summary.usage.clone()),
+    ) {
+        (None, None) => None,
+        (direct, nested) => Some(
+            direct
+                .unwrap_or_default()
+                .combined(&nested.unwrap_or_default()),
+        ),
+    };
     ToolResultMessage {
         role: ToolResultRole::ToolResult,
         tool_call_id: finalized.tool_call.id.clone(),
@@ -1875,8 +2038,8 @@ fn create_tool_result_message(finalized: &FinalizedToolCallOutcome) -> ToolResul
         } else {
             Some(finalized.result.details.clone())
         },
-        usage: finalized.result.usage.clone(),
-        nested_calls: None,
+        usage,
+        nested_calls,
         is_error: finalized.is_error,
         timestamp: now_millis(),
     }

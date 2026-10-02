@@ -217,6 +217,11 @@ pub struct ToolCallOutcome {
 pub struct ToolResultPatch {
     pub content: Option<Vec<rpi_ai::types::ToolResultContent>>,
     pub details: Option<serde_json::Value>,
+    /// Machine-readable result for tools that declare an `outputSchema`
+    /// (V16-06 FR-C). `None` with `content: Some(..)` means the handler
+    /// replaced the content without restating it, so the structured content
+    /// is dropped (runner.ts:1189-1193 @ a13d35a74).
+    pub structured_content: Option<serde_json::Value>,
     pub is_error: Option<bool>,
     pub usage: Option<rpi_ai::types::Usage>,
 }
@@ -400,17 +405,22 @@ pub trait ExtensionRunner: Send + Sync {
     /// `tool_call` interception (agent-session.ts:466-485). Returns the
     /// aggregated outcome; a failing handler is the caller's fail-safe
     /// decision (upstream rethrows, aborting the run).
+    /// `parent_tool_call_id` is set for calls another tool made through
+    /// `ctx.executeTool()` (V16-06 FR-E).
     async fn emit_tool_call(
         &self,
         _tool_call_id: &str,
         _tool_name: &str,
         _input: serde_json::Value,
+        _parent_tool_call_id: Option<&str>,
     ) -> Option<ToolCallOutcome> {
         None
     }
 
     /// `tool_result` interception (agent-session.ts:487-517): chained
     /// partial patch, `None` when no handler modified anything.
+    /// `structured_content` carries the tool's declared-schema result;
+    /// `parent_tool_call_id` is set for nested calls (V16-06 FR-E).
     #[allow(clippy::too_many_arguments)]
     async fn emit_tool_result(
         &self,
@@ -419,8 +429,10 @@ pub trait ExtensionRunner: Send + Sync {
         _input: serde_json::Value,
         _content: &[rpi_ai::types::ToolResultContent],
         _details: &serde_json::Value,
+        _structured_content: Option<&serde_json::Value>,
         _is_error: bool,
         _usage: Option<&rpi_ai::types::Usage>,
+        _parent_tool_call_id: Option<&str>,
     ) -> Option<ToolResultPatch> {
         None
     }
@@ -658,9 +670,19 @@ pub fn swap_runner(slot: &ExtensionRunnerRef, runner: Arc<dyn ExtensionRunner>) 
 pub fn extension_before_tool_call_hook(
     runner_ref: ExtensionRunnerRef,
 ) -> rpi_agent::agent_loop::BeforeToolCallFn {
+    extension_before_tool_call_hook_with_parent(runner_ref, None)
+}
+
+/// [`extension_before_tool_call_hook`] for a nested call: events carry
+/// `parent_tool_call_id` (V16-06 FR-E).
+pub fn extension_before_tool_call_hook_with_parent(
+    runner_ref: ExtensionRunnerRef,
+    parent_tool_call_id: Option<String>,
+) -> rpi_agent::agent_loop::BeforeToolCallFn {
     Arc::new(
         move |context: rpi_agent::agent_loop::BeforeToolCallContext, _signal| {
             let runner = read_runner(&runner_ref);
+            let parent = parent_tool_call_id.clone();
             Box::pin(async move {
                 if !runner.has_handlers("tool_call") {
                     return None;
@@ -670,6 +692,7 @@ pub fn extension_before_tool_call_hook(
                         &context.tool_call.id,
                         &context.tool_call.name,
                         context.args.clone(),
+                        parent.as_deref(),
                     )
                     .await?;
                 rpi_agent::agent_loop::BeforeToolCallResult {
@@ -695,9 +718,19 @@ pub fn extension_before_tool_call_hook(
 pub fn extension_after_tool_call_hook(
     runner_ref: ExtensionRunnerRef,
 ) -> rpi_agent::agent_loop::AfterToolCallFn {
+    extension_after_tool_call_hook_with_parent(runner_ref, None)
+}
+
+/// [`extension_after_tool_call_hook`] for a nested call: events carry
+/// `parent_tool_call_id` (V16-06 FR-E).
+pub fn extension_after_tool_call_hook_with_parent(
+    runner_ref: ExtensionRunnerRef,
+    parent_tool_call_id: Option<String>,
+) -> rpi_agent::agent_loop::AfterToolCallFn {
     Arc::new(
         move |context: rpi_agent::agent_loop::AfterToolCallContext, _signal| {
             let runner = read_runner(&runner_ref);
+            let parent = parent_tool_call_id.clone();
             Box::pin(async move {
                 if !runner.has_handlers("tool_result") {
                     return Ok(None);
@@ -709,14 +742,20 @@ pub fn extension_after_tool_call_hook(
                         context.args.clone(),
                         &context.result.content,
                         &context.result.details,
+                        context.result.structured_content.as_ref(),
                         context.is_error,
                         context.result.usage.as_ref(),
+                        parent.as_deref(),
                     )
                     .await;
                 Ok(
                     patch.map(|patch| rpi_agent::agent_loop::AfterToolCallResult {
                         content: patch.content,
                         details: patch.details,
+                        // Upstream deletes the structured content when a
+                        // handler replaces `content` without restating it
+                        // (`finalizeExecutedToolCall`, agent-loop.ts:733-741).
+                        structured_content: patch.structured_content,
                         // `hookResult.isError ?? isError` (agent-session.ts:512).
                         is_error: patch.is_error.or(Some(context.is_error)),
                         usage: patch.usage,

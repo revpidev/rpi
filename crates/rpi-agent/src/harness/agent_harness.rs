@@ -1280,6 +1280,10 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                                 Ok(Some(crate::agent_loop::AfterToolCallResult {
                                     content: patch.content,
                                     details: patch.details,
+                                    // The harness hook result has no structured
+                                    // content field; None preserves it unless
+                                    // `content` is replaced (V16-06 FR-C).
+                                    structured_content: None,
                                     is_error: patch.is_error,
                                     usage: patch.usage,
                                     terminate: patch.terminate,
@@ -1384,6 +1388,7 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
             get_follow_up_messages: Some(get_follow_up_messages),
             before_tool_call: Some(before_tool_call),
             after_tool_call: Some(after_tool_call),
+            nested_call_summary: None,
         }
     }
 

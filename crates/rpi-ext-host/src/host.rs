@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::api::{EventBus, ExtensionRuntime, HostActions, InsertionMap, UiBridge};
 use crate::error::ExtError;
@@ -93,6 +93,23 @@ impl NativeExtensionHost {
 
     pub fn event_bus(&self) -> EventBus {
         self.runtime().event_bus()
+    }
+
+    /// `mcp_servers_change` emission hook (V16-06 FR-F R2; upstream
+    /// `runner.ts:457-461`): notify extensions that the registered MCP
+    /// server set changed. The server registry + consumption land in V16-08;
+    /// this is the emission point it calls with the
+    /// `RegisteredMcpServer[]` JSON.
+    pub async fn emit_mcp_servers_change(&self, servers: Vec<Value>) {
+        self.core()
+            .emit(
+                crate::types::EVENT_MCP_SERVERS_CHANGE,
+                json!({
+                    "type": crate::types::EVENT_MCP_SERVERS_CHANGE,
+                    "servers": servers,
+                }),
+            )
+            .await;
     }
 
     /// Replace the loaded extension set (load methods + `/reload`).

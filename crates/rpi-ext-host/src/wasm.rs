@@ -644,6 +644,24 @@ pub async fn instantiate_and_init(
                     respond,
                 } => {
                     store.data().in_command.set(command_context);
+                    // V16-06 FR-E: while the guest handles a `toolExecute`
+                    // dispatch, an `executeTool` host call resolves its
+                    // caller id from the current-tool stack (the guest
+                    // thread is the one blocked in `rpi_host_call`).
+                    let tool_call_id = serde_json::from_slice::<Value>(&message)
+                        .ok()
+                        .filter(|value| {
+                            value.get("kind").and_then(Value::as_str) == Some("toolExecute")
+                        })
+                        .and_then(|value| {
+                            value
+                                .get("toolCallId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                    if let Some(tool_call_id) = &tool_call_id {
+                        host_call::push_current_tool_call(tool_call_id.clone());
+                    }
                     let _ = store.set_fuel(CALL_FUEL);
                     let result = write_guest_bytes(&mut store, &instance, &message)
                         .and_then(|(ptr, len)| {
@@ -652,6 +670,9 @@ pub async fn instantiate_and_init(
                                 .map_err(|e| format_wasm_error(&e))
                         })
                         .and_then(|packed| read_packed(&mut store, &instance, packed));
+                    if tool_call_id.is_some() {
+                        host_call::pop_current_tool_call();
+                    }
                     store.data().in_command.set(false);
                     // V14-22 C2 (R-U6.2): a guest that burns its fuel or
                     // traps mid-dispatch is dead — force-unmount its active

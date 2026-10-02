@@ -2445,3 +2445,173 @@ fn all_events_is_additive_41_in_upstream_order() {
         index("provider_stream_event") + 1
     );
 }
+
+// ---------------------------------------------------------------------------
+// V16-06 FR-B/C: exposure + structuredContent wire shapes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tool_exposure_serde_matches_upstream_names_and_alias() {
+    use rpi_ext_host::types::ToolExposure;
+    let exposure = |value: &str| serde_json::from_value::<ToolExposure>(json!(value)).unwrap();
+    assert_eq!(exposure("direct"), ToolExposure::Direct);
+    assert_eq!(exposure("model-only"), ToolExposure::ModelOnly);
+    assert_eq!(exposure("codemode"), ToolExposure::Codemode);
+    assert_eq!(exposure("codemode-deferred"), ToolExposure::Codemode);
+    assert_eq!(exposure("deferred"), ToolExposure::Deferred);
+    assert_eq!(exposure("hidden"), ToolExposure::Hidden);
+    assert_eq!(ToolExposure::default(), ToolExposure::Direct);
+    assert_eq!(
+        serde_json::to_value(ToolExposure::ModelOnly).unwrap(),
+        json!("model-only")
+    );
+    assert_eq!(
+        serde_json::to_value(ToolExposure::Deferred).unwrap(),
+        json!("deferred")
+    );
+}
+
+#[test]
+fn tool_loadout_changes_and_namespace_wire_shape() {
+    use rpi_ext_host::types::{ToolLoadoutChanges, ToolNamespace};
+    let changes = ToolLoadoutChanges {
+        descriptions: Some([("echo".to_owned(), "Echo text".to_owned())].into()),
+        hidden_declarations: Some(vec!["echo".to_owned()]),
+    };
+    assert_eq!(
+        serde_json::to_value(&changes).unwrap(),
+        json!({"descriptions": {"echo": "Echo text"}, "hiddenDeclarations": ["echo"]})
+    );
+    let namespace = ToolNamespace {
+        name: "mcp__docs".to_owned(),
+        description: Some("Docs tools".to_owned()),
+        instructions: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&namespace).unwrap(),
+        json!({"name": "mcp__docs", "description": "Docs tools"})
+    );
+}
+
+#[test]
+fn tool_event_payloads_carry_parent_and_structured_fields() {
+    use rpi_ext_host::types::{ToolCallEvent, ToolExecutionEndEvent, ToolResultEventResult};
+    let call = ToolCallEvent {
+        tool_call_id: "call/1".to_owned(),
+        tool_name: "echo".to_owned(),
+        input: json!({}),
+        parent_tool_call_id: Some("call".to_owned()),
+    };
+    assert_eq!(call.parent_tool_call_id.as_deref(), Some("call"));
+    let end = ToolExecutionEndEvent {
+        tool_call_id: "call/1".to_owned(),
+        tool_name: "echo".to_owned(),
+        result: json!({"structuredContent": {"ok": true}}),
+        is_error: false,
+        parent_tool_call_id: Some("call".to_owned()),
+    };
+    assert_eq!(
+        serde_json::to_value(&end).unwrap()["parentToolCallId"],
+        json!("call")
+    );
+    let patch = ToolResultEventResult {
+        content: None,
+        details: None,
+        structured_content: Some(json!({"n": 1})),
+        is_error: None,
+        usage: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&patch).unwrap(),
+        json!({"structuredContent": {"n": 1}})
+    );
+}
+
+#[tokio::test]
+async fn runner_tool_result_drops_structured_content_on_content_replace() {
+    // A handler that replaces `content` without restating `structuredContent`
+    // drops it (runner.ts:1185-1196 @ a13d35a74).
+    let host = host_with(vec![inline_ext("ext-a", |api| {
+        api.on(
+            ext::EVENT_TOOL_RESULT,
+            json_handler(|event| {
+                assert_eq!(event["structuredContent"], json!({"original": true}));
+                Ok(json!({"content": [{"type": "text", "text": "redacted"}]}))
+            }),
+        )
+        .unwrap();
+    })])
+    .await;
+    let mut payload = tool_result_event();
+    payload["structuredContent"] = json!({"original": true});
+    let result = host.emit_tool_result(payload).await.expect("patch");
+    assert_eq!(result["content"][0]["text"], "redacted");
+    assert!(result.get("structuredContent").is_none());
+}
+
+#[tokio::test]
+async fn runner_tool_result_keeps_structured_content_for_other_patches() {
+    // A handler that only patches `details` leaves the structured content
+    // (a handler that patches anything without `content` keeps it).
+    let host = host_with(vec![inline_ext("ext-a", |api| {
+        api.on(
+            ext::EVENT_TOOL_RESULT,
+            json_handler(|_| Ok(json!({"details": {"patched": true}}))),
+        )
+        .unwrap();
+    })])
+    .await;
+    let mut payload = tool_result_event();
+    payload["structuredContent"] = json!({"original": true});
+    let result = host.emit_tool_result(payload).await.expect("patch");
+    assert_eq!(result["details"], json!({"patched": true}));
+    assert_eq!(result["structuredContent"], json!({"original": true}));
+}
+
+#[tokio::test]
+async fn runner_tool_result_accepts_explicit_structured_content() {
+    let host = host_with(vec![inline_ext("ext-a", |api| {
+        api.on(
+            ext::EVENT_TOOL_RESULT,
+            json_handler(|_| {
+                Ok(json!({
+                    "content": [{"type": "text", "text": "replaced"}],
+                    "structuredContent": {"replacement": true}
+                }))
+            }),
+        )
+        .unwrap();
+    })])
+    .await;
+    let mut payload = tool_result_event();
+    payload["structuredContent"] = json!({"original": true});
+    let result = host.emit_tool_result(payload).await.expect("patch");
+    assert_eq!(result["structuredContent"], json!({"replacement": true}));
+}
+
+#[tokio::test]
+async fn runner_mcp_servers_change_carries_servers() {
+    let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let received_for_handler = received.clone();
+    let host = host_with(vec![inline_ext("ext-a", move |api| {
+        let received = received_for_handler.clone();
+        api.on_typed::<rpi_ext_host::types::McpServersChangeEvent, Value, _, _>(
+            ext::EVENT_MCP_SERVERS_CHANGE,
+            move |event, _ctx| {
+                let received = received.clone();
+                async move {
+                    received.lock().unwrap().push(json!(event.servers));
+                    Ok(None::<Value>)
+                }
+            },
+        )
+        .unwrap();
+    })])
+    .await;
+    host.emit_mcp_servers_change(vec![json!({"name": "docs", "enabled": true})])
+        .await;
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![json!([{"name": "docs", "enabled": true}])]
+    );
+}

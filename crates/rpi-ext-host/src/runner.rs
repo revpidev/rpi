@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::api::BoxFuture;
 use crate::api::{
@@ -262,6 +263,17 @@ impl ExtensionRunnerCore {
     /// `createContext` (runner.ts:665-738).
     pub fn create_context(&self) -> ExtensionContext {
         ExtensionContext::new(self.runtime.clone(), self.cwd.clone())
+    }
+
+    /// `createToolContext` (runner.ts:950-980 @ a13d35a74): the context a
+    /// tool's `execute` receives; carries the calling id and signal so
+    /// `ctx.executeTool()` can run nested calls under it (V16-06 FR-E).
+    pub fn create_tool_context(
+        &self,
+        tool_call_id: String,
+        signal: CancellationToken,
+    ) -> ExtensionContext {
+        ExtensionContext::for_tool(self.runtime.clone(), self.cwd.clone(), tool_call_id, signal)
     }
 
     /// `createCommandContext` (runner.ts:740-777) — command handlers get
@@ -841,7 +853,9 @@ impl ExtensionRunnerCore {
 
     /// `emitToolResult` (runner.ts:864-917): partial-patch chaining — each
     /// non-undefined result field replaces the corresponding event field and
-    /// later handlers observe earlier patches.
+    /// later handlers observe earlier patches. A handler that replaces
+    /// `content` without restating `structuredContent` drops it
+    /// (runner.ts:1185-1196 @ a13d35a74; V16-06 FR-C).
     pub async fn emit_tool_result(&self, payload: Value) -> Option<Value> {
         let mut current_event = payload.clone();
         let mut modified = false;
@@ -854,6 +868,9 @@ impl ExtensionRunnerCore {
                         continue;
                     }
                     // camelCase patch keys (types.ts:1079-1084).
+                    let content_replaced = handler_result
+                        .get("content")
+                        .is_some_and(|value| !value.is_null());
                     for key in ["content", "details", "isError", "usage"] {
                         if let Some(value) = handler_result.get(key)
                             && !value.is_null()
@@ -863,6 +880,25 @@ impl ExtensionRunnerCore {
                             }
                             modified = true;
                         }
+                    }
+                    if content_replaced {
+                        // Structured content that is not replaced along with
+                        // the content may no longer match it.
+                        let restated = handler_result
+                            .get("structuredContent")
+                            .is_some_and(|value| !value.is_null());
+                        if !restated && let Value::Object(map) = &mut current_event {
+                            map.remove("structuredContent");
+                        }
+                        modified = true;
+                    }
+                    if let Some(value) = handler_result.get("structuredContent")
+                        && !value.is_null()
+                    {
+                        if let Value::Object(map) = &mut current_event {
+                            map.insert("structuredContent".to_owned(), value.clone());
+                        }
+                        modified = true;
                     }
                 }
                 Err(error) => {
@@ -875,10 +911,16 @@ impl ExtensionRunnerCore {
             return None;
         }
 
-        // The result carries exactly the four patchable fields
+        // The result carries exactly the five patchable fields
         // (runner.ts:911-916).
         let mut out = Map::new();
-        for key in ["content", "details", "isError", "usage"] {
+        for key in [
+            "content",
+            "details",
+            "structuredContent",
+            "isError",
+            "usage",
+        ] {
             if let Some(value) = current_event.get(key) {
                 out.insert(key.to_owned(), value.clone());
             }

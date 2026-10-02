@@ -183,13 +183,17 @@ impl rpi_agent::types::AgentTool for HostToolAdapter {
         // #9548 (wrapper.ts): plain `wrapToolDefinition` execution — the
         // addedToolNames attachment went with the deferred-tool mechanism
         // (tool changes ride transcript system messages now).
+        let signal = signal;
+        let ctx = self
+            .host
+            .core()
+            .create_tool_context(tool_call_id.to_owned(), signal.clone());
         let request = ext::ToolExecuteRequest {
             tool_call_id: tool_call_id.to_owned(),
             params,
             signal,
             on_update,
         };
-        let ctx = self.host.core().create_context();
         (self.definition.execute)(request, ctx)
             .await
             .map_err(rpi_agent::AgentError::Tool)
@@ -365,13 +369,17 @@ impl ExtensionRunner for ExtensionHostAdapter {
         tool_call_id: &str,
         tool_name: &str,
         input: Value,
+        parent_tool_call_id: Option<&str>,
     ) -> Option<ToolCallOutcome> {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "type": ext::EVENT_TOOL_CALL,
             "toolCallId": tool_call_id,
             "toolName": tool_name,
             "input": input,
         });
+        if let Some(parent) = parent_tool_call_id {
+            payload["parentToolCallId"] = Value::String(parent.to_owned());
+        }
         match self.host.emit_tool_call(payload).await {
             Ok(Some(result)) => Some(ToolCallOutcome {
                 block: result.get("block").and_then(Value::as_bool),
@@ -399,6 +407,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn emit_tool_result(
         &self,
         tool_call_id: &str,
@@ -406,10 +415,12 @@ impl ExtensionRunner for ExtensionHostAdapter {
         input: Value,
         content: &[rpi_ai::types::ToolResultContent],
         details: &Value,
+        structured_content: Option<&Value>,
         is_error: bool,
         usage: Option<&rpi_ai::types::Usage>,
+        parent_tool_call_id: Option<&str>,
     ) -> Option<ToolResultPatch> {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "type": ext::EVENT_TOOL_RESULT,
             "toolCallId": tool_call_id,
             "toolName": tool_name,
@@ -419,6 +430,12 @@ impl ExtensionRunner for ExtensionHostAdapter {
             "isError": is_error,
             "usage": usage,
         });
+        if let Some(structured) = structured_content {
+            payload["structuredContent"] = structured.clone();
+        }
+        if let Some(parent) = parent_tool_call_id {
+            payload["parentToolCallId"] = Value::String(parent.to_owned());
+        }
         let result = self.host.emit_tool_result(payload).await?;
         Some(ToolResultPatch {
             content: result
@@ -427,6 +444,10 @@ impl ExtensionRunner for ExtensionHostAdapter {
                 .filter(|c| !c.is_null())
                 .and_then(Self::parse),
             details: result.get("details").cloned().filter(|d| !d.is_null()),
+            structured_content: result
+                .get("structuredContent")
+                .cloned()
+                .filter(|c| !c.is_null()),
             is_error: result.get("isError").and_then(Value::as_bool),
             usage: result
                 .get("usage")

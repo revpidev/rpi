@@ -80,6 +80,7 @@ fn test_config() -> AgentLoopConfig {
         get_follow_up_messages: None,
         before_tool_call: None,
         after_tool_call: None,
+        nested_call_summary: None,
     }
 }
 

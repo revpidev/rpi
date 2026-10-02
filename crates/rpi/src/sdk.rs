@@ -488,16 +488,19 @@ pub async fn create_agent_session(
                 };
                 let stream_options_with_headers = rpi_ai::models::ModelsSimpleStreamOptions {
                     simple,
-                    transform_headers: Some(Arc::new(move |headers| {
-                        let runner = crate::core::extensions::read_runner(&runner_ref);
-                        Box::pin(async move {
-                            if runner.has_handlers("before_provider_headers") {
-                                runner.emit_before_provider_headers(headers).await
-                            } else {
-                                headers
-                            }
-                        })
-                            as BoxFuture<'static, rpi_ai::types::ProviderHeaders>
+                    transform_headers: Some(Arc::new({
+                        let runner_ref = runner_ref.clone();
+                        move |headers| {
+                            let runner = crate::core::extensions::read_runner(&runner_ref);
+                            Box::pin(async move {
+                                if runner.has_handlers("before_provider_headers") {
+                                    runner.emit_before_provider_headers(headers).await
+                                } else {
+                                    headers
+                                }
+                            })
+                                as BoxFuture<'static, rpi_ai::types::ProviderHeaders>
+                        }
                     })),
                 };
                 // Arm the cache warmer from session requests only
@@ -563,11 +566,49 @@ pub async fn create_agent_session(
                     messages: context.messages,
                     tools: None,
                 };
-                Box::pin(model_runtime.stream_simple(
+                let stream = model_runtime.stream_simple(
                     &model,
                     &facade_context,
                     Some(stream_options_with_headers),
-                )) as rpi_agent::BoxStream<'static, rpi_ai::types::StreamEvent>
+                );
+                // V16-06 FR-F R1: `provider_stream_event` — a notification per
+                // parsed provider stream event, emitted in stream order
+                // (handlers awaited before the consumer sees the event) and
+                // never persisted. rpi adapters parse straight into pi
+                // `StreamEvent`s, so `data` is the parsed event JSON (the
+                // closest carrier equivalent of upstream's pre-normalization
+                // observation; registered in the task's implementation
+                // decisions).
+                let runner_ref_for_stream = runner_ref.clone();
+                let stream_provider = model.provider.clone();
+                let stream_api = model.api.to_string();
+                let stream_model = model.id.clone();
+                Box::pin(futures::StreamExt::then(stream, move |event| {
+                    let runner_ref = runner_ref_for_stream.clone();
+                    let provider = stream_provider.clone();
+                    let api = stream_api.clone();
+                    let model_id = stream_model.clone();
+                    async move {
+                        let runner = crate::core::extensions::read_runner(&runner_ref);
+                        if runner.has_handlers("provider_stream_event") {
+                            let data =
+                                serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+                            runner
+                                .emit_event(
+                                    "provider_stream_event",
+                                    serde_json::json!({
+                                        "type": "provider_stream_event",
+                                        "provider": provider,
+                                        "api": api,
+                                        "model": model_id,
+                                        "data": data,
+                                    }),
+                                )
+                                .await;
+                        }
+                        event
+                    }
+                })) as rpi_agent::BoxStream<'static, rpi_ai::types::StreamEvent>
             },
         )
     };
@@ -801,10 +842,21 @@ fn after_tool_call_with_image_normalization(
                     return Ok(None);
                 }
 
+                // `structuredContent: hookResult ? hookResult.structuredContent
+                // : result.structuredContent` (agent-session.ts:528 @
+                // a13d35a74): without a hook patch the executed result's
+                // structured content survives image normalization; with one,
+                // the patch decides (null when a handler replaced `content`
+                // without restating it).
+                let structured_content = match &extension_result {
+                    Some(result) => result.structured_content.clone(),
+                    None => context.result.structured_content.clone(),
+                };
                 let extension_result = extension_result.unwrap_or_default();
                 Ok(Some(rpi_agent::agent_loop::AfterToolCallResult {
                     content: Some(normalized.content),
                     details: extension_result.details,
+                    structured_content,
                     is_error: extension_result.is_error.or(Some(context.is_error)),
                     usage: extension_result.usage,
                     terminate: None,

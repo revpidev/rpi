@@ -32,6 +32,9 @@ use rpi_agent::compaction::branch_summarization::{
 };
 use rpi_agent::compaction::{CompactionResult, SummarizationArgs, estimate_context_tokens};
 use rpi_agent::messages::{AgentMessage, BashExecutionMessage, CustomMessage, CustomRole};
+use rpi_agent::nested_tool_calls::{
+    NestedCallRunner, NestedToolCallHost, NestedToolCallOptions, NestedToolExecutionEvent,
+};
 use rpi_agent::session::SessionEntry;
 use rpi_agent::types::{AgentEvent, AgentTool, QueueMode, ThinkingLevel};
 use rpi_agent::{Agent, AgentError};
@@ -492,6 +495,9 @@ struct AgentSessionInner {
     /// hooks. They stay active and callable, and the transcript still
     /// declares them, so the active set survives `/tree` and resume.
     hidden_declarations: Mutex<HashSet<String>>,
+    /// `_nestedToolCalls` (agent-session.ts:450-451 @ a13d35a74): created on
+    /// the first `ctx.executeTool()` call (V16-06 FR-E).
+    nested_tool_calls: tokio::sync::Mutex<Option<Arc<NestedCallRunner>>>,
     /// `_customTools` (agent-session.ts:345) — SDK-provided tools.
     custom_tools: Vec<Arc<dyn AgentTool>>,
     session_env_cell: Arc<std::sync::RwLock<crate::tools::SessionEnv>>,
@@ -561,6 +567,180 @@ impl std::fmt::Debug for ToolDefinitionEntry {
             .field("exposure", &self.exposure)
             .field("source_info", &self.source_info)
             .finish_non_exhaustive()
+    }
+}
+
+/// Session-side [`NestedToolCallHost`] (V16-06 FR-E): resolves callable
+/// tools, runs nested calls through the agent pipeline with parent-aware
+/// hooks, and emits `tool_execution_*` events to extensions and session
+/// listeners.
+struct SessionNestedHost {
+    session: WeakAgentSession,
+}
+
+fn nested_error_result(message: &str) -> rpi_agent::types::AgentToolResult {
+    rpi_agent::types::AgentToolResult {
+        content: vec![rpi_ai::types::ToolResultContent::Text(
+            rpi_ai::types::TextContent {
+                text: message.to_owned(),
+                text_signature: None,
+            },
+        )],
+        details: serde_json::json!({}),
+        ..Default::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl NestedToolCallHost for SessionNestedHost {
+    fn get_tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.session
+            .upgrade()
+            .map(|session| session.callable_tools())
+            .unwrap_or_default()
+    }
+
+    fn is_sequential(&self) -> bool {
+        self.session.upgrade().is_some_and(|session| {
+            session.inner.agent.tool_execution == rpi_agent::types::ToolExecutionMode::Sequential
+        })
+    }
+
+    async fn run_tool_call(
+        &self,
+        tool_call: rpi_agent::types::AgentToolCall,
+        parent_tool_call_id: String,
+        signal: Option<CancellationToken>,
+        on_update: rpi_agent::types::AgentToolUpdateCallback,
+    ) -> Result<rpi_agent::agent_loop::AgentToolCallOutcome, AgentError> {
+        let Some(session) = self.session.upgrade() else {
+            return Ok(rpi_agent::agent_loop::AgentToolCallOutcome {
+                tool_call,
+                result: nested_error_result("No session issued this call"),
+                is_error: true,
+            });
+        };
+        let Some(assistant_message) = session.find_last_assistant_message() else {
+            return Ok(rpi_agent::agent_loop::AgentToolCallOutcome {
+                tool_call,
+                result: nested_error_result("No assistant message issued this call"),
+                is_error: true,
+            });
+        };
+        let state = session.inner.agent.state();
+        let context = rpi_agent::agent_loop::AgentContext {
+            messages: state.messages.clone(),
+            tools: Some(state.tools.clone()),
+        };
+        let runner_ref = session.inner.extension_runner_ref.clone();
+        let before_tool_call = crate::core::extensions::extension_before_tool_call_hook_with_parent(
+            runner_ref.clone(),
+            Some(parent_tool_call_id.clone()),
+        );
+        let after_tool_call = crate::core::extensions::extension_after_tool_call_hook_with_parent(
+            runner_ref,
+            Some(parent_tool_call_id),
+        );
+        Ok(rpi_agent::agent_loop::run_tool_call(
+            tool_call,
+            rpi_agent::agent_loop::RunToolCallOptions {
+                tools: session.callable_tools(),
+                assistant_message,
+                context,
+                before_tool_call: Some(before_tool_call),
+                after_tool_call: Some(after_tool_call),
+                signal,
+                on_update: Some(on_update),
+            },
+        )
+        .await)
+    }
+
+    async fn emit(&self, event: NestedToolExecutionEvent) {
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        // `await this._extensionRunner.emit(event); this._emit(event)`
+        // (agent-session.ts:727-731 @ a13d35a74).
+        let (event_name, payload, agent_event) = match event {
+            NestedToolExecutionEvent::Start {
+                tool_call_id,
+                tool_name,
+                args,
+                parent_tool_call_id,
+            } => (
+                "tool_execution_start",
+                serde_json::json!({
+                    "type": "tool_execution_start",
+                    "toolCallId": tool_call_id,
+                    "toolName": tool_name,
+                    "args": args,
+                    "parentToolCallId": parent_tool_call_id,
+                }),
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id,
+                    tool_name,
+                    args,
+                    parent_tool_call_id: Some(parent_tool_call_id),
+                },
+            ),
+            NestedToolExecutionEvent::Update {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+                parent_tool_call_id,
+            } => {
+                let partial = serde_json::to_value(&partial_result).unwrap_or(Value::Null);
+                (
+                    "tool_execution_update",
+                    serde_json::json!({
+                        "type": "tool_execution_update",
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "args": args,
+                        "partialResult": partial,
+                        "parentToolCallId": parent_tool_call_id,
+                    }),
+                    AgentEvent::ToolExecutionUpdate {
+                        tool_call_id,
+                        tool_name,
+                        args,
+                        partial_result: partial,
+                        parent_tool_call_id: Some(parent_tool_call_id),
+                    },
+                )
+            }
+            NestedToolExecutionEvent::End {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+                parent_tool_call_id,
+            } => {
+                let result = serde_json::to_value(&result).unwrap_or(Value::Null);
+                (
+                    "tool_execution_end",
+                    serde_json::json!({
+                        "type": "tool_execution_end",
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "result": result,
+                        "isError": is_error,
+                        "parentToolCallId": parent_tool_call_id,
+                    }),
+                    AgentEvent::ToolExecutionEnd {
+                        tool_call_id,
+                        tool_name,
+                        result,
+                        is_error,
+                        parent_tool_call_id: Some(parent_tool_call_id),
+                    },
+                )
+            }
+        };
+        session.runner().emit_event(event_name, payload).await;
+        session.emit(AgentSessionEvent::Agent(Box::new(agent_event)));
     }
 }
 
@@ -713,6 +893,7 @@ impl AgentSession {
             tool_registry: Mutex::new(OrderedMap::default()),
             tool_definitions: Mutex::new(OrderedMap::default()),
             hidden_declarations: Mutex::new(HashSet::new()),
+            nested_tool_calls: tokio::sync::Mutex::new(None),
             custom_tools: config.custom_tools.clone(),
             session_env_cell: Arc::new(std::sync::RwLock::new(crate::tools::SessionEnv {
                 session_id: String::new(),
@@ -807,6 +988,10 @@ impl AgentSession {
         // 1720-1738 @ a13d35a74): `prepareLoadout` hidden declarations are
         // removed from the declarations every request carries.
         session.install_hidden_declarations_projection();
+        // `_nestedToolCalls` lookup (agent-session.ts:1075-1085 @
+        // a13d35a74): finished model-issued calls take their bounded
+        // nested-call record onto the result message (V16-06 FR-E).
+        session.install_nested_call_summary();
         // `_installAgentForcedPromptProjection()` (agent-session.ts:417 @
         // #9548).
         session.install_agent_forced_prompt_projection();
@@ -1536,6 +1721,10 @@ impl AgentSession {
 
     /// `_handleAgentEvent` (agent-session.ts:595-666).
     async fn handle_agent_event(&self, event: AgentEvent) {
+        // `_nestedToolCalls.clear()` on `agent_end` (agent-session.ts:1082-1084).
+        if matches!(event, AgentEvent::AgentEnd { .. }) {
+            self.clear_nested_tool_calls().await;
+        }
         // When a user message starts, remove it from the pending queues
         // BEFORE emitting (agent-session.ts:598-616).
         if let AgentEvent::MessageStart {
@@ -2356,6 +2545,65 @@ impl AgentSession {
             .collect()
     }
 
+    /// Install the nested-call summary lookup on the shared agent
+    /// (`_handleAgentEvent`'s `takeRecord`, agent-session.ts:1075-1085 @
+    /// a13d35a74; V16-06 FR-E). The loop calls it for each finished
+    /// model-issued tool call.
+    fn install_nested_call_summary(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner
+            .agent
+            .set_nested_call_summary(Some(Arc::new(move |tool_call_id: &str| {
+                let inner = weak.upgrade()?;
+                let runner = inner
+                    .nested_tool_calls
+                    .try_lock()
+                    .ok()
+                    .and_then(|slot| slot.clone());
+                let runner = runner?;
+                runner.take_record(tool_call_id)
+            })));
+    }
+
+    /// The session's nested-call runner, created on first use
+    /// (`_executeNestedToolCall`'s lazy `_nestedToolCalls`, agent-session.ts:708-735).
+    pub async fn nested_call_runner(&self) -> Arc<NestedCallRunner> {
+        let mut slot = self.inner.nested_tool_calls.lock().await;
+        if let Some(runner) = slot.as_ref() {
+            return runner.clone();
+        }
+        let runner = Arc::new(NestedCallRunner::new(Arc::new(SessionNestedHost {
+            session: self.downgrade(),
+        })));
+        *slot = Some(runner.clone());
+        runner
+    }
+
+    /// `_executeNestedToolCall` (agent-session.ts:697-735 @ a13d35a74): run
+    /// a call a tool made through `ctx.executeTool()` against the callable
+    /// tools, through the same pipeline and hooks as model-issued calls.
+    pub async fn execute_nested_tool_call(
+        &self,
+        parent_tool_call_id: &str,
+        name: &str,
+        args: Value,
+        options: NestedToolCallOptions,
+    ) -> Result<rpi_agent::agent_loop::AgentToolCallOutcome, rpi_agent::AgentError> {
+        let runner = self.nested_call_runner().await;
+        runner
+            .execute(parent_tool_call_id, name, args, options)
+            .await
+    }
+
+    /// Clear the nested-call scopes at `agent_end` (`_nestedToolCalls.clear()`,
+    /// agent-session.ts:1082-1084).
+    async fn clear_nested_tool_calls(&self) {
+        let runner = self.inner.nested_tool_calls.lock().await.clone();
+        if let Some(runner) = runner {
+            runner.clear();
+        }
+    }
+
     /// Refresh the shared `RPI_*` session env cell (requirements §3.3: bash
     /// resolves the tools' env per command spawn; model switches take effect immediately).
     fn sync_session_env(&self) {
@@ -2719,29 +2967,16 @@ impl AgentSession {
         options: &mut BuildSystemPromptOptions,
         messages: Option<&[AgentMessage]>,
     ) -> Option<rpi_ai::types::SystemMessage> {
-        // `selectedTools` filtered to the registry and deduplicated, tools
-        // set on the agent. Upstream mutates `options.selectedTools` in place
-        // (agent-session.ts:1150-1152), so the rendered sections AND the
-        // caller's stored run options carry exactly the executable loadout.
-        let registry = lock(&self.inner.tool_registry);
-        let mut valid_tool_names: Vec<String> = Vec::new();
-        let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
-        if let Some(selected) = &options.selected_tools {
-            let mut seen = std::collections::HashSet::new();
-            for name in selected {
-                if seen.insert(name.clone())
-                    && let Some(tool) = registry.get(name)
-                {
-                    valid_tool_names.push(name.clone());
-                    tools.push(tool.clone());
-                }
-            }
-        }
-        drop(registry);
+        // `options.selectedTools = this._applyToolLoadout(options.selectedTools)
+        // .map(t => t.name)` (agent-session.ts:1673-1676 @ a13d35a74): the
+        // prompt's selected tools are executable through the loadout hooks
+        // (description replacements + hidden declarations), and the agent
+        // tools are set from the same declared list.
+        let tools = self.apply_tool_loadout(options.selected_tools.clone().unwrap_or_default());
+        let valid_tool_names: Vec<String> =
+            tools.iter().map(|tool| tool.name().to_owned()).collect();
         self.inner.agent.set_tools(tools);
-        if options.selected_tools.is_some() {
-            options.selected_tools = Some(valid_tool_names);
-        }
+        options.selected_tools = Some(valid_tool_names);
 
         let replay_messages: Vec<rpi_ai::types::Message> = messages
             .unwrap_or(&self.inner.agent.state().messages)

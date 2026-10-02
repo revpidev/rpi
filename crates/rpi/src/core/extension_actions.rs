@@ -12,7 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rpi_ai::types::{ImageContent, UserContent};
 use rpi_ext_host::api::{
-    DeliverAs, ExecOptions, ExecResult, HostActions, SendMessageOptions, SendUserMessageOptions,
+    DeliverAs, ExecOptions, ExecResult, ExecuteToolOptions, ExecuteToolOutcome, HostActions,
+    SendMessageOptions, SendUserMessageOptions,
 };
 use rpi_ext_host::error::ExtError;
 use serde_json::Value;
@@ -534,6 +535,40 @@ impl HostActions for SessionHostActions {
             .remove_runtime_api_key(provider_id)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Backs `ExtensionToolContext.executeTool()` (types.ts:390-394 @
+    /// a13d35a74; V16-06 FR-E): run a nested tool call through the session's
+    /// nested-call runner (same validation, hooks, and permission checks as
+    /// model-issued calls). Tool failures come back as `is_error: true`.
+    async fn execute_tool(
+        &self,
+        caller_id: &str,
+        name: &str,
+        args: Value,
+        options: Option<ExecuteToolOptions>,
+    ) -> Result<ExecuteToolOutcome, ExtError> {
+        let Some(session) = self.session() else {
+            return Err(ExtError::Unbound("session is gone".to_owned()));
+        };
+        let options = options.unwrap_or_default();
+        let outcome = session
+            .execute_nested_tool_call(
+                caller_id,
+                name,
+                args,
+                rpi_agent::nested_tool_calls::NestedToolCallOptions {
+                    signal: options.signal,
+                    on_update: options.on_update,
+                },
+            )
+            .await
+            .map_err(|error| ExtError::Call(error.to_string()))?;
+        Ok(ExecuteToolOutcome {
+            tool_call: serde_json::to_value(&outcome.tool_call).unwrap_or(Value::Null),
+            result: outcome.result,
+            is_error: outcome.is_error,
+        })
     }
 }
 
