@@ -2347,9 +2347,8 @@ mod execute_tool_tests {
     #[test]
     fn execute_tool_without_a_caller_is_invalid_request() {
         let mut state = host_state(HashSet::from([Capability::Tools]));
-        let error = dispatch(&mut state, "executeTool", json!({"name": "echo"}))
-            .err()
-            .expect("rejected");
+        let error =
+            dispatch(&mut state, "executeTool", json!({"name": "echo"})).expect_err("rejected");
         assert_eq!(error.0, "invalidRequest");
         assert!(error.1.contains("during a tool execution"), "{error:?}");
     }
@@ -2358,9 +2357,8 @@ mod execute_tool_tests {
     fn execute_tool_with_a_caller_but_unbound_actions_reports_unbound() {
         let mut state = host_state(HashSet::from([Capability::Tools]));
         push_current_tool_call("call-1".to_owned());
-        let error = dispatch(&mut state, "executeTool", json!({"name": "echo"}))
-            .err()
-            .expect("rejected");
+        let error =
+            dispatch(&mut state, "executeTool", json!({"name": "echo"})).expect_err("rejected");
         pop_current_tool_call();
         assert_eq!(error.0, "unbound");
     }
