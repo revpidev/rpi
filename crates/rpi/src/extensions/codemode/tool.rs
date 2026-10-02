@@ -279,7 +279,7 @@ pub fn codemode_schema() -> Value {
     })
 }
 
-/// `createCodemodeToolDefinition` (tool.ts:406-427).
+/// `createCodemodeToolDefinition` (tool.ts:365-404).
 pub fn create_codemode_tool_definition(
     api: ExtensionApi,
     model_runtime: Arc<crate::core::model_runtime::ModelRuntime>,
@@ -312,7 +312,7 @@ pub fn create_codemode_tool_definition(
         ]),
         parameters: codemode_schema(),
         // Capable models write the script as raw text instead of a JSON-escaped
-        // string (tool.ts:422-424).
+        // string (tool.ts:380).
         constrained_sampling: Some(codemode_constrained_sampling()),
         output_schema: None,
         // Scripts must not start other scripts (tool.ts:416).
@@ -335,7 +335,7 @@ pub fn create_codemode_tool_definition(
     }
 }
 
-/// `constrainedSampling` (tool.ts:422-424): the Lark grammar that fixes the
+/// `constrainedSampling` (tool.ts:380): the Lark grammar that fixes the
 /// optional `// @options:` line; the OpenAI adapters consume the grammar
 /// variants when the model supports grammar tools.
 pub fn codemode_constrained_sampling() -> Value {

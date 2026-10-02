@@ -168,7 +168,8 @@ pub fn create_codemode_description(
         let section = render_tool_section(declaration);
         groups[index].entries.push(CatalogEntry {
             name: declaration.name.clone(),
-            cost: section.len().div_ceil(CHARS_PER_TOKEN),
+            // Upstream measures `String.length` (UTF-16 code units).
+            cost: section.encode_utf16().count().div_ceil(CHARS_PER_TOKEN),
             section,
         });
     }
