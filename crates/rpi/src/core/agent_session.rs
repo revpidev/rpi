@@ -1719,7 +1719,7 @@ impl AgentSession {
         self.resolve_idle_wait_if_idle();
     }
 
-    /// `_handleAgentEvent` (agent-session.ts:595-666).
+    /// `_handleAgentEvent` (agent-session.ts:1074-1086).
     async fn handle_agent_event(&self, event: AgentEvent) {
         // `_nestedToolCalls.clear()` on `agent_end` (agent-session.ts:1085).
         if matches!(event, AgentEvent::AgentEnd { .. }) {

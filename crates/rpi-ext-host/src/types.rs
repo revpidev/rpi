@@ -1038,7 +1038,7 @@ pub struct ToolResultEvent {
     pub details: Option<Value>,
     /// Machine-readable result for tools that declare an `outputSchema`.
     /// Handlers that redact `content` should also replace this; replacing
-    /// `content` alone drops it (runner.ts:1189-1193 @ a13d35a74).
+    /// `content` alone drops it (runner.ts:1185-1193 @ a13d35a74).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

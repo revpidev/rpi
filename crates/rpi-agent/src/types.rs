@@ -212,7 +212,7 @@ pub enum AgentEvent {
         tool_name: String,
         args: Value,
         /// Set when another tool (for example a codemode script) made this
-        /// call (types.ts:1040-1048 @ a13d35a74).
+        /// call (types.ts:1044-1051 @ a13d35a74; `parentToolCallId` at :1050).
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_tool_call_id: Option<String>,
     },

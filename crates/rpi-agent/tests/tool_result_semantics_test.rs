@@ -1,6 +1,7 @@
 //! V16-06 FR-C/E: tool-result semantics (`structuredContent` drop rule,
 //! `isError` carrying data) and the nested-call summary write on the tool
-//! result message (upstream `agent-loop.ts:709-754` / `:1075-1085`).
+//! result message (upstream `agent-loop.ts:853-903` /
+//! `agent-session.ts:1074-1086`).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

@@ -1908,7 +1908,7 @@ async fn execute_prepared_tool_call_with_sink(
     }
 }
 
-/// `finalizeExecutedToolCall` (agent-loop.ts:709-754). The five
+/// `finalizeExecutedToolCall` (agent-loop.ts:853-903). The five
 /// `afterToolCall` fields replace independently (no deep merge). Upstream
 /// wraps the hook in try/catch and downgrades a throw to an error result;
 /// `Err` from the Rust hook gets the same treatment.

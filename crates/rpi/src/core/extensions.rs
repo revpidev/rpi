@@ -220,7 +220,7 @@ pub struct ToolResultPatch {
     /// Machine-readable result for tools that declare an `outputSchema`
     /// (V16-06 FR-C). `None` with `content: Some(..)` means the handler
     /// replaced the content without restating it, so the structured content
-    /// is dropped (runner.ts:1189-1193 @ a13d35a74).
+    /// is dropped (runner.ts:1185-1193 @ a13d35a74).
     pub structured_content: Option<serde_json::Value>,
     pub is_error: Option<bool>,
     pub usage: Option<rpi_ai::types::Usage>,
@@ -754,7 +754,7 @@ pub fn extension_after_tool_call_hook_with_parent(
                         details: patch.details,
                         // Upstream deletes the structured content when a
                         // handler replaces `content` without restating it
-                        // (`finalizeExecutedToolCall`, agent-loop.ts:733-741).
+                        // (`finalizeExecutedToolCall`, agent-loop.ts:878-888).
                         structured_content: patch.structured_content,
                         // `hookResult.isError ?? isError` (agent-session.ts:512).
                         is_error: patch.is_error.or(Some(context.is_error)),
