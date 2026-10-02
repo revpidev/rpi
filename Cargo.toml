@@ -6,6 +6,7 @@ members = [
     "crates/rpi-agent",
     "crates/rpi-tui",
     "crates/rpi",
+    "crates/rpi-codemode",
     "crates/rpi-ext-host",
     "crates/rpi-ext-ask-user-question",
     "crates/rpi-ext-sdk",
@@ -29,6 +30,7 @@ license = "MIT"
 # Internal crates (dependency rules: docs/02-design.md §2.1, coding-standards §2.2).
 rpi-ai = { path = "crates/rpi-ai" }
 rpi-agent = { path = "crates/rpi-agent" }
+rpi-codemode = { path = "crates/rpi-codemode" }
 rpi-tui = { path = "crates/rpi-tui" }
 rpi-ext-host = { path = "crates/rpi-ext-host" }
 rpi-ext-ask-user-question = { path = "crates/rpi-ext-ask-user-question" }

@@ -3115,6 +3115,7 @@ dependencies = [
  "reqwest",
  "rpi-agent",
  "rpi-ai",
+ "rpi-codemode",
  "rpi-ext-host",
  "rpi-test-env",
  "rpi-test-support",
@@ -3189,6 +3190,22 @@ dependencies = [
  "tracing",
  "url",
  "zstd",
+]
+
+[[package]]
+name = "rpi-codemode"
+version = "0.1.5"
+dependencies = [
+ "futures",
+ "rpi-test-env",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wasmtime",
 ]
 
 [[package]]

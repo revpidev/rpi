@@ -1,0 +1,23 @@
+[package]
+name = "rpi-codemode"
+description = "Sandboxed JavaScript execution (QuickJS via wasmtime) where the only capability is calling injected tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+sha2.workspace = true
+# ADR-0034 decision 3 / ADR-0035: the single JS execution engine is a
+# vendored quickjs.wasm instance driven through wasmtime (never a second JS
+# engine, never a native QuickJS build). Same major line as rpi-ext-host.
+wasmtime = "47"
+
+[dev-dependencies]
+rpi-test-env.workspace = true
