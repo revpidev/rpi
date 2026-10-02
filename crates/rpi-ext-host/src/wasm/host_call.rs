@@ -2296,3 +2296,72 @@ mod model_registry_stream_tests {
         assert_eq!(error.0, "invalidRequest");
     }
 }
+
+/// V16-06 FR-E: `executeTool` dispatch-level behavior — capability gate,
+/// caller resolution from the in-flight `toolExecute` stack, and the
+/// unbound/absent-caller error kinds. The full nested pipeline is covered by
+/// `rpi/tests/tool_orchestration_test.rs`.
+#[cfg(test)]
+mod execute_tool_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::{
+        CapabilityRequirement, dispatch, pop_current_tool_call, push_current_tool_call,
+        required_capability,
+    };
+    use crate::api::{ExtensionApi, ExtensionRuntime, LoadedExtension};
+    use crate::wasm::{Capability, DispatchTarget, HostState, WasmForward};
+
+    fn host_state(capabilities: HashSet<Capability>) -> HostState {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:v16-06>", "<inline:v16-06>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        }
+    }
+
+    #[test]
+    fn execute_tool_is_tools_gated() {
+        assert!(matches!(
+            required_capability("executeTool"),
+            CapabilityRequirement::Requires(Capability::Tools)
+        ));
+    }
+
+    #[test]
+    fn execute_tool_without_a_caller_is_invalid_request() {
+        let mut state = host_state(HashSet::from([Capability::Tools]));
+        let error = dispatch(&mut state, "executeTool", json!({"name": "echo"}))
+            .err()
+            .expect("rejected");
+        assert_eq!(error.0, "invalidRequest");
+        assert!(error.1.contains("during a tool execution"), "{error:?}");
+    }
+
+    #[test]
+    fn execute_tool_with_a_caller_but_unbound_actions_reports_unbound() {
+        let mut state = host_state(HashSet::from([Capability::Tools]));
+        push_current_tool_call("call-1".to_owned());
+        let error = dispatch(&mut state, "executeTool", json!({"name": "echo"}))
+            .err()
+            .expect("rejected");
+        pop_current_tool_call();
+        assert_eq!(error.0, "unbound");
+    }
+}

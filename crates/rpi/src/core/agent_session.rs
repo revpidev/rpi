@@ -497,7 +497,7 @@ struct AgentSessionInner {
     hidden_declarations: Mutex<HashSet<String>>,
     /// `_nestedToolCalls` (agent-session.ts:450-451 @ a13d35a74): created on
     /// the first `ctx.executeTool()` call (V16-06 FR-E).
-    nested_tool_calls: tokio::sync::Mutex<Option<Arc<NestedCallRunner>>>,
+    nested_tool_calls: Mutex<Option<Arc<NestedCallRunner>>>,
     /// `_customTools` (agent-session.ts:345) — SDK-provided tools.
     custom_tools: Vec<Arc<dyn AgentTool>>,
     session_env_cell: Arc<std::sync::RwLock<crate::tools::SessionEnv>>,
@@ -893,7 +893,7 @@ impl AgentSession {
             tool_registry: Mutex::new(OrderedMap::default()),
             tool_definitions: Mutex::new(OrderedMap::default()),
             hidden_declarations: Mutex::new(HashSet::new()),
-            nested_tool_calls: tokio::sync::Mutex::new(None),
+            nested_tool_calls: Mutex::new(None),
             custom_tools: config.custom_tools.clone(),
             session_env_cell: Arc::new(std::sync::RwLock::new(crate::tools::SessionEnv {
                 session_id: String::new(),
@@ -1723,7 +1723,7 @@ impl AgentSession {
     async fn handle_agent_event(&self, event: AgentEvent) {
         // `_nestedToolCalls.clear()` on `agent_end` (agent-session.ts:1082-1084).
         if matches!(event, AgentEvent::AgentEnd { .. }) {
-            self.clear_nested_tool_calls().await;
+            self.clear_nested_tool_calls();
         }
         // When a user message starts, remove it from the pending queues
         // BEFORE emitting (agent-session.ts:598-616).
@@ -2555,11 +2555,7 @@ impl AgentSession {
             .agent
             .set_nested_call_summary(Some(Arc::new(move |tool_call_id: &str| {
                 let inner = weak.upgrade()?;
-                let runner = inner
-                    .nested_tool_calls
-                    .try_lock()
-                    .ok()
-                    .and_then(|slot| slot.clone());
+                let runner = lock(&inner.nested_tool_calls).clone();
                 let runner = runner?;
                 runner.take_record(tool_call_id)
             })));
@@ -2567,8 +2563,8 @@ impl AgentSession {
 
     /// The session's nested-call runner, created on first use
     /// (`_executeNestedToolCall`'s lazy `_nestedToolCalls`, agent-session.ts:708-735).
-    pub async fn nested_call_runner(&self) -> Arc<NestedCallRunner> {
-        let mut slot = self.inner.nested_tool_calls.lock().await;
+    pub fn nested_call_runner(&self) -> Arc<NestedCallRunner> {
+        let mut slot = lock(&self.inner.nested_tool_calls);
         if let Some(runner) = slot.as_ref() {
             return runner.clone();
         }
@@ -2589,7 +2585,7 @@ impl AgentSession {
         args: Value,
         options: NestedToolCallOptions,
     ) -> Result<rpi_agent::agent_loop::AgentToolCallOutcome, rpi_agent::AgentError> {
-        let runner = self.nested_call_runner().await;
+        let runner = self.nested_call_runner();
         runner
             .execute(parent_tool_call_id, name, args, options)
             .await
@@ -2597,8 +2593,8 @@ impl AgentSession {
 
     /// Clear the nested-call scopes at `agent_end` (`_nestedToolCalls.clear()`,
     /// agent-session.ts:1082-1084).
-    async fn clear_nested_tool_calls(&self) {
-        let runner = self.inner.nested_tool_calls.lock().await.clone();
+    fn clear_nested_tool_calls(&self) {
+        let runner = lock(&self.inner.nested_tool_calls).clone();
         if let Some(runner) = runner {
             runner.clear();
         }
@@ -2977,6 +2973,14 @@ impl AgentSession {
             tools.iter().map(|tool| tool.name().to_owned()).collect();
         self.inner.agent.set_tools(tools);
         options.selected_tools = Some(valid_tool_names);
+        // `options.toolSnippets = Object.fromEntries(Object.entries(...)
+        // .filter(([name]) => !this._hiddenDeclarations.has(name)))`
+        // (agent-session.ts:1676-1679): the prompt's tool list matches the
+        // declarations the request carries.
+        let hidden = lock(&self.inner.hidden_declarations).clone();
+        if let Some(snippets) = options.tool_snippets.as_mut() {
+            snippets.retain(|name, _| !hidden.contains(name));
+        }
 
         let replay_messages: Vec<rpi_ai::types::Message> = messages
             .unwrap_or(&self.inner.agent.state().messages)
