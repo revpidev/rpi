@@ -147,7 +147,7 @@ pub fn to_codemode_declaration(tool: &ToolInfo) -> rpi_codemode::CodemodeToolInf
 }
 
 /// Tools a script may call: every given tool except the codemode tool
-/// itself (tool.ts:180-182).
+/// itself (tool.ts:169-171).
 pub fn get_codemode_callable_tools(tools: &[ToolInfo]) -> Vec<ToolInfo> {
     tools
         .iter()
@@ -188,7 +188,7 @@ fn loadout_tool_info(entry: &rpi_ext_host::types::ToolLoadoutEntry) -> ToolInfo 
 }
 
 /// How the codemode tool presents tools that are both declared and callable
-/// from scripts (`prepareCodemodeLoadout`, tool.ts:376-404).
+/// from scripts (`prepareCodemodeLoadout`, tool.ts:329-363).
 fn prepare_codemode_loadout(
     loadout: &ToolLoadout,
     options: &CodemodeToolOptions,
@@ -267,7 +267,7 @@ fn prepare_codemode_loadout(
     }
 }
 
-/// `codemodeSchema` (tool.ts:100-104).
+/// `codemodeSchema` (tool.ts:87-91).
 pub fn codemode_schema() -> Value {
     json!({
         "type": "object",
@@ -315,7 +315,7 @@ pub fn create_codemode_tool_definition(
         // string (tool.ts:380).
         constrained_sampling: Some(codemode_constrained_sampling()),
         output_schema: None,
-        // Scripts must not start other scripts (tool.ts:416).
+        // Scripts must not start other scripts (tool.ts:377).
         exposure: ToolExposure::ModelOnly,
         namespace: None,
         annotations: None,

@@ -46,7 +46,7 @@ pub struct CodemodeToolOptions {
     pub get_inline_budget: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 }
 
-/// `CodamodeNestedCall` (tool.ts:126-136): the renderer-facing call row.
+/// `CodemodeNestedCall` (tool.ts:105-117): the renderer-facing call row.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedCall {

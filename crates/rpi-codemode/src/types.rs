@@ -23,7 +23,7 @@ pub struct CodemodeToolContext {
 /// The future an injected tool/global returns.
 pub type CodemodeToolFuture = BoxFuture<'static, Result<Value, String>>;
 
-/// A function a script can call (`CodamodeTool`, types.ts:20-48). Tool and
+/// A function a script can call (`CodemodeTool`, types.ts:20-48). Tool and
 /// global registrations share the shape; `spread` and `signature` are global
 /// rendering concerns.
 #[derive(Clone)]
