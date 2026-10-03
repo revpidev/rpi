@@ -1,8 +1,7 @@
 # built-in MCP cross-implementation parity report (V16-08 §6 / G3)
 
-Generated: 2026-10-03T03:32:15.493Z (rerun: `node scripts/mcp-parity/run-builtin-mcp-parity.mjs`)
 Upstream: external/pi/packages/mcp @ a13d35a74 (McpClient + StdioTransport, tsx)
-rpi: crates/rpi-mcp @ 061f77a
+rpi: crates/rpi-mcp
 
 Normalization: JSON-RPC ids → `$id`; `clientInfo.name` → `parity-client` (O1 brand exemption); frame transcripts recorded server-side by the shared fixture so a diff isolates the client.
 

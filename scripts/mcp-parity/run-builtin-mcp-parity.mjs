@@ -171,9 +171,10 @@ const framesRpi = rpi?.document?.frames?.length ?? 0;
 const lines = [
   "# built-in MCP cross-implementation parity report (V16-08 §6 / G3)",
   "",
-  `Generated: ${new Date().toISOString()} (rerun: \`node scripts/mcp-parity/run-builtin-mcp-parity.mjs\`)`,
+  // No volatile lines (no timestamp, no run-time HEAD): the committed report
+  // must be byte-identical across reruns so `git status` stays clean.
   `Upstream: external/pi/packages/mcp @ ${PI_PIN} (McpClient + StdioTransport, tsx)`,
-  `rpi: crates/rpi-mcp @ ${spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout.trim()}`,
+  `rpi: crates/rpi-mcp`,
   "",
   "Normalization: JSON-RPC ids → `$id`; `clientInfo.name` → `parity-client` (O1 brand exemption); " +
     "frame transcripts recorded server-side by the shared fixture so a diff isolates the client.",
