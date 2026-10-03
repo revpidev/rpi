@@ -137,6 +137,13 @@ const APP_TITLE: &str = "rpi";
 /// the event loop is always awake; here the driver polls with this cap).
 const DRIVER_PUMP_CAP: Duration = Duration::from_millis(50);
 
+/// `TERMINAL_QUERY_TIMEOUT_MS` (theme-controller.ts:25 @ a13d35a74): how long
+/// the system theme stays grayscale before falling back to palette indices.
+const TERMINAL_QUERY_TIMEOUT_MS: u64 = 100;
+/// Tokio backstop for the first color result; the Tui's own deadline is the
+/// real timeout, this only covers tests without a pump.
+const TERMINAL_QUERY_BACKSTOP_MS: u64 = 150;
+
 /// Double-press window for Ctrl+C exit / double-Escape
 /// (interactive-mode.ts:3533-3541, 2573-2588).
 const DOUBLE_PRESS_MS: u64 = 500;
@@ -4162,7 +4169,7 @@ impl InteractiveUi {
         let late_ui = Arc::clone(self);
         self.ui
             .query_terminal_colors(rpi_tui::tui::TerminalColorQueryOptions {
-                timeout: Duration::from_millis(100),
+                timeout: Duration::from_millis(TERMINAL_QUERY_TIMEOUT_MS),
                 on_late_reply: Some(Box::new(move |colors| {
                     late_ui.push(UiCommand::ApplyTerminalColors(colors));
                     late_ui.render_handle.request_render();
@@ -4180,7 +4187,9 @@ impl InteractiveUi {
         commands_selectors::spawn_async(async move {
             // The Tui's own deadline resolves the oneshot; the tokio timeout
             // is a backstop for tests without a pump.
-            if let Ok(Ok(colors)) = tokio::time::timeout(Duration::from_millis(150), receiver).await
+            if let Ok(Ok(colors)) =
+                tokio::time::timeout(Duration::from_millis(TERMINAL_QUERY_BACKSTOP_MS), receiver)
+                    .await
             {
                 first_ui.push(UiCommand::ApplyTerminalColors(colors));
                 first_ui.render_handle.request_render();
@@ -5470,7 +5479,9 @@ impl InteractiveMode {
         // the reported colors when the terminal answers; late replies still
         // route through the drain.
         let receiver = self.ui_state.submit_terminal_color_query();
-        if let Ok(Ok(colors)) = tokio::time::timeout(Duration::from_millis(150), receiver).await {
+        if let Ok(Ok(colors)) =
+            tokio::time::timeout(Duration::from_millis(TERMINAL_QUERY_BACKSTOP_MS), receiver).await
+        {
             self.ui_state.apply_terminal_colors(colors);
         }
     }
