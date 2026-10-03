@@ -4142,13 +4142,13 @@ impl InteractiveUi {
     fn reapply_for_terminal(&self) {
         let name = self.resolved_theme_name();
         let active = lock(&self.active_theme_name).clone();
-        if name == crate::core::themes::SYSTEM_THEME_NAME || Some(&name) != active.as_ref() {
-            if let Ok(theme) = crate::core::themes::load_theme(
+        if (name == crate::core::themes::SYSTEM_THEME_NAME || Some(&name) != active.as_ref())
+            && let Ok(theme) = crate::core::themes::load_theme(
                 &name,
                 Some(crate::core::themes::terminal_color_mode()),
-            ) {
-                self.apply_theme(Arc::new(theme));
-            }
+            )
+        {
+            self.apply_theme(Arc::new(theme));
         }
     }
 

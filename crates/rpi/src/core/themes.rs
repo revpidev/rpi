@@ -205,6 +205,8 @@ pub fn create_system_theme(mode: Option<ColorMode>) -> Theme {
         appearance,
         dim,
     )
+    // Invariant: every generated token is a valid hex/index/empty value;
+    // `from_resolved` only fails on a malformed explicit color.
     .expect("generated system theme colors always build")
 }
 

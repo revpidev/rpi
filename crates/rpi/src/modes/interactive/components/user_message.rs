@@ -80,7 +80,7 @@ impl UserMessageComponent {
             let theme = Arc::clone(&self.theme);
             Box::new(move |content: &str| theme.bg("userMessageBg", content))
         };
-        self.content = StdBox::new(Markdown::new(
+        *self.content = Markdown::new(
             self.text.clone(),
             self.output_pad,
             1,
@@ -103,7 +103,7 @@ impl UserMessageComponent {
                 ),
                 ..Default::default()
             }),
-        ));
+        );
     }
 }
 

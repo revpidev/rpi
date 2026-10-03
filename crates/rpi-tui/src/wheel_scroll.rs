@@ -129,14 +129,12 @@ impl WheelScrollAccelerator {
             return 1;
         }
 
-        self.average_gap = Some(match self.average_gap {
+        let average_gap = match self.average_gap {
             None => gap,
             Some(average_gap) => (average_gap + gap) / 2.0,
-        });
-        let lines = MAX_AUTO_LINES
-            .min(REFERENCE_GAP_MS / self.average_gap.unwrap())
-            .max(1.0)
-            + self.carry;
+        };
+        self.average_gap = Some(average_gap);
+        let lines = MAX_AUTO_LINES.min(REFERENCE_GAP_MS / average_gap).max(1.0) + self.carry;
         let whole = lines.floor();
         self.carry = lines - whole;
         // `whole` is always in `1..=MAX_AUTO_LINES` here.
