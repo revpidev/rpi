@@ -447,14 +447,21 @@ pub fn convert_responses_messages(
                             let mut item_id: Option<&str> = item_id_raw;
 
                             // For different-model messages, set id to undefined to
-                            // avoid pairing validation (OpenAI tracks which fc_xxx
-                            // ids were paired with rs_xxx reasoning items). When
-                            // replaying custom-tool calls as a function_call, also
-                            // drop non-fc_* ids such as ctc_* custom-tool ids
-                            // because function_call item ids must be fc_*.
-                            let starts_with_fc = item_id.is_some_and(|id| id.starts_with("fc_"));
-                            if (is_different_model && starts_with_fc)
-                                || (custom_input_property.is_none() && !starts_with_fc)
+                            // avoid pairing validation (OpenAI tracks which item IDs
+                            // were paired with rs_xxx reasoning items). Also drop ids
+                            // that do not match the replayed item type:
+                            // function_call ids must be fc_* and custom_tool_call
+                            // ids must be ctc_*. Foreign tool call ids are
+                            // normalized to fc_*, and a call can switch between the
+                            // two types when grammar tool support differs
+                            // (bc2d8dc1c, radius#115).
+                            let item_id_prefix = if custom_input_property.is_none() {
+                                "fc_"
+                            } else {
+                                "ctc_"
+                            };
+                            if is_different_model
+                                || !item_id.is_some_and(|id| id.starts_with(item_id_prefix))
                             {
                                 item_id = None;
                             }
@@ -1469,6 +1476,27 @@ impl<'a> ResponsesStreamProcessor<'a> {
             return Err(
                 "OpenAI Responses stream ended before a terminal response event".to_owned(),
             );
+        }
+        // #9974 (`1b2aa0ca0`): the agent runs every tool call in the final
+        // message. Refuse calls whose `output_item.done` never arrived —
+        // their arguments may be cut off or mixed up when a non-compliant
+        // server omits `output_index` (llama.cpp). Finished calls removed
+        // their scratch buffers.
+        if self.output.stop_reason == StopReason::ToolUse {
+            for (index, block) in self.output.content.iter().enumerate() {
+                let AssistantContent::ToolCall(call) = block else {
+                    continue;
+                };
+                let unfinished = self.scratch.get(&index).is_some_and(|scratch| {
+                    scratch.partial_json.is_some() || scratch.custom_input.is_some()
+                });
+                if unfinished {
+                    return Err(format!(
+                        "OpenAI Responses stream completed with an unfinished tool call: {} ({})",
+                        call.name, call.id
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -2579,6 +2607,55 @@ mod tests {
         assert_eq!(
             result,
             Err("OpenAI Responses stream ended before a terminal response event".to_owned())
+        );
+    }
+
+    /// #9974 (`1b2aa0ca0`): a completed stream whose tool call never
+    /// received `output_item.done` fails instead of running cut-off or
+    /// mixed-up arguments.
+    #[test]
+    fn test_processor_rejects_unfinished_tool_call() {
+        let raw = vec![
+            json!({"type": "response.output_item.added", "sequence_number": 0, "output_index": 0,
+                   "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "bash", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "sequence_number": 1, "output_index": 0,
+                   "item_id": "fc_1", "delta": "{\"command\":\"rm -rf /tmp/build"}),
+            json!({"type": "response.completed", "sequence_number": 2,
+                   "response": {"id": "resp_unfinished", "status": "completed"}}),
+        ];
+        let m = model(json!({}));
+        let (_events, result, _output) = replay(&m, &no_grammar(), &raw);
+        let error = result.expect_err("unfinished tool calls must fail the stream");
+        assert!(
+            error.starts_with("OpenAI Responses stream completed with an unfinished tool call:"),
+            "got: {error}"
+        );
+        assert!(error.contains("bash"), "got: {error}");
+    }
+
+    /// #9974: parallel tool calls without `output_index` (llama.cpp) used to
+    /// run mixed-up calls; the stream now ends with an error.
+    #[test]
+    fn test_processor_rejects_parallel_tool_calls_without_output_index() {
+        let raw = vec![
+            json!({"type": "response.output_item.added",
+                   "item": {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "bash", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_a", "delta": "{\"command\":\"echo a\"}"}),
+            json!({"type": "response.output_item.added",
+                   "item": {"type": "function_call", "id": "fc_b", "call_id": "call_b", "name": "bash", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_b", "delta": "{\"command\":\"echo b\"}"}),
+            json!({"type": "response.output_item.done",
+                   "item": {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "bash", "arguments": "{\"command\":\"echo a\"}"}}),
+            json!({"type": "response.output_item.done",
+                   "item": {"type": "function_call", "id": "fc_b", "call_id": "call_b", "name": "bash", "arguments": "{\"command\":\"echo b\"}"}}),
+            json!({"type": "response.completed", "response": {"id": "resp_no_output_index", "status": "completed"}}),
+        ];
+        let m = model(json!({}));
+        let (_events, result, _output) = replay(&m, &no_grammar(), &raw);
+        let error = result.expect_err("unfinished tool calls must fail the stream");
+        assert!(
+            error.starts_with("OpenAI Responses stream completed with an unfinished tool call:"),
+            "got: {error}"
         );
     }
 

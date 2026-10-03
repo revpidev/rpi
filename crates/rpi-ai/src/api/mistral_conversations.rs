@@ -652,20 +652,11 @@ fn build_tool_result_text(
 // Reasoning selection (promptMode vs reasoningEffort)
 // ---------------------------------------------------------------------------
 
-/// `usesReasoningEffort`: models that take `reasoningEffort` instead of
-/// `promptMode`. #8700 (96617628e): all reasoning-capable `mistral-medium-*`
-/// models; #9375 (4bd3f48df): Mistral-hosted GLM-5.2 (`zai-glm-5-2` — the
-/// ignored `prompt_mode` parameter is replaced by `reasoning_effort`).
-fn uses_reasoning_effort(model: &Model) -> bool {
-    model.id == "mistral-small-2603"
-        || model.id == "mistral-small-latest"
-        || model.id.starts_with("mistral-medium-")
-        || model.id == "zai-glm-5-2"
-}
-
-/// `usesPromptModeReasoning`.
-fn uses_prompt_mode_reasoning(model: &Model) -> bool {
-    model.reasoning && !uses_reasoning_effort(model)
+/// `usesReasoningEffort` replacement (#9678 `dc84c1ac0`): models with a
+/// thinking level map use `reasoning_effort` with the mapped values; models
+/// without one (Magistral) use `prompt_mode`.
+fn has_reasoning_effort_map(model: &Model) -> bool {
+    model.reasoning && model.thinking_level_map.is_some()
 }
 
 /// `mapReasoningEffort`: the model's thinking-level map value, defaulting to
@@ -1047,7 +1038,14 @@ impl<'a> StreamProcessor<'a> {
         if let Some(content) = &choice.delta.content {
             match content {
                 DeltaContent::Text(text) => {
-                    self.push_text_delta(sanitize_surrogates(text), events);
+                    let text_delta = sanitize_surrogates(text);
+                    // GLM models on Mistral send empty content deltas around
+                    // thinking and tool calls; opening a block for them
+                    // splits thinking, which Mistral rejects on replay
+                    // (#9674 `8930b9ec0`).
+                    if !text_delta.is_empty() {
+                        self.push_text_delta(text_delta, events);
+                    }
                 }
                 DeltaContent::Chunks(items) => {
                     for item in items {
@@ -1076,6 +1074,9 @@ impl<'a> StreamProcessor<'a> {
                                 let text_delta = sanitize_surrogates(
                                     item.get("text").and_then(Value::as_str).unwrap_or(""),
                                 );
+                                if text_delta.is_empty() {
+                                    continue;
+                                }
                                 self.push_text_delta(text_delta, events);
                             }
                             _ => {}
@@ -1531,7 +1532,25 @@ pub fn stream_simple(
         .and_then(|o| o.reasoning)
         .map(|reasoning| clamp_thinking_level(model, reasoning.to_model_level()))
         .filter(|level| *level != ModelThinkingLevel::Off);
-    let should_use_reasoning = model.reasoning && reasoning.is_some();
+    // #9678 (`dc84c1ac0`): models with a thinking level map send
+    // `reasoning_effort` (including the model's off value when thinking is
+    // off); other reasoning models (Magistral) send `prompt_mode`.
+    let reasoning_effort = if has_reasoning_effort_map(model) {
+        match reasoning {
+            Some(level) => Some(map_reasoning_effort(model, level)),
+            None => model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(&ModelThinkingLevel::Off))
+                .and_then(|mapped| mapped.clone()),
+        }
+    } else {
+        None
+    };
+    let prompt_mode = (model.reasoning
+        && !has_reasoning_effort_map(model)
+        && reasoning.is_some())
+        .then_some(MistralPromptMode::Reasoning);
 
     Ok(stream(
         model,
@@ -1539,13 +1558,8 @@ pub fn stream_simple(
         MistralOptions {
             stream: base,
             tool_choice,
-            prompt_mode: (should_use_reasoning && uses_prompt_mode_reasoning(model))
-                .then_some(MistralPromptMode::Reasoning),
-            reasoning_effort: if should_use_reasoning && uses_reasoning_effort(model) {
-                reasoning.map(|level| map_reasoning_effort(model, level))
-            } else {
-                None
-            },
+            prompt_mode,
+            reasoning_effort,
         },
     ))
 }
@@ -2164,30 +2178,18 @@ mod tests {
 
     #[test]
     fn test_reasoning_mode_selection() {
-        // Mistral Small 4 / Medium family: reasoning_effort (#8700: the
-        // whole mistral-medium-* family, not just 3.5).
-        for id in [
-            "mistral-small-2603",
-            "mistral-small-latest",
-            "mistral-medium-3.5",
-            "mistral-medium-2506",
-            "mistral-medium-latest",
-        ] {
-            let model = reasoning_model(id);
-            assert!(uses_reasoning_effort(&model), "{id}");
-            assert!(!uses_prompt_mode_reasoning(&model), "{id}");
-        }
-        // Magistral: prompt_mode.
-        let model = reasoning_model("magistral-medium-latest");
-        assert!(!uses_reasoning_effort(&model));
-        assert!(uses_prompt_mode_reasoning(&model));
-        // #9375 (4bd3f48df): Mistral-hosted GLM-5.2 uses reasoning_effort.
-        let model = reasoning_model("zai-glm-5-2");
-        assert!(uses_reasoning_effort(&model));
-        assert!(!uses_prompt_mode_reasoning(&model));
-        // Non-reasoning model: neither.
-        let model = make_model(json!({}));
-        assert!(!uses_prompt_mode_reasoning(&model));
+        // #9678 (`dc84c1ac0`): a thinking level map decides between
+        // reasoning_effort and prompt_mode — no hardcoded model ids.
+        let small = make_model(json!({
+            "id": "mistral-small-2603",
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "none", "high": "high"}
+        }));
+        assert!(has_reasoning_effort_map(&small));
+        let magistral = reasoning_model("magistral-medium-latest");
+        assert!(!has_reasoning_effort_map(&magistral));
+        let non_reasoning = make_model(json!({}));
+        assert!(!has_reasoning_effort_map(&non_reasoning));
     }
 
     #[test]
@@ -2381,6 +2383,98 @@ mod tests {
         // is empty are skipped, not parsed.
         let model = make_model(json!({}));
         run_handle_sse(&model, "data:\n\nevent: ping\n\ndata:   \n\n").expect("empty events");
+    }
+
+    /// [`run_handle_sse`] that returns the accumulated assistant message.
+    fn run_handle_sse_output(model: &Model, sse_payload: &str) -> AssistantMessage {
+        let events = AssistantMessageEventStream::new();
+        let mut output = initial_output(model);
+        let mut processor = StreamProcessor::new(&mut output, model);
+        let mut decoder = SseDecoder::new();
+        for sse in decoder.feed(sse_payload.as_bytes()).expect("decode") {
+            processor.handle_sse(&sse, &events).expect("handle sse");
+        }
+        for sse in decoder.finish().expect("decode") {
+            processor.handle_sse(&sse, &events).expect("handle sse");
+        }
+        output
+    }
+
+    /// #9674 (`8930b9ec0`): GLM models on Mistral send empty content deltas
+    /// around thinking and tool calls; they must not open empty text blocks
+    /// or split thinking into two blocks.
+    #[test]
+    fn test_handle_sse_ignores_empty_content_deltas() {
+        let model = make_model(json!({"id": "zai-glm-5-3"}));
+        let thinking = |text: &str| json!({"type": "thinking", "thinking": [{"type": "text", "text": text}]});
+        let tool_call = |args: &str, first: bool| {
+            let mut call = json!({
+                "index": 0,
+                "function": {"name": if first { "read" } else { "" }, "arguments": args}
+            });
+            if first {
+                call["id"] = json!("abc123456");
+            }
+            call
+        };
+        let deltas = [
+            json!({"content": ""}),
+            json!({"content": [thinking("first part,")]}),
+            json!({"content": ""}),
+            json!({"content": [{"type": "text", "text": ""}]}),
+            json!({"content": [thinking(" second part."), {"type": "text", "text": "Reading."}]}),
+            json!({"content": "", "tool_calls": [tool_call("", true)]}),
+            json!({"content": "", "tool_calls": [tool_call("{\"path\":", false)]}),
+            json!({"content": "", "tool_calls": [tool_call("\"a.txt\"}", false)]}),
+            json!({"content": ""}),
+        ];
+        let mut payload = String::new();
+        for (index, delta) in deltas.iter().enumerate() {
+            let finish = if index == deltas.len() - 1 {
+                json!("tool_calls")
+            } else {
+                Value::Null
+            };
+            let event = json!({
+                "id": "response-1",
+                "model": model.id,
+                "choices": [{"index": 0, "finish_reason": finish, "delta": delta}],
+            });
+            payload.push_str(&format!("data: {event}\n\n"));
+        }
+        let output = run_handle_sse_output(&model, &payload);
+        let thinking_texts: Vec<String> = output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContent::Thinking(thinking) => Some(thinking.thinking.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_texts, vec!["first part, second part."]);
+        let text_texts: Vec<String> = output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_texts, vec!["Reading."]);
+        let tool_calls: Vec<&ToolCall> = output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "read");
+        assert_eq!(
+            Value::Object(tool_calls[0].arguments.clone()),
+            json!({"path": "a.txt"})
+        );
     }
 
     #[test]
@@ -2628,27 +2722,59 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_simple_reasoning_effort_models() {
-        // mistral-reasoning-mode.test.ts: reasoning_effort for Small 4 / Medium 3.5.
+        // mistral-reasoning-mode.test.ts: reasoning_effort for models with a
+        // thinking level map; off sends the map's off value (#9678).
         // (9dd90a497: the captured payload is camelCase until the wire remap.)
-        for id in ["mistral-small-2603", "mistral-medium-3.5"] {
-            let model = reasoning_model(id);
-            let payload = capture_payload(&model, Some(ThinkingLevel::Medium)).await;
-            assert_eq!(payload["reasoningEffort"], json!("high"), "{id}");
-            assert!(payload.get("promptMode").is_none(), "{id}");
-        }
-        // Thinking off: no reasoning controls at all.
-        let model = reasoning_model("mistral-small-2603");
-        let payload = capture_payload(&model, None).await;
-        assert!(payload.get("reasoningEffort").is_none());
+        let model = make_model(json!({
+            "id": "mistral-small-2603",
+            "reasoning": true,
+            "thinkingLevelMap": {
+                "off": "none", "minimal": null, "low": null,
+                "medium": null, "high": "high", "xhigh": null, "max": null
+            }
+        }));
+        let payload = capture_payload(&model, Some(ThinkingLevel::Medium)).await;
+        assert_eq!(payload["reasoningEffort"], json!("high"));
         assert!(payload.get("promptMode").is_none());
+
+        // Thinking off: the model's off value is sent (none), not dropped.
+        let payload = capture_payload(&model, None).await;
+        assert_eq!(payload["reasoningEffort"], json!("none"));
+        assert!(payload.get("promptMode").is_none());
+
+        // GLM 5.3 map: low/high/max pass through; medium maps to high.
+        let glm = make_model(json!({
+            "id": "zai-glm-5-3",
+            "reasoning": true,
+            "thinkingLevelMap": {
+                "off": null, "minimal": null, "low": "low",
+                "medium": null, "high": "high", "xhigh": null, "max": "max"
+            }
+        }));
+        for (level, expected) in [
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Max, "max"),
+            (ThinkingLevel::Medium, "high"),
+        ] {
+            let payload = capture_payload(&glm, Some(level)).await;
+            assert_eq!(payload["reasoningEffort"], json!(expected), "{level:?}");
+            assert!(payload.get("promptMode").is_none(), "{level:?}");
+        }
     }
 
     #[tokio::test]
     async fn test_stream_simple_prompt_mode_models() {
-        // mistral-reasoning-mode.test.ts: prompt_mode for Magistral models.
+        // mistral-reasoning-mode.test.ts: prompt_mode for reasoning models
+        // without a thinking level map (Magistral).
         let model = reasoning_model("magistral-medium-latest");
         let payload = capture_payload(&model, Some(ThinkingLevel::Medium)).await;
         assert_eq!(payload["promptMode"], json!("reasoning"));
+        assert!(payload.get("reasoningEffort").is_none());
+
+        // Thinking off: no reasoning controls.
+        let payload = capture_payload(&model, None).await;
+        assert!(payload.get("promptMode").is_none());
         assert!(payload.get("reasoningEffort").is_none());
     }
 }

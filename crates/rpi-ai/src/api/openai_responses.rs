@@ -382,10 +382,16 @@ pub fn build_params(
 
     // 25a2c8dcf (#7568): merged last so custom keys override the named
     // request fields.
-    if let Some(sampling_params) = &options.stream.sampling_params {
-        for (key, value) in sampling_params {
-            params[key.clone()] = value.clone();
+    // Last so custom keys override the named request fields. Per-request
+    // keys override model defaults (#9506 `c01f687e5`).
+    let mut sampling = model.sampling_params.clone().unwrap_or_default();
+    if let Some(option_params) = &options.stream.sampling_params {
+        for (key, value) in option_params {
+            sampling.insert(key.clone(), value.clone());
         }
+    }
+    for (key, value) in &sampling {
+        params[key.clone()] = value.clone();
     }
 
     Ok(params)
@@ -399,7 +405,10 @@ pub fn build_params(
 pub fn get_service_tier_cost_multiplier(model_id: &str, service_tier: Option<&str>) -> f64 {
     match service_tier {
         Some("flex") => 0.5,
-        Some("priority") => {
+        // #10034 (`a6ca86102`): GPT-6 models report Fast mode as `"fast"`
+        // (the new name for priority processing) even when `"priority"` was
+        // requested.
+        Some("priority") | Some("fast") => {
             if model_id == "gpt-5.5" {
                 2.5
             } else {
@@ -1010,6 +1019,24 @@ mod tests {
         let plain = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
         assert!(plain.get("top_p").is_none());
         assert!(plain.get("temperature").is_none());
+
+        // #9506 (`c01f687e5`): model-level defaults apply to direct
+        // stream()/complete() calls; request keys override them.
+        let model_with_defaults = model(json!({
+            "samplingParams": {"top_p": 0.95, "min_p": 0.05}
+        }));
+        let override_options = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                sampling_params: Some(
+                    [("top_p".to_owned(), json!(0.5))].into_iter().collect(),
+                ),
+                ..StreamOptions::default()
+            },
+            ..OpenAIResponsesOptions::default()
+        };
+        let merged = params_for(&model_with_defaults, &ctx, &override_options);
+        assert_eq!(merged["top_p"], json!(0.5));
+        assert_eq!(merged["min_p"], json!(0.05));
     }
 
     // -- transcript tool additions (#9548; replaces the e47b8e37a-era
@@ -1472,6 +1499,15 @@ mod tests {
         assert_eq!(
             get_service_tier_cost_multiplier("gpt-5.5", Some("priority")),
             2.5
+        );
+        // #10034 (`a6ca86102`): GPT-6 reports Fast mode as "fast".
+        assert_eq!(
+            get_service_tier_cost_multiplier("gpt-6-luna", Some("fast")),
+            2.0
+        );
+        assert_eq!(
+            get_service_tier_cost_multiplier("gpt-6-luna", Some("priority")),
+            2.0
         );
         assert_eq!(
             get_service_tier_cost_multiplier("gpt-4o", Some("auto")),

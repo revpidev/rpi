@@ -429,10 +429,16 @@ pub fn build_params(
 
     // 25a2c8dcf (#7568): merged last so custom keys override the named
     // request fields.
-    if let Some(sampling_params) = &options.stream.sampling_params {
-        for (key, value) in sampling_params {
-            params[key.clone()] = value.clone();
+    // Last so custom keys override the named request fields. Per-request
+    // keys override model defaults (#9506 `c01f687e5`).
+    let mut sampling = model.sampling_params.clone().unwrap_or_default();
+    if let Some(option_params) = &options.stream.sampling_params {
+        for (key, value) in option_params {
+            sampling.insert(key.clone(), value.clone());
         }
+    }
+    for (key, value) in &sampling {
+        params[key.clone()] = value.clone();
     }
 
     Ok(params)
@@ -1161,6 +1167,25 @@ mod tests {
         let plain = params_for(&m, &ctx, &AzureOpenAIResponsesOptions::default());
         assert!(plain.get("top_p").is_none());
         assert!(plain.get("temperature").is_none());
+
+        // #9506 (`c01f687e5`): model-level defaults apply to direct
+        // stream()/complete() calls; request keys override them.
+        let model_with_defaults = model(json!({
+            "reasoning": false,
+            "samplingParams": {"top_p": 0.95, "min_p": 0.05}
+        }));
+        let override_options = AzureOpenAIResponsesOptions {
+            stream: StreamOptions {
+                sampling_params: Some(
+                    [("top_p".to_owned(), json!(0.5))].into_iter().collect(),
+                ),
+                ..StreamOptions::default()
+            },
+            ..AzureOpenAIResponsesOptions::default()
+        };
+        let merged = params_for(&model_with_defaults, &ctx, &override_options);
+        assert_eq!(merged["top_p"], json!(0.5));
+        assert_eq!(merged["min_p"], json!(0.05));
     }
 
     #[test]

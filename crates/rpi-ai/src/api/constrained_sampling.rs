@@ -212,10 +212,18 @@ fn schema_allows_null(schema: &Value) -> bool {
     }
 }
 
-/// `makeJsonSchemaNodeStrict` (constrained-sampling.ts:60-102, `7915cdac6`):
-/// in-place strict conversion of one schema node. Error texts are the
-/// upstream `UnsupportedStrictJsonSchemaError` messages verbatim.
-fn make_json_schema_node_strict(schema: &mut Value) -> Result<(), String> {
+/// Returns true when a provider's strict mode rejects this schema keyword
+/// with this value (`UnsupportedStrictSchemaKeywordCheck` @ 295cc72b0).
+pub type UnsupportedStrictSchemaKeywordCheck = fn(&str, &Value) -> bool;
+
+/// `makeJsonSchemaNodeStrict` (constrained-sampling.ts:60-102, `7915cdac6`;
+/// provider keyword check @ 295cc72b0): in-place strict conversion of one
+/// schema node. Error texts are the upstream
+/// `UnsupportedStrictJsonSchemaError` messages verbatim.
+fn make_json_schema_node_strict(
+    schema: &mut Value,
+    is_unsupported_keyword: Option<UnsupportedStrictSchemaKeywordCheck>,
+) -> Result<(), String> {
     let Some(object) = schema.as_object_mut() else {
         return Err("boolean schemas are unsupported".to_owned());
     };
@@ -223,6 +231,16 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<(), String> {
         // Upstream `schema[key] !== undefined` — mere presence fails.
         if object.contains_key(*key) {
             return Err(format!("{key} schemas are unsupported"));
+        }
+    }
+    if let Some(is_unsupported) = is_unsupported_keyword {
+        for (key, value) in object.iter() {
+            if is_unsupported(key, value) {
+                return Err(format!(
+                    "{key}: {} is unsupported",
+                    serde_json::to_string(value).unwrap_or_default()
+                ));
+            }
         }
     }
 
@@ -237,7 +255,7 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<(), String> {
             if is_structured_schema(variant) {
                 return Err("object and array unions are unsupported".to_owned());
             }
-            make_json_schema_node_strict(variant)?;
+            make_json_schema_node_strict(variant, is_unsupported_keyword)?;
         }
     }
 
@@ -245,7 +263,7 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<(), String> {
         if items.is_array() {
             return Err("tuple schemas are unsupported".to_owned());
         }
-        make_json_schema_node_strict(items)?;
+        make_json_schema_node_strict(items, is_unsupported_keyword)?;
     }
 
     let is_object_schema = object.get("type") == Some(&serde_json::json!("object"));
@@ -302,7 +320,7 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<(), String> {
         else {
             continue;
         };
-        make_json_schema_node_strict(property)?;
+        make_json_schema_node_strict(property, is_unsupported_keyword)?;
         if !required.contains(key) && !schema_allows_null(property) {
             *property = serde_json::json!({
                 "anyOf": [property.clone(), {"type": "null"}],
@@ -317,11 +335,20 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<(), String> {
 /// `makeStrictJsonSchema` (:117-130, `7915cdac6`): clone, strict-convert the
 /// root, require a `type: "object"` root.
 pub fn make_strict_json_schema(schema: &Value) -> Result<Value, String> {
+    make_strict_json_schema_with_check(schema, None)
+}
+
+/// [`make_strict_json_schema`] with a per-provider rejected-keyword check
+/// (295cc72b0): "prefer" tools that hit it fall back to non-strict.
+pub fn make_strict_json_schema_with_check(
+    schema: &Value,
+    is_unsupported_keyword: Option<UnsupportedStrictSchemaKeywordCheck>,
+) -> Result<Value, String> {
     let mut cloned = schema.clone();
     if !cloned.is_object() {
         return Err("root schema must have type object".to_owned());
     }
-    make_json_schema_node_strict(&mut cloned)?;
+    make_json_schema_node_strict(&mut cloned, is_unsupported_keyword)?;
     if cloned.get("type") != Some(&serde_json::json!("object")) {
         return Err("root schema must have type object".to_owned());
     }
@@ -338,10 +365,23 @@ pub fn get_json_schema_tool_parameters(tool: &Tool, strict: Option<bool>) -> Res
     }
 }
 
-/// `resolveJsonSchemaStrictSampling`.
+/// `resolveJsonSchemaStrictSampling` (:214-222 @ 295cc72b0): `None` = the
+/// tool keeps its unconverted schema; `Some(true)` = strict conversion;
+/// `prefer` falls back to non-strict for unsupported constructs, `require`
+/// fails loudly.
 pub fn resolve_json_schema_strict_sampling(
     tool: &Tool,
     supports_strict_mode: bool,
+) -> Result<Option<bool>, String> {
+    resolve_json_schema_strict_sampling_with_check(tool, supports_strict_mode, None)
+}
+
+/// [`resolve_json_schema_strict_sampling`] with a per-provider rejected
+/// keyword check (295cc72b0).
+pub fn resolve_json_schema_strict_sampling_with_check(
+    tool: &Tool,
+    supports_strict_mode: bool,
+    is_unsupported_keyword: Option<UnsupportedStrictSchemaKeywordCheck>,
 ) -> Result<Option<bool>, String> {
     let strict = match &tool.constrained_sampling {
         Some(ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema { strict })) => {
@@ -353,7 +393,7 @@ pub fn resolve_json_schema_strict_sampling(
     if supports_strict_mode {
         // Try the strict conversion: unsupported constructs fall back for
         // `prefer` and fail loudly for `require` (:214-222, `7915cdac6`).
-        return match make_strict_json_schema(&tool.parameters) {
+        return match make_strict_json_schema_with_check(&tool.parameters, is_unsupported_keyword) {
             Ok(_) => Ok(Some(true)),
             Err(_reason) if strict != ConstrainedSamplingStrict::Require => Ok(None),
             Err(reason) => Err(format!(

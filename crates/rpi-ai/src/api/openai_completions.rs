@@ -1448,10 +1448,16 @@ pub fn build_params(
 
     // 25a2c8dcf (#7568): merged last so custom keys override the named
     // request fields.
-    if let Some(sampling_params) = &options.stream.sampling_params {
-        for (key, value) in sampling_params {
-            params.insert(key.clone(), value.clone());
+    // Last so custom keys override the named request fields. Per-request
+    // keys override model defaults (#9506 `c01f687e5`).
+    let mut sampling = model.sampling_params.clone().unwrap_or_default();
+    if let Some(option_params) = &options.stream.sampling_params {
+        for (key, value) in option_params {
+            sampling.insert(key.clone(), value.clone());
         }
+    }
+    for (key, value) in &sampling {
+        params.insert(key.clone(), value.clone());
     }
 
     Ok(Value::Object(params))
@@ -4824,6 +4830,21 @@ mod build_and_stream_tests {
         );
         assert!(plain.get("top_p").is_none());
         assert!(plain.get("temperature").is_none());
+
+        // #9506 (`c01f687e5`): model-level defaults apply to direct
+        // stream()/complete() calls; request keys override them.
+        let model_with_defaults = make_model(json!({
+            "samplingParams": {"top_p": 0.95, "min_p": 0.05}
+        }));
+        let override_opts = options(StreamOptions {
+            sampling_params: Some(
+                [("top_p".to_owned(), json!(0.5))].into_iter().collect(),
+            ),
+            ..StreamOptions::default()
+        });
+        let merged = params_for(&model_with_defaults, &ctx, &override_opts, CacheRetention::Short);
+        assert_eq!(merged["top_p"], json!(0.5));
+        assert_eq!(merged["min_p"], json!(0.05));
     }
 
     /// Upstream openai-completions-thinking-token-budget.test.ts (d07889da0

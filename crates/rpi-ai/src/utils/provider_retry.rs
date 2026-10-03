@@ -136,6 +136,7 @@ fn retry_delay_ms(
 ) -> Result<u64, String> {
     if let Some(retry_after_ms) = error.header("retry-after-ms")
         && let Ok(value) = retry_after_ms.parse::<f64>()
+        && value.is_finite()
     {
         return validate_server_retry_delay_ms(value, max_retry_delay_ms, &error.message);
     }
@@ -156,7 +157,12 @@ fn retry_delay_ms(
                 date_ms - now_ms
             }
         };
-        return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, &error.message);
+        // #9571 (`2bbfcca43`): an unparseable `Retry-After` must fall
+        // through to the exponential backoff instead of `NaN.max(0) = 0`
+        // (an immediate retry).
+        if delay_ms.is_finite() {
+            return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, &error.message);
+        }
     }
 
     let exponential_delay = (0.5f64 * 2f64.powi(retry_index as i32)).min(8.0) * 1000.0;
@@ -313,6 +319,19 @@ mod tests {
             (2000..=3100).contains(&delay),
             "delay {delay} should be ~3000ms"
         );
+    }
+
+    /// #9571 (`2bbfcca43`): an unparseable `Retry-After` falls back to the
+    /// exponential backoff (500ms at index 0), not an immediate retry.
+    #[test]
+    fn test_unparseable_retry_after_falls_back_to_exponential_backoff() {
+        let err = error(Some(429), &[("retry-after", "not-a-date")], "m");
+        let delay = retry_delay_ms(&err, 0, None).expect("delay");
+        assert!((375..=500).contains(&delay), "exponential delay: {delay}");
+        // A non-finite numeric value falls through as well.
+        let err = error(Some(429), &[("retry-after", "NaN")], "m");
+        let delay = retry_delay_ms(&err, 0, None).expect("delay");
+        assert!((375..=500).contains(&delay), "exponential delay: {delay}");
     }
 
     #[test]

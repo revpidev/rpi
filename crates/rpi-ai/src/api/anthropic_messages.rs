@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::constrained_sampling::{
-    get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
+    get_json_schema_tool_parameters, resolve_json_schema_strict_sampling_with_check,
 };
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
 use crate::api::simple_options::{
@@ -953,6 +953,52 @@ fn should_use_fine_grained_tool_streaming_beta(model: &Model, context: &Transcri
         && !get_anthropic_compat(model).supports_eager_tool_input_streaming
 }
 
+/// Keywords Anthropic strict tool use rejects with a 400 for the whole
+/// request (295cc72b0, #9953).
+const ANTHROPIC_STRICT_UNSUPPORTED_KEYWORDS: [&str; 11] = [
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "maxItems",
+    "uniqueItems",
+    "minContains",
+    "maxContains",
+    "minProperties",
+    "maxProperties",
+];
+
+const ANTHROPIC_STRICT_STRING_FORMATS: [&str; 10] = [
+    "date-time",
+    "time",
+    "date",
+    "duration",
+    "email",
+    "hostname",
+    "uri",
+    "ipv4",
+    "ipv6",
+    "uuid",
+];
+
+/// `isAnthropicStrictUnsupportedKeyword` (anthropic-messages.ts @ 295cc72b0):
+/// schema keywords Anthropic strict mode rejects.
+fn is_anthropic_strict_unsupported_keyword(key: &str, value: &Value) -> bool {
+    if ANTHROPIC_STRICT_UNSUPPORTED_KEYWORDS.contains(&key) {
+        return true;
+    }
+    if key == "minItems" {
+        return value != &json!(0) && value != &json!(1);
+    }
+    if key == "format" {
+        return !value
+            .as_str()
+            .is_some_and(|format| ANTHROPIC_STRICT_STRING_FORMATS.contains(&format));
+    }
+    false
+}
+
 /// `convertTools`.
 fn convert_tools(
     tools: &[Tool],
@@ -966,7 +1012,11 @@ fn convert_tools(
         .iter()
         .enumerate()
         .map(|(index, tool)| {
-            let strict = resolve_json_schema_strict_sampling(tool, supports_strict_tools)?;
+            let strict = resolve_json_schema_strict_sampling_with_check(
+                tool,
+                supports_strict_tools,
+                Some(is_anthropic_strict_unsupported_keyword),
+            )?;
             // `getJsonSchemaToolParameters` (7915cdac6): the strict-converted
             // parameters feed both the direct schema and the legacy view.
             let schema = get_json_schema_tool_parameters(tool, strict)?;
@@ -1752,6 +1802,14 @@ impl<'a> StreamProcessor<'a> {
                     }
                     if let Some(cache_write) = json_u64(&usage["cache_creation_input_tokens"]) {
                         self.output.usage.cache_write = cache_write;
+                    }
+                    // #9210 (`667fc3dd3`): Vercel AI Gateway includes the
+                    // 1-hour cache-write TTL breakdown in deltas, though the
+                    // SDK only types it on message_start.
+                    if let Some(cache_write_1h) =
+                        json_u64(&usage["cache_creation"]["ephemeral_1h_input_tokens"])
+                    {
+                        self.output.usage.cache_write1h = Some(cache_write_1h);
                     }
                     // Reasoning tokens arrive in
                     // `output_tokens_details.thinking_tokens` on the final
@@ -2869,6 +2927,66 @@ pub(crate) mod tests {
         assert!(convert_tools(&[require_tool], false, true, false, None, false).is_err());
     }
 
+    /// #9953 (`295cc72b0`): "prefer" tools whose schema uses keywords
+    /// Anthropic strict mode rejects are sent non-strict instead of failing
+    /// the whole request.
+    #[test]
+    fn test_convert_tools_strict_unsupported_keywords_fall_back() {
+        let strict_tool = |properties: Value| -> Tool {
+            serde_json::from_value(json!({
+                "name": "lookup", "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": ["value"],
+                    "additionalProperties": false
+                },
+                "constrainedSampling": {"type": "json_schema", "strict": "prefer"}
+            }))
+            .expect("tool")
+        };
+
+        let unsupported = [
+            json!({"value": {"type": "integer", "minimum": 1, "maximum": 300000}}),
+            json!({"value": {"type": "string", "format": "regex"}}),
+            json!({"value": {"type": "array", "items": {"type": "string"}, "minItems": 2}}),
+        ];
+        for properties in unsupported {
+            let tool = strict_tool(properties.clone());
+            let converted = convert_tools(
+                std::slice::from_ref(&tool),
+                false,
+                true,
+                true,
+                None,
+                false,
+            )
+            .expect("tools");
+            assert!(
+                converted[0].get("strict").is_none(),
+                "keyword schema must fall back to non-strict: {properties}"
+            );
+        }
+
+        // Supported keywords stay strict.
+        let supported = strict_tool(json!({
+            "value": {
+                "type": "string", "minLength": 1, "maxLength": 1000,
+                "pattern": "^[a-z]+$", "format": "uri"
+            }
+        }));
+        let converted = convert_tools(
+            std::slice::from_ref(&supported),
+            false,
+            true,
+            true,
+            None,
+            false,
+        )
+        .expect("tools");
+        assert_eq!(converted[0]["strict"], json!(true));
+    }
+
     // -----------------------------------------------------------------------
     // build_params
     // -----------------------------------------------------------------------
@@ -3569,6 +3687,37 @@ pub(crate) mod tests {
                 "toolcall_delta",
                 "toolcall_end",
             ]
+        );
+    }
+
+    /// #9210 (`667fc3dd3`): Vercel AI Gateway reports the 1-hour
+    /// cache-write breakdown in the streaming `message_delta` rather than
+    /// `message_start`; it must price at the 2x input rate.
+    #[test]
+    fn test_stream_processor_prices_delta_only_1h_cache_writes() {
+        let model = make_model(json!({}));
+        let bytes = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"cache_creation_input_tokens\":6535,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":6535}}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+        let (_, reason, output) = drive_sse(&model, bytes.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.usage.cache_write, 6535);
+        assert_eq!(output.usage.cache_write1h, Some(6535));
+        assert!(
+            (output.usage.cost.cache_write
+                - 6535.0 * model.cost.rates.input * 2.0 / 1_000_000.0)
+                .abs()
+                < 1e-12,
+            "1h writes price at 2x input: {}",
+            output.usage.cost.cache_write
         );
     }
 

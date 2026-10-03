@@ -27,6 +27,9 @@ fn overflow_patterns() -> &'static [Regex] {
             // `Prompt too long` (code 1261) alongside Anthropic's
             // `prompt is too long`.
             r"(?i)prompt (?:is )?too long",
+            // #10208 (`3dd803d7e`): the z.ai CN endpoint reports
+            // `Prompt exceeds max length` (code 1261).
+            r"(?i)prompt exceeds max length",
             r"(?i)request_too_large",
             r"(?i)input is too long for requested model",
             r"(?i)exceeds the context window",
@@ -192,6 +195,8 @@ mod tests {
             // "message":"Prompt too long"}`) — upstream overflow.test.ts
             // "detects z.ai prompt-too-long errors".
             "400 {\"code\":\"1261\",\"message\":\"Prompt too long\"}",
+            // #10208 (`3dd803d7e`): the z.ai CN endpoint form.
+            "400 {\"code\":\"1261\",\"message\":\"Prompt exceeds max length\"}",
             "413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}",
             "Your input exceeds the context window of this model",
             "Requested token count exceeds the model's maximum context length of 131072 tokens",

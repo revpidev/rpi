@@ -47,21 +47,9 @@ pub fn build_base_options(
     let mut stream = options.map(|o| o.stream.clone()).unwrap_or_default();
     stream.max_tokens = Some(clamp_max_tokens_to_context(model, context, base_max_tokens));
     stream.api_key = api_key.or_else(|| options.and_then(|o| o.stream.api_key.clone()));
-    // 25a2c8dcf (#7568): `{...model.samplingParams, ...options?.samplingParams}`
-    // when either is set — per-request keys override model-level keys.
-    let option_sampling_params = stream.sampling_params.take();
-    stream.sampling_params = if model.sampling_params.is_none() && option_sampling_params.is_none()
-    {
-        None
-    } else {
-        let mut merged = model.sampling_params.clone().unwrap_or_default();
-        if let Some(option_params) = option_sampling_params {
-            for (key, value) in option_params {
-                merged.insert(key, value);
-            }
-        }
-        Some(merged)
-    };
+    // Model-level `samplingParams` are merged by the API adapters per
+    // request (#9506 `c01f687e5`), so the request's own map passes through
+    // unchanged here.
     stream
 }
 
@@ -262,30 +250,27 @@ mod tests {
         assert_eq!(base.sampling_params, None);
     }
 
-    /// Upstream: "applies model-level sampling params".
+    /// #9506 (`c01f687e5`): model-level params are merged by the API
+    /// adapters per request, so the base options leave them for the adapter
+    /// (a model-defaults-only call carries no request map here).
     #[test]
-    fn test_build_base_options_sampling_params_model_level() {
+    fn test_build_base_options_sampling_params_model_level_leaves_map_to_adapter() {
         let mut model = make_model(128_000, 8192);
         model.sampling_params =
             sampling_params(&[("temperature", json!(1)), ("top_p", json!(0.95))]);
         let base = build_base_options(&model, &context_with_text("hi"), None, None);
-        assert_eq!(
-            base.sampling_params,
-            sampling_params(&[("temperature", json!(1)), ("top_p", json!(0.95))])
-        );
+        assert_eq!(base.sampling_params, None);
     }
 
-    /// Upstream: "merges stream-option keys over model-level keys".
+    /// The request map passes through unchanged; the adapter merges the
+    /// model defaults underneath it (#9506 `c01f687e5`).
     #[test]
-    fn test_build_base_options_sampling_params_request_over_model() {
+    fn test_build_base_options_sampling_params_request_passes_through() {
         let mut model = make_model(128_000, 8192);
         model.sampling_params = sampling_params(&[("top_p", json!(0.95)), ("min_p", json!(0.05))]);
         let options = options_with_sampling(sampling_params(&[("top_p", json!(0.5))]));
         let base = build_base_options(&model, &context_with_text("hi"), Some(&options), None);
-        assert_eq!(
-            base.sampling_params,
-            sampling_params(&[("top_p", json!(0.5)), ("min_p", json!(0.05))])
-        );
+        assert_eq!(base.sampling_params, sampling_params(&[("top_p", json!(0.5))]));
     }
 
     /// Stream-option-only sampling params pass through.
