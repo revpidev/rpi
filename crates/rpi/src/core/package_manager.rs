@@ -1521,12 +1521,23 @@ impl DefaultPackageManager {
         Ok(resolved)
     }
 
-    /// `getTemporaryDir` (package-manager.ts:2047-2054): sha256 of
-    /// `{prefix}-{suffix}`, first 8 hex chars.
-    fn get_temporary_dir(&self, prefix: &str, suffix: Option<&str>) -> Result<PathBuf, String> {
+    /// `getTemporaryDir` (package-manager.ts:2074-2085 @ f444ea5ea): sha256
+    /// of `{prefix}-{suffix}@{ref}`, first 8 hex chars. Pinned temporary git
+    /// sources include the ref, so each ref gets its own checkout instead of
+    /// reusing the first downloaded commit (#9982).
+    fn get_temporary_dir(
+        &self,
+        prefix: &str,
+        suffix: Option<&str>,
+        ref_: Option<&str>,
+    ) -> Result<PathBuf, String> {
         let root =
             self.resolve_managed_path(&get_extension_temp_folder(&self.agent_dir)?, &[prefix])?;
-        let hash = sha2::Sha256::digest(format!("{prefix}-{}", suffix.unwrap_or("")).as_bytes());
+        let ref_suffix = match ref_ {
+            Some(ref_) => format!("@{ref_}"),
+            None => String::new(),
+        };
+        let hash = sha2::Sha256::digest(format!("{prefix}-{}{ref_suffix}", suffix.unwrap_or("")).as_bytes());
         let hash = hash[..4]
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -1542,7 +1553,7 @@ impl DefaultPackageManager {
     /// `getNpmInstallRoot` (package-manager.ts:1956-1965).
     fn get_npm_install_root(&self, scope: SourceScope, temporary: bool) -> Result<PathBuf, String> {
         if temporary {
-            return self.get_temporary_dir("npm", None);
+            return self.get_temporary_dir("npm", None, None);
         }
         match scope {
             SourceScope::Project => {
@@ -1561,7 +1572,7 @@ impl DefaultPackageManager {
     ) -> Result<PathBuf, String> {
         match scope {
             SourceScope::Temporary => Ok(self
-                .get_temporary_dir("npm", None)?
+                .get_temporary_dir("npm", None, None)?
                 .join("node_modules")
                 .join(&source.name)),
             SourceScope::Project => {
@@ -1620,7 +1631,13 @@ impl DefaultPackageManager {
         scope: SourceScope,
     ) -> Result<PathBuf, String> {
         if scope == SourceScope::Temporary {
-            return self.get_temporary_dir(&format!("git-{}", source.host), Some(&source.path));
+            // Include the ref in the cache folder so each pinned ref gets
+            // its own checkout (#9982, package-manager.ts:2123-2126).
+            return self.get_temporary_dir(
+                &format!("git-{}", source.host),
+                Some(&source.path),
+                source.ref_.as_deref(),
+            );
         }
         let install_root = self
             .get_git_install_root(scope)?
@@ -1652,31 +1669,51 @@ impl DefaultPackageManager {
         }
     }
 
-    /// `getPackageManagerName` (package-manager.ts:1748-1754): the part
-    /// after the last `--`, else the command basename without `.cmd`/`.exe`.
+    /// `getPackageManagerName` (package-manager.ts:1762-1785 @ 8d897edaa):
+    /// the package manager after the last `--` separator, else the command
+    /// name itself when it is one of npm/pnpm/bun; commands wrapped without
+    /// a separator (e.g. `corepack pnpm`) are detected from the leading
+    /// args. `.cmd`/`.exe` suffixes are stripped.
     fn get_package_manager_name(&self) -> Result<String, String> {
-        let (command, args) = self.get_npm_command()?;
-        let mut parts = vec![command];
-        parts.extend(args);
-        let after_separator = parts
-            .iter()
-            .rposition(|part| part == "--")
-            .and_then(|index| parts.get(index + 1));
-        let package_manager_command = match after_separator {
-            Some(part) => part.clone(),
-            None => parts.first().cloned().unwrap_or_default(),
+        let normalize = |command: &str| {
+            let base = Path::new(command)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let lower = base.to_lowercase();
+            for suffix in [".cmd", ".exe"] {
+                if lower.ends_with(suffix) {
+                    return base[..base.len() - suffix.len()].to_string();
+                }
+            }
+            base
         };
-        let base = Path::new(&package_manager_command)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let lower = base.to_lowercase();
-        for suffix in [".cmd", ".exe"] {
-            if lower.ends_with(suffix) {
-                return Ok(base[..base.len() - suffix.len()].to_string());
+        const SUPPORTED: [&str; 3] = ["npm", "pnpm", "bun"];
+        let (command, args) = self.get_npm_command()?;
+        let direct_command = normalize(&command);
+        if let Some(index) = args.iter().rposition(|part| part == "--") {
+            return Ok(match args.get(index + 1) {
+                Some(wrapped) => normalize(wrapped),
+                None => direct_command,
+            });
+        }
+        if SUPPORTED.contains(&direct_command.as_str()) {
+            return Ok(direct_command);
+        }
+        let mut wrapped: Vec<String> = Vec::new();
+        for arg in &args {
+            let name = normalize(arg);
+            if SUPPORTED.contains(&name.as_str()) && !wrapped.contains(&name) {
+                wrapped.push(name);
             }
         }
-        Ok(base)
+        if wrapped.len() > 1 {
+            return Err(format!(
+                "Ambiguous npmCommand package managers: {}",
+                wrapped.join(", ")
+            ));
+        }
+        Ok(wrapped.into_iter().next().unwrap_or(direct_command))
     }
 
     /// `runNpmCommand` (package-manager.ts:1756-1759).
@@ -1693,14 +1730,33 @@ impl DefaultPackageManager {
         self.runner.run(&request)
     }
 
-    /// `getGitDependencyInstallArgs` (package-manager.ts:1761-1767): with a
-    /// configured `npmCommand` argv wrapper, git package dependency installs
-    /// degrade to a bare `install`.
-    fn get_git_dependency_install_args(&self) -> Vec<String> {
-        match self.settings_manager.get_npm_command() {
-            Some(command) if !command.is_empty() => vec!["install".to_string()],
-            _ => vec!["install".to_string(), "--omit=dev".to_string()],
-        }
+    /// `getGitDependencyInstallArgs` (package-manager.ts:1798-1813 @
+    /// 8d897edaa): managed git packages never auto-install peer
+    /// dependencies — the per-manager flags disable peer resolution
+    /// (`--omit=peer` on bun, `auto-install-peers=false` on pnpm,
+    /// `--legacy-peer-deps` on npm); unknown package managers degrade to a
+    /// bare `install`.
+    fn get_git_dependency_install_args(&self) -> Result<Vec<String>, String> {
+        Ok(match self.get_package_manager_name()?.as_str() {
+            "bun" => vec![
+                "install".to_string(),
+                "--omit=dev".to_string(),
+                "--omit=peer".to_string(),
+            ],
+            "pnpm" => vec![
+                "install".to_string(),
+                "--prod".to_string(),
+                "--config.auto-install-peers=false".to_string(),
+                "--config.strict-peer-dependencies=false".to_string(),
+                "--config.strict-dep-builds=false".to_string(),
+            ],
+            "npm" => vec![
+                "install".to_string(),
+                "--omit=dev".to_string(),
+                "--legacy-peer-deps".to_string(),
+            ],
+            _ => vec!["install".to_string()],
+        })
     }
 
     /// `getNpmInstallArgs` (package-manager.ts:1774-1795): peer dependency
@@ -1905,7 +1961,7 @@ impl DefaultPackageManager {
                     .run(&CommandRequest::new("git", &["checkout", ref_]).with_cwd(&target_dir))?;
             }
             if target_dir.join("package.json").exists() {
-                self.run_npm_command(&self.get_git_dependency_install_args(), Some(&target_dir))?;
+                self.run_npm_command(&self.get_git_dependency_install_args()?, Some(&target_dir))?;
             }
             Ok(())
         })();
@@ -1979,7 +2035,7 @@ impl DefaultPackageManager {
         if !self.has_missing_git_dependencies(target_dir) {
             return Ok(());
         }
-        self.run_npm_command(&self.get_git_dependency_install_args(), Some(target_dir))
+        self.run_npm_command(&self.get_git_dependency_install_args()?, Some(target_dir))
     }
 
     /// `getGitUpdateMarkerPath` (package-manager.ts, b06dc76fd):
@@ -2014,7 +2070,7 @@ impl DefaultPackageManager {
             return Err(error);
         }
         if target_dir.join("package.json").exists() {
-            self.run_npm_command(&self.get_git_dependency_install_args(), Some(target_dir))?;
+            self.run_npm_command(&self.get_git_dependency_install_args()?, Some(target_dir))?;
         }
         let _ = std::fs::remove_file(marker_path);
         Ok(())
@@ -5200,6 +5256,41 @@ mod tests {
         }
     }
 
+    /// #9982 (`f444ea5ea`): pinned temporary git sources key the temp
+    /// folder by ref, so a changed ref loads a new checkout instead of
+    /// reusing the first download; unpinned sources keep the ref-less
+    /// folder.
+    #[test]
+    fn test_temporary_git_install_path_includes_the_pinned_ref() {
+        let dirs = TestDirs::new();
+        let manager = test_manager(&dirs, FakeRunner::ok());
+        let old = git_source(
+            "https://github.com/user/repo",
+            "github.com",
+            "user/repo",
+            Some("aaaaaaa"),
+        );
+        let new = git_source(
+            "https://github.com/user/repo",
+            "github.com",
+            "user/repo",
+            Some("bbbbbbb"),
+        );
+        let unpinned = git_source("https://github.com/user/repo", "github.com", "user/repo", None);
+        let old_path = manager
+            .get_git_install_path(&old, SourceScope::Temporary)
+            .unwrap();
+        let new_path = manager
+            .get_git_install_path(&new, SourceScope::Temporary)
+            .unwrap();
+        let unpinned_path = manager
+            .get_git_install_path(&unpinned, SourceScope::Temporary)
+            .unwrap();
+        assert_ne!(old_path, new_path, "each pinned ref gets its own checkout");
+        assert_ne!(old_path, unpinned_path);
+        assert!(old_path.ends_with("user/repo"));
+    }
+
     #[test]
     fn test_temporary_npm_install_path_under_agent_temp_folder() {
         let dirs = TestDirs::new();
@@ -5543,15 +5634,19 @@ mod tests {
         assert_eq!(calls[1].command, "git");
         assert_eq!(calls[1].args, vec!["checkout", "v1"]);
         assert_eq!(calls[1].cwd, Some(target.clone()));
-        // Dependencies install with `--omit=dev` when no npmCommand wrapper
-        // is configured.
+        // Dependencies install with `--omit=dev --legacy-peer-deps` when
+        // no npmCommand wrapper is configured (peer auto-install disabled,
+        // package-manager.ts @ 8d897edaa).
         let npm_call = calls.iter().find(|c| c.command == "npm").unwrap();
-        assert_eq!(npm_call.args, vec!["install", "--omit=dev"]);
+        assert_eq!(
+            npm_call.args,
+            vec!["install", "--omit=dev", "--legacy-peer-deps"]
+        );
         assert_eq!(npm_call.cwd, Some(target));
     }
 
     #[test]
-    fn test_install_git_deps_use_plain_install_with_npm_command() {
+    fn test_install_git_deps_disable_peers_through_pnpm_wrapper() {
         let dirs = TestDirs::new();
         let runner = FakeRunner::new(|request| {
             if request.command == "git" && request.args.first().map(String::as_str) == Some("clone")
@@ -5572,7 +5667,111 @@ mod tests {
             .into_iter()
             .find(|c| c.command == "pnpm")
             .unwrap();
-        assert_eq!(npm_call.args, vec!["install"]);
+        assert_eq!(
+            npm_call.args,
+            vec![
+                "install",
+                "--prod",
+                "--config.auto-install-peers=false",
+                "--config.strict-peer-dependencies=false",
+                "--config.strict-dep-builds=false"
+            ]
+        );
+    }
+
+    /// #9863 (`8d897edaa`): the package manager after the `--` separator
+    /// wins over the outer executable (`npm exec -- pnpm`).
+    #[test]
+    fn test_package_manager_name_prefers_the_segment_after_the_separator() {
+        let dirs = TestDirs::new();
+        let runner = FakeRunner::new(|_request| Ok(String::new()));
+        let mut manager = test_manager(&dirs, runner);
+        manager.settings_manager.set_npm_command(Some(vec![
+            "npm".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "pnpm".to_string(),
+        ]));
+        assert_eq!(manager.get_package_manager_name().unwrap(), "pnpm");
+        assert_eq!(
+            manager.get_git_dependency_install_args().unwrap(),
+            vec![
+                "install",
+                "--prod",
+                "--config.auto-install-peers=false",
+                "--config.strict-peer-dependencies=false",
+                "--config.strict-dep-builds=false"
+            ]
+        );
+    }
+
+    /// #9863 (`8d897edaa`): corepack-style wrappers without a separator are
+    /// detected from the leading args, and the install runs through the
+    /// wrapper with the manager's peer-disabling flags.
+    #[test]
+    fn test_detects_pnpm_through_corepack_and_installs_with_its_flags() {
+        let dirs = TestDirs::new();
+        let runner = FakeRunner::new(|request| {
+            if request.command == "git" && request.args.first().map(String::as_str) == Some("clone")
+            {
+                let target = PathBuf::from(request.args[2].clone());
+                write_file(&target.join("package.json"), "{}");
+            }
+            Ok(String::new())
+        });
+        let mut manager = test_manager(&dirs, runner.clone());
+        manager.settings_manager.set_npm_command(Some(vec![
+            "corepack".to_string(),
+            "pnpm".to_string(),
+        ]));
+        assert_eq!(manager.get_package_manager_name().unwrap(), "pnpm");
+        manager.install("git:github.com/user/repo", false).unwrap();
+
+        let npm_call = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.command == "corepack")
+            .expect("install runs through the wrapper");
+        assert_eq!(
+            &npm_call.args[..2],
+            &["pnpm".to_string(), "install".to_string()]
+        );
+        assert!(npm_call.args.contains(&"--prod".to_string()));
+    }
+
+    /// `getGitDependencyInstallArgs` disables peer installation on bun
+    /// (package-manager.ts @ 8d897edaa).
+    #[test]
+    fn test_git_dependency_install_args_on_bun() {
+        let dirs = TestDirs::new();
+        let runner = FakeRunner::new(|_request| Ok(String::new()));
+        let mut manager = test_manager(&dirs, runner);
+        manager
+            .settings_manager
+            .set_npm_command(Some(vec!["bun".to_string()]));
+        assert_eq!(
+            manager.get_git_dependency_install_args().unwrap(),
+            vec!["install", "--omit=dev", "--omit=peer"]
+        );
+    }
+
+    /// Ambiguous wrappers naming two supported managers are rejected
+    /// (package-manager.ts @ 8d897edaa).
+    #[test]
+    fn test_ambiguous_package_manager_wrapper_is_error() {
+        let dirs = TestDirs::new();
+        let runner = FakeRunner::new(|_request| Ok(String::new()));
+        let mut manager = test_manager(&dirs, runner);
+        manager.settings_manager.set_npm_command(Some(vec![
+            "mise".to_string(),
+            "npm".to_string(),
+            "pnpm".to_string(),
+        ]));
+        let error = manager.get_package_manager_name().unwrap_err();
+        assert!(
+            error.contains("Ambiguous npmCommand package managers: npm, pnpm"),
+            "got: {error}"
+        );
     }
 
     #[test]
@@ -5617,7 +5816,10 @@ mod tests {
             .into_iter()
             .find(|c| c.command == "npm")
             .unwrap();
-        assert_eq!(npm_call.args, vec!["install", "--omit=dev"]);
+        assert_eq!(
+            npm_call.args,
+            vec!["install", "--omit=dev", "--legacy-peer-deps"]
+        );
     }
 
     #[test]
