@@ -42,11 +42,17 @@
 //! - Raw mode: the previous state is captured with crossterm's
 //!   `is_raw_mode_enabled()` (upstream `process.stdin.isRaw || false`).
 //!   `process.stdin.pause()` in `stop()` (terminal.ts:446) has no Rust
-//!   equivalent: the stdin reader thread is spawned once and lives for the
-//!   process; `stop()` clears its live sender slot so bytes read while
-//!   stopped are discarded. Respawning the reader per `start()` would leave
-//!   the previous thread blocked in `read()`, where it would swallow the
-//!   first keystroke after a renderer hot-swap (T32 follow-up fix).
+//!   equivalent: the stdin reader thread is spawned once per process and
+//!   lives for the process; `stop()` clears the process-global live sender
+//!   slot so bytes read while stopped are discarded. Respawning the reader
+//!   per `start()` would leave the previous thread blocked in `read()`,
+//!   where it would swallow the first keystroke after a renderer hot-swap
+//!   (T32 follow-up fix). The reader is process-global rather than
+//!   per-`ProcessTerminal`: per-instance readers leaked one permanently
+//!   blocked thread per started terminal (test binaries start dozens), the
+//!   first of which also pinned the global `std::io::stdin()` mutex forever,
+//!   wedging any later `io::stdin()` consumer in the process — the reader
+//!   therefore reads fd 0 directly (see `spawn_stdin_reader`).
 //! - Size query: crossterm 0.29's `size()` falls back to spawning
 //!   `tput cols`/`tput lines` when the ioctl fails (no controlling tty and
 //!   a non-tty stdout) — two PATH-dependent subprocess spawns per `size()`
@@ -90,7 +96,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::keys::set_kitty_protocol_active;
@@ -409,6 +415,19 @@ enum NegotiationRead {
     NotNegotiation,
 }
 
+/// Process-global live sender slot for the stdin reader thread (see the
+/// header note): `start()` installs the starting terminal's channel sender,
+/// `stop()` clears it. Global — not per-instance — because the reader is a
+/// process singleton; the slot always belongs to the most recently started
+/// terminal (production runs exactly one `ProcessTerminal`; the T32 renderer
+/// hot-swap reuses it).
+static STDIN_SLOT: Mutex<Option<mpsc::Sender<TerminalEvent>>> = Mutex::new(None);
+
+/// Spawns the stdin reader on the first `start()`; later starts reuse it
+/// (the reader survives `stop()` so a hot-swap never strands a blocked
+/// `read()` that would swallow the first post-swap keystroke).
+static STDIN_READER_ONCE: Once = Once::new();
+
 /// The default terminal size query (upstream `get columns()` / `get rows()`
 /// read `process.stdout.columns` / `process.stdout.rows`): crossterm's
 /// ioctl, but only when stdout is a terminal. See the header note for why
@@ -448,14 +467,6 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
     progress_keepalive_deadline: Option<Instant>,
     event_tx: Option<mpsc::Sender<TerminalEvent>>,
     event_rx: Option<TerminalEventSource>,
-    /// Live sender slot shared with the persistent stdin reader thread.
-    /// `start()` installs the current channel's sender, `stop()` clears it.
-    /// The reader is spawned once and lives for the process: respawning it
-    /// per `start()` would leave the previous thread blocked in `read()`,
-    /// where it would consume (and discard) the first keystroke after a
-    /// renderer hot-swap before noticing its stale channel.
-    stdin_slot: Arc<Mutex<Option<mpsc::Sender<TerminalEvent>>>>,
-    stdin_reader_started: bool,
     resize_task: Option<tokio::task::JoinHandle<()>>,
     /// Terminal size query; injectable so tests can simulate "not a tty"
     /// (upstream tests monkey-patch `process.stdout.columns/rows`).
@@ -496,8 +507,6 @@ impl<W: Write> ProcessTerminal<W> {
             progress_keepalive_deadline: None,
             event_tx: None,
             event_rx: None,
-            stdin_slot: Arc::new(Mutex::new(None)),
-            stdin_reader_started: false,
             resize_task: None,
             query_size: default_query_size,
         }
@@ -553,48 +562,67 @@ impl<W: Write> ProcessTerminal<W> {
     /// the live sender slot (upstream `process.stdin` `data` events after
     /// `setEncoding("utf8")` + `resume()`).
     ///
-    /// Spawned once on the first `start()` and kept for the process
-    /// lifetime. Bytes read while the slot is empty (terminal stopped) or
-    /// whose send fails (stale receiver) are discarded — the reader never
-    /// exits just because the terminal was stopped, so a later `start()`
-    /// (renderer hot-swap) does not leave a zombie thread racing the live
-    /// one for stdin.
-    fn spawn_stdin_reader(&mut self) {
-        if self.stdin_reader_started {
-            return;
-        }
-        self.stdin_reader_started = true;
-        let slot = Arc::clone(&self.stdin_slot);
-        let spawned = std::thread::Builder::new()
-            .name("rpi-tui-stdin".to_string())
-            .spawn(move || {
-                let mut stdin = io::stdin().lock();
-                let mut buf = [0u8; 65_536];
-                let mut pending: Vec<u8> = Vec::new();
-                loop {
-                    match stdin.read(&mut buf) {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            pending.extend_from_slice(&buf[..n]);
-                            let (text, rest) = decode_utf8_incremental(&pending);
-                            pending = rest;
-                            if !text.is_empty() {
-                                let tx = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                if let Some(tx) = tx {
-                                    // A send failure means the receiver was
-                                    // dropped by `stop()`; discard the bytes.
-                                    let _ = tx.send(TerminalEvent::Input(text));
+    /// Spawned once per process on the first `start()` and kept for the
+    /// process lifetime. Bytes read while the slot is empty (terminal
+    /// stopped) or whose send fails (stale receiver) are discarded — the
+    /// reader never exits just because the terminal was stopped, so a later
+    /// `start()` (renderer hot-swap) does not leave a zombie thread racing
+    /// the live one for stdin.
+    ///
+    /// Process-global rather than per-`ProcessTerminal`: per-instance
+    /// readers leaked one permanently blocked thread per started terminal
+    /// (test binaries start dozens), the first of which also pinned the
+    /// global `std::io::stdin()` mutex for the process lifetime — wedging
+    /// any later `io::stdin()` consumer. On unix the reader therefore reads
+    /// fd 0 directly, bypassing that mutex.
+    fn spawn_stdin_reader() {
+        STDIN_READER_ONCE.call_once(|| {
+            let spawned = std::thread::Builder::new()
+                .name("rpi-tui-stdin".to_string())
+                .spawn(move || {
+                    #[cfg(unix)]
+                    let mut input = {
+                        use std::os::unix::io::FromRawFd;
+                        // SAFETY: fd 0 (stdin) is a valid, process-owned
+                        // descriptor that outlives this thread; ManuallyDrop
+                        // keeps the `File` from closing it on drop. Reading
+                        // the fd directly bypasses the global
+                        // `std::io::stdin()` mutex, which a process-lifetime
+                        // blocking reader must not hold.
+                        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) })
+                    };
+                    #[cfg(not(unix))]
+                    let mut input = io::stdin();
+                    let mut buf = [0u8; 65_536];
+                    let mut pending: Vec<u8> = Vec::new();
+                    loop {
+                        match input.read(&mut buf) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                pending.extend_from_slice(&buf[..n]);
+                                let (text, rest) = decode_utf8_incremental(&pending);
+                                pending = rest;
+                                if !text.is_empty() {
+                                    let tx = STDIN_SLOT
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .clone();
+                                    if let Some(tx) = tx {
+                                        // A send failure means the receiver was
+                                        // dropped by `stop()`; discard the bytes.
+                                        let _ = tx.send(TerminalEvent::Input(text));
+                                    }
                                 }
                             }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
                         }
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
                     }
-                }
-            });
-        // Detach: the thread exits on EOF or read error, and idles (bytes
-        // discarded) while the terminal is stopped.
-        drop(spawned);
+                });
+            // Detach: the thread exits on EOF or read error, and idles (bytes
+            // discarded) while the terminal is stopped.
+            drop(spawned);
+        });
     }
 
     /// SIGWINCH → channel forwarder (upstream
@@ -839,8 +867,8 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         self.event_tx = Some(tx);
         self.event_rx = Some(TerminalEventSource::new(rx));
         // Publish the new sender to the persistent stdin reader (spawned
-        // once below); input read before this point is discarded.
-        *self.stdin_slot.lock().unwrap_or_else(|e| e.into_inner()) = self.event_tx.clone();
+        // once per process below); input read before this point is discarded.
+        *STDIN_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = self.event_tx.clone();
 
         // Resize handler wiring (upstream `process.stdout.on("resize")`).
         self.spawn_resize_forwarder();
@@ -855,7 +883,7 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         // equivalent binding is bundled in this port (see header note).
 
         self.query_and_enable_kitty_protocol();
-        self.spawn_stdin_reader();
+        Self::spawn_stdin_reader();
     }
 
     fn stop(&mut self) {
@@ -884,11 +912,11 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
             buffer.destroy();
         }
 
-        // Remove event handlers / event sources. The stdin reader slot is
-        // cleared FIRST so the persistent reader discards bytes from here
-        // on; its in-flight send to the old channel may fail, which it
-        // treats as discard.
-        *self.stdin_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Remove event handlers / event sources. The process-global stdin
+        // reader slot is cleared FIRST so the persistent reader discards
+        // bytes from here on; its in-flight send to the old channel may
+        // fail, which it treats as discard.
+        *STDIN_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.input_handler = None;
         self.resize_handler = None;
         if let Some(task) = self.resize_task.take() {
@@ -1638,6 +1666,51 @@ mod tests {
         assert!(
             (terminal.query_size)().is_err(),
             "off-tty size query must fail fast into the COLUMNS/LINES/default chain"
+        );
+    }
+
+    /// Regression: all started terminals share ONE process-global stdin
+    /// reader thread — per-instance readers leaked a permanently blocked
+    /// thread per started terminal, and the first pinned the global
+    /// `std::io::stdin()` mutex for the process lifetime. Counts threads by
+    /// name via /proc; where /proc is unavailable both counts read 0 and the
+    /// assertion passes vacuously. Red/green caveat: the revert evidence
+    /// needs stdin to block in `read()` (PTY or held-open pipe) — with stdin
+    /// at EOF (e.g. `/dev/null`) per-instance readers exit immediately and
+    /// the reverted code passes vacuously too.
+    #[cfg(unix)]
+    #[test]
+    fn started_terminals_share_a_single_stdin_reader_thread() {
+        fn stdin_reader_threads() -> usize {
+            let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+                return 0;
+            };
+            tasks
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    std::fs::read_to_string(entry.path().join("comm"))
+                        .is_ok_and(|name| name.trim() == "rpi-tui-stdin")
+                })
+                .count()
+        }
+
+        let before = stdin_reader_threads();
+        let mut terminals: Vec<_> = (0..3)
+            .map(|_| ProcessTerminal::with_writer(SharedWriter::default()))
+            .collect();
+        for terminal in &mut terminals {
+            terminal.start(Box::new(|_| {}), Box::new(|| {}));
+        }
+        let after = stdin_reader_threads();
+        // Stop LIFO: crossterm tracks raw mode process-globally, so terminals
+        // started after the first captured `was_raw=true`; reverse order
+        // leaves the real terminal restored on PTY runs.
+        for terminal in terminals.iter_mut().rev() {
+            terminal.stop();
+        }
+        assert!(
+            after <= before + 1,
+            "start() must not spawn a reader per terminal (before={before}, after={after})"
         );
     }
 
