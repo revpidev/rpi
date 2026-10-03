@@ -531,6 +531,13 @@ impl Component for SettingsList {
         }))
     }
 
+    /// The list owns keyboard routing for an open submenu, so a forwarded
+    /// focus request must keep focus on the list, not the submenu child that
+    /// closes later (tui.ts:85-92 @ b3487650f).
+    fn has_handle_input(&self) -> bool {
+        true
+    }
+
     fn handle_input(&mut self, data: &str) {
         // If a submenu is active, delegate all input to it. The submenu's
         // cancel (triggered by escape) will call done() which closes it.

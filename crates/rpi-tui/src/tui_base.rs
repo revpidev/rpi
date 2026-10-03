@@ -609,7 +609,7 @@ impl TuiBase {
         if captures {
             self.set_focus(Some(component));
         }
-        self.terminal().hide_cursor();
+        self.hide_terminal_cursor();
         self.request_render(false);
     }
 
@@ -637,7 +637,7 @@ impl TuiBase {
             self.set_focus(top_visible.or(entry.pre_focus.clone()));
         }
         if self.overlay_stack.is_empty() {
-            self.terminal().hide_cursor();
+            self.hide_terminal_cursor();
         }
         self.request_render(false);
     }
@@ -802,7 +802,7 @@ impl TuiBase {
             self.set_focus(top_visible.or(entry.pre_focus.clone()));
         }
         if self.overlay_stack.is_empty() {
-            self.terminal().hide_cursor();
+            self.hide_terminal_cursor();
         }
         self.request_render(false);
     }
@@ -899,7 +899,7 @@ impl TuiBase {
         }
         self.show_hardware_cursor = enabled;
         if !enabled {
-            self.terminal().hide_cursor();
+            self.hide_terminal_cursor();
         }
         self.request_render(false);
     }
@@ -1125,6 +1125,16 @@ impl TuiBase {
         }
         self.query_cell_size();
         self.request_render(false);
+    }
+
+    /// Hide the cursor while running. After `stop()`, the shell owns the
+    /// cursor and it must stay visible (`hideTerminalCursor`,
+    /// tui.ts:795-797 @ b3487650f): an extension can close an overlay during
+    /// shutdown, after `stop()` already restored the cursor.
+    fn hide_terminal_cursor(&mut self) {
+        if !self.stopped {
+            self.terminal().hide_cursor();
+        }
     }
 
     /// `TuiBase.stop` common prefix (tui.ts:746-750 @ 4181f66): mark stopped

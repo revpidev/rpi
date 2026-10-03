@@ -181,6 +181,15 @@ pub trait Component: Send {
     /// (upstream optional `handleInput`, tui.ts:75).
     fn handle_input(&mut self, _data: &str) {}
 
+    /// Whether [`Component::handle_input`] is a real handler (upstream's
+    /// structural `component.handleInput` check, tui.ts:88 @ b3487650f).
+    /// Forwarding components that route keys to hosted children override
+    /// this so a forwarded focus request keeps keyboard focus on the host
+    /// instead of a child that the host may later remove.
+    fn has_handle_input(&self) -> bool {
+        false
+    }
+
     /// If true, the component receives key release events (Kitty protocol).
     /// Default false — release events are filtered out (tui.ts:81).
     fn wants_key_release(&self) -> bool {
@@ -601,14 +610,32 @@ impl From<TuiMouseEventResult> for TuiMouseHandlerResult {
 /// Semantics 1:1 with upstream: no `handle_mouse` → `None`; a result with
 /// none of handled/capture/focus → `None`; otherwise the result is promoted
 /// with the component as the dispatch target (and as the focus target when
-/// `focus` is set). A forwarded dispatch result passes through unchanged
-/// (upstream `if ("target" in result) return result`).
+/// `focus` is set). A forwarded dispatch result passes through — except
+/// that a forwarded focus request keeps the forwarding component as the
+/// focus target when it handles input itself (tui.ts:85-92 @ b3487650f).
 pub fn dispatch_mouse_event(
     component: &SharedComponent,
     event: &TuiMouseEvent,
 ) -> Option<TuiMouseDispatchResult> {
-    match lock_component(component).handle_mouse(event)? {
-        TuiMouseHandlerResult::Forwarded(result) => Some(result),
+    // Bind the result first so the component lock is released before any
+    // nested lock in the match arms (std::sync::Mutex is not reentrant).
+    let result = lock_component(component).handle_mouse(event)?;
+    match result {
+        // The component forwarded the event to a child it hosts. Like a
+        // delegating container, it routes keys to that child itself, so it
+        // keeps keyboard focus: focusing the child directly would leave
+        // focus on a detached component once the host removes it — e.g. a
+        // closed settings submenu (tui.ts:85-92 @ b3487650f).
+        TuiMouseHandlerResult::Forwarded(result) => {
+            if result.focus && lock_component(component).has_handle_input() {
+                Some(TuiMouseDispatchResult {
+                    focus_target: Some(Arc::clone(component)),
+                    ..result
+                })
+            } else {
+                Some(result)
+            }
+        }
         TuiMouseHandlerResult::Event(result) => {
             if !result.handled && !result.capture && !result.focus {
                 return None;
@@ -1224,6 +1251,29 @@ mod mouse_dispatch_tests {
         }
     }
 
+    /// A host that forwards its child's dispatch result (upstream
+    /// `component.handleMouse` returning a result with `"target"`).
+    struct ForwardingHost {
+        child: SharedComponent,
+        handles_input: bool,
+    }
+
+    impl Component for ForwardingHost {
+        fn render(&self, _width: usize) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+            dispatch_mouse_event(&self.child, event).map(TuiMouseHandlerResult::Forwarded)
+        }
+
+        fn has_handle_input(&self) -> bool {
+            self.handles_input
+        }
+
+        fn handle_input(&mut self, _data: &str) {}
+    }
+
     fn event(event_type: TuiMouseEventType, x: isize, y: isize) -> TuiMouseEvent {
         TuiMouseEvent {
             event_type,
@@ -1260,6 +1310,61 @@ mod mouse_dispatch_tests {
             seen: Arc::new(AtomicUsize::new(0)),
         });
         assert!(dispatch_mouse_event(&component, &event(TuiMouseEventType::Press, 0, 0)).is_none());
+    }
+
+    // Regression for b3487650f: a forwarding host that handles input keeps
+    // keyboard focus when its child requests focus, so removing the child
+    // (e.g. a closed settings submenu) cannot leave focus detached.
+    #[test]
+    fn forwarded_focus_keeps_the_host_when_it_handles_input() {
+        let child = shared_component(Recording {
+            label: "child",
+            results: vec![(
+                TuiMouseEventType::Press,
+                TuiMouseEventResult {
+                    handled: true,
+                    focus: true,
+                    ..Default::default()
+                },
+            )],
+            seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let host = shared_component(ForwardingHost {
+            child,
+            handles_input: true,
+        });
+        let result = dispatch_mouse_event(&host, &event(TuiMouseEventType::Press, 0, 0)).unwrap();
+        let focus_target = result.focus_target.expect("focus implies focusTarget");
+        assert!(
+            same_component(&focus_target, &host),
+            "the forwarding host keeps keyboard focus"
+        );
+    }
+
+    #[test]
+    fn forwarded_focus_stays_on_the_child_without_host_input() {
+        let child = shared_component(Recording {
+            label: "child",
+            results: vec![(
+                TuiMouseEventType::Press,
+                TuiMouseEventResult {
+                    handled: true,
+                    focus: true,
+                    ..Default::default()
+                },
+            )],
+            seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let host = shared_component(ForwardingHost {
+            child: Arc::clone(&child),
+            handles_input: false,
+        });
+        let result = dispatch_mouse_event(&host, &event(TuiMouseEventType::Press, 0, 0)).unwrap();
+        let focus_target = result.focus_target.expect("focus implies focusTarget");
+        assert!(
+            same_component(&focus_target, &child),
+            "a host without input handling does not steal focus"
+        );
     }
 
     #[test]

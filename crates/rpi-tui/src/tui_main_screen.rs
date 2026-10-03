@@ -3080,6 +3080,49 @@ mod tests {
 
     // ---- "width overflow protection" ----
 
+    // https://github.com/earendil-works/pi/issues/10026 (`b3487650f`): the
+    // terminal cursor stays visible after stop, even when an overlay closes
+    // during shutdown.
+    #[test]
+    fn hiding_an_overlay_after_stop_keeps_the_cursor_visible() {
+        let terminal = VirtualTerminal::new(80, 24);
+        let tui = new_tui(&terminal);
+        tui.start();
+        tui.show_overlay(
+            static_overlay_simple(&["OVERLAY"]),
+            Some(OverlayOptions {
+                non_capturing: true,
+                ..Default::default()
+            }),
+        );
+        tui.stop(TuiStopOptions::default());
+        tui.hide_overlay();
+        assert!(
+            !terminal.cursor_hidden(),
+            "the shell owns the cursor after stop"
+        );
+    }
+
+    #[test]
+    fn hiding_an_overlay_handle_after_stop_keeps_the_cursor_visible() {
+        let terminal = VirtualTerminal::new(80, 24);
+        let tui = new_tui(&terminal);
+        tui.start();
+        let handle = tui.show_overlay(
+            static_overlay_simple(&["OVERLAY"]),
+            Some(OverlayOptions {
+                non_capturing: true,
+                ..Default::default()
+            }),
+        );
+        tui.stop(TuiStopOptions::default());
+        handle.hide();
+        assert!(
+            !terminal.cursor_hidden(),
+            "the shell owns the cursor after stop"
+        );
+    }
+
     #[test]
     fn overlay_truncates_lines_that_exceed_declared_width() {
         let terminal = VirtualTerminal::new(80, 24);
