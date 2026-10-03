@@ -57,6 +57,7 @@ use crate::tools::path_utils::{normalize_path, resolve_path};
 pub use rpi_tui::components::scroll_view::ScrollbarMode;
 pub use rpi_tui::terminal_image::{ImageProtocol, TerminalCapabilityOverrides};
 pub use rpi_tui::tui::TuiMode;
+pub use rpi_tui::wheel_scroll::WheelScrollLines;
 
 /// rpi#54 (D-103): unlike upstream `DEFAULT_HTTP_IDLE_TIMEOUT_MS`
 /// (http-dispatcher.ts:4, 5 min via undici `headersTimeout`/`bodyTimeout`),
@@ -265,6 +266,31 @@ pub enum DefaultProjectTrust {
 
 /// `TransportSetting = Transport` (settings-manager.ts:64).
 pub type TransportSetting = Transport;
+
+/// `QuietStartup` (settings-manager.ts:111 @ f29ea3deb): `true` hides all
+/// startup output, `"header"` keeps only the startup header; anything else
+/// is `false`. The tri-state is consumed by the startup header/details
+/// split (V16-10 FR-F); the setting key registers with V16-13.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuietStartup {
+    True,
+    Header,
+    #[default]
+    False,
+}
+
+impl QuietStartup {
+    /// Whether the startup header itself is hidden (`quietStartup: true`).
+    pub fn hides_header(self) -> bool {
+        matches!(self, QuietStartup::True)
+    }
+
+    /// Whether the startup details (model scope line, loaded-resource
+    /// listing) are shown (`quietStartup: false`).
+    pub fn shows_details(self) -> bool {
+        matches!(self, QuietStartup::False)
+    }
+}
 
 /// `settings.doubleEscapeAction`: `"fork" | "tree" | "none"`
 /// (settings-manager.ts:116).
@@ -1854,14 +1880,26 @@ impl SettingsManager {
         self.save();
     }
 
-    /// `getQuietStartup` (settings-manager.ts:889-891) — default false.
-    pub fn get_quiet_startup(&self) -> bool {
-        self.settings.get_bool("quietStartup").unwrap_or(false)
+    /// `getQuietStartup` (settings-manager.ts:1089-1092 @ f29ea3deb):
+    /// default `false`; `true` hides all startup output, `"header"` keeps
+    /// only the startup header.
+    pub fn get_quiet_startup(&self) -> QuietStartup {
+        let value = self.settings.get("quietStartup");
+        match value {
+            Some(Value::Bool(true)) => QuietStartup::True,
+            Some(Value::String(text)) if text == "header" => QuietStartup::Header,
+            _ => QuietStartup::False,
+        }
     }
 
-    /// `setQuietStartup` (settings-manager.ts:893-897).
-    pub fn set_quiet_startup(&mut self, quiet: bool) {
-        self.global_settings.set("quietStartup", Value::Bool(quiet));
+    /// `setQuietStartup` (settings-manager.ts:1094-1098).
+    pub fn set_quiet_startup(&mut self, quiet: QuietStartup) {
+        let value = match quiet {
+            QuietStartup::True => Value::Bool(true),
+            QuietStartup::Header => Value::String("header".to_string()),
+            QuietStartup::False => Value::Bool(false),
+        };
+        self.global_settings.set("quietStartup", value);
         self.mark_modified("quietStartup", None);
         self.save();
     }
@@ -2480,12 +2518,12 @@ impl SettingsManager {
         self.save();
     }
 
-    /// `getTuiMode` (settings-manager.ts:1130-1132 @ 5446cd754 @ 4181f66):
-    /// default `"regular"`; only `"fullscreen"` returns fullscreen.
+    /// `getTuiMode` (settings-manager.ts:1370-1372 @ 88ff80b98): default
+    /// `"fullscreen"`; only `"regular"` returns regular.
     pub fn get_tui_mode(&self) -> TuiMode {
         match self.settings.get_str("tuiMode") {
-            Some("fullscreen") => TuiMode::Fullscreen,
-            _ => TuiMode::Regular,
+            Some("regular") => TuiMode::Regular,
+            _ => TuiMode::Fullscreen,
         }
     }
 
@@ -2544,6 +2582,35 @@ impl SettingsManager {
         self.global_settings
             .set("fullscreenCopyOnSelect", Value::Bool(enabled));
         self.mark_modified("fullscreenCopyOnSelect", None);
+        self.save();
+    }
+
+    /// `getFullscreenWheelScrollLines` (settings-manager.ts:1388-1393 @
+    /// f1927c2d5, #9758): `"auto"` default; finite numbers are floored and
+    /// clamped to 1-100, everything else falls back to `"auto"`.
+    pub fn get_fullscreen_wheel_scroll_lines(&self) -> WheelScrollLines {
+        match self.settings.get("fullscreenWheelScrollLines") {
+            Some(Value::Number(number)) => match number.as_f64() {
+                Some(lines) if lines.is_finite() => {
+                    let lines = lines.floor().clamp(1.0, 100.0) as u64;
+                    WheelScrollLines::lines(lines)
+                }
+                _ => WheelScrollLines::Auto,
+            },
+            _ => WheelScrollLines::Auto,
+        }
+    }
+
+    /// `setFullscreenWheelScrollLines` (settings-manager.ts:1395-1399):
+    /// numbers persist clamped to 1-100.
+    pub fn set_fullscreen_wheel_scroll_lines(&mut self, lines: WheelScrollLines) {
+        let value = match lines {
+            WheelScrollLines::Auto => Value::String("auto".to_string()),
+            WheelScrollLines::Lines(lines) => Value::Number(lines.clamp(1, 100).into()),
+        };
+        self.global_settings
+            .set("fullscreenWheelScrollLines", value);
+        self.mark_modified("fullscreenWheelScrollLines", None);
         self.save();
     }
 
@@ -3985,7 +4052,7 @@ mod tests {
             json!({"theme": "dark", "queueMode": "all"}),
         );
 
-        manager.set_quiet_startup(true);
+        manager.set_quiet_startup(QuietStartup::True);
 
         let saved = read_json(&global_path(&dirs));
         assert_eq!(saved["steeringMode"], json!("all"));
@@ -4123,7 +4190,7 @@ mod tests {
         );
         assert!(!manager.get_hide_thinking_block());
         assert!(!manager.get_show_cache_miss_notices());
-        assert!(!manager.get_quiet_startup());
+        assert_eq!(manager.get_quiet_startup(), QuietStartup::False);
         assert_eq!(
             manager.get_default_project_trust(),
             DefaultProjectTrust::Ask
@@ -4492,41 +4559,72 @@ mod tests {
     //  test/settings-manager.test.ts:400-450)
     // =======================================================================
 
-    // Port of "defaults to regular and persists fullscreen mode".
+    // Port of "defaults to fullscreen and persists regular mode"
+    // (settings-manager.test.ts @ 88ff80b98).
     #[test]
-    fn test_tui_mode_defaults_to_regular_and_persists_fullscreen() {
+    fn test_tui_mode_defaults_to_fullscreen_and_persists_regular() {
         let dirs = test_dirs();
         let mut manager = create(&dirs);
 
-        assert_eq!(manager.get_tui_mode(), TuiMode::Regular);
-
-        manager.set_tui_mode(TuiMode::Fullscreen);
-
         assert_eq!(manager.get_tui_mode(), TuiMode::Fullscreen);
+
+        manager.set_tui_mode(TuiMode::Regular);
+
+        assert_eq!(manager.get_tui_mode(), TuiMode::Regular);
         let saved = read_json(&global_path(&dirs));
-        assert_eq!(saved["tuiMode"], json!("fullscreen"));
+        assert_eq!(saved["tuiMode"], json!("regular"));
     }
 
-    // Port of "falls back to regular for unsupported values".
+    // Port of "falls back to fullscreen for unsupported values".
     #[test]
-    fn test_tui_mode_falls_back_to_regular_for_unsupported_values() {
+    fn test_tui_mode_falls_back_to_fullscreen_for_unsupported_values() {
         let dirs = test_dirs();
         write_json(&global_path(&dirs), json!({"tuiMode": "other"}));
 
         let manager = create(&dirs);
 
-        assert_eq!(manager.get_tui_mode(), TuiMode::Regular);
+        assert_eq!(manager.get_tui_mode(), TuiMode::Fullscreen);
     }
 
     // Port of "does not recognize the old uiMode setting".
     #[test]
     fn test_tui_mode_does_not_recognize_old_ui_mode_setting() {
         let dirs = test_dirs();
-        write_json(&global_path(&dirs), json!({"uiMode": "fullscreen"}));
+        write_json(&global_path(&dirs), json!({"uiMode": "regular"}));
 
         let manager = create(&dirs);
 
-        assert_eq!(manager.get_tui_mode(), TuiMode::Regular);
+        assert_eq!(manager.get_tui_mode(), TuiMode::Fullscreen);
+    }
+
+    // Port of "persists fullscreen wheel scroll lines" (#9758, f1927c2d5).
+    #[test]
+    fn test_fullscreen_wheel_scroll_lines_validates_and_persists() {
+        let dirs = test_dirs();
+        let mut manager = create(&dirs);
+
+        assert_eq!(
+            manager.get_fullscreen_wheel_scroll_lines(),
+            WheelScrollLines::Auto
+        );
+
+        manager.set_fullscreen_wheel_scroll_lines(WheelScrollLines::lines(3));
+        let saved = read_json(&global_path(&dirs));
+        assert_eq!(saved["fullscreenWheelScrollLines"], json!(3));
+
+        for (value, expected) in [
+            (json!(7.9), WheelScrollLines::lines(7)),
+            (json!(0), WheelScrollLines::lines(1)),
+            (json!(1000), WheelScrollLines::lines(100)),
+            (json!("fast"), WheelScrollLines::Auto),
+            (json!(null), WheelScrollLines::Auto),
+        ] {
+            write_json(
+                &global_path(&dirs),
+                json!({"fullscreenWheelScrollLines": value}),
+            );
+            assert_eq!(create(&dirs).get_fullscreen_wheel_scroll_lines(), expected);
+        }
     }
 
     // Port of "validates and persists fullscreen settings".

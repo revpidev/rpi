@@ -174,25 +174,25 @@ pub fn startup_onboarding(theme: &Theme) -> String {
     )
 }
 
-/// Build the built-in header component (interactive-mode.ts:732-790).
+/// Build the built-in header component (interactive-mode.ts:732-790 @
+/// f29ea3deb).
+///
+/// `show_details` is the `quietStartup` details split: `false` (set by
+/// `quietStartup: true` for the whole header, or `"header"` for the
+/// compact onboarding line) drops the "and loaded resources" hint. The
+/// caller decides whether to mount the header at all.
 ///
 /// Returns `(tree entry, shared handle)` — the mode keeps the shared handle
-/// for the tools-expansion linkage and the tree owns the entry wrapper. When
-/// `quiet_startup` is set the header is an empty `Text` (upstream assigns
-/// `new Text("", 0, 0)` and the expansion linkage skips it via the
-/// `isExpandable` check).
+/// for the tools-expansion linkage and the tree owns the entry wrapper.
 pub fn build_builtin_header(
     theme: ThemeHandle,
     version: &str,
     expanded: bool,
-    quiet_startup: bool,
+    show_details: bool,
 ) -> (
     Box<dyn Component>,
     Option<Arc<std::sync::Mutex<ExpandableText>>>,
 ) {
-    if quiet_startup {
-        return (Box::new(Text::new("", 0, 0, None)), None);
-    }
     // The header bakes theme colors into its text; the closures rebuild it
     // from the shared theme slot on invalidation so a theme change cannot
     // leave stale colors (bf8e4b953, ThemedText).
@@ -204,10 +204,15 @@ pub fn build_builtin_header(
         let logo = startup_logo(&theme, &collapsed_version);
         let (_, compact_instructions) = startup_instructions(&theme);
         let onboarding = startup_onboarding(&theme);
+        let resources_hint = if show_details {
+            " and loaded resources"
+        } else {
+            ""
+        };
         let compact_onboarding = theme.fg(
             "dim",
             &format!(
-                "Press {} to show full startup help and loaded resources.",
+                "Press {} to show full startup help{resources_hint}.",
                 key_text("app.tools.expand")
             ),
         );
@@ -314,12 +319,13 @@ mod tests {
     }
 
     #[test]
-    fn quiet_startup_yields_empty_header() {
-        let (component, expandable) = build_builtin_header(theme_handle(), "0.1.0", false, true);
-        assert!(expandable.is_none());
+    fn header_details_flag_controls_the_resources_hint() {
+        let (component, expandable) = build_builtin_header(theme_handle(), "0.1.0", false, false);
+        assert!(expandable.is_some());
+        let rendered = component.render(80).join("\n");
         assert!(
-            component.render(80).is_empty(),
-            "quiet header renders nothing"
+            !rendered.contains("and loaded resources"),
+            "header-only startup omits the resources hint: {rendered}"
         );
     }
 

@@ -444,6 +444,11 @@ pub(crate) enum UiCommand {
     /// a component callback (lock contract); automatic pairs resolve the
     /// terminal appearance asynchronously and push the resolved branch name.
     ApplyThemeName(String),
+    /// Mode-internal: the terminal reported its colors (single-pass OSC
+    /// 10/11/4 query, theme-controller.ts `applyTerminalColors` 113-124).
+    /// Routed through the drain so regeneration happens on the driver
+    /// thread.
+    ApplyTerminalColors(rpi_tui::terminal_colors::TerminalColors),
     /// Mode-internal: hot-swap the TUI renderer from the `/settings`
     /// tui-mode change (interactive-mode.ts:4559-4567). MUST be routed
     /// through the drain: the settings callback fires inside the focused
@@ -1138,6 +1143,7 @@ fn select_list_theme(theme: &Arc<Theme>) -> Arc<SelectListTheme> {
 fn fullscreen_alt_screen_options(
     theme_handle: &Arc<Mutex<Arc<Theme>>>,
     copy_on_select: bool,
+    wheel_scroll_lines: rpi_tui::wheel_scroll::WheelScrollLines,
     terminal: &rpi_tui::tui::SharedTerminal,
     clipboard_env_override: &Arc<Mutex<Option<clipboard::ClipboardEnv>>>,
 ) -> rpi_tui::tui_alt_screen::TuiAltScreenOptions {
@@ -1211,18 +1217,20 @@ fn fullscreen_alt_screen_options(
         scroll_to_end_indicator: Some(scroll_to_end_indicator),
         copy_on_select: Some(copy_on_select),
         copy_selection: Some(copy_selection),
+        wheel_scroll_lines: Some(wheel_scroll_lines),
         ..TuiAltScreenOptions::default()
     }
 }
 
-/// Resolve the active theme from settings (default `dark`).
+/// Resolve the active theme from settings (default `system`).
 fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) -> Arc<Theme> {
     // ThemeController constructor (theme-controller.ts:41-46): the
     // session-local `currentThemeSetting` (the `--use-theme` value) takes
     // priority over the persisted settings value; automatic pairs resolve
     // against the env-detected terminal background
     // (`detectTerminalBackgroundFromEnv`) until the async detection in
-    // `init_auto_theme` refines it.
+    // `init_auto_theme` refines it. Without a setting the system theme is
+    // the default (`resolveThemeSetting(...) ?? SYSTEM_THEME_NAME`).
     let setting = initial_theme_setting
         .map(str::to_string)
         .or_else(|| session.settings_manager(|settings| settings.get_theme_setting()));
@@ -1233,8 +1241,11 @@ fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) ->
         rpi_tui::terminal_colors::TerminalColorScheme::Light => TerminalTheme::Light,
         rpi_tui::terminal_colors::TerminalColorScheme::Dark => TerminalTheme::Dark,
     };
+    // The system theme starts in grayscale until `init_auto_theme` reports
+    // the terminal colors (theme-controller.ts:42-44).
+    crate::core::themes::mark_terminal_colors_pending();
     let theme_name = crate::core::themes::resolve_theme_setting(setting.as_deref(), terminal_theme)
-        .unwrap_or_else(|| "dark".to_string());
+        .unwrap_or_else(|| crate::core::themes::SYSTEM_THEME_NAME.to_string());
     let theme = load_theme(
         &theme_name,
         Some(crate::core::themes::terminal_color_mode()),
@@ -1285,6 +1296,10 @@ pub(crate) struct InteractiveUi {
     /// callbacks write it on the driver thread while the color-scheme
     /// listener reads it.
     theme_setting_override: Mutex<Option<String>>,
+    /// `activeThemeName` (theme-controller.ts:23): the theme currently
+    /// applied, used by the terminal-color/scheme reapply logic to leave
+    /// other selections alone. Written by [`Self::apply_theme`].
+    active_theme_name: Mutex<Option<String>>,
     /// The markdown palette derived from [`Self::theme`] (theme.ts:1230-1271);
     /// swapped together with it.
     pub(crate) markdown_theme: Mutex<Arc<MarkdownTheme>>,
@@ -1684,6 +1699,9 @@ impl InteractiveUi {
         let copy_on_select = self
             .session()
             .settings_manager(|s| s.get_fullscreen_copy_on_select());
+        let wheel_scroll_lines = self
+            .session()
+            .settings_manager(|s| s.get_fullscreen_wheel_scroll_lines());
         let new_renderer: Renderer = match mode {
             TuiMode::Fullscreen => {
                 Renderer::Alt(rpi_tui::tui_alt_screen::TuiAltScreen::with_shared_terminal(
@@ -1693,6 +1711,7 @@ impl InteractiveUi {
                     fullscreen_alt_screen_options(
                         &self.scrollbar_theme,
                         copy_on_select,
+                        wheel_scroll_lines,
                         &terminal,
                         &self.clipboard_env_override,
                     ),
@@ -1763,7 +1782,8 @@ impl InteractiveUi {
         let auto_sync_enabled = crate::modes::interactive::theme_watcher::auto_theme_pair(
             self.theme_setting().as_deref(),
         )
-        .is_some();
+        .is_some()
+            || self.resolved_theme_name() == crate::core::themes::SYSTEM_THEME_NAME;
         self.ui
             .set_terminal_color_scheme_notifications(auto_sync_enabled);
 
@@ -1854,9 +1874,10 @@ impl InteractiveUi {
     }
 
     /// `bindTerminalColorSchemeListener` (theme-controller.ts:35, 120-124):
-    /// register the listener that re-resolves an automatic theme pair when
-    /// the terminal reports a color-scheme change (`applyTerminalTheme`,
-    /// theme-controller.ts:126-135). Shared by `init_auto_theme` (initial
+    /// register the listener that re-resolves the theme when the terminal
+    /// reports a color-scheme change (`applyTerminalColorSchemeChange`,
+    /// theme-controller.ts:126-135), then queries the terminal colors again
+    /// (they decide the appearance). Shared by `init_auto_theme` (initial
     /// bind) and `switch_tui_mode` (`themeController.rebindTui()`,
     /// interactive-mode.ts:827) so the two bind sites cannot drift. The
     /// listener runs on the driver thread (the TUI's tick) — the same thread
@@ -1870,22 +1891,32 @@ impl InteractiveUi {
         };
         self.ui
             .on_terminal_color_scheme_change(Box::new(move |scheme| {
+                // `if (!this.autoSyncEnabled) return;` (theme-controller.ts:127).
                 let setting = listener_ui.theme_setting();
-                let Some((light, dark)) =
+                let auto_sync =
                     crate::modes::interactive::theme_watcher::auto_theme_pair(setting.as_deref())
-                else {
+                        .is_some()
+                        || listener_ui.resolved_theme_name()
+                            == crate::core::themes::SYSTEM_THEME_NAME;
+                if !auto_sync {
                     return;
-                };
-                let name = match scheme {
-                    rpi_tui::terminal_colors::TerminalColorScheme::Light => light,
-                    rpi_tui::terminal_colors::TerminalColorScheme::Dark => dark,
-                };
-                if let Ok(theme) = crate::core::themes::load_theme(
-                    &name,
-                    Some(crate::core::themes::terminal_color_mode()),
-                ) {
-                    listener_ui.apply_theme(Arc::new(theme));
                 }
+                let previous = crate::core::themes::get_terminal_theme();
+                let scheme = match scheme {
+                    rpi_tui::terminal_colors::TerminalColorScheme::Light => {
+                        crate::core::themes::TerminalTheme::Light
+                    }
+                    rpi_tui::terminal_colors::TerminalColorScheme::Dark => {
+                        crate::core::themes::TerminalTheme::Dark
+                    }
+                };
+                crate::core::themes::set_terminal_color_scheme(Some(scheme));
+                if crate::core::themes::get_terminal_theme() != previous {
+                    listener_ui.reapply_for_terminal();
+                }
+                // `this.queryTerminalColors()` (theme-controller.ts:135): the
+                // terminal's colors changed too, so query them again.
+                listener_ui.query_terminal_colors_async();
             }));
     }
 
@@ -2565,6 +2596,12 @@ impl InteractiveUi {
                 };
                 self.apply_theme(Arc::new(theme));
             }
+            UiCommand::ApplyTerminalColors(colors) => {
+                // `applyTerminalColors` (theme-controller.ts:113-124): merge
+                // with the last report, regenerate the system theme (or a
+                // pair branch) and re-render.
+                self.apply_terminal_colors(colors);
+            }
             UiCommand::SwitchTuiMode(mode) => {
                 // onTuiModeChange (interactive-mode.ts:4559-4567 @ b103937d3),
                 // applied from the drain (see the variant's doc comment):
@@ -3098,8 +3135,7 @@ impl InteractiveUi {
     }
 
     /// `showLoadedResources` (interactive-mode.ts:1421-1627): the loaded
-    /// resources listing — Context / Skills / Prompts / Extensions / Themes
-    /// sections (ExpandableText, compact name lists) plus the diagnostics
+    /// resources listing — Context / Skills / Prompts / Extensions sections (ExpandableText, compact name lists) plus the diagnostics
     /// block. Renders into the dedicated `loaded_resources_container`, so
     /// chat clears do not remove it (interactive-mode.ts:1426-1427).
     ///
@@ -3119,7 +3155,7 @@ impl InteractiveUi {
         let quiet_startup = self
             .session()
             .settings_manager(|settings| settings.get_quiet_startup());
-        let show_listing = force || self.verbose || !quiet_startup;
+        let show_listing = force || self.verbose || quiet_startup.shows_details();
         let show_diagnostics = show_listing || show_diagnostics_when_quiet;
         if !show_listing && !show_diagnostics {
             return;
@@ -3128,7 +3164,7 @@ impl InteractiveUi {
         // Snapshot the loaded resources so the loader lock is released
         // before any further `self` locks.
         let loader = self.session().resource_loader();
-        let (skills, prompts, extensions, themes, context_files, diagnostics) = {
+        let (skills, prompts, extensions, context_files, diagnostics) = {
             let loader = lock(&loader);
             let loaded = loader.resources();
             let skills: Vec<String> = loaded
@@ -3148,22 +3184,6 @@ impl InteractiveUi {
                 .filter_map(|path| {
                     path.file_name()
                         .map(|name| name.to_string_lossy().into_owned())
-                })
-                .collect();
-            // Custom themes only — built-ins are excluded (interactive-mode.ts:1552-1555).
-            let themes: Vec<String> = loaded
-                .themes
-                .iter()
-                .filter(|theme| theme.source_path.is_some())
-                .map(|theme| {
-                    theme.name.clone().unwrap_or_else(|| {
-                        theme
-                            .source_path
-                            .as_ref()
-                            .and_then(|path| path.file_name())
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_default()
-                    })
                 })
                 .collect();
             // Context listing (interactive-mode.ts:1495): system prompt
@@ -3191,14 +3211,7 @@ impl InteractiveUi {
                     )
                 })
                 .collect();
-            (
-                skills,
-                prompts,
-                extensions,
-                themes,
-                context_files,
-                diagnostics,
-            )
+            (skills, prompts, extensions, context_files, diagnostics)
         };
         drop(loader);
 
@@ -3285,14 +3298,6 @@ impl InteractiveUi {
                     &mut container,
                     "Extensions",
                     format_compact_list(extensions, true),
-                    None,
-                );
-            }
-            if !themes.is_empty() {
-                add_loaded_section(
-                    &mut container,
-                    "Themes",
-                    format_compact_list(themes, true),
                     None,
                 );
             }
@@ -4100,6 +4105,89 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
+    /// `resolveThemeName` (theme-controller.ts:87-90): the theme for the
+    /// current setting and terminal appearance. Without a setting the system
+    /// theme is the default.
+    pub(crate) fn resolved_theme_name(&self) -> String {
+        let terminal_theme = crate::core::themes::get_terminal_theme();
+        crate::core::themes::resolve_theme_setting(self.theme_setting().as_deref(), terminal_theme)
+            .unwrap_or_else(|| crate::core::themes::SYSTEM_THEME_NAME.to_string())
+    }
+
+    /// `applyTerminalColors` (theme-controller.ts:113-124): record reported
+    /// colors — themes use the terminal defaults for tokens set to `""`,
+    /// the system theme is generated from all of them, and light/dark
+    /// detection uses them. Re-renders only when they changed (including
+    /// timeouts).
+    pub(crate) fn apply_terminal_colors(&self, reported: rpi_tui::terminal_colors::TerminalColors) {
+        let previous = crate::core::themes::get_terminal_colors();
+        let first_report = !crate::core::themes::has_terminal_colors();
+        let next = rpi_tui::terminal_colors::TerminalColors {
+            foreground: reported.foreground.or(previous.foreground),
+            background: reported.background.or(previous.background),
+            palette: reported.palette.or_else(|| previous.palette.clone()),
+        };
+        if !first_report && next == previous {
+            return;
+        }
+        crate::core::themes::set_terminal_colors(next);
+        self.reapply_for_terminal();
+        self.ui.invalidate();
+        self.ui.request_render(false);
+    }
+
+    /// `reapplyForTerminal` (theme-controller.ts:126-135): re-apply the
+    /// setting after the terminal's colors or appearance changed:
+    /// regenerate the system theme, or switch the theme of a pair.
+    fn reapply_for_terminal(&self) {
+        let name = self.resolved_theme_name();
+        let active = lock(&self.active_theme_name).clone();
+        if name == crate::core::themes::SYSTEM_THEME_NAME || Some(&name) != active.as_ref() {
+            if let Ok(theme) = crate::core::themes::load_theme(
+                &name,
+                Some(crate::core::themes::terminal_color_mode()),
+            ) {
+                self.apply_theme(Arc::new(theme));
+            }
+        }
+    }
+
+    /// `queryTerminalColors()` (theme-controller.ts:101-103): submit a
+    /// single-pass query with the late-reply hook installed. The caller owns
+    /// the returned receiver (first result); late replies always route
+    /// through the drain as [`UiCommand::ApplyTerminalColors`].
+    pub(crate) fn submit_terminal_color_query(
+        self: &Arc<Self>,
+    ) -> tokio::sync::oneshot::Receiver<rpi_tui::terminal_colors::TerminalColors> {
+        let late_ui = Arc::clone(self);
+        self.ui
+            .query_terminal_colors(rpi_tui::tui::TerminalColorQueryOptions {
+                timeout: Duration::from_millis(100),
+                on_late_reply: Some(Box::new(move |colors| {
+                    late_ui.push(UiCommand::ApplyTerminalColors(colors));
+                    late_ui.render_handle.request_render();
+                })),
+            })
+    }
+
+    /// Fire-and-forget variant used by runtime paths that do not await the
+    /// first result (the color-scheme listener, `/settings` changes): the
+    /// first result and late replies both route through the drain. Runs off
+    /// the driver thread (the replies are pumped by it) via `spawn_async`.
+    pub(crate) fn query_terminal_colors_async(self: &Arc<Self>) {
+        let receiver = self.submit_terminal_color_query();
+        let first_ui = Arc::clone(self);
+        commands_selectors::spawn_async(async move {
+            // The Tui's own deadline resolves the oneshot; the tokio timeout
+            // is a backstop for tests without a pump.
+            if let Ok(Ok(colors)) = tokio::time::timeout(Duration::from_millis(150), receiver).await
+            {
+                first_ui.push(UiCommand::ApplyTerminalColors(colors));
+                first_ui.render_handle.request_render();
+            }
+        });
+    }
+
     /// `rebuildChatFromMessages` (interactive-mode.ts:3524-3527).
     pub(crate) fn rebuild_chat_from_messages(&self) {
         lock(&self.chat_container).clear();
@@ -4114,6 +4202,7 @@ impl InteractiveUi {
     /// 800-804). Called from the drain / the color-scheme listener — never
     /// concurrently with component callbacks.
     pub(crate) fn apply_theme(&self, theme: Arc<Theme>) {
+        *lock(&self.active_theme_name) = theme.name.clone();
         *lock(&self.theme) = Arc::clone(&theme);
         *lock(&self.scrollbar_theme) = Arc::clone(&theme);
         let markdown = {
@@ -4648,6 +4737,8 @@ impl InteractiveMode {
             // (tui-renderer.ts:36, interactive-mode.ts:539 @ 9841914,
             // 4e4949299).
             let copy_on_select = session.settings_manager(|s| s.get_fullscreen_copy_on_select());
+            let wheel_scroll_lines =
+                session.settings_manager(|s| s.get_fullscreen_wheel_scroll_lines());
             let terminal: rpi_tui::tui::SharedTerminal = Arc::new(std::sync::Mutex::new(terminal));
             let alt = rpi_tui::tui_alt_screen::TuiAltScreen::with_shared_terminal(
                 Arc::clone(&terminal),
@@ -4656,6 +4747,7 @@ impl InteractiveMode {
                 fullscreen_alt_screen_options(
                     &theme_handle,
                     copy_on_select,
+                    wheel_scroll_lines,
                     &terminal,
                     &clipboard_env_override,
                 ),
@@ -4745,6 +4837,7 @@ impl InteractiveMode {
             session: RwLock::new(session.clone()),
             theme: Arc::new(Mutex::new(Arc::clone(&theme))),
             theme_setting_override: Mutex::new(options.initial_theme_setting.clone()),
+            active_theme_name: Mutex::new(None),
             markdown_theme: Mutex::new(markdown_theme),
             render_handle,
             event_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -5185,27 +5278,26 @@ impl InteractiveMode {
         );
         self.git_watcher = Some(git_watcher);
 
-        // Header (interactive-mode.ts:731-791): quiet startup yields an
-        // empty header; otherwise the ExpandableText linked to tools
-        // expansion.
+        // Header (interactive-mode.ts:731-791 @ f29ea3deb): `quietStartup:
+        // true` hides the header; `"header"` keeps it but suppresses the
+        // details (the loaded-resource listing; rpi has no model-scope line,
+        // [N/A-struct]).
         let quiet_startup = self
             .session
             .settings_manager(|settings| settings.get_quiet_startup());
+        let show_header = self.options.verbose || !quiet_startup.hides_header();
+        let show_details = self.options.verbose || quiet_startup.shows_details();
         let expanded = self.options.verbose || *lock(&ui_state.tool_output_expanded);
-        let (header, expandable) = build_builtin_header(
-            Arc::clone(&ui_state.theme),
-            VERSION,
-            expanded,
-            quiet_startup,
-        );
+        let (header, expandable) =
+            build_builtin_header(Arc::clone(&ui_state.theme), VERSION, expanded, show_details);
         let mut header_container = lock(&ui_state.header_container);
-        if !quiet_startup {
+        if show_header {
             header_container
                 .children
                 .push(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
         }
         header_container.children.push(header);
-        if !quiet_startup {
+        if show_header {
             header_container
                 .children
                 .push(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
@@ -5341,36 +5433,45 @@ impl InteractiveMode {
         self.shutdown().await;
     }
 
-    /// Auto theme resolution + color-scheme follow (theme-controller.ts:37-45
-    /// and 113-125): when the theme setting is an automatic pair (or the
-    /// plain `"auto"` shorthand), detect the terminal appearance, apply the
-    /// matching branch, and follow color-scheme changes. The change listener
-    /// is registered unconditionally (upstream registers it in the controller
-    /// constructor, theme-controller.ts:34) so a `/settings` switch to an
-    /// automatic pair at runtime is followed too; the listener no-ops while
-    /// the setting is not an automatic pair, and terminal notifications stay
-    /// disabled until then (`setAutoSync`, theme-controller.ts:107-111).
+    /// Theme controller init (theme-controller.ts:37-45 and 107-135): bind
+    /// the color-scheme listener, enable terminal notifications when the
+    /// setting follows the terminal (pair or `system`), apply the resolved
+    /// theme (the system theme starts in grayscale via
+    /// `markTerminalColorsPending`), then query the terminal's colors; late
+    /// replies re-apply through the drain (`ApplyTerminalColors`). The change
+    /// listener is registered unconditionally (upstream registers it in the
+    /// controller constructor, theme-controller.ts:34) so a `/settings`
+    /// switch to an automatic pair at runtime is followed too.
     async fn init_auto_theme(&self) {
         let ui = &self.ui_state.ui;
         self.ui_state.bind_terminal_color_scheme_listener();
 
         let setting = self.ui_state.theme_setting();
-        let Some((light, dark)) =
-            crate::modes::interactive::theme_watcher::auto_theme_pair(setting.as_deref())
-        else {
-            return;
-        };
-        ui.set_terminal_color_scheme_notifications(true);
-        let terminal_theme =
-            crate::modes::interactive::theme_watcher::detect_terminal_theme_for_auto(ui, 100).await;
-        let name = match terminal_theme {
-            rpi_tui::terminal_colors::TerminalColorScheme::Light => light,
-            rpi_tui::terminal_colors::TerminalColorScheme::Dark => dark,
-        };
+        let is_system =
+            self.ui_state.resolved_theme_name() == crate::core::themes::SYSTEM_THEME_NAME;
+        let is_pair =
+            crate::modes::interactive::theme_watcher::auto_theme_pair(setting.as_deref()).is_some();
+        // `setAutoSync(pair || system)` (theme-controller.ts:39-41, 107-111).
+        ui.set_terminal_color_scheme_notifications(is_pair || is_system);
+
+        // `markTerminalColorsPending()` + `initTheme(activeThemeName, true)`
+        // (theme-controller.ts:42-44): the first system frame is grayscale.
+        crate::core::themes::mark_terminal_colors_pending();
+        let name = self.ui_state.resolved_theme_name();
         if let Ok(theme) =
             crate::core::themes::load_theme(&name, Some(crate::core::themes::terminal_color_mode()))
         {
             self.ui_state.apply_theme(Arc::new(theme));
+        }
+
+        // `applyFromSettings()`'s `queryTerminalColors()`
+        // (theme-controller.ts:45) + `waitForTerminalColors()` (50-56): await
+        // the first result (or the 100ms timeout) so startup rendering uses
+        // the reported colors when the terminal answers; late replies still
+        // route through the drain.
+        let receiver = self.ui_state.submit_terminal_color_query();
+        if let Ok(Ok(colors)) = tokio::time::timeout(Duration::from_millis(150), receiver).await {
+            self.ui_state.apply_terminal_colors(colors);
         }
     }
 
@@ -6360,6 +6461,7 @@ mod tests {
             UiCommand::Escape => "escape",
             UiCommand::ThemeChanged => "theme_changed",
             UiCommand::ApplyThemeName(_) => "apply_theme_name",
+            UiCommand::ApplyTerminalColors(_) => "apply_terminal_colors",
             UiCommand::SwitchTuiMode(_) => "switch_tui_mode",
             UiCommand::GitBranchChanged => "git_branch_changed",
             UiCommand::NewVersionAvailable(_) => "new_version_available",
@@ -8300,8 +8402,8 @@ mod tests {
         assert!(a_index < b_index, "sorted compact list: {skills}");
         assert!(rendered.contains("[Prompts]"), "rendered: {rendered}");
         assert!(rendered.contains("/review"), "rendered: {rendered}");
-        assert!(rendered.contains("[Themes]"), "rendered: {rendered}");
-        assert!(rendered.contains("custom"), "rendered: {rendered}");
+        // 2b0a123de: the [Themes] section is not part of the startup banner.
+        assert!(!rendered.contains("[Themes]"), "rendered: {rendered}");
         // The broken theme produced a diagnostic block (warning color).
         assert!(
             rendered.contains("[Resource issues]"),
@@ -8333,8 +8435,9 @@ mod tests {
     #[tokio::test]
     async fn show_loaded_resources_quiet_shows_diagnostics_only() {
         let (mode, _terminal, _tmp_keep) = loaded_resources_harness(false).await;
-        mode.session
-            .settings_manager(|settings| settings.set_quiet_startup(true));
+        mode.session.settings_manager(|settings| {
+            settings.set_quiet_startup(crate::core::settings_manager::QuietStartup::True)
+        });
         let ui = &mode.ui_state;
         ui.show_loaded_resources();
 
@@ -8356,8 +8459,9 @@ mod tests {
     #[tokio::test]
     async fn show_loaded_resources_verbose_overrides_quiet() {
         let (mode, _terminal, _tmp_keep) = loaded_resources_harness(true).await;
-        mode.session
-            .settings_manager(|settings| settings.set_quiet_startup(true));
+        mode.session.settings_manager(|settings| {
+            settings.set_quiet_startup(crate::core::settings_manager::QuietStartup::True)
+        });
         let ui = &mode.ui_state;
         ui.show_loaded_resources();
 
@@ -8653,6 +8757,41 @@ mod tests {
         assert!(
             matches!(name.as_deref(), Some("dark" | "light")),
             "auto branch applied, got {name:?}"
+        );
+    }
+
+    /// `applyTerminalColors` (theme-controller.ts:113-124): a report
+    /// regenerates the selected system theme and switches it to the reported
+    /// appearance (V16-10 FR-C; the harness stands in for the OSC mock pump).
+    #[tokio::test]
+    async fn apply_terminal_colors_regenerates_the_system_theme() {
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        session.settings_manager(|settings| settings.set_theme("system"));
+        *lock(&ui.theme_setting_override) = Some("system".to_string());
+
+        ui.apply_terminal_colors(rpi_tui::terminal_colors::TerminalColors {
+            background: Some(rpi_tui::terminal_colors::RgbColor {
+                r: 40,
+                g: 42,
+                b: 54,
+            }),
+            foreground: Some(rpi_tui::terminal_colors::RgbColor {
+                r: 248,
+                g: 248,
+                b: 242,
+            }),
+            palette: None,
+        });
+
+        let theme = lock(&ui.theme).clone();
+        assert_eq!(theme.name.as_deref(), Some("system"));
+        assert_eq!(theme.appearance(), crate::core::themes::TerminalTheme::Dark);
+        // Body text uses the terminal's reported foreground (OSC 10 default).
+        assert_eq!(theme.get_fg_ansi("text"), "\x1b[39m");
+        // Cleanup the process-global terminal state.
+        crate::core::themes::set_terminal_colors(
+            rpi_tui::terminal_colors::TerminalColors::default(),
         );
     }
 

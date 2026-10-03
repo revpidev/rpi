@@ -558,7 +558,7 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
-  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
+  --tui-mode <mode>              TUI mode: fullscreen (default) or regular
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as RPI_OFFLINE=1)
@@ -1415,7 +1415,7 @@ mod tests {
         let help = print_help(&[], false);
         assert!(
             help.contains(
-                "--tui-mode <mode>              TUI mode: regular (default) or fullscreen"
+                "--tui-mode <mode>              TUI mode: fullscreen (default) or regular"
             ),
             "help text must contain --tui-mode line"
         );

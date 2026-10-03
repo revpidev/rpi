@@ -14,7 +14,6 @@ use std::boxed::Box as StdBox;
 use std::sync::Arc;
 
 use rpi_ext_host::types::MarkdownTransformerFn;
-use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
 use rpi_tui::tui::Component;
 
@@ -24,12 +23,16 @@ use super::markdown_transform::create_markdown_transform;
 use super::util::{OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START};
 
 /// Component that renders a user message (user-message.ts:11-57).
+///
+/// `e792ba131` (v1.0.0): the Markdown pads and colors its own background — a
+/// Box around it kept a second full-width copy of every line with identical
+/// output.
 pub struct UserMessageComponent {
     text: String,
     markdown_theme: Arc<MarkdownTheme>,
     output_pad: usize,
     theme: Arc<Theme>,
-    content_box: TuiBox,
+    content: StdBox<Markdown>,
     /// Extension-registered Markdown transformers (user-message.ts:17).
     markdown_transformers: Vec<MarkdownTransformerFn>,
 }
@@ -44,10 +47,17 @@ impl UserMessageComponent {
     ) -> Self {
         let mut component = Self {
             text: text.into(),
-            markdown_theme,
+            markdown_theme: Arc::clone(&markdown_theme),
             output_pad,
             theme,
-            content_box: TuiBox::new(0, 0, None),
+            content: StdBox::new(Markdown::new(
+                String::new(),
+                0,
+                0,
+                Arc::clone(&markdown_theme),
+                None,
+                None,
+            )),
             markdown_transformers,
         };
         component.rebuild();
@@ -62,22 +72,22 @@ impl UserMessageComponent {
 
     /// `rebuild` (user-message.ts:29-45).
     fn rebuild(&mut self) {
-        let bg = {
-            let theme = Arc::clone(&self.theme);
-            Box::new(move |content: &str| theme.bg("userMessageBg", content))
-        };
-        let mut content_box = TuiBox::new(self.output_pad, 1, Some(bg));
         let color = {
             let theme = Arc::clone(&self.theme);
             Box::new(move |content: &str| theme.fg("userMessageText", content))
         };
-        content_box.add_child(StdBox::new(Markdown::new(
+        let bg_color = {
+            let theme = Arc::clone(&self.theme);
+            Box::new(move |content: &str| theme.bg("userMessageBg", content))
+        };
+        self.content = StdBox::new(Markdown::new(
             self.text.clone(),
-            0,
-            0,
+            self.output_pad,
+            1,
             Arc::clone(&self.markdown_theme),
             Some(DefaultTextStyle {
                 color: Some(color),
+                bg_color: Some(bg_color),
                 ..Default::default()
             }),
             Some(MarkdownOptions {
@@ -93,14 +103,13 @@ impl UserMessageComponent {
                 ),
                 ..Default::default()
             }),
-        )));
-        self.content_box = content_box;
+        ));
     }
 }
 
 impl Component for UserMessageComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = self.content_box.render(width);
+        let mut lines = self.content.render(width);
         if lines.is_empty() {
             return lines;
         }
@@ -113,7 +122,7 @@ impl Component for UserMessageComponent {
     }
 
     fn invalidate(&mut self) {
-        self.content_box.invalidate();
+        Component::invalidate(&mut *self.content);
         self.rebuild();
     }
 }

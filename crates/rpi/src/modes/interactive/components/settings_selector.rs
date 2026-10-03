@@ -144,6 +144,7 @@ pub struct SettingsSelectorOptions {
     pub fullscreen_exit_output: crate::core::settings_manager::FullscreenExitOutput,
     pub fullscreen_scrollbar: rpi_tui::components::scroll_view::ScrollbarMode,
     pub fullscreen_copy_on_select: bool,
+    pub fullscreen_wheel_scroll_lines: rpi_tui::wheel_scroll::WheelScrollLines,
     pub warnings: WarningSettings,
 }
 
@@ -198,6 +199,9 @@ pub enum SettingsChange {
     /// `onFullscreenCopyOnSelectChange` (settings-selector.ts:124 @ 9841914,
     /// 4e4949299).
     FullscreenCopyOnSelect(bool),
+    /// `onFullscreenWheelScrollLinesChange` (settings-selector.ts:734-746 @
+    /// f1927c2d5, #9758).
+    FullscreenWheelScrollLines(rpi_tui::wheel_scroll::WheelScrollLines),
     Warnings(WarningSettings),
 }
 
@@ -321,6 +325,22 @@ fn parse_fullscreen_scrollbar(value: &str) -> rpi_tui::components::scroll_view::
         "hidden" => rpi_tui::components::scroll_view::ScrollbarMode::Hidden,
         _ => rpi_tui::components::scroll_view::ScrollbarMode::Auto,
     }
+}
+
+/// `WheelScrollLines` <-> `"auto"` | `1`-`100`
+/// (settings-manager.ts:1388-1399 @ f1927c2d5, #9758).
+fn fullscreen_wheel_scroll_lines_to_str(lines: rpi_tui::wheel_scroll::WheelScrollLines) -> String {
+    match lines {
+        rpi_tui::wheel_scroll::WheelScrollLines::Auto => "auto".to_string(),
+        rpi_tui::wheel_scroll::WheelScrollLines::Lines(lines) => lines.to_string(),
+    }
+}
+
+fn parse_fullscreen_wheel_scroll_lines(value: &str) -> rpi_tui::wheel_scroll::WheelScrollLines {
+    value
+        .parse::<u64>()
+        .map(|lines| rpi_tui::wheel_scroll::WheelScrollLines::Lines(lines.clamp(1, 100)))
+        .unwrap_or(rpi_tui::wheel_scroll::WheelScrollLines::Auto)
 }
 
 fn tree_filter_to_str(mode: TreeFilterMode) -> &'static str {
@@ -1974,7 +1994,8 @@ impl SettingsSelectorComponent {
                 id: "tui-mode".to_string(),
                 label: "TUI mode".to_string(),
                 description: Some(
-                    "Interface layout; fullscreen mode is experimental".to_string(),
+                    "Interface layout; regular mode uses the terminal's normal scrollback"
+                        .to_string(),
                 ),
                 current_value: tui_mode_to_str(options.tui_mode).to_string(),
                 values: Some(vec!["regular".to_string(), "fullscreen".to_string()]),
@@ -2025,6 +2046,32 @@ impl SettingsSelectorComponent {
                     "false".to_string()
                 },
                 values: Some(vec!["true".to_string(), "false".to_string()]),
+                submenu: None,
+            },
+            // settings-selector.ts:734-746 @ f1927c2d5, #9758.
+            SettingItem {
+                id: "fullscreen-wheel-scroll-lines".to_string(),
+                label: "Fullscreen wheel scrolling".to_string(),
+                description: Some(
+                    "Lines per mouse-wheel event in fullscreen mode; 'auto' speeds up fast wheel spins where the terminal does not"
+                        .to_string(),
+                ),
+                current_value: fullscreen_wheel_scroll_lines_to_str(
+                    options.fullscreen_wheel_scroll_lines,
+                ),
+                values: Some({
+                    let mut values = vec!["auto".to_string()];
+                    let mut lines = vec![1u64, 2, 3, 5, 10];
+                    if let rpi_tui::wheel_scroll::WheelScrollLines::Lines(current) =
+                        options.fullscreen_wheel_scroll_lines
+                    {
+                        lines.push(current);
+                    }
+                    lines.sort_unstable();
+                    lines.dedup();
+                    values.extend(lines.into_iter().map(|lines| lines.to_string()));
+                    values
+                }),
                 submenu: None,
             },
             SettingItem {
@@ -2358,6 +2405,9 @@ impl SettingsSelectorComponent {
                 "fullscreen-copy-on-select" => {
                     SettingsChange::FullscreenCopyOnSelect(new_value == "true")
                 }
+                "fullscreen-wheel-scroll-lines" => SettingsChange::FullscreenWheelScrollLines(
+                    parse_fullscreen_wheel_scroll_lines(new_value),
+                ),
                 "theme" => SettingsChange::Theme(new_value.to_string()),
                 _ => return,
             };
@@ -2475,6 +2525,7 @@ mod tests {
             fullscreen_exit_output: crate::core::settings_manager::FullscreenExitOutput::Transcript,
             fullscreen_scrollbar: rpi_tui::components::scroll_view::ScrollbarMode::Auto,
             fullscreen_copy_on_select: true,
+            fullscreen_wheel_scroll_lines: rpi_tui::wheel_scroll::WheelScrollLines::Auto,
             warnings: WarningSettings {
                 anthropic_extra_usage: Some(true),
             },
@@ -2568,7 +2619,7 @@ mod tests {
         // with them; +fullscreen-copy-on-select, 4e4949299; +cache warming
         // row #9668/V15-05; the 10-row window always scrolls).
         let supports_images = get_capabilities().images.is_some();
-        let item_count = if supports_images { 33 } else { 31 };
+        let item_count = if supports_images { 34 } else { 32 };
         assert!(
             lines
                 .iter()
@@ -2935,12 +2986,13 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Theme item index: 30 with image rows, 28 without (3 T32 items
-        // added before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar).
+        // Theme item index: 33 with image rows, 31 without (4 rows added
+        // before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar,
+        // fullscreen-wheel-scroll-lines).
         let target = if get_capabilities().images.is_some() {
-            32
+            33
         } else {
-            30
+            31
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2988,12 +3040,13 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Theme item index: 30 with image rows, 28 without (3 T32 items
-        // added before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar).
+        // Theme item index: 33 with image rows, 31 without (4 rows added
+        // before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar,
+        // fullscreen-wheel-scroll-lines).
         let target = if get_capabilities().images.is_some() {
-            32
+            33
         } else {
-            30
+            31
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -3043,7 +3096,7 @@ mod tests {
         // 26 base + 3 T32 items + fullscreen-copy-on-select (4e4949299) +
         // cache warming (#9668/V15-05).
         let supports_images = get_capabilities().images.is_some();
-        let expected = if supports_images { 33 } else { 31 };
+        let expected = if supports_images { 34 } else { 32 };
         let lines = render_plain(&component, 100);
         let joined = lines.join("\n");
         // The scroll indicator shows the total count.

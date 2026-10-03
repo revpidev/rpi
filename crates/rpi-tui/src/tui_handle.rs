@@ -32,6 +32,7 @@ use crate::tui::{
 };
 use crate::tui_alt_screen::TuiAltScreen;
 use crate::tui_main_screen::{TuiMainScreen, TuiMainScreenRenderState};
+use crate::wheel_scroll::WheelScrollLines;
 
 /// The live renderer behind a [`TuiHandle`] — one of the two concrete
 /// implementations (tui.rs:565).
@@ -422,6 +423,14 @@ impl TuiHandle {
         match self.renderer_clone() {
             RendererClone::Main(tui) => tui.terminal_color_scheme_listener_count(),
             RendererClone::Alt(tui) => tui.terminal_color_scheme_listener_count(),
+        }
+    }
+
+    /// Apply the fullscreen wheel-scroll setting (upstream
+    /// `setWheelScrollLines`, tui-alt-screen.ts:291). No-op in regular mode.
+    pub fn set_wheel_scroll_lines(&self, lines: WheelScrollLines) {
+        if let RendererClone::Alt(tui) = self.renderer_clone() {
+            tui.set_wheel_scroll_lines(lines);
         }
     }
 

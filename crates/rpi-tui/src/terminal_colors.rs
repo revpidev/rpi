@@ -131,23 +131,21 @@ pub fn parse_osc_color_response(data: &str) -> Option<OscColorResponse> {
         (OscColorTarget::Foreground, after)
     } else if let Some(after) = rest.strip_prefix("11;") {
         (OscColorTarget::Background, after)
-    } else if let Some(after) = rest.strip_prefix("4;") {
+    } else {
+        let after = rest.strip_prefix("4;")?;
         let semicolon = after.find(';')?;
         let index = &after[..semicolon];
         if index.is_empty() || index.len() > 3 || !index.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        (OscColorTarget::Palette(index.parse().ok()?), &after[semicolon + 1..])
-    } else {
-        return None;
+        (
+            OscColorTarget::Palette(index.parse().ok()?),
+            &after[semicolon + 1..],
+        )
     };
-    let value = if let Some(value) = after.strip_suffix('\x07') {
-        value
-    } else if let Some(value) = after.strip_suffix("\x1b\\") {
-        value
-    } else {
-        return None;
-    };
+    let value = after
+        .strip_suffix('\x07')
+        .or_else(|| after.strip_suffix("\x1b\\"))?;
     // `[^\x07\x1b]*`: the value must not contain a terminator char itself.
     if value.contains(['\x07', '\x1b']) {
         return None;

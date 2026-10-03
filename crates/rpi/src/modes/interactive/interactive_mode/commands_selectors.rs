@@ -411,18 +411,24 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
             // `currentThemeSetting ?? getThemeSetting()` prefer it.
             *lock(&ui.theme_setting_override) = Some(theme_setting.clone());
             // `applyFromSettings` (theme-controller.ts:37-60): automatic
-            // pairs resolve against the terminal appearance (async); plain
-            // names load directly. Both apply through the drain
-            // (`ApplyThemeName`) so `apply_theme` never runs inside this
-            // component callback (lock contract).
+            // pairs resolve against the terminal appearance (async); the
+            // system theme regenerates from the reported colors; plain names
+            // load directly. All apply through the drain (`ApplyThemeName`)
+            // so `apply_theme` never runs inside this component callback
+            // (lock contract). The terminal colors are queried afterwards in
+            // every case (`applyFromSettings` always calls
+            // `queryTerminalColors()`, theme-controller.ts:45).
+            let resolved = ui.resolved_theme_name();
+            let is_auto = auto_theme_pair(Some(theme_setting.as_str())).is_some()
+                || resolved == crate::core::themes::SYSTEM_THEME_NAME;
+            ui.ui.set_terminal_color_scheme_notifications(is_auto);
             match auto_theme_pair(Some(theme_setting.as_str())) {
                 Some((light, dark)) => apply_auto_theme_pair(ui, light, dark),
                 None => {
-                    // `setAutoSync(false)` (theme-controller.ts:47).
-                    ui.ui.set_terminal_color_scheme_notifications(false);
-                    ui.push(UiCommand::ApplyThemeName(theme_setting));
+                    ui.push(UiCommand::ApplyThemeName(resolved));
                 }
             }
+            ui.query_terminal_colors_async();
         }
         SettingsChange::ThemePreview(_) => {
             // Ignored by the integration layer (component header).
@@ -495,7 +501,14 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
             lock(&ui.editor).set_autocomplete_max_visible(max_visible.min(20) as usize);
         }
         SettingsChange::QuietStartup(enabled) => {
-            session.settings_manager(|s| s.set_quiet_startup(enabled));
+            // The selector's on/off maps onto the tri-state; the `"header"`
+            // choice is registered by V16-13.
+            let quiet = if enabled {
+                crate::core::settings_manager::QuietStartup::True
+            } else {
+                crate::core::settings_manager::QuietStartup::False
+            };
+            session.settings_manager(|s| s.set_quiet_startup(quiet));
         }
         SettingsChange::DefaultProjectTrust(default_project_trust) => {
             session.settings_manager(|s| s.set_default_project_trust(default_project_trust));
@@ -543,6 +556,13 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
             // renderer (`setCopyOnSelect`; no-op in regular mode).
             session.settings_manager(|s| s.set_fullscreen_copy_on_select(enabled));
             ui.ui.set_copy_on_select(enabled);
+        }
+        SettingsChange::FullscreenWheelScrollLines(lines) => {
+            // onFullscreenWheelScrollLinesChange (interactive-mode.ts:4777-4779
+            // @ f1927c2d5, #9758): persist + apply to the live alt-screen
+            // renderer (`setWheelScrollLines`; no-op in regular mode).
+            session.settings_manager(|s| s.set_fullscreen_wheel_scroll_lines(lines));
+            ui.ui.set_wheel_scroll_lines(lines);
         }
         SettingsChange::Warnings(warnings) => {
             session.settings_manager(|s| s.set_warnings(&warnings));
@@ -1306,7 +1326,7 @@ impl InteractiveUi {
             }),
             current_theme: session
                 .settings_manager(|s| s.get_theme_setting())
-                .unwrap_or_else(|| "dark".to_string()),
+                .unwrap_or_else(|| crate::core::themes::SYSTEM_THEME_NAME.to_string()),
             // The terminal color scheme (upstream
             // themeController.getTerminalTheme) drives the theme submenu's
             // automatic-pair preview. Detection exists asynchronously
@@ -1330,7 +1350,9 @@ impl InteractiveUi {
             output_pad: session.settings_manager(|s| s.get_output_pad()),
             autocomplete_max_visible: session
                 .settings_manager(|s| s.get_autocomplete_max_visible()),
-            quiet_startup: session.settings_manager(|s| s.get_quiet_startup()),
+            quiet_startup: session
+                .settings_manager(|s| s.get_quiet_startup())
+                .hides_header(),
             // The local `trust_manager::DefaultProjectTrust` mirrors the
             // settings enum (trust-manager.ts); the settings value is
             // already the type the selector expects.
@@ -1342,6 +1364,8 @@ impl InteractiveUi {
             fullscreen_scrollbar: session.settings_manager(|s| s.get_fullscreen_scrollbar()),
             fullscreen_copy_on_select: session
                 .settings_manager(|s| s.get_fullscreen_copy_on_select()),
+            fullscreen_wheel_scroll_lines: session
+                .settings_manager(|s| s.get_fullscreen_wheel_scroll_lines()),
             warnings: session.settings_manager(|s| s.get_warnings()),
         };
 
@@ -4211,7 +4235,7 @@ mod tests {
     async fn settings_theme_change_applies_named_theme_via_drain() {
         let (mode, _terminal, session, _tmp) = mode_harness().await;
         let ui = &mode.ui_state;
-        assert_eq!(lock(&ui.theme).name.as_deref(), Some("dark"));
+        assert_eq!(lock(&ui.theme).name.as_deref(), Some("system"));
 
         apply_settings_change(ui, SettingsChange::Theme("light".to_string()));
         assert_eq!(
@@ -4431,8 +4455,8 @@ mod tests {
         );
         assert_eq!(
             session.settings_manager(|s| s.get_tui_mode()),
-            rpi_tui::tui::TuiMode::Regular,
-            "not persisted before the switch succeeds"
+            rpi_tui::tui::TuiMode::Fullscreen,
+            "not persisted before the switch succeeds (the settings default is fullscreen)"
         );
 
         // The drain performs the switch + persists + confirms.
@@ -4475,8 +4499,8 @@ mod tests {
         );
         assert_eq!(
             session.settings_manager(|s| s.get_tui_mode()),
-            rpi_tui::tui::TuiMode::Regular,
-            "overlay rejection: not persisted"
+            rpi_tui::tui::TuiMode::Fullscreen,
+            "overlay rejection: not persisted (the settings default is fullscreen)"
         );
     }
 
