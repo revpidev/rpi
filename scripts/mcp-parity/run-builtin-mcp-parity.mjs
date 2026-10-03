@@ -173,7 +173,7 @@ const lines = [
   "",
   `Generated: ${new Date().toISOString()} (rerun: \`node scripts/mcp-parity/run-builtin-mcp-parity.mjs\`)`,
   `Upstream: external/pi/packages/mcp @ ${PI_PIN} (McpClient + StdioTransport, tsx)`,
-  `rpi: crates/rpi-mcp @ ${spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout.trim()} (uncommitted working tree)`,
+  `rpi: crates/rpi-mcp @ ${spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout.trim()}`,
   "",
   "Normalization: JSON-RPC ids → `$id`; `clientInfo.name` → `parity-client` (O1 brand exemption); " +
     "frame transcripts recorded server-side by the shared fixture so a diff isolates the client.",
