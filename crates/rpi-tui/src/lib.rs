@@ -53,6 +53,7 @@ pub mod tui_handle;
 pub mod tui_main_screen;
 pub mod undo_stack;
 pub mod utils;
+pub mod wheel_scroll;
 pub mod word_navigation;
 
 pub use error::TuiError;

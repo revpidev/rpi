@@ -102,6 +102,7 @@ use crate::utils::{
     extract_ansi_code, get_grapheme_cell_range, get_osc8_link_at_column, get_word_segmenter,
     slice_by_column, strip_terminal_sequences, truncate_to_width, visible_width,
 };
+use crate::wheel_scroll::{WheelScrollAccelerator, WheelScrollLines};
 
 // =============================================================================
 // Constants (tui-alt-screen.ts:44-61)
@@ -413,9 +414,10 @@ pub enum CopySelectionOutcome {
 /// callbacks); see the header note.
 #[derive(Default)]
 pub struct TuiAltScreenOptions {
-    /// `wheelScrollLines`: logical lines per wheel event. Normalized with
-    /// `Math.max(1, Math.floor(_ ?? 1))` (tui-alt-screen.ts:178).
-    pub wheel_scroll_lines: Option<u64>,
+    /// `wheelScrollLines`: lines per wheel event. `None` defaults to one
+    /// line; [`WheelScrollLines::Auto`] accelerates with wheel velocity
+    /// (tui-alt-screen.ts:172, 270).
+    pub wheel_scroll_lines: Option<WheelScrollLines>,
     /// `mouse` (default true): capture mouse events for viewport scrolling
     /// and application-owned text selection.
     pub mouse: Option<bool>,
@@ -627,7 +629,10 @@ pub(crate) struct TuiAltScreenInner {
     active_search: Option<ActiveSearch>,
     pressed_url: Option<String>,
     selection_dragged: bool,
-    wheel_scroll_lines: u64,
+    wheel_scroll: WheelScrollAccelerator,
+    /// Monotonic origin for the wheel accelerator's `performance.now()`
+    /// (captured when the renderer is created; tui-alt-screen.ts:698).
+    wheel_scroll_start: Instant,
     mouse_enabled: bool,
     /// `mouseCapture` (tui-alt-screen.ts:96 @ 9841914, 71026970a): the
     /// component that requested drag/release routing via a `capture` result.
@@ -825,9 +830,15 @@ impl TuiAltScreen {
             active_search: None,
             pressed_url: None,
             selection_dragged: false,
-            // `Math.max(1, Math.floor(options.wheelScrollLines ?? 1))`
-            // (tui-alt-screen.ts:178); `u64` is already floored.
-            wheel_scroll_lines: options.wheel_scroll_lines.unwrap_or(1).max(1),
+            // `new WheelScrollAccelerator(options.wheelScrollLines ?? 1)`
+            // (tui-alt-screen.ts:270); `Lines` is already floor/max(1) by
+            // construction (`u64`).
+            wheel_scroll: WheelScrollAccelerator::new_with_platform_acceleration(
+                options
+                    .wheel_scroll_lines
+                    .unwrap_or(WheelScrollLines::Lines(1)),
+            ),
+            wheel_scroll_start: Instant::now(),
             mouse_enabled: options.mouse.unwrap_or(true),
             mouse_capture: None,
             mouse_press_target: None,
@@ -1027,6 +1038,20 @@ impl TuiAltScreen {
     pub fn is_following_output(&self) -> bool {
         self.try_read(TuiAltScreenInner::is_following_output_inner)
             .unwrap_or(false)
+    }
+
+    /// `setWheelScrollLines` (tui-alt-screen.ts:291-293): set the lines moved
+    /// per wheel event and reset the velocity state.
+    pub fn set_wheel_scroll_lines(&self, lines: WheelScrollLines) {
+        self.run_or_queue(move |inner| inner.wheel_scroll.set_lines(lines));
+    }
+
+    /// `getScreenLines` (tui-alt-screen.ts:316-318): the lines of the last
+    /// rendered frame, one per terminal row, as written to the terminal.
+    /// Empty on lock contention or before the first frame.
+    pub fn get_screen_lines(&self) -> Vec<String> {
+        self.try_read(|inner| inner.previous_screen.clone())
+            .unwrap_or_default()
     }
 
     /// `setLayoutRoot` (tui-alt-screen.ts:193-198).
@@ -2248,15 +2273,21 @@ impl TuiAltScreenInner {
             // Wheel events reach components first (`71026970a`); the
             // viewport scroll only runs when no component consumed them and
             // no overlay holds focus (`2e4d23959`, FR-G).
+            let now_ms = self.wheel_scroll_start.elapsed().as_secs_f64() * 1000.0;
+            let lines = self.wheel_scroll.next(wheel_event.direction as i8, now_ms);
+            // SGR mouse button codes use bit 3 (value 8) for the Alt modifier.
+            let wheel_delta = i64::from(wheel_event.direction)
+                * if wheel_event.button & 8 != 0 {
+                    (lines * ALT_WHEEL_SCROLL_MULTIPLIER) as i64
+                } else {
+                    lines as i64
+                };
             let event = self.create_mouse_event(
                 TuiMouseEventType::Wheel,
                 wheel_event.button,
                 wheel_event.x,
                 wheel_event.y,
-                Some(
-                    i64::from(wheel_event.direction)
-                        * self.get_wheel_scroll_lines(wheel_event.button),
-                ),
+                Some(wheel_delta),
                 None,
             );
             let overlay = self.dispatch_mouse_to_overlay(&event);
@@ -2276,7 +2307,7 @@ impl TuiAltScreenInner {
             if self.should_defer_viewport_input_to_overlay() {
                 return None;
             }
-            self.route_wheel(wheel_event);
+            self.route_wheel(wheel_event, wheel_delta);
             return Some(consume());
         }
         if let Some(mouse_event) = parse_sgr_mouse_event(data) {
@@ -2761,24 +2792,13 @@ impl TuiAltScreenInner {
         self.handle_selection_mouse_event(raw);
     }
 
-    /// `getWheelScrollLines` (tui-alt-screen.ts:968-970 @ #9166
-    /// `ab9e6f89b`): SGR mouse button codes use bit 3 (value 8) for the
-    /// Alt modifier — Alt-modified wheel events scroll at the accelerated
-    /// rate.
-    fn get_wheel_scroll_lines(&self, button: u32) -> i64 {
-        let lines = self.wheel_scroll_lines;
-        if button & 8 != 0 {
-            (lines * ALT_WHEEL_SCROLL_MULTIPLIER) as i64
-        } else {
-            lines as i64
-        }
-    }
-
-    /// `routeWheel` (tui-alt-screen.ts:489-501): deepest scroll view under
+    /// `routeWheel` (tui-alt-screen.ts:985-996): deepest scroll view under
     /// the pointer first, chaining the unconsumed delta; the primary scroll
-    /// view is the fallback. `overscroll: "contain"` stops the chain.
-    fn route_wheel(&mut self, event: WheelEvent) {
-        let mut remaining = i64::from(event.direction) * self.get_wheel_scroll_lines(event.button);
+    /// view is the fallback. `overscroll: "contain"` stops the chain. The
+    /// `delta` is the wheel line delta already computed by the accelerator
+    /// (tui-alt-screen.ts:710).
+    fn route_wheel(&mut self, event: WheelEvent, delta: i64) {
+        let mut remaining = delta;
         let mut seen: Vec<*const Mutex<Box<dyn Component>>> = Vec::new();
         let scroll_views = self
             .current_layout
@@ -5261,7 +5281,7 @@ mod tests {
             None,
             None,
             TuiAltScreenOptions {
-                wheel_scroll_lines: Some(3),
+                wheel_scroll_lines: Some(WheelScrollLines::Lines(3)),
                 ..TuiAltScreenOptions::default()
             },
         );
