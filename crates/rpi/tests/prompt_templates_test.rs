@@ -1,8 +1,8 @@
 //! Integration tests for `core::prompt_templates` (port of
-//! `prompt-templates.ts` @ pi 0.82.1 (2efa728)): template discovery,
-//! frontmatter handling, and the expansion entry point against a real
-//! filesystem. The argument-expansion DSL itself is covered by the module
-//! unit tests.
+//! `prompt-templates.ts` @ pi v1.0.0 (a13d35a74)): template discovery,
+//! frontmatter handling, resource diagnostics (#9830), and the expansion
+//! entry point against a real filesystem. The argument-expansion DSL itself
+//! is covered by the module unit tests.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,7 +62,7 @@ fn loads_md_files_named_by_basename() {
     tmp.write("commit.md", "Commit changes");
     tmp.write("notes.txt", "not a template");
 
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
     let mut names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, ["commit", "review"]);
@@ -74,12 +74,16 @@ fn non_recursive_and_missing_dir() {
     tmp.write("top.md", "top level");
     tmp.write("sub/nested.md", "nested");
 
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].name, "top");
 
     // Missing directory → empty list (prompt-templates.ts:141-143).
-    assert!(load_templates_from_dir(&tmp.path().join("does-not-exist")).is_empty());
+    assert!(
+        load_templates_from_dir(&tmp.path().join("does-not-exist"))
+            .templates
+            .is_empty()
+    );
 }
 
 #[cfg(unix)]
@@ -96,7 +100,7 @@ fn follows_symlinks_and_skips_broken_ones() {
     std::os::unix::fs::symlink(tmp.path().join("adir"), tmp.path().join("dirlink.md"))
         .expect("failed to create dir symlink");
 
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
     let mut names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, ["linked", "real"]);
@@ -114,7 +118,7 @@ fn frontmatter_description_and_argument_hint() {
         "---\ndescription: Review some code\nargument-hint: <file> [focus]\n---\nBody $1\n",
     );
 
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
     assert_eq!(templates.len(), 1);
     let t = &templates[0];
     assert_eq!(t.description, "Review some code");
@@ -127,14 +131,14 @@ fn frontmatter_description_and_argument_hint() {
 fn description_defaults_to_first_non_empty_line() {
     let tmp = TempDir::new();
     tmp.write("a.md", "\n\n  \nFirst real line\nsecond line\n");
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
     // Untrimmed first line (JS keeps leading whitespace).
     assert_eq!(templates[0].description, "First real line");
     assert_eq!(templates[0].argument_hint, None);
 
     // Frontmatter without description → same fallback over the body.
     tmp.write("b.md", "---\nargument-hint: x\n---\nBody line here\n");
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
     let b = templates
         .iter()
         .find(|t| t.name == "b")
@@ -150,7 +154,7 @@ fn description_truncates_at_60_chars() {
     tmp.write("exact.md", &exactly_60);
     tmp.write("over.md", &over_60);
 
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
     let exact = templates.iter().find(|t| t.name == "exact").expect("exact");
     let over = templates.iter().find(|t| t.name == "over").expect("over");
     assert_eq!(exact.description, exactly_60);
@@ -164,15 +168,56 @@ fn crlf_file_and_invalid_yaml() {
         "crlf.md",
         "---\r\ndescription: Windows\r\n---\r\nBody line\r\n",
     );
-    // Invalid YAML frontmatter → the whole template load fails
-    // (loadTemplateFromFile catch → null, prompt-templates.ts:130-132).
-    tmp.write("bad.md", "---\nkey: [unclosed\n---\nbody\n");
+    // Invalid YAML frontmatter → the template is dropped and a warning is
+    // reported; valid siblings keep loading (#9830, prompt-templates.ts:120-126).
+    let bad_path = tmp.write("bad.md", "---\nkey: [unclosed\n---\nbody\n");
 
-    let templates = load_templates_from_dir(tmp.path());
-    assert_eq!(templates.len(), 1);
-    assert_eq!(templates[0].name, "crlf");
-    assert_eq!(templates[0].description, "Windows");
-    assert_eq!(templates[0].content, "Body line");
+    let result = load_templates_from_dir(tmp.path());
+    assert_eq!(result.templates.len(), 1);
+    assert_eq!(result.templates[0].name, "crlf");
+    assert_eq!(result.templates[0].description, "Windows");
+    assert_eq!(result.templates[0].content, "Body line");
+    assert_eq!(result.diagnostics.len(), 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.kind, rpi::core::skills::DiagnosticKind::Warning);
+    assert_eq!(diagnostic.path.as_deref(), Some(bad_path.as_path()));
+    assert!(
+        diagnostic.message.contains("line 1"),
+        "diagnostic carries position: {}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn reports_invalid_frontmatter_and_keeps_valid_siblings() {
+    // Regression test for #9354 (prompt-templates.test.ts:625-655 @ b6419322e).
+    let tmp = TempDir::new();
+    let invalid_path = tmp.write(
+        "invalid.md",
+        "---\ndescription: Broken: unquoted colon\n---\nDo something.\n",
+    );
+    tmp.write("valid.md", "Valid prompt content.");
+
+    let options = LoadPromptTemplatesOptions {
+        cwd: tmp.path().to_path_buf(),
+        agent_dir: tmp.path().join("agent"),
+        prompt_paths: vec![tmp.path().to_string_lossy().into_owned()],
+        include_defaults: false,
+    };
+    let result = load_prompt_templates(&options);
+    let names: Vec<&str> = result.templates.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["valid"]);
+    assert_eq!(result.diagnostics.len(), 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.kind, rpi::core::skills::DiagnosticKind::Warning);
+    assert_eq!(diagnostic.path.as_deref(), Some(invalid_path.as_path()));
+    assert!(
+        diagnostic.message.contains("line 1") && diagnostic.message.contains("column"),
+        // serde_yaml reports its own column (20) where the JS `yaml` package
+        // reports 14; the shape (warning + path + position) is the contract.
+        "diagnostic carries the YAML position: {}",
+        diagnostic.message
+    );
 }
 
 #[test]
@@ -180,7 +225,7 @@ fn empty_body_yields_empty_description_and_content() {
     let tmp = TempDir::new();
     tmp.write("empty.md", "");
 
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].description, "");
     assert_eq!(templates[0].content, "");
@@ -216,7 +261,7 @@ fn loads_defaults_then_explicit_paths() {
     };
     tmp.write("single.txt", "not a template");
 
-    let templates = load_prompt_templates(&options);
+    let templates = load_prompt_templates(&options).templates;
     let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, ["global", "project", "extra", "single"]);
 }
@@ -237,7 +282,7 @@ fn include_defaults_false_and_relative_explicit_path() {
         include_defaults: false,
     };
 
-    let templates = load_prompt_templates(&options);
+    let templates = load_prompt_templates(&options).templates;
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].name, "explicit");
 }
@@ -253,7 +298,7 @@ fn expand_loaded_template_end_to_end() {
         "review.md",
         "---\ndescription: Review code\n---\nReview $1 with focus on ${2:-general quality}",
     );
-    let templates = load_templates_from_dir(tmp.path());
+    let templates = load_templates_from_dir(tmp.path()).templates;
 
     // Found: quote-aware tokenisation + DSL expansion.
     assert_eq!(

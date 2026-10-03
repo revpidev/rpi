@@ -842,7 +842,12 @@ impl DefaultResourceLoader {
                     .collect(),
                 include_defaults: false,
             });
-            dedupe_prompts(loaded)
+            // `[...loaded.diagnostics, ...deduped.diagnostics]` (#9830,
+            // resource-loader.ts:700-709 @ b6419322e).
+            let (deduped, mut diagnostics) = dedupe_prompts(loaded.templates);
+            let mut load_diagnostics = loaded.diagnostics;
+            load_diagnostics.append(&mut diagnostics);
+            (deduped, load_diagnostics)
         };
         self.resources.prompts = prompts;
         self.prompt_diagnostics = diagnostics;

@@ -29,6 +29,12 @@
 //!   non-strings. A YAML syntax error still fails the whole template load
 //!   (upstream: `parse` throws, `loadTemplateFromFile` catches → `null`).
 //! - `.rpi` rename per ADR-0001 (`CONFIG_DIR_NAME`).
+//! - `loadPromptTemplates` returns [`LoadPromptTemplatesResult`] with
+//!   resource diagnostics (#9830, b6419322e): read/YAML failures are
+//!   reported as warnings instead of being silently dropped. The YAML
+//!   parser is `serde_yaml`, so the diagnostic *message* wording is the
+//!   Rust library's (it still carries line/column); shape and
+//!   sibling-preservation match upstream.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +43,7 @@ use std::sync::OnceLock;
 use regex::{Captures, Regex};
 
 use crate::config;
+use crate::core::skills::{DiagnosticKind, ResourceDiagnostic};
 use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
@@ -297,11 +304,26 @@ pub fn parse_frontmatter(content: &str) -> Result<ParsedFrontmatter, RpiError> {
 // Template loading (prompt-templates.ts:104-263)
 // ---------------------------------------------------------------------------
 
-/// `loadTemplateFromFile` (prompt-templates.ts:104-133). Returns `None` on
-/// any read or frontmatter-parse failure (upstream `try/catch → null`).
-fn load_template_from_file(file_path: &Path) -> Option<PromptTemplate> {
-    let raw_content = std::fs::read_to_string(file_path).ok()?;
-    let parsed = parse_frontmatter(&raw_content).ok()?;
+/// `loadTemplateFromFile` (prompt-templates.ts:105-163). Returns the parsed
+/// template (if any) plus resource diagnostics: read failures and YAML
+/// syntax errors become warnings while valid siblings keep loading (#9830,
+/// b6419322e).
+fn load_template_from_file(file_path: &Path) -> (Option<PromptTemplate>, Vec<ResourceDiagnostic>) {
+    let mut diagnostics = Vec::new();
+    let raw_content = match std::fs::read_to_string(file_path) {
+        Ok(content) => content,
+        Err(error) => {
+            diagnostics.push(prompt_warning(error.to_string(), file_path));
+            return (None, diagnostics);
+        }
+    };
+    let parsed = match parse_frontmatter(&raw_content) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            diagnostics.push(prompt_warning(error.raw_message(), file_path));
+            return (None, diagnostics);
+        }
+    };
 
     // basename(filePath).replace(/\.md$/, "")
     let name = file_path
@@ -334,30 +356,59 @@ fn load_template_from_file(file_path: &Path) -> Option<PromptTemplate> {
         .filter(|hint| !hint.is_empty())
         .cloned();
 
-    Some(PromptTemplate {
-        name,
-        description,
-        argument_hint,
-        content: parsed.body,
-        file_path: file_path.to_path_buf(),
-    })
+    (
+        Some(PromptTemplate {
+            name,
+            description,
+            argument_hint,
+            content: parsed.body,
+            file_path: file_path.to_path_buf(),
+        }),
+        diagnostics,
+    )
 }
 
-/// `loadTemplatesFromDir` (prompt-templates.ts:138-175): scan a directory
+/// Build a prompt-loading resource warning (diagnostics.ts:10-15 shape).
+fn prompt_warning(message: impl Into<String>, path: &Path) -> ResourceDiagnostic {
+    ResourceDiagnostic {
+        kind: DiagnosticKind::Warning,
+        message: message.into(),
+        path: Some(path.to_path_buf()),
+        collision: None,
+    }
+}
+
+/// `LoadPromptTemplatesResult` (prompt-templates.ts:208-211 @ b6419322e).
+#[derive(Debug, Default)]
+pub struct LoadPromptTemplatesResult {
+    pub templates: Vec<PromptTemplate>,
+    pub diagnostics: Vec<ResourceDiagnostic>,
+}
+
+/// `loadTemplatesFromDir` (prompt-templates.ts:168-197): scan a directory
 /// for `.md` files (non-recursive) and load them as prompt templates.
 /// Symlinks are followed (a symlink whose target is a file is loaded; a
 /// broken symlink is skipped). Missing/unreadable directories yield an
 /// empty list.
-pub fn load_templates_from_dir(dir: &Path) -> Vec<PromptTemplate> {
+pub fn load_templates_from_dir(dir: &Path) -> LoadPromptTemplatesResult {
     let mut templates = Vec::new();
+    let mut diagnostics = Vec::new();
 
     if !dir.exists() {
-        return templates;
+        return LoadPromptTemplatesResult {
+            templates,
+            diagnostics,
+        };
     }
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return templates,
+        Err(_) => {
+            return LoadPromptTemplatesResult {
+                templates,
+                diagnostics,
+            };
+        }
     };
 
     for entry in entries.flatten() {
@@ -377,15 +428,19 @@ pub fn load_templates_from_dir(dir: &Path) -> Vec<PromptTemplate> {
             file_type.is_file()
         };
 
-        if is_file
-            && entry.file_name().to_string_lossy().ends_with(".md")
-            && let Some(template) = load_template_from_file(&full_path)
-        {
-            templates.push(template);
+        if is_file && entry.file_name().to_string_lossy().ends_with(".md") {
+            let (template, mut file_diagnostics) = load_template_from_file(&full_path);
+            if let Some(template) = template {
+                templates.push(template);
+            }
+            diagnostics.append(&mut file_diagnostics);
         }
     }
 
-    templates
+    LoadPromptTemplatesResult {
+        templates,
+        diagnostics,
+    }
 }
 
 /// `LoadPromptTemplatesOptions` (prompt-templates.ts:177-186).
@@ -405,24 +460,27 @@ fn process_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
-/// `loadPromptTemplates` (prompt-templates.ts:194-263): load all prompt
+/// `loadPromptTemplates` (prompt-templates.ts:214-288): load all prompt
 /// templates from:
 /// 1. Global: `agentDir/prompts/`
 /// 2. Project: `cwd/.rpi/prompts/`
 /// 3. Explicit prompt paths
 ///
 /// The `sourceInfo` scope classification is not ported (see module header).
-pub fn load_prompt_templates(options: &LoadPromptTemplatesOptions) -> Vec<PromptTemplate> {
+pub fn load_prompt_templates(options: &LoadPromptTemplatesOptions) -> LoadPromptTemplatesResult {
     let resolved_cwd = resolve_path(&options.cwd.to_string_lossy(), &process_cwd());
     let resolved_agent_dir = resolve_path(&options.agent_dir.to_string_lossy(), &process_cwd());
 
     let mut templates = Vec::new();
+    let mut diagnostics = Vec::new();
 
     if options.include_defaults {
-        templates.extend(load_templates_from_dir(&resolved_agent_dir.join("prompts")));
-        templates.extend(load_templates_from_dir(&config::get_project_prompts_dir(
-            &resolved_cwd,
-        )));
+        let mut global = load_templates_from_dir(&resolved_agent_dir.join("prompts"));
+        templates.append(&mut global.templates);
+        diagnostics.append(&mut global.diagnostics);
+        let mut project = load_templates_from_dir(&config::get_project_prompts_dir(&resolved_cwd));
+        templates.append(&mut project.templates);
+        diagnostics.append(&mut project.diagnostics);
     }
 
     // 3. Load explicit prompt paths.
@@ -435,19 +493,29 @@ pub fn load_prompt_templates(options: &LoadPromptTemplatesOptions) -> Vec<Prompt
 
         match std::fs::metadata(&resolved_path) {
             Ok(stats) if stats.is_dir() => {
-                templates.extend(load_templates_from_dir(&resolved_path));
+                let mut loaded = load_templates_from_dir(&resolved_path);
+                templates.append(&mut loaded.templates);
+                diagnostics.append(&mut loaded.diagnostics);
             }
             Ok(stats) if stats.is_file() && resolved_path.to_string_lossy().ends_with(".md") => {
-                if let Some(template) = load_template_from_file(&resolved_path) {
+                let (template, mut file_diagnostics) = load_template_from_file(&resolved_path);
+                if let Some(template) = template {
                     templates.push(template);
                 }
+                diagnostics.append(&mut file_diagnostics);
             }
-            // Ignore read failures / non-md entries.
-            _ => {}
+            // Non-md entries are ignored; read failures are reported.
+            Ok(_) => {}
+            Err(error) => {
+                diagnostics.push(prompt_warning(error.to_string(), &resolved_path));
+            }
         }
     }
 
-    templates
+    LoadPromptTemplatesResult {
+        templates,
+        diagnostics,
+    }
 }
 
 // ---------------------------------------------------------------------------
