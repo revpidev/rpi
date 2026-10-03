@@ -8,9 +8,10 @@ implementation itself (the fixture server is byte-identically constructed on bot
 ## Running
 
 ```bash
-bash scripts/mcp-parity/run-parity-suite.sh         # one-shot: dependency install + four legs + archiving
+bash scripts/mcp-parity/run-parity-suite.sh         # one-shot: dependency install + legs + archiving
 bash scripts/mcp-parity/run-parity-suite.sh mcp-parity   # single leg (multi-selectable)
 node scripts/mcp-parity/run-mcp-parity.mjs     # all scenarios; non-zero exit = differences exist
+node scripts/mcp-parity/run-builtin-mcp-parity.mjs   # V16-08 built-in leg (see below)
 ```
 
 - Dependencies install into `/tmp/rpi-mcp-parity-deps` (`setup-deps.sh` copies the upstream
@@ -20,6 +21,33 @@ node scripts/mcp-parity/run-mcp-parity.mjs     # all scenarios; non-zero exit = 
 - Reports land in `rpi/fixtures/generated/mcp-parity/` (`parity-report.md` +
   per-scenario `parity-<scenario>-{upstream,rpi}.json`), **committed to git as the
   evidence chain** (normalization strips run-time-volatile values, so re-runs produce no churn).
+
+## Built-in MCP parity (V16-08 G3)
+
+The built-in `crates/rpi-mcp` client is compared against the upstream package
+client `external/pi/packages/mcp` @ a13d35a74 (read-only) — the source package
+the standalone adapter also consumes. The same fixture server
+(`fixture-server.mjs`, stdio) drives both sides, and the normalized
+transcripts/results are diffed:
+
+- rpi side: `crates/rpi-mcp/examples/builtin_mcp_parity_runner.rs`
+  (`McpClient` + `StdioTransport`)
+- upstream side: `builtin-upstream-runner.mjs` (tsx running the pinned
+  `packages/mcp` `src/index.ts` directly)
+
+Coverage: `initialize` handshake, `notifications/initialized`, `tools/list`,
+`tools/call` (success and error result), `resources/read`. Normalization: ids
+→ `$id`, `clientInfo.name` → `parity-client` (O1 brand exemption).
+
+```bash
+node scripts/mcp-parity/run-builtin-mcp-parity.mjs
+# → fixtures/generated/mcp-parity/builtin-parity-report.md
+#   + builtin-parity-stdio-{upstream,rpi}.json (committed evidence chain)
+```
+
+The leg resolves `tsx` from `/tmp/rpi-mcp-parity-deps` when present, otherwise
+from `external/pi/node_modules`, so it runs standalone without the full
+adapter dependency closure.
 
 ## Target track (TE13 skeleton, ADR-0025)
 
@@ -94,10 +122,12 @@ node scripts/mcp-parity/run-render-call-parity.mjs
   throwing stub — no sampling is registered in parity scenarios).
 - `setup-deps.sh`: external dependency installation (copies the upstream lockfile then `npm ci`; the full
   transitive closure matches upstream).
-- `run-parity-suite.sh`: the one-shot re-run entry (dependency install → four legs → archiving); includes
+- `run-parity-suite.sh`: the one-shot re-run entry (dependency install → legs → archiving); includes
   `conformance-baseline.yml` (expected failures) and
   `normalize-conformance.mjs` (conformance archive normalization: timestamps/ephemeral
   ports/session ids/retry jitter → markers).
+- `run-builtin-mcp-parity.mjs` + `builtin-upstream-runner.mjs`: the V16-08
+  built-in leg (see above).
 
 ## OAuth parity (TE02 self-test item 5 / TE03 prerequisite)
 

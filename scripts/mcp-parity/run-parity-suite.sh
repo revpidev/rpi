@@ -5,6 +5,7 @@
 #
 # Legs (see scripts/mcp-parity/README.md):
 #   mcp-parity     frame/result parity, upstream Node vs rpi Rust client
+#   builtin-mcp-parity  built-in rpi-mcp vs upstream packages/mcp (V16-08 G3)
 #   oauth-parity   OAuth authorization-code + PKCE flow parity (stub AS)
 #   conformance    official @modelcontextprotocol/conformance referee
 #                  driving the crate example conformance_driver
@@ -37,7 +38,7 @@ CONFORMANCE_SCENARIOS=(
   elicitation-sep1034-client-defaults
 )
 
-ALL_LEGS=(mcp-parity render-call-parity oauth-parity conformance e2e-parity)
+ALL_LEGS=(mcp-parity builtin-mcp-parity render-call-parity oauth-parity conformance e2e-parity)
 if [[ $# -gt 0 ]]; then
   LEGS=("$@")
 else
@@ -77,6 +78,16 @@ if [[ " ${LEGS[*]} " == *" mcp-parity "* ]]; then
     LEG_STATUS[mcp-parity]=PASS
   else
     LEG_STATUS[mcp-parity]=FAIL
+  fi
+fi
+
+# --- builtin-mcp-parity (V16-08 G3: built-in rpi-mcp vs upstream packages/mcp) ---
+if [[ " ${LEGS[*]} " == *" builtin-mcp-parity "* ]]; then
+  log "leg builtin-mcp-parity"
+  if node "$SCRIPT_DIR/run-builtin-mcp-parity.mjs"; then
+    LEG_STATUS[builtin-mcp-parity]=PASS
+  else
+    LEG_STATUS[builtin-mcp-parity]=FAIL
   fi
 fi
 
