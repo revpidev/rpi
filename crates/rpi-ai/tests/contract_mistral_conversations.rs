@@ -431,10 +431,21 @@ async fn test_mistral_prompt_mode_reasoning_stream() {
 
 #[tokio::test]
 async fn test_mistral_reasoning_effort_stream() {
-    // mistral-reasoning-mode.test.ts intent: Mistral Small 4 / Medium 3.5 use
-    // `reasoning_effort` instead of `prompt_mode`.
+    // mistral-reasoning-mode.test.ts intent: models with a thinking level
+    // map use `reasoning_effort` instead of `prompt_mode` (#9678); the
+    // vendored catalog supplies the maps for Small 4 / Medium 3.5.
     let (base_url, mut captured) = serve(vec![(200, TEXT_SSE)]).await;
-    let m = model("mistral-small-2603", &base_url, json!({"reasoning": true}));
+    let m = model(
+        "mistral-small-2603",
+        &base_url,
+        json!({
+            "reasoning": true,
+            "thinkingLevelMap": {
+                "off": "none", "minimal": null, "low": null,
+                "medium": null, "high": "high", "xhigh": null, "max": null
+            }
+        }),
+    );
     let events = collect(
         MistralConversations
             .stream_simple(

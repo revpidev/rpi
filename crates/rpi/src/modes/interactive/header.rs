@@ -21,7 +21,9 @@ use crate::core::themes::Theme;
 use crate::modes::interactive::components::ThemeHandle;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 use crate::modes::interactive::components::keybinding_hints::{key_hint, key_text, raw_key_hint};
 

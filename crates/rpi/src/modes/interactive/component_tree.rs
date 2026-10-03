@@ -113,10 +113,7 @@ pub fn component_from_tree(tree: &Value, theme: &Arc<Theme>) -> Box<dyn Componen
                 let template = template.to_owned();
                 let hint_theme = Arc::clone(theme);
                 preview = preview.with_hint(Box::new(move |hidden| {
-                    hint_theme.fg(
-                        "muted",
-                        &template.replace("{hidden}", &hidden.to_string()),
-                    )
+                    hint_theme.fg("muted", &template.replace("{hidden}", &hidden.to_string()))
                 }));
             }
             Box::new(preview)

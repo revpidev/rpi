@@ -286,10 +286,7 @@ impl FooterComponent {
         // virtual models land (see [`SessionStats`]).
         let limits_model = self.session.model().map(|model| (model.provider, model.id));
         {
-            let cached = self
-                .session_stats
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let cached = self.session_stats.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cached.as_ref()
                 && cached.session_id == session_id
                 && cached.leaf_id == leaf_id
@@ -364,10 +361,7 @@ impl FooterComponent {
             latest_cache_hit_rate,
             context_usage,
         };
-        *self
-            .session_stats
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
+        *self.session_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
         stats
     }
 }

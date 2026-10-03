@@ -270,7 +270,10 @@ mod tests {
         model.sampling_params = sampling_params(&[("top_p", json!(0.95)), ("min_p", json!(0.05))]);
         let options = options_with_sampling(sampling_params(&[("top_p", json!(0.5))]));
         let base = build_base_options(&model, &context_with_text("hi"), Some(&options), None);
-        assert_eq!(base.sampling_params, sampling_params(&[("top_p", json!(0.5))]));
+        assert_eq!(
+            base.sampling_params,
+            sampling_params(&[("top_p", json!(0.5))])
+        );
     }
 
     /// Stream-option-only sampling params pass through.

@@ -1547,9 +1547,7 @@ pub fn stream_simple(
     } else {
         None
     };
-    let prompt_mode = (model.reasoning
-        && !has_reasoning_effort_map(model)
-        && reasoning.is_some())
+    let prompt_mode = (model.reasoning && !has_reasoning_effort_map(model) && reasoning.is_some())
         .then_some(MistralPromptMode::Reasoning);
 
     Ok(stream(
@@ -2406,7 +2404,8 @@ mod tests {
     #[test]
     fn test_handle_sse_ignores_empty_content_deltas() {
         let model = make_model(json!({"id": "zai-glm-5-3"}));
-        let thinking = |text: &str| json!({"type": "thinking", "thinking": [{"type": "text", "text": text}]});
+        let thinking =
+            |text: &str| json!({"type": "thinking", "thinking": [{"type": "text", "text": text}]});
         let tool_call = |args: &str, first: bool| {
             let mut call = json!({
                 "index": 0,

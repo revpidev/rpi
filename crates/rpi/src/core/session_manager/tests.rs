@@ -2366,7 +2366,10 @@ fn create_branched_session_writes_file_immediately_when_forking_at_user_message(
         .append_message(assistant_msg("new answer"))
         .expect("append");
     let records = read_session_file_records(&new_file);
-    assert_eq!(session_file_roles(&records), ["session", "user", "assistant"]);
+    assert_eq!(
+        session_file_roles(&records),
+        ["session", "user", "assistant"]
+    );
 }
 
 #[test]
@@ -2835,7 +2838,10 @@ fn deferred_persistence_no_file_before_first_conversation_message() {
         SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
             .expect("create");
     let file = session.get_session_file().expect("file").to_path_buf();
-    assert!(!file.exists(), "no file for a session with only setup entries");
+    assert!(
+        !file.exists(),
+        "no file for a session with only setup entries"
+    );
 
     session
         .append_model_change("anthropic", "claude-sonnet-4-5")
@@ -2882,9 +2888,14 @@ fn first_user_message_creates_file_and_later_entries_append() {
 
     let file = session.get_session_file().expect("file").to_path_buf();
     let records = read_session_file_records(&file);
-    assert_eq!(session_file_roles(&records), ["session", "model_change", "user"]);
+    assert_eq!(
+        session_file_roles(&records),
+        ["session", "model_change", "user"]
+    );
 
-    session.append_custom_entry("preset-state", None).expect("append");
+    session
+        .append_custom_entry("preset-state", None)
+        .expect("append");
     session
         .append_message(assistant_msg("first answer"))
         .expect("append");

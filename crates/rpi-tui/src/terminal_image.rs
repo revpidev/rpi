@@ -924,12 +924,12 @@ pub fn calculate_image_cell_size_with_aspect(
     // #8938 (`7cf037c21`): reduce Kitty's cell-aligned distortion without
     // shrinking iTerm2 reservations.
     if width_scale <= height_scale {
-        let ideal_rows =
-            (columns * cell_dimensions.width_px * image_height) / (image_width * cell_dimensions.height_px);
+        let ideal_rows = (columns * cell_dimensions.width_px * image_height)
+            / (image_width * cell_dimensions.height_px);
         rows = choose_less_distorted_cell_count(rows, ideal_rows);
     } else {
-        let ideal_columns =
-            (rows * cell_dimensions.height_px * image_width) / (image_height * cell_dimensions.width_px);
+        let ideal_columns = (rows * cell_dimensions.height_px * image_width)
+            / (image_height * cell_dimensions.width_px);
         columns = choose_less_distorted_cell_count(columns, ideal_columns);
     }
 

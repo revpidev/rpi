@@ -228,8 +228,10 @@ impl BashResultRenderComponent {
             // bash.ts:280-284.
             let hint = format!(
                 "{} {}{}",
-                self.theme
-                    .fg("muted", &format!("... ({} earlier lines,", preview.skipped_count)),
+                self.theme.fg(
+                    "muted",
+                    &format!("... ({} earlier lines,", preview.skipped_count)
+                ),
                 key_hint(&self.theme, "app.tools.expand", "to expand"),
                 self.theme.fg("muted", ")")
             );

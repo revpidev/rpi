@@ -20,7 +20,9 @@ use crate::core::themes::Theme;
 pub type ThemeHandle = Arc<Mutex<Arc<Theme>>>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Themed text component (upstream `ThemedText`).

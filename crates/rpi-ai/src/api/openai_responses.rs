@@ -1027,9 +1027,7 @@ mod tests {
         }));
         let override_options = OpenAIResponsesOptions {
             stream: StreamOptions {
-                sampling_params: Some(
-                    [("top_p".to_owned(), json!(0.5))].into_iter().collect(),
-                ),
+                sampling_params: Some([("top_p".to_owned(), json!(0.5))].into_iter().collect()),
                 ..StreamOptions::default()
             },
             ..OpenAIResponsesOptions::default()

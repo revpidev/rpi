@@ -49,7 +49,6 @@ pub use assistant_message::AssistantMessageComponent;
 pub use bash_execution::BashExecutionComponent;
 pub use branch_summary_message::BranchSummaryMessageComponent;
 pub use compaction_summary_message::CompactionSummaryMessageComponent;
-pub use themed_text::{ThemeHandle, ThemedText};
 pub use custom_entry::CustomEntryComponent;
 pub use custom_message::CustomMessageComponent;
 pub use diff::{RenderDiffOptions, render_diff};
@@ -61,6 +60,7 @@ pub use status_indicator::{
     RetryStatusIndicator, SharedStatusIndicator, StatusIndicator, StatusIndicatorKind,
     WorkingStatusIndicator,
 };
+pub use themed_text::{ThemeHandle, ThemedText};
 pub use tool_execution::{
     ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, ToolResultState,
 };

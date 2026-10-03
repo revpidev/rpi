@@ -6780,11 +6780,7 @@ mod tests {
         ] {
             assert_eq!(trigger.is_match(text), expected, "trigger {text:?}");
         }
-        for (text, expected) in [
-            ("see (@x", true),
-            ("see `#x", true),
-            ("foo(@x", false),
-        ] {
+        for (text, expected) in [("see (@x", true), ("see `#x", true), ("foo(@x", false)] {
             assert_eq!(debounce.is_match(text), expected, "debounce {text:?}");
         }
     }

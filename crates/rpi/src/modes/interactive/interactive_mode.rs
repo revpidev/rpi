@@ -1235,8 +1235,14 @@ fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) ->
     };
     let theme_name = crate::core::themes::resolve_theme_setting(setting.as_deref(), terminal_theme)
         .unwrap_or_else(|| "dark".to_string());
-    let theme = load_theme(&theme_name, Some(crate::core::themes::terminal_color_mode()))
-        .unwrap_or_else(|_| load_theme("dark", Some(crate::core::themes::terminal_color_mode())).expect("builtin dark theme must load"));
+    let theme = load_theme(
+        &theme_name,
+        Some(crate::core::themes::terminal_color_mode()),
+    )
+    .unwrap_or_else(|_| {
+        load_theme("dark", Some(crate::core::themes::terminal_color_mode()))
+            .expect("builtin dark theme must load")
+    });
     Arc::new(theme)
 }
 
@@ -1874,7 +1880,10 @@ impl InteractiveUi {
                     rpi_tui::terminal_colors::TerminalColorScheme::Light => light,
                     rpi_tui::terminal_colors::TerminalColorScheme::Dark => dark,
                 };
-                if let Ok(theme) = crate::core::themes::load_theme(&name, Some(crate::core::themes::terminal_color_mode())) {
+                if let Ok(theme) = crate::core::themes::load_theme(
+                    &name,
+                    Some(crate::core::themes::terminal_color_mode()),
+                ) {
                     listener_ui.apply_theme(Arc::new(theme));
                 }
             }));
@@ -2538,14 +2547,20 @@ impl InteractiveUi {
                 // `applyThemeName` (theme-controller.ts:92-100): fall back to
                 // the built-in dark theme on load failure and surface the
                 // error.
-                let theme = match crate::core::themes::load_theme(&name, Some(crate::core::themes::terminal_color_mode())) {
+                let theme = match crate::core::themes::load_theme(
+                    &name,
+                    Some(crate::core::themes::terminal_color_mode()),
+                ) {
                     Ok(theme) => theme,
                     Err(error) => {
                         self.show_error(&format!(
                             "Failed to load theme \"{name}\": {error}\nFell back to dark theme."
                         ));
-                        crate::core::themes::load_theme("dark", Some(crate::core::themes::terminal_color_mode()))
-                            .expect("builtin dark theme must load")
+                        crate::core::themes::load_theme(
+                            "dark",
+                            Some(crate::core::themes::terminal_color_mode()),
+                        )
+                        .expect("builtin dark theme must load")
                     }
                 };
                 self.apply_theme(Arc::new(theme));
@@ -3290,26 +3305,26 @@ impl InteractiveUi {
             // [Prompt conflicts], [Extension issues], [Theme conflicts],
             // interactive-mode.ts:1576-1625) collapse to a single block.
             let diagnostics_snapshot = diagnostics;
-            container.add_child(Box::new(crate::modes::interactive::components::ThemedText::new(
-                Arc::clone(&self.theme),
-                move |theme| {
-                    let mut lines = vec![theme.fg("warning", "[Resource issues]")];
-                    for (message, path) in &diagnostics_snapshot {
-                        match path {
-                            Some(path) => {
-                                lines.push(theme.fg("warning", &format!("  {path}")));
-                                lines.push(theme.fg("warning", &format!("    {message}")));
-                            }
-                            None => {
-                                lines.push(theme.fg("warning", &format!("  {message}")))
+            container.add_child(Box::new(
+                crate::modes::interactive::components::ThemedText::new(
+                    Arc::clone(&self.theme),
+                    move |theme| {
+                        let mut lines = vec![theme.fg("warning", "[Resource issues]")];
+                        for (message, path) in &diagnostics_snapshot {
+                            match path {
+                                Some(path) => {
+                                    lines.push(theme.fg("warning", &format!("  {path}")));
+                                    lines.push(theme.fg("warning", &format!("    {message}")));
+                                }
+                                None => lines.push(theme.fg("warning", &format!("  {message}"))),
                             }
                         }
-                    }
-                    lines.join("\n")
-                },
-                0,
-                0,
-            )));
+                        lines.join("\n")
+                    },
+                    0,
+                    0,
+                ),
+            ));
             container.add_child(Box::new(Spacer::new(1)));
         }
     }
@@ -5352,7 +5367,9 @@ impl InteractiveMode {
             rpi_tui::terminal_colors::TerminalColorScheme::Light => light,
             rpi_tui::terminal_colors::TerminalColorScheme::Dark => dark,
         };
-        if let Ok(theme) = crate::core::themes::load_theme(&name, Some(crate::core::themes::terminal_color_mode())) {
+        if let Ok(theme) =
+            crate::core::themes::load_theme(&name, Some(crate::core::themes::terminal_color_mode()))
+        {
             self.ui_state.apply_theme(Arc::new(theme));
         }
     }
@@ -8306,7 +8323,10 @@ mod tests {
         ));
         lock(&ui.loaded_resources_container).invalidate();
         let after = lock(&ui.loaded_resources_container).render(80).join("\n");
-        assert_ne!(rendered, after, "loaded resources repaint after a theme change");
+        assert_ne!(
+            rendered, after,
+            "loaded resources repaint after a theme change"
+        );
         assert!(after.contains("[Context]"), "contents survive the repaint");
     }
 

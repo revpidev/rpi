@@ -2953,15 +2953,9 @@ pub(crate) mod tests {
         ];
         for properties in unsupported {
             let tool = strict_tool(properties.clone());
-            let converted = convert_tools(
-                std::slice::from_ref(&tool),
-                false,
-                true,
-                true,
-                None,
-                false,
-            )
-            .expect("tools");
+            let converted =
+                convert_tools(std::slice::from_ref(&tool), false, true, true, None, false)
+                    .expect("tools");
             assert!(
                 converted[0].get("strict").is_none(),
                 "keyword schema must fall back to non-strict: {properties}"
@@ -3712,8 +3706,7 @@ pub(crate) mod tests {
         assert_eq!(output.usage.cache_write, 6535);
         assert_eq!(output.usage.cache_write1h, Some(6535));
         assert!(
-            (output.usage.cost.cache_write
-                - 6535.0 * model.cost.rates.input * 2.0 / 1_000_000.0)
+            (output.usage.cost.cache_write - 6535.0 * model.cost.rates.input * 2.0 / 1_000_000.0)
                 .abs()
                 < 1e-12,
             "1h writes price at 2x input: {}",

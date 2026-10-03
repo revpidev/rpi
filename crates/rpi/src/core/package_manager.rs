@@ -1537,7 +1537,9 @@ impl DefaultPackageManager {
             Some(ref_) => format!("@{ref_}"),
             None => String::new(),
         };
-        let hash = sha2::Sha256::digest(format!("{prefix}-{}{ref_suffix}", suffix.unwrap_or("")).as_bytes());
+        let hash = sha2::Sha256::digest(
+            format!("{prefix}-{}{ref_suffix}", suffix.unwrap_or("")).as_bytes(),
+        );
         let hash = hash[..4]
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -5276,7 +5278,12 @@ mod tests {
             "user/repo",
             Some("bbbbbbb"),
         );
-        let unpinned = git_source("https://github.com/user/repo", "github.com", "user/repo", None);
+        let unpinned = git_source(
+            "https://github.com/user/repo",
+            "github.com",
+            "user/repo",
+            None,
+        );
         let old_path = manager
             .get_git_install_path(&old, SourceScope::Temporary)
             .unwrap();
@@ -5720,10 +5727,9 @@ mod tests {
             Ok(String::new())
         });
         let mut manager = test_manager(&dirs, runner.clone());
-        manager.settings_manager.set_npm_command(Some(vec![
-            "corepack".to_string(),
-            "pnpm".to_string(),
-        ]));
+        manager
+            .settings_manager
+            .set_npm_command(Some(vec!["corepack".to_string(), "pnpm".to_string()]));
         assert_eq!(manager.get_package_manager_name().unwrap(), "pnpm");
         manager.install("git:github.com/user/repo", false).unwrap();
 

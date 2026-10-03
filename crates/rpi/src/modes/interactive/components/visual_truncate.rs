@@ -44,13 +44,7 @@ pub fn truncate_to_visual_lines(
     width: usize,
     padding_x: usize,
 ) -> VisualTruncateResult {
-    truncate_to_visual_lines_keep(
-        text,
-        max_visual_lines,
-        width,
-        padding_x,
-        VisualKeep::End,
-    )
+    truncate_to_visual_lines_keep(text, max_visual_lines, width, padding_x, VisualKeep::End)
 }
 
 /// [`truncate_to_visual_lines`] with an explicit `keep` end
@@ -119,10 +113,7 @@ impl VisualLinePreview {
 
     /// Sets the styled hint line for the given number of hidden visual
     /// lines (`formatHint`, visual-truncate.ts:63).
-    pub fn with_hint(
-        mut self,
-        hint: Box<dyn Fn(usize) -> String + Send + Sync>,
-    ) -> Self {
+    pub fn with_hint(mut self, hint: Box<dyn Fn(usize) -> String + Send + Sync>) -> Self {
         self.hint = Some(hint);
         self
     }
@@ -139,13 +130,8 @@ impl Component for VisualLinePreview {
         {
             return lines.clone();
         }
-        let preview = truncate_to_visual_lines_keep(
-            &self.text,
-            self.max_visual_lines,
-            width,
-            0,
-            self.keep,
-        );
+        let preview =
+            truncate_to_visual_lines_keep(&self.text, self.max_visual_lines, width, 0, self.keep);
         let mut lines = preview.visual_lines;
         if preview.skipped_count > 0 {
             let hint = match &self.hint {
@@ -158,10 +144,7 @@ impl Component for VisualLinePreview {
                 VisualKeep::End => lines.insert(0, hint),
             }
         }
-        *self
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some((width, lines.clone()));
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((width, lines.clone()));
         lines
     }
 
@@ -216,13 +199,7 @@ mod tests {
 
     #[test]
     fn keep_start_keeps_the_first_visual_lines() {
-        let result = truncate_to_visual_lines_keep(
-            "aaa bbb ccc ddd",
-            1,
-            8,
-            0,
-            VisualKeep::Start,
-        );
+        let result = truncate_to_visual_lines_keep("aaa bbb ccc ddd", 1, 8, 0, VisualKeep::Start);
         assert_eq!(result.skipped_count, 1);
         assert_eq!(result.visual_lines.len(), 1);
         assert!(result.visual_lines[0].contains("aaa"));

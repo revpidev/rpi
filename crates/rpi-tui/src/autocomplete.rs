@@ -51,10 +51,7 @@ fn path_wrapper_closer(c: char) -> Option<char> {
 /// its closer, e.g. `app/[slug]/pa` or `(group)/pa`.
 fn strip_leading_wrappers(token: &str) -> String {
     let mut result = token;
-    loop {
-        let Some(first) = result.chars().next() else {
-            break;
-        };
+    while let Some(first) = result.chars().next() {
         let Some(closer) = path_wrapper_closer(first) else {
             break;
         };
@@ -2957,8 +2954,9 @@ mod tests {
         for wrapper in ["(", "[", "{", "<", "`", "((", "(`"] {
             for prefix in ["src/ma", "./src/ma"] {
                 let line = format!("see {wrapper}{prefix}");
-                let result = get_suggestions(&provider, &[line.clone()], 0, line.len(), true)
-                    .unwrap_or_else(|| panic!("expected suggestions for {line}"));
+                let result =
+                    get_suggestions(&provider, std::slice::from_ref(&line), 0, line.len(), true)
+                        .unwrap_or_else(|| panic!("expected suggestions for {line}"));
                 assert_eq!(result.prefix, prefix, "line: {line}");
                 assert_eq!(result.items.len(), 1, "line: {line}");
                 assert_eq!(
@@ -2986,11 +2984,21 @@ mod tests {
         );
         // Embedded `@` without a boundary stays inert.
         let embedded = "foo(@REA".to_string();
-        assert!(get_suggestions(&provider, &[embedded.clone()], 0, embedded.len(), false).is_none());
+        assert!(
+            get_suggestions(
+                &provider,
+                std::slice::from_ref(&embedded),
+                0,
+                embedded.len(),
+                false
+            )
+            .is_none()
+        );
         for before in ["(", "see (", "[", "`", "<", "{"] {
             let line = format!("{before}@REA");
-            let result = get_suggestions(&provider, &[line.clone()], 0, line.len(), false)
-                .unwrap_or_else(|| panic!("expected @ suggestions for {line}"));
+            let result =
+                get_suggestions(&provider, std::slice::from_ref(&line), 0, line.len(), false)
+                    .unwrap_or_else(|| panic!("expected @ suggestions for {line}"));
             assert_eq!(result.prefix, "@REA");
             assert_eq!(result.items[0].value, "@README.md");
         }
@@ -3007,7 +3015,10 @@ mod tests {
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
             "cwd",
-            &folder_structure(&[], &[("[slug]/page.tsx", "x"), ("(group)/layout.tsx", "x")]),
+            &folder_structure(
+                &[],
+                &[("[slug]/page.tsx", "x"), ("(group)/layout.tsx", "x")],
+            ),
         );
         let provider = CombinedAutocompleteProvider::new(
             Vec::new(),
@@ -3020,8 +3031,9 @@ mod tests {
             ("./[slug]/pa", "./[slug]/page.tsx"),
         ] {
             let line = format!("see {prefix}");
-            let result = get_suggestions(&provider, &[line.clone()], 0, line.len(), true)
-                .unwrap_or_else(|| panic!("expected suggestions for {line}"));
+            let result =
+                get_suggestions(&provider, std::slice::from_ref(&line), 0, line.len(), true)
+                    .unwrap_or_else(|| panic!("expected suggestions for {line}"));
             assert_eq!(result.prefix, prefix);
             assert_eq!(result.items[0].value, value);
         }
