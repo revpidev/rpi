@@ -320,6 +320,33 @@ fn is_printable_ascii(str: &str) -> bool {
     str.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 
+/// Width of a string made of printable ASCII, tabs, and ANSI escape
+/// sequences, or `None` if it contains anything else. Matches
+/// [`visible_width`] for those strings without allocating or segmenting
+/// graphemes (`asciiVisibleWidth`, utils.ts:255-275 @ b485fa312).
+fn ascii_visible_width(str: &str) -> Option<usize> {
+    let mut width = 0;
+    let mut i = 0;
+    while i < str.len() {
+        let byte = str.as_bytes()[i];
+        if (0x20..=0x7e).contains(&byte) {
+            width += 1;
+            i += 1;
+        } else if byte == 0x09 {
+            width += 3;
+            i += 1;
+        } else if byte == 0x1b {
+            // Unterminated/unsupported escape sequences take the slow path,
+            // which treats the raw bytes like any other control character.
+            let ansi = extract_ansi_code(str, i)?;
+            i += ansi.length;
+        } else {
+            return None;
+        }
+    }
+    Some(width)
+}
+
 /// `truncateFragmentToWidth` (utils.ts:61-139): truncate a fragment (typically
 /// the ellipsis) to a width, keeping ANSI codes and tabs intact.
 fn truncate_fragment_to_width(text: &str, max_width: usize) -> (String, usize) {
@@ -474,9 +501,12 @@ pub fn visible_width(str: &str) -> usize {
         return 0;
     }
 
-    // Fast path: pure ASCII printable
-    if is_printable_ascii(str) {
-        return str.len();
+    // Fast path: printable ASCII, tabs, and ANSI escape sequences. Styled
+    // lines take this path, so re-rendering after a theme change does not
+    // run grapheme segmentation on every line (`asciiVisibleWidth`,
+    // utils.ts @ b485fa312).
+    if let Some(width) = ascii_visible_width(str) {
+        return width;
     }
 
     // Check cache
@@ -5390,6 +5420,39 @@ mod tests {
     fn should_treat_isolated_regional_indicators_as_width_2() {
         assert_eq!(visible_width("🇨"), 2);
         assert_eq!(visible_width("🇨🇳"), 2);
+    }
+
+    // ---- styled-ASCII fast path (utils.ts @ b485fa312) ----
+    //
+    // Ports of `test/visible-width.test.ts`: styled ASCII measures without
+    // per-line grapheme segmentation or allocation.
+
+    #[test]
+    fn should_measure_styled_ascii_without_counting_escape_sequences() {
+        assert_eq!(visible_width("\x1b[38;5;4mhello\x1b[39m world"), 11);
+        assert_eq!(
+            visible_width("\x1b]8;;https://example.com\x07link\x1b]8;;\x07"),
+            4
+        );
+        assert_eq!(visible_width("\x1b]133;A\x1b\\prompt"), 6);
+        assert_eq!(visible_width("\x1b_pi:c\x07cursor"), 6);
+    }
+
+    #[test]
+    fn should_count_tabs_as_three_columns_in_styled_text() {
+        assert_eq!(visible_width("\x1b[1ma\tb\x1b[22m"), 5);
+    }
+
+    #[test]
+    fn should_measure_styled_non_ascii_text() {
+        assert_eq!(visible_width("\x1b[31m日本\x1b[39m ok"), 7);
+        assert_eq!(visible_width("\x1b[31m─→\x1b[39m"), 2);
+    }
+
+    #[test]
+    fn should_treat_unterminated_escape_sequences_as_zero_width_control_characters() {
+        assert_eq!(visible_width("\x1b[31"), 3);
+        assert_eq!(visible_width("a\x1b"), 1);
     }
 
     // ---- R5.3.2 grapheme-width exception table guards (dfe47d3fb) ----

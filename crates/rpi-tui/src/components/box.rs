@@ -15,7 +15,7 @@ use std::cell::RefCell;
 
 use crate::components::text::ColorFn;
 use crate::tui::{Component, TuiMouseEvent, TuiMouseHandlerResult};
-use crate::utils::{apply_background_to_line, visible_width};
+use crate::utils::visible_width;
 
 type RenderCache = Option<CacheEntry>;
 
@@ -115,10 +115,11 @@ impl Box {
         let pad_needed = width.saturating_sub(vis_len);
         let padded = format!("{line}{}", " ".repeat(pad_needed));
 
-        if let Some(bg_fn) = &self.bg_fn {
-            apply_background_to_line(&padded, width, bg_fn)
-        } else {
-            padded
+        // Already padded to `width`, so apply the background directly
+        // instead of measuring the line again (box.ts:158-165 @ b485fa312).
+        match &self.bg_fn {
+            Some(bg_fn) => bg_fn(&padded),
+            None => padded,
         }
     }
 }
@@ -148,9 +149,11 @@ impl Component for Box {
         });
         let mut child_lines: Vec<String> = Vec::new();
         for lines in per_child_lines {
-            for line in lines {
-                child_lines.push(format!("{left_pad}{line}"));
-            }
+            // Keep the child lines unpadded: children usually return the same
+            // strings every frame, so the cache check below stays cheap, and
+            // padding happens only on a cache miss (box.ts:106-146
+            // @ b485fa312).
+            child_lines.extend(lines);
         }
 
         if child_lines.is_empty() {
@@ -177,7 +180,7 @@ impl Component for Box {
 
         // Content
         for line in &child_lines {
-            result.push(self.apply_bg(line, width));
+            result.push(self.apply_bg(&format!("{left_pad}{line}"), width));
         }
 
         // Bottom padding

@@ -453,32 +453,48 @@ impl InflightRefresh {
     }
 }
 
-/// `mergeModels` (remote-catalog-provider.ts:8-16): the dynamic overlay over
-/// the baseline — same-id models replace the baseline entry, new ids append.
+/// `mergeModels` (remote-catalog-provider.ts:12-17 @ c34f2d6ad): the
+/// dynamic overlay over the baseline — same-id models replace the baseline
+/// entry in place, new ids append. A map index keeps the merge linear in
+/// catalog size (a per-model linear scan was quadratic).
 pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
     let mut merged: Vec<Model> = baseline.to_vec();
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(baseline.len() + dynamic.len());
+    for (position, model) in merged.iter().enumerate() {
+        // `Map.set` semantics: a repeated key keeps its first position.
+        index.entry(model.id.clone()).or_insert(position);
+    }
     for model in dynamic {
-        match merged.iter_mut().find(|entry| entry.id == model.id) {
-            Some(entry) => *entry = model.clone(),
-            None => merged.push(model.clone()),
+        match index.get(&model.id) {
+            Some(&position) => merged[position] = model.clone(),
+            None => {
+                index.insert(model.id.clone(), merged.len());
+                merged.push(model.clone());
+            }
         }
     }
     merged
 }
 
-/// `mergeModels` for schema v6 (`remote-catalog-provider.ts:26-30 @
+/// `mergeModels` for schema v6 (`remote-catalog-provider.ts:31-35 @
 /// a13d35a74`): the merge key is `type\0id`, so the same upstream id may
-/// appear once per type. Same-key models replace the baseline entry; new
-/// keys append.
+/// appear once per type. Same-key models replace the baseline entry in
+/// place; new keys append. A map index keeps the merge linear (@ c34f2d6ad).
 pub fn merge_any_models(baseline: &[AnyModel], dynamic: &[AnyModel]) -> Vec<AnyModel> {
+    let key = |model: &AnyModel| format!("{}\0{}", model.model_type().as_str(), model.id());
     let mut merged: Vec<AnyModel> = baseline.to_vec();
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(baseline.len() + dynamic.len());
+    for (position, model) in merged.iter().enumerate() {
+        index.entry(key(model)).or_insert(position);
+    }
     for model in dynamic {
-        match merged
-            .iter_mut()
-            .find(|entry| entry.model_type() == model.model_type() && entry.id() == model.id())
-        {
-            Some(entry) => *entry = model.clone(),
-            None => merged.push(model.clone()),
+        let model_key = key(model);
+        match index.get(&model_key) {
+            Some(&position) => merged[position] = model.clone(),
+            None => {
+                index.insert(model_key, merged.len());
+                merged.push(model.clone());
+            }
         }
     }
     merged

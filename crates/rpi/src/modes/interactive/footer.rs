@@ -25,9 +25,9 @@ use rpi_agent::session::SessionEntry;
 use rpi_tui::tui::Component;
 use rpi_tui::utils::{truncate_to_width, visible_width};
 
-use crate::core::agent_session::AgentSession;
+use crate::core::agent_session::{AgentSession, ContextUsage};
 use crate::core::themes::Theme;
-use crate::core::usage_totals::{add_usage_to_totals, create_usage_totals};
+use crate::core::usage_totals::{UsageTotals, add_usage_to_totals, create_usage_totals};
 
 /// `formatTokens` (footer.ts:24-30).
 pub fn format_tokens(count: u64) -> String {
@@ -196,12 +196,35 @@ impl FooterDataProvider {
     }
 }
 
+/// Cached session-derived footer stats (footer.ts:47-56 @ b485fa312).
+///
+/// Usage totals and context usage scan the whole session, and the footer
+/// renders on every frame. Entries are append-only and every append moves
+/// the leaf, so the results only change with the session, leaf, entry
+/// count, or the model whose context window applies.
+///
+/// V16-12 cross-registration: upstream keys this on
+/// `routedModel?.model ?? session.model`; rpi has no routed model yet, so
+/// the session's current model is the key. V16-12 must switch the key (and
+/// `get_context_usage` upstream of it) to the routed model when it lands.
+#[derive(Clone)]
+struct SessionStats {
+    session_id: String,
+    leaf_id: Option<String>,
+    entry_count: usize,
+    limits_model: Option<(String, String)>,
+    usage_totals: UsageTotals,
+    latest_cache_hit_rate: Option<f64>,
+    context_usage: Option<ContextUsage>,
+}
+
 /// `FooterComponent` (footer.ts:50-245).
 pub struct FooterComponent {
     session: AgentSession,
     footer_data: Arc<FooterDataProvider>,
     auto_compact_enabled: bool,
     theme: Arc<Theme>,
+    session_stats: Mutex<Option<SessionStats>>,
 }
 
 impl FooterComponent {
@@ -223,6 +246,7 @@ impl FooterComponent {
             footer_data,
             auto_compact_enabled: true,
             theme,
+            session_stats: Mutex::new(None),
         }
     }
 
@@ -242,18 +266,45 @@ impl FooterComponent {
     pub fn data_provider(&self) -> &Arc<FooterDataProvider> {
         &self.footer_data
     }
-}
 
-impl Component for FooterComponent {
-    fn render(&self, width: usize) -> Vec<String> {
+    /// Usage totals and context usage scan the whole session, and the footer
+    /// renders on every frame; cache them per session state
+    /// (footer.ts:67-104 @ b485fa312). Entries are append-only and every
+    /// append moves the leaf, so the entry count plus the leaf covers all
+    /// message/usage changes.
+    fn get_session_stats(&self) -> SessionStats {
+        let manager = self.session.session_manager();
+        let (session_id, leaf_id, entry_count) = {
+            let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                manager.get_session_id().to_owned(),
+                manager.get_leaf_id().map(str::to_owned),
+                manager.entry_count(),
+            )
+        };
+        // V16-12 cross-registration: this key becomes the routed model when
+        // virtual models land (see [`SessionStats`]).
+        let limits_model = self.session.model().map(|model| (model.provider, model.id));
+        {
+            let cached = self
+                .session_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cached.as_ref()
+                && cached.session_id == session_id
+                && cached.leaf_id == leaf_id
+                && cached.entry_count == entry_count
+                && cached.limits_model == limits_model
+            {
+                return cached.clone();
+            }
+        }
+
         // Cumulative usage across ALL session entries — not just
         // post-compaction messages (footer.ts:87-104).
         let mut usage_totals = create_usage_totals();
         let mut latest_cache_hit_rate: Option<f64> = None;
-
-        let entries = self
-            .session
-            .session_manager()
+        let entries = manager
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_entries();
@@ -304,6 +355,32 @@ impl Component for FooterComponent {
         // tokens are unknown until the next LLM response after compaction
         // (footer.ts:106-111).
         let context_usage = self.session.get_context_usage();
+        let stats = SessionStats {
+            session_id,
+            leaf_id,
+            entry_count,
+            limits_model,
+            usage_totals,
+            latest_cache_hit_rate,
+            context_usage,
+        };
+        *self
+            .session_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
+        stats
+    }
+}
+
+impl Component for FooterComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        // Cumulative usage and context usage are cached until the session,
+        // leaf, entry count, or limits model changes (footer.ts:66-111
+        // @ b485fa312).
+        let stats = self.get_session_stats();
+        let usage_totals = &stats.usage_totals;
+        let latest_cache_hit_rate = stats.latest_cache_hit_rate;
+        let context_usage = &stats.context_usage;
         let context_window = context_usage
             .as_ref()
             .map(|c| c.context_window)

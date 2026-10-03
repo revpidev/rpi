@@ -26,6 +26,15 @@ const ANSI_PATTERN: &str = concat!(
 
 static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
 
+/// Regex matching the characters removed by `sanitizeBinaryOutput`
+/// (shell.ts:155-157 @ b485fa312): control characters except tab, newline,
+/// and carriage return, plus the interlinear annotation characters
+/// U+FFF9–U+FFFB. All removed characters are single UTF-16 code units, so
+/// surrogate pairs are never split.
+const BINARY_OUTPUT_PATTERN: &str = r"[\x00-\x08\x0B\x0C\x0E-\x1F\x{FFF9}-\x{FFFB}]";
+
+static BINARY_OUTPUT_REGEX: OnceLock<Regex> = OnceLock::new();
+
 /// Strip ANSI escape sequences from a string.
 ///
 /// Port of `stripAnsi` (ansi.ts:46-60). Fast path: if the input contains
@@ -44,35 +53,20 @@ pub fn strip_ansi(value: &str) -> String {
     regex.replace_all(value, "").into_owned()
 }
 
-/// Remove control characters and Unicode format characters from output.
+/// Remove control characters and Unicode interlinear annotation characters
+/// from output.
 ///
-/// Port of `sanitizeBinaryOutput` (shell.ts:144-174). Removes:
+/// Port of `sanitizeBinaryOutput` (shell.ts:153-162 @ b485fa312): one regex
+/// replace instead of a per-character array pass. Removes:
 /// - Control characters `U+0000`–`U+001F` (preserves `\t`, `\n`, `\r`)
-/// - Unicode format characters `U+FFF9`–`U+FFFB`
+/// - Unicode interlinear annotation characters `U+FFF9`–`U+FFFB`
 pub fn sanitize_binary_output(value: &str) -> String {
-    value
-        .chars()
-        .filter(|&c| {
-            let code = c as u32;
-
-            // Allow tab, newline, carriage return.
-            if code == 0x09 || code == 0x0A || code == 0x0D {
-                return true;
-            }
-
-            // Filter out control characters 0x00–0x1F.
-            if code <= 0x1F {
-                return false;
-            }
-
-            // Filter out Unicode format characters U+FFF9–U+FFFB.
-            if (0xFFF9..=0xFFFB).contains(&code) {
-                return false;
-            }
-
-            true
-        })
-        .collect()
+    let regex = BINARY_OUTPUT_REGEX.get_or_init(|| {
+        // Invariant: BINARY_OUTPUT_PATTERN is a verified-valid regex literal.
+        Regex::new(BINARY_OUTPUT_PATTERN)
+            .expect("BINARY_OUTPUT_PATTERN is verified valid at development time")
+    });
+    regex.replace_all(value, "").into_owned()
 }
 
 // -----------------------------------------------------------------------

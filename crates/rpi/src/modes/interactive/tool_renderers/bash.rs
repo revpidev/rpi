@@ -36,9 +36,7 @@ use crate::modes::interactive::components::tool_execution::{
     RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
     get_text_output, lock_recover,
 };
-use crate::modes::interactive::components::visual_truncate::{
-    VisualTruncateResult, truncate_to_visual_lines,
-};
+use crate::modes::interactive::components::visual_truncate::truncate_to_visual_lines;
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
 
 /// `BASH_PREVIEW_LINES` (bash.ts:204).
@@ -197,10 +195,12 @@ impl TruncationView {
 
 /// The result-render component (bash.ts:219-225 `BashResultRenderComponent`
 /// and :239-319 `rebuildBashResultRenderComponent`): output preview,
-/// truncation warnings, and the Elapsed/Took timing line. The preview is
-/// cached per width (bash.ts:213-217, :272-294); the timing line is computed
-/// at `render()` time from the shared state so the 1s ticker only needs to
-/// request a re-render.
+/// truncation warnings, and the Elapsed/Took timing line. The complete
+/// collapsed output — including the expand hint — is cached per width
+/// (bash.ts:213-217, :272-294 @ b485fa312): the renderer runs on every
+/// frame for every bash result in the transcript. The timing line is
+/// computed at `render()` time from the shared state so the 1s ticker only
+/// needs to request a re-render.
 struct BashResultRenderComponent {
     styled_output: String,
     warnings: Option<String>,
@@ -208,11 +208,13 @@ struct BashResultRenderComponent {
     is_partial: bool,
     state: Arc<BashRenderState>,
     theme: Theme,
-    cache: RefCell<Option<(usize, VisualTruncateResult)>>,
+    cache: RefCell<Option<(usize, Vec<String>)>>,
 }
 
 impl BashResultRenderComponent {
-    fn preview(&self, width: usize) -> VisualTruncateResult {
+    /// The collapsed preview lines (leading spacer, optional hint, kept
+    /// visual lines), cached per width.
+    fn preview(&self, width: usize) -> Vec<String> {
         if let Some((cached_width, cached)) = &*self.cache.borrow()
             && *cached_width == width
         {
@@ -221,8 +223,21 @@ impl BashResultRenderComponent {
         // padding_x = 0: the component sits inside the component's `Box`
         // (visual-truncate.rs doc).
         let preview = truncate_to_visual_lines(&self.styled_output, BASH_PREVIEW_LINES, width, 0);
-        *self.cache.borrow_mut() = Some((width, preview.clone()));
-        preview
+        let mut lines: Vec<String> = vec![String::new()];
+        if preview.skipped_count > 0 {
+            // bash.ts:280-284.
+            let hint = format!(
+                "{} {}{}",
+                self.theme
+                    .fg("muted", &format!("... ({} earlier lines,", preview.skipped_count)),
+                key_hint(&self.theme, "app.tools.expand", "to expand"),
+                self.theme.fg("muted", ")")
+            );
+            lines.push(truncate_to_width(&hint, width, "...", false));
+        }
+        lines.extend(preview.visual_lines);
+        *self.cache.borrow_mut() = Some((width, lines.clone()));
+        lines
     }
 }
 
@@ -238,22 +253,7 @@ impl Component for BashResultRenderComponent {
                 lines.push(String::new());
                 lines.extend(wrap_text_with_ansi(&self.styled_output, width));
             } else {
-                let preview = self.preview(width);
-                lines.push(String::new());
-                if preview.skipped_count > 0 {
-                    // bash.ts:280-284.
-                    let hint = format!(
-                        "{} {}{}",
-                        self.theme.fg(
-                            "muted",
-                            &format!("... ({} earlier lines,", preview.skipped_count)
-                        ),
-                        key_hint(&self.theme, "app.tools.expand", "to expand"),
-                        self.theme.fg("muted", ")")
-                    );
-                    lines.push(truncate_to_width(&hint, width, "...", false));
-                }
-                lines.extend(preview.visual_lines);
+                lines.extend(self.preview(width));
             }
         }
 
