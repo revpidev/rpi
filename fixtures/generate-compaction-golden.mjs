@@ -895,12 +895,29 @@ function writePrompt(name, content) {
 	console.log(`prompts/${name} (${content.length} chars)`);
 }
 
+function messageText(message) {
+	if (!message) return "";
+	const content = message.content;
+	if (typeof content === "string") return content;
+	return (content ?? []).map((block) => block.text ?? "").join("\n");
+}
+
+// v1.0.0 `normalizeContext` moves the system prompt into a system message,
+// so captures locate the system/user messages by role instead of index 0.
+function captureText(capture) {
+	return {
+		system: messageText(capture.context.messages.find((message) => message.role === "system")),
+		text: messageText(capture.context.messages.find((message) => message.role === "user")),
+	};
+}
+
 // 1. Initial history summary render + system prompt.
 {
 	const { captured, streamFn } = captureStreamFn(["SUMMARY ONE"]);
 	await generateSummaryWithUsage(SAMPLE_MESSAGES, MODEL, 16384, undefined, undefined, undefined, undefined, undefined, undefined, streamFn);
-	writePrompt("system_prompt.txt", captured[0].context.systemPrompt);
-	writePrompt("history_initial.txt", captured[0].context.messages[0].content[0].text);
+	const first = captureText(captured[0]);
+	writePrompt("system_prompt.txt", first.system);
+	writePrompt("history_initial.txt", first.text);
 	writePrompt("history_initial_options.json", JSON.stringify({ maxTokens: captured[0].options.maxTokens, cacheRetention: captured[0].options.cacheRetention, hasSessionId: typeof captured[0].options.sessionId === "string" && captured[0].options.sessionId.length > 0 }, null, 2) + "\n");
 }
 
@@ -919,7 +936,7 @@ function writePrompt(name, content) {
 		undefined,
 		streamFn,
 	);
-	writePrompt("history_update.txt", captured[0].context.messages[0].content[0].text);
+	writePrompt("history_update.txt", captureText(captured[0]).text);
 }
 
 // 3. Turn prefix render (via compact() on a split-turn preparation) and the
@@ -939,8 +956,8 @@ function writePrompt(name, content) {
 	if (!preparation?.isSplitTurn) throw new Error("expected a split-turn preparation");
 	const { captured, streamFn } = captureStreamFn(["HISTORY SUMMARY TEXT", "TURN PREFIX SUMMARY TEXT"]);
 	const result = await compact(preparation, MODEL, undefined, undefined, "keep the auth details", undefined, undefined, streamFn);
-	writePrompt("history_in_split_turn.txt", captured[0].context.messages[0].content[0].text);
-	writePrompt("turn_prefix.txt", captured[1].context.messages[0].content[0].text);
+	writePrompt("history_in_split_turn.txt", captureText(captured[0]).text);
+	writePrompt("turn_prefix.txt", captureText(captured[1]).text);
 	writePrompt("split_turn_merged_summary.txt", result.summary);
 	writeFileSync(
 		join(promptsDir, "split_turn_result.json"),
@@ -991,7 +1008,7 @@ function writePrompt(name, content) {
 				firstKeptEntryId: result.firstKeptEntryId,
 				usage: result.usage,
 				details: result.details,
-				promptText: captured[0].context.messages[0].content[0].text,
+				promptText: captureText(captured[0]).text,
 			},
 			null,
 			2,
@@ -1010,7 +1027,7 @@ function writePrompt(name, content) {
 	]);
 	const { captured, streamFn } = captureStreamFn(["BRANCH SUMMARY TEXT"]);
 	const result = await generateBranchSummary(branchEntries, { model: MODEL, streamFn, signal: undefined });
-	writePrompt("branch.txt", captured[0].context.messages[0].content[0].text);
+	writePrompt("branch.txt", captureText(captured[0]).text);
 	writePrompt("branch_result_summary.txt", result.summary);
 	writeFileSync(
 		join(promptsDir, "branch_result.json"),
@@ -1039,7 +1056,7 @@ function writePrompt(name, content) {
 		signal: undefined,
 		customInstructions: "focus on OAuth",
 	});
-	writePrompt("branch_custom_instructions.txt", captured[0].context.messages[0].content[0].text);
+	writePrompt("branch_custom_instructions.txt", captureText(captured[0]).text);
 }
 
 console.log("prompt captures written");

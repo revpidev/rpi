@@ -584,21 +584,24 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages."#;
 
-/// `TURN_PREFIX_SUMMARIZATION_PROMPT` — byte-exact (compaction.ts:795-808).
-pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = r#"This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+/// `TURN_PREFIX_SUMMARIZATION_PROMPT` — byte-exact (compaction.ts:942-957
+/// @ a13d35a74; #9908 `d192bd6dc`). Conversation content and instructions
+/// are separated, and the wording is continuation-oriented so reasoning
+/// models (Fable 5.1) do not refuse the split-turn summary.
+pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = r#"The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
 
-Summarize the prefix to provide context for the retained suffix:
+Create a concise checkpoint of the user's request and the progress shown above. This checkpoint will be placed before the later messages so the conversation can continue with the necessary context.
 
 ## Original Request
-[What did the user ask for in this turn?]
+[What did the user ask for?]
 
-## Early Progress
-- [Key decisions and work done in the prefix]
+## Progress So Far
+- [Key decisions and work completed in these messages]
 
-## Context for Suffix
-- [Information needed to understand the retained recent work]
+## Context Needed to Continue
+- [Information from these messages needed to understand the later work]
 
-Be concise. Focus on what's needed to understand the kept suffix."#;
+Only summarize information explicitly present above. Do not infer or recreate later messages."#;
 
 /// Split-turn merge format literal (compaction.ts:881).
 pub const SPLIT_TURN_MERGE_SEPARATOR: &str = "\n\n---\n\n**Turn Context (split turn):**\n\n";
@@ -1348,7 +1351,7 @@ async fn generate_turn_prefix_summary(
     let llm_messages = convert_to_llm(messages);
     let conversation_text = serialize_conversation(&llm_messages);
     let prompt_text = format!(
-        "<conversation>\n{conversation_text}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+        "# Conversation\n{conversation_text}\n\n# Instructions\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
     );
     let summarization_messages = vec![rpi_ai::types::Message::User(UserMessage {
         role: UserRole::User,
