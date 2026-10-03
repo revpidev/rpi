@@ -35,6 +35,8 @@ use std::sync::OnceLock;
 use crate::config;
 use crate::error::RpiError;
 
+pub mod system;
+
 // ===========================================================================
 // Built-in theme JSON (verbatim values from upstream dark.json / light.json)
 // ===========================================================================
