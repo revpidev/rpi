@@ -566,10 +566,11 @@ fn build_session_options(
     out
 }
 
-/// Prepare the initial message (main.ts:121-140).
+/// Prepare the initial message (main.ts:121-140 @ f5c946480).
+/// `@file` images are NOT resized here: `AgentSession` resizes them after
+/// extension hooks select the request model (main.ts:209-225, #9631).
 async fn prepare_initial_message(
     parsed: &mut Args,
-    auto_resize_images: bool,
     stdin_content: Option<&str>,
 ) -> Result<(Option<String>, Option<Vec<rpi_ai::types::ImageContent>>), FileProcessError> {
     if parsed.file_args.is_empty() {
@@ -577,7 +578,7 @@ async fn prepare_initial_message(
         return Ok((result.initial_message, result.initial_images));
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let processed = process_file_arguments(&parsed.file_args, &cwd, auto_resize_images).await?;
+    let processed = process_file_arguments(&parsed.file_args, &cwd, false).await?;
     let result = build_initial_message(
         &mut parsed.messages,
         Some(&processed.text),
@@ -1363,18 +1364,8 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     }
 
     let mut parsed_owned = (*parsed).clone();
-    let auto_resize = {
-        let loader = runtime
-            .services()
-            .resource_loader
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        loader.settings_manager().get_image_auto_resize()
-    };
     let (initial_message, initial_images) =
-        match prepare_initial_message(&mut parsed_owned, auto_resize, stdin_content.as_deref())
-            .await
-        {
+        match prepare_initial_message(&mut parsed_owned, stdin_content.as_deref()).await {
             Ok(result) => result,
             Err(error) => {
                 let _ = writeln!(err, "Error: {error}");

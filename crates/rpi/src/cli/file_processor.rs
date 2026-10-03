@@ -85,7 +85,14 @@ pub async fn process_file_arguments(
                     message: e.to_string(),
                 }
             })?;
-            match process_image(&content, mime_type, auto_resize_images) {
+            match process_image(
+                &content,
+                mime_type,
+                crate::tools::image_process::ProcessImageOptions {
+                    auto_resize_images: Some(auto_resize_images),
+                    resize_options: None,
+                },
+            ) {
                 Err(processed) => {
                     text.push_str(&format!(
                         "<file name=\"{}\">{}</file>\n",
@@ -136,6 +143,7 @@ pub async fn process_file_arguments(
 mod tests {
     use super::*;
     use crate::tools::test_helpers::TempDir;
+    use base64::Engine;
 
     #[tokio::test]
     async fn test_text_file_wrapped_in_file_tag() {
@@ -208,5 +216,31 @@ mod tests {
             temp.path().join("img.png").display()
         )));
         assert!(result.text.ends_with("</file>\n"));
+    }
+
+    /// V16-04 FR-H (#9631): `autoResizeImages: false` defers resizing to
+    /// `AgentSession` (after extension hooks select the request model), so
+    /// the CLI keeps the original bytes.
+    #[tokio::test]
+    async fn test_auto_resize_false_keeps_original_bytes() {
+        let temp = TempDir::new();
+        let img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
+            image::ImageBuffer::from_pixel(2100, 2100, image::Rgba([9, 9, 9, 255]));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(temp.path().join("big.png"), &png).expect("write");
+
+        let result = process_file_arguments(&["big.png".to_owned()], temp.path(), false)
+            .await
+            .expect("process");
+        assert_eq!(result.images.len(), 1);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result.images[0].data)
+            .expect("base64");
+        assert_eq!(
+            decoded, png,
+            "autoResizeImages=false defers resizing to the session"
+        );
     }
 }

@@ -39,7 +39,7 @@ use rpi_agent::types::AgentTool;
 /// Port of the `ToolContext` shape used throughout `packages/coding-agent/src/core/tools/`.
 /// The `cwd` is the working directory for path resolution; `session_env` carries
 /// optional session/model metadata injected into `RPI_*` environment variables.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     /// Working directory for resolving relative paths.
     pub cwd: PathBuf,
@@ -49,6 +49,11 @@ pub struct ToolContext {
     /// model/thinking/session-file changes so the bash tool resolves `RPI_*`
     /// per command spawn (requirements §3.3: model switches take effect immediately).
     pub session_env: Option<std::sync::Arc<std::sync::RwLock<SessionEnv>>>,
+    /// Optional live accessor for the session's current model (V16-04
+    /// FR-H): per-model image resize profiles (#9631) must follow model
+    /// switches, and `AgentTool::execute` carries no model context (the
+    /// upstream `ctx?.model` equivalent).
+    pub current_model: Option<Arc<dyn Fn() -> Option<rpi_ai::types::Model> + Send + Sync>>,
 }
 
 /// Session-level environment metadata, surfaced as `RPI_*` env vars in bash.
@@ -389,6 +394,7 @@ mod wiring_tests {
         let ctx = ToolContext {
             cwd: PathBuf::from("."),
             session_env: None,
+            current_model: None,
         };
         let tools = create_builtin_tools(
             &ctx,
@@ -408,6 +414,7 @@ mod wiring_tests {
         let ctx = ToolContext {
             cwd: PathBuf::from("."),
             session_env: None,
+            current_model: None,
         };
         let tools = create_builtin_tools(
             &ctx,
@@ -443,6 +450,7 @@ mod wiring_tests {
         let ctx = ToolContext {
             cwd: base.clone(),
             session_env: None,
+            current_model: None,
         };
         let tools = create_builtin_tools(
             &ctx,

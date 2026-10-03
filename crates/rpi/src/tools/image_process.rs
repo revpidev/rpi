@@ -15,6 +15,7 @@ use base64::Engine;
 use image::DynamicImage;
 use image::ImageEncoder;
 use image::imageops::FilterType;
+use rpi_ai::types::ModelImageResizeOptions;
 
 // ---------------------------------------------------------------------------
 // Constants (image-resize-core.ts:22-29)
@@ -255,9 +256,11 @@ fn normalize_image(bytes: &[u8], mime_type: &str) -> Option<NormalizedImage> {
 // resizeImageInProcess (image-resize-core.ts:59-163)
 // ---------------------------------------------------------------------------
 
-/// Resize an image to fit within max dimensions and encoded file size.
+/// `resizeImageInProcess` (image-resize-core.ts:59-163) with the per-model
+/// overrides of #9631 (`opts = { ...DEFAULT_OPTIONS, ...resizeOptions }`,
+/// image-resize-core.ts:64-70 @ f5c946480).
 ///
-/// Returns `None` if the image cannot be resized below `MAX_BYTES`.
+/// Returns `None` if the image cannot be resized below `max_bytes`.
 ///
 /// Strategy (image-resize-core.ts:46-57):
 /// 1. Resize to maxWidth/maxHeight maintaining aspect ratio.
@@ -266,7 +269,23 @@ fn normalize_image(bytes: &[u8], mime_type: &str) -> Option<NormalizedImage> {
 ///
 /// **Intentional difference**: the upstream `image` crate decodes GIF to the
 /// first frame, matching Photon's behaviour (single-frame processing).
-fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
+fn resize_image(
+    input_bytes: &[u8],
+    mime_type: &str,
+    options: Option<&ModelImageResizeOptions>,
+) -> Option<ResizedImage> {
+    let max_width = options.and_then(|o| o.max_width).unwrap_or(MAX_WIDTH);
+    let max_height = options.and_then(|o| o.max_height).unwrap_or(MAX_HEIGHT);
+    let max_bytes = options
+        .and_then(|o| o.max_bytes)
+        .map(|bytes| bytes as usize)
+        .unwrap_or(MAX_BYTES);
+    // Schema-validated upstream (1..=100); clamp defensively for direct
+    // callers that bypass the models.json parser.
+    let jpeg_quality = options
+        .and_then(|o| o.jpeg_quality)
+        .map(|quality| quality.clamp(1, 100) as u8)
+        .unwrap_or(JPEG_QUALITY);
     let input_base64_size = input_bytes.len().div_ceil(3) * 4;
 
     // Decode image. Any decode error → None (upstream try-catch → null).
@@ -280,7 +299,7 @@ fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
 
     // Check if already within all limits (dimensions AND encoded size)
     // (image-resize-core.ts:82-93).
-    if original_width <= MAX_WIDTH && original_height <= MAX_HEIGHT && input_base64_size < MAX_BYTES
+    if original_width <= max_width && original_height <= max_height && input_base64_size < max_bytes
     {
         let data = base64::engine::general_purpose::STANDARD.encode(input_bytes);
         return Some(ResizedImage {
@@ -302,20 +321,20 @@ fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
     let mut target_width = original_width;
     let mut target_height = original_height;
 
-    if target_width > MAX_WIDTH {
+    if target_width > max_width {
         target_height =
-            ((target_height as f64 * MAX_WIDTH as f64) / target_width as f64).round() as u32;
-        target_width = MAX_WIDTH;
+            ((target_height as f64 * max_width as f64) / target_width as f64).round() as u32;
+        target_width = max_width;
     }
-    if target_height > MAX_HEIGHT {
+    if target_height > max_height {
         target_width =
-            ((target_width as f64 * MAX_HEIGHT as f64) / target_height as f64).round() as u32;
-        target_height = MAX_HEIGHT;
+            ((target_width as f64 * max_height as f64) / target_height as f64).round() as u32;
+        target_height = max_height;
     }
 
     // Quality gradient with deduplication (image-resize-core.ts:122).
     let quality_steps: Vec<u8> = {
-        let raw = [JPEG_QUALITY, 85, 70, 55, 40];
+        let raw = [jpeg_quality, 85, 70, 55, 40];
         let mut seen = std::collections::HashSet::new();
         raw.iter().filter(|q| seen.insert(**q)).copied().collect()
     };
@@ -329,7 +348,7 @@ fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
         // PNG candidate (image-resize-core.ts:112).
         if let Ok(png_data) = encode_png(&resized) {
             let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-            if png_b64.len() < MAX_BYTES {
+            if png_b64.len() < max_bytes {
                 return Some(ResizedImage {
                     data: png_b64,
                     mime_type: "image/png".to_string(),
@@ -346,7 +365,7 @@ fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
         for &quality in &quality_steps {
             if let Ok(jpeg_data) = encode_jpeg(&resized, quality) {
                 let jpeg_b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_data);
-                if jpeg_b64.len() < MAX_BYTES {
+                if jpeg_b64.len() < max_bytes {
                     return Some(ResizedImage {
                         data: jpeg_b64,
                         mime_type: "image/jpeg".to_string(),
@@ -413,11 +432,21 @@ pub fn resolved_image_resize_options(
 // processImage (image-process.ts:72-118)
 // ---------------------------------------------------------------------------
 
+/// `ProcessImageOptions` (image-process.ts:5-10 @ f5c946480).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessImageOptions {
+    /// Whether to auto-resize images. Default: true.
+    pub auto_resize_images: Option<bool>,
+    /// Optional per-model resize overrides. Uses the global defaults when
+    /// omitted (zero-regression red line, #9631).
+    pub resize_options: Option<ModelImageResizeOptions>,
+}
+
 /// Process an image for inline display.
 ///
 /// * `bytes` — raw image bytes.
 /// * `mime_type` — detected MIME type (e.g. `"image/png"`, `"image/bmp"`).
-/// * `auto_resize` — whether to resize to 2000×2000 / 4.5 MB limits.
+/// * `options` — auto-resize flag + optional per-model resize profile.
 ///
 /// On error, `message` is one of:
 /// - `"[Image omitted: could not be converted to a supported inline image format.]"`
@@ -425,19 +454,23 @@ pub fn resolved_image_resize_options(
 pub fn process_image(
     bytes: &[u8],
     mime_type: &str,
-    auto_resize: bool,
+    options: ProcessImageOptions,
 ) -> Result<ProcessedImage, ProcessImageError> {
+    let auto_resize = options.auto_resize_images.unwrap_or(true);
     let normalized = normalize_image(bytes, mime_type).ok_or_else(|| ProcessImageError {
         message: "[Image omitted: could not be converted to a supported inline image format.]"
             .to_string(),
     })?;
 
     if auto_resize {
-        let resized = resize_image(&normalized.bytes, &normalized.mime_type).ok_or_else(|| {
-            ProcessImageError {
-                message: "[Image omitted: could not be resized below the inline image size limit.]"
-                    .to_string(),
-            }
+        let resized = resize_image(
+            &normalized.bytes,
+            &normalized.mime_type,
+            options.resize_options.as_ref(),
+        )
+        .ok_or_else(|| ProcessImageError {
+            message: "[Image omitted: could not be resized below the inline image size limit.]"
+                .to_string(),
         })?;
 
         let mut hints = Vec::new();
@@ -491,6 +524,23 @@ mod tests {
     use super::*;
     use image::{ImageBuffer, Rgb, Rgba};
 
+    /// Test-local shorthand for the historic `(bytes, mime, auto_resize)`
+    /// signature; production call sites pass a [`ProcessImageOptions`].
+    fn process(
+        bytes: &[u8],
+        mime_type: &str,
+        auto_resize: bool,
+    ) -> Result<ProcessedImage, ProcessImageError> {
+        process_image(
+            bytes,
+            mime_type,
+            ProcessImageOptions {
+                auto_resize_images: Some(auto_resize),
+                resize_options: None,
+            },
+        )
+    }
+
     /// Generate a small solid-colour PNG image (10×10).
     fn make_small_png() -> Vec<u8> {
         let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
@@ -524,7 +574,7 @@ mod tests {
     #[test]
     fn test_small_png_no_resize() {
         let png = make_small_png();
-        let result = process_image(&png, "image/png", true).unwrap();
+        let result = process(&png, "image/png", true).unwrap();
         assert_eq!(result.mime_type, "image/png");
         assert!(result.hints.is_empty());
         assert_eq!(result.width, 10);
@@ -539,7 +589,7 @@ mod tests {
     #[test]
     fn test_large_png_triggers_resize_hint() {
         let png = make_large_png();
-        let result = process_image(&png, "image/png", true).unwrap();
+        let result = process(&png, "image/png", true).unwrap();
         // Was resized: dimensions should be <= 2000.
         assert!(result.width <= MAX_WIDTH);
         assert!(result.height <= MAX_HEIGHT);
@@ -567,7 +617,7 @@ mod tests {
     #[test]
     fn test_bmp_converted_to_png() {
         let bmp = make_small_bmp();
-        let result = process_image(&bmp, "image/bmp", true).unwrap();
+        let result = process(&bmp, "image/bmp", true).unwrap();
         assert_eq!(result.mime_type, "image/png");
         // Should have conversion hint.
         assert!(
@@ -591,7 +641,7 @@ mod tests {
             0xFF, 0xFF, 0xFF, 0xFF, // garbage width/height
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // garbage
         ];
-        let result = process_image(&corrupt, "image/png", true);
+        let result = process(&corrupt, "image/png", true);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().message,
@@ -602,7 +652,7 @@ mod tests {
     #[test]
     fn test_auto_resize_false_passes_through() {
         let png = make_small_png();
-        let result = process_image(&png, "image/png", false).unwrap();
+        let result = process(&png, "image/png", false).unwrap();
         assert_eq!(result.mime_type, "image/png");
         assert!(result.hints.is_empty());
         // Data should be base64 of original.
@@ -615,7 +665,7 @@ mod tests {
     #[test]
     fn test_auto_resize_false_bmp_conversion() {
         let bmp = make_small_bmp();
-        let result = process_image(&bmp, "image/bmp", false).unwrap();
+        let result = process(&bmp, "image/bmp", false).unwrap();
         assert_eq!(result.mime_type, "image/png");
         assert!(
             result
@@ -628,7 +678,7 @@ mod tests {
     #[test]
     fn test_unsupported_garbage_normalize_error() {
         let garbage = b"not an image at all".to_vec();
-        let result = process_image(&garbage, "application/octet-stream", true);
+        let result = process(&garbage, "application/octet-stream", true);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().message,
@@ -640,7 +690,7 @@ mod tests {
     fn test_jpeg_mime_normalization() {
         let png = make_small_png();
         // "image/jpg" should be normalised to "image/jpeg".
-        let result = process_image(&png, "image/jpg", true).unwrap();
+        let result = process(&png, "image/jpg", true).unwrap();
         assert_eq!(result.mime_type, "image/jpeg");
     }
 
@@ -648,7 +698,7 @@ mod tests {
     fn test_mime_with_parameters() {
         let png = make_small_png();
         // MIME with charset parameter should still be recognised.
-        let result = process_image(&png, "image/png; charset=utf-8", true).unwrap();
+        let result = process(&png, "image/png; charset=utf-8", true).unwrap();
         assert_eq!(result.mime_type, "image/png");
     }
 
@@ -761,5 +811,85 @@ mod tests {
         // every model of the current vendored catalog until the V16-02
         // regen lands generator-injected profiles.
         assert_eq!(resolved_image_resize_options(&model_with(None)), None);
+    }
+
+    /// V16-04 FR-H: a model resize profile caps the resized dimensions and
+    /// byte budget before base64 encoding (cache-safe, #9631).
+    #[test]
+    fn test_model_resize_profile_caps_dimensions() {
+        let png = make_large_png(); // 3000×3000
+        let result = process_image(
+            &png,
+            "image/png",
+            ProcessImageOptions {
+                auto_resize_images: Some(true),
+                resize_options: Some(ModelImageResizeOptions {
+                    max_width: Some(120),
+                    max_height: Some(80),
+                    max_bytes: None,
+                    jpeg_quality: None,
+                }),
+            },
+        )
+        .unwrap();
+        assert!(result.width <= 120, "width {}", result.width);
+        assert!(result.height <= 80, "height {}", result.height);
+        // Aspect ratio preserved (3000×3000 → 120×120 then capped by 80).
+        assert_eq!((result.width, result.height), (80, 80));
+        assert!(
+            result
+                .hints
+                .iter()
+                .any(|hint| hint.contains("displayed at 80x80")),
+            "hints: {:?}",
+            result.hints
+        );
+    }
+
+    #[test]
+    fn test_model_resize_profile_caps_bytes() {
+        let png = make_large_png();
+        let max_bytes = 12_000_u64;
+        let result = process_image(
+            &png,
+            "image/png",
+            ProcessImageOptions {
+                auto_resize_images: Some(true),
+                resize_options: Some(ModelImageResizeOptions {
+                    max_width: None,
+                    max_height: None,
+                    max_bytes: Some(max_bytes),
+                    jpeg_quality: None,
+                }),
+            },
+        )
+        .unwrap();
+        // The encoder keeps shrinking until the base64 payload fits.
+        assert!(
+            result.data.len() < max_bytes as usize,
+            "base64 payload {} >= {max_bytes}",
+            result.data.len()
+        );
+    }
+
+    /// Zero-regression red line: no profile → byte-identical output to the
+    /// historical global defaults (small images pass through untouched).
+    #[test]
+    fn test_no_profile_is_byte_identical() {
+        let png = make_small_png();
+        let result = process_image(
+            &png,
+            "image/png",
+            ProcessImageOptions {
+                auto_resize_images: Some(true),
+                resize_options: None,
+            },
+        )
+        .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result.data)
+            .unwrap();
+        assert_eq!(decoded, png);
+        assert!(result.hints.is_empty());
     }
 }

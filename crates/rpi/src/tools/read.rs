@@ -10,12 +10,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rpi_agent::{AgentError, AgentTool, AgentToolResult, AgentToolUpdateCallback};
-use rpi_ai::types::{ImageContent, TextContent, ToolResultContent};
+use rpi_ai::types::{ImageContent, ModelImageResizeOptions, TextContent, ToolResultContent};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::ToolContext;
-use crate::tools::image_process::process_image;
+use crate::tools::image_process::{
+    ProcessImageOptions, process_image, resolved_image_resize_options,
+};
 use crate::tools::mime::{IMAGE_TYPE_SNIFF_BYTES, detect_supported_image_mime_type};
 use crate::tools::path_utils::resolve_read_path;
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
@@ -78,8 +80,12 @@ impl ReadOperations for LocalReadOperations {
 
 /// Options for creating a read tool instance.
 pub struct ReadToolOptions {
-    /// Whether to auto-resize images to 2000×2000 max. Default: `true`.
+    /// Whether to auto-resize images to the inline provider limits.
+    /// Default: `true`.
     pub auto_resize_images: bool,
+    /// Fallback resize profile when the execution context carries no live
+    /// model (read.ts:60 @ f5c946480).
+    pub resize_options: Option<ModelImageResizeOptions>,
     /// Custom operations for file reading. Default: local filesystem.
     pub operations: Option<Arc<dyn ReadOperations>>,
     /// Whether the current model supports image input.
@@ -93,15 +99,12 @@ impl Default for ReadToolOptions {
     fn default() -> Self {
         Self {
             auto_resize_images: true,
+            resize_options: None,
             operations: None,
             model_supports_images: None,
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// createReadTool (read.ts:203-215, 349-351)
-// ---------------------------------------------------------------------------
 
 /// Create a read tool bound to the given context.
 pub fn create_read_tool(ctx: &ToolContext, options: ReadToolOptions) -> Arc<dyn AgentTool> {
@@ -111,6 +114,12 @@ pub fn create_read_tool(ctx: &ToolContext, options: ReadToolOptions) -> Arc<dyn 
     Arc::new(ReadTool {
         cwd: ctx.cwd.clone(),
         auto_resize_images: options.auto_resize_images,
+        // `ctx?.model?.inputLimits?.images?.resize` (read.ts:112-117): the
+        // live accessor follows permissionless model switches; the static
+        // option is the upstream fallback for contexts without model
+        // metadata.
+        current_model: ctx.current_model.clone(),
+        resize_options: options.resize_options,
         operations,
         model_supports_images: options.model_supports_images,
     })
@@ -123,6 +132,11 @@ pub fn create_read_tool(ctx: &ToolContext, options: ReadToolOptions) -> Arc<dyn 
 struct ReadTool {
     cwd: PathBuf,
     auto_resize_images: bool,
+    /// Live session-model accessor (V16-04 FR-H); `None` in bare test
+    /// contexts without a session.
+    current_model: Option<Arc<dyn Fn() -> Option<rpi_ai::types::Model> + Send + Sync>>,
+    /// Static fallback profile (read.ts:60).
+    resize_options: Option<ModelImageResizeOptions>,
     operations: Arc<dyn ReadOperations>,
     model_supports_images: Option<bool>,
 }
@@ -245,7 +259,21 @@ impl AgentTool for ReadTool {
         if let Some(mime) = mime_type {
             // ===================== Image branch (read.ts:247-263) =====================
             let buffer = self.operations.read_file(&absolute_path).await?;
-            let result = process_image(&buffer, &mime, self.auto_resize_images);
+            let resize_options = self
+                .current_model
+                .as_ref()
+                .and_then(|current| current())
+                .as_ref()
+                .and_then(resolved_image_resize_options)
+                .or(self.resize_options);
+            let result = process_image(
+                &buffer,
+                &mime,
+                ProcessImageOptions {
+                    auto_resize_images: Some(self.auto_resize_images),
+                    resize_options,
+                },
+            );
 
             let content = match result {
                 Err(err) => {
@@ -436,6 +464,7 @@ impl AgentTool for ReadTool {
 mod tests {
     use super::*;
     use crate::tools::ToolContext;
+    use base64::Engine;
     use std::path::PathBuf;
 
     /// Minimal temp dir for test file creation.
@@ -478,6 +507,7 @@ mod tests {
         ToolContext {
             cwd: cwd.to_path_buf(),
             session_env: None,
+            current_model: None,
         }
     }
 
@@ -767,6 +797,47 @@ mod tests {
         match &result.content[1] {
             ToolResultContent::Image(img) => assert_eq!(img.mime_type, "image/png"),
             _ => panic!("expected image block"),
+        }
+    }
+
+    // ---- V16-04 FR-H (#9631): the live model resize profile applies ----
+    #[tokio::test]
+    async fn test_read_image_uses_live_model_resize_profile() {
+        let dir = TestDir::new();
+        let img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
+            image::ImageBuffer::from_pixel(300, 200, image::Rgba([1, 2, 3, 255]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        dir.write_bytes("wide.png", &buf);
+        let model: rpi_ai::types::Model = serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "m", "api": "openai-completions", "provider": "p",
+            "baseUrl": "https://example.com", "reasoning": false,
+            "input": ["text", "image"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000, "maxTokens": 100,
+            "inputLimits": {"images": {"resize": {"maxWidth": 40, "maxHeight": 30}}}
+        }))
+        .expect("model");
+        let mut tool_ctx = ctx(dir.path());
+        tool_ctx.current_model = Some(Arc::new(move || Some(model.clone())));
+        let tool = create_read_tool(&tool_ctx, ReadToolOptions::default());
+
+        let result = read_file(&*tool, "wide.png").await;
+        match &result.content[1] {
+            ToolResultContent::Image(img) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&img.data)
+                    .expect("base64");
+                let decoded = image::load_from_memory(&bytes).expect("decoded image");
+                assert!(
+                    decoded.width() <= 40 && decoded.height() <= 30,
+                    "profile capped to {}x{}",
+                    decoded.width(),
+                    decoded.height()
+                );
+            }
+            other => panic!("expected image block, got {other:?}"),
         }
     }
 

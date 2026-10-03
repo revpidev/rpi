@@ -245,6 +245,7 @@ async fn parity_tool_calls_real_tools() {
         let ctx = rpi::tools::ToolContext {
             cwd: dir.0.clone(),
             session_env: None,
+            current_model: None,
         };
         let delayed_read = DelayedReadOperations {
             inner: Arc::new(rpi::tools::read::LocalReadOperations),

@@ -12,9 +12,9 @@
 //! (upstream commit b0e05b442).
 
 use base64::Engine;
-use rpi_ai::types::{ImageContent, TextContent, ToolResultContent};
+use rpi_ai::types::{ImageContent, ModelImageResizeOptions, TextContent, ToolResultContent};
 
-use crate::tools::image_process::process_image;
+use crate::tools::image_process::{ProcessImageOptions, process_image};
 
 /// Result of normalizing tool-result content.
 #[derive(Debug)]
@@ -48,6 +48,7 @@ pub struct NormalizedToolResult {
 pub fn normalize_tool_result_images(
     content: Vec<ToolResultContent>,
     auto_resize_images: bool,
+    resize_options: Option<ModelImageResizeOptions>,
 ) -> NormalizedToolResult {
     // Fast path: no image blocks (tool-result-images.ts:26-28).
     if !content
@@ -82,7 +83,14 @@ pub fn normalize_tool_result_images(
             }
         };
 
-        let processed = match process_image(&bytes, mime_type, auto_resize_images) {
+        let processed = match process_image(
+            &bytes,
+            mime_type,
+            ProcessImageOptions {
+                auto_resize_images: Some(auto_resize_images),
+                resize_options,
+            },
+        ) {
             Ok(p) => p,
             Err(_) => {
                 // Keep original on processing failure
@@ -129,6 +137,15 @@ pub fn normalize_tool_result_images(
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgba};
+
+    /// Test-local shorthand for the historic `(content, auto_resize)`
+    /// signature; production callers pass the model resize profile too.
+    fn normalize(
+        content: Vec<ToolResultContent>,
+        auto_resize_images: bool,
+    ) -> NormalizedToolResult {
+        normalize_tool_result_images(content, auto_resize_images, None)
+    }
 
     /// Generate a 1×1 PNG (well within limits).
     fn make_tiny_png() -> Vec<u8> {
@@ -193,7 +210,7 @@ mod tests {
     #[test]
     fn test_no_image_blocks_returns_unchanged() {
         let content = vec![text_block("no images here")];
-        let result = normalize_tool_result_images(content.clone(), true);
+        let result = normalize(content.clone(), true);
         assert!(!result.changed);
         assert_eq!(result.content, content);
     }
@@ -202,7 +219,7 @@ mod tests {
     fn test_small_image_within_limits_returns_unchanged() {
         let png = make_tiny_png();
         let content = vec![text_block("screenshot"), image_block(&png, "image/png")];
-        let result = normalize_tool_result_images(content.clone(), true);
+        let result = normalize(content.clone(), true);
         assert!(!result.changed);
         assert_eq!(result.content, content);
     }
@@ -213,7 +230,7 @@ mod tests {
     fn test_built_in_tool_oversized_image_is_resized() {
         let png = make_oversized_png();
         let content = vec![text_block("captured"), image_block(&png, "image/png")];
-        let result = normalize_tool_result_images(content, true);
+        let result = normalize(content, true);
         assert!(result.changed);
 
         // Should be: text + resized-image + dimension-hint
@@ -251,7 +268,7 @@ mod tests {
             image_block(&png, "image/png"),
             text_block("injected by extension"),
         ];
-        let result = normalize_tool_result_images(content, true);
+        let result = normalize(content, true);
         assert!(result.changed);
 
         // Image hint is inserted immediately after the image block
@@ -277,7 +294,7 @@ mod tests {
         // Simulates extension completely replacing tool result content.
         let png = make_oversized_png();
         let content = vec![image_block(&png, "image/png")];
-        let result = normalize_tool_result_images(content, true);
+        let result = normalize(content, true);
         assert!(result.changed);
         // Image + dimension hint.
         assert_eq!(result.content.len(), 2);
@@ -299,7 +316,7 @@ mod tests {
             unreachable!()
         };
 
-        let result = normalize_tool_result_images(content, false);
+        let result = normalize(content, false);
         // Oversized image with auto-resize off: no change.
         assert!(!result.changed);
         if let ToolResultContent::Image(img) = &result.content[0] {
@@ -315,7 +332,7 @@ mod tests {
         // process_image converts it to PNG (image-process.ts:105-118).
         let bmp = make_tiny_bmp();
         let content = vec![image_block(&bmp, "image/bmp")];
-        let result = normalize_tool_result_images(content, false);
+        let result = normalize(content, false);
         assert!(result.changed);
         // Converted image + conversion hint.
         assert_eq!(result.content.len(), 2);
@@ -338,7 +355,7 @@ mod tests {
             data: b64(b"not-an-image"),
             mime_type: "image/png".to_string(),
         })];
-        let result = normalize_tool_result_images(content.clone(), true);
+        let result = normalize(content.clone(), true);
         // Failure: original preserved, no change reported.
         assert!(!result.changed);
         assert_eq!(result.content, content);
@@ -350,7 +367,7 @@ mod tests {
             data: "!!!not-base64!!!".to_string(),
             mime_type: "image/png".to_string(),
         })];
-        let result = normalize_tool_result_images(content.clone(), true);
+        let result = normalize(content.clone(), true);
         assert!(!result.changed);
         assert_eq!(result.content, content);
     }
@@ -365,7 +382,7 @@ mod tests {
             image_block(&png, "image/png"),
             text_block("after"),
         ];
-        let result = normalize_tool_result_images(content, true);
+        let result = normalize(content, true);
         assert!(result.changed);
 
         let types: Vec<&str> = result
@@ -385,5 +402,33 @@ mod tests {
             matches!(&result.content[2], ToolResultContent::Text(t) if t.text.contains("original 2400x4800"))
         );
         assert!(matches!(&result.content[3], ToolResultContent::Text(t) if t.text == "after"));
+    }
+
+    /// V16-04 FR-H (#9631): tool-result normalization consumes the current
+    /// model's resize profile.
+    #[test]
+    fn test_model_resize_profile_applies_to_tool_results() {
+        let png = make_oversized_png(); // 2400×4800
+        let result = normalize_tool_result_images(
+            vec![image_block(&png, "image/png")],
+            true,
+            Some(rpi_ai::types::ModelImageResizeOptions {
+                max_width: Some(100),
+                max_height: Some(50),
+                max_bytes: None,
+                jpeg_quality: None,
+            }),
+        );
+        assert!(result.changed);
+        match &result.content[0] {
+            ToolResultContent::Image(img) => {
+                let (width, height) = read_png_dimensions(&img.data);
+                assert!(width <= 100 && height <= 50, "{width}x{height}");
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+        // Dimension hint reflects the profile-scaled size.
+        assert!(matches!(result.content.get(1),
+            Some(ToolResultContent::Text(t)) if t.text.contains("displayed at")));
     }
 }

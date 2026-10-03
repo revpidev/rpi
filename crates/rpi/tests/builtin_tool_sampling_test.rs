@@ -24,6 +24,7 @@ fn test_ctx() -> ToolContext {
     ToolContext {
         cwd: PathBuf::from("."),
         session_env: None,
+        current_model: None,
     }
 }
 

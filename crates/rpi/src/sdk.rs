@@ -676,6 +676,7 @@ pub async fn create_agent_session(
     agent_options.after_tool_call = Some(after_tool_call_with_image_normalization(
         extension_runner_ref.clone(),
         resource_loader.clone(),
+        agent_cell.clone(),
     ));
     agent_options.on_response = Some(crate::core::extensions::extension_on_response_callback(
         extension_runner_ref.clone(),
@@ -806,6 +807,7 @@ fn filter_tool_result_image_blocks(blocks: &mut Vec<rpi_ai::types::ToolResultCon
 fn after_tool_call_with_image_normalization(
     runner_ref: crate::core::extensions::ExtensionRunnerRef,
     resource_loader: Arc<Mutex<crate::core::resource_loader::DefaultResourceLoader>>,
+    agent_cell: Arc<std::sync::OnceLock<Arc<rpi_agent::Agent>>>,
 ) -> rpi_agent::agent_loop::AfterToolCallFn {
     let extension_hook = extension_after_tool_call_hook(runner_ref);
     Arc::new(
@@ -813,6 +815,7 @@ fn after_tool_call_with_image_normalization(
               signal: tokio_util::sync::CancellationToken| {
             let extension_hook = extension_hook.clone();
             let resource_loader = resource_loader.clone();
+            let agent_cell = agent_cell.clone();
             Box::pin(async move {
                 // Step 1: extension tool_result hook (agent-session.ts:501-514).
                 let extension_result = extension_hook(context.clone(), signal).await?;
@@ -823,16 +826,28 @@ fn after_tool_call_with_image_normalization(
                     .and_then(|r| r.content.clone())
                     .unwrap_or_else(|| context.result.content.clone());
 
-                // Step 3: read autoResize from settings (agent-session.ts:519).
-                let auto_resize = {
+                // Step 3: read autoResize from settings and the current
+                // model's resize profile (agent-session.ts:517-520
+                // @ f5c946480).
+                let (auto_resize, resize_options) = {
                     let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
-                    loader.settings_manager().get_image_auto_resize()
+                    let auto_resize = loader.settings_manager().get_image_auto_resize();
+                    drop(loader);
+                    let resize_options = agent_cell
+                        .get()
+                        .and_then(|agent| {
+                            crate::core::agent_session::model_or_none(&agent.state().model)
+                        })
+                        .as_ref()
+                        .and_then(crate::tools::image_process::resolved_image_resize_options);
+                    (auto_resize, resize_options)
                 };
 
                 // Step 4: normalize (agent-session.ts:518-520).
                 let normalized = crate::tools::tool_result_images::normalize_tool_result_images(
                     content,
                     auto_resize,
+                    resize_options,
                 );
 
                 // Step 5: assemble final override (agent-session.ts:522-531).

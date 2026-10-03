@@ -19,6 +19,7 @@ fn test_ctx() -> ToolContext {
     ToolContext {
         cwd: PathBuf::from("."),
         session_env: None,
+        current_model: None,
     }
 }
 
@@ -184,6 +185,7 @@ mod bash_tool_tests {
         let ctx = ToolContext {
             cwd: PathBuf::from("/nonexistent/path/xyz123"),
             session_env: None,
+            current_model: None,
         };
         let tool = create_bash_tool(&ctx, BashToolOptions::default());
         let err = run_bash(&tool, "echo test", None).await.unwrap_err();
@@ -356,6 +358,7 @@ mod bash_tool_tests {
                 model: Some("test-model".into()),
                 reasoning_level: Some("high".into()),
             }))),
+            current_model: None,
         };
         let tool = create_bash_tool(&ctx, BashToolOptions::default());
         let out = run_bash(&tool, "env", None).await.unwrap();
@@ -381,6 +384,7 @@ mod bash_tool_tests {
         let ctx = ToolContext {
             cwd: PathBuf::from("."),
             session_env: None,
+            current_model: None,
         };
         let tool = create_bash_tool(&ctx, BashToolOptions::default());
         let out = run_bash(&tool, "env", None).await.unwrap();
@@ -404,6 +408,7 @@ mod bash_tool_tests {
                 model: None,
                 reasoning_level: None,
             }))),
+            current_model: None,
         };
         let tool = create_bash_tool(
             &ctx,
@@ -434,6 +439,7 @@ mod bash_tool_tests {
                 model: Some("model-a".into()),
                 reasoning_level: None,
             }))),
+            current_model: None,
         };
         let tool = create_bash_tool(&ctx, BashToolOptions::default());
 

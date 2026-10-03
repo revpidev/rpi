@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use base64::Engine;
 use futures::future::BoxFuture;
 use rpi_agent::compaction::branch_summarization::{
     CollectEntriesResult, GenerateBranchSummaryOptions, collect_entries_for_branch_summary,
@@ -2307,6 +2308,14 @@ impl AgentSession {
         let ctx = crate::tools::ToolContext {
             cwd: PathBuf::from(&self.inner.cwd),
             session_env: Some(self.inner.session_env_cell.clone()),
+            // V16-04 FR-H: the read tool resolves the per-model image resize
+            // profile (`ctx?.model` upstream) through this live accessor; the
+            // agent state is the single model authority.
+            current_model: {
+                let agent = self.inner.agent.clone();
+                Some(Arc::new(move || model_or_none(&agent.state().model))
+                    as Arc<dyn Fn() -> Option<Model> + Send + Sync>)
+            },
         };
         let tool_options = {
             let loader = lock(&self.inner.resource_loader);
@@ -3350,6 +3359,64 @@ impl AgentSession {
             && self.inner.agent.has_queued_messages()
     }
 
+    /// `_normalizePromptImages` (agent-session.ts:1890-1911 @ f5c946480):
+    /// run prompt images through the shared `process_image` seam with the
+    /// current model's resize profile before they enter the request and
+    /// history. Cache-safe: resampling happens before base64 encoding, and a
+    /// missing profile keeps the historical global defaults (zero-regression
+    /// red line, #9631).
+    fn normalize_prompt_images(
+        &self,
+        images: Option<Vec<ImageContent>>,
+    ) -> (Vec<ImageContent>, Vec<String>) {
+        let Some(images) = images else {
+            return (Vec::new(), Vec::new());
+        };
+        let auto_resize = {
+            let loader = lock(&self.inner.resource_loader);
+            loader.settings_manager().get_image_auto_resize()
+        };
+        let resize_options = self
+            .model()
+            .as_ref()
+            .and_then(crate::tools::image_process::resolved_image_resize_options);
+        let mut normalized_images = Vec::new();
+        let mut hints = Vec::new();
+        for image in images {
+            // `Buffer.from(data, "base64")` is lenient; an undecodable
+            // payload falls through to the conversion-failure hint.
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(&image.data) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    hints.push(
+                        "[Image omitted: could not be converted to a supported inline image format.]"
+                            .to_owned(),
+                    );
+                    continue;
+                }
+            };
+            let processed = crate::tools::image_process::process_image(
+                &bytes,
+                &image.mime_type,
+                crate::tools::image_process::ProcessImageOptions {
+                    auto_resize_images: Some(auto_resize),
+                    resize_options,
+                },
+            );
+            match processed {
+                Ok(processed) => {
+                    normalized_images.push(ImageContent {
+                        data: processed.data,
+                        mime_type: processed.mime_type,
+                    });
+                    hints.extend(processed.hints);
+                }
+                Err(error) => hints.push(error.message),
+            }
+        }
+        (normalized_images, hints)
+    }
+
     /// `prompt` (agent-session.ts:1114-1265).
     pub async fn prompt(&self, text: &str, options: PromptOptions) -> Result<(), RpiError> {
         let expand_prompt_templates = options.expand_prompt_templates.unwrap_or(true);
@@ -3461,26 +3528,6 @@ impl AgentSession {
                 self.check_compaction(&last_assistant, false).await;
             }
 
-            // Build the message batch (agent-session.ts:1204-1253).
-            let mut messages: Vec<AgentMessage> = Vec::new();
-            let mut user_content: Vec<UserContentBlock> = vec![UserContentBlock::Text(
-                TextContent {
-                    text: expanded_text.clone(),
-                    text_signature: None,
-                },
-            )];
-            if let Some(images) = images.clone() {
-                user_content.extend(images.into_iter().map(UserContentBlock::Image));
-            }
-            messages.push(AgentMessage::User(UserMessage {
-                role: UserRole::User,
-                content: UserContent::Blocks(user_content),
-                timestamp: now_millis(),
-            }));
-
-            // Pending "nextTurn" asides.
-            messages.extend(lock(&self.inner.pending_next_turn_messages).drain(..));
-
             // before_agent_start extension event (agent-session.ts:1398-1436
             // @ #9548). Handlers may edit `systemPromptOptions` (collections
             // mutable) or return `systemPrompt` — the runner chains the
@@ -3529,6 +3576,34 @@ impl AgentSession {
             if !handler_edited_tools {
                 options.selected_tools = Some(self.get_active_tool_names());
             }
+
+            // Build the message batch (agent-session.ts:2028-2044
+            // @ f5c946480): after the hook so extension-driven model
+            // selection determines the resize profile used for the request
+            // and history (#9631).
+            let (normalized_images, image_hints) = self.normalize_prompt_images(images.clone());
+            let user_text = if image_hints.is_empty() {
+                expanded_text.clone()
+            } else {
+                format!("{expanded_text}\n\n{}", image_hints.join("\n"))
+            };
+
+            let mut messages: Vec<AgentMessage> = Vec::new();
+            let mut user_content: Vec<UserContentBlock> =
+                vec![UserContentBlock::Text(TextContent {
+                    text: user_text,
+                    text_signature: None,
+                })];
+            user_content.extend(normalized_images.into_iter().map(UserContentBlock::Image));
+            messages.push(AgentMessage::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Blocks(user_content),
+                timestamp: now_millis(),
+            }));
+
+            // Pending "nextTurn" asides.
+            messages.extend(lock(&self.inner.pending_next_turn_messages).drain(..));
+
             for msg in result_messages {
                 messages.push(AgentMessage::Custom(CustomMessage {
                     role: CustomRole::Custom,

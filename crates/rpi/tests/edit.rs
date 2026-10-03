@@ -18,6 +18,7 @@ fn make_ctx(cwd: &std::path::Path) -> ToolContext {
     ToolContext {
         cwd: cwd.to_path_buf(),
         session_env: None,
+        current_model: None,
     }
 }
 
