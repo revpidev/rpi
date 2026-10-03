@@ -1762,7 +1762,11 @@ pub fn slice_with_width(
     while i < line.len() {
         if let Some(ansi) = extract_ansi_code(line, i) {
             if current_col >= start_col && current_col < end_col {
+                // Keep original order: codes from before the range must
+                // precede codes at the boundary (17f3dccbe #10169).
+                result.push_str(&pending_ansi);
                 result.push_str(ansi.code);
+                pending_ansi.clear();
             } else if current_col < start_col {
                 pending_ansi.push_str(ansi.code);
             }
@@ -5798,6 +5802,28 @@ mod tests {
     }
 
     // ---- tab width accounting (tab-width.test.ts, utils-level cases) ----
+
+    // ---- sliceByColumn ANSI order regression (17f3dccbe, #10169) ----
+
+    /// `regression-slice-by-column-ansi-order.test.ts`: a reset inside the
+    /// kept range must stay after the style code that opened before it.
+    #[test]
+    fn keeps_a_reset_at_the_slice_start_after_earlier_style_codes() {
+        let line = "\x1b[32mfoo\x1b[39m bar";
+        assert_eq!(slice_by_column(line, 3, 4, true), "\x1b[32m\x1b[39m bar");
+    }
+
+    /// `regression-slice-by-column-ansi-order.test.ts`: color must not leak
+    /// into text after a highlighted token.
+    #[test]
+    fn does_not_leak_color_into_text_after_a_highlighted_token() {
+        let line = "Another \x1b[35malpha\x1b[39m line with \x1b[35mbeta\x1b[39m later.";
+        let after = slice_by_column(line, 13, 100, true);
+        assert_eq!(
+            after,
+            "\x1b[35m\x1b[39m line with \x1b[35mbeta\x1b[39m later."
+        );
+    }
 
     #[test]
     fn keeps_slice_helper_widths_consistent_with_visible_width() {
