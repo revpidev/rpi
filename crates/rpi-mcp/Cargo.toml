@@ -1,0 +1,42 @@
+[package]
+name = "rpi-mcp"
+description = "Port of @earendil-works/pi-mcp: standalone MCP client (stdio + streamable HTTP transports, hand-written JSON-RPC, OAuth 2.1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Test-only stdio MCP server (counterpart of packages/mcp/test/fixtures).
+[[bin]]
+name = "mcp-test-server"
+path = "tests/fixtures/mcp-test-server.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+bytes.workspace = true
+url.workspace = true
+# PKCE S256 helpers (32-byte verifier, base64url challenge) — the same
+# dependency rpi-ai's OAuth layer uses (coding-standards appendix A).
+oauth2.workspace = true
+# Loopback OAuth callback server (RFC 8252); same stack as rpi-ai's.
+axum.workspace = true
+# Random state/PKCE bytes (system CSPRNG).
+ring.workspace = true
+base64.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Process-group kill for the stdio transport (whole wrapper tree).
+libc.workspace = true
+
+[dev-dependencies]
+rpi-test-env.workspace = true
+libc.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

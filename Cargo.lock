@@ -3101,6 +3101,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "chrono",
  "comrak",
  "flate2",
  "fs2",
@@ -3117,6 +3118,7 @@ dependencies = [
  "rpi-ai",
  "rpi-codemode",
  "rpi-ext-host",
+ "rpi-mcp",
  "rpi-test-env",
  "rpi-test-support",
  "rpi-tui",
@@ -3354,6 +3356,30 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "rpi-mcp"
+version = "0.1.5"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "futures",
+ "libc",
+ "oauth2",
+ "reqwest",
+ "ring",
+ "rpi-test-env",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
 ]
 
 [[package]]

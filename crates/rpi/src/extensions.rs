@@ -18,6 +18,7 @@
 
 pub mod codemode;
 pub mod llama;
+pub mod mcp;
 pub mod tool_search;
 
 #[cfg(test)]

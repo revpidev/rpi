@@ -103,6 +103,61 @@ fn split_lines_for_counting(content: &str) -> Vec<&str> {
 }
 
 // -----------------------------------------------------------------------
+// truncateMiddle (truncate.ts:289-306)
+// -----------------------------------------------------------------------
+
+/// `MiddleTruncationResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiddleTruncationResult {
+    /// The start and end of the content with a `…N chars truncated…` marker
+    /// between them.
+    pub content: String,
+    pub truncated: bool,
+    /// Characters left out.
+    pub removed_chars: usize,
+    pub total_bytes: usize,
+    pub total_lines: usize,
+}
+
+/// Keep the start and the end of `content`, half of `maxBytes` each, and
+/// replace the middle with a `…N chars truncated…` marker. Cuts only at
+/// UTF-8 character boundaries.
+pub fn truncate_middle(content: &str, max_bytes: usize) -> MiddleTruncationResult {
+    let bytes = content.as_bytes();
+    let total_lines = split_lines_for_counting(content).len();
+    if bytes.len() <= max_bytes {
+        return MiddleTruncationResult {
+            content: content.to_owned(),
+            truncated: false,
+            removed_chars: 0,
+            total_bytes: bytes.len(),
+            total_lines,
+        };
+    }
+    // Continuation bytes (10xxxxxx) are not character starts.
+    let is_boundary = |index: usize| index >= bytes.len() || (bytes[index] & 0xc0) != 0x80;
+    let mut head_end = max_bytes / 2;
+    while head_end > 0 && !is_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = bytes.len() - (max_bytes - max_bytes / 2);
+    while tail_start < bytes.len() && !is_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+    let tail = String::from_utf8_lossy(&bytes[tail_start..]).into_owned();
+    let removed = String::from_utf8_lossy(&bytes[head_end..tail_start]).into_owned();
+    let removed_chars = removed.chars().count();
+    MiddleTruncationResult {
+        content: format!("{head}…{removed_chars} chars truncated…{tail}"),
+        truncated: true,
+        removed_chars,
+        total_bytes: bytes.len(),
+        total_lines,
+    }
+}
+
+// -----------------------------------------------------------------------
 // formatSize (truncate.ts:61-69)
 // -----------------------------------------------------------------------
 
@@ -639,6 +694,27 @@ mod tests {
         assert_eq!(format_size(51200), "50.0KB");
         assert_eq!(format_size(1024 * 1024), "1.0MB");
         assert_eq!(format_size(1024 * 1024 * 5), "5.0MB");
+    }
+
+    #[test]
+    fn test_truncate_middle() {
+        let short = truncate_middle("hello", 10);
+        assert!(!short.truncated);
+        assert_eq!(short.content, "hello");
+        let long = truncate_middle(&"a".repeat(100), 20);
+        assert!(long.truncated);
+        assert_eq!(long.total_bytes, 100);
+        assert!(long.content.starts_with(&"a".repeat(10)));
+        assert!(long.content.ends_with(&"a".repeat(10)));
+        assert!(
+            long.content.contains("…80 chars truncated…"),
+            "{}",
+            long.content
+        );
+        // Multibyte content is cut at character boundaries.
+        let multibyte = truncate_middle(&"日".repeat(50), 21);
+        assert!(multibyte.truncated);
+        assert!(multibyte.content.contains("chars truncated"));
     }
 
     #[test]
