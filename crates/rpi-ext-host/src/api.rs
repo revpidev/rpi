@@ -3206,4 +3206,44 @@ mod tests {
         runtime.event_bus().emit("chan", Value::Null);
         assert_eq!(*received.lock().unwrap(), 0);
     }
+
+    /// `RpcClient` listener iteration (#9990, `92e8d4f02`): a listener that
+    /// unsubscribes during dispatch must not make later listeners miss the
+    /// event. The bus emits over a snapshot, so the third handler still
+    /// runs after the second removes it.
+    #[test]
+    fn event_bus_keeps_dispatching_after_an_inline_unsubscribe() {
+        let bus = EventBus::new();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+        let seen_first = seen.clone();
+        // Dropping the unsubscribe handle leaves the handler registered.
+        let _ = bus.on(
+            "chan",
+            Arc::new(move |_| seen_first.lock().unwrap().push("first")),
+        );
+
+        // The second handler removes the third during dispatch.
+        let third_unsub: Arc<std::sync::Mutex<Option<Unsubscribe>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let unsub_slot = third_unsub.clone();
+        let _ = bus.on(
+            "chan",
+            Arc::new(move |_| {
+                if let Some(unsub) = unsub_slot.lock().unwrap().take() {
+                    unsub();
+                }
+            }),
+        );
+
+        let seen_third = seen.clone();
+        let unsub = bus.on(
+            "chan",
+            Arc::new(move |_| seen_third.lock().unwrap().push("third")),
+        );
+        *third_unsub.lock().unwrap() = Some(unsub);
+
+        bus.emit("chan", Value::Null);
+        assert_eq!(*seen.lock().unwrap(), vec!["first", "third"]);
+    }
 }

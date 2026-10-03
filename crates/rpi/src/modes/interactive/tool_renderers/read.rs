@@ -574,6 +574,23 @@ mod tests {
             )),
             ":0-9"
         );
+        // #9996 (`49681e1b7`): strict tool schemas make models send null for
+        // omitted optional fields, which must render as a full-file read.
+        assert_eq!(
+            strip_escape_sequences(&format_read_line_range(
+                &json!({"offset": null, "limit": null}),
+                &theme
+            )),
+            ""
+        );
+        assert_eq!(
+            strip_escape_sequences(&format_read_call(
+                &json!({"path": "src/example.ts", "offset": null, "limit": null}),
+                &theme,
+                "/cwd"
+            )),
+            "read src/example.ts"
+        );
     }
 
     // --- formatReadCall ------------------------------------------------------
