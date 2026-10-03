@@ -170,15 +170,30 @@ pub fn parse_args(args: &[String]) -> Args {
             result.help = true;
         } else if arg == "--version" || arg == "-v" {
             result.version = true;
-        } else if arg == "--mode" && i + 1 < args.len() {
-            i += 1;
-            let mode = &args[i];
-            if mode == "text" || mode == "json" || mode == "rpc" {
-                result.mode = Some(match mode.as_str() {
-                    "text" => Mode::Text,
-                    "json" => Mode::Json,
-                    _ => Mode::Rpc,
-                });
+        } else if arg == "--mode" {
+            // #9045 (args.ts:95-109 @ e40126f57): missing / option-shaped
+            // values are rejected without consuming the next argument;
+            // invalid values consume their token and report the exact
+            // upstream message.
+            let next = args.get(i + 1);
+            if next.is_none_or(|mode| mode.starts_with('-')) {
+                result
+                    .diagnostics
+                    .push(Diagnostic::error("--mode requires text, json, or rpc"));
+            } else {
+                i += 1;
+                let mode = &args[i];
+                if mode == "text" || mode == "json" || mode == "rpc" {
+                    result.mode = Some(match mode.as_str() {
+                        "text" => Mode::Text,
+                        "json" => Mode::Json,
+                        _ => Mode::Rpc,
+                    });
+                } else {
+                    result.diagnostics.push(Diagnostic::error(format!(
+                        "Invalid mode \"{mode}\". Valid values: text, json, rpc"
+                    )));
+                }
             }
         } else if arg == "--continue" || arg == "-c" {
             result.continue_ = true;
@@ -927,14 +942,70 @@ mod tests {
         );
     }
 
+    // Issue #9045 (args.test.ts:150-188 @ e40126f57)
+
     #[test]
-    fn test_parses_mode() {
-        assert_eq!(args(&["--mode", "json"]).mode, Some(Mode::Json));
+    fn test_parses_mode_values() {
+        for (raw, expected) in [
+            ("text", Mode::Text),
+            ("json", Mode::Json),
+            ("rpc", Mode::Rpc),
+        ] {
+            let result = args(&["--mode", raw]);
+            assert_eq!(result.mode, Some(expected));
+            assert!(result.diagnostics.is_empty());
+        }
     }
 
     #[test]
-    fn test_parses_mode_rpc() {
-        assert_eq!(args(&["--mode", "rpc"]).mode, Some(Mode::Rpc));
+    fn test_rejects_invalid_mode_values() {
+        for raw in ["yaml", ""] {
+            let result = args(&["--mode", raw, "--version"]);
+            assert_eq!(result.mode, None);
+            assert!(result.version);
+            assert!(result.messages.is_empty());
+            assert!(result.unknown_flags.is_empty());
+            assert_eq!(
+                result.diagnostics,
+                vec![Diagnostic::error(format!(
+                    "Invalid mode \"{raw}\". Valid values: text, json, rpc"
+                ))]
+            );
+        }
+    }
+
+    #[test]
+    fn test_reports_missing_mode_value() {
+        let result = args(&["--mode"]);
+        assert_eq!(result.mode, None);
+        assert!(result.unknown_flags.is_empty());
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error("--mode requires text, json, or rpc")]
+        );
+    }
+
+    #[test]
+    fn test_does_not_consume_another_option_as_mode_value() {
+        let result = args(&["--mode", "--version"]);
+        assert_eq!(result.mode, None);
+        assert!(result.version);
+        assert!(result.unknown_flags.is_empty());
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error("--mode requires text, json, or rpc")]
+        );
+    }
+
+    #[test]
+    fn test_reports_invalid_mode_value_after_a_valid_one() {
+        let result = args(&["--mode", "json", "--mode", "yaml"]);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error(
+                "Invalid mode \"yaml\". Valid values: text, json, rpc"
+            )]
+        );
     }
 
     #[test]
