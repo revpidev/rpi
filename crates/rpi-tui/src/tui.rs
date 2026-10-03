@@ -110,9 +110,10 @@
 //!   (`"abc%"` → anchor center) applies to negative/NaN percent values.
 //! - `add_input_listener` / `on_terminal_color_scheme_change` return numeric
 //!   ids paired with `remove_*` methods instead of unsubscribe closures.
-//! - `query_terminal_background_color` / `query_terminal_color_scheme` return
-//!   `oneshot::Receiver`s instead of Promises; their timeouts fire from
-//!   `TuiMainScreen::tick`.
+//! - `query_terminal_colors` returns a `oneshot::Receiver` instead of a
+//!   Promise; its timeout fires from `TuiMainScreen::tick` and late replies
+//!   come through `TerminalColorQueryOptions::on_late_reply` (the two legacy
+//!   query faces were removed with the single-pass replacement, 0.99.0).
 //! - The width-overflow path truncates the line with `slice_by_column` and
 //!   continues rendering (ADR-0020, deviation D-086; upstream stops the TUI
 //!   and throws). A diagnostic snapshot is still written to `rpi-tui-crash.log`
