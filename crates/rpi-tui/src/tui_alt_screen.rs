@@ -3778,10 +3778,11 @@ impl TuiAltScreenInner {
         result
     }
 
-    /// `compositeScrollToEndIndicator` (tui-alt-screen.ts:1611-1628 @
-    /// 9841914, 79680533c): center the jump-to-end label on the last row of
-    /// a follow-end primary scroll view scrolled away from its end, and
-    /// record its hit rectangle.
+    /// `compositeScrollToEndIndicator` (tui-alt-screen.ts:1611-1648 @
+    /// a13d35a74; 79680533c, #9842 8c7279378): center the jump-to-end label
+    /// on the last row of a follow-end primary scroll view scrolled away
+    /// from its end, independently of scrollbar visibility, and record its
+    /// hit rectangle.
     fn composite_scroll_to_end_indicator(
         &mut self,
         screen: Vec<String>,
@@ -3819,13 +3820,18 @@ impl TuiAltScreenInner {
         let scrollbar_column = crate::layout::get_scrollbar_geometry(box_, false)
             .map(|geometry| geometry.column)
             .unwrap_or(clip.x + clip.width as isize);
-        let available_width = (scrollbar_column - clip.x).max(0) as usize;
-        let text = truncate_to_width(&indicator(), available_width, "", false);
+        // #9842 (8c7279378, tui-alt-screen.ts:1630-1641 @ a13d35a74): center
+        // the label on the clip independently of scrollbar visibility, then
+        // clip drawing/click bounds before the scrollbar column.
+        let label = truncate_to_width(&indicator(), clip.width, "", false);
+        let label_width = visible_width(&label) as isize;
+        let column = clip.x + (clip.width as isize - label_width) / 2;
+        let available_width = (scrollbar_column - column).max(0) as usize;
+        let text = truncate_to_width(&label, available_width, "", false);
         let text_width = visible_width(&text);
         if text_width == 0 {
             return screen;
         }
-        let column = clip.x + ((available_width - text_width) / 2) as isize;
         let mut result = screen;
         let composited = composite_tui_line(
             &result[row as usize],
@@ -8382,6 +8388,78 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // it("keeps the jump-to-end indicator centered as the auto scrollbar
+    // hides and reappears") (tui-alt-screen.test.ts:141-171 @ 8c7279378,
+    // #9842)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn keeps_the_jump_to_end_indicator_centered_as_the_auto_scrollbar_hides_and_reappears() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = VirtualTerminal::new(80, 6);
+        let label = " ↓ Jump to latest message · End ";
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                scroll_to_end_indicator: Some(Arc::new(move || label.to_string())),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        let transcript = shared_component(ScrollView::new(
+            shared_component(TestText {
+                lines: Arc::new(Mutex::new(
+                    (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>(),
+                )),
+            }),
+            ScrollViewOptions {
+                follow: Follow::End,
+                primary: true,
+                scrollbar: ScrollbarMode::Auto,
+                scrollbar_hide_delay: Duration::ZERO,
+                ..ScrollViewOptions::default()
+            },
+        ));
+        tui.set_layout_root(Some(transcript.clone()));
+        tui.start();
+        settle(&tui);
+
+        // Scrolling over the track keeps the scrollbar visible until the
+        // pointer leaves.
+        send_input(&terminal, &tui, "\x1b[<64;80;1M");
+        settle(&tui);
+        assert!(with_sv(&transcript, ScrollView::is_scrollbar_visible));
+        assert!(!with_sv(&transcript, ScrollView::is_following_end));
+        let scroll_top = with_sv(&transcript, ScrollView::scroll_top);
+        let visible_column = terminal.get_viewport()[5].find(label);
+
+        // Leaving the track lets the auto-hide timer expire without changing
+        // the content or the label position.
+        send_input(&terminal, &tui, "\x1b[<35;79;1M");
+        let now = settle(&tui);
+        tui.tick(now + Duration::from_millis(1));
+        settle(&tui);
+        assert!(!with_sv(&transcript, ScrollView::is_scrollbar_visible));
+        assert_eq!(with_sv(&transcript, ScrollView::scroll_top), scroll_top);
+        let hidden_column = terminal.get_viewport()[5].find(label);
+
+        send_input(&terminal, &tui, "\x1b[<35;80;1M");
+        settle(&tui);
+        assert!(with_sv(&transcript, ScrollView::is_scrollbar_visible));
+        assert_eq!(with_sv(&transcript, ScrollView::scroll_top), scroll_top);
+        let revealed_column = terminal.get_viewport()[5].find(label);
+
+        // Centered on the clip width independently of the scrollbar
+        // (80 - 32 visible label width) / 2 = 24.
+        assert_eq!(
+            [visible_column, hidden_column, revealed_column],
+            [Some(24), Some(24), Some(24)]
+        );
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
     // it("leaves the scrollbar clickable when the jump-to-end indicator spans the transcript")
     // (tui-alt-screen.test.ts:141-169 @ 9841914; with 457ae8c79 the press
     // lands on the scrollbar TRACK and starts a drag instead of activating
@@ -8451,6 +8529,9 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<64;1;1M");
         settle(&tui);
         assert!(!with_sv(&transcript, ScrollView::is_following_end));
+
+        // #9842: the indicator is clipped before the scrollbar column.
+        assert_eq!(terminal.get_viewport()[3], format!("{}┃", "↓".repeat(29)));
 
         // The indicator must not intercept a press on the scrollbar's last
         // column: the track press starts a drag (jump-to-page clamps at the
