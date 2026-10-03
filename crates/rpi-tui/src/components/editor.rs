@@ -498,6 +498,10 @@ fn escape_character_class(value: char) -> String {
     out
 }
 
+/// Opening wrappers that may precede a trigger token in prose, e.g.
+/// `(@src/foo` or `` `@src/foo `` (d5629e204, editor.ts:256).
+const AUTOCOMPLETE_WRAPPER_CLASS_CONTENT: &str = r"[\(\[\{<`]";
+
 /// `buildTriggerPattern` (editor.ts:259-267, #9746 `bfa686240`):
 /// `(boundary)(?:@"[^"]*|[chars]suffix*)$` — the boundary is start or a
 /// separator; unquoted trigger contexts stop at separators.
@@ -508,7 +512,7 @@ fn build_trigger_pattern(trigger_characters: &[char]) -> Regex {
         .collect();
     let separator = autocomplete_separator_class_content();
     Regex::new(&format!(
-        r#"(?:^|[{separator}])(?:@\"[^\"]*|[{class}][^{separator}]*)$"#
+        r#"(?:^|[{separator}]){AUTOCOMPLETE_WRAPPER_CLASS_CONTENT}*(?:@\"[^\"]*|[{class}][^{separator}]*)$"#
     ))
     .expect("static trigger pattern")
 }
@@ -522,7 +526,7 @@ fn build_debounce_pattern(trigger_characters: &[char]) -> Regex {
         .collect();
     let separator = autocomplete_separator_class_content();
     Regex::new(&format!(
-        r#"(?:^|[{separator}])(?:@(?:\"[^\"]*|[^{separator}]*)|[{escaped_without_at}][^{separator}]*)$"#
+        r#"(?:^|[{separator}]){AUTOCOMPLETE_WRAPPER_CLASS_CONTENT}*(?:@(?:\"[^\"]*|[^{separator}]*)|[{escaped_without_at}][^{separator}]*)$"#
     ))
     .expect("static debounce pattern")
 }
@@ -6751,6 +6755,35 @@ mod tests {
             ("查看，@\"my folder", true),
             ("查看，@a，b", false),
             ("查看@x", false),
+        ] {
+            assert_eq!(debounce.is_match(text), expected, "debounce {text:?}");
+        }
+    }
+
+    /// d5629e204: opening wrappers such as `(`, `[`, `{`, `<`, or a
+    /// backtick may precede a trigger token; `(` without a preceding
+    /// boundary stays prose.
+    #[test]
+    fn trigger_and_debounce_patterns_accept_opening_wrappers() {
+        let trigger = build_trigger_pattern(&DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS);
+        let debounce = build_debounce_pattern(&DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS);
+        for (text, expected) in [
+            ("(@REA", true),
+            ("see (@REA", true),
+            ("[@REA", true),
+            ("`#x", true),
+            ("<@src/foo", true),
+            ("{@x", true),
+            ("see (`@x", true),
+            ("foo(@REA", false),
+            ("user(@example.com", false),
+        ] {
+            assert_eq!(trigger.is_match(text), expected, "trigger {text:?}");
+        }
+        for (text, expected) in [
+            ("see (@x", true),
+            ("see `#x", true),
+            ("foo(@x", false),
         ] {
             assert_eq!(debounce.is_match(text), expected, "debounce {text:?}");
         }

@@ -18,6 +18,7 @@
 //!   ASCII labels used in practice).
 //! - `os.homedir()` becomes `$HOME` (same value on Unix).
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -30,6 +31,41 @@ use crate::utils::is_autocomplete_separator;
 /// Path delimiters that terminate a completion token (`PATH_DELIMITERS`,
 /// autocomplete.ts:7).
 const PATH_DELIMITERS: [char; 5] = [' ', '\t', '"', '\'', '='];
+
+/// `PATH_WRAPPERS` (autocomplete.ts:9 @ d5629e204): opening wrappers that
+/// may precede a path in prose, mapped to their closing counterpart.
+fn path_wrapper_closer(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '<' => Some('>'),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+/// `stripLeadingWrappers` (autocomplete.ts:61-72 @ d5629e204): strip
+/// opening wrappers before a path, e.g. `(~/Dev` -> `~/Dev` or
+/// `` `src/ma `` -> `src/ma`. Keeps a wrapper when the token also contains
+/// its closer, e.g. `app/[slug]/pa` or `(group)/pa`.
+fn strip_leading_wrappers(token: &str) -> String {
+    let mut result = token;
+    loop {
+        let Some(first) = result.chars().next() else {
+            break;
+        };
+        let Some(closer) = path_wrapper_closer(first) else {
+            break;
+        };
+        let rest = &result[first.len_utf8()..];
+        if rest.contains(closer) {
+            break;
+        }
+        result = rest;
+    }
+    result.to_string()
+}
 
 /// `toDisplayPath` (autocomplete.ts:9-11).
 fn to_display_path(value: &str) -> String {
@@ -107,15 +143,25 @@ fn find_unclosed_quote_start(text: &str) -> Option<usize> {
     in_quotes.then_some(quote_start)
 }
 
-/// `isTokenStart` (autocomplete.ts:70-72, #9746): the char before the
-/// index is a separator (path delimiter, whitespace, or CJK punctuation);
-/// index 0 is a token start via the `^` arm of the upstream boundary
-/// regex.
+/// `isTokenStart` (autocomplete.ts:70-72, #9746; wrappers @ d5629e204): the
+/// char before the index is a separator (path delimiter, whitespace, or CJK
+/// punctuation); index 0 is a token start via the `^` arm of the upstream
+/// boundary regex. Opening wrappers before the token are skipped, so
+/// `see (~/Dev` starts after the boundary that precedes `(`.
 fn is_token_start(text: &str, index: usize) -> bool {
-    index == 0
+    let mut start = index;
+    while start > 0
+        && text
+            .chars()
+            .nth(start - 1)
+            .is_some_and(|c| path_wrapper_closer(c).is_some())
+    {
+        start -= 1;
+    }
+    start == 0
         || text
             .chars()
-            .nth(index - 1)
+            .nth(start - 1)
             .is_some_and(|c| PATH_DELIMITERS.contains(&c) || is_autocomplete_separator(c))
 }
 
@@ -529,9 +575,13 @@ impl CombinedAutocompleteProvider {
             });
         }
 
-        if !options.force && text_before_cursor.starts_with('/') {
-            let Some(space_index) = text_before_cursor.find(' ') else {
-                let prefix = text_before_cursor[1..].to_string();
+        // #10218 (`65117e31f`): leading whitespace does not disable slash
+        // completion — the command text is trimmed and the original
+        // whitespace is preserved in the applied completion.
+        let command_text = text_before_cursor.trim_start();
+        if !options.force && command_text.starts_with('/') {
+            let Some(space_index) = command_text.find(' ') else {
+                let prefix = command_text[1..].to_string();
                 let command_items: Vec<CommandItem> = self
                     .commands
                     .iter()
@@ -565,19 +615,31 @@ impl CombinedAutocompleteProvider {
                     })
                     .collect();
 
-                let filtered: Vec<AutocompleteItem> =
-                    fuzzy_filter(command_items, &prefix, |item| {
-                        // #9120 (`d7951ec36`): rank `skill:` commands by
-                        // their bare name so `/idea` finds
-                        // `skill:research-idea`; an explicit `skill:` query
-                        // keeps matching the full name.
-                        if !prefix.starts_with("skill:") && item.name.starts_with("skill:") {
-                            item.name["skill:".len()..].to_string()
-                        } else {
-                            item.name.clone()
-                        }
-                    })
+                // #9944 (`36af9dc48`): skill commands match by their bare
+                // name first, then still match the full `skill:<name>` form
+                // (so typing just `skill` lists every loaded skill).
+                let bare_name_matches: Vec<CommandItem> =
+                    fuzzy_filter(command_items.clone(), &prefix, |item| {
+                        item.name
+                            .strip_prefix("skill:")
+                            .map(str::to_string)
+                            .unwrap_or_else(|| item.name.clone())
+                    });
+                let bare_names: HashSet<String> = bare_name_matches
+                    .iter()
+                    .map(|item| item.name.clone())
+                    .collect();
+                let full_name_only: Vec<CommandItem> = command_items
                     .into_iter()
+                    .filter(|item| {
+                        item.name.starts_with("skill:") && !bare_names.contains(&item.name)
+                    })
+                    .collect();
+                let full_name_matches =
+                    fuzzy_filter(full_name_only, &prefix, |item| item.name.clone());
+                let filtered: Vec<AutocompleteItem> = bare_name_matches
+                    .into_iter()
+                    .chain(full_name_matches)
                     .map(|item| AutocompleteItem {
                         value: item.name,
                         label: item.label,
@@ -590,12 +652,12 @@ impl CombinedAutocompleteProvider {
                 }
                 return Some(AutocompleteSuggestions {
                     items: filtered,
-                    prefix: text_before_cursor,
+                    prefix: command_text.to_string(),
                 });
             };
 
-            let command_name = text_before_cursor[1..space_index].to_string();
-            let argument_text = text_before_cursor[space_index + 1..].to_string();
+            let command_name = command_text[1..space_index].to_string();
+            let argument_text = command_text[space_index + 1..].to_string();
 
             let command = self.commands.iter().find(|cmd| {
                 let name = match cmd {
@@ -769,10 +831,14 @@ impl CombinedAutocompleteProvider {
         }
 
         let last_delimiter_index = find_last_delimiter(text);
-        let token_start = last_delimiter_index.map_or(0, |index| index + 1);
+        let token: String = match last_delimiter_index {
+            None => text.to_string(),
+            Some(index) => text.chars().skip(index + 1).collect(),
+        };
+        let token = strip_leading_wrappers(&token);
 
-        if text.chars().nth(token_start) == Some('@') {
-            return Some(text.chars().skip(token_start).collect());
+        if token.starts_with('@') {
+            return Some(token);
         }
 
         None
@@ -790,6 +856,7 @@ impl CombinedAutocompleteProvider {
             None => text.to_string(),
             Some(index) => text.chars().skip(index + 1).collect(),
         };
+        let path_prefix = strip_leading_wrappers(&path_prefix);
 
         // For forced extraction (Tab key), always return something.
         if force_extract {
@@ -1271,6 +1338,7 @@ struct ScopedFuzzyQuery {
 }
 
 /// Slash command item for fuzzy filtering (`getSuggestions` mapping).
+#[derive(Clone)]
 struct CommandItem {
     name: String,
     label: String,
@@ -2758,6 +2826,7 @@ mod tests {
                 "Refine a raw idea into a falsifiable seed",
             ),
             ("skill:to-sidecar", "Route work to a sidecar"),
+            ("skill:brainstorm", "Generate ideas"),
             ("model", "Select the active model"),
         ]
         .into_iter()
@@ -2783,7 +2852,9 @@ mod tests {
         result.items.into_iter().map(|item| item.value).collect()
     }
 
-    /// #9120: rank `skill:` commands by their bare name.
+    /// #9120: rank `skill:` commands by their bare name; the full-name
+    /// fuzzy matches (e.g. `skill:deep-research` for `idea`) follow the
+    /// bare-name matches (#9944 `36af9dc48`).
     #[test]
     fn ranks_skill_research_idea_first_for_query_idea() {
         let items = skill_suggestions_for("idea");
@@ -2791,7 +2862,67 @@ mod tests {
             items.first().map(String::as_str),
             Some("skill:research-idea")
         );
-        assert!(!items.contains(&"skill:deep-research".to_string()));
+        let research = items
+            .iter()
+            .position(|item| item == "skill:research-idea")
+            .expect("research-idea suggestion");
+        let deep = items
+            .iter()
+            .position(|item| item == "skill:deep-research")
+            .expect("deep-research full-name match");
+        assert!(deep > research, "bare-name matches rank first: {items:?}");
+    }
+
+    // Regression test for #9944 (`36af9dc48`).
+    #[test]
+    fn lists_skills_while_typing_the_skill_prefix() {
+        let items = skill_suggestions_for("skill");
+        let skills: Vec<String> = items
+            .iter()
+            .filter(|item| item.starts_with("skill:"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            skills,
+            vec![
+                "skill:deep-research",
+                "skill:research-idea",
+                "skill:to-sidecar",
+                "skill:brainstorm",
+            ]
+        );
+    }
+
+    /// #9944: fuzzy skill-prefix shorthand keeps working.
+    #[test]
+    fn keeps_fuzzy_skill_prefix_shorthand_working() {
+        let items = skill_suggestions_for("skbra");
+        assert!(items.contains(&"skill:brainstorm".to_string()));
+    }
+
+    /// #10218 (`65117e31f`): leading whitespace does not disable slash
+    /// completion and the applied completion preserves it.
+    #[test]
+    fn completes_commands_after_leading_whitespace() {
+        let provider = CombinedAutocompleteProvider::new(
+            skill_commands(),
+            std::env::temp_dir().display().to_string(),
+            None,
+        );
+        let line = "  /mod".to_string();
+        let result = get_suggestions(&provider, std::slice::from_ref(&line), 0, line.len(), false)
+            .expect("completes after leading whitespace");
+        assert_eq!(result.prefix, "/mod");
+        assert_eq!(result.items[0].value, "model");
+        let applied = provider.apply_completion(
+            std::slice::from_ref(&line),
+            0,
+            line.len(),
+            &result.items[0],
+            &result.prefix,
+        );
+        assert_eq!(applied.lines[0], "  /model ");
+        assert_eq!(applied.cursor_col, "  /model ".len());
     }
 
     #[test]
@@ -2804,5 +2935,95 @@ mod tests {
     fn keeps_explicit_skill_queries_working() {
         let items = skill_suggestions_for("skill:side");
         assert!(items.contains(&"skill:to-sidecar".to_string()));
+    }
+
+    // Regression for d5629e204: path and `@` completion after opening
+    // wrappers like `(` and backticks.
+    #[test]
+    fn completes_paths_after_opening_wrappers() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-wrappers");
+        let base_dir = temp.path.join("cwd");
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder("cwd", &folder_structure(&[], &[("src/main.rs", "x")]));
+        let provider = CombinedAutocompleteProvider::new(
+            Vec::new(),
+            base_dir.display().to_string(),
+            Some(fd_path),
+        );
+        for wrapper in ["(", "[", "{", "<", "`", "((", "(`"] {
+            for prefix in ["src/ma", "./src/ma"] {
+                let line = format!("see {wrapper}{prefix}");
+                let result = get_suggestions(&provider, &[line.clone()], 0, line.len(), true)
+                    .unwrap_or_else(|| panic!("expected suggestions for {line}"));
+                assert_eq!(result.prefix, prefix, "line: {line}");
+                assert_eq!(result.items.len(), 1, "line: {line}");
+                assert_eq!(
+                    result.items[0].value,
+                    prefix.replace("src/ma", "src/main.rs")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completes_at_after_opening_wrappers() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-at-wrappers");
+        let base_dir = temp.path.join("cwd");
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder("cwd", &folder_structure(&[], &[("README.md", "readme")]));
+        let provider = CombinedAutocompleteProvider::new(
+            Vec::new(),
+            base_dir.display().to_string(),
+            Some(fd_path),
+        );
+        // Embedded `@` without a boundary stays inert.
+        let embedded = "foo(@REA".to_string();
+        assert!(get_suggestions(&provider, &[embedded.clone()], 0, embedded.len(), false).is_none());
+        for before in ["(", "see (", "[", "`", "<", "{"] {
+            let line = format!("{before}@REA");
+            let result = get_suggestions(&provider, &[line.clone()], 0, line.len(), false)
+                .unwrap_or_else(|| panic!("expected @ suggestions for {line}"));
+            assert_eq!(result.prefix, "@REA");
+            assert_eq!(result.items[0].value, "@README.md");
+        }
+    }
+
+    #[test]
+    fn keeps_wrappers_that_are_closed_inside_the_path() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-wrapper-closers");
+        let base_dir = temp.path.join("cwd");
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder(
+            "cwd",
+            &folder_structure(&[], &[("[slug]/page.tsx", "x"), ("(group)/layout.tsx", "x")]),
+        );
+        let provider = CombinedAutocompleteProvider::new(
+            Vec::new(),
+            base_dir.display().to_string(),
+            Some(fd_path),
+        );
+        for (prefix, value) in [
+            ("[slug]/pa", "[slug]/page.tsx"),
+            ("(group)/la", "(group)/layout.tsx"),
+            ("./[slug]/pa", "./[slug]/page.tsx"),
+        ] {
+            let line = format!("see {prefix}");
+            let result = get_suggestions(&provider, &[line.clone()], 0, line.len(), true)
+                .unwrap_or_else(|| panic!("expected suggestions for {line}"));
+            assert_eq!(result.prefix, prefix);
+            assert_eq!(result.items[0].value, value);
+        }
     }
 }
