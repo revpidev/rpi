@@ -3849,6 +3849,10 @@ mod tests {
     /// 设置在能力面生效。
     #[test]
     fn test_terminal_capability_overrides_compose_with_tui_layer() {
+        // Serialize with theme-loading tests that read the same overrides.
+        let _capability_guard = crate::test_support::CAPABILITY_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dirs = test_dirs();
         write_json(
             &global_path(&dirs),

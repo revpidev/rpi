@@ -862,13 +862,33 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: u32, visible_rows: u32) ->
     )
 }
 
-/// `calculateImageCellSize` (terminal-image.ts:257-281). Mirror upstream's
-/// f64 arithmetic exactly so results match `Math.floor`/`Math.ceil` behavior.
+/// `calculateImageCellSize` (terminal-image.ts:257-292 @ 7cf037c21).
+/// Mirrors upstream's f64 arithmetic exactly so results match
+/// `Math.floor`/`Math.ceil` behavior. Without `optimize_aspect_ratio` the
+/// ceiling placement is used; Kitty passes true to pick the less distorted
+/// of the ceiling and one-cell-smaller counts.
 pub fn calculate_image_cell_size(
     image_dimensions: ImageDimensions,
     max_width_cells: f64,
     max_height_cells: Option<f64>,
     cell_dimensions: CellDimensions,
+) -> ImageCellSize {
+    calculate_image_cell_size_with_aspect(
+        image_dimensions,
+        max_width_cells,
+        max_height_cells,
+        cell_dimensions,
+        false,
+    )
+}
+
+/// [`calculate_image_cell_size`] with the Kitty aspect-ratio optimization toggled.
+pub fn calculate_image_cell_size_with_aspect(
+    image_dimensions: ImageDimensions,
+    max_width_cells: f64,
+    max_height_cells: Option<f64>,
+    cell_dimensions: CellDimensions,
+    optimize_aspect_ratio: bool,
 ) -> ImageCellSize {
     let max_width = max_width_cells.floor().max(1.0);
     let max_height = max_height_cells.map(|h| h.floor().max(1.0));
@@ -884,15 +904,55 @@ pub fn calculate_image_cell_size(
 
     let scaled_width_px = image_width * scale;
     let scaled_height_px = image_height * scale;
-    let columns = (scaled_width_px / cell_dimensions.width_px).ceil();
-    let rows = (scaled_height_px / cell_dimensions.height_px).ceil();
+    let mut columns = (scaled_width_px / cell_dimensions.width_px)
+        .ceil()
+        .max(1.0)
+        .min(max_width);
+    let height_rows = scaled_height_px / cell_dimensions.height_px;
+    let mut rows = height_rows.ceil().max(1.0);
+    if let Some(h) = max_height {
+        rows = rows.min(h);
+    }
+
+    if !optimize_aspect_ratio {
+        return ImageCellSize {
+            columns: columns as u32,
+            rows: rows as u32,
+        };
+    }
+
+    // #8938 (`7cf037c21`): reduce Kitty's cell-aligned distortion without
+    // shrinking iTerm2 reservations.
+    if width_scale <= height_scale {
+        let ideal_rows =
+            (columns * cell_dimensions.width_px * image_height) / (image_width * cell_dimensions.height_px);
+        rows = choose_less_distorted_cell_count(rows, ideal_rows);
+    } else {
+        let ideal_columns =
+            (rows * cell_dimensions.height_px * image_width) / (image_height * cell_dimensions.width_px);
+        columns = choose_less_distorted_cell_count(columns, ideal_columns);
+    }
 
     ImageCellSize {
-        columns: columns.clamp(1.0, max_width) as u32,
-        rows: match max_height {
-            Some(h) => rows.clamp(1.0, h) as u32,
-            None => rows.max(1.0) as u32,
-        },
+        columns: columns as u32,
+        rows: rows as u32,
+    }
+}
+
+/// `chooseLessDistortedCellCount` (terminal-image.ts:440-447 @ 7cf037c21):
+/// the ceiling count or one less, whichever is closer to the ideal count.
+fn choose_less_distorted_cell_count(upper_count: f64, ideal_count: f64) -> f64 {
+    if upper_count <= 1.0 {
+        return upper_count;
+    }
+
+    let lower_count = upper_count - 1.0;
+    let upper_distortion = (upper_count / ideal_count).max(ideal_count / upper_count);
+    let lower_distortion = (lower_count / ideal_count).max(ideal_count / lower_count);
+    if lower_distortion < upper_distortion {
+        lower_count
+    } else {
+        upper_count
     }
 }
 
@@ -1073,11 +1133,14 @@ pub fn render_image(
 
     // `options.maxWidthCells ?? 80` (terminal-image.ts:443).
     let max_width = options.max_width_cells.unwrap_or(80.0);
-    let size = calculate_image_cell_size(
+    // Reduce Kitty's cell-aligned distortion without shrinking iTerm2
+    // reservations (terminal-image.ts:647-655 @ 7cf037c21).
+    let size = calculate_image_cell_size_with_aspect(
         image_dimensions,
         max_width,
         options.max_height_cells,
         get_cell_dimensions(),
+        caps.images == Some(ImageProtocol::Kitty),
     );
 
     if caps.images == Some(ImageProtocol::Kitty) {
@@ -2087,6 +2150,85 @@ mod tests {
                 rows: 2
             }
         );
+    }
+
+    /// #8938 (`7cf037c21`): Kitty's aspect optimization picks the less
+    /// distorted count. Ports of the upstream `image cell sizing` cases.
+    #[test]
+    fn test_kitty_aspect_optimization_reserves_a_row_for_thin_images() {
+        let size = calculate_image_cell_size_with_aspect(
+            ImageDimensions {
+                width_px: 1200.0,
+                height_px: 12.0,
+            },
+            60.0,
+            None,
+            CellDimensions {
+                width_px: 9.0,
+                height_px: 18.0,
+            },
+            true,
+        );
+        assert_eq!(size.columns, 60);
+        assert_eq!(size.rows, 1);
+    }
+
+    #[test]
+    fn test_kitty_aspect_optimization_keeps_the_ceiling_when_rounding_down_is_worse() {
+        let size = calculate_image_cell_size_with_aspect(
+            ImageDimensions {
+                width_px: 615.0,
+                height_px: 86.0,
+            },
+            60.0,
+            None,
+            CellDimensions {
+                width_px: 15.0,
+                height_px: 28.0,
+            },
+            true,
+        );
+        assert_eq!(size.columns, 60);
+        assert_eq!(size.rows, 5);
+    }
+
+    #[test]
+    fn test_kitty_aspect_optimization_picks_proportional_thin_widths() {
+        for (width_px, expected_columns) in [(1.0, 1), (140.0, 1), (149.0, 2)] {
+            let size = calculate_image_cell_size_with_aspect(
+                ImageDimensions {
+                    width_px,
+                    height_px: 1000.0,
+                },
+                30.0,
+                Some(10.0),
+                CellDimensions {
+                    width_px: 1.0,
+                    height_px: 1.0,
+                },
+                true,
+            );
+            assert_eq!(size.columns, expected_columns, "width {width_px}");
+            assert_eq!(size.rows, 10, "width {width_px}");
+        }
+    }
+
+    #[test]
+    fn test_iterm2_keeps_the_ceiling_without_aspect_optimization() {
+        let size = calculate_image_cell_size(
+            ImageDimensions {
+                width_px: 400.0,
+                height_px: 900.0,
+            },
+            30.0,
+            Some(15.0),
+            CellDimensions {
+                width_px: 14.0,
+                height_px: 28.0,
+            },
+        );
+        assert_eq!(size.columns, 14);
+        assert_eq!(size.rows, 15);
     }
 
     #[test]

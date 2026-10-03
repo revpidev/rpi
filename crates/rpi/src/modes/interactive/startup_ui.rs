@@ -156,7 +156,7 @@ pub(crate) async fn run_first_time_setup_with_terminal(
         TerminalColorScheme::Light => "light",
     };
 
-    let setup_theme = match load_theme(detected_name, None) {
+    let setup_theme = match load_theme(detected_name, Some(crate::core::themes::terminal_color_mode())) {
         Ok(theme) => Arc::new(theme),
         Err(error) => {
             stop.store(true, Ordering::Relaxed);
@@ -193,7 +193,7 @@ pub(crate) async fn run_first_time_setup_with_terminal(
     let preview_component = Arc::clone(&component);
     let preview_ui = ui.clone();
     lock(&component).on_theme_preview = Some(Box::new(move |name: &str| {
-        if let Ok(theme) = load_theme(name, None) {
+        if let Ok(theme) = load_theme(name, Some(crate::core::themes::terminal_color_mode())) {
             lock(&preview_component).set_theme(Arc::new(theme));
         }
         preview_ui.invalidate();
@@ -300,7 +300,7 @@ pub(crate) fn run_startup_selector_with_terminal(
     let theme_name =
         crate::core::themes::resolve_theme_setting(settings.get_theme().as_deref(), terminal_theme)
             .unwrap_or_else(|| terminal_theme.as_str().to_string());
-    let theme = match load_theme(&theme_name, None) {
+    let theme = match load_theme(&theme_name, Some(crate::core::themes::terminal_color_mode())) {
         Ok(theme) => Arc::new(theme),
         Err(_) => return None,
     };

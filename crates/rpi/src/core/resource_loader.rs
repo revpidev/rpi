@@ -1191,7 +1191,7 @@ fn load_theme_from_file(
     themes: &mut Vec<Theme>,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
-    match load_theme_from_path(path, None) {
+    match load_theme_from_path(path, Some(crate::core::themes::terminal_color_mode())) {
         Ok(theme) => themes.push(theme),
         Err(error) => {
             // Record the bare message, like upstream `error.message` — the
@@ -1780,6 +1780,68 @@ mod tests {
     }
 
     // --- dedupe_themes (resource-loader.ts:942-967) --------------------------
+
+    /// #9973 (`ddba59618`): custom themes are constructed with the terminal
+    /// color mode — truecolor unless the `terminal.trueColor` capability
+    /// override says otherwise — instead of always emitting truecolor
+    /// sequences.
+    #[test]
+    fn custom_themes_honor_the_terminal_color_mode() {
+        let tmp = TempDir::new();
+        let theme_path = tmp.path().join("capability-test.json");
+        let mut colors: serde_json::Map<String, Value> = REQUIRED_COLOR_KEYS
+            .iter()
+            .map(|key| (key.to_string(), Value::String("#000000".to_string())))
+            .collect();
+        colors.insert(
+            "userMessageBg".to_string(),
+            Value::String("#3c3544".to_string()),
+        );
+        std::fs::write(
+            &theme_path,
+            serde_json::to_string(&serde_json::json!({
+                "name": "capability-test",
+                "colors": Value::Object(colors),
+            }))
+            .expect("theme json"),
+        )
+        .expect("write theme");
+
+        let _capability_guard = crate::test_support::CAPABILITY_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `terminal.trueColor = true` → truecolor sequences.
+        rpi_tui::terminal_image::set_capability_overrides(
+            rpi_tui::terminal_image::TerminalCapabilityOverrides {
+                true_color: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut themes = Vec::new();
+        let mut diagnostics = Vec::new();
+        load_theme_from_file(&theme_path, &mut themes, &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            themes[0].bg("userMessageBg", "x"),
+            "\x1b[48;2;60;53;68mx\x1b[49m"
+        );
+
+        // `terminal.trueColor = false` → 256-color sequences.
+        rpi_tui::terminal_image::set_capability_overrides(
+            rpi_tui::terminal_image::TerminalCapabilityOverrides {
+                true_color: Some(false),
+                ..Default::default()
+            },
+        );
+        let mut themes = Vec::new();
+        let mut diagnostics = Vec::new();
+        load_theme_from_file(&theme_path, &mut themes, &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(themes[0].bg("userMessageBg", "x"), "\x1b[48;5;59mx\x1b[49m");
+
+        rpi_tui::terminal_image::set_capability_overrides(Default::default());
+        rpi_tui::terminal_image::reset_capabilities_cache();
+    }
 
     fn theme_with_colors(name: &str, source_path: Option<&Path>) -> Theme {
         let colors: serde_json::Map<String, Value> = REQUIRED_COLOR_KEYS

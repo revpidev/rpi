@@ -23,3 +23,15 @@ pub mod tools;
 pub mod utils;
 
 pub use error::RpiError;
+
+/// Test-only process-wide locks for state that has no injection seam.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global terminal capability
+    /// overrides ([`rpi_tui::terminal_image::set_capability_overrides`]).
+    /// Theme construction reads the overrides (#9973), so mutating tests
+    /// and theme-loading tests must not overlap.
+    pub(crate) static CAPABILITY_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+}

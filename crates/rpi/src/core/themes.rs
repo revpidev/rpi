@@ -353,6 +353,19 @@ pub enum ColorMode {
     Color256,
 }
 
+/// The colour mode for the current terminal: truecolor unless the terminal
+/// (or the `terminal.trueColor` override applied to the rpi-tui
+/// capabilities) reports otherwise (`getTerminalColorMode`,
+/// terminal-image.ts:172; theme construction consumes it,
+/// resource-loader.ts @ ddba59618 #9973).
+pub fn terminal_color_mode() -> ColorMode {
+    if rpi_tui::terminal_image::get_capabilities().true_color {
+        ColorMode::TrueColor
+    } else {
+        ColorMode::Color256
+    }
+}
+
 /// RGB colour triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb {

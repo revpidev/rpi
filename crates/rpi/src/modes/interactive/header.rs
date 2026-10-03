@@ -15,7 +15,14 @@ use rpi_tui::components::text::Text;
 use rpi_tui::tui::Component;
 
 use crate::config::APP_NAME;
+use std::sync::{Mutex, MutexGuard};
+
 use crate::core::themes::Theme;
+use crate::modes::interactive::components::ThemeHandle;
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 use crate::modes::interactive::components::keybinding_hints::{key_hint, key_text, raw_key_hint};
 
 /// `ExpandableText` (interactive-mode.ts:168-190): a `Text` whose content is
@@ -69,7 +76,17 @@ impl Component for ExpandableText {
         self.text.render(width)
     }
 
-    fn invalidate(&mut self) {}
+    /// `ThemedText.invalidate` (components/themed-text.ts @ bf8e4b953):
+    /// rebuild the text from its closure so a theme change repaints the
+    /// baked ANSI colors instead of keeping the old ones.
+    fn invalidate(&mut self) {
+        let text = if self.expanded {
+            (self.get_expanded_text)()
+        } else {
+            (self.get_collapsed_text)()
+        };
+        self.text.set_text(text);
+    }
 
     fn set_expanded(&mut self, expanded: bool) {
         // `setToolsExpanded` walk over the loaded-resources container
@@ -163,7 +180,7 @@ pub fn startup_onboarding(theme: &Theme) -> String {
 /// `new Text("", 0, 0)` and the expansion linkage skips it via the
 /// `isExpandable` check).
 pub fn build_builtin_header(
-    theme: Arc<Theme>,
+    theme: ThemeHandle,
     version: &str,
     expanded: bool,
     quiet_startup: bool,
@@ -174,21 +191,37 @@ pub fn build_builtin_header(
     if quiet_startup {
         return (Box::new(Text::new("", 0, 0, None)), None);
     }
-    let logo = startup_logo(&theme, version);
-    let (expanded_instructions, compact_instructions) = startup_instructions(&theme);
-    let onboarding = startup_onboarding(&theme);
-    let compact_onboarding = theme.fg(
-        "dim",
-        &format!(
-            "Press {} to show full startup help and loaded resources.",
-            key_text("app.tools.expand")
-        ),
-    );
-    let collapsed = format!("{logo}\n{compact_instructions}\n{compact_onboarding}\n\n{onboarding}");
-    let expanded_text = format!("{logo}\n{expanded_instructions}\n\n{onboarding}");
+    // The header bakes theme colors into its text; the closures rebuild it
+    // from the shared theme slot on invalidation so a theme change cannot
+    // leave stale colors (bf8e4b953, ThemedText).
+    let version = version.to_string();
+    let collapsed_theme = Arc::clone(&theme);
+    let collapsed_version = version.clone();
+    let collapsed = move || {
+        let theme = lock(&collapsed_theme).clone();
+        let logo = startup_logo(&theme, &collapsed_version);
+        let (_, compact_instructions) = startup_instructions(&theme);
+        let onboarding = startup_onboarding(&theme);
+        let compact_onboarding = theme.fg(
+            "dim",
+            &format!(
+                "Press {} to show full startup help and loaded resources.",
+                key_text("app.tools.expand")
+            ),
+        );
+        format!("{logo}\n{compact_instructions}\n{compact_onboarding}\n\n{onboarding}")
+    };
+    let expanded_theme = theme;
+    let expanded_text_build = move || {
+        let theme = lock(&expanded_theme).clone();
+        let logo = startup_logo(&theme, &version);
+        let (expanded_instructions, _) = startup_instructions(&theme);
+        let onboarding = startup_onboarding(&theme);
+        format!("{logo}\n{expanded_instructions}\n\n{onboarding}")
+    };
     let expandable = Arc::new(std::sync::Mutex::new(ExpandableText::new(
-        Box::new(move || collapsed.clone()),
-        Box::new(move || expanded_text.clone()),
+        Box::new(collapsed),
+        Box::new(expanded_text_build),
         expanded,
         1,
         0,
@@ -205,13 +238,12 @@ pub struct ExpandableTextRegion(Arc<std::sync::Mutex<ExpandableText>>);
 
 impl Component for ExpandableTextRegion {
     fn render(&self, width: usize) -> Vec<String> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .render(width)
+        lock(&self.0).render(width)
     }
 
-    fn invalidate(&mut self) {}
+    fn invalidate(&mut self) {
+        Component::invalidate(&mut *lock(&self.0));
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +253,23 @@ mod tests {
 
     fn theme() -> Arc<Theme> {
         Arc::new(load_theme("dark", None).expect("builtin dark theme must load"))
+    }
+
+    fn theme_handle() -> ThemeHandle {
+        Arc::new(Mutex::new(theme()))
+    }
+
+    /// bf8e4b953: the header rebuilds its baked colors after a theme change
+    /// (the UI invalidates on theme updates).
+    #[test]
+    fn header_rebuilds_colors_after_a_theme_change() {
+        let handle = theme_handle();
+        let (mut component, _) = build_builtin_header(Arc::clone(&handle), "0.1.0", false, false);
+        let before = component.render(80).join("\n");
+        *lock(&handle) = Arc::new(load_theme("light", None).expect("light theme"));
+        component.invalidate();
+        let after = component.render(80).join("\n");
+        assert_ne!(before, after, "the header must repaint with the new theme");
     }
 
     #[test]
@@ -264,7 +313,7 @@ mod tests {
 
     #[test]
     fn quiet_startup_yields_empty_header() {
-        let (component, expandable) = build_builtin_header(theme(), "0.1.0", false, true);
+        let (component, expandable) = build_builtin_header(theme_handle(), "0.1.0", false, true);
         assert!(expandable.is_none());
         assert!(
             component.render(80).is_empty(),
@@ -274,7 +323,7 @@ mod tests {
 
     #[test]
     fn non_quiet_header_is_expandable_and_starts_collapsed() {
-        let (component, expandable) = build_builtin_header(theme(), "0.1.0", false, false);
+        let (component, expandable) = build_builtin_header(theme_handle(), "0.1.0", false, false);
         let expandable = expandable.expect("expandable header");
         let rendered = component.render(80);
         assert!(rendered.len() > 1);

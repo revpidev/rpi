@@ -1235,8 +1235,8 @@ fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) ->
     };
     let theme_name = crate::core::themes::resolve_theme_setting(setting.as_deref(), terminal_theme)
         .unwrap_or_else(|| "dark".to_string());
-    let theme = load_theme(&theme_name, None)
-        .unwrap_or_else(|_| load_theme("dark", None).expect("builtin dark theme must load"));
+    let theme = load_theme(&theme_name, Some(crate::core::themes::terminal_color_mode()))
+        .unwrap_or_else(|_| load_theme("dark", Some(crate::core::themes::terminal_color_mode())).expect("builtin dark theme must load"));
     Arc::new(theme)
 }
 
@@ -1265,8 +1265,11 @@ pub(crate) struct InteractiveUi {
     /// The active theme. `Mutex` because the theme watcher / auto-theme
     /// listener swaps it on the driver thread while the run loop reads it
     /// (T12-S6; the write always happens on the driver thread via
-    /// [`InteractiveUi::apply_theme`]).
-    pub(crate) theme: Mutex<Arc<Theme>>,
+    /// [`InteractiveUi::apply_theme`]). `Arc` so themed components
+    /// (the startup header, loaded resources, chat notices) can share the
+    /// slot and rebuild their text on a theme change (#9973/ThemedText,
+    /// bf8e4b953).
+    pub(crate) theme: crate::modes::interactive::components::ThemeHandle,
     /// `currentThemeSetting` (theme-controller.ts:22-23): session-local
     /// theme-setting override — set from `--use-theme`
     /// (`initialThemeSetting`) and updated on an explicit in-run theme
@@ -1597,7 +1600,9 @@ impl component_registry::ComponentMountPoint for UiMountPoint {
 struct StatusTextTrack {
     /// Address of the `SharedChild` wrapper inside the chat container.
     entry_address: usize,
-    handle: Arc<Mutex<Text>>,
+    handle: Arc<Mutex<crate::modes::interactive::components::ThemedText>>,
+    /// Current status message; coalescing updates it and rebuilds `handle`.
+    message: Arc<Mutex<String>>,
 }
 
 /// In-flight `/share` (gist) state — the loader's cancel flag and the temp
@@ -1869,7 +1874,7 @@ impl InteractiveUi {
                     rpi_tui::terminal_colors::TerminalColorScheme::Light => light,
                     rpi_tui::terminal_colors::TerminalColorScheme::Dark => dark,
                 };
-                if let Ok(theme) = crate::core::themes::load_theme(&name, None) {
+                if let Ok(theme) = crate::core::themes::load_theme(&name, Some(crate::core::themes::terminal_color_mode())) {
                     listener_ui.apply_theme(Arc::new(theme));
                 }
             }));
@@ -2326,12 +2331,15 @@ impl InteractiveUi {
                     if reason == CompactionReason::Manual {
                         self.show_error(&error_message);
                     } else {
-                        self.add_chat_child(Box::new(Text::new(
-                            lock(&self.theme).fg("error", &error_message),
-                            1,
-                            0,
-                            None,
-                        )));
+                        let message = error_message;
+                        self.add_chat_child(Box::new(
+                            crate::modes::interactive::components::ThemedText::new(
+                                Arc::clone(&self.theme),
+                                move |theme| theme.fg("error", &message),
+                                1,
+                                0,
+                            ),
+                        ));
                     }
                 }
                 // Signal the run loop to flush messages queued during
@@ -2530,13 +2538,13 @@ impl InteractiveUi {
                 // `applyThemeName` (theme-controller.ts:92-100): fall back to
                 // the built-in dark theme on load failure and surface the
                 // error.
-                let theme = match crate::core::themes::load_theme(&name, None) {
+                let theme = match crate::core::themes::load_theme(&name, Some(crate::core::themes::terminal_color_mode())) {
                     Ok(theme) => theme,
                     Err(error) => {
                         self.show_error(&format!(
                             "Failed to load theme \"{name}\": {error}\nFell back to dark theme."
                         ));
-                        crate::core::themes::load_theme("dark", None)
+                        crate::core::themes::load_theme("dark", Some(crate::core::themes::terminal_color_mode()))
                             .expect("builtin dark theme must load")
                     }
                 };
@@ -3179,7 +3187,10 @@ impl InteractiveUi {
         };
         drop(loader);
 
-        let section_header = |name: &str| lock(&self.theme).fg("mdHeading", &format!("[{name}]"));
+        // Bodies are plain text; the closures style them with the shared
+        // theme on every invalidation, so a theme change repaints the
+        // loaded-resources block instead of keeping stale colors
+        // (bf8e4b953, ThemedText).
         let format_compact_list = |items: Vec<String>, sort: bool| -> String {
             let mut labels: Vec<String> = items
                 .into_iter()
@@ -3189,7 +3200,7 @@ impl InteractiveUi {
             if sort {
                 labels.sort();
             }
-            lock(&self.theme).fg("dim", &format!("  {}", labels.join(", ")))
+            format!("  {}", labels.join(", "))
         };
         // `addLoadedSection` (interactive-mode.ts:1443-1458): an
         // ExpandableText with the header + compact body, expanded state
@@ -3199,15 +3210,26 @@ impl InteractiveUi {
                                   compact_body: String,
                                   expanded_body: Option<String>| {
             let expanded_state = self.verbose || *lock(&self.tool_output_expanded);
-            let collapsed = format!("{}\n{}", section_header(name), compact_body);
-            let expanded_text = format!(
-                "{}\n{}",
-                section_header(name),
-                expanded_body.unwrap_or(compact_body)
-            );
+            let theme = Arc::clone(&self.theme);
+            let header_name = name.to_string();
+            let compact_body_plain = compact_body.clone();
+            let expanded_body_plain = expanded_body.unwrap_or(compact_body);
+            let build = move |body: &str| {
+                let theme = lock(&theme).clone();
+                format!(
+                    "{}\n{}",
+                    theme.fg("mdHeading", &format!("[{header_name}]")),
+                    theme.fg("dim", body)
+                )
+            };
+            let collapsed_build = build.clone();
+            let collapsed_body = compact_body_plain;
+            let collapsed = move || collapsed_build(&collapsed_body);
+            let expanded_body = expanded_body_plain;
+            let expanded_text = move || build(&expanded_body);
             let section = ExpandableText::new(
-                Box::new(move || collapsed.clone()),
-                Box::new(move || expanded_text.clone()),
+                Box::new(collapsed),
+                Box::new(expanded_text),
                 expanded_state,
                 0,
                 0,
@@ -3267,17 +3289,27 @@ impl InteractiveUi {
             // upstream's four per-kind blocks ([Skill conflicts],
             // [Prompt conflicts], [Extension issues], [Theme conflicts],
             // interactive-mode.ts:1576-1625) collapse to a single block.
-            let mut lines = vec![lock(&self.theme).fg("warning", "[Resource issues]")];
-            for (message, path) in &diagnostics {
-                match path {
-                    Some(path) => {
-                        lines.push(lock(&self.theme).fg("warning", &format!("  {path}")));
-                        lines.push(lock(&self.theme).fg("warning", &format!("    {message}")));
+            let diagnostics_snapshot = diagnostics;
+            container.add_child(Box::new(crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(&self.theme),
+                move |theme| {
+                    let mut lines = vec![theme.fg("warning", "[Resource issues]")];
+                    for (message, path) in &diagnostics_snapshot {
+                        match path {
+                            Some(path) => {
+                                lines.push(theme.fg("warning", &format!("  {path}")));
+                                lines.push(theme.fg("warning", &format!("    {message}")));
+                            }
+                            None => {
+                                lines.push(theme.fg("warning", &format!("  {message}")))
+                            }
+                        }
                     }
-                    None => lines.push(lock(&self.theme).fg("warning", &format!("  {message}"))),
-                }
-            }
-            container.add_child(Box::new(Text::new(lines.join("\n"), 0, 0, None)));
+                    lines.join("\n")
+                },
+                0,
+                0,
+            )));
             container.add_child(Box::new(Spacer::new(1)));
         }
     }
@@ -3356,16 +3388,16 @@ impl InteractiveUi {
             } else {
                 format!("{} thinking blocks", dropped.len())
             };
+            let message = format!("Anthropic dropped {noun}: {}", dropped.join("; "));
             self.add_chat_child(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
-            self.add_chat_child(Box::new(Text::new(
-                lock(&self.theme).fg(
-                    "warning",
-                    &format!("Anthropic dropped {noun}: {}", dropped.join("; ")),
+            self.add_chat_child(Box::new(
+                crate::modes::interactive::components::ThemedText::new(
+                    Arc::clone(&self.theme),
+                    move |theme| theme.fg("warning", &message),
+                    1,
+                    0,
                 ),
-                1,
-                0,
-                None,
-            )));
+            ));
         }
     }
 
@@ -3383,16 +3415,16 @@ impl InteractiveUi {
         {
             return;
         }
+        let message = crate::core::cache_warming::format_cache_warming_usage(entry);
         self.add_chat_child(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
-        self.add_chat_child(Box::new(Text::new(
-            lock(&self.theme).fg(
-                "dim",
-                &crate::core::cache_warming::format_cache_warming_usage(entry),
+        self.add_chat_child(Box::new(
+            crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(&self.theme),
+                move |theme| theme.fg("dim", &message),
+                1,
+                0,
             ),
-            1,
-            0,
-            None,
-        )));
+        ));
     }
 
     fn add_compaction_cost_notice(&self, kind: CompactionCostKind, usage: &rpi_ai::types::Usage) {
@@ -3413,19 +3445,19 @@ impl InteractiveUi {
             CompactionCostKind::Compaction => "Compaction",
             CompactionCostKind::BranchSummary => "Branch summary",
         };
+        let message = format!(
+            "{label}: {} tokens billed{cost}",
+            crate::modes::interactive::footer::format_tokens(tokens)
+        );
         self.add_chat_child(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
-        self.add_chat_child(Box::new(Text::new(
-            lock(&self.theme).fg(
-                "warning",
-                &format!(
-                    "{label}: {} tokens billed{cost}",
-                    crate::modes::interactive::footer::format_tokens(tokens)
-                ),
+        self.add_chat_child(Box::new(
+            crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(&self.theme),
+                move |theme| theme.fg("warning", &message),
+                1,
+                0,
             ),
-            1,
-            0,
-            None,
-        )));
+        ));
     }
 
     /// `showStatus` (interactive-mode.ts:3194-3212): dim status line with
@@ -3443,7 +3475,8 @@ impl InteractiveUi {
             && Some(child_address(&*children[children.len() - 2])) == last_spacer_address;
         if coalesces {
             let track = last_text.take().expect("checked above");
-            lock(&track.handle).set_text(lock(&self.theme).fg("dim", message));
+            *lock(&track.message) = message.to_owned();
+            lock(&track.handle).rebuild();
             self.render_handle.request_render();
             return;
         }
@@ -3451,12 +3484,19 @@ impl InteractiveUi {
         let spacer = Box::new(rpi_tui::components::spacer::Spacer::new(1));
         let spacer_address = child_address(&*spacer);
         children.push(spacer);
-        let handle = Arc::new(Mutex::new(Text::new(
-            lock(&self.theme).fg("dim", message),
-            1,
-            0,
-            None,
-        )));
+        let message_cell = Arc::new(Mutex::new(message.to_owned()));
+        let build_cell = Arc::clone(&message_cell);
+        let handle = Arc::new(Mutex::new(
+            crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(&self.theme),
+                move |theme| {
+                    let message = build_cell.lock().unwrap_or_else(|e| e.into_inner());
+                    theme.fg("dim", &message)
+                },
+                1,
+                0,
+            ),
+        ));
         let wrapper = Box::new(SharedChild(handle.clone()));
         let entry_address = child_address(&*wrapper);
         children.push(wrapper);
@@ -3464,29 +3504,36 @@ impl InteractiveUi {
         *lock(&self.last_status_text) = Some(StatusTextTrack {
             entry_address,
             handle,
+            message: message_cell,
         });
         self.render_handle.request_render();
     }
 
     /// `showError` (interactive-mode.ts:3868-3873).
     pub(crate) fn show_error(&self, message: &str) {
-        self.add_chat_child(Box::new(Text::new(
-            lock(&self.theme).fg("error", &format!("Error: {message}")),
-            1,
-            0,
-            None,
-        )));
+        let message = format!("Error: {message}");
+        self.add_chat_child(Box::new(
+            crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(&self.theme),
+                move |theme| theme.fg("error", &message),
+                1,
+                0,
+            ),
+        ));
         self.render_handle.request_render();
     }
 
     /// `showWarning` (interactive-mode.ts:3874-3878).
     pub(crate) fn show_warning(&self, message: &str) {
-        self.add_chat_child(Box::new(Text::new(
-            lock(&self.theme).fg("warning", &format!("Warning: {message}")),
-            1,
-            0,
-            None,
-        )));
+        let message = format!("Warning: {message}");
+        self.add_chat_child(Box::new(
+            crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(&self.theme),
+                move |theme| theme.fg("warning", &message),
+                1,
+                0,
+            ),
+        ));
         self.render_handle.request_render();
     }
 
@@ -4019,18 +4066,22 @@ impl InteractiveUi {
             chat.children
                 .push(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
         }
-        chat.children.push(Box::new(Text::new(
-            lock(&self.theme).fg(
-                "warning",
-                &format!(
-                    "This project is not trusted. Project {} resources and packages are ignored. Use /trust to save a trust decision, then restart rpi.",
-                    crate::config::CONFIG_DIR_NAME
-                ),
+        chat.children.push(Box::new(
+            crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(&self.theme),
+                move |theme| {
+                    theme.fg(
+                        "warning",
+                        &format!(
+                            "This project is not trusted. Project {} resources and packages are ignored. Use /trust to save a trust decision, then restart rpi.",
+                            crate::config::CONFIG_DIR_NAME
+                        ),
+                    )
+                },
+                1,
+                0,
             ),
-            1,
-            0,
-            None,
-        )));
+        ));
         self.render_handle.request_render();
     }
 
@@ -4055,6 +4106,9 @@ impl InteractiveUi {
             markdown_theme(&current)
         };
         *lock(&self.markdown_theme) = markdown;
+        // Rebuild the pending-messages block from the queue with the new
+        // theme (the notice lines bake colors at build time; bf8e4b953).
+        self.update_pending_messages_display();
         self.ui.invalidate();
         self.update_editor_border_color();
         // Extension widgets bake theme ANSI codes at mount time; rebuild
@@ -4674,7 +4728,7 @@ impl InteractiveMode {
         let ui_state = Arc::new(InteractiveUi {
             ui: ui.clone(),
             session: RwLock::new(session.clone()),
-            theme: Mutex::new(Arc::clone(&theme)),
+            theme: Arc::new(Mutex::new(Arc::clone(&theme))),
             theme_setting_override: Mutex::new(options.initial_theme_setting.clone()),
             markdown_theme: Mutex::new(markdown_theme),
             render_handle,
@@ -5124,7 +5178,7 @@ impl InteractiveMode {
             .settings_manager(|settings| settings.get_quiet_startup());
         let expanded = self.options.verbose || *lock(&ui_state.tool_output_expanded);
         let (header, expandable) = build_builtin_header(
-            Arc::clone(&lock(&ui_state.theme)),
+            Arc::clone(&ui_state.theme),
             VERSION,
             expanded,
             quiet_startup,
@@ -5298,7 +5352,7 @@ impl InteractiveMode {
             rpi_tui::terminal_colors::TerminalColorScheme::Light => light,
             rpi_tui::terminal_colors::TerminalColorScheme::Dark => dark,
         };
-        if let Ok(theme) = crate::core::themes::load_theme(&name, None) {
+        if let Ok(theme) = crate::core::themes::load_theme(&name, Some(crate::core::themes::terminal_color_mode())) {
             self.ui_state.apply_theme(Arc::new(theme));
         }
     }
@@ -8242,6 +8296,18 @@ mod tests {
             rendered.contains("Failed to parse theme"),
             "rendered: {rendered}"
         );
+
+        // bf8e4b953: a theme change rebuilds the loaded-resources colors
+        // instead of leaving the previous theme's ANSI codes. The UI
+        // performs the invalidation on the driver thread; the test issues
+        // it directly on the container.
+        ui.apply_theme(Arc::new(
+            crate::core::themes::load_theme("light", None).expect("light theme"),
+        ));
+        lock(&ui.loaded_resources_container).invalidate();
+        let after = lock(&ui.loaded_resources_container).render(80).join("\n");
+        assert_ne!(rendered, after, "loaded resources repaint after a theme change");
+        assert!(after.contains("[Context]"), "contents survive the repaint");
     }
 
     #[tokio::test]
