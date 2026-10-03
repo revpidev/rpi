@@ -88,6 +88,9 @@ pub(super) struct ActiveRun {
     pub(super) generation: u64,
     pub(super) request: CacheWarmRequest,
     pub(super) is_current: IsCurrent,
+    /// Cache lifetime that seeded the schedule (cache-warmer.ts:143 @
+    /// 3390bd936).
+    pub(super) ttl_ms: u64,
     pub(super) delay_ms: u64,
     pub(super) started_at: tokio::time::Instant,
     pub(super) token: CancellationToken,
@@ -97,6 +100,10 @@ pub(super) struct ActiveRun {
     /// Pausable-clock deadline of the armed refresh (the enforcement copy;
     /// `next_warm_at` is display-only).
     pub(super) next_warm_deadline: tokio::time::Instant,
+    /// Latest safe time to send this refresh, keeping half of the planned
+    /// pre-expiry margin (cache-warmer.ts:147-149 @ 3390bd936); a timer
+    /// delayed past it would likely be a full-price cache write, not a warm.
+    pub(super) refresh_deadline_at: tokio::time::Instant,
     /// `run.timer === undefined` ⇔ a refresh is in flight.
     pub(super) refreshing: bool,
     pub(super) extension_override: bool,
@@ -249,12 +256,14 @@ impl CacheWarmer {
                 generation,
                 request,
                 is_current,
+                ttl_ms,
                 delay_ms,
                 started_at: tokio::time::Instant::now(),
                 token: CancellationToken::new(),
                 phase: Phase::Streaming,
                 next_warm_at: 0,
                 next_warm_deadline: tokio::time::Instant::now(),
+                refresh_deadline_at: tokio::time::Instant::now(),
                 refreshing: false,
                 extension_override: false,
             });
@@ -354,6 +363,27 @@ impl CacheWarmer {
         } else {
             None
         }
+    }
+
+    /// `refreshDeadlineMissed` (cache-warmer.ts:355-360 @ 3390bd936): true
+    /// when the armed refresh fired after its safe deadline; the run is
+    /// stopped with the `"cache refresh deadline missed"` reason.
+    pub(super) fn refresh_deadline_missed(&self, generation: u64) -> bool {
+        let within_deadline = {
+            let state = lock(&self.state);
+            let Some(run) = &state.run else {
+                return false;
+            };
+            if run.generation != generation {
+                return false;
+            }
+            tokio::time::Instant::now() <= run.refresh_deadline_at
+        };
+        if within_deadline {
+            return false;
+        }
+        self.stop("cache refresh deadline missed", None);
+        true
     }
 
     /// `validateRun` (cache-warmer.ts:347-353): true when `generation` is

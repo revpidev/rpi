@@ -244,6 +244,18 @@ impl FakeRuntime {
                 events.push(event);
                 Box::pin(async move { action })
             }),
+            DecideArg::WarmAfterSleep(ms) => Arc::new(move |event| {
+                {
+                    let mut events = events_for_decide.lock().unwrap();
+                    events.push(event);
+                }
+                Box::pin(async move {
+                    // A slow extension hook: under the paused clock the
+                    // tokio auto-advance moves past the refresh deadline.
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    CacheWarmingAction::Warm
+                })
+            }),
         };
         // Route append_usage through the real SessionManager but capture the
         // note argument (appendUsage call assertion, cache-warmer.test.ts:168-174).
@@ -298,6 +310,9 @@ enum DecideArg {
     Warm,
     Stop,
     Record,
+    /// Warm, but let the extension decision take longer than the remaining
+    /// pre-expiry margin (cache-warmer.test.ts:200-215 @ 3390bd936).
+    WarmAfterSleep(u64),
 }
 
 fn request(model: &Model, reasoning: Option<rpi_ai::types::ThinkingLevel>) -> CacheWarmRequest {
@@ -625,6 +640,65 @@ async fn default_off_mode_never_spawns_or_sends() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn skips_refreshes_after_their_safe_deadline() {
+    // cache-warmer.test.ts:182-198 @ 3390bd936: a five-minute cache is
+    // scheduled for 4m30s and keeps 15s of the 30s expiry margin; a timer
+    // delayed past 4m45s (285_000ms) must not send a refresh (it would be a
+    // full-price cache write, not a warm).
+    let runtime = FakeRuntime::new(
+        CacheWarmingModeArg::Idle,
+        branch_with_prompt(100_000),
+        DecideArg::Record,
+    );
+    runtime
+        .warmer
+        .start(request(&adaptive_model(), None), always_current());
+    // Simulate a timer delayed by sleep: fire 1ms past the safe deadline.
+    tokio::time::advance(std::time::Duration::from_millis(285_001)).await;
+    tokio::task::yield_now().await;
+
+    assert!(runtime.models.calls.lock().unwrap().is_empty());
+    let status = runtime.warmer.status();
+    assert_eq!(status.state, WarmingState::Inactive);
+    assert_eq!(
+        status.reason.as_deref(),
+        Some("cache refresh deadline missed")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rechecks_the_refresh_deadline_after_an_extension_decision() {
+    // cache-warmer.test.ts:200-215 @ 3390bd936: the deadline is rechecked
+    // after the `cache_warming_decision` hook resolves, so a slow extension
+    // decision cannot push a stale refresh through.
+    let runtime = FakeRuntime::new(
+        CacheWarmingModeArg::Idle,
+        branch_with_prompt(100_000),
+        DecideArg::WarmAfterSleep(15_001),
+    );
+    runtime
+        .warmer
+        .start(request(&adaptive_model(), None), always_current());
+    // The timer fires 1ms after the scheduled 4m30s (within the deadline);
+    // the decision sleeps 15s — past 4m45s — before returning Warm, so the
+    // recheck must stop the run.
+    tokio::time::advance(std::time::Duration::from_millis(270_001)).await;
+    tokio::task::yield_now().await;
+    // Wake the slow decision's sleep (15s) so it returns Warm at 4m45s+.
+    tokio::time::advance(std::time::Duration::from_millis(15_001)).await;
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    assert!(runtime.models.calls.lock().unwrap().is_empty());
+    let status = runtime.warmer.status();
+    assert_eq!(status.state, WarmingState::Inactive);
+    assert_eq!(
+        status.reason.as_deref(),
+        Some("cache refresh deadline missed")
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn idle_safety_window_stops_warming() {
     // 30-minute idle horizon (cache-warmer.ts:18): with a 300s TTL the
     // 5-minute refresh cadence would exceed the window after the run
@@ -637,7 +711,14 @@ async fn idle_safety_window_stops_warming() {
     runtime
         .warmer
         .start(request(&adaptive_model(), None), always_current());
-    tokio::time::advance(std::time::Duration::from_millis(29 * 60_000)).await;
+    // Step the clock through the 4m30s refresh cadence so each armed timer
+    // fires at its scheduled time (a single 29-minute jump would simulate a
+    // late timer, which the refresh-deadline tests cover instead).
+    for _ in 0..6 {
+        tokio::time::advance(std::time::Duration::from_millis(270_000)).await;
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(std::time::Duration::from_millis(120_000)).await;
     tokio::task::yield_now().await;
     runtime.warmer.on_agent_settled();
     // Next refresh (270s later) lands beyond startedAt + 30min → schedule

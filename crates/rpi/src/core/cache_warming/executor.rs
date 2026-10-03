@@ -41,6 +41,10 @@ impl CacheWarmer {
             let next = now + Duration::from_millis(run.delay_ms);
             run.next_warm_deadline = next;
             run.next_warm_at = wall_epoch_ms().saturating_add(run.delay_ms);
+            // Keep half of the planned pre-expiry margin for timer delays and
+            // request dispatch (cache-warmer.ts:287-290 @ 3390bd936).
+            run.refresh_deadline_at =
+                next + Duration::from_millis(run.ttl_ms.saturating_sub(run.delay_ms) / 2);
             run.refreshing = false;
             let deadline = run.deadline();
             (
@@ -89,6 +93,9 @@ impl CacheWarmer {
         if !self.validate_run(generation) {
             return;
         }
+        if self.refresh_deadline_missed(generation) {
+            return;
+        }
         let (decision, request, token) = {
             let state = lock(&self.state);
             let Some(run) = &state.run else {
@@ -112,7 +119,7 @@ impl CacheWarmer {
         // Extension failures fall back to pi's own decision
         // (cache-warmer.ts:296-301).
         let action = ((self.deps.decide)(event)).await;
-        if !self.validate_run(generation) {
+        if !self.validate_run(generation) || self.refresh_deadline_missed(generation) {
             return;
         }
         let extension_override = action != decision.action;
