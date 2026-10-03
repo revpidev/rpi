@@ -24,6 +24,7 @@
 
 pub mod alt_screen_search;
 pub mod autocomplete;
+pub mod colors;
 pub mod components;
 pub mod error;
 pub mod fuzzy;
@@ -37,6 +38,7 @@ pub mod layout_node;
 pub mod mermaid;
 pub mod mouse;
 pub mod native_modifiers;
+pub mod oklab;
 pub mod recovery;
 pub mod stdin_buffer;
 pub mod terminal;

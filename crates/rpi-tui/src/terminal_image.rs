@@ -7,7 +7,10 @@
 //! identified) and the capability-override layer (env
 //! `RPI_HYPERLINKS`/`RPI_IMAGE_PROTOCOL`/`RPI_TRUE_COLOR` + programmatic
 //! `set_capability_overrides`, e86823096 / #8665) and the Zed branch
-//! (`649214477` / #8828) tracking 9841914. The Kitty image metadata registry
+//! (`649214477` / #8828) tracking 9841914. The `-direct` TERM truecolor hint
+//! (terminal-image.ts:75) and `get_terminal_color_mode`
+//! (terminal-image.ts:170-172) track a13d35a74 / pi v1.0.0. The Kitty image
+//! metadata registry
 //! (`register_kitty_image_metadata` / `get_kitty_image_metadata` /
 //! `crop_kitty_image_line` / `get_kitty_image_placement`) and the
 //! `render_image` registration call also track the 4181f66 revision
@@ -293,7 +296,10 @@ fn detect_capabilities_inner(
     let terminal_emulator = env_var("TERMINAL_EMULATOR").to_lowercase();
     let term = env_var("TERM").to_lowercase();
     let color_term = env_var("COLORTERM").to_lowercase();
-    let has_true_color_hint = color_term == "truecolor" || color_term == "24bit";
+    // terminal-image.ts:75 @ a13d35a74 also treats a `-direct` TERM suffix as a
+    // truecolor hint (e.g. `xterm-direct`).
+    let has_true_color_hint =
+        color_term == "truecolor" || color_term == "24bit" || term.ends_with("-direct");
 
     // Emit OSC 8 hyperlinks only when tmux confirms it forwards.
     // Image protocols are unreliable under tmux, so leave `images: null`.
@@ -432,6 +438,16 @@ pub fn get_capabilities() -> TerminalCapabilities {
         }
         capabilities
     })
+}
+
+/// `getTerminalColorMode` (terminal-image.ts:170-172 @ a13d35a74): truecolor
+/// when the detected capabilities advertise it, otherwise 256-color.
+pub fn get_terminal_color_mode() -> crate::colors::TerminalColorMode {
+    if get_capabilities().true_color {
+        crate::colors::TerminalColorMode::TrueColor
+    } else {
+        crate::colors::TerminalColorMode::Color256
+    }
 }
 
 /// `resetCapabilitiesCache` (terminal-image.ts:134-136).
@@ -1469,6 +1485,16 @@ mod tests {
             assert!(caps.true_color);
             assert!(!caps.hyperlinks);
             assert_eq!(caps.images, None);
+        });
+    }
+
+    #[test]
+    fn test_detect_capabilities_enables_truecolor_from_direct_color_term() {
+        // terminal-image.ts:75 @ a13d35a74: a `-direct` TERM suffix is a
+        // truecolor hint (terminal-image.test.ts:446-450, `xterm-direct`).
+        with_env(&[("TERM", Some("xterm-direct"))], || {
+            let caps = detect_capabilities_with(|| false);
+            assert!(caps.true_color);
         });
     }
 
