@@ -7,6 +7,7 @@ pub mod auth_guidance;
 pub mod cache_warming;
 pub mod changelog;
 pub mod compaction_runner;
+pub mod crash_attribution;
 pub mod environment;
 pub mod export_html;
 pub mod extension_actions;
