@@ -483,11 +483,11 @@ mod tests {
     #[test]
     fn theme_vars_dark_uses_explicit_export_colors() {
         let vars = generate_theme_vars(Some("dark"));
-        assert!(vars.contains("--userMessageBg: #343541;"), "vars: {vars}");
+        assert!(vars.contains("--userMessageBg: #213b49;"), "vars: {vars}");
         // The dark theme pins explicit export colors (themes.rs dark JSON).
-        assert!(vars.contains("--exportPageBg: #18181e;"), "vars: {vars}");
-        assert!(vars.contains("--exportCardBg: #1e1e24;"), "vars: {vars}");
-        assert!(vars.contains("--exportInfoBg: #3c3728;"), "vars: {vars}");
+        assert!(vars.contains("--exportPageBg: #21252c;"), "vars: {vars}");
+        assert!(vars.contains("--exportCardBg: #282c34;"), "vars: {vars}");
+        assert!(vars.contains("--exportInfoBg: #4e2f1b;"), "vars: {vars}");
         // Joined with newline + 6 spaces (index.ts:127).
         assert!(vars.contains("\n      --"), "join separator: {vars}");
     }
@@ -557,8 +557,8 @@ mod tests {
         // Vendored libraries inlined.
         assert!(html.contains("marked"), "marked vendored");
         // Theme export colors land in the CSS (dark theme explicit values).
-        assert!(html.contains("--exportPageBg: #18181e;"));
-        assert!(html.contains("--body-bg: #18181e;"), "body bg substituted");
+        assert!(html.contains("--exportPageBg: #21252c;"));
+        assert!(html.contains("--body-bg: #21252c;"), "body bg substituted");
     }
 
     #[test]

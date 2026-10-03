@@ -22,10 +22,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
-use rpi_tui::terminal_colors::{RgbColor, TerminalColorScheme};
+use rpi_tui::terminal_colors::TerminalColorScheme;
 use rpi_tui::tui_handle::TuiHandle;
 
-use crate::core::themes::get_theme_watch_path;
+use crate::core::themes::{TerminalTheme, get_theme_watch_path};
 use crate::modes::interactive::interactive_mode::{InteractiveUi, UiCommand};
 
 /// Poll interval for the theme watcher (upstream debounces reloads by 100ms,
@@ -64,122 +64,72 @@ pub(crate) fn auto_theme_pair(setting: Option<&str>) -> Option<(String, String)>
 }
 
 // =============================================================================
-// Terminal appearance detection (theme.ts:718-789)
+// Terminal appearance detection (theme.ts:697-716 @ a13d35a74)
 // =============================================================================
 
-/// `getRgbColorLuminance` (theme.ts:718-724): WCAG-relative-luminance-style
-/// linearization of an sRGB channel.
-fn rgb_luminance(rgb: RgbColor) -> f64 {
-    let RgbColor { r, g, b } = rgb;
-    let to_linear = |channel: u8| {
-        let value = f64::from(channel) / 255.0;
-        if value <= 0.03928 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * to_linear(r) + 0.7152 * to_linear(g) + 0.0722 * to_linear(b)
-}
-
-/// `getThemeForRgbColor` (theme.ts:730-732): luminance >= 0.5 is light.
-pub(crate) fn theme_for_rgb(rgb: &RgbColor) -> TerminalColorScheme {
-    if rgb_luminance(*rgb) >= 0.5 {
-        TerminalColorScheme::Light
-    } else {
-        TerminalColorScheme::Dark
+/// Map between the rpi-tui scheme enum and the rpi theme enum.
+fn to_theme(scheme: TerminalColorScheme) -> TerminalTheme {
+    match scheme {
+        TerminalColorScheme::Dark => TerminalTheme::Dark,
+        TerminalColorScheme::Light => TerminalTheme::Light,
     }
 }
 
-/// `ansi256ToHex` (theme.ts:978-1034): 256-color index → `#rrggbb`.
-fn ansi256_to_hex(index: u8) -> String {
-    // Basic colors (0-15) - approximate common terminal values.
-    const BASIC_COLORS: [&str; 16] = [
-        "#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080", "#c0c0c0",
-        "#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff",
-    ];
-    let index = index as u16;
-    if index < 16 {
-        return BASIC_COLORS[index as usize].to_string();
+fn to_scheme(theme: TerminalTheme) -> TerminalColorScheme {
+    match theme {
+        TerminalTheme::Dark => TerminalColorScheme::Dark,
+        TerminalTheme::Light => TerminalColorScheme::Light,
     }
-    // Color cube (16-231): 6x6x6 = 216 colors.
-    if index < 232 {
-        let cube_index = index - 16;
-        let r = cube_index / 36;
-        let g = (cube_index % 36) / 6;
-        let b = cube_index % 6;
-        let to_hex = |n: u16| -> String {
-            let value = if n == 0 { 0 } else { 55 + n * 40 };
-            format!("{value:02x}")
-        };
-        return format!("#{}{}{}", to_hex(r), to_hex(g), to_hex(b));
-    }
-    // Grayscale (232-255): 24 shades.
-    let gray = 8 + (index - 232) * 10;
-    format!("#{gray:02x}{gray:02x}{gray:02x}")
 }
 
-/// `getColorFgBgBackgroundIndex` (theme.ts:707-716): the last numeric
-/// segment of `COLORFGBG` (the background index).
-fn colorfgbg_background_index(colorfgbg: &str) -> Option<u8> {
-    for part in colorfgbg.rsplit(';') {
-        if let Ok(bg) = part.trim().parse::<u8>() {
-            return Some(bg);
-        }
-    }
-    None
+/// `detectColorFgBgTheme` (theme.ts:697-705 @ a13d35a74): `COLORFGBG`'s last
+/// field is an ANSI index classified like Vim (0-6 and 8 dark, 7 and 9-15
+/// light); missing/invalid values have no answer.
+pub(crate) fn detect_color_fg_bg_theme(colorfgbg: Option<&str>) -> Option<TerminalColorScheme> {
+    crate::core::themes::detect_color_fg_bg_theme(colorfgbg).map(to_scheme)
 }
 
-/// `detectTerminalBackgroundFromEnv` (theme.ts:734-753): the `COLORFGBG`
-/// background index luminance, falling back to `dark` when absent.
+/// `detectTerminalBackgroundFromEnv` (theme.ts:734-753 @ 9841914, superseded
+/// by `detectTerminalTheme` @ a13d35a74): `COLORFGBG`, falling back to dark.
 pub(crate) fn detect_terminal_background_from_env(colorfgbg: Option<&str>) -> TerminalColorScheme {
-    if let Some(index) = colorfgbg.and_then(colorfgbg_background_index) {
-        let hex = ansi256_to_hex(index);
-        let rgb = hex_to_rgb(&hex).expect("ansi256_to_hex always yields #rrggbb");
-        return theme_for_rgb(&rgb);
-    }
-    TerminalColorScheme::Dark
+    detect_color_fg_bg_theme(colorfgbg).unwrap_or(TerminalColorScheme::Dark)
 }
 
-/// Parse a `#rrggbb` hex color (the ansi256 table emits these directly).
-fn hex_to_rgb(hex: &str) -> Option<RgbColor> {
-    let hex = hex.strip_prefix('#')?;
-    Some(RgbColor {
-        r: u8::from_str_radix(hex.get(0..2)?, 16).ok()?,
-        g: u8::from_str_radix(hex.get(2..4)?, 16).ok()?,
-        b: u8::from_str_radix(hex.get(4..6)?, 16).ok()?,
-    })
+/// `detectTerminalTheme` (theme.ts:707-716 @ a13d35a74): the reported
+/// background (with the foreground as a tiebreaker) decides; without one the
+/// terminal's light/dark report, then `COLORFGBG`, then dark.
+pub(crate) fn detect_terminal_theme(
+    colors: &rpi_tui::terminal_colors::TerminalColors,
+    reported_scheme: Option<TerminalColorScheme>,
+    colorfgbg: Option<&str>,
+) -> TerminalColorScheme {
+    to_scheme(crate::core::themes::detect_terminal_theme(
+        colors,
+        reported_scheme.map(to_theme),
+        colorfgbg,
+    ))
 }
 
-/// `detectTerminalThemeForAuto` (theme.ts:777-789): DSR color-scheme query,
-/// then OSC 11 background query, then `COLORFGBG`/fallback.
+/// `detectTerminalThemeForAuto` (theme.ts:777-789 @ 9841914): the single-pass
+/// OSC 10/11/4 query, then `detectTerminalTheme`. The Tui's own deadline
+/// resolves the oneshot after `timeout_ms`; the tokio timeout is a backstop
+/// for terminals that never reply (and tests without a pump).
 pub(crate) async fn detect_terminal_theme_for_auto(
     ui: &TuiHandle,
     timeout_ms: u64,
 ) -> TerminalColorScheme {
     let timeout = Duration::from_millis(timeout_ms);
-    // The Tui's own deadline resolves the oneshot; the tokio timeout is a
-    // backstop for terminals that never reply (and tests without a pump).
     let slack = Duration::from_millis(50);
-    let scheme = ui.query_terminal_color_scheme(timeout);
-    if let Some(scheme) = tokio::time::timeout(timeout + slack, scheme)
+    let colors = ui.query_terminal_colors(rpi_tui::tui::TerminalColorQueryOptions {
+        timeout,
+        on_late_reply: None,
+    });
+    let colors = tokio::time::timeout(timeout + slack, colors)
         .await
         .ok()
         .and_then(|reply| reply.ok())
-        .flatten()
-    {
-        return scheme;
-    }
-    let rgb = ui.query_terminal_background_color(timeout);
-    if let Some(rgb) = tokio::time::timeout(timeout + slack, rgb)
-        .await
-        .ok()
-        .and_then(|reply| reply.ok())
-        .flatten()
-    {
-        return theme_for_rgb(&rgb);
-    }
-    detect_terminal_background_from_env(std::env::var("COLORFGBG").ok().as_deref())
+        .unwrap_or_default();
+    detect_terminal_theme(&colors, None, std::env::var("COLORFGBG").ok().as_deref())
 }
 
 // =============================================================================
@@ -260,44 +210,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn theme_for_rgb_uses_relative_luminance_threshold() {
+    fn detect_color_fg_bg_theme_classifies_indices_like_vim() {
+        // 0-6 and 8 are dark; 7 and 9-15 are light (theme.ts:697-705).
         assert_eq!(
-            theme_for_rgb(&RgbColor { r: 0, g: 0, b: 0 }),
+            detect_color_fg_bg_theme(Some("15;0")),
+            Some(TerminalColorScheme::Dark)
+        );
+        assert_eq!(
+            detect_color_fg_bg_theme(Some("0;8")),
+            Some(TerminalColorScheme::Dark)
+        );
+        assert_eq!(
+            detect_color_fg_bg_theme(Some("0;7")),
+            Some(TerminalColorScheme::Light)
+        );
+        assert_eq!(
+            detect_color_fg_bg_theme(Some("0;15")),
+            Some(TerminalColorScheme::Light)
+        );
+        assert_eq!(detect_color_fg_bg_theme(Some("0;16")), None);
+        assert_eq!(detect_color_fg_bg_theme(Some("")), None);
+        assert_eq!(detect_color_fg_bg_theme(None), None);
+        // The rxvt three-field form uses the last field.
+        assert_eq!(
+            detect_color_fg_bg_theme(Some("0;0;1")),
+            Some(TerminalColorScheme::Dark)
+        );
+    }
+
+    #[test]
+    fn detect_terminal_background_from_env_falls_back_to_dark() {
+        assert_eq!(
+            detect_terminal_background_from_env(Some("15;0")),
             TerminalColorScheme::Dark
         );
         assert_eq!(
-            theme_for_rgb(&RgbColor {
+            detect_terminal_background_from_env(Some("0;15")),
+            TerminalColorScheme::Light
+        );
+        // Missing env falls back to dark (theme.ts:747-752).
+        assert_eq!(
+            detect_terminal_background_from_env(None),
+            TerminalColorScheme::Dark
+        );
+    }
+
+    #[test]
+    fn detect_terminal_theme_prefers_reported_background_then_scheme_then_env() {
+        use rpi_tui::terminal_colors::{RgbColor, TerminalColors};
+        // Reported background wins.
+        let colors = TerminalColors {
+            background: Some(RgbColor {
                 r: 255,
                 g: 255,
-                b: 255
+                b: 255,
             }),
+            ..TerminalColors::default()
+        };
+        assert_eq!(
+            detect_terminal_theme(&colors, Some(TerminalColorScheme::Dark), Some("15;0")),
             TerminalColorScheme::Light
         );
-        // #808080: luminance ≈ 0.216 < 0.5 → dark.
+        // Without a background, the light/dark report wins over COLORFGBG.
         assert_eq!(
-            theme_for_rgb(&RgbColor {
-                r: 0x80,
-                g: 0x80,
-                b: 0x80
-            }),
-            TerminalColorScheme::Dark
-        );
-        // #cccccc: luminance ≈ 0.604 ≥ 0.5 → light.
-        assert_eq!(
-            theme_for_rgb(&RgbColor {
-                r: 0xcc,
-                g: 0xcc,
-                b: 0xcc
-            }),
+            detect_terminal_theme(
+                &TerminalColors::default(),
+                Some(TerminalColorScheme::Light),
+                Some("15;0")
+            ),
             TerminalColorScheme::Light
         );
-        // #999999: luminance ≈ 0.319 < 0.5 → dark.
+        // Then COLORFGBG, then dark.
         assert_eq!(
-            theme_for_rgb(&RgbColor {
-                r: 0x99,
-                g: 0x99,
-                b: 0x99
-            }),
+            detect_terminal_theme(&TerminalColors::default(), None, Some("0;15")),
+            TerminalColorScheme::Light
+        );
+        assert_eq!(
+            detect_terminal_theme(&TerminalColors::default(), None, None),
             TerminalColorScheme::Dark
         );
     }
@@ -333,52 +322,5 @@ mod tests {
         );
         assert_eq!(auto_theme_pair(Some("dark")), None);
         assert_eq!(auto_theme_pair(None), None);
-    }
-
-    #[test]
-    fn colorfgbg_background_index_reads_last_numeric_segment() {
-        assert_eq!(colorfgbg_background_index("15;0"), Some(0));
-        assert_eq!(colorfgbg_background_index("0;15"), Some(15));
-        assert_eq!(colorfgbg_background_index("4"), Some(4));
-        assert_eq!(colorfgbg_background_index("x;y"), None);
-        assert_eq!(colorfgbg_background_index(""), None);
-    }
-
-    #[test]
-    fn detect_terminal_background_from_env_uses_colorfgbg_luminance() {
-        // Index 0 = black → dark.
-        assert_eq!(
-            detect_terminal_background_from_env(Some("15;0")),
-            TerminalColorScheme::Dark
-        );
-        // Index 15 = white → light.
-        assert_eq!(
-            detect_terminal_background_from_env(Some("0;15")),
-            TerminalColorScheme::Light
-        );
-        // Index 4 = blue (#0000ff): luminance ≈ 0.072 → dark.
-        assert_eq!(
-            detect_terminal_background_from_env(Some("4")),
-            TerminalColorScheme::Dark
-        );
-        // Index 7 = light gray (#c0c0c0): luminance ≈ 0.527 ≥ 0.5 → light.
-        assert_eq!(
-            detect_terminal_background_from_env(Some("7")),
-            TerminalColorScheme::Light
-        );
-        // Index 232 = #080808 → dark; 255 = #fefefe → light (grayscale ramp).
-        assert_eq!(
-            detect_terminal_background_from_env(Some("232")),
-            TerminalColorScheme::Dark
-        );
-        assert_eq!(
-            detect_terminal_background_from_env(Some("255")),
-            TerminalColorScheme::Light
-        );
-        // Missing env falls back to dark (theme.ts:747-752).
-        assert_eq!(
-            detect_terminal_background_from_env(None),
-            TerminalColorScheme::Dark
-        );
     }
 }

@@ -67,10 +67,11 @@ fn test_builtin_dark_256_mode() {
 
 #[test]
 fn test_builtin_theme_var_resolution() {
-    // Dark theme: accent color = "accent" var ref → "#8abeb7" (138,190,183)
+    // Dark theme: accent color = "violet" var ref → okhsl(295 50% 67%) →
+    // #a798d7 (167,152,215) in the v1.0.0 rewrite (bf8e4b953).
     let theme = load_theme("dark", Some(ColorMode::TrueColor)).unwrap();
     let accent = theme.get_fg_ansi("accent");
-    assert!(accent.contains("138") && accent.contains("190") && accent.contains("183"));
+    assert_eq!(accent, "\x1b[38;2;167;152;215m");
 }
 
 #[test]
@@ -279,17 +280,17 @@ fn test_auto_theme_full_cycle() {
 #[test]
 fn test_builtin_dark_export_colors() {
     let colors = get_theme_export_colors("dark");
-    assert_eq!(colors.page_bg.as_deref(), Some("#18181e"));
-    assert_eq!(colors.card_bg.as_deref(), Some("#1e1e24"));
-    assert_eq!(colors.info_bg.as_deref(), Some("#3c3728"));
+    assert_eq!(colors.page_bg.as_deref(), Some("#21252c"));
+    assert_eq!(colors.card_bg.as_deref(), Some("#282c34"));
+    assert_eq!(colors.info_bg.as_deref(), Some("#4e2f1b"));
 }
 
 #[test]
 fn test_builtin_light_export_colors() {
     let colors = get_theme_export_colors("light");
-    assert_eq!(colors.page_bg.as_deref(), Some("#f8f8f8"));
-    assert_eq!(colors.card_bg.as_deref(), Some("#ffffff"));
-    assert_eq!(colors.info_bg.as_deref(), Some("#fffae6"));
+    assert_eq!(colors.page_bg.as_deref(), Some("#efeeee"));
+    assert_eq!(colors.card_bg.as_deref(), Some("#f7f6f6"));
+    assert_eq!(colors.info_bg.as_deref(), Some("#ede3dd"));
 }
 
 // --- Resolved theme colors for HTML export --------------------------------
@@ -305,7 +306,7 @@ fn test_resolved_theme_colors_dark() {
     assert!(colors.contains_key("thinkingMax"));
 }
 
-// --- COLORFGBG luminance detection ----------------------------------------
+// --- COLORFGBG index classification ----------------------------------------
 
 #[test]
 fn test_colorfgbg_dark_background() {
@@ -323,36 +324,23 @@ fn test_colorfggb_light_background() {
 }
 
 #[test]
+fn test_colorfgbg_index_eight_is_dark_and_seven_is_light() {
+    // Vim-style classification (theme.ts:697-705 @ a13d35a74).
+    let det = detect_terminal_background_from_env_str("15;8");
+    assert_eq!(det.theme, TerminalTheme::Dark);
+    let det = detect_terminal_background_from_env_str("0;7");
+    assert_eq!(det.theme, TerminalTheme::Light);
+    // An out-of-palette index falls back to dark.
+    let det = detect_terminal_background_from_env_str("0;235");
+    assert_eq!(det.source, TerminalThemeSource::Fallback);
+}
+
+#[test]
 fn test_colorfgbg_no_env_fallback() {
     let det = detect_terminal_background_from_env_str("");
     assert_eq!(det.theme, TerminalTheme::Dark);
     assert_eq!(det.source, TerminalThemeSource::Fallback);
     assert_eq!(det.confidence, TerminalThemeConfidence::Low);
-}
-
-// --- OSC 11 response parsing ----------------------------------------------
-
-#[test]
-fn test_osc11_rgb_response() {
-    let data = "\x1b]11;rgb:0000/0000/0000\x07";
-    let rgb = parse_osc11_background_color(data).unwrap();
-    assert_eq!(rgb, Rgb { r: 0, g: 0, b: 0 });
-    assert_eq!(get_theme_for_rgb_color(&rgb), TerminalTheme::Dark);
-}
-
-#[test]
-fn test_osc11_white_background_is_light() {
-    let data = "\x1b]11;rgb:ffff/ffff/ffff\x07";
-    let rgb = parse_osc11_background_color(data).unwrap();
-    assert_eq!(
-        rgb,
-        Rgb {
-            r: 255,
-            g: 255,
-            b: 255
-        }
-    );
-    assert_eq!(get_theme_for_rgb_color(&rgb), TerminalTheme::Light);
 }
 
 // --- Name validation ------------------------------------------------------

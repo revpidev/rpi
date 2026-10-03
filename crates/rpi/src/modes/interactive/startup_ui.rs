@@ -302,7 +302,7 @@ pub(crate) fn run_startup_selector_with_terminal(
     let terminal_theme = crate::core::themes::detect_terminal_background_from_env().theme;
     let theme_name =
         crate::core::themes::resolve_theme_setting(settings.get_theme().as_deref(), terminal_theme)
-            .unwrap_or_else(|| terminal_theme.as_str().to_string());
+            .unwrap_or_else(|| crate::core::themes::SYSTEM_THEME_NAME.to_string());
     let theme = match load_theme(
         &theme_name,
         Some(crate::core::themes::terminal_color_mode()),

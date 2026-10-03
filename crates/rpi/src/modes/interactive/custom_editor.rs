@@ -479,11 +479,11 @@ mod tests {
         );
         let joined = standalone.join("\n");
         assert!(
-            joined.contains(theme.get_fg_ansi("accent")),
+            joined.contains(theme.get_fg_ansi("accent").as_str()),
             "accent spinner: {joined:?}"
         );
         assert!(
-            joined.contains(theme.get_fg_ansi("muted")),
+            joined.contains(theme.get_fg_ansi("muted").as_str()),
             "muted label: {joined:?}"
         );
     }
@@ -535,7 +535,7 @@ mod tests {
         // theme.getFgAnsi("thinkingHigh"))` has length 5).
         let thinking_prefix = theme.get_fg_ansi("thinkingHigh");
         assert_eq!(
-            top.matches(thinking_prefix).count(),
+            top.matches(thinking_prefix.as_str()).count(),
             4,
             "border runs + spinner + label"
         );

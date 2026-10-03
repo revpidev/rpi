@@ -664,11 +664,11 @@ mod tests {
             "write src.rs\n\nfn main() {\n    let x = 1;\n}"
         );
         assert!(
-            text.contains(theme.get_fg_ansi("syntaxType")),
+            text.contains(theme.get_fg_ansi("syntaxType").as_str()),
             "fn/let must be syntaxType"
         );
         assert!(
-            text.contains(theme.get_fg_ansi("syntaxNumber")),
+            text.contains(theme.get_fg_ansi("syntaxNumber").as_str()),
             "1 must be syntaxNumber"
         );
         // No recognized language (notes.txt): plain lines, toolOutput colored.

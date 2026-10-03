@@ -30,12 +30,251 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Mutex, OnceLock};
+
+use rpi_tui::colors as tui_colors;
+use rpi_tui::terminal_colors::{RgbColor as TerminalRgb, TerminalColors};
 
 use crate::config;
 use crate::error::RpiError;
 
 pub mod system;
+
+pub use self::system::SYSTEM_THEME_NAME;
+
+// ===========================================================================
+// Terminal color state (theme.ts:406-417 @ a13d35a74)
+// ===========================================================================
+
+/// The terminal's reported colors; replaced (never mutated) on update, so
+/// themes can cache resolved colors by identity.
+static TERMINAL_COLORS: Mutex<TerminalColors> = Mutex::new(TerminalColors {
+    foreground: None,
+    background: None,
+    palette: None,
+});
+/// Whether a report has ever been applied (upstream's `previous` check,
+/// theme-controller.ts:114-116).
+static TERMINAL_COLORS_REPORTED: AtomicBool = AtomicBool::new(false);
+/// The terminal's last light/dark report (mode 2031); only used while it has
+/// not reported a background (theme.ts:410-412).
+static TERMINAL_COLOR_SCHEME: Mutex<Option<TerminalTheme>> = Mutex::new(None);
+/// While the terminal color query is in flight, the system theme renders in
+/// grayscale (theme.ts:408-409).
+static TERMINAL_COLORS_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn lock_terminal<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// `setTerminalColors` (theme.ts:418-421): record the terminal's reported
+/// colors and end the pending (grayscale) state.
+pub fn set_terminal_colors(colors: TerminalColors) {
+    *lock_terminal(&TERMINAL_COLORS) = colors;
+    TERMINAL_COLORS_REPORTED.store(true, AtomicOrdering::Relaxed);
+    TERMINAL_COLORS_PENDING.store(false, AtomicOrdering::Relaxed);
+}
+
+/// The terminal's last reported colors (clone of the shared snapshot).
+pub fn get_terminal_colors() -> TerminalColors {
+    lock_terminal(&TERMINAL_COLORS).clone()
+}
+
+/// Whether `set_terminal_colors` has ever been called (the controller's
+/// first-report check).
+pub fn has_terminal_colors() -> bool {
+    TERMINAL_COLORS_REPORTED.load(AtomicOrdering::Relaxed)
+}
+
+/// `setTerminalColorScheme` (theme.ts:424-426): the fallback appearance for
+/// terminals that do not report their background.
+pub fn set_terminal_color_scheme(scheme: Option<TerminalTheme>) {
+    *lock_terminal(&TERMINAL_COLOR_SCHEME) = scheme;
+}
+
+/// The terminal's last light/dark report.
+pub fn get_terminal_color_scheme() -> Option<TerminalTheme> {
+    *lock_terminal(&TERMINAL_COLOR_SCHEME)
+}
+
+/// `markTerminalColorsPending` (theme.ts:429-431): render the system theme
+/// in grayscale until `set_terminal_colors` reports the terminal's colors.
+pub fn mark_terminal_colors_pending() {
+    TERMINAL_COLORS_PENDING.store(true, AtomicOrdering::Relaxed);
+}
+
+/// Whether the system theme is currently rendering in grayscale.
+pub fn terminal_colors_pending() -> bool {
+    TERMINAL_COLORS_PENDING.load(AtomicOrdering::Relaxed)
+}
+
+/// `detectColorFgBgTheme` (theme.ts:697-705 @ a13d35a74): the last numeric
+/// `COLORFGBG` field is an ANSI index classified like Vim — 0-6 and 8 dark,
+/// 7 and 9-15 light; anything else has no answer.
+pub fn detect_color_fg_bg_theme(colorfgbg: Option<&str>) -> Option<TerminalTheme> {
+    let background = colorfgbg?.rsplit(';').next()?.trim();
+    if background.is_empty()
+        || background.len() > 2
+        || !background.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let index: u32 = background.parse().ok()?;
+    if index > 15 {
+        return None;
+    }
+    Some(if index <= 6 || index == 8 {
+        TerminalTheme::Dark
+    } else {
+        TerminalTheme::Light
+    })
+}
+
+/// `detectTerminalTheme` (theme.ts:707-716 @ a13d35a74): the reported
+/// background (with the foreground as a tiebreaker) decides; without one the
+/// terminal's light/dark report, then `COLORFGBG`, then dark.
+pub fn detect_terminal_theme(
+    colors: &TerminalColors,
+    reported_scheme: Option<TerminalTheme>,
+    colorfgbg: Option<&str>,
+) -> TerminalTheme {
+    if let Some(background) = colors.background {
+        return match system::terminal_appearance(background, colors.foreground) {
+            system::Appearance::Dark => TerminalTheme::Dark,
+            system::Appearance::Light => TerminalTheme::Light,
+        };
+    }
+    reported_scheme
+        .or_else(|| detect_color_fg_bg_theme(colorfgbg))
+        .unwrap_or(TerminalTheme::Dark)
+}
+
+/// `getTerminalTheme` (theme.ts:719-721): the appearance from everything the
+/// terminal reported so far.
+pub fn get_terminal_theme() -> TerminalTheme {
+    detect_terminal_theme(
+        &get_terminal_colors(),
+        get_terminal_color_scheme(),
+        std::env::var("COLORFGBG").ok().as_deref(),
+    )
+}
+
+/// `createSystemTheme` (theme.ts:614-624): generate the `system` theme from
+/// the terminal's reported colors (grayscale while they are pending).
+pub fn create_system_theme(mode: Option<ColorMode>) -> Theme {
+    let colors = get_terminal_colors();
+    let generated = system::generate_system_theme_colors(&system::SystemThemeInput {
+        foreground: colors.foreground,
+        background: colors.background,
+        palette: colors.palette,
+        saturation: Some(if terminal_colors_pending() { 0.0 } else { 1.0 }),
+        appearance_hint: Some(match get_terminal_theme() {
+            TerminalTheme::Dark => system::Appearance::Dark,
+            TerminalTheme::Light => system::Appearance::Light,
+        }),
+    });
+    let resolved: HashMap<String, ResolvedColor> = generated
+        .colors
+        .iter()
+        .map(|(token, value)| {
+            let resolved = match value {
+                system::SystemColorValue::Hex(hex) => ResolvedColor::Hex(hex.clone()),
+                system::SystemColorValue::Index(index) => ResolvedColor::Index(*index),
+                system::SystemColorValue::Default => ResolvedColor::Empty,
+            };
+            ((*token).to_string(), resolved)
+        })
+        .collect();
+    let appearance = generated.appearance.map(|appearance| match appearance {
+        system::Appearance::Dark => TerminalTheme::Dark,
+        system::Appearance::Light => TerminalTheme::Light,
+    });
+    let dim: Vec<String> = generated
+        .dim
+        .iter()
+        .map(|token| (*token).to_string())
+        .collect();
+    Theme::from_resolved(
+        resolved,
+        mode.unwrap_or(ColorMode::TrueColor),
+        Some(SYSTEM_THEME_NAME.to_string()),
+        None,
+        appearance,
+        dim,
+    )
+    .expect("generated system theme colors always build")
+}
+
+/// Map the rpi [ColorMode] onto the TUI color mode.
+pub(crate) fn tui_color_mode(mode: ColorMode) -> tui_colors::TerminalColorMode {
+    match mode {
+        ColorMode::TrueColor => tui_colors::TerminalColorMode::TrueColor,
+        ColorMode::Color256 => tui_colors::TerminalColorMode::Color256,
+    }
+}
+
+/// `parseColor` on a theme color string plus the `#rgb` expansion
+/// (theme.ts:171-183; colors.ts:121-140).
+fn resolved_rgb(value: &str) -> Result<Rgb, RpiError> {
+    if let Some(hex) = value.strip_prefix('#') {
+        if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let mut expanded = String::from("#");
+            for c in hex.chars() {
+                expanded.push(c);
+                expanded.push(c);
+            }
+            return hex_to_rgb(&expanded);
+        }
+        return hex_to_rgb(value);
+    }
+    let color =
+        tui_colors::parse_color(value).map_err(|error| RpiError::Resource(error.to_string()))?;
+    let rgb = tui_colors::color_to_rgb(&color);
+    Ok(Rgb {
+        r: rgb.r.round() as u32,
+        g: rgb.g.round() as u32,
+        b: rgb.b.round() as u32,
+    })
+}
+
+/// `#rrggbb` for a resolved color string (hex passthrough/normalization, or
+/// `parseColor` for OKLCH/OKHSL values).
+pub fn resolved_color_to_hex(value: &str) -> String {
+    if let Some(hex) = value.strip_prefix('#') {
+        if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let mut expanded = String::from("#");
+            for c in hex.chars() {
+                expanded.push(c);
+                expanded.push(c);
+            }
+            return expanded;
+        }
+        if hex.len() == 6 {
+            return value.to_string();
+        }
+    }
+    match tui_colors::parse_color(value) {
+        Ok(color) => tui_colors::color_to_hex(&color),
+        Err(_) => value.to_string(),
+    }
+}
+
+/// Upstream `/^ok(lch|hsl)\(/i` literal-color check in `resolveVarRefs`
+/// (theme.ts:234).
+fn is_function_color(value: &str) -> bool {
+    for prefix in ["oklch(", "okhsl("] {
+        if value
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            return true;
+        }
+    }
+    false
+}
 
 // ===========================================================================
 // Built-in theme JSON (verbatim values from upstream dark.json / light.json)
@@ -43,11 +282,165 @@ pub mod system;
 
 /// Embedded `dark.json` (values ported verbatim from
 /// `packages/coding-agent/src/modes/interactive/theme/dark.json`).
-const DARK_THEME_JSON: &str = r##"{"name":"dark","vars":{"cyan":"#00d7ff","blue":"#5f87ff","green":"#b5bd68","red":"#cc6666","yellow":"#ffff00","text":"#d4d4d4","gray":"#808080","dimGray":"#666666","darkGray":"#505050","accent":"#8abeb7","selectedBg":"#3a3a4a","userMsgBg":"#343541","toolPendingBg":"#282832","toolSuccessBg":"#283228","toolErrorBg":"#3c2828","customMsgBg":"#2d2838"},"colors":{"accent":"accent","border":"blue","borderAccent":"cyan","borderMuted":"darkGray","success":"green","error":"red","warning":"yellow","muted":"gray","dim":"dimGray","text":"text","thinkingText":"gray","selectedBg":"selectedBg","userMessageBg":"userMsgBg","userMessageText":"text","customMessageBg":"customMsgBg","customMessageText":"text","customMessageLabel":"#9575cd","toolPendingBg":"toolPendingBg","toolSuccessBg":"toolSuccessBg","toolErrorBg":"toolErrorBg","toolTitle":"text","toolOutput":"gray","mdHeading":"#f0c674","mdLink":"#81a2be","mdLinkUrl":"dimGray","mdCode":"accent","mdCodeBlock":"green","mdCodeBlockBorder":"gray","mdQuote":"gray","mdQuoteBorder":"gray","mdHr":"gray","mdListBullet":"accent","toolDiffAdded":"green","toolDiffRemoved":"red","toolDiffContext":"gray","syntaxComment":"#6A9955","syntaxKeyword":"#569CD6","syntaxFunction":"#DCDCAA","syntaxVariable":"#9CDCFE","syntaxString":"#CE9178","syntaxNumber":"#B5CEA8","syntaxType":"#4EC9B0","syntaxOperator":"#D4D4D4","syntaxPunctuation":"#D4D4D4","thinkingOff":"darkGray","thinkingMinimal":"#6e6e6e","thinkingLow":"#5f87af","thinkingMedium":"#81a2be","thinkingHigh":"#b294bb","thinkingXhigh":"#d183e8","thinkingMax":"#ff5fff","bashMode":"green","scrollbarTrack":"darkGray","scrollbarThumb":"text","searchMatchBg":"selectedBg","searchMatchText":"text"},"export":{"pageBg":"#18181e","cardBg":"#1e1e24","infoBg":"#3c3728"}}"##;
+const DARK_THEME_JSON: &str = r##"{
+	"$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+	"name": "dark",
+	"appearance": "dark",
+	"vars": {
+		"text": "okhsl(234 3% 89%)",
+		"muted": "okhsl(229 6% 67%)",
+		"violet": "okhsl(295 50% 67%)",
+		"blue": "okhsl(232 54% 67%)",
+		"green": "okhsl(159 59% 67%)",
+		"red": "okhsl(20 72% 67%)",
+		"yellow": "okhsl(83 88% 67%)",
+		"blueBg": "okhsl(233 41% 24%)"
+	},
+	"colors": {
+		"accent": "violet",
+		"border": "okhsl(231 57% 65%)",
+		"borderAccent": "okhsl(295 53% 64%)",
+		"borderMuted": "okhsl(229 8% 53%)",
+		"success": "green",
+		"error": "red",
+		"warning": "yellow",
+		"muted": "muted",
+		"dim": "okhsl(229 8% 56%)",
+		"text": "text",
+		"thinkingText": "okhsl(226 7% 65%)",
+		"selectedBg": "blueBg",
+		"scrollbarTrack": "okhsl(237 7% 33%)",
+		"scrollbarThumb": "okhsl(232 7% 65%)",
+		"searchMatchBg": "okhsl(53 51% 24%)",
+		"searchMatchText": "muted",
+		"userMessageBg": "blueBg",
+		"userMessageText": "text",
+		"customMessageBg": "okhsl(295 42% 24%)",
+		"customMessageText": "muted",
+		"customMessageLabel": "violet",
+		"toolPendingBg": "okhsl(229 5% 24%)",
+		"toolSuccessBg": "okhsl(158 46% 25%)",
+		"toolErrorBg": "okhsl(19 54% 25%)",
+		"toolTitle": "text",
+		"toolOutput": "muted",
+		"mdHeading": "yellow",
+		"mdLink": "blue",
+		"mdLinkUrl": "muted",
+		"mdCode": "violet",
+		"mdCodeBlock": "green",
+		"mdCodeBlockBorder": "muted",
+		"mdQuote": "muted",
+		"mdQuoteBorder": "muted",
+		"mdHr": "muted",
+		"mdListBullet": "violet",
+		"toolDiffAdded": "green",
+		"toolDiffRemoved": "red",
+		"toolDiffContext": "muted",
+		"syntaxComment": "muted",
+		"syntaxKeyword": "blue",
+		"syntaxFunction": "yellow",
+		"syntaxVariable": "okhsl(202 58% 67%)",
+		"syntaxString": "okhsl(52 67% 67%)",
+		"syntaxNumber": "green",
+		"syntaxType": "violet",
+		"syntaxOperator": "muted",
+		"syntaxPunctuation": "muted",
+		"thinkingOff": "okhsl(229 8% 49%)",
+		"thinkingMinimal": "okhsl(232 20% 52%)",
+		"thinkingLow": "okhsl(232 45% 54%)",
+		"thinkingMedium": "okhsl(263 59% 56%)",
+		"thinkingHigh": "okhsl(295 73% 59%)",
+		"thinkingXhigh": "okhsl(337 81% 61%)",
+		"thinkingMax": "okhsl(20 99% 63%)",
+		"bashMode": "okhsl(159 64% 65%)"
+	},
+	"export": {
+		"pageBg": "okhsl(262 14% 16%)",
+		"cardBg": "okhsl(264 13% 19%)",
+		"infoBg": "okhsl(53 51% 24%)"
+	}
+}"##;
 
 /// Embedded `light.json` (values ported verbatim from
 /// `packages/coding-agent/src/modes/interactive/theme/light.json`).
-const LIGHT_THEME_JSON: &str = r##"{"name":"light","vars":{"teal":"#5a8080","blue":"#547da7","green":"#588458","red":"#aa5555","yellow":"#9a7326","text":"#1f2328","mediumGray":"#6c6c6c","dimGray":"#767676","lightGray":"#b0b0b0","selectedBg":"#d0d0e0","userMsgBg":"#e8e8e8","toolPendingBg":"#e8e8f0","toolSuccessBg":"#e8f0e8","toolErrorBg":"#f0e8e8","customMsgBg":"#ede7f6"},"colors":{"accent":"teal","border":"blue","borderAccent":"teal","borderMuted":"lightGray","success":"green","error":"red","warning":"yellow","muted":"mediumGray","dim":"dimGray","text":"text","thinkingText":"mediumGray","selectedBg":"selectedBg","userMessageBg":"userMsgBg","userMessageText":"text","customMessageBg":"customMsgBg","customMessageText":"text","customMessageLabel":"#7e57c2","toolPendingBg":"toolPendingBg","toolSuccessBg":"toolSuccessBg","toolErrorBg":"toolErrorBg","toolTitle":"text","toolOutput":"mediumGray","mdHeading":"yellow","mdLink":"blue","mdLinkUrl":"dimGray","mdCode":"teal","mdCodeBlock":"green","mdCodeBlockBorder":"mediumGray","mdQuote":"mediumGray","mdQuoteBorder":"mediumGray","mdHr":"mediumGray","mdListBullet":"green","toolDiffAdded":"green","toolDiffRemoved":"red","toolDiffContext":"mediumGray","syntaxComment":"#008000","syntaxKeyword":"#0000FF","syntaxFunction":"#795E26","syntaxVariable":"#001080","syntaxString":"#A31515","syntaxNumber":"#098658","syntaxType":"#267F99","syntaxOperator":"#000000","syntaxPunctuation":"#000000","thinkingOff":"lightGray","thinkingMinimal":"#767676","thinkingLow":"blue","thinkingMedium":"teal","thinkingHigh":"#875f87","thinkingXhigh":"#8b008b","thinkingMax":"#af005f","bashMode":"green","scrollbarTrack":"lightGray","scrollbarThumb":"text","searchMatchBg":"selectedBg","searchMatchText":"text"},"export":{"pageBg":"#f8f8f8","cardBg":"#ffffff","infoBg":"#fffae6"}}"##;
+const LIGHT_THEME_JSON: &str = r##"{
+	"$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+	"name": "light",
+	"appearance": "light",
+	"vars": {
+		"text": "okhsl(225 5% 27%)",
+		"muted": "okhsl(229 8% 47%)",
+		"violet": "okhsl(295 60% 46%)",
+		"blue": "okhsl(231 68% 47%)",
+		"green": "okhsl(159 75% 46%)",
+		"red": "okhsl(20 91% 47%)",
+		"yellow": "okhsl(83 99% 47%)",
+		"blueBg": "okhsl(235 19% 91%)"
+	},
+	"colors": {
+		"accent": "violet",
+		"border": "okhsl(231 67% 55%)",
+		"borderAccent": "okhsl(295 59% 55%)",
+		"borderMuted": "okhsl(235 7% 66%)",
+		"success": "green",
+		"error": "red",
+		"warning": "yellow",
+		"muted": "muted",
+		"dim": "okhsl(229 7% 59%)",
+		"text": "text",
+		"thinkingText": "okhsl(234 8% 55%)",
+		"selectedBg": "blueBg",
+		"scrollbarTrack": "okhsl(248 3% 90%)",
+		"scrollbarThumb": "okhsl(226 7% 65%)",
+		"searchMatchBg": "okhsl(56 22% 91%)",
+		"searchMatchText": "muted",
+		"userMessageBg": "blueBg",
+		"userMessageText": "text",
+		"customMessageBg": "okhsl(295 25% 91%)",
+		"customMessageText": "muted",
+		"customMessageLabel": "violet",
+		"toolPendingBg": "okhsl(248 3% 91%)",
+		"toolSuccessBg": "okhsl(156 21% 91%)",
+		"toolErrorBg": "okhsl(24 23% 91%)",
+		"toolTitle": "text",
+		"toolOutput": "muted",
+		"mdHeading": "yellow",
+		"mdLink": "blue",
+		"mdLinkUrl": "muted",
+		"mdCode": "violet",
+		"mdCodeBlock": "green",
+		"mdCodeBlockBorder": "muted",
+		"mdQuote": "muted",
+		"mdQuoteBorder": "muted",
+		"mdHr": "muted",
+		"mdListBullet": "violet",
+		"toolDiffAdded": "green",
+		"toolDiffRemoved": "red",
+		"toolDiffContext": "muted",
+		"syntaxComment": "muted",
+		"syntaxKeyword": "blue",
+		"syntaxFunction": "yellow",
+		"syntaxVariable": "okhsl(203 73% 46%)",
+		"syntaxString": "okhsl(52 84% 46%)",
+		"syntaxNumber": "green",
+		"syntaxType": "violet",
+		"syntaxOperator": "muted",
+		"syntaxPunctuation": "muted",
+		"thinkingOff": "okhsl(223 5% 80%)",
+		"thinkingMinimal": "okhsl(229 14% 78%)",
+		"thinkingLow": "okhsl(232 33% 76%)",
+		"thinkingMedium": "okhsl(264 48% 74%)",
+		"thinkingHigh": "okhsl(295 62% 72%)",
+		"thinkingXhigh": "okhsl(337 74% 70%)",
+		"thinkingMax": "okhsl(20 98% 68%)",
+		"bashMode": "okhsl(159 74% 55%)"
+	},
+	"export": {
+		"pageBg": "okhsl(17 3% 94%)",
+		"cardBg": "okhsl(17 5% 97%)",
+		"infoBg": "okhsl(56 22% 91%)"
+	}
+}"##;
 
 // ===========================================================================
 // Constants
@@ -212,16 +605,6 @@ const GRAY_VALUES: [u32; 24] = [
 // Terminal introspection byte sequences (actual send/receive is T12)
 // ===========================================================================
 
-/// OSC 11 query — queries the terminal default background colour
-/// (written at `tui.ts:1689`). Response: `\x1b]11;rgb:RRRR/GGGG/BBBB\x07`
-/// parsed by [`parse_osc11_background_color`].
-pub const OSC_11_QUERY: &[u8] = b"\x1b]11;?\x07";
-
-/// CSI ?996n — queries the terminal colour-scheme preference (dark/light)
-/// (written at `tui.ts:1716`). Response: `\x1b[?997;Nn` parsed by
-/// [`parse_terminal_color_scheme_report`].
-pub const CSI_996_QUERY: &[u8] = b"\x1b[?996n";
-
 /// CSI 16t — queries the terminal cell dimensions in pixels (written at
 /// `tui.ts:686`, only used by image-capable terminals).
 pub const CSI_16T_QUERY: &[u8] = b"\x1b[16t";
@@ -361,10 +744,11 @@ pub enum ColorMode {
 /// terminal-image.ts:172; theme construction consumes it,
 /// resource-loader.ts @ ddba59618 #9973).
 pub fn terminal_color_mode() -> ColorMode {
-    if rpi_tui::terminal_image::get_capabilities().true_color {
-        ColorMode::TrueColor
-    } else {
-        ColorMode::Color256
+    // Single detection source (terminal-image.ts:172 @ a13d35a74): reuse the
+    // capability-based decision instead of re-reading the flags.
+    match rpi_tui::terminal_image::get_terminal_color_mode() {
+        tui_colors::TerminalColorMode::TrueColor => ColorMode::TrueColor,
+        tui_colors::TerminalColorMode::Color256 => ColorMode::Color256,
     }
 }
 
@@ -454,6 +838,10 @@ pub struct ThemeExport {
 pub struct ThemeJson {
     #[serde(default)]
     pub name: String,
+    /// `appearance` (theme.ts:96-100 @ a13d35a74): the background the theme
+    /// is designed for; detected from the theme colors when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub vars: HashMap<String, ColorValue>,
     pub colors: HashMap<String, ColorValue>,
@@ -476,11 +864,29 @@ pub struct ThemeInfo {
     pub path: Option<PathBuf>,
 }
 
+/// `ThemeStyle` (theme.ts:123-128 @ a13d35a74): a token name or a concrete
+/// color for either slot plus text attributes.
+#[derive(Debug, Clone, Default)]
+pub struct ThemeStyle {
+    pub fg: Option<ThemeStyleColor>,
+    pub bg: Option<ThemeStyleColor>,
+    pub attributes: tui_colors::TextAttributes,
+}
+
+/// Either a theme token name (`ThemeColor`/`ThemeBg`) or a concrete color.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThemeStyleColor {
+    Token(String),
+    Color(tui_colors::Color),
+}
+
 /// A constructed theme with pre-computed ANSI escape sequences.
 ///
-/// Port of `class Theme` (theme.ts:330-432). Foreground and background
-/// colours are separated because they use different ANSI reset codes (39 vs
-/// 49).
+/// Port of `class Theme` (theme.ts:330-432 @ a13d35a74). Foreground and
+/// background colours are separated because they use different ANSI reset
+/// codes (39 vs 49). `colors` holds the concrete color per token (terminal
+/// defaults resolved at construction) and `dim_tokens` the tokens rendered
+/// faint (SGR 2).
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub name: Option<String>,
@@ -488,6 +894,9 @@ pub struct Theme {
     fg_colors: HashMap<String, String>,
     bg_colors: HashMap<String, String>,
     mode: ColorMode,
+    own_appearance: Option<TerminalTheme>,
+    colors: HashMap<String, tui_colors::Color>,
+    dim_tokens: HashSet<String>,
 }
 
 // ===========================================================================
@@ -616,7 +1025,7 @@ fn fg_ansi(color: &ResolvedColor, mode: ColorMode) -> Result<String, RpiError> {
         ResolvedColor::Empty => Ok("\x1b[39m".to_string()),
         ResolvedColor::Index(i) => Ok(format!("\x1b[38;5;{}m", i)),
         ResolvedColor::Hex(h) => {
-            let rgb = hex_to_rgb(h)?;
+            let rgb = resolved_rgb(h)?;
             match mode {
                 ColorMode::TrueColor => Ok(format!("\x1b[38;2;{};{};{}m", rgb.r, rgb.g, rgb.b)),
                 ColorMode::Color256 => {
@@ -635,7 +1044,7 @@ fn bg_ansi(color: &ResolvedColor, mode: ColorMode) -> Result<String, RpiError> {
         ResolvedColor::Empty => Ok("\x1b[49m".to_string()),
         ResolvedColor::Index(i) => Ok(format!("\x1b[48;5;{}m", i)),
         ResolvedColor::Hex(h) => {
-            let rgb = hex_to_rgb(h)?;
+            let rgb = resolved_rgb(h)?;
             match mode {
                 ColorMode::TrueColor => Ok(format!("\x1b[48;2;{};{};{}m", rgb.r, rgb.g, rgb.b)),
                 ColorMode::Color256 => {
@@ -664,7 +1073,7 @@ fn resolve_var_refs(
             if s.is_empty() {
                 return Ok(ResolvedColor::Empty);
             }
-            if s.starts_with('#') {
+            if s.starts_with('#') || is_function_color(s) {
                 return Ok(ResolvedColor::Hex(s.clone()));
             }
             // Variable reference
@@ -761,6 +1170,12 @@ fn is_valid_color_value(v: &serde_json::Value) -> bool {
 /// Validate a theme name — must not contain `/` (theme.ts:516-522,
 /// schema pattern `^[^/]+$`).
 pub fn assert_theme_name_is_valid(name: &str) -> Result<(), RpiError> {
+    if name == SYSTEM_THEME_NAME {
+        return Err(RpiError::Resource(format!(
+            "Invalid theme name \"{}\": \"{}\" is reserved for the generated system theme.",
+            name, SYSTEM_THEME_NAME
+        )));
+    }
     if name.contains('/') {
         return Err(RpiError::Resource(format!(
             "Invalid theme name \"{}\": theme names cannot contain \"/\" because it is reserved for automatic light/dark theme settings.",
@@ -997,25 +1412,25 @@ pub fn create_theme(
     let colors = with_color_fallbacks(theme_json.colors.clone());
 
     let resolved = resolve_theme_colors(&colors, &theme_json.vars)?;
-    let bg_set: HashSet<&str> = BG_COLOR_KEYS.iter().copied().collect();
-    let mut fg_colors: HashMap<String, String> = HashMap::new();
-    let mut bg_colors: HashMap<String, String> = HashMap::new();
-
-    for (key, color) in &resolved {
-        if bg_set.contains(key.as_str()) {
-            bg_colors.insert(key.clone(), bg_ansi(color, color_mode)?);
-        } else {
-            fg_colors.insert(key.clone(), fg_ansi(color, color_mode)?);
+    let appearance = match theme_json.appearance.as_deref() {
+        Some("dark") => Some(TerminalTheme::Dark),
+        Some("light") => Some(TerminalTheme::Light),
+        Some(other) => {
+            return Err(RpiError::Resource(format!(
+                "Invalid theme \"{}\": appearance must be \"dark\" or \"light\", got \"{}\". See the built-in themes (dark.json, light.json) for reference values.",
+                theme_json.name, other
+            )));
         }
-    }
-
-    Ok(Theme {
-        name: Some(theme_json.name.clone()),
-        source_path: source_path.map(Path::to_path_buf),
-        fg_colors,
-        bg_colors,
-        mode: color_mode,
-    })
+        None => None,
+    };
+    Theme::from_resolved(
+        resolved,
+        color_mode,
+        Some(theme_json.name.clone()),
+        source_path.map(Path::to_path_buf),
+        appearance,
+        Vec::new(),
+    )
 }
 
 /// Load and construct a theme from a file path (theme.ts:623-627).
@@ -1050,6 +1465,11 @@ pub fn load_theme_json(name: &str) -> Result<ThemeJson, RpiError> {
 
 /// Load and construct a [`Theme`] by name (theme.ts:629-636).
 pub fn load_theme(name: &str, mode: Option<ColorMode>) -> Result<Theme, RpiError> {
+    // The system theme name is reserved: it takes precedence over custom
+    // themes of the same name (theme.ts:629-636 @ a13d35a74).
+    if name == SYSTEM_THEME_NAME {
+        return Ok(create_system_theme(mode));
+    }
     let theme_json = load_theme_json(name)?;
     create_theme(&theme_json, mode, None)
 }
@@ -1065,6 +1485,14 @@ pub fn get_theme_by_name(name: &str) -> Option<Theme> {
 pub fn get_available_themes() -> Vec<ThemeInfo> {
     let mut result: Vec<ThemeInfo> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+
+    // The system theme is generated, so it has no file; it comes first
+    // (theme.ts:470-514 @ a13d35a74).
+    seen.insert(SYSTEM_THEME_NAME.to_string());
+    result.push(ThemeInfo {
+        name: SYSTEM_THEME_NAME.to_string(),
+        path: None,
+    });
 
     // Built-in themes
     for name in get_builtin_themes().keys() {
@@ -1099,7 +1527,15 @@ pub fn get_available_themes() -> Vec<ThemeInfo> {
         }
     }
 
-    result.sort_by(|a, b| a.name.cmp(&b.name));
+    // The system theme comes first: it is the default and adapts to every
+    // terminal.
+    result.sort_by(
+        |a, b| match (a.name == SYSTEM_THEME_NAME, b.name == SYSTEM_THEME_NAME) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        },
+    );
     result
 }
 
@@ -1139,20 +1575,29 @@ pub fn get_resolved_theme_colors(theme_name: &str) -> Result<HashMap<String, Str
         let css = match color {
             ResolvedColor::Index(i) => ansi256_to_hex(*i),
             ResolvedColor::Empty => default_text.to_string(),
-            ResolvedColor::Hex(h) => h.clone(),
+            // CSS custom properties take hex; OKLCH/OKHSL values (and #rgb)
+            // go through `colorToHex(parseColor(...))` (theme.ts:1022-1043).
+            ResolvedColor::Hex(h) => resolved_color_to_hex(h),
         };
         css_colors.insert(key.clone(), css);
     }
     Ok(css_colors)
 }
 
-/// Check if a theme name is the light theme (theme.ts:1048-1051).
+/// Check if a theme is a light theme (theme.ts:1048-1051 @ a13d35a74):
+/// loads the theme and compares its appearance.
 pub fn is_light_theme(theme_name: &str) -> bool {
-    theme_name == "light"
+    get_theme_by_name(theme_name)
+        .map(|theme| theme.appearance() == TerminalTheme::Light)
+        .unwrap_or(false)
 }
 
 /// Get explicit export colours from a theme (theme.ts:1057-1085).
 pub fn get_theme_export_colors(theme_name: &str) -> ThemeExportColors {
+    // The generated system theme has no export colors (theme.ts:1057-1085).
+    if theme_name == SYSTEM_THEME_NAME {
+        return ThemeExportColors::default();
+    }
     let theme_json = match load_theme_json(theme_name) {
         Ok(j) => j,
         Err(_) => return ThemeExportColors::default(),
@@ -1169,7 +1614,9 @@ pub fn get_theme_export_colors(theme_name: &str) -> ThemeExportColors {
         match resolved {
             ResolvedColor::Index(i) => Some(ansi256_to_hex(i)),
             ResolvedColor::Empty => None,
-            ResolvedColor::Hex(h) => Some(h),
+            // Export colors end up in CSS, which understands hex and
+            // oklch() directly but not okhsl() (theme.ts:1070-1082).
+            ResolvedColor::Hex(h) => Some(resolved_color_to_hex(&h)),
         }
     };
     ThemeExportColors {
@@ -1231,69 +1678,22 @@ pub fn resolve_theme_setting(
 // ===========================================================================
 
 /// sRGB → linear conversion for one channel (theme.ts:719-722).
-fn to_linear(channel: u32) -> f64 {
-    let value = channel as f64 / 255.0;
-    if value <= 0.03928 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
+/// `detectTerminalBackgroundFromEnv` (theme.ts:734-753 @ 9841914, superseded
+/// by `detectTerminalTheme` @ a13d35a74): the `COLORFGBG` index classified
+/// like Vim, falling back to dark.
+pub fn detect_terminal_background_from_env() -> TerminalThemeDetection {
+    let colorfgbg = std::env::var("COLORFGBG").unwrap_or_default();
+    detect_terminal_background_from_env_str(&colorfgbg)
 }
 
-/// Relative luminance of an RGB colour (theme.ts:718-724).
-pub fn get_rgb_color_luminance(rgb: &Rgb) -> f64 {
-    0.2126 * to_linear(rgb.r) + 0.7152 * to_linear(rgb.g) + 0.0722 * to_linear(rgb.b)
-}
-
-/// Luminance from a 256-colour index (theme.ts:726-728).
-pub fn get_ansi_color_luminance(index: u32) -> f64 {
-    let hex = ansi256_to_hex(index);
-    let rgb = hex_to_rgb(&hex).unwrap_or(Rgb { r: 0, g: 0, b: 0 });
-    get_rgb_color_luminance(&rgb)
-}
-
-/// Classify an RGB colour as light or dark (theme.ts:730-732).
-pub fn get_theme_for_rgb_color(rgb: &Rgb) -> TerminalTheme {
-    if get_rgb_color_luminance(rgb) >= 0.5 {
-        TerminalTheme::Light
-    } else {
-        TerminalTheme::Dark
-    }
-}
-
-/// Parse the background index from a COLORFGBG env var (theme.ts:707-716).
-///
-/// Format is typically `"fg;bg"` or `"fg;bg;0"`. Scans from the right for the
-/// first valid 0-255 integer.
-pub fn get_color_fg_bg_background_index(colorfgbg: &str) -> Option<u32> {
-    let parts: Vec<&str> = colorfgbg.split(';').collect();
-    for part in parts.iter().rev() {
-        let trimmed = part.trim();
-        if let Ok(bg) = trimmed.parse::<u32>()
-            && bg <= 255
-        {
-            return Some(bg);
-        }
-    }
-    None
-}
-
-/// Detect terminal theme from environment (COLORFGBG or fallback)
-/// (theme.ts:734-753).
-///
-/// Pure function — does not read `std::env`. Pass the COLORFGBG string
-/// explicitly.
+/// Pure form of [`detect_terminal_background_from_env`]; does not read
+/// `std::env`.
 pub fn detect_terminal_background_from_env_str(colorfgbg: &str) -> TerminalThemeDetection {
-    if let Some(bg) = get_color_fg_bg_background_index(colorfgbg) {
-        let luminance = get_ansi_color_luminance(bg);
+    if let Some(theme) = detect_color_fg_bg_theme(Some(colorfgbg)) {
         return TerminalThemeDetection {
-            theme: if luminance >= 0.5 {
-                TerminalTheme::Light
-            } else {
-                TerminalTheme::Dark
-            },
+            theme,
             source: TerminalThemeSource::ColorFgBg,
-            detail: format!("background color index {}", bg),
+            detail: format!("COLORFGBG {}", colorfgbg),
             confidence: TerminalThemeConfidence::High,
         };
     }
@@ -1303,110 +1703,6 @@ pub fn detect_terminal_background_from_env_str(colorfgbg: &str) -> TerminalTheme
         detail: "no terminal background hint found".to_string(),
         confidence: TerminalThemeConfidence::Low,
     }
-}
-
-/// Detect terminal theme from environment (theme.ts:734-753).
-///
-/// Reads `COLORFGBG` from the process environment.
-pub fn detect_terminal_background_from_env() -> TerminalThemeDetection {
-    let colorfgbg = std::env::var("COLORFGBG").unwrap_or_default();
-    detect_terminal_background_from_env_str(&colorfgbg)
-}
-
-// ===========================================================================
-// OSC / CSI Response Parsing (terminal-colors.ts)
-// ===========================================================================
-
-/// Check whether `data` is an OSC 11 background-colour response
-/// (terminal-colors.ts:31-33).
-pub fn is_osc11_background_color_response(data: &str) -> bool {
-    parse_osc11_background_color(data).is_some()
-}
-
-/// Parse an OSC 11 background-colour response into [`Rgb`]
-/// (terminal-colors.ts:35-65).
-///
-/// Supports `#RRGGBB` (6 hex), `#RRRRGGGGBBBB` (12 hex), and
-/// `rgb:RRRR/GGGG/BBBB` formats. Multi-digit channels are normalised to 0-255
-/// by linear scaling.
-pub fn parse_osc11_background_color(data: &str) -> Option<Rgb> {
-    let bytes = data.as_bytes();
-    if bytes.len() < 7 {
-        return None;
-    }
-    // Must start with ESC ] 1 1 ;
-    if &bytes[..5] != b"\x1b]11;" {
-        return None;
-    }
-    // Must end with BEL or ESC-backslash (ST)
-    let body_end = if bytes[bytes.len() - 1] == 0x07 {
-        bytes.len() - 1
-    } else if bytes.len() >= 2 && &bytes[bytes.len() - 2..] == b"\x1b\\" {
-        bytes.len() - 2
-    } else {
-        return None;
-    };
-    let body = std::str::from_utf8(&bytes[5..body_end]).ok()?.trim();
-    parse_osc_color_value(body)
-}
-
-/// Parse a colour value from an OSC 11 response body.
-fn parse_osc_color_value(value: &str) -> Option<Rgb> {
-    if let Some(hex) = value.strip_prefix('#') {
-        if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            let r = u32::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u32::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u32::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some(Rgb { r, g, b });
-        }
-        if hex.len() == 12 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            let r = parse_osc_hex_channel(&hex[0..4])?;
-            let g = parse_osc_hex_channel(&hex[4..8])?;
-            let b = parse_osc_hex_channel(&hex[8..12])?;
-            return Some(Rgb { r, g, b });
-        }
-        return None;
-    }
-    // rgb:RRRR/GGGG/BBBB or rgba:RRRR/GGGG/BBBB format
-    let lower = value.to_ascii_lowercase();
-    let rest = lower
-        .strip_prefix("rgba:")
-        .or_else(|| lower.strip_prefix("rgb:"))?;
-    let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let r = parse_osc_hex_channel(parts[0])?;
-    let g = parse_osc_hex_channel(parts[1])?;
-    let b = parse_osc_hex_channel(parts[2])?;
-    Some(Rgb { r, g, b })
-}
-
-/// Normalise a variable-length hex channel to 0-255 (terminal-colors.ts:17-26).
-fn parse_osc_hex_channel(channel: &str) -> Option<u32> {
-    if channel.is_empty() || !channel.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let len = channel.len();
-    let max = 16_u32.pow(len as u32).saturating_sub(1);
-    if max == 0 {
-        return None;
-    }
-    let val = u32::from_str_radix(channel, 16).ok()?;
-    Some(((val as f64 / max as f64) * 255.0).round() as u32)
-}
-
-/// Parse a CSI ?997 colour-scheme report (terminal-colors.ts:67-72).
-///
-/// `\x1b[?997;1n` → Dark, `\x1b[?997;2n` → Light.
-pub fn parse_terminal_color_scheme_report(data: &str) -> Option<TerminalTheme> {
-    if data == "\x1b[?997;1n" {
-        return Some(TerminalTheme::Dark);
-    }
-    if data == "\x1b[?997;2n" {
-        return Some(TerminalTheme::Light);
-    }
-    None
 }
 
 // ===========================================================================
@@ -1434,22 +1730,219 @@ pub fn get_theme_watch_path(theme_name: &str) -> Option<PathBuf> {
 // Theme struct methods
 // ===========================================================================
 
+/// Convert a resolved color into the concrete color model.
+fn resolved_to_color(color: &ResolvedColor) -> Option<tui_colors::Color> {
+    match color {
+        ResolvedColor::Empty => None,
+        ResolvedColor::Index(index) => tui_colors::indexed_color(i64::from(*index)).ok(),
+        ResolvedColor::Hex(value) => {
+            let value = if value.starts_with('#') && value.len() == 4 {
+                resolved_color_to_hex(value)
+            } else {
+                value.clone()
+            };
+            tui_colors::parse_color(&value).ok()
+        }
+    }
+}
+
+/// A terminal-reported RGB color as the concrete color model.
+fn terminal_rgb_color(rgb: TerminalRgb) -> tui_colors::Color {
+    tui_colors::Color::Rgb(tui_colors::Rgb {
+        r: f64::from(rgb.r),
+        g: f64::from(rgb.g),
+        b: f64::from(rgb.b),
+    })
+}
+
+/// `detectAppearance` (theme.ts:436-445 @ a13d35a74): the background a theme
+/// is designed for, from the lightness of its own colors. Palette indices
+/// 0-15 follow the user's terminal and say nothing about the theme.
+fn detect_appearance(
+    foregrounds: &[tui_colors::Color],
+    backgrounds: &[tui_colors::Color],
+) -> Option<TerminalTheme> {
+    fn average_lightness(colors: &[tui_colors::Color]) -> Option<f64> {
+        let fixed: Vec<&tui_colors::Color> = colors
+            .iter()
+            .filter(|color| !matches!(color, tui_colors::Color::Indexed(index) if *index < 16))
+            .collect();
+        if fixed.is_empty() {
+            return None;
+        }
+        Some(
+            fixed
+                .iter()
+                .map(|color| tui_colors::color_to_oklch(color).l)
+                .sum::<f64>()
+                / fixed.len() as f64,
+        )
+    }
+    let foreground = average_lightness(foregrounds);
+    let background = average_lightness(backgrounds);
+    match (foreground, background) {
+        (Some(foreground), Some(background)) => Some(if background < foreground {
+            TerminalTheme::Dark
+        } else {
+            TerminalTheme::Light
+        }),
+        (None, Some(background)) => Some(if background < 0.5 {
+            TerminalTheme::Dark
+        } else {
+            TerminalTheme::Light
+        }),
+        (Some(foreground), None) => Some(if foreground > 0.5 {
+            TerminalTheme::Dark
+        } else {
+            TerminalTheme::Light
+        }),
+        (None, None) => None,
+    }
+}
+
 impl Theme {
-    /// Wrap text in a foreground colour (theme.ts:359-363).
-    pub fn fg(&self, color: &str, text: &str) -> String {
-        let ansi = self.fg_colors.get(color).map(|s| s.as_str()).unwrap_or("");
-        format!("{}{}\x1b[39m", ansi, text)
+    /// Build a theme from resolved colors (shared by JSON themes and the
+    /// generated system theme). Terminal defaults for `""` tokens and the
+    /// faint (SGR 2) mixing happen here (theme.ts:322-337).
+    fn from_resolved(
+        resolved: HashMap<String, ResolvedColor>,
+        mode: ColorMode,
+        name: Option<String>,
+        source_path: Option<PathBuf>,
+        appearance: Option<TerminalTheme>,
+        dim: Vec<String>,
+    ) -> Result<Theme, RpiError> {
+        let bg_set: HashSet<&str> = BG_COLOR_KEYS.iter().copied().collect();
+        let mut fg_colors: HashMap<String, String> = HashMap::new();
+        let mut bg_colors: HashMap<String, String> = HashMap::new();
+        let mut colors: HashMap<String, tui_colors::Color> = HashMap::new();
+        let mut concrete_foregrounds: Vec<tui_colors::Color> = Vec::new();
+        let mut concrete_backgrounds: Vec<tui_colors::Color> = Vec::new();
+        let mut default_foreground_tokens: Vec<String> = Vec::new();
+        let mut default_background_tokens: Vec<String> = Vec::new();
+        for (key, color) in &resolved {
+            let is_background = bg_set.contains(key.as_str());
+            if is_background {
+                bg_colors.insert(key.clone(), bg_ansi(color, mode)?);
+            } else {
+                fg_colors.insert(key.clone(), fg_ansi(color, mode)?);
+            }
+            match color {
+                ResolvedColor::Empty => {
+                    if is_background {
+                        default_background_tokens.push(key.clone());
+                    } else {
+                        default_foreground_tokens.push(key.clone());
+                    }
+                }
+                _ => {
+                    if let Some(concrete) = resolved_to_color(color) {
+                        if is_background {
+                            concrete_backgrounds.push(concrete);
+                        } else {
+                            concrete_foregrounds.push(concrete);
+                        }
+                        colors.insert(key.clone(), concrete);
+                    }
+                }
+            }
+        }
+        let own_appearance =
+            appearance.or_else(|| detect_appearance(&concrete_foregrounds, &concrete_backgrounds));
+        // Terminal defaults for "" tokens: the reported colors, or a guess
+        // based on the appearance (theme.ts:306-317).
+        let terminal = get_terminal_colors();
+        let guessed_appearance = own_appearance.unwrap_or_else(get_terminal_theme);
+        let (guessed_foreground, guessed_background) = match guessed_appearance {
+            TerminalTheme::Dark => (
+                tui_colors::Color::Rgb(tui_colors::Rgb {
+                    r: 229.0,
+                    g: 229.0,
+                    b: 231.0,
+                }),
+                tui_colors::Color::Rgb(tui_colors::Rgb {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                }),
+            ),
+            TerminalTheme::Light => (
+                tui_colors::Color::Rgb(tui_colors::Rgb {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                }),
+                tui_colors::Color::Rgb(tui_colors::Rgb {
+                    r: 255.0,
+                    g: 255.0,
+                    b: 255.0,
+                }),
+            ),
+        };
+        let foreground = terminal
+            .foreground
+            .map(terminal_rgb_color)
+            .unwrap_or(guessed_foreground);
+        let background = terminal
+            .background
+            .map(terminal_rgb_color)
+            .unwrap_or(guessed_background);
+        for token in default_foreground_tokens {
+            colors.insert(token, foreground);
+        }
+        for token in default_background_tokens {
+            colors.insert(token, background);
+        }
+        let dim_tokens: HashSet<String> = dim.into_iter().collect();
+        for token in &dim_tokens {
+            if let Some(color) = colors.get(token).copied()
+                && let Ok(mixed) = tui_colors::mix_colors(
+                    &color,
+                    &background,
+                    0.4,
+                    tui_colors::ColorMixSpace::Oklch,
+                )
+            {
+                colors.insert(token.clone(), mixed);
+            }
+        }
+        Ok(Theme {
+            name,
+            source_path,
+            fg_colors,
+            bg_colors,
+            mode,
+            own_appearance,
+            colors,
+            dim_tokens,
+        })
     }
 
+    /// Wrap text in a foreground colour (theme.ts:359-363); faint tokens add
+    /// SGR 2 and close it with the color reset.
+    pub fn fg(&self, color: &str, text: &str) -> String {
+        let ansi = self.fg_colors.get(color).map(|s| s.as_str()).unwrap_or("");
+        if self.dim_tokens.contains(color) {
+            format!("{ansi}\x1b[2m{text}\x1b[22;39m")
+        } else {
+            format!("{ansi}{text}\x1b[39m")
+        }
+    }
     /// Wrap text in a background colour (theme.ts:365-369).
     pub fn bg(&self, color: &str, text: &str) -> String {
         let ansi = self.bg_colors.get(color).map(|s| s.as_str()).unwrap_or("");
         format!("{}{}\x1b[49m", ansi, text)
     }
 
-    /// Raw ANSI foreground prefix for a colour (theme.ts:391-395).
-    pub fn get_fg_ansi(&self, color: &str) -> &str {
-        self.fg_colors.get(color).map(|s| s.as_str()).unwrap_or("")
+    /// Raw ANSI foreground prefix for a colour (theme.ts:391-395); faint
+    /// tokens include SGR 2.
+    pub fn get_fg_ansi(&self, color: &str) -> String {
+        let ansi = self.fg_colors.get(color).cloned().unwrap_or_default();
+        if self.dim_tokens.contains(color) {
+            format!("{ansi}\x1b[2m")
+        } else {
+            ansi
+        }
     }
 
     /// Raw ANSI background prefix for a colour (theme.ts:397-401).
@@ -1460,6 +1953,45 @@ impl Theme {
     /// Current colour mode (theme.ts:403-405).
     pub fn get_color_mode(&self) -> ColorMode {
         self.mode
+    }
+
+    /// `theme.appearance` (theme.ts:313-315): declared in the theme JSON or
+    /// detected from its colors, falling back to the terminal's appearance.
+    pub fn appearance(&self) -> TerminalTheme {
+        self.own_appearance.unwrap_or_else(get_terminal_theme)
+    }
+
+    /// `theme.colors` (theme.ts:322): concrete colors for all tokens.
+    pub fn colors(&self) -> &HashMap<String, tui_colors::Color> {
+        &self.colors
+    }
+
+    /// `theme.style(text, options)` (theme.ts:342-357): resolve tokens or
+    /// concrete colors and apply the attributes with reverse-order resets.
+    pub fn style(&self, text: &str, options: &ThemeStyle) -> String {
+        let mut attributes = options.attributes;
+        let fg_ansi = match &options.fg {
+            Some(ThemeStyleColor::Token(token)) => {
+                if self.dim_tokens.contains(token) {
+                    attributes.dim = true;
+                }
+                Some(self.get_fg_ansi(token))
+            }
+            Some(ThemeStyleColor::Color(color)) => Some(tui_colors::foreground_ansi(
+                color,
+                tui_color_mode(self.mode),
+            )),
+            None => None,
+        };
+        let bg_ansi = match &options.bg {
+            Some(ThemeStyleColor::Token(token)) => Some(self.get_bg_ansi(token).to_string()),
+            Some(ThemeStyleColor::Color(color)) => Some(tui_colors::background_ansi(
+                color,
+                tui_color_mode(self.mode),
+            )),
+            None => None,
+        };
+        tui_colors::style_text_with_ansi(text, fg_ansi.as_deref(), bg_ansi.as_deref(), &attributes)
     }
 
     /// Map a thinking-level string to its border colour name
@@ -1772,54 +2304,68 @@ mod tests {
     fn test_builtin_dark_specific_values() {
         let themes = get_builtin_themes();
         let dark = &themes["dark"];
-        // vars
+        // vars (bf8e4b953 rewrite: OKHSL values from the pin's dark.json)
+        assert_eq!(dark.appearance.as_deref(), Some("dark"));
         assert_eq!(
-            dark.vars.get("cyan"),
-            Some(&ColorValue::Str("#00d7ff".to_string()))
+            dark.vars.get("text"),
+            Some(&ColorValue::Str("okhsl(234 3% 89%)".to_string()))
         );
         assert_eq!(
-            dark.vars.get("accent"),
-            Some(&ColorValue::Str("#8abeb7".to_string()))
+            dark.vars.get("blue"),
+            Some(&ColorValue::Str("okhsl(232 54% 67%)".to_string()))
         );
         // colors (var refs)
         assert_eq!(
             dark.colors.get("accent"),
-            Some(&ColorValue::Str("accent".to_string()))
+            Some(&ColorValue::Str("violet".to_string()))
         );
         assert_eq!(
             dark.colors.get("border"),
-            Some(&ColorValue::Str("blue".to_string()))
+            Some(&ColorValue::Str("okhsl(231 57% 65%)".to_string()))
         );
-        // colors (direct hex)
+        // colors (var refs)
         assert_eq!(
             dark.colors.get("customMessageLabel"),
-            Some(&ColorValue::Str("#9575cd".to_string()))
+            Some(&ColorValue::Str("violet".to_string()))
         );
-        // export
+        // export (okhsl values; converted to hex on export)
         let export = dark.export.as_ref().unwrap();
-        assert_eq!(export.page_bg, Some(ColorValue::Str("#18181e".to_string())));
-        assert_eq!(export.card_bg, Some(ColorValue::Str("#1e1e24".to_string())));
-        assert_eq!(export.info_bg, Some(ColorValue::Str("#3c3728".to_string())));
+        assert_eq!(
+            export.page_bg,
+            Some(ColorValue::Str("okhsl(262 14% 16%)".to_string()))
+        );
+        assert_eq!(
+            export.card_bg,
+            Some(ColorValue::Str("okhsl(264 13% 19%)".to_string()))
+        );
+        assert_eq!(
+            export.info_bg,
+            Some(ColorValue::Str("okhsl(53 51% 24%)".to_string()))
+        );
     }
 
     #[test]
     fn test_builtin_light_specific_values() {
         let themes = get_builtin_themes();
         let light = &themes["light"];
+        assert_eq!(light.appearance.as_deref(), Some("light"));
         assert_eq!(
-            light.vars.get("teal"),
-            Some(&ColorValue::Str("#5a8080".to_string()))
+            light.vars.get("text"),
+            Some(&ColorValue::Str("okhsl(225 5% 27%)".to_string()))
         );
         assert_eq!(
             light.colors.get("accent"),
-            Some(&ColorValue::Str("teal".to_string()))
+            Some(&ColorValue::Str("violet".to_string()))
         );
         assert_eq!(
             light.colors.get("customMessageLabel"),
-            Some(&ColorValue::Str("#7e57c2".to_string()))
+            Some(&ColorValue::Str("violet".to_string()))
         );
         let export = light.export.as_ref().unwrap();
-        assert_eq!(export.page_bg, Some(ColorValue::Str("#f8f8f8".to_string())));
+        assert_eq!(
+            export.page_bg,
+            Some(ColorValue::Str("okhsl(17 3% 94%)".to_string()))
+        );
     }
 
     #[test]
@@ -2013,6 +2559,7 @@ mod tests {
         );
         let theme_json = ThemeJson {
             name: "bool-color".to_string(),
+            appearance: None,
             vars: HashMap::new(),
             colors,
             export: None,
@@ -2039,6 +2586,7 @@ mod tests {
         );
         let theme_json = ThemeJson {
             name: "wide-index".to_string(),
+            appearance: None,
             vars: HashMap::new(),
             colors,
             export: None,
@@ -2078,6 +2626,7 @@ mod tests {
         );
         let theme_json = ThemeJson {
             name: "test".to_string(),
+            appearance: None,
             vars: HashMap::new(),
             colors,
             export: None,
@@ -2099,6 +2648,7 @@ mod tests {
         let make_theme = |colors: HashMap<String, ColorValue>, name: &str| {
             let theme_json = ThemeJson {
                 name: name.to_string(),
+                appearance: None,
                 vars: HashMap::new(),
                 colors,
                 export: None,
@@ -2138,25 +2688,33 @@ mod tests {
     }
 
     // dark.json:36-37 / light.json:35-36 @ 9841914: the built-in themes set
-    // both scrollbar tokens explicitly (dark: darkGray/text, light:
-    // lightGray/text).
+    // both scrollbar tokens explicitly; the v1.0.0 rewrite gives them their
+    // own OKHSL values, so they no longer alias borderMuted/text.
+    fn truecolor_fg(value: &str) -> String {
+        let color = rpi_tui::colors::parse_color(value).expect("valid theme color");
+        rpi_tui::colors::foreground_ansi(&color, rpi_tui::colors::TerminalColorMode::TrueColor)
+    }
+
     #[test]
     fn test_builtin_themes_carry_explicit_scrollbar_colors() {
         let themes = get_builtin_themes();
         let dark = create_theme(&themes["dark"], Some(ColorMode::TrueColor), None).unwrap();
         assert_eq!(
             dark.get_fg_ansi("scrollbarTrack"),
-            dark.get_fg_ansi("borderMuted")
-        ); // darkGray
-        assert_eq!(dark.get_fg_ansi("scrollbarThumb"), dark.get_fg_ansi("text"));
+            truecolor_fg("okhsl(237 7% 33%)")
+        );
+        assert_eq!(
+            dark.get_fg_ansi("scrollbarThumb"),
+            truecolor_fg("okhsl(232 7% 65%)")
+        );
         let light = create_theme(&themes["light"], Some(ColorMode::TrueColor), None).unwrap();
         assert_eq!(
             light.get_fg_ansi("scrollbarTrack"),
-            light.get_fg_ansi("borderMuted")
-        ); // lightGray
+            truecolor_fg("okhsl(248 3% 90%)")
+        );
         assert_eq!(
             light.get_fg_ansi("scrollbarThumb"),
-            light.get_fg_ansi("text")
+            truecolor_fg("okhsl(226 7% 65%)")
         );
     }
 
@@ -2245,32 +2803,64 @@ mod tests {
     // --- Terminal detection -----------------------------------------------
 
     #[test]
-    fn test_colorfgbg_parsing() {
-        assert_eq!(get_color_fg_bg_background_index("0;15"), Some(15));
-        assert_eq!(get_color_fg_bg_background_index("7;0;0"), Some(0));
-        assert_eq!(get_color_fg_bg_background_index("15;235"), Some(235));
-        assert_eq!(get_color_fg_bg_background_index(""), None);
-        assert_eq!(get_color_fg_bg_background_index("abc"), None);
+    fn test_detect_color_fg_bg_theme_classifies_indices_like_vim() {
+        // 0-6 and 8 dark; 7 and 9-15 light (theme.ts:697-705 @ a13d35a74).
+        assert_eq!(
+            detect_color_fg_bg_theme(Some("15;0")),
+            Some(TerminalTheme::Dark)
+        );
+        assert_eq!(
+            detect_color_fg_bg_theme(Some("0;8")),
+            Some(TerminalTheme::Dark)
+        );
+        assert_eq!(
+            detect_color_fg_bg_theme(Some("0;7")),
+            Some(TerminalTheme::Light)
+        );
+        assert_eq!(
+            detect_color_fg_bg_theme(Some("0;15")),
+            Some(TerminalTheme::Light)
+        );
+        // Out-of-range/absent/invalid values have no answer.
+        assert_eq!(detect_color_fg_bg_theme(Some("0;16")), None);
+        assert_eq!(detect_color_fg_bg_theme(Some("0;235")), None);
+        assert_eq!(detect_color_fg_bg_theme(Some("")), None);
+        assert_eq!(detect_color_fg_bg_theme(Some("abc;def")), None);
+        assert_eq!(detect_color_fg_bg_theme(None), None);
     }
 
     #[test]
-    fn test_luminance_black() {
-        let rgb = Rgb { r: 0, g: 0, b: 0 };
-        let lum = get_rgb_color_luminance(&rgb);
-        assert!(lum < 0.5);
-        assert_eq!(get_theme_for_rgb_color(&rgb), TerminalTheme::Dark);
-    }
-
-    #[test]
-    fn test_luminance_white() {
-        let rgb = Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
+    fn test_detect_terminal_theme_prefers_reported_colors_then_scheme_then_env() {
+        let colors = TerminalColors {
+            background: Some(TerminalRgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            ..TerminalColors::default()
         };
-        let lum = get_rgb_color_luminance(&rgb);
-        assert!(lum >= 0.5);
-        assert_eq!(get_theme_for_rgb_color(&rgb), TerminalTheme::Light);
+        // Reported background wins over the scheme and COLORFGBG.
+        assert_eq!(
+            detect_terminal_theme(&colors, Some(TerminalTheme::Dark), Some("15;0")),
+            TerminalTheme::Light
+        );
+        // Without a background: the light/dark report, then COLORFGBG, then dark.
+        assert_eq!(
+            detect_terminal_theme(
+                &TerminalColors::default(),
+                Some(TerminalTheme::Light),
+                Some("15;0")
+            ),
+            TerminalTheme::Light
+        );
+        assert_eq!(
+            detect_terminal_theme(&TerminalColors::default(), None, Some("0;15")),
+            TerminalTheme::Light
+        );
+        assert_eq!(
+            detect_terminal_theme(&TerminalColors::default(), None, None),
+            TerminalTheme::Dark
+        );
     }
 
     #[test]
@@ -2296,59 +2886,206 @@ mod tests {
         assert_eq!(det.confidence, TerminalThemeConfidence::Low);
     }
 
-    // --- OSC/CSI parsing --------------------------------------------------
+    // --- Theme file format (V16-10 FR-D) ----------------------------------
 
-    #[test]
-    fn test_parse_osc11_hex_6() {
-        let data = "\x1b]11;#ff0000\x07";
-        let rgb = parse_osc11_background_color(data).unwrap();
-        assert_eq!(rgb, Rgb { r: 255, g: 0, b: 0 });
+    fn all_required_colors(value: &str) -> HashMap<String, ColorValue> {
+        REQUIRED_COLOR_KEYS
+            .iter()
+            .map(|key| ((*key).to_string(), ColorValue::Str(value.to_string())))
+            .collect()
     }
 
     #[test]
-    fn test_parse_osc11_rgb_format() {
-        let data = "\x1b]11;rgb:ffff/0000/0000\x07";
-        let rgb = parse_osc11_background_color(data).unwrap();
-        assert_eq!(rgb, Rgb { r: 255, g: 0, b: 0 });
-    }
-
-    #[test]
-    fn test_parse_osc11_hex_12() {
-        let data = "\x1b]11;#ffff00000000\x07";
-        let rgb = parse_osc11_background_color(data).unwrap();
-        assert_eq!(rgb, Rgb { r: 255, g: 0, b: 0 });
-    }
-
-    #[test]
-    fn test_parse_osc11_st_terminator() {
-        let data = "\x1b]11;#00ff00\x1b\\";
-        let rgb = parse_osc11_background_color(data).unwrap();
-        assert_eq!(rgb, Rgb { r: 0, g: 255, b: 0 });
-    }
-
-    #[test]
-    fn test_parse_osc11_invalid() {
-        assert!(parse_osc11_background_color("not a response").is_none());
-        assert!(parse_osc11_background_color("\x1b]11;?\x07").is_none()); // query, not response
-    }
-
-    #[test]
-    fn test_parse_color_scheme_report() {
-        assert_eq!(
-            parse_terminal_color_scheme_report("\x1b[?997;1n"),
-            Some(TerminalTheme::Dark)
+    fn test_theme_file_six_color_forms_and_var_refs() {
+        let mut colors = all_required_colors("#101010");
+        // `#rgb` (expands to #aabbcc), oklch(), okhsl(), 0-255 index, var ref.
+        colors.insert("accent".to_string(), ColorValue::Str("#abc".to_string()));
+        colors.insert(
+            "border".to_string(),
+            ColorValue::Str("oklch(62% 0.1 200)".to_string()),
         );
-        assert_eq!(
-            parse_terminal_color_scheme_report("\x1b[?997;2n"),
-            Some(TerminalTheme::Light)
+        colors.insert(
+            "success".to_string(),
+            ColorValue::Str("okhsl(159 59% 67%)".to_string()),
         );
-        assert!(parse_terminal_color_scheme_report("garbage").is_none());
+        colors.insert("error".to_string(), ColorValue::Index(9));
+        colors.insert("warning".to_string(), ColorValue::Str("brand".to_string()));
+        let mut vars = HashMap::new();
+        vars.insert("brand".to_string(), ColorValue::Str("#123456".to_string()));
+        let json = ThemeJson {
+            name: "extended".to_string(),
+            appearance: None,
+            vars,
+            colors,
+            export: None,
+        };
+        let theme = create_theme(&json, Some(ColorMode::TrueColor), None).expect("theme");
+        assert_eq!(theme.get_fg_ansi("accent"), "\x1b[38;2;170;187;204m");
+        assert!(theme.get_fg_ansi("border").starts_with("\x1b[38;2;"));
+        assert!(theme.get_fg_ansi("success").starts_with("\x1b[38;2;"));
+        assert_eq!(theme.get_fg_ansi("warning"), "\x1b[38;2;18;52;86m");
+        assert_eq!(
+            theme.colors().get("error"),
+            Some(&tui_colors::Color::Indexed(9))
+        );
+        // Omitted appearance is detected from the theme's own colors
+        // (theme.ts:436-445); the fixture's foregrounds average above 0.5.
+        assert_eq!(theme.appearance(), TerminalTheme::Dark);
+        // Explicit appearance wins over detection.
+        let mut light_json = ThemeJson {
+            name: "explicit-light".to_string(),
+            appearance: Some("light".to_string()),
+            vars: HashMap::new(),
+            colors: all_required_colors("#eeeeee"),
+            export: None,
+        };
+        let light = create_theme(&light_json, Some(ColorMode::TrueColor), None).expect("theme");
+        assert_eq!(light.appearance(), TerminalTheme::Light);
+        // Invalid appearance values are rejected.
+        light_json.appearance = Some("dusk".to_string());
+        assert!(create_theme(&light_json, Some(ColorMode::TrueColor), None).is_err());
     }
 
     #[test]
-    fn test_is_osc11_response() {
-        assert!(is_osc11_background_color_response("\x1b]11;#000000\x07"));
-        assert!(!is_osc11_background_color_response("hello"));
+    fn test_theme_style_resolves_tokens_and_attributes() {
+        let mut colors = all_required_colors("#101010");
+        colors.insert("accent".to_string(), ColorValue::Str("#010203".to_string()));
+        let json = ThemeJson {
+            name: "style".to_string(),
+            appearance: Some("dark".to_string()),
+            vars: HashMap::new(),
+            colors,
+            export: None,
+        };
+        let theme = create_theme(&json, Some(ColorMode::TrueColor), None).expect("theme");
+        let style = ThemeStyle {
+            fg: Some(ThemeStyleColor::Token("accent".to_string())),
+            bg: None,
+            attributes: tui_colors::TextAttributes {
+                bold: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            theme.style("x", &style),
+            "\x1b[38;2;1;2;3m\x1b[1mx\x1b[22m\x1b[39m"
+        );
+        let concrete = ThemeStyle {
+            fg: Some(ThemeStyleColor::Color(
+                tui_colors::parse_color("#0a0b0c").expect("color"),
+            )),
+            bg: None,
+            attributes: tui_colors::TextAttributes::default(),
+        };
+        assert_eq!(theme.style("y", &concrete), "\x1b[38;2;10;11;12my\x1b[39m");
+    }
+
+    // --- System theme + terminal state (V16-10 FR-C, OSC mock) ------------
+
+    static TERMINAL_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn terminal_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        TERMINAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn reset_terminal_state() {
+        *lock_terminal(&TERMINAL_COLORS) = TerminalColors::default();
+        *lock_terminal(&TERMINAL_COLOR_SCHEME) = None;
+        TERMINAL_COLORS_REPORTED.store(false, AtomicOrdering::Relaxed);
+        TERMINAL_COLORS_PENDING.store(false, AtomicOrdering::Relaxed);
+    }
+
+    fn dracula_colors() -> TerminalColors {
+        let palette = [
+            "#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2",
+            "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff",
+        ]
+        .iter()
+        .map(|hex| {
+            let color = rpi_tui::colors::parse_color(hex).expect("palette color");
+            let rgb = rpi_tui::colors::color_to_rgb(&color);
+            TerminalRgb {
+                r: rgb.r.round() as u8,
+                g: rgb.g.round() as u8,
+                b: rgb.b.round() as u8,
+            }
+        })
+        .collect();
+        TerminalColors {
+            background: Some(TerminalRgb {
+                r: 40,
+                g: 42,
+                b: 54,
+            }),
+            foreground: Some(TerminalRgb {
+                r: 248,
+                g: 248,
+                b: 242,
+            }),
+            palette: Some(palette),
+        }
+    }
+
+    #[test]
+    fn test_system_theme_lists_first_and_is_reserved() {
+        assert_eq!(get_available_themes()[0].name, SYSTEM_THEME_NAME);
+        let export = get_theme_export_colors("system");
+        assert!(export.page_bg.is_none() && export.card_bg.is_none() && export.info_bg.is_none());
+        assert!(assert_theme_name_is_valid(SYSTEM_THEME_NAME).is_err());
+        assert!(assert_theme_name_is_valid("my-system").is_ok());
+    }
+
+    #[test]
+    fn test_system_theme_generates_from_reported_colors() {
+        let _guard = terminal_state_lock();
+        reset_terminal_state();
+        set_terminal_colors(dracula_colors());
+        let theme = load_theme("system", Some(ColorMode::TrueColor)).expect("system theme");
+        assert_eq!(theme.appearance(), TerminalTheme::Dark);
+        // Body text uses the terminal foreground (OSC 10 default).
+        assert_eq!(theme.get_fg_ansi("text"), "\x1b[39m");
+        // Palette-derived colors are concrete.
+        assert!(theme.get_fg_ansi("error").starts_with("\x1b[38;"));
+        let error = theme.colors().get("error").expect("error color");
+        assert!(tui_colors::color_to_oklch(error).c > 0.01);
+        reset_terminal_state();
+    }
+
+    #[test]
+    fn test_system_theme_renders_grayscale_while_pending() {
+        let _guard = terminal_state_lock();
+        reset_terminal_state();
+        mark_terminal_colors_pending();
+        let pending = create_system_theme(Some(ColorMode::TrueColor));
+        let pending_error = pending.colors().get("error").expect("error color");
+        assert!(
+            tui_colors::color_to_oklch(pending_error).c < 0.005,
+            "pending system theme is grayscale"
+        );
+        // A late report replaces the grayscale frame.
+        set_terminal_colors(dracula_colors());
+        let reported = create_system_theme(Some(ColorMode::TrueColor));
+        let error = reported.colors().get("error").expect("error color");
+        assert!(tui_colors::color_to_oklch(error).c > 0.01);
+        reset_terminal_state();
+    }
+
+    #[test]
+    fn test_terminal_scheme_change_drives_system_theme_without_background() {
+        let _guard = terminal_state_lock();
+        reset_terminal_state();
+        set_terminal_color_scheme(Some(TerminalTheme::Light));
+        assert_eq!(get_terminal_theme(), TerminalTheme::Light);
+        let theme = create_system_theme(Some(ColorMode::TrueColor));
+        assert_eq!(theme.appearance(), TerminalTheme::Light);
+        // No background/palette: the ANSI palette indices tier.
+        assert_eq!(
+            theme.colors().get("error"),
+            Some(&tui_colors::Color::Indexed(1))
+        );
+        reset_terminal_state();
     }
 
     // --- Text styles ------------------------------------------------------
@@ -2383,16 +3120,6 @@ mod tests {
     }
 
     // --- Terminal introspection constants ---------------------------------
-
-    #[test]
-    fn test_osc_11_query_bytes() {
-        assert_eq!(OSC_11_QUERY, b"\x1b]11;?\x07");
-    }
-
-    #[test]
-    fn test_csi_996_query_bytes() {
-        assert_eq!(CSI_996_QUERY, b"\x1b[?996n");
-    }
 
     #[test]
     fn test_csi_16t_query_bytes() {

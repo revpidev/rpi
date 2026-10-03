@@ -983,11 +983,11 @@ mod tests {
         let rendered = component.render(80).join("\n");
         assert!(rendered.contains('\u{1b}'), "highlighted output has ANSI");
         assert!(
-            rendered.contains(theme.get_fg_ansi("syntaxKeyword")),
+            rendered.contains(theme.get_fg_ansi("syntaxKeyword").as_str()),
             "rust keywords must be highlighted"
         );
         assert!(
-            rendered.contains(theme.get_fg_ansi("syntaxType")),
+            rendered.contains(theme.get_fg_ansi("syntaxType").as_str()),
             "rust fn/let must be highlighted"
         );
         assert_eq!(
@@ -1017,8 +1017,8 @@ mod tests {
             )
             .expect("result component");
         let rendered = component.render(80).join("\n");
-        assert!(rendered.contains(theme.get_fg_ansi("toolOutput")));
-        assert!(!rendered.contains(theme.get_fg_ansi("syntaxKeyword")));
+        assert!(rendered.contains(theme.get_fg_ansi("toolOutput").as_str()));
+        assert!(!rendered.contains(theme.get_fg_ansi("syntaxKeyword").as_str()));
         assert_eq!(
             pad_trim(&strip_escape_sequences(&rendered)),
             "\nalpha\nbeta"
@@ -1060,10 +1060,10 @@ mod tests {
         let stripped = strip_escape_sequences(&rendered);
         assert!(stripped.contains("Error: permission denied"));
         assert!(
-            !rendered.contains(theme.get_fg_ansi("syntaxKeyword")),
+            !rendered.contains(theme.get_fg_ansi("syntaxKeyword").as_str()),
             "no syntax highlighting for error output"
         );
-        assert!(rendered.contains(theme.get_fg_ansi("toolOutput")));
+        assert!(rendered.contains(theme.get_fg_ansi("toolOutput").as_str()));
     }
 
     // --- renderResult: truncation warnings -----------------------------------

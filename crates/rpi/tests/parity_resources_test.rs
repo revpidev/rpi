@@ -460,7 +460,17 @@ fn parity_settings_deep_merge() {
             "packages": serde_json::to_value(manager.get_packages()).expect("packages"),
             "extensionPaths": manager.get_extension_paths(),
             "themeSetting": manager.get_theme_setting(),
-            "quietStartup": manager.get_quiet_startup(),
+            "quietStartup": match manager.get_quiet_startup() {
+                rpi::core::settings_manager::QuietStartup::True => {
+                    serde_json::Value::Bool(true)
+                }
+                rpi::core::settings_manager::QuietStartup::Header => {
+                    serde_json::Value::String("header".to_string())
+                }
+                rpi::core::settings_manager::QuietStartup::False => {
+                    serde_json::Value::Bool(false)
+                }
+            },
             "steeringMode": serde_json::to_value(manager.get_steering_mode()).expect("steering"),
         });
         compare("settings", name, &case["expected"], &mut actual, &[]);

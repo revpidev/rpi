@@ -691,14 +691,26 @@ mod tests {
         assert_ne!(keyword, string);
         assert_ne!(keyword, comment);
         assert_ne!(string, comment);
-        assert!(out.contains(keyword), "keywords must use syntaxKeyword");
-        assert!(out.contains(string), "strings must use syntaxString");
-        assert!(out.contains(comment), "comments must use syntaxComment");
-        assert!(out.contains(number), "numbers must use syntaxNumber");
+        assert!(
+            out.contains(keyword.as_str()),
+            "keywords must use syntaxKeyword"
+        );
+        assert!(
+            out.contains(string.as_str()),
+            "strings must use syntaxString"
+        );
+        assert!(
+            out.contains(comment.as_str()),
+            "comments must use syntaxComment"
+        );
+        assert!(
+            out.contains(number.as_str()),
+            "numbers must use syntaxNumber"
+        );
         // `fn`/`let` are storage.type in the Rust grammar → syntaxType;
         // `main` is entity.name.function → syntaxFunction.
-        assert!(out.contains(t.get_fg_ansi("syntaxType")));
-        assert!(out.contains(t.get_fg_ansi("syntaxFunction")));
+        assert!(out.contains(t.get_fg_ansi("syntaxType").as_str()));
+        assert!(out.contains(t.get_fg_ansi("syntaxFunction").as_str()));
     }
 
     // --- highlightCode round-trip --------------------------------------------
@@ -752,7 +764,7 @@ mod tests {
             assert!(out.contains('\x1b'), "{lang} must produce ANSI colors");
             for needle in needles {
                 assert!(
-                    out.contains(t.get_fg_ansi(needle)),
+                    out.contains(t.get_fg_ansi(needle).as_str()),
                     "{lang} must produce {needle} colors"
                 );
             }
@@ -806,11 +818,11 @@ mod tests {
         let code = "<html><body><script>function foo() { let a = 1; }</script></body></html>";
         let out = highlight_code(code, Some("html"), &t).join("\n");
         assert!(
-            out.contains(t.get_fg_ansi("syntaxType")),
+            out.contains(t.get_fg_ansi("syntaxType").as_str()),
             "script body keywords must use syntaxType"
         );
         assert!(
-            out.contains(t.get_fg_ansi("syntaxFunction")),
+            out.contains(t.get_fg_ansi("syntaxFunction").as_str()),
             "function names must use syntaxFunction"
         );
     }
