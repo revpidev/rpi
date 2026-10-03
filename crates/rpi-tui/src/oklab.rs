@@ -58,8 +58,8 @@ const LAB_TO_LMS: Matrix = [
 ];
 /// `LMS_TO_LINEAR_SRGB` (oklab.ts:40-44).
 const LMS_TO_LINEAR_SRGB: Matrix = [
-    [4.0767416360759583, -3.3077115392580629, 0.2309699031821043],
-    [-1.2684379732850315, 2.6097573492876882, -0.341319376002657],
+    [4.076741636075958, -3.307711539258063, 0.2309699031821043],
+    [-1.2684379732850315, 2.609757349287688, -0.341319376002657],
     [-0.0041960761386756, -0.7034186179359362, 1.7076146940746117],
 ];
 
@@ -356,7 +356,15 @@ mod tests {
         });
         assert!((channels.s - 1.0).abs() < 1e-6, "s={}", channels.s);
         assert!((channels.h - 29.2339).abs() < 1e-2, "h={}", channels.h);
-        assert_eq!(channels.l, oklab_to_okhsl_lightness(0.627955));
+        // Tolerance absorbs f64 evaluation-order differences: `channels.l`
+        // comes from the computed Oklab lightness while the right side uses
+        // the rounded constant 0.627955. Upstream asserts closeness, not bit
+        // equality; the observed gap is ~4e-7.
+        assert!(
+            (channels.l - oklab_to_okhsl_lightness(0.627955)).abs() < 1e-5,
+            "l={}",
+            channels.l
+        );
     }
 
     #[test]
