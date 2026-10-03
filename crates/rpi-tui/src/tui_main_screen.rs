@@ -1841,6 +1841,7 @@ mod tests {
 
     use super::*;
     use crate::keys::{is_key_release, matches_key};
+    use crate::terminal_colors::RgbColor;
     use crate::test_vt::{
         EnvGuard, TestTui, VirtualTerminal, render_and_flush, send_input, settle, state_lock,
     };
@@ -1849,7 +1850,6 @@ mod tests {
         OverlayOptions, OverlayUnfocusOptions, SizeValue, TuiInputListenerResult,
         composite_tui_line, shared_component,
     };
-    use crate::terminal_colors::RgbColor;
     use crate::tui_base::TuiBase;
     use crate::utils::slice_by_column;
     use std::sync::atomic::AtomicBool;
@@ -5506,10 +5506,7 @@ mod tests {
                 b: 255
             })
         );
-        assert_eq!(
-            colors.background,
-            Some(RgbColor { r: 0, g: 0, b: 0 })
-        );
+        assert_eq!(colors.background, Some(RgbColor { r: 0, g: 0, b: 0 }));
         assert_eq!(colors.palette.map(|palette| palette.len()), Some(16));
         // The trailing DA1 is consumed; only "x" reached the component.
         send_input(&terminal, &tui, "\x1b[?62;22c");
@@ -5557,7 +5554,13 @@ mod tests {
         });
         // Fire the explicit deadline (upstream waits 5ms of real time).
         tui.tick(Instant::now() + Duration::from_millis(5));
-        assert!(query.blocking_recv().expect("query sender").background.is_none());
+        assert!(
+            query
+                .blocking_recv()
+                .expect("query sender")
+                .background
+                .is_none()
+        );
 
         send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
         send_input(&terminal, &tui, "\x1b[?62;22c");
