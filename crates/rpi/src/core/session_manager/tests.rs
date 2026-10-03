@@ -2298,7 +2298,53 @@ fn create_branched_session_extracts_correct_path_from_branched_tree() {
 }
 
 #[test]
-fn create_branched_session_does_not_duplicate_entries_when_forking_from_first_user_message() {
+fn create_branched_session_does_not_duplicate_entries_when_forking_before_first_user_message() {
+    let tmp = TempDir::new();
+    let mut session =
+        SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
+            .expect("create");
+    let model_change_id = session
+        .append_model_change("anthropic", "claude-sonnet-4-5")
+        .expect("append");
+    session
+        .append_message(user_msg("first question"))
+        .expect("append");
+    session
+        .append_message(assistant_msg("first answer"))
+        .expect("append");
+
+    // Fork from a setup entry (no user or assistant message in branched path).
+    let new_file = session
+        .create_branched_session(&model_change_id)
+        .expect("create_branched_session")
+        .expect("persisted session returns a file");
+
+    // Nothing to save yet, so the file is created later by the first user message (#10000).
+    assert!(!new_file.exists());
+
+    session
+        .append_message(user_msg("new question"))
+        .expect("append");
+    assert!(new_file.exists());
+
+    // Simulate an extension adding an entry before the assistant.
+    session
+        .append_custom_entry("preset-state", Some(json!({"name": "plan"})))
+        .expect("append");
+    session
+        .append_message(assistant_msg("new answer"))
+        .expect("append");
+
+    // Exactly one header and each entry written once.
+    let records = read_session_file_records(&new_file);
+    assert_eq!(
+        session_file_roles(&records),
+        ["session", "model_change", "user", "custom", "assistant"]
+    );
+}
+
+#[test]
+fn create_branched_session_writes_file_immediately_when_forking_at_user_message() {
     let tmp = TempDir::new();
     let mut session =
         SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
@@ -2309,88 +2355,18 @@ fn create_branched_session_does_not_duplicate_entries_when_forking_from_first_us
     session
         .append_message(assistant_msg("first answer"))
         .expect("append");
-    session
-        .append_message(user_msg("second question"))
-        .expect("append");
-    session
-        .append_message(assistant_msg("second answer"))
-        .expect("append");
 
-    // Fork from the very first user message (no assistant in branched path).
     let new_file = session
         .create_branched_session(&id1)
         .expect("create_branched_session")
-        .expect("persisted session returns a file");
+        .expect("file");
+    assert!(new_file.exists());
 
-    // No assistant in path: file deferred until first assistant response.
-    assert!(!new_file.exists());
-
-    // Simulate extension adding an entry before the assistant.
-    session
-        .append_custom_entry("preset-state", Some(json!({"name": "plan"})))
-        .expect("append");
     session
         .append_message(assistant_msg("new answer"))
         .expect("append");
-
-    // Exactly one header and no duplicate ids.
-    assert!(new_file.exists());
-    let content = std::fs::read_to_string(&new_file).expect("read");
-    let records: Vec<Value> = content
-        .trim()
-        .split('\n')
-        .filter(|l| !l.is_empty())
-        .map(|l| serde_json::from_str(l).expect("json"))
-        .collect();
-    assert_eq!(
-        records
-            .iter()
-            .filter(|r| r["type"] == json!("session"))
-            .count(),
-        1
-    );
-    let ids: Vec<&str> = records
-        .iter()
-        .filter(|r| r["type"] != json!("session"))
-        .filter_map(|r| r["id"].as_str())
-        .collect();
-    let unique: std::collections::HashSet<&&str> = ids.iter().collect();
-    assert_eq!(unique.len(), ids.len());
-}
-
-#[test]
-fn create_branched_session_writes_file_immediately_when_forking_from_point_with_assistant() {
-    let tmp = TempDir::new();
-    let mut session =
-        SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
-            .expect("create");
-    session
-        .append_message(user_msg("first question"))
-        .expect("append");
-    let id2 = session
-        .append_message(assistant_msg("first answer"))
-        .expect("append");
-    session
-        .append_message(user_msg("second question"))
-        .expect("append");
-    session
-        .append_message(assistant_msg("second answer"))
-        .expect("append");
-
-    let new_file = session
-        .create_branched_session(&id2)
-        .expect("create_branched_session")
-        .expect("file");
-    assert!(new_file.exists());
-    let content = std::fs::read_to_string(&new_file).expect("read");
-    let header_count = content
-        .trim()
-        .split('\n')
-        .filter(|l| !l.is_empty())
-        .map(|l| serde_json::from_str::<Value>(l).expect("json"))
-        .filter(|r| r["type"] == json!("session"))
-        .count();
-    assert_eq!(header_count, 1);
+    let records = read_session_file_records(&new_file);
+    assert_eq!(session_file_roles(&records), ["session", "user", "assistant"]);
 }
 
 #[test]
@@ -2849,28 +2825,36 @@ fn generates_a_uuidv7_id_when_options_provided_without_id() {
 // T07 self-check anchors
 // ===========================================================================
 
-/// Deferred persistence: the file is not created before the first assistant message
+/// Deferred persistence (#10000 `ff72faba2`): setup-only entries stay in
+/// memory; the file is created by the first user or assistant message
 /// (flushed + wx).
 #[test]
-fn deferred_persistence_no_file_before_first_assistant() {
+fn deferred_persistence_no_file_before_first_conversation_message() {
     let tmp = TempDir::new();
     let mut session =
         SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
             .expect("create");
     let file = session.get_session_file().expect("file").to_path_buf();
-    assert!(!file.exists(), "no file before first assistant");
+    assert!(!file.exists(), "no file for a session with only setup entries");
 
-    session.append_message(user_msg("hello")).expect("append");
+    session
+        .append_model_change("anthropic", "claude-sonnet-4-5")
+        .expect("append");
     session
         .append_thinking_level_change("high")
         .expect("append");
     session.append_custom_entry("ext", None).expect("append");
-    assert!(!file.exists(), "still no file without assistant");
+    assert!(
+        !file.exists(),
+        "still no file without a user or assistant message"
+    );
 
-    session.append_message(assistant_msg("hi")).expect("append");
-    assert!(file.exists(), "wx creates file on first assistant");
+    // #10000: the first user message must survive a first turn that never
+    // produces an assistant message.
+    session.append_message(user_msg("hello")).expect("append");
+    assert!(file.exists(), "wx creates file on the first user message");
 
-    // All pre-assistant entries were written in the same flush.
+    // All pre-conversation entries were written in the same flush.
     let content = std::fs::read_to_string(&file).expect("read");
     let lines: Vec<&str> = content.trim().split('\n').collect();
     assert_eq!(lines.len(), 5, "header + 4 entries");
@@ -2881,6 +2865,63 @@ fn deferred_persistence_no_file_before_first_assistant() {
     assert_eq!(content.trim().split('\n').count(), 6);
 }
 
+/// The file is created when the first user message is appended and later
+/// entries append without rewriting the earlier ones (#10000).
+#[test]
+fn first_user_message_creates_file_and_later_entries_append() {
+    let tmp = TempDir::new();
+    let mut session =
+        SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
+            .expect("create");
+    session
+        .append_model_change("anthropic", "claude-sonnet-4-5")
+        .expect("append");
+    session
+        .append_message(user_msg("first question"))
+        .expect("append");
+
+    let file = session.get_session_file().expect("file").to_path_buf();
+    let records = read_session_file_records(&file);
+    assert_eq!(session_file_roles(&records), ["session", "model_change", "user"]);
+
+    session.append_custom_entry("preset-state", None).expect("append");
+    session
+        .append_message(assistant_msg("first answer"))
+        .expect("append");
+    let records = read_session_file_records(&file);
+    assert_eq!(
+        session_file_roles(&records),
+        ["session", "model_change", "user", "custom", "assistant"]
+    );
+}
+
+/// One label per record: the message role for message entries, otherwise
+/// the entry type (`readSessionFileRoles`, test/utilities.ts @ #10000).
+fn session_file_roles(records: &[Value]) -> Vec<&str> {
+    records
+        .iter()
+        .map(|record| {
+            record
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                .or_else(|| record.get("type").and_then(Value::as_str))
+                .unwrap_or("")
+        })
+        .collect()
+}
+
+/// Parse a session JSONL file into records.
+fn read_session_file_records(file: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(file)
+        .expect("read session file")
+        .trim()
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("json"))
+        .collect()
+}
+
 /// `wx` exclusive creation: target exists → the error propagates; no overwrite, no panic.
 #[test]
 fn wx_exclusive_create_fails_when_file_already_exists() {
@@ -2889,12 +2930,12 @@ fn wx_exclusive_create_fails_when_file_already_exists() {
         SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
             .expect("create");
     let file = session.get_session_file().expect("file").to_path_buf();
-    session.append_message(user_msg("hello")).expect("append");
 
     // Simulate a stale file at the target path before the first flush.
     std::fs::write(&file, "stale\n").expect("write stale");
+    // The first conversation entry triggers the deferred `wx` create (#10000).
     let err = session
-        .append_message(assistant_msg("hi"))
+        .append_message(user_msg("hello"))
         .expect_err("must fail");
     assert!(matches!(err, RpiError::Io(_)), "io error, got: {err}");
     // The stale file is untouched.
@@ -2914,10 +2955,11 @@ fn append_write_failure_in_readonly_directory_is_error_not_panic() {
 
     let mut session = SessionManager::create(tmp.path(), Some(&dir), NewSessionOptions::default())
         .expect("create");
-    session.append_message(user_msg("hello")).expect("append");
 
+    // The deferred create (#10000) happens with the first conversation
+    // entry, so the read-only directory makes that append fail.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
-    let result = session.append_message(assistant_msg("hi"));
+    let result = session.append_message(user_msg("hello"));
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
 
     assert!(

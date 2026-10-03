@@ -1427,10 +1427,30 @@ impl SessionManager {
         Ok(())
     }
 
-    /// `_persist` (session-manager.ts:1015-1042): deferred persistence — the
-    /// file is not created until the first assistant message (the `flushed`
-    /// flag plus `wx` exclusive create); afterwards entries are appended
-    /// directly. No file locking (G4 red line).
+    /// A new session file is created only once the session contains a user
+    /// or assistant message (`_hasConversation`, session-manager.ts @
+    /// #10000 `ff72faba2`): setup entries alone (model, thinking level,
+    /// system prompt) stay in memory, so opening and closing without
+    /// chatting leaves no file behind. Starting at the user message (not
+    /// the first assistant reply) keeps the prompt on disk when the first
+    /// turn never completes.
+    fn has_conversation(&self) -> bool {
+        self.records.iter().any(|record| {
+            record.type_tag() == "message"
+                && record
+                    .raw
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "user" || role == "assistant")
+        })
+    }
+
+    /// `_persist` (session-manager.ts:1015-1042 @ #10000): deferred
+    /// persistence — the file is not created until the first user or
+    /// assistant message (the `flushed` flag plus `wx` exclusive create);
+    /// afterwards entries are appended directly. No file locking (G4 red
+    /// line).
     fn persist_appended_entry(&mut self) -> Result<(), RpiError> {
         if !self.persist {
             return Ok(());
@@ -1445,27 +1465,13 @@ impl SessionManager {
             None => return Ok(()),
         };
 
-        // Duck-typed like upstream: e.type === "message" && role assistant.
-        let has_assistant = self.records.iter().any(|r| {
-            r.type_tag() == "message"
-                && r.raw
-                    .get("message")
-                    .and_then(|m| m.get("role"))
-                    .and_then(Value::as_str)
-                    == Some("assistant")
-        });
-        if !has_assistant {
-            if self.flushed {
-                let mut fd = std::fs::OpenOptions::new().append(true).open(&file)?;
-                fd.write_all(entry_line.as_bytes())?;
-                fd.write_all(b"\n")?;
-            }
-            // Not flushed: leave it false so when the assistant arrives all
-            // entries get written.
-            return Ok(());
-        }
-
         if !self.flushed {
+            // Setup entries alone stay in memory: the file appears with the
+            // first user or assistant message (#10000). Until then the
+            // `flushed` flag stays false so all entries flush together.
+            if !self.has_conversation() {
+                return Ok(());
+            }
             // `wx` — exclusive create; EEXIST propagates as an error.
             let mut fd = std::fs::OpenOptions::new()
                 .write(true)
@@ -2217,19 +2223,11 @@ impl SessionManager {
 
         if self.persist {
             self.session_file = Some(new_session_file.clone());
-            // Only write the file now if it contains an assistant message;
-            // otherwise defer to persist_entry on the first assistant
-            // response, matching the newSession() contract
-            // (session-manager.ts:1477-1488).
-            let has_assistant = self.records.iter().any(|r| {
-                r.type_tag() == "message"
-                    && r.raw
-                        .get("message")
-                        .and_then(|m| m.get("role"))
-                        .and_then(Value::as_str)
-                        == Some("assistant")
-            });
-            if has_assistant {
+            // Use the same rule as persist_appended_entry (#10000): write
+            // now if the branched path already has a conversation,
+            // otherwise let the first later user/assistant message create
+            // the file (session-manager.ts:1477-1488).
+            if self.has_conversation() {
                 self.rewrite_file()?;
                 self.flushed = true;
             } else {
@@ -2267,6 +2265,13 @@ impl SessionManager {
     /// `getSessionId`.
     pub fn get_session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// `getEntryCount` (session-manager.ts @ b485fa312): number of session
+    /// entries, excluding the header. Does not copy the entries like
+    /// [`Self::get_entries`], so render paths can call it every frame.
+    pub fn entry_count(&self) -> usize {
+        self.by_id.len()
     }
 
     /// `getSessionFile` — `None` for in-memory sessions.
