@@ -436,6 +436,18 @@ pub fn parse_args(args: &[String]) -> Args {
         }
     }
 
+    // #10236 (`0c453048b`): `--provider` without `--model` used to be
+    // silently ignored and ran the default model from another provider; it
+    // now fails with an error (same diagnostic family as the `--mode`
+    // checks, R3.12.7).
+    if let Some(provider) = result.provider.as_deref()
+        && result.model.is_none()
+    {
+        result.diagnostics.push(Diagnostic::error(format!(
+            "--provider requires --model (for example: --provider {provider} --model <pattern>)"
+        )));
+    }
+
     result
 }
 
@@ -509,7 +521,7 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
   {APP_NAME} <command> --help          Show help for install/remove/uninstall/update/self-uninstall/list/config/auth
 
 {options_bold}
-  --provider <name>              Provider name (default: google)
+  --provider <name>              Provider to search for --model (requires --model)
   --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)
@@ -892,6 +904,21 @@ mod tests {
             args(&["--provider", "openai"]).provider.as_deref(),
             Some("openai")
         );
+    }
+
+    /// #10236 (`0c453048b`): `--provider` requires `--model`.
+    #[test]
+    fn test_provider_without_model_is_an_error() {
+        let result = args(&["--provider", "openai"]);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error(
+                "--provider requires --model (for example: --provider openai --model <pattern>)"
+            )]
+        );
+        // With a model the pair is accepted.
+        let result = args(&["--provider", "openai", "--model", "gpt-4o"]);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[test]

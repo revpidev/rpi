@@ -1967,6 +1967,7 @@ impl InteractiveUi {
                         source: Some("stored credential".to_string()),
                         kind,
                     }),
+                    subscription: None,
                 }
             })
             .collect();
@@ -2885,11 +2886,26 @@ fn run_clipboard_command(program: &str, args: &[&str], timeout: Duration) -> Opt
     status.filter(|status| status.success()).map(|_| bytes)
 }
 
-/// Probe the X11 clipboard for a PNG image (`readClipboardImageViaXclip`,
-/// clipboard-image.ts:213-238, collapsed to the preferred `image/png`
-/// target). `None` when xclip is absent, times out, or holds no image.
+/// Probe the X11 clipboard for a PNG image (#9786 `8676a0dcd`): list the
+/// advertised TARGETS first and only read `image/png` when the clipboard
+/// advertises it. Clipboard owners such as browsers answer unadvertised
+/// image targets, which misidentified text as an image. `None` when xclip
+/// is absent, times out, or holds no image.
 fn read_clipboard_image_png() -> Option<Vec<u8>> {
     if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let targets = run_clipboard_command(
+        "xclip",
+        &["-selection", "clipboard", "-t", "TARGETS", "-o"],
+        CLIPBOARD_READ_TIMEOUT,
+    )?;
+    let targets = String::from_utf8_lossy(&targets);
+    let advertises_png = targets
+        .lines()
+        .map(str::trim)
+        .any(|target| target == "image/png");
+    if !advertises_png {
         return None;
     }
     let bytes = run_clipboard_command(
@@ -3947,10 +3963,17 @@ mod tests {
         PathEnvRestore { previous }
     }
 
-    /// Write fake `xclip`/`wl-paste` executables: the `-t image/png` probe
-    /// either emits PNG bytes (`image: true`) or nothing (`image: false`);
-    /// plain text reads always print `pasted-text`.
-    fn fake_clipboard_tools(dir: &TempDir, image: bool) -> std::path::PathBuf {
+    /// Write fake `xclip`/`wl-paste` executables: `-t TARGETS` advertises
+    /// `image/png` only when `image` is true (otherwise `text/plain`), the
+    /// `-t image/png` probe emits PNG bytes when `image` is true, and plain
+    /// text reads always print `pasted-text`. Every call is appended to
+    /// `arguments_log` when given, so tests can assert which targets were
+    /// probed.
+    fn fake_clipboard_tools_with_log(
+        dir: &TempDir,
+        image: bool,
+        arguments_log: Option<&std::path::Path>,
+    ) -> std::path::PathBuf {
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).expect("fake bin dir");
         let image_payload = if image {
@@ -3958,12 +3981,21 @@ mod tests {
         } else {
             ""
         };
+        let targets_payload = if image {
+            "printf 'image/png\\n';\n"
+        } else {
+            "printf 'text/plain\\n';\n"
+        };
+        let log_line = match arguments_log {
+            Some(log) => format!("printf '%s\\n' \"$*\" >> '{}';\n", log.display()),
+            None => String::new(),
+        };
         for name in ["xclip", "wl-paste"] {
             let script = bin.join(name);
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = image/png ]; then\n    {image_payload}exit 0\n  fi\ndone\nprintf pasted-text\n"
+                    "#!/bin/sh\n{log_line}for arg in \"$@\"; do\n  if [ \"$arg\" = TARGETS ]; then\n    {targets_payload}    exit 0\n  fi\n  if [ \"$arg\" = image/png ]; then\n    {image_payload}exit 0\n  fi\ndone\nprintf pasted-text\n"
                 ),
             )
             .expect("write fake clipboard tool");
@@ -3975,6 +4007,10 @@ mod tests {
             }
         }
         bin
+    }
+
+    fn fake_clipboard_tools(dir: &TempDir, image: bool) -> std::path::PathBuf {
+        fake_clipboard_tools_with_log(dir, image, None)
     }
 
     #[tokio::test]
@@ -4023,6 +4059,73 @@ mod tests {
             lock(&ui.editor).get_text(),
             "pasted-text",
             "text fallback inserts the clipboard text"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_does_not_probe_unadvertised_image_targets() {
+        // Regression for #9786 (`8676a0dcd`).
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new();
+        let log = tmp.path().join("clipboard-args.log");
+        let bin = fake_clipboard_tools_with_log(&tmp, false, Some(&log));
+        let _path_restore = prepend_path(&bin);
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+
+        // The text fallback still runs, but the image probe was skipped.
+        assert_eq!(lock(&ui.editor).get_text(), "pasted-text");
+        let log = std::fs::read_to_string(&log).expect("argument log");
+        assert!(log.contains("TARGETS"), "targets are listed first: {log}");
+        assert!(
+            !log.contains("image/png"),
+            "unadvertised image targets must not be probed: {log}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_does_not_probe_image_targets_when_listing_fails() {
+        // Regression for #9786 (`8676a0dcd`).
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new();
+        let log = tmp.path().join("clipboard-args.log");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("xclip");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}';\nfor arg in \"$@\"; do\n  if [ \"$arg\" = TARGETS ]; then exit 1; fi\n  if [ \"$arg\" = image/png ]; then printf 'PNG'; exit 0; fi\ndone\nprintf pasted-text\n",
+                log.display()
+            ),
+        )
+        .expect("write fake xclip");
+        let wl_paste = bin.join("wl-paste");
+        std::fs::write(&wl_paste, "#!/bin/sh\nprintf pasted-text\n").expect("write fake wl-paste");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for script in [&script, &wl_paste] {
+                std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod fake clipboard tool");
+            }
+        }
+        let _path_restore = prepend_path(&bin);
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+
+        assert_eq!(lock(&ui.editor).get_text(), "pasted-text");
+        let log = std::fs::read_to_string(&log).expect("argument log");
+        assert!(log.contains("TARGETS"), "targets are listed first: {log}");
+        assert!(
+            !log.contains("image/png"),
+            "a failed listing must skip the image probe: {log}"
         );
     }
 

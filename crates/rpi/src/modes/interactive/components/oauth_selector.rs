@@ -57,6 +57,10 @@ pub struct AuthSelectorProvider {
     /// one upstream; ambient-only api-key methods do not.
     pub method_login: bool,
     pub status: Option<AuthCheck>,
+    /// Whether the provider's OAuth sign-in is backed by a subscription
+    /// (`isSubscription` @ ed8b3bcc1). `Some(false)` labels it as an
+    /// account; unset keeps the "subscription" label.
+    pub subscription: Option<bool>,
 }
 
 impl AuthSelectorProvider {
@@ -67,6 +71,11 @@ impl AuthSelectorProvider {
     pub fn from_provider(provider: &Arc<dyn Provider>, status: Option<AuthCheck>) -> Vec<Self> {
         let mut options = Vec::new();
         let auth = provider.auth();
+        let subscription = Some(
+            auth.oauth
+                .as_ref()
+                .is_some_and(|method| method.is_subscription()),
+        );
         if auth.oauth.is_some() {
             options.push(Self {
                 id: provider.id().to_string(),
@@ -75,6 +84,7 @@ impl AuthSelectorProvider {
                 method_name: auth.oauth.as_ref().map(|method| method.name().to_string()),
                 method_login: true,
                 status: status.clone(),
+                subscription,
             });
         }
         if auth.api_key.is_some() {
@@ -91,6 +101,7 @@ impl AuthSelectorProvider {
                     .as_ref()
                     .is_some_and(|method| method.supports_login()),
                 status,
+                subscription,
             });
         }
         options.sort_by(|a, b| a.name.cmp(&b.name));
@@ -122,11 +133,16 @@ impl AuthSelectorMode {
     }
 }
 
-/// `formatAuthSelectorProviderType` (oauth-selector.ts:22-24).
-fn format_auth_selector_provider_type(auth_type: &AuthType) -> &'static str {
+/// `formatAuthSelectorProviderType` (oauth-selector.ts:22-32 @ ed8b3bcc1):
+/// OAuth sign-ins without a subscription are labeled as accounts.
+fn format_auth_selector_provider_type(
+    auth_type: &AuthType,
+    subscription: Option<bool>,
+) -> &'static str {
     match auth_type {
-        AuthType::Oauth => "subscription",
         AuthType::ApiKey => "API key",
+        AuthType::Oauth if subscription == Some(false) => "account",
+        AuthType::Oauth => "subscription",
     }
 }
 
@@ -299,7 +315,7 @@ impl OAuthSelectorComponent {
                 "muted",
                 &format!(
                     " [{}]",
-                    format_auth_selector_provider_type(&provider.auth_type)
+                    format_auth_selector_provider_type(&provider.auth_type, provider.subscription)
                 ),
             )
         } else {
@@ -315,21 +331,23 @@ impl OAuthSelectorComponent {
         }
     }
 
-    /// `formatStatusIndicator` (oauth-selector.ts:164-181).
+    /// `formatStatusIndicator` (oauth-selector.ts:164-181 @ ed8b3bcc1): a
+    /// missing status reads "not configured", and a method that differs from
+    /// the provider's configured kind uses the type label ("account" for
+    /// non-subscription OAuth).
     fn format_status_indicator(&self, provider: &AuthSelectorProvider) -> String {
         let Some(status) = &provider.status else {
-            return self.theme.fg("muted", " • unconfigured");
+            return self.theme.fg("muted", " • not configured");
         };
         if status.kind != provider.auth_type {
-            let label = if status.kind == AuthType::Oauth {
-                "subscription configured"
-            } else {
-                "API key configured"
-            };
+            let label = format!(
+                "{} configured",
+                format_auth_selector_provider_type(&status.kind, provider.subscription)
+            );
             return format!(
                 "{}{}",
                 self.theme.fg("muted", " • "),
-                self.theme.fg("warning", label)
+                self.theme.fg("warning", &label)
             );
         }
         let Some(source) = &status.source else {
@@ -448,6 +466,7 @@ mod tests {
             method_name: None,
             method_login: auth_type == AuthType::Oauth,
             status,
+            subscription: None,
         }
     }
 
@@ -612,6 +631,7 @@ mod tests {
                 kind: AuthType::ApiKey,
                 source: source.map(str::to_string),
             }),
+            subscription: None,
         };
         assert!(
             component
@@ -639,11 +659,62 @@ mod tests {
                 kind: AuthType::ApiKey,
                 source: None,
             }),
+            subscription: None,
         };
         assert!(
             component
                 .format_status_indicator(&mismatched)
                 .contains("API key configured")
+        );
+    }
+
+    /// ed8b3bcc1: a missing status reads "not configured", and non-
+    /// subscription OAuth sign-ins are labeled as accounts.
+    #[test]
+    fn status_indicator_labels_not_configured_and_accounts() {
+        let component = OAuthSelectorComponent::new(
+            theme(),
+            AuthSelectorMode::Login,
+            vec![],
+            Box::new(|_| {}),
+            Box::new(|| {}),
+            None,
+        );
+        let no_status = provider("p", "P", AuthType::Oauth, None);
+        assert!(
+            component
+                .format_status_indicator(&no_status)
+                .contains("not configured")
+        );
+
+        let account = AuthSelectorProvider {
+            id: "radius".into(),
+            name: "Radius".into(),
+            auth_type: AuthType::ApiKey,
+            method_name: None,
+            method_login: false,
+            status: Some(AuthCheck {
+                kind: AuthType::Oauth,
+                source: None,
+            }),
+            subscription: Some(false),
+        };
+        assert!(
+            component
+                .format_status_indicator(&account)
+                .contains("account configured")
+        );
+        assert_eq!(
+            format_auth_selector_provider_type(&AuthType::Oauth, Some(false)),
+            "account"
+        );
+        assert_eq!(
+            format_auth_selector_provider_type(&AuthType::Oauth, Some(true)),
+            "subscription"
+        );
+        assert_eq!(
+            format_auth_selector_provider_type(&AuthType::ApiKey, Some(false)),
+            "API key"
         );
     }
 }
