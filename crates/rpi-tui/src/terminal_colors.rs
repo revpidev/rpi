@@ -1,8 +1,11 @@
-//! OSC 11 background color and color scheme report parsing (terminal-colors.ts).
+//! OSC 10/11/4 color replies and color-scheme report parsing
+//! (terminal-colors.ts @ a13d35a74).
 //!
-//! Port of `packages/tui/src/terminal-colors.ts` @ pi 0.82.1 (2efa728), with
-//! `parse_terminal_color_scheme_report` tracking the 4181f66 revision
-//! (0e633790c: accept batched reports, last one wins).
+//! Port of `packages/tui/src/terminal-colors.ts` @ pi v1.0.0 (a13d35a74),
+//! plus the `RgbColor` / `TerminalColors` / `OscColorTarget` types consumed by
+//! the single-pass `queryTerminalColors()` query (tui.ts:1470). The two
+//! legacy query faces (`parseOsc11BackgroundColor` and the per-face query
+//! methods) were removed upstream in 0.99.0 ([BREAKING], V16-10 FR-B).
 //!
 //! Intentional differences: none.
 
@@ -21,7 +24,37 @@ pub enum TerminalColorScheme {
     Light,
 }
 
-/// `hexToRgb` (terminal-colors.ts:9-15); caller guarantees a `#rrggbb` value.
+/// Colors the terminal reports for its current theme
+/// (terminal-colors.ts:10-17).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalColors {
+    /// Default foreground (OSC 10).
+    pub foreground: Option<RgbColor>,
+    /// Default background (OSC 11).
+    pub background: Option<RgbColor>,
+    /// ANSI colors 0-15 (OSC 4). Only set when the terminal reported all 16.
+    pub palette: Option<Vec<RgbColor>>,
+}
+
+/// What an OSC color reply reports: the default foreground (OSC 10),
+/// background (OSC 11), or a palette index (OSC 4)
+/// (terminal-colors.ts:41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscColorTarget {
+    Foreground,
+    Background,
+    Palette(u32),
+}
+
+/// One parsed OSC color reply (terminal-colors.ts:48-58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OscColorResponse {
+    pub target: OscColorTarget,
+    /// `None` when the reply carried an unparseable color.
+    pub rgb: Option<RgbColor>,
+}
+
+/// `hexToRgb` (terminal-colors.ts:19-25); caller guarantees six hex digits.
 fn hex_to_rgb(hex: &str) -> Option<RgbColor> {
     let hex = hex.strip_prefix('#')?;
     let r = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
@@ -30,7 +63,7 @@ fn hex_to_rgb(hex: &str) -> Option<RgbColor> {
     Some(RgbColor { r, g, b })
 }
 
-/// `parseOscHexChannel` (terminal-colors.ts:17-26).
+/// `parseOscHexChannel` (terminal-colors.ts:27-36).
 fn parse_osc_hex_channel(channel: &str) -> Option<u8> {
     // /^[0-9a-f]+$/i
     if channel.is_empty() || !channel.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -45,7 +78,7 @@ fn parse_osc_hex_channel(channel: &str) -> Option<u8> {
 }
 
 /// Strips the optional `rgb:`/`rgba:` prefix, case-insensitively
-/// (`value.replace(/^rgba?:/i, "")`, terminal-colors.ts:56).
+/// (`value.replace(/^rgba?:/i, "")`, terminal-colors.ts:66).
 fn strip_rgb_prefix(value: &str) -> &str {
     for prefix in ["rgb:", "rgba:"] {
         if value
@@ -58,28 +91,9 @@ fn strip_rgb_prefix(value: &str) -> &str {
     value
 }
 
-/// Matches `/^\x1b\]11;([^\x07\x1b]*)(?:\x07|\x1b\\)$/i`
-/// (terminal-colors.ts:28) and returns the captured value. The capture stops at
-/// the first terminator char, which must then be the very end of the response.
-fn parse_osc11_background_color_match(data: &str) -> Option<&str> {
-    let rest = data.strip_prefix("\x1b]11;")?;
-    let terminator_pos = rest.find(['\x07', '\x1b'])?;
-    let (value, terminator) = rest.split_at(terminator_pos);
-    match terminator {
-        "\x07" | "\x1b\\" => Some(value),
-        _ => None,
-    }
-}
-
-/// `isOsc11BackgroundColorResponse` (terminal-colors.ts:31-33).
-pub fn is_osc11_background_color_response(data: &str) -> bool {
-    parse_osc11_background_color_match(data).is_some()
-}
-
-/// `parseOsc11BackgroundColor` (terminal-colors.ts:35-65).
-pub fn parse_osc11_background_color(data: &str) -> Option<RgbColor> {
-    let value = parse_osc11_background_color_match(data)?.trim();
-
+/// `parseOscColorValue` (terminal-colors.ts:60-80).
+fn parse_osc_color_value(raw_value: &str) -> Option<RgbColor> {
+    let value = raw_value.trim();
     if let Some(hex) = value.strip_prefix('#') {
         // /^[0-9a-f]{6}$/i
         if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -95,8 +109,8 @@ pub fn parse_osc11_background_color(data: &str) -> Option<RgbColor> {
         return None;
     }
 
-    // `rgb:`/`rgba:` responses (e.g. `rgb:0000/8000/ffff`); at least three
-    // slash-separated channels, extra parts ignored (JS array destructuring).
+    // `rgb:`/`rgba:` responses (e.g. `rgb:0000/8000/ffff`); extra parts are
+    // ignored (JS array destructuring).
     let rgb_value = strip_rgb_prefix(value);
     let mut parts = rgb_value.split('/');
     let r = parse_osc_hex_channel(parts.next()?)?;
@@ -105,13 +119,51 @@ pub fn parse_osc11_background_color(data: &str) -> Option<RgbColor> {
     Some(RgbColor { r, g, b })
 }
 
-/// `parseTerminalColorSchemeReport` (terminal-colors.ts:67-73 @ 4181f66,
-/// 0e633790c). Matches the upstream regex `/^(?:\x1b\[\?997;(1|2)n)+$/`
-/// (terminal-colors.ts:29): one or more concatenated reports — terminals may
-/// batch the query reply and a change notification into one read. The JS
-/// capture group keeps the LAST iteration's digit, so the final report wins.
-/// The regex has no flags, so the match is case-sensitive: a trailing `N`
-/// does not match.
+/// `parseOscColorResponse` (terminal-colors.ts:48-58). Returns `None` when
+/// `data` is not an OSC 10/11/4 reply; `rgb` is `None` when it is a reply
+/// with an unparseable color.
+///
+/// Matches the upstream regex
+/// `/^\x1b\](?:(1[01])|4;(\d{1,3}));([^\x07\x1b]*)(?:\x07|\x1b\\)$/i`.
+pub fn parse_osc_color_response(data: &str) -> Option<OscColorResponse> {
+    let rest = data.strip_prefix("\x1b]")?;
+    let (target, after) = if let Some(after) = rest.strip_prefix("10;") {
+        (OscColorTarget::Foreground, after)
+    } else if let Some(after) = rest.strip_prefix("11;") {
+        (OscColorTarget::Background, after)
+    } else if let Some(after) = rest.strip_prefix("4;") {
+        let semicolon = after.find(';')?;
+        let index = &after[..semicolon];
+        if index.is_empty() || index.len() > 3 || !index.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        (OscColorTarget::Palette(index.parse().ok()?), &after[semicolon + 1..])
+    } else {
+        return None;
+    };
+    let value = if let Some(value) = after.strip_suffix('\x07') {
+        value
+    } else if let Some(value) = after.strip_suffix("\x1b\\") {
+        value
+    } else {
+        return None;
+    };
+    // `[^\x07\x1b]*`: the value must not contain a terminator char itself.
+    if value.contains(['\x07', '\x1b']) {
+        return None;
+    }
+    Some(OscColorResponse {
+        target,
+        rgb: parse_osc_color_value(value),
+    })
+}
+
+/// `parseTerminalColorSchemeReport` (terminal-colors.ts:82-88). Matches the
+/// upstream regex `/^(?:\x1b\[\?997;(1|2)n)+$/`: one or more concatenated
+/// reports — terminals may batch the query reply and a change notification
+/// into one read. The JS capture group keeps the LAST iteration's digit, so
+/// the final report wins. The regex has no flags, so the match is
+/// case-sensitive: a trailing `N` does not match.
 pub fn parse_terminal_color_scheme_report(data: &str) -> Option<TerminalColorScheme> {
     let mut rest = data;
     let mut last = None;
@@ -134,38 +186,126 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_osc11_background_color_parses_16bit_rgb_responses() {
+    fn test_parse_osc_color_response_parses_osc_10_11_and_4_replies() {
         assert_eq!(
-            parse_osc11_background_color("\x1b]11;rgb:0000/8000/ffff\x07"),
-            Some(RgbColor {
-                r: 0,
-                g: 128,
-                b: 255
+            parse_osc_color_response("\x1b]10;rgb:ffff/ffff/ffff\x07"),
+            Some(OscColorResponse {
+                target: OscColorTarget::Foreground,
+                rgb: Some(RgbColor {
+                    r: 255,
+                    g: 255,
+                    b: 255
+                }),
+            })
+        );
+        assert_eq!(
+            parse_osc_color_response("\x1b]4;13;#ff0080\x1b\\"),
+            Some(OscColorResponse {
+                target: OscColorTarget::Palette(13),
+                rgb: Some(RgbColor {
+                    r: 255,
+                    g: 0,
+                    b: 128
+                }),
+            })
+        );
+        assert_eq!(
+            parse_osc_color_response("\x1b]4;1;bogus\x07"),
+            Some(OscColorResponse {
+                target: OscColorTarget::Palette(1),
+                rgb: None,
+            })
+        );
+        assert_eq!(parse_osc_color_response("\x1b]12;#ffffff\x07"), None);
+    }
+
+    #[test]
+    fn test_parse_osc_color_response_parses_hex_and_16bit_responses() {
+        assert_eq!(
+            parse_osc_color_response("\x1b]11;#ffffff\x1b\\"),
+            Some(OscColorResponse {
+                target: OscColorTarget::Background,
+                rgb: Some(RgbColor {
+                    r: 255,
+                    g: 255,
+                    b: 255
+                }),
+            })
+        );
+        assert_eq!(
+            parse_osc_color_response("\x1b]11;rgb:0000/8000/ffff\x07"),
+            Some(OscColorResponse {
+                target: OscColorTarget::Background,
+                rgb: Some(RgbColor {
+                    r: 0,
+                    g: 128,
+                    b: 255
+                }),
+            })
+        );
+        assert_eq!(
+            parse_osc_color_response("\x1b]11;#00008000ffff\x07"),
+            Some(OscColorResponse {
+                target: OscColorTarget::Background,
+                rgb: Some(RgbColor {
+                    r: 0,
+                    g: 128,
+                    b: 255
+                }),
             })
         );
     }
 
     #[test]
-    fn test_parse_osc11_background_color_parses_hex_responses() {
+    fn test_parse_osc_color_response_rejects_non_strict_responses() {
+        assert_eq!(parse_osc_color_response("x\x1b]11;#ffffff\x07"), None);
+        assert_eq!(parse_osc_color_response("\x1b]11;#ffffff\x07x"), None);
+        assert_eq!(parse_osc_color_response("\x1b]11;#ffffff"), None);
+        assert_eq!(parse_osc_color_response("\x1b]4;1234;#ffffff\x07"), None);
+        assert_eq!(parse_osc_color_response("\x1b]4;;#ffffff\x07"), None);
+        assert_eq!(parse_osc_color_response("\x1b]11;#ff\x07\x1b\\"), None);
+    }
+
+    #[test]
+    fn test_parse_osc_color_response_accepts_case_insensitive_hex_and_rgb_prefix() {
         assert_eq!(
-            parse_osc11_background_color("\x1b]11;#ffffff\x1b\\"),
-            Some(RgbColor {
-                r: 255,
-                g: 255,
-                b: 255
+            parse_osc_color_response("\x1b]11;#FFAABB\x07"),
+            Some(OscColorResponse {
+                target: OscColorTarget::Background,
+                rgb: Some(RgbColor {
+                    r: 255,
+                    g: 170,
+                    b: 187
+                }),
             })
         );
         assert_eq!(
-            parse_osc11_background_color("\x1b]11;#000000\x07"),
-            Some(RgbColor { r: 0, g: 0, b: 0 })
+            parse_osc_color_response("\x1b]11;RGB:ff00/ff00/ff00\x07"),
+            // 4-digit channels: 0xff00 / 0xffff * 255 = 254.0088 → 254.
+            Some(OscColorResponse {
+                target: OscColorTarget::Background,
+                rgb: Some(RgbColor {
+                    r: 254,
+                    g: 254,
+                    b: 254
+                }),
+            })
         );
     }
 
     #[test]
-    fn test_parse_osc11_background_color_rejects_non_strict_responses() {
-        assert_eq!(parse_osc11_background_color("x\x1b]11;#ffffff\x07"), None);
-        assert_eq!(parse_osc11_background_color("\x1b]10;#ffffff\x07"), None);
-        assert_eq!(parse_osc11_background_color("\x1b]11;#ffffff\x07x"), None);
+    fn test_parse_osc_color_response_trims_whitespace_around_value() {
+        assert_eq!(
+            parse_osc_color_response("\x1b]11; #ffffff \x07"),
+            Some(OscColorResponse {
+                target: OscColorTarget::Background,
+                rgb: Some(RgbColor {
+                    r: 255,
+                    g: 255,
+                    b: 255
+                }),
+            })
+        );
     }
 
     #[test]
@@ -193,64 +333,6 @@ mod tests {
         assert_eq!(parse_terminal_color_scheme_report("x\x1b[?997;1n"), None);
         // A valid report followed by trailing garbage fails the `$` anchor.
         assert_eq!(parse_terminal_color_scheme_report("\x1b[?997;1nx"), None);
-    }
-
-    // Supplementary coverage (upstream tests these functions only indirectly
-    // through the TUI core, which is ported in a later phase).
-
-    #[test]
-    fn test_is_osc11_background_color_response() {
-        assert!(is_osc11_background_color_response("\x1b]11;#ffffff\x07"));
-        assert!(is_osc11_background_color_response(
-            "\x1b]11;rgb:0000/8000/ffff\x1b\\"
-        ));
-        assert!(!is_osc11_background_color_response("\x1b]11;#ffffff\x07x"));
-        assert!(!is_osc11_background_color_response("plain text"));
-    }
-
-    #[test]
-    fn test_parse_osc11_background_color_accepts_case_insensitive_hex_and_rgb_prefix() {
-        assert_eq!(
-            parse_osc11_background_color("\x1b]11;#FFAABB\x07"),
-            Some(RgbColor {
-                r: 255,
-                g: 170,
-                b: 187
-            })
-        );
-        assert_eq!(
-            parse_osc11_background_color("\x1b]11;RGB:ff00/ff00/ff00\x07"),
-            // 4-digit channels: 0xff00 / 0xffff * 255 = 254.0088 → round = 254.
-            Some(RgbColor {
-                r: 254,
-                g: 254,
-                b: 254
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_osc11_background_color_parses_12_digit_hex_channels() {
-        assert_eq!(
-            parse_osc11_background_color("\x1b]11;#00008000ffff\x07"),
-            Some(RgbColor {
-                r: 0,
-                g: 128,
-                b: 255
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_osc11_background_color_trims_whitespace_around_value() {
-        assert_eq!(
-            parse_osc11_background_color("\x1b]11; #ffffff \x07"),
-            Some(RgbColor {
-                r: 255,
-                g: 255,
-                b: 255
-            })
-        );
     }
 
     #[test]

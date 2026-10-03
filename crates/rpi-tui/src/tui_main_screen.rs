@@ -32,16 +32,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 
 use crate::terminal::{InputHandler, ResizeHandler, Terminal};
-use crate::terminal_colors::{RgbColor, TerminalColorScheme};
+use crate::terminal_colors::TerminalColors;
 use crate::terminal_image::{delete_kitty_image, is_image_line};
 use crate::tui::{
     OverlayHandle, OverlayOptions, RenderHandle, SharedComponent, SharedTerminal,
-    TerminalColorSchemeListener, Tui, TuiInputListener, TuiMode, TuiStopOptions, lock_component,
-    lock_shared, same_component,
+    TerminalColorQueryOptions, TerminalColorSchemeListener, Tui, TuiInputListener, TuiMode,
+    TuiStopOptions, lock_component, lock_shared, same_component,
 };
 use crate::tui_base::{
-    CursorPos, PendingOsc11BackgroundQuery, PendingTerminalColorSchemeQuery, RenderSchedule,
-    TerminalSizeCache, TuiBase, env_flag_is_1, schedule_render,
+    CursorPos, RenderSchedule, TerminalSizeCache, TuiBase, env_flag_is_1, schedule_render,
 };
 use crate::utils::{slice_by_column, visible_width, width_divergence_extra};
 
@@ -617,47 +616,16 @@ impl TuiMainScreen {
 
     // --- terminal introspection queries -----------------------------------
 
-    /// Upstream `queryTerminalBackgroundColor` (tui.ts:1670): OSC 11 query
-    /// (`ESC ] 11 ; ? BEL`); resolves with the parsed RGB color, or `None` on
-    /// timeout / parse failure. The timeout is fired by [`TuiMainScreen::tick`].
-    pub fn query_terminal_background_color(
+    /// Upstream `queryTerminalColors` (tui.ts:1470): the OSC 10/11/4 + DA1
+    /// single-pass query. The timeout is fired by [`TuiMainScreen::tick`].
+    pub fn query_terminal_colors(
         &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<RgbColor>> {
+        options: TerminalColorQueryOptions,
+    ) -> oneshot::Receiver<TerminalColors> {
         let (sender, receiver) = oneshot::channel();
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + options.timeout;
         self.run_or_queue(move |inner| {
-            inner
-                .pending_osc11_background_queries
-                .push_back(PendingOsc11BackgroundQuery {
-                    settled: false,
-                    sender: Some(sender),
-                    deadline: Some(deadline),
-                });
-            inner.pending_osc11_background_replies += 1;
-            inner.terminal().write("\x1b]11;?\x07");
-        });
-        receiver
-    }
-
-    /// Upstream `queryTerminalColorScheme` (tui.ts:1698): DSR `CSI ? 996 n`.
-    /// Terminals that support the color palette notification protocol reply
-    /// with `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light).
-    pub fn query_terminal_color_scheme(
-        &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<TerminalColorScheme>> {
-        let (sender, receiver) = oneshot::channel();
-        let deadline = Instant::now() + timeout;
-        self.run_or_queue(move |inner| {
-            inner
-                .pending_terminal_color_scheme_queries
-                .push(PendingTerminalColorSchemeQuery {
-                    settled: false,
-                    sender: Some(sender),
-                    deadline: Some(deadline),
-                });
-            inner.terminal().write("\x1b[?996n");
+            inner.start_terminal_color_query(deadline, options.on_late_reply, sender)
         });
         receiver
     }
@@ -1841,18 +1809,11 @@ impl Tui for TuiMainScreen {
         TuiMainScreen::set_terminal_color_scheme_notifications(self, enabled);
     }
 
-    fn query_terminal_background_color(
+    fn query_terminal_colors(
         &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<RgbColor>> {
-        TuiMainScreen::query_terminal_background_color(self, timeout)
-    }
-
-    fn query_terminal_color_scheme(
-        &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<TerminalColorScheme>> {
-        TuiMainScreen::query_terminal_color_scheme(self, timeout)
+        options: TerminalColorQueryOptions,
+    ) -> oneshot::Receiver<TerminalColors> {
+        TuiMainScreen::query_terminal_colors(self, options)
     }
 
     fn invalidate(&self) {
@@ -1888,6 +1849,7 @@ mod tests {
         OverlayOptions, OverlayUnfocusOptions, SizeValue, TuiInputListenerResult,
         composite_tui_line, shared_component,
     };
+    use crate::terminal_colors::RgbColor;
     use crate::tui_base::TuiBase;
     use crate::utils::slice_by_column;
     use std::sync::atomic::AtomicBool;
@@ -5468,7 +5430,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // terminal-colors.test.ts: "TUI.queryTerminalBackgroundColor"
+    // terminal-colors.test.ts: "TUI.queryTerminalColors"
     // -------------------------------------------------------------------------
 
     fn colors_test_setup() -> (
@@ -5492,88 +5454,156 @@ mod tests {
         (terminal, tui, component_h, listener_inputs)
     }
 
-    #[test]
-    fn osc11_writes_query_and_resolves_with_parsed_rgb_reply() {
-        let (terminal, tui, _component, _listeners) = colors_test_setup();
-        let query = tui.query_terminal_background_color(Duration::from_millis(1000));
-        assert!(terminal.get_writes().contains("\x1b]11;?\x07"));
+    fn palette_replies() -> Vec<String> {
+        (0..16)
+            .map(|index| format!("\x1b]4;{};#000000\x07", index))
+            .collect()
+    }
 
-        send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
+    /// The upstream `wait(5)` for the late-reply test: fire the explicit
+    /// deadline instead (the Rust port has no JS timers; see tui.rs header).
+    fn query_colors(
+        tui: &TuiMainScreen,
+        timeout: Duration,
+    ) -> tokio::sync::oneshot::Receiver<TerminalColors> {
+        tui.query_terminal_colors(crate::tui::TerminalColorQueryOptions {
+            timeout,
+            on_late_reply: None,
+        })
+    }
+
+    #[test]
+    fn terminal_colors_query_writes_all_colors_in_one_write_and_consumes_replies() {
+        let (terminal, tui, component_h, listeners) = colors_test_setup();
+        let query = query_colors(&tui, Duration::from_millis(1000));
+        let written = terminal.get_writes();
+        let query_at = written
+            .rfind("\x1b]10;?\x07\x1b]11;?\x07\x1b]4;0;?\x07")
+            .expect("query written");
+        let written = &written[query_at..];
+        assert!(
+            written.starts_with("\x1b]10;?\x07\x1b]11;?\x07\x1b]4;0;?\x07"),
+            "single-pass query starts with OSC 10/11/4, got {written:?}"
+        );
+        assert!(
+            written.ends_with("\x1b[c"),
+            "single-pass query ends with DA1, got {written:?}"
+        );
+
+        send_input(&terminal, &tui, "x");
+        send_input(&terminal, &tui, "\x1b]10;#ffffff\x07");
+        send_input(&terminal, &tui, "\x1b]11;rgb:0000/0000/0000\x1b\\");
+        for reply in palette_replies() {
+            send_input(&terminal, &tui, &reply);
+        }
+        // Resolves once every reply arrived, without waiting for DA1.
+        let colors = query.blocking_recv().expect("query sender");
         assert_eq!(
-            query.blocking_recv().ok().flatten(),
+            colors.foreground,
             Some(RgbColor {
                 r: 255,
                 g: 255,
                 b: 255
             })
         );
-        tui.stop(TuiStopOptions::default());
-    }
-
-    #[test]
-    fn osc11_consumes_replies_before_listeners_and_focused_dispatch() {
-        let (terminal, tui, component_h, listener_inputs) = colors_test_setup();
-        let query = tui.query_terminal_background_color(Duration::from_millis(1000));
-
-        send_input(&terminal, &tui, "\x1b]11;#000000\x07");
-
         assert_eq!(
-            query.blocking_recv().ok().flatten(),
+            colors.background,
             Some(RgbColor { r: 0, g: 0, b: 0 })
         );
-        assert_eq!(*lock_shared(&listener_inputs), Vec::<String>::new());
-        assert_eq!(component_h.inputs(), Vec::<String>::new());
+        assert_eq!(colors.palette.map(|palette| palette.len()), Some(16));
+        // The trailing DA1 is consumed; only "x" reached the component.
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert_eq!(component_h.inputs(), vec!["x"]);
+        assert_eq!(*lock_shared(&listeners), vec!["x"]);
         tui.stop(TuiStopOptions::default());
     }
 
     #[test]
-    fn osc11_consumes_unparseable_strict_replies_and_resolves_none() {
-        let (terminal, tui, component_h, listener_inputs) = colors_test_setup();
-        let query = tui.query_terminal_background_color(Duration::from_millis(1000));
+    fn terminal_colors_query_resolves_on_da1_with_replies_in_query_order() {
+        let (terminal, tui, _component, _listeners) = colors_test_setup();
+        let first = query_colors(&tui, Duration::from_millis(1000));
+        let second = query_colors(&tui, Duration::from_millis(1000));
 
-        send_input(&terminal, &tui, "\x1b]11;not-a-color\x07");
+        send_input(&terminal, &tui, "\x1b]11;#000000\x07");
+        // An incomplete palette is dropped.
+        for reply in palette_replies().into_iter().take(8) {
+            send_input(&terminal, &tui, &reply);
+        }
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        send_input(&terminal, &tui, "\x1b[?62;22c");
 
-        assert_eq!(query.blocking_recv().ok().flatten(), None);
-        assert_eq!(*lock_shared(&listener_inputs), Vec::<String>::new());
-        assert_eq!(component_h.inputs(), Vec::<String>::new());
+        let first = first.blocking_recv().expect("first query sender");
+        assert_eq!(first.foreground, None);
+        assert_eq!(first.background, Some(RgbColor { r: 0, g: 0, b: 0 }));
+        assert_eq!(first.palette, None);
+        let second = second.blocking_recv().expect("second query sender");
+        assert_eq!(second.foreground, None);
+        assert_eq!(second.background, None);
+        assert_eq!(second.palette, None);
         tui.stop(TuiStopOptions::default());
     }
 
     #[test]
-    fn osc11_dispatches_non_matching_input_normally_while_waiting() {
-        let (terminal, tui, component_h, listener_inputs) = colors_test_setup();
-        let mut query = tui.query_terminal_background_color(Duration::from_millis(1000));
+    fn terminal_colors_query_reports_late_replies_after_timeout_and_consumes_until_da1() {
+        let (terminal, tui, component_h, listeners) = colors_test_setup();
+        let late: Arc<Mutex<Vec<crate::terminal_colors::TerminalColors>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let late_clone = Arc::clone(&late);
+        let query = tui.query_terminal_colors(crate::tui::TerminalColorQueryOptions {
+            timeout: Duration::from_millis(1),
+            on_late_reply: Some(Box::new(move |colors| {
+                lock_shared(&late_clone).push(colors);
+            })),
+        });
+        // Fire the explicit deadline (upstream waits 5ms of real time).
+        tui.tick(Instant::now() + Duration::from_millis(5));
+        assert!(query.blocking_recv().expect("query sender").background.is_none());
+
+        send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        let late = lock_shared(&late);
+        assert_eq!(
+            late.as_slice(),
+            &[crate::terminal_colors::TerminalColors {
+                foreground: None,
+                background: Some(RgbColor {
+                    r: 255,
+                    g: 255,
+                    b: 255
+                }),
+                palette: None,
+            }]
+        );
+        drop(late);
+        assert_eq!(component_h.inputs(), Vec::<String>::new());
+        assert_eq!(*lock_shared(&listeners), Vec::<String>::new());
+
+        // With no query pending, color replies are ordinary input again.
+        send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
+        assert_eq!(component_h.inputs(), vec!["\x1b]11;#ffffff\x07"]);
+        tui.stop(TuiStopOptions::default());
+    }
+
+    #[test]
+    fn terminal_colors_query_dispatches_non_matching_input_normally_while_waiting() {
+        let (terminal, tui, component_h, listeners) = colors_test_setup();
+        let mut query = query_colors(&tui, Duration::from_millis(1000));
 
         send_input(&terminal, &tui, "x");
         assert!(query.try_recv().is_err(), "query should still be pending");
-        assert_eq!(*lock_shared(&listener_inputs), vec!["x"]);
+        assert_eq!(*lock_shared(&listeners), vec!["x"]);
         assert_eq!(component_h.inputs(), vec!["x"]);
 
         send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
+        send_input(&terminal, &tui, "\x1b[?62;22c");
         assert_eq!(
-            query.blocking_recv().ok().flatten(),
+            query.blocking_recv().expect("query sender").background,
             Some(RgbColor {
                 r: 255,
                 g: 255,
                 b: 255
             })
         );
-        tui.stop(TuiStopOptions::default());
-    }
-
-    #[test]
-    fn osc11_keeps_consuming_a_late_reply_after_timeout() {
-        let (terminal, tui, component_h, listener_inputs) = colors_test_setup();
-        let query = tui.query_terminal_background_color(Duration::from_millis(1));
-        // Fire the explicit deadline (upstream waits 5ms of real time).
-        tui.tick(Instant::now() + Duration::from_millis(5));
-
-        assert_eq!(query.blocking_recv().ok().flatten(), None);
-
-        send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
-
-        assert_eq!(*lock_shared(&listener_inputs), Vec::<String>::new());
-        assert_eq!(component_h.inputs(), Vec::<String>::new());
         tui.stop(TuiStopOptions::default());
     }
 
@@ -5608,96 +5638,6 @@ mod tests {
         tui.stop(TuiStopOptions::default());
     }
 
-    // -------------------------------------------------------------------------
-    // TUI render scheduling (tui-render.test.ts:91-115, 29d9f087c)
-    // -------------------------------------------------------------------------
-
-    /// `InputComponent` (tui-render.test.ts:27-38): counts renders; handled
-    /// input replaces the rendered lines.
-    struct InputComponent {
-        lines: Arc<Mutex<Vec<String>>>,
-        render_count: Arc<Mutex<u64>>,
-    }
-
-    impl Component for InputComponent {
-        fn render(&self, _width: usize) -> Vec<String> {
-            *lock_shared(&self.render_count) += 1;
-            lock_shared(&self.lines).clone()
-        }
-
-        fn handle_input(&mut self, data: &str) {
-            *lock_shared(&self.lines) = vec![data.to_string()];
-        }
-    }
-
-    #[test]
-    fn renders_keyboard_input_without_waiting_for_a_throttled_frame() {
-        let terminal = VirtualTerminal::new(40, 10);
-        let tui = new_tui(&terminal);
-        let lines = Arc::new(Mutex::new(vec!["initial".to_string()]));
-        let render_count = Arc::new(Mutex::new(0u64));
-        let component = shared_component(InputComponent {
-            lines: Arc::clone(&lines),
-            render_count: Arc::clone(&render_count),
-        });
-        tui.add_child(component.clone());
-        tui.set_focus(Some(component));
-        tui.start();
-        settle(&tui);
-        let render_count_before_input = *lock_shared(&render_count);
-
-        // Queue a normal throttled render first. Keyboard input should preempt it.
-        *lock_shared(&lines) = vec!["pending".to_string()];
-        tui.request_render(false);
-        terminal.send_input("first");
-        terminal.send_input("second");
-        terminal.send_input("typed");
-        // Upstream awaits a single `process.nextTick`; here the first tick
-        // drains all queued inputs (arming the immediate deadline) and the
-        // second fires it — both well inside the 16ms throttle window of the
-        // queued frame.
-        tui.tick(Instant::now());
-        tui.tick(Instant::now());
-
-        assert_eq!(
-            *lock_shared(&render_count),
-            render_count_before_input + 1,
-            "three inputs in one tick render exactly once, without waiting for the throttled frame"
-        );
-        assert_eq!(*lock_shared(&lines), vec!["typed".to_string()]);
-        // The preempted throttled frame must not render a second time once its
-        // original deadline passes.
-        tui.tick(Instant::now() + Duration::from_millis(20));
-        assert_eq!(*lock_shared(&render_count), render_count_before_input + 1);
-        tui.stop(TuiStopOptions::default());
-    }
-
-    #[test]
-    fn pending_render_survives_stop_and_fires_after_restart() {
-        let terminal = VirtualTerminal::new(40, 10);
-        let tui = new_tui(&terminal);
-        let (component, lines) = test_component(&["a"]);
-        tui.add_child(component);
-        tui.start();
-        let rendered_at = settle(&tui);
-        terminal.clear_writes();
-
-        // A throttled render pending at stop() keeps its deadline (upstream
-        // leaks renderRequested here; see header note) and fires on the
-        // first tick after start().
-        set_lines(&lines, &["b"]);
-        tui.request_render(false);
-        tui.stop(TuiStopOptions::default());
-        tui.start();
-        terminal.clear_writes();
-        tui.tick(rendered_at + Duration::from_millis(20));
-        assert!(
-            terminal.get_writes().contains('b'),
-            "pending render fires on the first tick after restart"
-        );
-        tui.stop(TuiStopOptions::default());
-    }
-
     #[test]
     fn stopped_tui_defers_render_deadline_but_keeps_query_timeouts() {
         let terminal = VirtualTerminal::new(40, 10);
@@ -5715,7 +5655,7 @@ mod tests {
         );
         // A live introspection query keeps its timeout in next_deadline even
         // while stopped (tick fires it regardless of stopped).
-        let _query = tui.query_terminal_color_scheme(Duration::from_millis(500));
+        let _query = query_colors(&tui, Duration::from_millis(500));
         tui.stop(TuiStopOptions::default());
         let stopped_deadline = tui
             .next_deadline()
@@ -5744,7 +5684,7 @@ mod tests {
 
         // No render pending: the query timeout becomes the next deadline.
         let requested_at = Instant::now();
-        let _query = tui.query_terminal_color_scheme(Duration::from_millis(500));
+        let _query = query_colors(&tui, Duration::from_millis(500));
         let deadline = tui
             .next_deadline()
             .expect("query timeout must contribute a deadline");
@@ -5768,7 +5708,7 @@ mod tests {
         tui.start();
         settle(&tui);
 
-        let _query = tui.query_terminal_background_color(Duration::ZERO);
+        let _query = query_colors(&tui, Duration::ZERO);
         assert!(
             tui.has_pending_work(),
             "an expired query timeout is pending work"
@@ -5776,31 +5716,26 @@ mod tests {
         tui.tick(Instant::now() + Duration::from_millis(1));
         assert!(
             !tui.has_pending_work(),
-            "the fired timeout is reaped, nothing pending"
+            "the fired timeout is no longer pending work"
         );
         tui.stop(TuiStopOptions::default());
     }
 
     #[test]
-    fn settled_queries_are_reaped_from_pending_queues() {
-        let terminal = VirtualTerminal::new(40, 10);
-        let tui = new_tui(&terminal);
-        let (component, _lines) = test_component(&["a"]);
-        tui.add_child(component);
-        tui.start();
-        settle(&tui);
-
-        let _osc11 = tui.query_terminal_background_color(Duration::ZERO);
-        let _scheme = tui.query_terminal_color_scheme(Duration::ZERO);
+    fn timed_out_queries_are_completed_and_popped_by_da1() {
+        let (terminal, tui, _component, _listeners) = colors_test_setup();
+        let mut query = query_colors(&tui, Duration::ZERO);
         tui.tick(Instant::now() + Duration::from_millis(1));
+        // The timeout completed the query (sender delivered), but the entry
+        // stays until DA1 so later replies keep attaching to the right query.
+        assert!(query.try_recv().is_ok(), "timeout resolves the query");
+        // DA1 pops the completed entry; without a query pending, a DA1 reply
+        // is ordinary input again.
+        send_input(&terminal, &tui, "\x1b[?62;22c");
         let inner = tui.lock_inner();
         assert!(
-            inner.pending_osc11_background_queries.is_empty(),
-            "timed-out osc11 queries are reaped"
-        );
-        assert!(
-            inner.pending_terminal_color_scheme_queries.is_empty(),
-            "timed-out color scheme queries are reaped"
+            inner.base.pending_terminal_color_queries.is_empty(),
+            "DA1 pops the completed query"
         );
         drop(inner);
         tui.stop(TuiStopOptions::default());

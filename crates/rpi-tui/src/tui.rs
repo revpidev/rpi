@@ -151,7 +151,7 @@ use tokio::sync::oneshot;
 use crate::components::scroll_view::ScrollView;
 use crate::layout_node::LayoutNode;
 use crate::terminal::Terminal;
-use crate::terminal_colors::{RgbColor, TerminalColorScheme};
+use crate::terminal_colors::{TerminalColorScheme, TerminalColors};
 use crate::terminal_image::is_image_line;
 use crate::tui_main_screen::TuiMainScreen;
 use crate::utils::{extract_segments, slice_by_column, slice_with_width, visible_width};
@@ -724,6 +724,20 @@ pub type TuiInputListener = Box<dyn FnMut(&str) -> Option<TuiInputListenerResult
 /// Color scheme change listener (tui.ts:320).
 pub type TerminalColorSchemeListener = Box<dyn FnMut(TerminalColorScheme) + Send>;
 
+/// `onLateReply` (tui.ts:1470): receives the replies if the query completes
+/// after the timeout, e.g. over slow links.
+pub type TerminalColorLateReply = Box<dyn FnMut(TerminalColors) + Send>;
+
+/// Options for [`Tui::query_terminal_colors`] (tui.ts:1470).
+#[derive(Default)]
+pub struct TerminalColorQueryOptions {
+    /// Query timeout, for terminals that do not answer DA1 either.
+    pub timeout: Duration,
+    /// Receives the replies if the query completes after the timeout, e.g.
+    /// over slow links (upstream `onLateReply`).
+    pub on_late_reply: Option<TerminalColorLateReply>,
+}
+
 // =============================================================================
 // Overlay types (tui.ts:124-251)
 // =============================================================================
@@ -1045,18 +1059,14 @@ pub trait Tui: Send + Sync {
 
     // --- terminal introspection queries -------------------------------------
 
-    /// Upstream `queryTerminalBackgroundColor` (tui.ts:316); resolves with
-    /// the parsed RGB color, or `None` on timeout / parse failure.
-    fn query_terminal_background_color(
+    /// Upstream `queryTerminalColors` (tui.ts:1470): a single-pass query for
+    /// the default foreground (OSC 10), background (OSC 11), and ANSI colors
+    /// 0-15 (OSC 4), closed by a trailing DA1 request. Resolves when the DA1
+    /// reply or all color replies arrive, or when the timeout expires.
+    fn query_terminal_colors(
         &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<RgbColor>>;
-
-    /// Upstream `queryTerminalColorScheme` (tui.ts:317).
-    fn query_terminal_color_scheme(
-        &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<TerminalColorScheme>>;
+        options: TerminalColorQueryOptions,
+    ) -> oneshot::Receiver<TerminalColors>;
 
     /// Upstream `invalidate` override (tui.ts:686-689 via `Component`):
     /// children plus overlays.

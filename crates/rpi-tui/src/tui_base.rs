@@ -36,15 +36,15 @@ use tokio::sync::oneshot;
 use crate::keys::{is_key_release, matches_key};
 use crate::terminal::{InputHandler, ResizeHandler, Terminal};
 use crate::terminal_colors::{
-    RgbColor, TerminalColorScheme, is_osc11_background_color_response,
-    parse_osc11_background_color, parse_terminal_color_scheme_report,
+    OscColorTarget, RgbColor, TerminalColors, parse_osc_color_response,
+    parse_terminal_color_scheme_report,
 };
 use crate::terminal_image::{CellDimensions, get_capabilities, is_image_line, set_cell_dimensions};
 use crate::tui::{
     CURSOR_MARKER, Component, OverlayAnchor, OverlayBounds, OverlayMargin, OverlayMarginSpec,
     OverlayOptions, OverlayUnfocusOptions, SEGMENT_RESET, SharedComponent, SharedTerminal,
-    SizeValue, TerminalColorSchemeListener, TuiInputListener, composite_tui_line, lock_component,
-    lock_shared, parse_size_value, same_component,
+    SizeValue, TerminalColorLateReply, TerminalColorSchemeListener, TuiInputListener,
+    composite_tui_line, lock_component, lock_shared, parse_size_value, same_component,
 };
 use crate::utils::{normalize_terminal_output, slice_by_column, visible_width};
 
@@ -101,21 +101,88 @@ pub(crate) enum OverlayFocusRestorePolicy {
     Preserve,
 }
 
-/// `PendingOsc11BackgroundQuery` (tui.ts:92-96); the `setTimeout` timer is an
-/// explicit deadline fired by [`TuiMainScreen::tick`] (see header note). Settled
-/// entries are reaped (upstream relies on GC).
-pub(crate) struct PendingOsc11BackgroundQuery {
-    pub(crate) settled: bool,
-    pub(crate) sender: Option<oneshot::Sender<Option<RgbColor>>>,
+/// Number of ANSI palette colors reported through OSC 4.
+pub(crate) const TERMINAL_PALETTE_SIZE: usize = 16;
+/// OSC 10 and 11 plus OSC 4 for every palette color.
+pub(crate) const TERMINAL_COLOR_REPLY_COUNT: usize = 2 + TERMINAL_PALETTE_SIZE;
+/// Default colors, palette colors 0-15, and a trailing primary device
+/// attributes (DA1) request (tui.ts:160-169). Every terminal answers DA1 and
+/// terminals answer in order, so the DA1 reply marks the end of the color
+/// replies, including for terminals that ignore the color queries.
+pub(crate) const TERMINAL_COLOR_QUERY: &str = "\x1b]10;?\x07\x1b]11;?\x07\
+\x1b]4;0;?\x07\x1b]4;1;?\x07\x1b]4;2;?\x07\x1b]4;3;?\x07\
+\x1b]4;4;?\x07\x1b]4;5;?\x07\x1b]4;6;?\x07\x1b]4;7;?\x07\
+\x1b]4;8;?\x07\x1b]4;9;?\x07\x1b]4;10;?\x07\x1b]4;11;?\x07\
+\x1b]4;12;?\x07\x1b]4;13;?\x07\x1b]4;14;?\x07\x1b]4;15;?\x07\x1b[c";
+
+/// Upstream's `deliver` slot: the promise's resolve until the timeout, then
+/// `onLateReply`.
+pub(crate) enum TerminalColorQueryDelivery {
+    Resolve(oneshot::Sender<TerminalColors>),
+    Late(TerminalColorLateReply),
+}
+
+/// `PendingTerminalColorQuery` (tui.ts:146-159). The `setTimeout` timer is an
+/// explicit deadline fired by [`TuiMainScreen::tick`] (see header note); the
+/// query stays in the FIFO after completion until its DA1 reply arrives
+/// (upstream behavior).
+pub(crate) struct PendingTerminalColorQuery {
+    pub(crate) foreground: Option<RgbColor>,
+    pub(crate) background: Option<RgbColor>,
+    pub(crate) palette: [Option<RgbColor>; TERMINAL_PALETTE_SIZE],
+    /// Targets that already replied, keyed 0 = foreground, 1 = background,
+    /// 2 + index = palette index (upstream's `Set<string>`).
+    pub(crate) replied: [bool; TERMINAL_COLOR_REPLY_COUNT],
+    pub(crate) replied_count: usize,
+    /// Receives the result: the promise's resolve until the timeout, then
+    /// `onLateReply`. Unset once the query completed; later replies are
+    /// ignored.
+    pub(crate) delivery: Option<TerminalColorQueryDelivery>,
+    /// Stored until the timeout replaces `delivery` with it.
+    pub(crate) on_late_reply: Option<TerminalColorLateReply>,
     pub(crate) deadline: Option<Instant>,
 }
 
-/// Pending `query_terminal_color_scheme` (tui.ts:1698-1718); same explicit
-/// deadline treatment, same reaping of settled entries.
-pub(crate) struct PendingTerminalColorSchemeQuery {
-    pub(crate) settled: bool,
-    pub(crate) sender: Option<oneshot::Sender<Option<TerminalColorScheme>>>,
-    pub(crate) deadline: Option<Instant>,
+/// `terminalColorQueryResult` (tui.ts:1161-1164): the palette is only set when
+/// all 16 colors arrived.
+fn terminal_color_query_result(query: &PendingTerminalColorQuery) -> TerminalColors {
+    let palette = query.palette.iter().all(Option::is_some).then(|| {
+        query
+            .palette
+            .iter()
+            .map(|color| color.expect("all palette colors present"))
+            .collect()
+    });
+    TerminalColors {
+        foreground: query.foreground,
+        background: query.background,
+        palette,
+    }
+}
+
+/// `completeTerminalColorQuery` (tui.ts:1166-1170): delivers the result once
+/// through the current `deliver` slot and clears the timeout.
+fn complete_terminal_color_query(query: &mut PendingTerminalColorQuery) {
+    let colors = terminal_color_query_result(query);
+    query.deadline = None;
+    match query.delivery.take() {
+        Some(TerminalColorQueryDelivery::Resolve(sender)) => {
+            let _ = sender.send(colors);
+        }
+        Some(TerminalColorQueryDelivery::Late(mut callback)) => callback(colors),
+        None => {}
+    }
+}
+
+/// `DEVICE_ATTRIBUTES_RESPONSE_PATTERN` (tui.ts:170): `/^\x1b\[\?[\d;]*c$/`.
+fn is_device_attributes_response(data: &str) -> bool {
+    let Some(rest) = data.strip_prefix("\x1b[?") else {
+        return false;
+    };
+    let Some(body) = rest.strip_suffix('c') else {
+        return false;
+    };
+    body.bytes().all(|b| b.is_ascii_digit() || b == b';')
 }
 
 /// `OverlayLayout` result (tui.ts:906): `{ width, row, col, maxHeight }`.
@@ -211,11 +278,9 @@ pub(crate) struct TuiBase {
     pub(crate) clear_on_shrink: bool,
     pub(crate) full_redraw_count: u64,
     pub(crate) stopped: bool,
-    pub(crate) pending_osc11_background_replies: usize,
-    pub(crate) pending_osc11_background_queries: VecDeque<PendingOsc11BackgroundQuery>,
+    pub(crate) pending_terminal_color_queries: VecDeque<PendingTerminalColorQuery>,
     pub(crate) terminal_color_scheme_listeners: Vec<(u64, TerminalColorSchemeListener)>,
     pub(crate) terminal_color_scheme_notifications_enabled: bool,
-    pub(crate) pending_terminal_color_scheme_queries: Vec<PendingTerminalColorSchemeQuery>,
     /// Directory for debug/crash logs. When `None`, debug logging is
     /// disabled and crash dumps fall back to the OS temp directory
     /// (tui.ts:486-487 @ 9841914).
@@ -272,11 +337,9 @@ impl TuiBase {
             clear_on_shrink: false,
             full_redraw_count: 0,
             stopped: false,
-            pending_osc11_background_replies: 0,
-            pending_osc11_background_queries: VecDeque::new(),
+            pending_terminal_color_queries: VecDeque::new(),
             terminal_color_scheme_listeners: Vec::new(),
             terminal_color_scheme_notifications_enabled: false,
-            pending_terminal_color_scheme_queries: Vec::new(),
             log_directory,
             focus_order_counter: 0,
             overlay_stack: Vec::new(),
@@ -1182,41 +1245,27 @@ impl TuiBase {
     /// Timeouts fire regardless of stopped, like upstream's `setTimeout`
     /// (tui.ts:1678-1686, 1715).
     pub(crate) fn fire_expired_queries(&mut self, now: Instant) {
-        for query in &mut self.pending_osc11_background_queries {
-            if !query.settled && query.deadline.is_some_and(|deadline| now >= deadline) {
-                query.settled = true;
-                query.deadline = None;
-                if let Some(sender) = query.sender.take() {
-                    let _ = sender.send(None);
-                }
+        for query in &mut self.pending_terminal_color_queries {
+            if !query.deadline.is_some_and(|deadline| now >= deadline) {
+                continue;
             }
-        }
-        for query in &mut self.pending_terminal_color_scheme_queries {
-            if !query.settled && query.deadline.is_some_and(|deadline| now >= deadline) {
-                query.settled = true;
-                query.deadline = None;
-                if let Some(sender) = query.sender.take() {
-                    let _ = sender.send(None);
-                }
+            query.deadline = None;
+            // Resolve the promise with the replies so far, and keep
+            // collecting late replies for `onLateReply` (tui.ts:1481-1484).
+            let colors = terminal_color_query_result(query);
+            if let Some(TerminalColorQueryDelivery::Resolve(sender)) = query.delivery.take() {
+                let _ = sender.send(colors);
             }
+            query.delivery = query
+                .on_late_reply
+                .take()
+                .map(TerminalColorQueryDelivery::Late);
         }
-        // Reap settled entries (upstream relies on GC, tui.ts:1678-1718). The
-        // osc11 reply match pops the front FIFO, so settled fronts must not
-        // linger; the color-scheme Vec is only ever appended to otherwise.
-        while self
-            .pending_osc11_background_queries
-            .front()
-            .is_some_and(|query| query.settled)
-        {
-            self.pending_osc11_background_queries.pop_front();
-        }
-        self.pending_terminal_color_scheme_queries
-            .retain(|query| !query.settled);
     }
 
     /// `handleInput` (tui.ts:765-839).
     pub(crate) fn handle_input(&mut self, data: &str) {
-        if self.consume_osc11_background_response(data) {
+        if self.consume_terminal_color_response(data) {
             return;
         }
         if self.consume_terminal_color_scheme_report(data) {
@@ -1341,30 +1390,61 @@ impl TuiBase {
         self.request_immediate_render();
     }
 
-    /// `consumeOsc11BackgroundResponse` (tui.ts:841-863).
-    pub(crate) fn consume_osc11_background_response(&mut self, data: &str) -> bool {
-        if self.pending_osc11_background_replies == 0 {
+    /// `consumeTerminalColorResponse` (tui.ts:1128-1160). Returns whether the
+    /// input belonged to the pending color query (and was consumed).
+    pub(crate) fn consume_terminal_color_response(&mut self, data: &str) -> bool {
+        if !self.pending_terminal_color_queries.front().is_some() {
             return false;
         }
-        if !is_osc11_background_color_response(data) {
-            return false;
+        if is_device_attributes_response(data) {
+            // Terminals answer in order; the DA1 reply closes the oldest
+            // query (tui.ts:1133-1136).
+            let Some(mut query) = self.pending_terminal_color_queries.pop_front() else {
+                return false;
+            };
+            complete_terminal_color_query(&mut query);
+            return true;
         }
 
-        let rgb = parse_osc11_background_color(data);
-        self.pending_osc11_background_replies -= 1;
-        if let Some(mut query) = self.pending_osc11_background_queries.pop_front()
-            && !query.settled
-        {
-            query.settled = true;
-            query.deadline = None;
-            if let Some(sender) = query.sender.take() {
-                let _ = sender.send(rgb);
+        let Some(response) = parse_osc_color_response(data) else {
+            return false;
+        };
+        let index = match response.target {
+            OscColorTarget::Foreground => 0,
+            OscColorTarget::Background => 1,
+            OscColorTarget::Palette(index) => {
+                let index = index as usize;
+                if index >= TERMINAL_PALETTE_SIZE {
+                    // Out-of-range palette index: parsed, but not part of the
+                    // 16-color report (upstream's `target < SIZE` guard).
+                    return true;
+                }
+                2 + index
             }
+        };
+        let Some(query) = self.pending_terminal_color_queries.front_mut() else {
+            return false;
+        };
+        // `if (!query.deliver || query.replied.has(key))` (tui.ts:1142).
+        if query.delivery.is_none() || query.replied[index] {
+            return true;
+        }
+        query.replied[index] = true;
+        query.replied_count += 1;
+        match response.target {
+            OscColorTarget::Foreground => query.foreground = response.rgb,
+            OscColorTarget::Background => query.background = response.rgb,
+            OscColorTarget::Palette(index) => query.palette[index as usize] = response.rgb,
+        }
+        if query.replied_count == TERMINAL_COLOR_REPLY_COUNT {
+            // All colors arrived: complete, but keep the entry so the trailing
+            // DA1 reply still pops the right query (tui.ts:1152-1154).
+            complete_terminal_color_query(query);
         }
         true
     }
 
-    /// `consumeTerminalColorSchemeReport` (tui.ts:865-875).
+    /// `consumeTerminalColorSchemeReport` (tui.ts:1162-1173).
     pub(crate) fn consume_terminal_color_scheme_report(&mut self, data: &str) -> bool {
         let Some(scheme) = parse_terminal_color_scheme_report(data) else {
             return false;
@@ -1372,21 +1452,6 @@ impl TuiBase {
         for (_, listener) in &mut self.terminal_color_scheme_listeners {
             listener(scheme);
         }
-        // Query promises resolve through a registered listener upstream; the
-        // net effect is that every unsettled query resolves with the report.
-        for query in &mut self.pending_terminal_color_scheme_queries {
-            if !query.settled {
-                query.settled = true;
-                query.deadline = None;
-                if let Some(sender) = query.sender.take() {
-                    let _ = sender.send(Some(scheme));
-                }
-            }
-        }
-        // Reap settled queries (upstream's promises are GC'd once the
-        // notification listener unsubscribes, tui.ts:1698-1718).
-        self.pending_terminal_color_scheme_queries
-            .retain(|query| !query.settled);
         true
     }
 
@@ -1574,35 +1639,43 @@ impl TuiBase {
         }
     }
 
+    /// Start a single-pass terminal color query (tui.ts:1470-1516): pushes the
+    /// pending entry and writes the OSC 10/11/4 + DA1 request.
+    pub(crate) fn start_terminal_color_query(
+        &mut self,
+        deadline: Instant,
+        on_late_reply: Option<TerminalColorLateReply>,
+        sender: oneshot::Sender<TerminalColors>,
+    ) {
+        self.pending_terminal_color_queries
+            .push_back(PendingTerminalColorQuery {
+                foreground: None,
+                background: None,
+                palette: [None; TERMINAL_PALETTE_SIZE],
+                replied: [false; TERMINAL_COLOR_REPLY_COUNT],
+                replied_count: 0,
+                delivery: Some(TerminalColorQueryDelivery::Resolve(sender)),
+                on_late_reply,
+                deadline: Some(deadline),
+            });
+        self.terminal().write(TERMINAL_COLOR_QUERY);
+    }
+
     /// Earliest deadline among unsettled introspection queries. Their
     /// timeouts fire from [`TuiInner::tick`] regardless of stopped, like
     /// upstream's `setTimeout` (tui.ts:1678-1686, 1715).
     pub(crate) fn next_query_deadline(&self) -> Option<Instant> {
-        self.pending_osc11_background_queries
+        self.pending_terminal_color_queries
             .iter()
-            .filter(|query| !query.settled)
             .filter_map(|query| query.deadline)
-            .chain(
-                self.pending_terminal_color_scheme_queries
-                    .iter()
-                    .filter(|query| !query.settled)
-                    .filter_map(|query| query.deadline),
-            )
             .min()
     }
 
     /// Whether any unsettled introspection query's deadline expired by `now`
     /// (an expired timeout is pending work; future deadlines are not).
     pub(crate) fn has_expired_query(&self, now: Instant) -> bool {
-        let expired = |deadline: Option<Instant>| deadline.is_some_and(|deadline| now >= deadline);
-        let osc11_expired = self
-            .pending_osc11_background_queries
+        self.pending_terminal_color_queries
             .iter()
-            .any(|query| !query.settled && expired(query.deadline));
-        let scheme_expired = self
-            .pending_terminal_color_scheme_queries
-            .iter()
-            .any(|query| !query.settled && expired(query.deadline));
-        osc11_expired || scheme_expired
+            .any(|query| query.deadline.is_some_and(|deadline| now >= deadline))
     }
 }

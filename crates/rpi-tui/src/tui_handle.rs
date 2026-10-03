@@ -24,10 +24,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use crate::components::scroll_view::ScrollbarMode;
-use crate::terminal_colors::{RgbColor, TerminalColorScheme};
+use crate::terminal_colors::TerminalColors;
 use crate::tui::{
     OverlayHandle, OverlayOptions, RenderHandle, SharedComponent, SharedTerminal,
-    TerminalColorSchemeListener, Tui, TuiInputListener, TuiMode, TuiStopOptions,
+    TerminalColorQueryOptions, TerminalColorSchemeListener, Tui, TuiInputListener, TuiMode,
+    TuiStopOptions,
 };
 use crate::tui_alt_screen::TuiAltScreen;
 use crate::tui_main_screen::{TuiMainScreen, TuiMainScreenRenderState};
@@ -426,25 +427,14 @@ impl TuiHandle {
 
     // --- terminal introspection queries -----------------------------------
 
-    /// Upstream `queryTerminalBackgroundColor` (tui.ts:316).
-    pub fn query_terminal_background_color(
+    /// Upstream `queryTerminalColors` (tui.ts:1470).
+    pub fn query_terminal_colors(
         &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<RgbColor>> {
+        options: TerminalColorQueryOptions,
+    ) -> oneshot::Receiver<TerminalColors> {
         match self.renderer_clone() {
-            RendererClone::Main(tui) => tui.query_terminal_background_color(timeout),
-            RendererClone::Alt(tui) => tui.query_terminal_background_color(timeout),
-        }
-    }
-
-    /// Upstream `queryTerminalColorScheme` (tui.ts:317).
-    pub fn query_terminal_color_scheme(
-        &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<TerminalColorScheme>> {
-        match self.renderer_clone() {
-            RendererClone::Main(tui) => tui.query_terminal_color_scheme(timeout),
-            RendererClone::Alt(tui) => tui.query_terminal_color_scheme(timeout),
+            RendererClone::Main(tui) => tui.query_terminal_colors(options),
+            RendererClone::Alt(tui) => tui.query_terminal_colors(options),
         }
     }
 

@@ -80,7 +80,7 @@ use crate::mouse::{
     parse_wheel_event,
 };
 use crate::terminal::{InputHandler, ResizeHandler, Terminal};
-use crate::terminal_colors::{RgbColor, TerminalColorScheme};
+use crate::terminal_colors::TerminalColors;
 use crate::terminal_image::{
     ImageProtocol, TerminalCapabilities, delete_all_kitty_images, delete_all_kitty_placements,
     get_capabilities, is_image_line, set_capabilities,
@@ -88,16 +88,13 @@ use crate::terminal_image::{
 use crate::tui::{
     CURSOR_MARKER, Component, OverlayAnchor, OverlayBounds, OverlayHandle, OverlayHandleOps,
     OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, RenderHandle, SharedComponent,
-    SharedTerminal, SizeValue, TerminalColorSchemeListener, Tui, TuiInputListener,
-    TuiInputListenerResult, TuiMode, TuiMouseButton, TuiMouseDispatchResult,
+    SharedTerminal, SizeValue, TerminalColorQueryOptions, TerminalColorSchemeListener, Tui,
+    TuiInputListener, TuiInputListenerResult, TuiMode, TuiMouseButton, TuiMouseDispatchResult,
     TuiMouseDispatchTarget, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult,
     TuiStopOptions, ViewportTui, composite_tui_line, dispatch_mouse_event, lock_component,
     lock_shared, retarget_mouse_event, same_component, shared_component,
 };
-use crate::tui_base::{
-    PendingOsc11BackgroundQuery, PendingTerminalColorSchemeQuery, RenderSchedule,
-    TerminalSizeCache, TuiBase, schedule_render,
-};
+use crate::tui_base::{RenderSchedule, TerminalSizeCache, TuiBase, schedule_render};
 use crate::utils::{
     extract_ansi_code, get_grapheme_cell_range, get_osc8_link_at_column, get_word_segmenter,
     slice_by_column, strip_terminal_sequences, truncate_to_width, visible_width,
@@ -1223,44 +1220,16 @@ impl TuiAltScreen {
             .unwrap_or(0)
     }
 
-    /// Upstream `queryTerminalBackgroundColor` (tui.ts:1670); the timeout is
-    /// fired by [`TuiAltScreen::tick`].
-    pub fn query_terminal_background_color(
+    /// Upstream `queryTerminalColors` (tui.ts:1470); the timeout is fired by
+    /// [`TuiAltScreen::tick`].
+    pub fn query_terminal_colors(
         &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<RgbColor>> {
+        options: TerminalColorQueryOptions,
+    ) -> oneshot::Receiver<TerminalColors> {
         let (sender, receiver) = oneshot::channel();
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + options.timeout;
         self.run_or_queue(move |inner| {
-            inner
-                .pending_osc11_background_queries
-                .push_back(PendingOsc11BackgroundQuery {
-                    settled: false,
-                    sender: Some(sender),
-                    deadline: Some(deadline),
-                });
-            inner.pending_osc11_background_replies += 1;
-            inner.terminal().write("\x1b]11;?\x07");
-        });
-        receiver
-    }
-
-    /// Upstream `queryTerminalColorScheme` (tui.ts:1698).
-    pub fn query_terminal_color_scheme(
-        &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<TerminalColorScheme>> {
-        let (sender, receiver) = oneshot::channel();
-        let deadline = Instant::now() + timeout;
-        self.run_or_queue(move |inner| {
-            inner
-                .pending_terminal_color_scheme_queries
-                .push(PendingTerminalColorSchemeQuery {
-                    settled: false,
-                    sender: Some(sender),
-                    deadline: Some(deadline),
-                });
-            inner.terminal().write("\x1b[?996n");
+            inner.start_terminal_color_query(deadline, options.on_late_reply, sender)
         });
         receiver
     }
@@ -2176,7 +2145,7 @@ impl TuiAltScreenInner {
     /// `handleInput` with the upstream first-position viewport listener
     /// emulated as a pre-dispatch step (see the header note).
     fn handle_input(&mut self, data: &str) {
-        if self.consume_osc11_background_response(data) {
+        if self.consume_terminal_color_response(data) {
             return;
         }
         if self.consume_terminal_color_scheme_report(data) {
@@ -4331,18 +4300,11 @@ impl Tui for TuiAltScreen {
         TuiAltScreen::set_terminal_color_scheme_notifications(self, enabled);
     }
 
-    fn query_terminal_background_color(
+    fn query_terminal_colors(
         &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<RgbColor>> {
-        TuiAltScreen::query_terminal_background_color(self, timeout)
-    }
-
-    fn query_terminal_color_scheme(
-        &self,
-        timeout: Duration,
-    ) -> oneshot::Receiver<Option<TerminalColorScheme>> {
-        TuiAltScreen::query_terminal_color_scheme(self, timeout)
+        options: TerminalColorQueryOptions,
+    ) -> oneshot::Receiver<TerminalColors> {
+        TuiAltScreen::query_terminal_colors(self, options)
     }
 
     fn invalidate(&self) {
