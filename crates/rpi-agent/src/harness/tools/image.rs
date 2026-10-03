@@ -34,7 +34,7 @@ pub fn detect_supported_image_mime_type(buffer: &[u8]) -> Option<&'static str> {
             None
         };
     }
-    if starts_with_ascii(buffer, 0, "GIF") {
+    if starts_with_ascii(buffer, 0, "GIF87a") || starts_with_ascii(buffer, 0, "GIF89a") {
         return Some("image/gif");
     }
     if starts_with_ascii(buffer, 0, "RIFF") && starts_with_ascii(buffer, 8, "WEBP") {
@@ -187,9 +187,23 @@ mod tests {
             detect_supported_image_mime_type(b"GIF89a"),
             Some("image/gif")
         );
+        // #9755 (tools.test.ts @ 47a18e37b): both complete signatures.
+        assert_eq!(
+            detect_supported_image_mime_type(b"GIF87a"),
+            Some("image/gif")
+        );
         assert_eq!(
             detect_supported_image_mime_type(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
             Some("image/webp")
+        );
+    }
+
+    #[test]
+    fn bare_gif_prefix_is_not_an_image() {
+        assert_eq!(detect_supported_image_mime_type(b"GIF"), None);
+        assert_eq!(
+            detect_supported_image_mime_type(b"GIF image description"),
+            None
         );
     }
 

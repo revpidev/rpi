@@ -38,8 +38,9 @@ pub fn detect_supported_image_mime_type(buffer: &[u8]) -> Option<&'static str> {
         };
     }
 
-    // GIF (mime.ts:12-14): ASCII "GIF".
-    if starts_with_ascii(buffer, 0, "GIF") {
+    // GIF (mime.ts:13): complete "GIF87a"/"GIF89a" signatures only
+    // (#9755, 47a18e37b) — bare "GIF" text files are not images.
+    if starts_with_ascii(buffer, 0, "GIF87a") || starts_with_ascii(buffer, 0, "GIF89a") {
         return Some("image/gif");
     }
 
@@ -231,6 +232,28 @@ mod tests {
     fn test_gif_detected() {
         let buf = b"GIF89a rest of header";
         assert_eq!(detect_supported_image_mime_type(buf), Some("image/gif"));
+    }
+
+    // #9755 (image-process.test.ts:30 @ 47a18e37b): both complete signatures.
+    #[test]
+    fn test_gif_complete_signatures_detected() {
+        for signature in ["GIF87a", "GIF89a"] {
+            let buf = format!("{signature} rest of header");
+            assert_eq!(
+                detect_supported_image_mime_type(buf.as_bytes()),
+                Some("image/gif")
+            );
+        }
+    }
+
+    #[test]
+    fn test_bare_gif_prefix_is_not_an_image() {
+        // A text file starting with "GIF" is no longer misclassified.
+        assert_eq!(detect_supported_image_mime_type(b"GIF"), None);
+        assert_eq!(
+            detect_supported_image_mime_type(b"GIF image description"),
+            None
+        );
     }
 
     #[test]
