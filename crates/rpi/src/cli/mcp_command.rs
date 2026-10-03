@@ -1048,4 +1048,51 @@ mod tests {
         assert_eq!(code, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// The sign-in prompt/browser seam used by `rpi mcp login`: stubbed
+    /// sinks capture the URL, the non-interactive prompt never reads stdin.
+    /// No network, no real browser.
+    #[tokio::test]
+    async fn cli_sign_in_prompt_uses_stub_sinks_without_network() {
+        let logged: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let opened: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompt = CliSignInPrompt {
+            options: PromptOptions {
+                open_url: Some({
+                    let opened = opened.clone();
+                    Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_owned()))
+                }),
+                log: {
+                    let logged = logged.clone();
+                    Arc::new(move |line: &str| logged.lock().unwrap().push(line.to_owned()))
+                },
+            },
+            name: "docs".to_owned(),
+            timeout_ms: 10,
+            interactive: false,
+        };
+        let url = url::Url::parse("https://as.example/authorize?client_id=x").unwrap();
+        prompt.show_authorization_url(url.clone());
+        {
+            let lines = logged.lock().unwrap();
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines[0].contains("Sign in to MCP server \"docs\" in your browser:"),
+                "{}",
+                lines[0]
+            );
+            assert!(lines[0].contains(url.as_str()), "{}", lines[0]);
+        }
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            &[url.as_str().to_owned()]
+        );
+        // Non-interactive: no stdin read; the very short timeout returns None.
+        let result = prompt
+            .prompt_for_redirect_url(CancellationToken::new())
+            .await;
+        assert!(result.is_none());
+    }
 }

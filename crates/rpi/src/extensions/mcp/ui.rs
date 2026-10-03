@@ -224,6 +224,90 @@ pub fn script_needs_server(code: &str, server: &str) -> bool {
     code.contains(&mcp_namespace(server))
 }
 
+/// Replaceable-coexistence detection (FR-H, `resource-loader.ts:116-146`):
+/// the source path of the extension that registered an `mcp` tool or `/mcp`
+/// command other than the built-in itself, or `None` when the built-in owns
+/// both surfaces. Pure so the tool and command paths are unit-testable
+/// without a host.
+fn find_replacer(own_path: &str, tools: &[Value], commands: &[Value]) -> Option<String> {
+    let owner = |entries: &[Value]| {
+        entries.iter().find_map(|entry| {
+            if entry.get("name").and_then(Value::as_str) != Some("mcp") {
+                return None;
+            }
+            let path = entry
+                .get("sourceInfo")
+                .and_then(|info| info.get("path"))
+                .and_then(Value::as_str)?;
+            (path != own_path).then(|| path.to_owned())
+        })
+    };
+    owner(tools).or_else(|| owner(commands))
+}
+
+/// The active `mcp__*` names a resumed/reloaded loadout references that no
+/// server has registered yet (`_restoreToolsFromTranscript` pending set,
+/// agent-session.ts:1763-1768 @ a13d35a74, v1.0.0 `c662ec7e3`).
+pub fn pending_mcp_tools(active_tools: &[String], registered: &HashSet<String>) -> HashSet<String> {
+    active_tools
+        .iter()
+        .filter(|name| name.starts_with("mcp__") && !registered.contains(*name))
+        .cloned()
+        .collect()
+}
+
+/// The subset of [`pending_mcp_tools`] a server has registered since and
+/// that is not active yet — re-attached on registration
+/// (`_refreshToolRegistry` pending activation, agent-session.ts:3534-3539).
+pub fn attachable_pending_tools(
+    pending: &HashSet<String>,
+    active_tools: &[String],
+    registered: &HashSet<String>,
+) -> Vec<String> {
+    let active: HashSet<&String> = active_tools.iter().collect();
+    let mut names: Vec<String> = pending
+        .iter()
+        .filter(|name| registered.contains(*name) && !active.contains(*name))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// The `before_agent_start` result (`index.ts:1002-1015`): the
+/// `mcp_servers` section write, `null` when there is no such section (the
+/// `sections` diff mechanism decides whether it is appended).
+fn servers_section_options(section: Option<String>) -> Value {
+    json!({
+        "systemPromptOptions": {
+            "sections": {
+                MCP_SERVERS_SECTION: section.map(Value::String).unwrap_or(Value::Null),
+            },
+        },
+    })
+}
+
+/// The sign-in URL rendering (`/mcp`, #10186, `ui.ts:183`): OSC 8
+/// hyperlinks in TUI mode, the bare URL otherwise.
+fn sign_in_url_display(url: &url::Url, tui_mode: bool) -> String {
+    if tui_mode {
+        format!(
+            "{}\n{}",
+            rpi_tui::terminal_image::hyperlink(url.as_str(), url.as_str()),
+            rpi_tui::terminal_image::hyperlink(
+                if cfg!(target_os = "macos") {
+                    "Cmd+click to open"
+                } else {
+                    "Ctrl+click to open"
+                },
+                url.as_str(),
+            )
+        )
+    } else {
+        url.as_str().to_owned()
+    }
+}
+
 /// One configured server (`McpServer`, index.ts:84).
 struct McpServer {
     entry: Mutex<McpServerEntry>,
@@ -334,51 +418,11 @@ impl McpBuiltinState {
     /// another extension already registered an `mcp` tool or `/mcp`
     /// command, the built-in stands down (no config read, no connections).
     fn replacer(&self) -> Option<String> {
-        let own = self.api.extension().path.clone();
-        let tool_replacer = self
-            .api
-            .get_all_tools()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|tool| {
-                tool.get("name").and_then(Value::as_str) == Some("mcp")
-                    && tool
-                        .get("sourceInfo")
-                        .and_then(|info| info.get("path"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|path| path != own)
-            });
-        let command_replacer = self
-            .api
-            .get_commands()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|command| {
-                command.get("name").and_then(Value::as_str) == Some("mcp")
-                    && command
-                        .get("sourceInfo")
-                        .and_then(|info| info.get("path"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|path| path != own)
-            });
-        tool_replacer
-            .map(|tool| {
-                tool.get("sourceInfo")
-                    .and_then(|info| info.get("path"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("<extension>")
-                    .to_owned()
-            })
-            .or_else(|| {
-                command_replacer.map(|command| {
-                    command
-                        .get("sourceInfo")
-                        .and_then(|info| info.get("path"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("<extension>")
-                        .to_owned()
-                })
-            })
+        find_replacer(
+            &self.api.extension().path,
+            &self.api.get_all_tools().unwrap_or_default(),
+            &self.api.get_commands().unwrap_or_default(),
+        )
     }
 
     /// `ensureDiscoveryActive` (index.ts:456).
@@ -603,6 +647,29 @@ impl McpBuiltinState {
             }
         }
         self.sync_resource_tools();
+        // A deferred `mcp__*` name restored from the loadout and still
+        // pending becomes active now that its server registered it
+        // (agent-session.ts:3534-3539).
+        self.attach_pending_tools();
+    }
+
+    /// `_refreshToolRegistry` pending activation (agent-session.ts:3534-3539):
+    /// re-activate any restored `mcp__*` loadout name that was pending and is
+    /// registered by now.
+    fn attach_pending_tools(self: &Arc<Self>) {
+        if lock(&self.pending_tools).is_empty() {
+            return;
+        }
+        let active = self.api.get_active_tools().unwrap_or_default();
+        let registered: HashSet<String> = lock(&self.tools).definitions.keys().cloned().collect();
+        let pending = lock(&self.pending_tools).clone();
+        let attach = attachable_pending_tools(&pending, &active, &registered);
+        if attach.is_empty() {
+            return;
+        }
+        let mut next = active;
+        next.extend(attach);
+        let _ = self.api.set_active_tools(next);
     }
 
     /// `hideTools` (index.ts:337).
@@ -1533,13 +1600,10 @@ impl McpBuiltinState {
         {
             let registered: HashSet<String> =
                 lock(&self.tools).definitions.keys().cloned().collect();
-            let pending: HashSet<String> = self
-                .api
-                .get_active_tools()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|name| name.starts_with("mcp__") && !registered.contains(name))
-                .collect();
+            let pending = pending_mcp_tools(
+                &self.api.get_active_tools().unwrap_or_default(),
+                &registered,
+            );
             *lock(&self.pending_tools) = pending;
         }
         {
@@ -1687,13 +1751,7 @@ impl McpBuiltinState {
         // servers' connections by now; the next prompt clears the rest.
         lock(&self.pending_tools).clear();
         let _ = event;
-        Ok(json!({
-            "systemPromptOptions": {
-                "sections": {
-                    MCP_SERVERS_SECTION: section.map(Value::String).unwrap_or(Value::Null),
-                },
-            },
-        }))
+        Ok(servers_section_options(section))
     }
 
     /// `tool_call` handler (index.ts:1016): wait for the servers a codemode
@@ -2242,22 +2300,7 @@ struct NotifySignInPrompt {
 #[async_trait::async_trait]
 impl McpSignInPrompt for NotifySignInPrompt {
     fn show_authorization_url(&self, url: url::Url) {
-        let text = if self.tui_mode {
-            format!(
-                "{}\n{}",
-                rpi_tui::terminal_image::hyperlink(url.as_str(), url.as_str()),
-                rpi_tui::terminal_image::hyperlink(
-                    if cfg!(target_os = "macos") {
-                        "Cmd+click to open"
-                    } else {
-                        "Ctrl+click to open"
-                    },
-                    url.as_str(),
-                )
-            )
-        } else {
-            url.as_str().to_owned()
-        };
+        let text = sign_in_url_display(&url, self.tui_mode);
         self.ui.notify(
             &format!(
                 "Sign in to MCP server \"{}\" in your browser:\n{text}",
@@ -2403,5 +2446,116 @@ mod tests {
             "c",
             json!({"command": "x", "exposure": "hidden", "toolExposure": {"t": "deferred"}})
         )));
+    }
+
+    #[test]
+    fn find_replacer_detects_tool_and_command_owners() {
+        let own = "<inline:mcp>";
+        assert_eq!(find_replacer(own, &[], &[]), None);
+        // The built-in's own registrations never count.
+        assert_eq!(
+            find_replacer(
+                own,
+                &[json!({"name": "mcp", "sourceInfo": {"path": own}})],
+                &[]
+            ),
+            None
+        );
+        // Another extension's `mcp` tool takes over (tool path).
+        assert_eq!(
+            find_replacer(
+                own,
+                &[
+                    json!({"name": "other", "sourceInfo": {"path": "<inline:x>"}}),
+                    json!({"name": "mcp", "sourceInfo": {"path": "<inline:adapter>"}}),
+                ],
+                &[]
+            ),
+            Some("<inline:adapter>".to_owned())
+        );
+        // Another extension's `/mcp` command takes over (command path).
+        assert_eq!(
+            find_replacer(
+                own,
+                &[],
+                &[json!({"name": "mcp", "sourceInfo": {"path": "<inline:adapter>"}})]
+            ),
+            Some("<inline:adapter>".to_owned())
+        );
+        // A registration without source info is not a replacer.
+        assert_eq!(find_replacer(own, &[json!({"name": "mcp"})], &[]), None);
+        // Tool detection wins over command detection.
+        assert_eq!(
+            find_replacer(
+                own,
+                &[json!({"name": "mcp", "sourceInfo": {"path": "<inline:tool>"}})],
+                &[json!({"name": "mcp", "sourceInfo": {"path": "<inline:cmd>"}})]
+            ),
+            Some("<inline:tool>".to_owned())
+        );
+    }
+
+    #[test]
+    fn pending_mcp_tools_keeps_unregistered_restored_names() {
+        let registered = HashSet::from(["mcp__docs__search".to_owned()]);
+        let active = [
+            "read".to_owned(),
+            "mcp__docs__search".to_owned(), // registered → not pending
+            "mcp__git__log".to_owned(),     // not registered → pending
+            "todo".to_owned(),
+        ];
+        assert_eq!(
+            pending_mcp_tools(&active, &registered),
+            HashSet::from(["mcp__git__log".to_owned()])
+        );
+        // Non-mcp names never become pending.
+        assert!(pending_mcp_tools(&["read".to_owned()], &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn attachable_pending_tools_reattaches_registered_names() {
+        let pending = HashSet::from(["mcp__git__log".to_owned(), "mcp__late".to_owned()]);
+        let registered = HashSet::from(["mcp__git__log".to_owned()]);
+        // `mcp__git__log` registered but inactive → attached; `mcp__late` is
+        // still missing (pending until the next prompt clears it).
+        assert_eq!(
+            attachable_pending_tools(&pending, &["read".to_owned()], &registered),
+            vec!["mcp__git__log".to_owned()]
+        );
+        // Already active → not re-attached.
+        assert!(
+            attachable_pending_tools(&pending, &["mcp__git__log".to_owned()], &registered)
+                .is_empty()
+        );
+        // Nothing registered yet → nothing attached.
+        assert!(attachable_pending_tools(&pending, &[], &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn before_agent_start_result_carries_the_section_or_null() {
+        let with = servers_section_options(Some("MCP servers whose tools…".to_owned()));
+        assert_eq!(
+            with["systemPromptOptions"]["sections"][MCP_SERVERS_SECTION],
+            json!("MCP servers whose tools…")
+        );
+        let without = servers_section_options(None);
+        assert!(without["systemPromptOptions"]["sections"][MCP_SERVERS_SECTION].is_null());
+    }
+
+    #[test]
+    fn sign_in_url_is_a_hyperlink_only_in_tui_mode() {
+        let url = url::Url::parse("https://as.example/authorize?client_id=x").unwrap();
+        let tui = sign_in_url_display(&url, true);
+        assert!(
+            tui.contains("\u{1b}]8;;https://as.example/authorize?client_id=x"),
+            "{tui}"
+        );
+        assert!(
+            tui.contains("https://as.example/authorize?client_id=x\u{1b}\\"),
+            "{tui}"
+        );
+        let plain = sign_in_url_display(&url, false);
+        assert_eq!(plain, url.as_str());
+        assert!(!plain.contains('\u{1b}'));
     }
 }
