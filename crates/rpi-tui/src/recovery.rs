@@ -188,7 +188,7 @@ pub fn spawn_signal_restore(_tui: &TuiMainScreen) -> Option<tokio::task::JoinHan
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     use crate::terminal::ProcessTerminal;
 
@@ -228,6 +228,45 @@ mod tests {
         }
     }
 
+    /// Pins the process-global terminal capabilities for the test duration
+    /// (same idiom as `tui_alt_screen.rs`'s `CapsGuard`): start/stop read
+    /// the env-detected cache (`before_terminal_start` → `get_capabilities`,
+    /// `start_common` → `query_cell_size`), which otherwise drifts with the
+    /// test environment (TERM_PROGRAM/TMUX/...) and — for iTerm2 — mutates
+    /// the global cache mid-test (the alt-screen iTerm2 demotion). Holds
+    /// both global-state locks in the same acquisition order as
+    /// `tui_alt_screen.rs`'s guard so concurrent capability-mutating suites
+    /// serialize against the pin; drop resets the cache so later tests
+    /// re-detect from the environment.
+    struct CapsGuard {
+        _state: MutexGuard<'static, ()>,
+        _image_state: MutexGuard<'static, ()>,
+    }
+
+    impl CapsGuard {
+        fn pin() -> CapsGuard {
+            let state = crate::test_vt::state_lock();
+            let image_state = crate::terminal_image::TEST_STATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::terminal_image::set_capabilities(crate::terminal_image::TerminalCapabilities {
+                images: None,
+                true_color: false,
+                hyperlinks: false,
+            });
+            CapsGuard {
+                _state: state,
+                _image_state: image_state,
+            }
+        }
+    }
+
+    impl Drop for CapsGuard {
+        fn drop(&mut self) {
+            crate::terminal_image::reset_capabilities_cache();
+        }
+    }
+
     /// Serializes the tests that replace the process-global panic hook —
     /// cargo runs tests on parallel threads by default and concurrent
     /// set_hook/take_hook pairs would chain onto the wrong hook.
@@ -242,8 +281,13 @@ mod tests {
     fn panic_hook_restores_terminal_before_chained_hook() {
         let _serial = HOOK_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _hook_guard = PanicHookGuard;
+        let _caps_guard = CapsGuard::pin();
         let writer = SharedWriter::default();
-        let terminal = ProcessTerminal::with_writer(writer.clone());
+        let mut terminal = ProcessTerminal::with_writer(writer.clone());
+        // Pin the size query: the default reads the real terminal, whose
+        // no-tty fallback (crossterm 0.29 spawns `tput`) can block forever —
+        // see `terminal.rs::default_query_size`.
+        terminal.set_query_size(|| Ok((80, 24)));
         let tui = TuiMainScreen::new(Box::new(terminal));
         tui.start();
 
@@ -313,8 +357,13 @@ mod tests {
     fn panic_hook_for_handle_restores_terminal_regular_mode() {
         let _serial = HOOK_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _hook_guard = PanicHookGuard;
+        let _caps_guard = CapsGuard::pin();
         let writer = SharedWriter::default();
-        let terminal = ProcessTerminal::with_writer(writer.clone());
+        let mut terminal = ProcessTerminal::with_writer(writer.clone());
+        // Pin the size query: the default reads the real terminal, whose
+        // no-tty fallback (crossterm 0.29 spawns `tput`) can block forever —
+        // see `terminal.rs::default_query_size`.
+        terminal.set_query_size(|| Ok((80, 24)));
         let tui = TuiMainScreen::new(Box::new(terminal));
         let handle = crate::tui_handle::TuiHandle::from_main(tui);
         handle.start();
@@ -342,8 +391,13 @@ mod tests {
     fn panic_hook_for_handle_restores_terminal_alt_screen_mode() {
         let _serial = HOOK_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _hook_guard = PanicHookGuard;
+        let _caps_guard = CapsGuard::pin();
         let writer = SharedWriter::default();
-        let terminal = ProcessTerminal::with_writer(writer.clone());
+        let mut terminal = ProcessTerminal::with_writer(writer.clone());
+        // Pin the size query: the default reads the real terminal, whose
+        // no-tty fallback (crossterm 0.29 spawns `tput`) can block forever —
+        // see `terminal.rs::default_query_size`.
+        terminal.set_query_size(|| Ok((80, 24)));
         let alt = crate::tui_alt_screen::TuiAltScreen::new(Box::new(terminal));
         let handle = crate::tui_handle::TuiHandle::from_alt(alt);
         handle.start();

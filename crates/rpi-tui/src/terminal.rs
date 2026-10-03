@@ -47,6 +47,16 @@
 //!   stopped are discarded. Respawning the reader per `start()` would leave
 //!   the previous thread blocked in `read()`, where it would swallow the
 //!   first keystroke after a renderer hot-swap (T32 follow-up fix).
+//! - Size query: crossterm 0.29's `size()` falls back to spawning
+//!   `tput cols`/`tput lines` when the ioctl fails (no controlling tty and
+//!   a non-tty stdout) — two PATH-dependent subprocess spawns per `size()`
+//!   call, with no timeout, so a broken/stuck `tput` wedges the caller
+//!   (observed: the `recovery.rs` panic-hook tests hang forever in no-TTY
+//!   environments while PTY runs pass instantly). Upstream has no such
+//!   fallback (`process.stdout.columns` is `undefined` off-tty), so the
+//!   default query ([`default_query_size`]) only runs the ioctl when stdout
+//!   is a terminal and otherwise fails fast into the COLUMNS/LINES/default
+//!   chain of `columns()`/`rows()`.
 //! - Windows `ENABLE_VIRTUAL_TERMINAL_INPUT`: upstream loads a native Node
 //!   helper (`win32-console-mode.node`, terminal.ts:338-366); crossterm's
 //!   raw mode does not set this flag and no native helper is bundled, so on
@@ -76,7 +86,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::mpsc;
@@ -399,6 +409,18 @@ enum NegotiationRead {
     NotNegotiation,
 }
 
+/// The default terminal size query (upstream `get columns()` / `get rows()`
+/// read `process.stdout.columns` / `process.stdout.rows`): crossterm's
+/// ioctl, but only when stdout is a terminal. See the header note for why
+/// crossterm 0.29's no-tty `tput` subprocess fallback must not run.
+fn default_query_size() -> io::Result<(u16, u16)> {
+    if io::stdout().is_terminal() {
+        crossterm::terminal::size()
+    } else {
+        Err(io::Error::other("not a tty"))
+    }
+}
+
 /// Real terminal on process stdin/stdout (upstream `ProcessTerminal`,
 /// terminal.ts:99-531), based on crossterm for raw mode and size queries.
 ///
@@ -437,6 +459,8 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
     resize_task: Option<tokio::task::JoinHandle<()>>,
     /// Terminal size query; injectable so tests can simulate "not a tty"
     /// (upstream tests monkey-patch `process.stdout.columns/rows`).
+    /// Defaults to [`default_query_size`]; see the header note for why the
+    /// default must not reach crossterm 0.29's no-tty `tput` fallback.
     query_size: fn() -> io::Result<(u16, u16)>,
 }
 
@@ -475,8 +499,17 @@ impl<W: Write> ProcessTerminal<W> {
             stdin_slot: Arc::new(Mutex::new(None)),
             stdin_reader_started: false,
             resize_task: None,
-            query_size: crossterm::terminal::size,
+            query_size: default_query_size,
         }
+    }
+
+    /// Test injection for the size query (upstream tests monkey-patch
+    /// `process.stdout.columns/rows`): pins dimensions without touching the
+    /// environment, keeping tests off the ioctl / no-tty fallback paths (see
+    /// [`default_query_size`]).
+    #[cfg(test)]
+    pub(crate) fn set_query_size(&mut self, query_size: fn() -> io::Result<(u16, u16)>) {
+        self.query_size = query_size;
     }
 
     /// Upstream `get modifyOtherKeysActive()` (terminal.ts:130-132).
@@ -1587,6 +1620,25 @@ mod tests {
             Some(value) => rpi_test_env::set_var("LINES", value),
             None => rpi_test_env::remove_var("LINES"),
         }
+    }
+
+    /// Regression (no-TTY hang found in the V16-07 G2 run): the default size
+    /// query must not reach crossterm 0.29's `tput` subprocess fallback when
+    /// stdout is not a terminal — a stuck `tput` in PATH otherwise wedges
+    /// every dimension read with no timeout. Red/green: reverting the gate
+    /// (`query_size: crossterm::terminal::size`) makes this fail on any
+    /// no-TTY machine with `tput` installed (the fallback returns Ok).
+    #[test]
+    fn default_size_query_does_not_spawn_tput_off_tty() {
+        if io::stdout().is_terminal() {
+            // PTY runs take the ioctl path; the fallback is not exercised.
+            return;
+        }
+        let terminal = ProcessTerminal::with_writer(SharedWriter::default());
+        assert!(
+            (terminal.query_size)().is_err(),
+            "off-tty size query must fail fast into the COLUMNS/LINES/default chain"
+        );
     }
 
     // --- Port-specific regression tests for behavior the upstream suite only
