@@ -182,7 +182,7 @@ pub trait Component: Send {
     fn handle_input(&mut self, _data: &str) {}
 
     /// Whether [`Component::handle_input`] is a real handler (upstream's
-    /// structural `component.handleInput` check, tui.ts:88 @ b3487650f).
+    /// structural `component.handleInput` check, tui.ts:89 @ bf8e4b953).
     /// Forwarding components that route keys to hosted children override
     /// this so a forwarded focus request keeps keyboard focus on the host
     /// instead of a child that the host may later remove.
@@ -612,7 +612,7 @@ impl From<TuiMouseEventResult> for TuiMouseHandlerResult {
 /// with the component as the dispatch target (and as the focus target when
 /// `focus` is set). A forwarded dispatch result passes through — except
 /// that a forwarded focus request keeps the forwarding component as the
-/// focus target when it handles input itself (tui.ts:85-92 @ b3487650f).
+/// focus target when it handles input itself (tui.ts:84-90 @ bf8e4b953).
 pub fn dispatch_mouse_event(
     component: &SharedComponent,
     event: &TuiMouseEvent,
@@ -625,7 +625,7 @@ pub fn dispatch_mouse_event(
         // delegating container, it routes keys to that child itself, so it
         // keeps keyboard focus: focusing the child directly would leave
         // focus on a detached component once the host removes it — e.g. a
-        // closed settings submenu (tui.ts:85-92 @ b3487650f).
+        // closed settings submenu (tui.ts:84-90 @ bf8e4b953).
         TuiMouseHandlerResult::Forwarded(result) => {
             if result.focus && lock_component(component).has_handle_input() {
                 Some(TuiMouseDispatchResult {
@@ -1312,7 +1312,7 @@ mod mouse_dispatch_tests {
         assert!(dispatch_mouse_event(&component, &event(TuiMouseEventType::Press, 0, 0)).is_none());
     }
 
-    // Regression for b3487650f: a forwarding host that handles input keeps
+    // Regression for bf8e4b953: a forwarding host that handles input keeps
     // keyboard focus when its child requests focus, so removing the child
     // (e.g. a closed settings submenu) cannot leave focus detached.
     #[test]

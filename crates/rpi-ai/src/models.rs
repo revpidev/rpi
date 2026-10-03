@@ -457,6 +457,11 @@ impl InflightRefresh {
 /// dynamic overlay over the baseline — same-id models replace the baseline
 /// entry in place, new ids append. A map index keeps the merge linear in
 /// catalog size (a per-model linear scan was quadratic).
+///
+/// Narrow intentional difference: upstream's `Map` collapses duplicate
+/// keys inside the baseline (first position + last value), while this port
+/// keeps duplicated baseline entries as-is; callers pass deduplicated
+/// catalogs, and the dynamic-overlay result is identical.
 pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
     let mut merged: Vec<Model> = baseline.to_vec();
     let mut index: HashMap<String, usize> = HashMap::with_capacity(baseline.len() + dynamic.len());

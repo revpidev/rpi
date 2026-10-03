@@ -1521,7 +1521,7 @@ impl DefaultPackageManager {
         Ok(resolved)
     }
 
-    /// `getTemporaryDir` (package-manager.ts:2074-2085 @ f444ea5ea): sha256
+    /// `getTemporaryDir` (package-manager.ts:2177-2184 @ f444ea5ea): sha256
     /// of `{prefix}-{suffix}@{ref}`, first 8 hex chars. Pinned temporary git
     /// sources include the ref, so each ref gets its own checkout instead of
     /// reusing the first downloaded commit (#9982).
@@ -1634,7 +1634,7 @@ impl DefaultPackageManager {
     ) -> Result<PathBuf, String> {
         if scope == SourceScope::Temporary {
             // Include the ref in the cache folder so each pinned ref gets
-            // its own checkout (#9982, package-manager.ts:2123-2126).
+            // its own checkout (#9982, package-manager.ts:2157).
             return self.get_temporary_dir(
                 &format!("git-{}", source.host),
                 Some(&source.path),

@@ -3710,7 +3710,7 @@ mod tests {
         let (mut mode, terminal, session, tmp) = switchable_harness().await;
         // A persisted session file to resume. Written directly:
         // `SessionManager` defers file creation to the first assistant
-        // message (session-manager.ts:1015-1042), so a user-message-only
+        // message (session-manager.ts:1172-1194), so a user-message-only
         // session never lands on disk. Written under the harness temp dir —
         // the manager's default session dir resolves CWD-relative here and
         // would litter the crate dir.

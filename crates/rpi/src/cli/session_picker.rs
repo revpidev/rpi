@@ -192,7 +192,7 @@ mod tests {
     /// Build the picker's inputs over a temp agent dir / cwd, with one
     /// persisted session file in `session_dir` (written directly —
     /// `SessionManager` defers file creation to the first assistant
-    /// message, session-manager.ts:1015-1042).
+    /// message, session-manager.ts:1172-1194).
     fn picker_fixture() -> (TempDir, PathBuf, PathBuf, SettingsManager, String) {
         let tmp = TempDir::new();
         let agent_dir = tmp.path().join("agent");

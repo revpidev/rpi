@@ -1129,7 +1129,7 @@ impl TuiBase {
 
     /// Hide the cursor while running. After `stop()`, the shell owns the
     /// cursor and it must stay visible (`hideTerminalCursor`,
-    /// tui.ts:795-797 @ b3487650f): an extension can close an overlay during
+    /// tui.ts:834-836 (definition) / 829 (call) @ b3487650f): an extension can close an overlay during
     /// shutdown, after `stop()` already restored the cursor.
     fn hide_terminal_cursor(&mut self) {
         if !self.stopped {

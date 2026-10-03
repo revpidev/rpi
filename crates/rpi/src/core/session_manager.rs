@@ -1446,7 +1446,7 @@ impl SessionManager {
         })
     }
 
-    /// `_persist` (session-manager.ts:1015-1042 @ #10000): deferred
+    /// `_persist` (session-manager.ts:1172-1194 @ #10000): deferred
     /// persistence — the file is not created until the first user or
     /// assistant message (the `flushed` flag plus `wx` exclusive create);
     /// afterwards entries are appended directly. No file locking (G4 red
@@ -2226,7 +2226,7 @@ impl SessionManager {
             // Use the same rule as persist_appended_entry (#10000): write
             // now if the branched path already has a conversation,
             // otherwise let the first later user/assistant message create
-            // the file (session-manager.ts:1477-1488).
+            // the file (session-manager.ts:1717-1724).
             if self.has_conversation() {
                 self.rewrite_file()?;
                 self.flushed = true;

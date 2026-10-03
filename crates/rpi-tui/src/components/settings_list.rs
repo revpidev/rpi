@@ -533,7 +533,7 @@ impl Component for SettingsList {
 
     /// The list owns keyboard routing for an open submenu, so a forwarded
     /// focus request must keep focus on the list, not the submenu child that
-    /// closes later (tui.ts:85-92 @ b3487650f).
+    /// closes later (tui.ts:84-90 @ bf8e4b953).
     fn has_handle_input(&self) -> bool {
         true
     }

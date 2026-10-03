@@ -862,7 +862,7 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: u32, visible_rows: u32) ->
     )
 }
 
-/// `calculateImageCellSize` (terminal-image.ts:257-292 @ 7cf037c21).
+/// `calculateImageCellSize` (terminal-image.ts:449-486 @ 7cf037c21).
 /// Mirrors upstream's f64 arithmetic exactly so results match
 /// `Math.floor`/`Math.ceil` behavior. Without `optimize_aspect_ratio` the
 /// ceiling placement is used; Kitty passes true to pick the less distorted
