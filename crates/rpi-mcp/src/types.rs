@@ -228,7 +228,8 @@ fn optional_string(value: Option<&Value>) -> Option<String> {
 }
 
 /// `Resource` (types.ts:97).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Resource {
     pub uri: String,
     pub name: String,
@@ -296,7 +297,8 @@ impl Resource {
 }
 
 /// `ResourceTemplate` (types.ts:110).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResourceTemplate {
     pub uri_template: String,
     pub name: String,

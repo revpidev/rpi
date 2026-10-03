@@ -77,13 +77,16 @@ Other options:
 const HELP_HINT: &str = "Use \"rpi mcp --help\" for usage.";
 
 /// `McpCommandOptions` (cli.ts:88).
+/// Console line sink.
+pub type CliLineSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct McpCommandOptions {
     pub cwd: String,
     pub agent_dir: PathBuf,
     pub credentials: Option<Arc<McpOAuthCredentialStore>>,
-    pub open_url: Option<Arc<dyn Fn(&str) + Send + Sync>>,
-    pub log: Arc<dyn Fn(&str) + Send + Sync>,
-    pub error: Arc<dyn Fn(&str) + Send + Sync>,
+    pub open_url: Option<CliLineSink>,
+    pub log: CliLineSink,
+    pub error: CliLineSink,
 }
 
 impl McpCommandOptions {
@@ -284,12 +287,11 @@ pub async fn run_mcp_command(args: &[String], options: McpCommandOptions) -> i32
                     .collect::<Vec<_>>()
                     .join(", ");
                 options.error(format!(
-                    "No MCP server named \"{name}\".{}{} Configured: {}.",
+                    "No MCP server named \"{name}\".{} Configured: {}.",
                     untrusted_note
                         .as_deref()
                         .map(|note| format!(" {note}"))
                         .unwrap_or_default(),
-                    if untrusted_note.is_some() { "" } else { "" },
                     if names.is_empty() {
                         "none".to_owned()
                     } else {
@@ -350,7 +352,7 @@ fn create_connection(
     Arc::new(McpServerConnection::new(McpServerConnectionOptions {
         entry: entry.clone(),
         cwd: options.cwd.clone(),
-        create_transport: Arc::new(|entry, cwd, auth| create_default_transport(entry, cwd, auth)),
+        create_transport: Arc::new(create_default_transport),
         credentials,
         provider_token: None,
         on_tools: Arc::new(|_| {}),
@@ -841,10 +843,7 @@ async fn login(
 
 impl McpCommandOptions {
     fn clone_for_prompt(&self) -> PromptOptions {
-        PromptOptions {
-            open_url: self.open_url.clone(),
-            log: self.log.clone(),
-        }
+        self.prompt_sinks()
     }
 }
 
@@ -852,8 +851,8 @@ impl McpCommandOptions {
 /// holds no path state).
 #[derive(Clone)]
 struct PromptOptions {
-    open_url: Option<Arc<dyn Fn(&str) + Send + Sync>>,
-    log: Arc<dyn Fn(&str) + Send + Sync>,
+    open_url: Option<CliLineSink>,
+    log: CliLineSink,
 }
 
 /// The CLI's `McpSignInPrompt` (cli.ts `waitForRedirectUrl`).
@@ -938,6 +937,16 @@ pub fn console_options(cwd: &str, agent_dir: PathBuf) -> McpCommandOptions {
         open_url: None,
         log: Arc::new(|line| println!("{line}")),
         error: Arc::new(|line| eprintln!("{line}")),
+    }
+}
+
+impl McpCommandOptions {
+    /// The prompt's shared sinks.
+    fn prompt_sinks(&self) -> PromptOptions {
+        PromptOptions {
+            open_url: self.open_url.clone(),
+            log: self.log.clone(),
+        }
     }
 }
 

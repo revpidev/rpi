@@ -359,6 +359,10 @@ impl McpTransport for StdioTransport {
         Ok(())
     }
 
+    fn stderr_tail(&self) -> Option<String> {
+        Some(self.stderr())
+    }
+
     fn events(&self) -> Arc<TransportEvents> {
         self.events.clone()
     }

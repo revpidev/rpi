@@ -155,8 +155,8 @@ pub fn render_servers_section(servers: &[McpServerListing]) -> Option<String> {
         })
         .collect();
     let intro = servers_section_intro(
-        reaches.iter().any(|reach| *reach == "codemode"),
-        reaches.iter().any(|reach| *reach == "tool_search"),
+        reaches.contains(&"codemode"),
+        reaches.contains(&"tool_search"),
     );
     let heads: Vec<String> = listed
         .iter()
@@ -267,6 +267,9 @@ pub struct McpBuiltinState {
     /// Servers that were waiting for a sign-in, with the token state they
     /// had then.
     tokens_at_sign_in: Mutex<HashMap<String, String>>,
+    /// Deferred tool names a resumed/reloaded loadout still references but
+    /// no server has registered yet (v1.0.0 `c662ec7e3`).
+    pending_tools: Mutex<HashSet<String>>,
     /// Resolves `auth.provider` tokens (`/login` credentials).
     model_runtime: Arc<crate::core::model_runtime::ModelRuntime>,
 }
@@ -292,6 +295,7 @@ impl McpBuiltinState {
             server_log: Mutex::new(None),
             tools: Mutex::new(ToolState::default()),
             tokens_at_sign_in: Mutex::new(HashMap::new()),
+            pending_tools: Mutex::new(HashSet::new()),
             model_runtime,
         }
     }
@@ -323,7 +327,58 @@ impl McpBuiltinState {
     }
 
     fn transport_factory(&self) -> McpTransportFactory {
-        Arc::new(|entry, cwd, auth| create_default_transport(entry, cwd, auth))
+        Arc::new(create_default_transport)
+    }
+
+    /// Replaceable coexistence (FR-H, resource-loader.ts:116-146): when
+    /// another extension already registered an `mcp` tool or `/mcp`
+    /// command, the built-in stands down (no config read, no connections).
+    fn replacer(&self) -> Option<String> {
+        let own = self.api.extension().path.clone();
+        let tool_replacer = self
+            .api
+            .get_all_tools()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some("mcp")
+                    && tool
+                        .get("sourceInfo")
+                        .and_then(|info| info.get("path"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| path != own)
+            });
+        let command_replacer = self
+            .api
+            .get_commands()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|command| {
+                command.get("name").and_then(Value::as_str) == Some("mcp")
+                    && command
+                        .get("sourceInfo")
+                        .and_then(|info| info.get("path"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| path != own)
+            });
+        tool_replacer
+            .map(|tool| {
+                tool.get("sourceInfo")
+                    .and_then(|info| info.get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("<extension>")
+                    .to_owned()
+            })
+            .or_else(|| {
+                command_replacer.map(|command| {
+                    command
+                        .get("sourceInfo")
+                        .and_then(|info| info.get("path"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("<extension>")
+                        .to_owned()
+                })
+            })
     }
 
     /// `ensureDiscoveryActive` (index.ts:456).
@@ -819,13 +874,10 @@ impl McpBuiltinState {
                 let _ = sender.send(true);
                 return;
             }
-            match state.create_connection(server).await {
-                Ok(connection) => {
-                    if is_current() {
-                        let _ = connection.get_client().await;
-                    }
-                }
-                Err(_) => {}
+            if let Ok(connection) = state.create_connection(server).await
+                && is_current()
+            {
+                let _ = connection.get_client().await;
             }
             let _ = sender.send(true);
         });
@@ -908,20 +960,20 @@ impl McpBuiltinState {
             Some(only) => {
                 for server in only {
                     let entry = lock(&server.entry);
-                    if entry.config.enabled() {
-                        if let Some(message) = describe_state(server) {
-                            lines.push(format!("{}: {message}", entry.name));
-                        }
+                    if entry.config.enabled()
+                        && let Some(message) = describe_state(server)
+                    {
+                        lines.push(format!("{}: {message}", entry.name));
                     }
                 }
             }
             None => {
                 for server in lock(&self.servers).clone() {
                     let entry = lock(&server.entry);
-                    if entry.config.enabled() {
-                        if let Some(message) = describe_state(&server) {
-                            lines.push(format!("{}: {message}", entry.name));
-                        }
+                    if entry.config.enabled()
+                        && let Some(message) = describe_state(&server)
+                    {
+                        lines.push(format!("{}: {message}", entry.name));
                     }
                 }
             }
@@ -1181,7 +1233,7 @@ impl McpBuiltinState {
         removed
     }
 
-    fn pick_server<'a>(&'a self, name: &str) -> Option<Arc<McpServer>> {
+    fn pick_server(&self, name: &str) -> Option<Arc<McpServer>> {
         self.find_server(name)
     }
 
@@ -1387,7 +1439,7 @@ impl McpBuiltinState {
     }
 
     fn argument_completions(&self, prefix: &str) -> Option<Value> {
-        let parts: Vec<&str> = prefix.trim_start().split_whitespace().collect();
+        let parts: Vec<&str> = prefix.split_whitespace().collect();
         let action = parts.first().copied().unwrap_or_default();
         if parts.len() > 2 {
             return None;
@@ -1442,6 +1494,19 @@ impl McpBuiltinState {
 
     /// `session_start` handler (index.ts:935).
     fn on_session_start(self: &Arc<Self>, ctx: ExtensionContext) {
+        if let Some(replacer) = self.replacer() {
+            self.session_active.store(false, Ordering::SeqCst);
+            *lock(&self.servers) = Vec::new();
+            if let Ok(ui) = ctx.ui() {
+                ui.notify(
+                    &format!(
+                        "MCP: extension \"{replacer}\" replaced the built-in MCP extension; its servers are not connected."
+                    ),
+                    NotifyType::Warning,
+                );
+            }
+            return;
+        }
         let cwd = ctx.cwd().unwrap_or_default().to_owned();
         let trusted = ctx.is_project_trusted().unwrap_or(false);
         let loaded = load_mcp_config(
@@ -1462,6 +1527,21 @@ impl McpBuiltinState {
         *lock(&self.configured_entries) = loaded.servers.clone();
         let (registered, overridden) = self.registered_servers();
         *lock(&self.overridden) = overridden;
+        // A resumed/reloaded loadout can name MCP tools that no server has
+        // registered yet; keep them pending so a later registration attaches
+        // (v1.0.0 `c662ec7e3`).
+        {
+            let registered: HashSet<String> =
+                lock(&self.tools).definitions.keys().cloned().collect();
+            let pending: HashSet<String> = self
+                .api
+                .get_active_tools()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|name| name.starts_with("mcp__") && !registered.contains(name))
+                .collect();
+            *lock(&self.pending_tools) = pending;
+        }
         {
             let mut servers: Vec<Arc<McpServer>> = loaded
                 .servers
@@ -1603,6 +1683,9 @@ impl McpBuiltinState {
             })
             .collect();
         let section = render_servers_section(&listings);
+        // Tools a resumed loadout named must have been re-registered by the
+        // servers' connections by now; the next prompt clears the rest.
+        lock(&self.pending_tools).clear();
         let _ = event;
         Ok(json!({
             "systemPromptOptions": {
@@ -1894,13 +1977,13 @@ impl McpBuiltinState {
     ) -> Option<Arc<McpServer>> {
         if let Some(name) = name {
             let server = self.pick_server(name);
-            if server.is_none() {
-                if let Ok(ui) = ctx.ui() {
-                    ui.notify(
-                        &format!("No MCP server named \"{name}\"."),
-                        NotifyType::Error,
-                    );
-                }
+            if server.is_none()
+                && let Ok(ui) = ctx.ui()
+            {
+                ui.notify(
+                    &format!("No MCP server named \"{name}\"."),
+                    NotifyType::Error,
+                );
             }
             return server;
         }

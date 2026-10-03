@@ -254,6 +254,10 @@ pub trait McpTransport: Send + Sync {
     async fn close(&self) -> Result<(), McpTransportError>;
     /// `setProtocolVersion?` (transport.ts:15).
     fn set_protocol_version(&self, _version: &str) {}
+    /// Captured stderr tail (stdio only), for connection-failure diagnostics.
+    fn stderr_tail(&self) -> Option<String> {
+        None
+    }
     fn events(&self) -> Arc<TransportEvents>;
 }
 
