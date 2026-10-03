@@ -48,6 +48,10 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         "registerTool" | "unregisterTool" | "toolUpdate" | "executeTool" => {
             Requires(Capability::Tools)
         }
+        // V16-08 FR-E: MCP server registration is tools-capability surface.
+        "registerMcpServer" | "unregisterMcpServer" | "getMcpServers" => {
+            Requires(Capability::Tools)
+        }
         "registerCommand" | "registerShortcut" | "registerFlag" => Requires(Capability::Commands),
         "registerMessageRenderer" | "registerEntryRenderer" | "registerMarkdownTransformer" => {
             Requires(Capability::Ui)
@@ -463,6 +467,47 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
         // ADR-0015: `unregisterTool(name)` — removes this extension's own
         // registry entry (returns bool); post-bind the session refreshes and
         // the tool leaves the active set. Unknown names → false, no error.
+        "registerMcpServer" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    (
+                        "invalidRequest",
+                        "registerMcpServer: missing name".to_owned(),
+                    )
+                })?
+                .to_owned();
+            let config = args.get("config").cloned().unwrap_or(Value::Null);
+            state
+                .api
+                .register_mcp_server(&name, config)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(Value::Null)
+        }
+        "unregisterMcpServer" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    (
+                        "invalidRequest",
+                        "unregisterMcpServer: missing name".to_owned(),
+                    )
+                })?
+                .to_owned();
+            state
+                .api
+                .unregister_mcp_server(&name)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(Value::Null)
+        }
+        "getMcpServers" => Ok(Value::Array(
+            state
+                .api
+                .get_mcp_servers()
+                .map_err(|e| (error_kind(&e), e.to_string()))?,
+        )),
         "unregisterTool" => {
             let name = str_arg(&args, "name")
                 .ok_or_else(|| ("invalidRequest", "unregisterTool: missing name".to_owned()))?;

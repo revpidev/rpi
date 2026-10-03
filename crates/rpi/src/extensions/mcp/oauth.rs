@@ -243,6 +243,7 @@ impl McpOAuthServerStore {
         let lock_path = lock_dir.join(name);
         let lock = match std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -283,6 +284,7 @@ impl McpOAuthServerStore {
         }
         let lock = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

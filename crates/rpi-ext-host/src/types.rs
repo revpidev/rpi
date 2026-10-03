@@ -459,6 +459,124 @@ pub struct TreePreparation {
 // `RegisteredMcpServer` (core/mcp-servers.ts:265) is carried as JSON: the shape is
 // owned by the MCP server registration surface (V16-08).
 
+/// `RegisteredMcpServer` (core/mcp-servers.ts:283): a server an extension
+/// registered with `pi.registerMcpServer()`. `config` stays JSON here; the
+/// MCP extension validates it into its typed config (V16-08).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredMcpServer {
+    pub name: String,
+    pub config: Value,
+    pub extension_path: String,
+}
+
+/// `mcpNamespace` (mcp-servers.ts:133): `mcp__<server>` with `-` replaced.
+fn mcp_namespace(server: &str) -> String {
+    format!("mcp__{}", server.replace('-', "_"))
+}
+
+/// `McpServerRegistry` (core/mcp-servers.ts:290): servers registered by the
+/// extensions of one runtime, in registration order. The registration
+/// checks mirror `loader.ts:464-479`: ownership by the same extension is
+/// allowed (replacement), another extension's name and `-`/`_` namespace
+/// clashes are rejected.
+#[derive(Default)]
+pub struct McpServerRegistry {
+    servers: Vec<RegisteredMcpServer>,
+    change_listener: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl McpServerRegistry {
+    /// `register` (mcp-servers.ts:296 + loader.ts:464-479).
+    pub fn register(&mut self, server: RegisteredMcpServer) -> Result<(), String> {
+        if let Some(existing) = self
+            .servers
+            .iter()
+            .find(|existing| existing.name == server.name)
+            && existing.extension_path != server.extension_path
+        {
+            return Err(format!(
+                "MCP server \"{}\" is already registered by extension \"{}\"",
+                server.name, existing.extension_path
+            ));
+        }
+        if let Some(clash) = self.servers.iter().find(|existing| {
+            existing.name != server.name
+                && mcp_namespace(&existing.name) == mcp_namespace(&server.name)
+        }) {
+            return Err(format!(
+                "MCP server \"{}\" conflicts with registered server \"{}\"",
+                server.name, clash.name
+            ));
+        }
+        match self
+            .servers
+            .iter_mut()
+            .find(|existing| existing.name == server.name)
+        {
+            Some(existing) => *existing = server,
+            None => self.servers.push(server),
+        }
+        self.notify();
+        Ok(())
+    }
+
+    /// `unregister` (mcp-servers.ts:302): remove a server registered by
+    /// `extension_path`.
+    pub fn unregister(&mut self, name: &str, extension_path: &str) {
+        let before = self.servers.len();
+        self.servers
+            .retain(|server| !(server.name == name && server.extension_path == extension_path));
+        if self.servers.len() != before {
+            self.notify();
+        }
+    }
+
+    /// Remove every server owned by one extension (failed factory rollback).
+    pub fn unregister_all_for(&mut self, extension_path: &str) {
+        let before = self.servers.len();
+        self.servers
+            .retain(|server| server.extension_path != extension_path);
+        if self.servers.len() != before {
+            self.notify();
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&RegisteredMcpServer> {
+        self.servers.iter().find(|server| server.name == name)
+    }
+
+    /// `list` (mcp-servers.ts:314): copies in registration order.
+    pub fn list(&self) -> Vec<RegisteredMcpServer> {
+        self.servers.clone()
+    }
+
+    /// `setChangeListener` (mcp-servers.ts:320).
+    pub fn set_change_listener(&mut self, listener: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.change_listener = listener;
+    }
+
+    fn notify(&self) {
+        if let Some(listener) = &self.change_listener {
+            listener();
+        }
+    }
+
+    /// `RegisteredMcpServer[]` JSON (`getMcpServers`).
+    pub fn to_json(&self) -> Vec<Value> {
+        self.servers
+            .iter()
+            .map(|server| {
+                serde_json::json!({
+                    "name": server.name,
+                    "config": server.config,
+                    "extensionPath": server.extension_path,
+                })
+            })
+            .collect()
+    }
+}
+
 /// `McpServersChangeEvent` (types.ts:710-714 @ a13d35a74): fired when an
 /// extension registers or unregisters an MCP server after the extensions are
 /// bound. Registered while loading → read with `pi.getMcpServers()` on

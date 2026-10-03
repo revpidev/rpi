@@ -67,6 +67,45 @@ pub async fn bind_session_actions(
         host_handle: tokio::runtime::Handle::current(),
     });
     host.bind_actions(actions).await;
+    // V16-08 FR-E/H: extensions registering or unregistering an MCP server
+    // notify every `mcp_servers_change` handler (loader.ts:464-492 +
+    // runner.ts `applyRuntimeChange`). The listener holds a weak session so
+    // a stale registry never keeps one alive.
+    {
+        let registry = host.runtime().mcp_servers();
+        let weak = session.downgrade();
+        let host_handle = tokio::runtime::Handle::current();
+        let registry_for_emit = registry.clone();
+        let listener: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let weak = weak.clone();
+            let registry = registry_for_emit.clone();
+            let handle = host_handle.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                handle.spawn(async move {
+                    if let Some(session) = weak.upgrade() {
+                        let servers = registry
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .to_json();
+                        session
+                            .extension_runner()
+                            .emit_event(
+                                rpi_ext_host::types::EVENT_MCP_SERVERS_CHANGE,
+                                serde_json::json!({
+                                    "type": rpi_ext_host::types::EVENT_MCP_SERVERS_CHANGE,
+                                    "servers": servers,
+                                }),
+                            )
+                            .await;
+                    }
+                });
+            }));
+        });
+        registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_change_listener(Some(listener));
+    }
     // `ExtensionContextActions` half (agent-session.ts:2405-2431,
     // runner.ts:336-347).
     host.runtime().set_context_actions(Some(Arc::new(

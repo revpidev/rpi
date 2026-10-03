@@ -1256,6 +1256,7 @@ struct RuntimeInner {
     context_actions: RwLock<Option<Arc<dyn ContextActions>>>,
     command_actions: RwLock<Option<Arc<dyn CommandContextActions>>>,
     ui_bridge: RwLock<Option<Arc<dyn UiBridge>>>,
+    mcp_servers: Arc<std::sync::Mutex<crate::types::McpServerRegistry>>,
     mode: RwLock<ExtensionMode>,
     event_bus: EventBus,
     /// Tracked event-bus subscriptions that are auto-unsubscribed on
@@ -1287,12 +1288,21 @@ impl ExtensionRuntime {
                 context_actions: RwLock::new(None),
                 command_actions: RwLock::new(None),
                 ui_bridge: RwLock::new(None),
+                mcp_servers: Arc::new(std::sync::Mutex::new(
+                    crate::types::McpServerRegistry::default(),
+                )),
                 mode: RwLock::new(ExtensionMode::Print),
                 event_bus: EventBus::new(),
                 event_bus_unsubscribers: std::sync::Mutex::new(HashMap::new()),
                 next_bus_subscription_id: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// `runtime.mcpServers` (loader.ts:440-492): the extension-registered
+    /// MCP server registry (V16-08 FR-E).
+    pub fn mcp_servers(&self) -> Arc<std::sync::Mutex<crate::types::McpServerRegistry>> {
+        self.inner.mcp_servers.clone()
     }
 
     /// `assertActive` (loader.ts:175-179).
@@ -2268,6 +2278,31 @@ pub(crate) fn extension_namespace(extension_path: &str) -> String {
 /// clone; clones share the extension registration maps, the runtime, and
 /// the load transaction (FR-F: while the factory runs, shared-state
 /// registration writes are buffered).
+/// Structural validation for `registerMcpServer` (loader.ts:466): the deep
+/// config validation lives with the MCP extension (V16-08).
+fn validate_registered_mcp_config(name: &str, config: &Value) -> Result<(), String> {
+    if name.is_empty()
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+    {
+        return Err(format!(
+            "invalid server name \"{name}\" (use letters, digits, \"_\" and \"-\")"
+        ));
+    }
+    let Some(config) = config.as_object() else {
+        return Err(format!("server \"{name}\" must be an object"));
+    };
+    let command = config.get("command").is_some_and(Value::is_string);
+    let url = config.get("url").is_some_and(Value::is_string);
+    if command == url {
+        return Err(format!(
+            "server \"{name}\" needs either \"command\" (stdio) or \"url\" (streamable HTTP)"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ExtensionApi {
     extension: Arc<LoadedExtension>,
@@ -2467,6 +2502,13 @@ impl ExtensionApi {
         for unsubscribe in self.load.take_unsubscribers() {
             unsubscribe();
         }
+        // V16-08 FR-E: a failed factory must not leave MCP server
+        // registrations behind (loader.ts `applyRuntimeChange` rollback).
+        self.runtime
+            .mcp_servers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unregister_all_for(&self.extension.path);
         self.load.take_flag_values();
         self.load.take_runtime_changes();
     }
@@ -2585,6 +2627,57 @@ impl ExtensionApi {
             }
         }
         Ok(removed)
+    }
+
+    /// `pi.registerMcpServer(name, config)` (loader.ts:464-479 @ a13d35a74):
+    /// validates the registration shape, enforces ownership and `-`/`_`
+    /// namespace uniqueness, and registers into the runtime registry. The
+    /// registration is not written to `mcp.json`. Deep config validation
+    /// happens when the MCP extension consumes the registry (V16-08).
+    pub fn register_mcp_server(&self, name: &str, config: Value) -> Result<(), ExtError> {
+        self.assert_api_active()?;
+        self.runtime.assert_active()?;
+        validate_registered_mcp_config(name, &config).map_err(|error| {
+            ExtError::Call(format!(
+                "Invalid MCP server registered by extension \"{}\": {error}",
+                self.extension.path
+            ))
+        })?;
+        self.runtime
+            .mcp_servers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(crate::types::RegisteredMcpServer {
+                name: name.to_owned(),
+                config,
+                extension_path: self.extension.path.clone(),
+            })
+            .map_err(ExtError::Call)
+    }
+
+    /// `pi.unregisterMcpServer(name)` (loader.ts:483-486).
+    pub fn unregister_mcp_server(&self, name: &str) -> Result<(), ExtError> {
+        self.assert_api_active()?;
+        self.runtime.assert_active()?;
+        self.runtime
+            .mcp_servers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unregister(name, &self.extension.path);
+        Ok(())
+    }
+
+    /// `pi.getMcpServers()` (loader.ts:488-491): every server registered by
+    /// extensions, in registration order.
+    pub fn get_mcp_servers(&self) -> Result<Vec<Value>, ExtError> {
+        self.assert_api_active()?;
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .mcp_servers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_json())
     }
 
     /// `pi.registerCommand(name, options)` (loader.ts:254-261).

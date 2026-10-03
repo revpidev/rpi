@@ -438,12 +438,22 @@ pub trait McpToolCaller: Send + Sync {
     ) -> Result<CallToolResult, McpError>;
 }
 
+/// Looks up the connection a tool definition calls through.
+pub type McpClientLookup = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<Arc<dyn McpToolCaller>, String>>
+        + Send
+        + Sync,
+>;
+
+/// Progress callback a tool call forwards to the UI.
+pub type ProgressCallback = Arc<dyn Fn(&ProgressNotification) + Send + Sync>;
+
 /// `McpRequestOptions` subset the tool passes through.
 #[derive(Clone, Default)]
 pub struct McpCallOptions {
     pub signal: Option<tokio_util::sync::CancellationToken>,
     pub timeout_ms: Option<u64>,
-    pub on_progress: Option<Arc<dyn Fn(&ProgressNotification) + Send + Sync>>,
+    pub on_progress: Option<ProgressCallback>,
 }
 
 /// `createMcpToolDefinition` (tools.ts:279).
@@ -454,11 +464,7 @@ pub struct CreateMcpToolOptions {
     pub exposure: McpExposure,
     pub namespace: ToolNamespace,
     pub timeout_ms: u64,
-    pub get_client: Arc<
-        dyn Fn() -> futures::future::BoxFuture<'static, Result<Arc<dyn McpToolCaller>, String>>
-            + Send
-            + Sync,
-    >,
+    pub get_client: McpClientLookup,
     pub readable_resources: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
@@ -548,37 +554,36 @@ pub fn create_mcp_tool_definition(options: CreateMcpToolOptions) -> ToolDefiniti
             let readable_resources = readable_resources.clone();
             Box::pin(async move {
                 let connection = get_client().await?;
-                let on_progress: Option<Arc<dyn Fn(&ProgressNotification) + Send + Sync>> =
-                    on_update.map(|callback| {
-                        let server = server.clone();
-                        let tool_id = tool_id.clone();
-                        Arc::new(move |progress: &ProgressNotification| {
-                            let total = progress
-                                .total
-                                .map(|total| format!("/{total}"))
-                                .unwrap_or_default();
-                            let text = progress.message.clone().unwrap_or_else(|| {
-                                format!("Progress {}{total}", progress.progress)
-                            });
-                            callback(AgentToolResult {
-                                content: vec![ToolResultContent::Text(TextContent {
-                                    text,
-                                    text_signature: None,
-                                })],
-                                details: McpToolDetails {
-                                    server: server.clone(),
-                                    tool: tool_id.clone(),
-                                    full_output_path: None,
-                                }
-                                .to_json(),
-                                structured_content: None,
-                                usage: None,
-                                is_error: None,
-                                terminate: None,
-                            });
-                        })
-                            as Arc<dyn Fn(&ProgressNotification) + Send + Sync>
-                    });
+                let on_progress: Option<ProgressCallback> = on_update.map(|callback| {
+                    let server = server.clone();
+                    let tool_id = tool_id.clone();
+                    Arc::new(move |progress: &ProgressNotification| {
+                        let total = progress
+                            .total
+                            .map(|total| format!("/{total}"))
+                            .unwrap_or_default();
+                        let text = progress
+                            .message
+                            .clone()
+                            .unwrap_or_else(|| format!("Progress {}{total}", progress.progress));
+                        callback(AgentToolResult {
+                            content: vec![ToolResultContent::Text(TextContent {
+                                text,
+                                text_signature: None,
+                            })],
+                            details: McpToolDetails {
+                                server: server.clone(),
+                                tool: tool_id.clone(),
+                                full_output_path: None,
+                            }
+                            .to_json(),
+                            structured_content: None,
+                            usage: None,
+                            is_error: None,
+                            terminate: None,
+                        });
+                    }) as Arc<dyn Fn(&ProgressNotification) + Send + Sync>
+                });
                 let result = connection
                     .call_tool(
                         &tool_id,

@@ -12,13 +12,13 @@ use std::path::Path;
 
 use rpi_ext_host::types::ToolExposure;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 /// `.rpi` project directory name.
 pub const CONFIG_DIR_NAME: &str = crate::config::CONFIG_DIR_NAME;
 
 /// `McpExposure` (mcp-servers.ts:11): server-side exposure tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum McpExposure {
     Codemode,
     Deferred,
@@ -165,6 +165,13 @@ impl McpServerConfig {
         match self {
             McpServerConfig::Stdio(config) => &config.common,
             McpServerConfig::Http(config) => &config.common,
+        }
+    }
+
+    pub fn common_mut(&mut self) -> &mut McpServerCommon {
+        match self {
+            McpServerConfig::Stdio(config) => &mut config.common,
+            McpServerConfig::Http(config) => &mut config.common,
         }
     }
 
@@ -792,86 +799,10 @@ fn detect_indent(text: &str) -> String {
     "  ".to_owned()
 }
 
-/// `RegisteredMcpServer` (mcp-servers.ts:283): a server an extension
-/// registered with `pi.registerMcpServer()`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RegisteredMcpServer {
-    pub name: String,
-    pub config: McpServerConfig,
-    pub extension_path: String,
-}
-
-/// `McpServerRegistry` (mcp-servers.ts:290): servers registered by the
-/// extensions of one runtime, in registration order.
-#[derive(Default)]
-pub struct McpServerRegistry {
-    servers: Vec<RegisteredMcpServer>,
-    change_listener: Option<Box<dyn Fn() + Send + Sync>>,
-}
-
-impl McpServerRegistry {
-    /// `register` (mcp-servers.ts:296): register or replace, then notify.
-    pub fn register(&mut self, server: RegisteredMcpServer) {
-        match self
-            .servers
-            .iter_mut()
-            .find(|existing| existing.name == server.name)
-        {
-            Some(existing) => *existing = server,
-            None => self.servers.push(server),
-        }
-        self.notify();
-    }
-
-    /// `unregister` (mcp-servers.ts:302): remove a server registered by
-    /// `extension_path`; other extensions' servers are left alone.
-    pub fn unregister(&mut self, name: &str, extension_path: &str) {
-        let before = self.servers.len();
-        self.servers
-            .retain(|server| !(server.name == name && server.extension_path == extension_path));
-        if self.servers.len() != before {
-            self.notify();
-        }
-    }
-
-    pub fn get(&self, name: &str) -> Option<&RegisteredMcpServer> {
-        self.servers.iter().find(|server| server.name == name)
-    }
-
-    /// `list` (mcp-servers.ts:314): copies in registration order.
-    pub fn list(&self) -> Vec<RegisteredMcpServer> {
-        self.servers.clone()
-    }
-
-    /// `setChangeListener` (mcp-servers.ts:320).
-    pub fn set_change_listener(&mut self, listener: Option<Box<dyn Fn() + Send + Sync>>) {
-        self.change_listener = listener;
-    }
-
-    fn notify(&self) {
-        if let Some(listener) = &self.change_listener {
-            listener();
-        }
-    }
-
-    /// The `RegisteredMcpServer[]` JSON the `mcp_servers_change` event and
-    /// `getMcpServers()` use.
-    pub fn to_json(&self) -> Vec<Value> {
-        self.list()
-            .into_iter()
-            .map(|server| {
-                json!({
-                    "name": server.name,
-                    "config": server.config.to_json(),
-                    "extensionPath": server.extension_path,
-                })
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]

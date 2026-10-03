@@ -378,6 +378,31 @@ impl Extension {
             .map(|value| value.as_bool().unwrap_or(false))
     }
 
+    /// `pi.registerMcpServer(name, config)` (V16-08 FR-E): register an MCP
+    /// server this extension provides. The registration is not persisted;
+    /// register again on every load. A server of the same name in `mcp.json`
+    /// takes precedence.
+    pub fn register_mcp_server(&self, name: &str, config: Value) -> Result<(), String> {
+        host_call(
+            "registerMcpServer",
+            json!({ "name": name, "config": config }),
+        )
+        .map(|_| ())
+    }
+
+    /// `pi.unregisterMcpServer(name)` (V16-08 FR-E): remove a server this
+    /// extension registered and close its connection.
+    pub fn unregister_mcp_server(&self, name: &str) -> Result<(), String> {
+        host_call("unregisterMcpServer", json!({ "name": name })).map(|_| ())
+    }
+
+    /// `pi.getMcpServers()` (V16-08 FR-E): every MCP server registered by
+    /// extensions, in registration order.
+    pub fn get_mcp_servers(&self) -> Result<Vec<Value>, String> {
+        host_call("getMcpServers", json!({}))
+            .map(|value| value.as_array().cloned().unwrap_or_default())
+    }
+
     /// Host call escape hatch for the rest of the capability surface
     /// (ui.*/ctx.*/command.*/provider/exec — docs/extension-abi.md).
     pub fn call(&self, method: &str, args: Value) -> Result<Value, String> {

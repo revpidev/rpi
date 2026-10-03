@@ -626,6 +626,15 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         if first == "self-uninstall" {
             return crate::cli::package_command::run_self_uninstall(&args);
         }
+        if first == "mcp" {
+            // `rpi mcp` never loads extensions or a session (cli.ts:1-6).
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            let options = crate::cli::mcp_command::console_options(
+                &cwd.display().to_string(),
+                crate::config::get_agent_dir(),
+            );
+            return crate::cli::mcp_command::run_mcp_command(&args[1..], options).await;
+        }
         if first == "auth"
             && let Some(exit_code) = crate::cli::run_auth::run_auth(&args).await
         {
@@ -951,6 +960,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         services.model_runtime.clone(),
                     ),
                     crate::extensions::tool_search::inline_extension(),
+                    crate::extensions::mcp::inline_extension(services.model_runtime.clone()),
                 ];
                 let mut project_trust_diagnostics: Vec<AgentSessionRuntimeDiagnostic> = Vec::new();
 

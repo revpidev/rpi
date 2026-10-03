@@ -15,18 +15,24 @@ use std::sync::Arc;
 
 use rpi_ext_host::loader::InlineExtension;
 
+use crate::core::model_runtime::ModelRuntime;
+
 pub use config::{
     LoadedMcpConfig, McpExposure, McpScope, McpServerConfig, McpServerConfigPatch, McpServerEntry,
-    McpServerRegistry, RegisteredMcpServer, load_mcp_config, mcp_namespace,
+    load_mcp_config, mcp_namespace,
 };
 
 /// The built-in hidden `mcp` extension. `replaceable`/`builtin` naming and
 /// the `-builtin:mcp` disable surface are V16-13's governance scope; this
-/// factory is the implementation it wires.
-pub fn inline_extension() -> InlineExtension {
+/// factory is the implementation it wires. `model_runtime` resolves
+/// `auth.provider` tokens (`/login` credentials).
+pub fn inline_extension(model_runtime: Arc<ModelRuntime>) -> InlineExtension {
     InlineExtension::Named {
         name: "mcp".to_owned(),
         hidden: true,
-        factory: Arc::new(|api| Box::pin(async move { ui::create_mcp_extension(api) })),
+        factory: Arc::new(move |api| {
+            let model_runtime = model_runtime.clone();
+            Box::pin(async move { ui::create_mcp_extension(api, model_runtime) })
+        }),
     }
 }
