@@ -1212,6 +1212,14 @@ pub type ComponentTree = Value;
 /// - `box`: bordered container; props `paddingX` / `paddingY`, `borderColor`
 ///   (theme color name); `children` stacked vertically.
 /// - `column`: unbordered vertical stack; `children`.
+/// - `visualPreview` (additive v1 node, V16-09 @ 0582d9c11): props `text`
+///   (string, may contain newlines; wraps at the render width), `fg` (theme
+///   color name, applied per line), `maxVisualLines` (uint, default 5),
+///   `keep` (`"start"` default | `"end"` — which visual lines survive
+///   truncation), `hint` (string, `{hidden}` replaced by the skipped
+///   visual-line count; rendered muted). Collapsed output is limited to
+///   wrapped lines, so one long line such as minified JSON cannot fill the
+///   screen.
 ///
 /// v1 deviations from the design sketch (§13): `row` is deferred — rpi-tui
 /// has no horizontal container; treat horizontal composition as out of
@@ -1220,7 +1228,7 @@ pub type ComponentTree = Value;
 pub const COMPONENT_TREE_SCHEMA_V1: &str = r#"{
   "$id": "rpi.component-tree.v1",
   "node": {
-    "type": {"enum": ["text", "spacer", "box", "column"]},
+    "type": {"enum": ["text", "spacer", "box", "column", "visualPreview"]},
     "props": {
       "text": "string (text only, required)",
       "fg": "theme color name | #rrggbb (text)",

@@ -626,20 +626,30 @@ pub fn create_mcp_tool_definition(options: CreateMcpToolOptions) -> ToolDefiniti
                 if output.trim().is_empty() {
                     return Ok(json!({"type": "column", "children": []}));
                 }
-                let mut children: Vec<ComponentTree> = Vec::new();
-                let lines: Vec<&str> = output.lines().collect();
-                if render.expanded || lines.len() <= OUTPUT_PREVIEW_LINES {
-                    for line in lines {
-                        children.push(text_component(line.replace('\t', "    ")));
-                    }
+                let output = output.replace('\t', "    ");
+                let style = if result.is_error == Some(true) {
+                    "error"
                 } else {
-                    for line in lines.iter().take(OUTPUT_PREVIEW_LINES) {
-                        children.push(text_component(line.replace('\t', "    ")));
-                    }
-                    let hidden = lines.len() - OUTPUT_PREVIEW_LINES;
+                    "toolOutput"
+                };
+                let mut children: Vec<ComponentTree> = Vec::new();
+                if render.expanded {
                     children.push(json!({
                         "type": "text",
-                        "props": {"text": format!("... ({hidden} more lines)"), "fg": "muted"},
+                        "props": {"text": output, "fg": style},
+                    }));
+                } else {
+                    // Limit wrapped lines, not logical ones: MCP results are
+                    // often one long JSON line (tools.ts @ 0582d9c11).
+                    children.push(json!({
+                        "type": "visualPreview",
+                        "props": {
+                            "text": output,
+                            "fg": style,
+                            "maxVisualLines": OUTPUT_PREVIEW_LINES,
+                            "keep": "start",
+                            "hint": "... ({hidden} more lines)",
+                        },
                     }));
                 }
                 if let Some(path) = result.details.get("fullOutputPath").and_then(Value::as_str) {
@@ -648,12 +658,7 @@ pub fn create_mcp_tool_definition(options: CreateMcpToolOptions) -> ToolDefiniti
                         "props": {"text": format!("Full output: {path}"), "fg": "muted"},
                     }));
                 }
-                let style = if result.is_error == Some(true) {
-                    "error"
-                } else {
-                    "toolOutput"
-                };
-                Ok(json!({"type": "column", "children": children, "props": {"fg": style}}))
+                Ok(json!({"type": "column", "children": children}))
             },
         )),
     }

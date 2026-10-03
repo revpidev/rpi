@@ -20,6 +20,7 @@ use rpi_tui::tui::Component;
 use serde_json::Value;
 
 use super::components::dynamic_border::DynamicBorder;
+use super::components::visual_truncate::{VisualKeep, VisualLinePreview};
 use crate::core::themes::Theme;
 
 /// Map a ComponentTree JSON node onto a rpi-tui component.
@@ -81,6 +82,44 @@ pub fn component_from_tree(tree: &Value, theme: &Arc<Theme>) -> Box<dyn Componen
                 return Box::new(bordered);
             }
             Box::new(container)
+        }
+        // Additive v1 node (V16-09, 0582d9c11): collapsed output limited
+        // to visual lines. A single long line such as minified JSON must
+        // not fill the screen; the native fallback and bash renderer use
+        // the same component directly.
+        "visualPreview" => {
+            let raw = props.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = match props.get("fg").and_then(Value::as_str) {
+                // Style each line separately so kept lines carry their
+                // color after truncation slices the block.
+                Some(fg) => raw
+                    .split('\n')
+                    .map(|line| theme.fg(fg, line))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                None => raw.to_owned(),
+            };
+            let keep = match props.get("keep").and_then(Value::as_str) {
+                Some("end") => VisualKeep::End,
+                _ => VisualKeep::Start,
+            };
+            let max_visual_lines = props
+                .get("maxVisualLines")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .clamp(1, 64) as usize;
+            let mut preview = VisualLinePreview::new(text, max_visual_lines, keep);
+            if let Some(template) = props.get("hint").and_then(Value::as_str) {
+                let template = template.to_owned();
+                let hint_theme = Arc::clone(theme);
+                preview = preview.with_hint(Box::new(move |hidden| {
+                    hint_theme.fg(
+                        "muted",
+                        &template.replace("{hidden}", &hidden.to_string()),
+                    )
+                }));
+            }
+            Box::new(preview)
         }
         // Fail-visible fallback for unknown/malformed nodes.
         _ => Box::new(Text::new(tree.to_string(), 0, 0, None)),
@@ -145,6 +184,48 @@ fn styled_text(props: &Value, theme: &Arc<Theme>) -> String {
 mod tests {
     use super::*;
     use rpi_tui::utils::visible_width;
+
+    #[test]
+    fn visual_preview_node_limits_wrapped_lines() {
+        let theme = Arc::new(crate::core::themes::load_theme("dark", None).unwrap());
+        let long = "x".repeat(1000);
+        let tree = serde_json::json!({
+            "type": "visualPreview",
+            "props": {
+                "text": long,
+                "fg": "toolOutput",
+                "maxVisualLines": 5,
+                "keep": "start",
+                "hint": "... ({hidden} more lines)",
+            },
+        });
+        let lines = component_from_tree(&tree, &theme).render(50);
+        assert_eq!(lines.len(), 6, "5 kept + hint");
+        assert_eq!(visible_width(&lines[5]), "... (15 more lines)".len());
+        assert!(
+            lines[0].contains("xxx") && visible_width(&lines[0]) == 50,
+            "kept visual line: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn visual_preview_node_keeps_end_lines_with_the_hint_first() {
+        let theme = Arc::new(crate::core::themes::load_theme("dark", None).unwrap());
+        let text = (1..=20)
+            .map(|i| format!("line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tree = serde_json::json!({
+            "type": "visualPreview",
+            "props": {"text": text, "maxVisualLines": 2, "keep": "end"},
+        });
+        let lines = component_from_tree(&tree, &theme).render(40);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("... (18 more lines)"));
+        assert!(lines[1].contains("line-19"));
+        assert!(lines[2].contains("line-20"));
+    }
 
     #[test]
     fn truncate_prop_clips_instead_of_wrapping() {

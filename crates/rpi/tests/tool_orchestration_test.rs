@@ -77,7 +77,7 @@ fn tool_definition(
         name: name.to_owned(),
         label: name.to_owned(),
         description: description.to_owned(),
-        prompt_snippet: None,
+        prompt_snippet: Some(description.to_owned()),
         prompt_guidelines: None,
         parameters: json!({"type": "object"}),
         constrained_sampling: None,
@@ -367,8 +367,10 @@ async fn orchestrator_exposure_loadout_and_nested_calls() {
 
     let requests: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let descriptions: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let request_prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let requests_for_factory = requests.clone();
     let descriptions_for_factory = descriptions.clone();
+    let prompts_for_factory = request_prompts.clone();
     fixture.provider.set_responses(vec![
         FauxResponseStep::Factory(Box::new(move |context, _options, _state, _model| {
             let tools = rpi_ai::utils::transcript::get_current_tools(&context.messages);
@@ -376,6 +378,9 @@ async fn orchestrator_exposure_loadout_and_nested_calls() {
                 .lock()
                 .unwrap()
                 .push(tools.iter().map(|tool| tool.name.clone()).collect());
+            prompts_for_factory.lock().unwrap().push(
+                rpi_ai::utils::transcript::get_current_system_prompt(&context.messages),
+            );
             descriptions_for_factory.lock().unwrap().extend(
                 tools
                     .iter()
@@ -407,6 +412,21 @@ async fn orchestrator_exposure_loadout_and_nested_calls() {
 
     // `echo` stays active, but its declaration is left out of requests.
     assert_eq!(requests.lock().unwrap()[0], vec!["run_tools"]);
+
+    // #10192 (`028c0ec56`): the prompt's tool list matches the declarations
+    // the request carries — hidden declarations are not listed.
+    let request_prompts = request_prompts.lock().unwrap();
+    let system_prompt = request_prompts
+        .first()
+        .expect("the request carries a system prompt");
+    assert!(
+        system_prompt.contains("- run_tools: "),
+        "the visible tool is listed: {system_prompt}"
+    );
+    assert!(
+        !system_prompt.contains("- echo: ") && !system_prompt.contains("- secret: "),
+        "hidden tools must not be listed: {system_prompt}"
+    );
     let descriptions = descriptions.lock().unwrap().clone();
     assert_eq!(
         descriptions

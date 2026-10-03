@@ -62,6 +62,7 @@ use crate::core::themes::Theme;
 use crate::tools::sanitize::{sanitize_binary_output, strip_ansi};
 
 use super::keybinding_hints::key_hint;
+use super::visual_truncate::{VisualKeep, VisualLinePreview};
 
 /// `FALLBACK_PREVIEW_LINES` (tool-execution.ts:40, e14afc648 / V14-11 FR-G):
 /// collapsed generic-fallback preview height.
@@ -397,37 +398,39 @@ impl ToolExecutionComponent {
 
     /// `createResultFallback` (tool-execution.ts:139-145 @ 9841914,
     /// e14afc648/V14-11 FR-G): collapsed shows the first
-    /// [`FALLBACK_PREVIEW_LINES`] lines with a `... (N more lines, …)` hint
+    /// [`FALLBACK_PREVIEW_LINES`] **visual** lines with a
+    /// `... (N more lines, …)` hint
     /// (`keyHint("app.tools.expand", "to expand")`); expanded shows the
     /// full output. Only the generic fallback — renderers and built-in
     /// tools are unaffected.
-    fn create_result_fallback(&self) -> Option<Text> {
+    fn create_result_fallback(&self) -> Option<StdBox<dyn Component>> {
         let output = get_text_output(self.result.as_ref(), self.show_images);
         if output.is_empty() {
             return None;
         }
-        let lines: Vec<&str> = output.split('\n').collect();
-        let display_end = if self.expanded {
-            lines.len()
-        } else {
-            FALLBACK_PREVIEW_LINES.min(lines.len())
-        };
-        let remaining = lines.len() - display_end;
-        let mut text = lines[..display_end]
-            .iter()
+        let styled = output
+            .split('\n')
             .map(|line| self.theme.fg("toolOutput", line))
             .collect::<Vec<_>>()
             .join("\n");
-        if remaining > 0 {
-            text += &format!(
-                "\n{} {}{}",
-                self.theme
-                    .fg("muted", &format!("... ({remaining} more lines,")),
-                key_hint(&self.theme, "app.tools.expand", "to expand"),
-                self.theme.fg("muted", ")"),
-            );
+        if self.expanded {
+            // `new Text(`\n${styled}`)` (tool-execution.ts:316-322):
+            // upstream renders a Text that wraps at width.
+            return Some(StdBox::new(Text::new(styled, 0, 0, None)));
         }
-        Some(Text::new(text, 0, 0, None))
+        let theme = Arc::clone(&self.theme);
+        Some(StdBox::new(
+            VisualLinePreview::new(styled, FALLBACK_PREVIEW_LINES, VisualKeep::Start).with_hint(
+                Box::new(move |hidden| {
+                    format!(
+                        "{} {}{}",
+                        theme.fg("muted", &format!("... ({hidden} more lines,")),
+                        key_hint(&theme, "app.tools.expand", "to expand"),
+                        theme.fg("muted", ")"),
+                    )
+                }),
+            ),
+        ))
     }
 
     /// `updateArgs` (tool-execution.ts:147-150).
@@ -590,7 +593,6 @@ impl ToolExecutionComponent {
             return Some(component);
         }
         self.create_result_fallback()
-            .map(|text| StdBox::new(text) as StdBox<dyn Component>)
     }
 
     /// `updateDisplay` (tool-execution.ts:253-359).
