@@ -53,19 +53,29 @@ is_baselined() {
 }
 
 # --- dependency install (idempotent; skips when the closure is in place) ---
+# Only some legs need the out-of-tree npm closure; builtin-mcp-parity resolves
+# tsx from external/pi/node_modules when the closure is absent, so it can run
+# standalone.
+DEPS_LEGS=" mcp-parity render-call-parity oauth-parity conformance e2e-parity "
+needs_deps=0
+for leg in "${LEGS[@]}"; do
+  [[ " $DEPS_LEGS " == *" $leg "* ]] && needs_deps=1
+done
 need_setup=0
-if [[ ! -d "$DEPS_DIR/node_modules" ]] \
-  || [[ ! -f "$DEPS_DIR/node_modules/tsx/dist/loader.mjs" ]] \
-  || [[ ! -f "$REFREE_BIN" ]]; then
-  need_setup=1
+if [[ $needs_deps -eq 1 ]]; then
+  if [[ ! -d "$DEPS_DIR/node_modules" ]] \
+    || [[ ! -f "$DEPS_DIR/node_modules/tsx/dist/loader.mjs" ]] \
+    || [[ ! -f "$REFREE_BIN" ]]; then
+    need_setup=1
+  fi
 fi
-if [[ ${RPI_PARITY_SUITE_SKIP_SETUP:-0} != 1 && $need_setup -eq 1 ]]; then
+if [[ $needs_deps -eq 1 && ${RPI_PARITY_SUITE_SKIP_SETUP:-0} != 1 && $need_setup -eq 1 ]]; then
   log "installing out-of-tree deps (npm ci from upstream lockfile) into $DEPS_DIR"
   if ! bash "$SCRIPT_DIR/setup-deps.sh" "$DEPS_DIR"; then
     echo "run-parity-suite.sh: setup-deps.sh failed" >&2
     exit 1
   fi
-elif [[ $need_setup -eq 1 ]]; then
+elif [[ $needs_deps -eq 1 && $need_setup -eq 1 ]]; then
   echo "run-parity-suite.sh: deps missing under $DEPS_DIR and RPI_PARITY_SUITE_SKIP_SETUP=1" >&2
   exit 1
 fi
