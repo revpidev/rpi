@@ -623,6 +623,9 @@ pub struct AgentOverride {
     /// `append` | `replace`.
     pub system_prompt_mode: Option<String>,
     pub inherit_project_context: Option<bool>,
+    /// Upstream #1560 `inheritGlobalContext` override (agents.ts:562 @
+    /// 0fc0eebb; same shape as the sibling inherit booleans).
+    pub inherit_global_context: Option<bool>,
     pub inherit_skills: Option<bool>,
     /// `fresh` | `fork` | false (clear).
     pub default_context: Option<Option<String>>,
@@ -1041,6 +1044,17 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                     path,
                                     name,
                                     "inheritProjectContext",
+                                    "a boolean",
+                                )
+                            })?);
+                    }
+                    "inheritGlobalContext" => {
+                        parsed_entry.inherit_global_context =
+                            Some(field.as_bool().ok_or_else(|| {
+                                invalid_override_field(
+                                    path,
+                                    name,
+                                    "inheritGlobalContext",
                                     "a boolean",
                                 )
                             })?);
@@ -1566,7 +1580,8 @@ mod tests {
                     "scout":{"model":false,"disabled":true},
                     "worker":{"systemPromptMode":"append",
                               "thinking":false,"defaultContext":"fork","acceptanceRole":"writer",
-                              "skills":["s1"],"systemPrompt":"custom","inheritSkills":false},
+                              "skills":["s1"],"systemPrompt":"custom","inheritSkills":false,
+                              "inheritGlobalContext":true},
                     "reviewer":{"completionGuard":true}
                 }
             }}"#,
@@ -1603,6 +1618,7 @@ mod tests {
         assert_eq!(worker.skills, Some(Some(vec!["s1".to_string()])));
         assert_eq!(worker.system_prompt.as_deref(), Some("custom"));
         assert_eq!(worker.inherit_skills, Some(false));
+        assert_eq!(worker.inherit_global_context, Some(true));
         // completionGuard is beyond the documented set → ignored, not fatal.
         assert!(
             settings
@@ -1621,6 +1637,12 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"subagents":{"agentOverrides":{"x":{"thinking":5}}}}"#,
+        )
+        .unwrap();
+        assert!(read_subagent_settings(&path).is_err());
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverrides":{"x":{"inheritGlobalContext":"yes"}}}}"#,
         )
         .unwrap();
         assert!(read_subagent_settings(&path).is_err());

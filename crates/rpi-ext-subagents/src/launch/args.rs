@@ -30,11 +30,14 @@ use crate::paths;
 pub const TASK_ARG_LIMIT: usize = 8000;
 pub const SUBAGENT_TASK_DELIVERY_ENV: &str = "RPI_SUBAGENT_TASK_DELIVERY";
 pub const SUBAGENT_CHILD_ENV: &str = "RPI_SUBAGENT_CHILD";
-/// Host-side global-context opt-out (ADR-0026 decision 2; the host reads
-/// the same name in `resource_loader::no_global_context`).
-pub const NO_GLOBAL_CONTEXT_ENV: &str = "RPI_NO_GLOBAL_CONTEXT";
 pub const SUBAGENT_FANOUT_CHILD_ENV: &str = "RPI_SUBAGENT_FANOUT_CHILD";
 pub const SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV: &str = "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT";
+/// Port of upstream #1560's `PI_SUBAGENT_INHERIT_GLOBAL_CONTEXT`
+/// (pi-args.ts:827 @ 7db37a7c), two-state like the sibling switches. The
+/// host reads it in `resource_loader::no_global_context`, but only under
+/// `RPI_SUBAGENT_CHILD=1` — a stray ambient value alone cannot change a
+/// top-level session.
+pub const SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV: &str = "RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT";
 pub const SUBAGENT_INHERIT_SKILLS_ENV: &str = "RPI_SUBAGENT_INHERIT_SKILLS";
 pub const SUBAGENT_PARENT_SESSION_ENV: &str = "RPI_SUBAGENT_PARENT_SESSION";
 pub const SUBAGENT_RUN_ID_ENV: &str = "RPI_SUBAGENT_RUN_ID";
@@ -294,6 +297,10 @@ pub struct BuildArgsInput {
     pub system_prompt: Option<String>,
     pub system_prompt_mode: &'static str,
     pub inherit_project_context: bool,
+    /// Upstream #1560 `inheritGlobalContext` (frontmatter/override, default
+    /// false): rendered two-state into the child env; the host skips only
+    /// the global agent-dir context segment when the value is `0`.
+    pub inherit_global_context: bool,
     pub inherit_skills: bool,
     pub require_read_tool: bool,
     pub tools: Option<Vec<String>>,
@@ -682,13 +689,6 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     env.insert("MCP_DIRECT_TOOLS".into(), Some("__none__".into()));
     let _ = &input.mcp_direct_tools;
     env.insert(SUBAGENT_CHILD_ENV.into(), Some("1".into()));
-    // ADR-0026 decision 3 (TE18 FR-H): children default to NOT inheriting
-    // the operator's global agent-dir context (upstream #1560 default). The
-    // host skips only the global context segment when this env is set
-    // (`resource_loader::no_global_context`); a host that does not know the
-    // switch keeps loading it (old-host fallback — no refusal, no crash).
-    // No user-visible config key in v0.1.4 (ADR-0026 decision 4).
-    env.insert(NO_GLOBAL_CONTEXT_ENV.into(), Some("1".into()));
     env.insert(
         SUBAGENT_FANOUT_CHILD_ENV.into(),
         Some(
@@ -845,6 +845,23 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV.into(),
         Some(
             if input.inherit_project_context {
+                "1"
+            } else {
+                "0"
+            }
+            .into(),
+        ),
+    );
+    // Port of upstream #1560's two-state global-context switch
+    // (pi-args.ts:827 @ 7db37a7c): children default to NOT inheriting the
+    // operator's global agent-dir context; `inheritGlobalContext: true`
+    // opts the child back in. The host skips only the global segment when
+    // `RPI_SUBAGENT_CHILD=1` is present and this value is "0"; a host that
+    // does not know the key keeps inheriting (no refusal, no crash).
+    env.insert(
+        SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV.into(),
+        Some(
+            if input.inherit_global_context {
                 "1"
             } else {
                 "0"
@@ -1454,9 +1471,11 @@ mod te18_args_tests {
     }
 
     #[test]
-    fn child_env_carries_global_context_opt_out() {
-        // ADR-0026 decision 3 (FR-H): every spawned child defaults to not
-        // inheriting the operator's global context file.
+    fn child_env_carries_global_context_inherit_switch() {
+        // Port of upstream #1560 (pi-args.ts:827 @ 7db37a7c): every spawned
+        // child carries the two-state switch; the default (false) opts out
+        // of the operator's global context file, `inheritGlobalContext:
+        // true` opts back in.
         let dir = temp_dir();
         let input = BuildArgsInput {
             base_args: vec!["--mode".into(), "json".into(), "-p".into()],
@@ -1467,12 +1486,22 @@ mod te18_args_tests {
             inherit_skills: false,
             ..Default::default()
         };
-        let result = build_rpi_args(&input).unwrap();
+        let opted_out = build_rpi_args(&input).unwrap();
         assert_eq!(
-            result.env.get(NO_GLOBAL_CONTEXT_ENV),
+            opted_out.env.get(SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV),
+            Some(&Some("0".into()))
+        );
+        cleanup_temp_dir(&opted_out.temp_dir);
+        let opted_in = build_rpi_args(&BuildArgsInput {
+            inherit_global_context: true,
+            ..input
+        })
+        .unwrap();
+        assert_eq!(
+            opted_in.env.get(SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV),
             Some(&Some("1".into()))
         );
-        cleanup_temp_dir(&result.temp_dir);
+        cleanup_temp_dir(&opted_in.temp_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

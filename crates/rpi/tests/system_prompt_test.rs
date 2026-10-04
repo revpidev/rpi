@@ -478,24 +478,38 @@ fn include_global_false_skips_only_the_global_segment() {
 }
 
 #[test]
-fn no_global_context_env_gate_matches_only_truthy_values() {
+fn no_global_context_env_gate_requires_child_marker_and_false_value() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    for value in ["1", "true", "TRUE", " 1 "] {
-        rpi_test_env::set_var("RPI_NO_GLOBAL_CONTEXT", value);
-        assert!(
-            no_global_context(),
-            "value {value:?} should enable the gate"
-        );
-    }
-    for value in ["0", "false", "", "no", "off"] {
-        rpi_test_env::set_var("RPI_NO_GLOBAL_CONTEXT", value);
+    rpi_test_env::remove_var("RPI_SUBAGENT_CHILD");
+    rpi_test_env::remove_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT");
+
+    // `0`/`false` opt out only under the child marker; a stray ambient
+    // value without the marker must not change a top-level session.
+    for value in ["0", "false", "FALSE", " 0 "] {
+        rpi_test_env::set_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT", value);
         assert!(
             !no_global_context(),
-            "value {value:?} should not enable the gate"
+            "value {value:?} without the child marker must not gate"
+        );
+        rpi_test_env::set_var("RPI_SUBAGENT_CHILD", "1");
+        assert!(
+            no_global_context(),
+            "value {value:?} under the child marker should gate"
+        );
+        rpi_test_env::remove_var("RPI_SUBAGENT_CHILD");
+    }
+    // Inherit values and unset keep loading under the child marker.
+    rpi_test_env::set_var("RPI_SUBAGENT_CHILD", "1");
+    for value in ["1", "true", "TRUE", "yes", ""] {
+        rpi_test_env::set_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT", value);
+        assert!(
+            !no_global_context(),
+            "value {value:?} should keep inheriting"
         );
     }
-    rpi_test_env::remove_var("RPI_NO_GLOBAL_CONTEXT");
+    rpi_test_env::remove_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT");
     assert!(!no_global_context(), "unset env keeps default inheritance");
+    rpi_test_env::remove_var("RPI_SUBAGENT_CHILD");
 }
 
 #[test]
@@ -508,9 +522,24 @@ fn no_global_context_env_skips_global_segment_end_to_end() {
     tmp.write("agent/AGENTS.md", "global");
     tmp.write("repo/AGENTS.md", "repo");
 
-    rpi_test_env::set_var("RPI_NO_GLOBAL_CONTEXT", "1");
+    rpi_test_env::set_var("RPI_SUBAGENT_CHILD", "1");
+    rpi_test_env::set_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT", "0");
     let files = load_project_context_files(&cwd, &agent_dir, !no_global_context());
-    rpi_test_env::remove_var("RPI_NO_GLOBAL_CONTEXT");
+    rpi_test_env::remove_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT");
+    rpi_test_env::remove_var("RPI_SUBAGENT_CHILD");
     let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
     assert_eq!(contents, ["repo"], "env gate skips only the global segment");
+
+    // Opt-in (`1`) keeps the global segment for a child.
+    rpi_test_env::set_var("RPI_SUBAGENT_CHILD", "1");
+    rpi_test_env::set_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT", "1");
+    let files = load_project_context_files(&cwd, &agent_dir, !no_global_context());
+    rpi_test_env::remove_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT");
+    rpi_test_env::remove_var("RPI_SUBAGENT_CHILD");
+    let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        ["global", "repo"],
+        "opt-in keeps the global segment"
+    );
 }

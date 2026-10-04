@@ -377,6 +377,7 @@ mod tests {
             thinking: crate::agents::discover::ThinkingSpec::Unset,
             system_prompt_mode: "replace",
             inherit_project_context: false,
+            inherit_global_context: false,
             inherit_skills: false,
             default_context: None,
             default_async: None,

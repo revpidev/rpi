@@ -242,11 +242,13 @@ function normalizeOutput(output) {
 		const RPI_ONLY_ENV_KEYS = new Set([
 			"RPI_SUBAGENT_STEER_INBOX",
 			"RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR",
-			// TE18 (ADR-0026): the rpi-side switch for upstream #1560's
-			// in-process `inheritGlobalContext: false` default — no argv/env
-			// counterpart on either pin; its presence is pinned by crate unit
-			// tests + the e2e env dump instead of this diff.
-			"RPI_NO_GLOBAL_CONTEXT",
+			// TE18/R7.1.11.4 (ADR-0026; opt-in landed with the #1560 port):
+			// `RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT` is the two-state child
+			// switch for upstream #1560's `inheritGlobalContext` (the frozen
+			// v0.48 argv/env golden predates the feature, so neither pin has a
+			// counterpart); its presence is pinned by crate unit tests + the
+			// e2e env dump instead of this diff.
+			"RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT",
 			// TE19 (#1397/#1615): v0.66 launch-contract additions with no
 			// v0.48 argv/env counterpart — the intersected thinking ceiling
 			// (thinking-ceiling.ts, upstream threads it in-process) and the

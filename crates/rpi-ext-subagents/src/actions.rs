@@ -103,6 +103,14 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
         }
     ));
     lines.push(format!(
+        "Inherit global context: {}",
+        if agent.inherit_global_context {
+            "true"
+        } else {
+            "false"
+        }
+    ));
+    lines.push(format!(
         "Inherit skills: {}",
         if agent.inherit_skills {
             "true"

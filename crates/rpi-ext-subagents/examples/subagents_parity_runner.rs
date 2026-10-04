@@ -82,6 +82,7 @@ fn run_args_case(input: &Value) -> Value {
             _ => "replace",
         },
         inherit_project_context: input.get("inheritProjectContext") == Some(&Value::Bool(true)),
+        inherit_global_context: input.get("inheritGlobalContext") == Some(&Value::Bool(true)),
         inherit_skills: input.get("inheritSkills") == Some(&Value::Bool(true)),
         require_read_tool: input.get("requireReadTool") == Some(&Value::Bool(true)),
         tools: get_list("tools"),

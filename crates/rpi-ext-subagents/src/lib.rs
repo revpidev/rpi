@@ -1549,6 +1549,8 @@ pub mod parity {
         pub system_prompt: Option<String>,
         pub system_prompt_mode: &'static str,
         pub inherit_project_context: bool,
+        /// Upstream #1560 global-context inherit switch (two-state env).
+        pub inherit_global_context: bool,
         pub inherit_skills: bool,
         pub require_read_tool: bool,
         pub tools: Option<Vec<String>>,
@@ -1592,6 +1594,7 @@ pub mod parity {
             system_prompt: input.system_prompt.clone(),
             system_prompt_mode: input.system_prompt_mode,
             inherit_project_context: input.inherit_project_context,
+            inherit_global_context: input.inherit_global_context,
             inherit_skills: input.inherit_skills,
             require_read_tool: input.require_read_tool,
             tools: input.tools.clone(),

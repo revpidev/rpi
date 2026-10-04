@@ -242,6 +242,9 @@ pub struct ForegroundRunInput {
     /// Resolved tool budget env value (#2302); `None` leaves the env unset.
     pub tool_budget_env: Option<String>,
     pub agent_inherit_project_context: bool,
+    /// Upstream #1560 `inheritGlobalContext` (agent frontmatter/override,
+    /// default false): rides the child env as `RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT`.
+    pub agent_inherit_global_context: bool,
     pub agent_inherit_skills: bool,
     pub task: String,
     pub task_delivery: Option<TaskDelivery>,
@@ -357,6 +360,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         system_prompt: Some(input.agent_system_prompt.clone()),
         system_prompt_mode: input.agent_system_prompt_mode,
         inherit_project_context: input.agent_inherit_project_context,
+        inherit_global_context: input.agent_inherit_global_context,
         inherit_skills: input.agent_inherit_skills,
         require_read_tool: false,
         tools: input.agent_tools.clone(),
@@ -1512,6 +1516,7 @@ mod terminal_classification_tests {
             diff_baseline: None,
             tool_budget_env: None,
             agent_inherit_project_context: true,
+            agent_inherit_global_context: false,
             agent_inherit_skills: false,
             task: "replay".to_string(),
             task_delivery: None,

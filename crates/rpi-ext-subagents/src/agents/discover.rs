@@ -79,6 +79,10 @@ pub struct AgentConfig {
     pub thinking: ThinkingSpec,
     pub system_prompt_mode: &'static str,
     pub inherit_project_context: bool,
+    /// Upstream #1560 `inheritGlobalContext`: children default to NOT
+    /// inheriting the operator's global agent-dir context; `true` opts the
+    /// agent back in (agents.ts:2014 @ 0fc0eebb parses strictly `==="true"`).
+    pub inherit_global_context: bool,
     pub inherit_skills: bool,
     pub default_context: Option<ContextMode>,
     pub default_async: Option<bool>,
@@ -680,6 +684,13 @@ pub fn agent_from_content(
         Some("false") => false,
         _ => default_inherit_project_context(local_name),
     };
+    // agents.ts:2014 @ 0fc0eebb: strictly `=== "true"`; absent, `false`,
+    // or any other value stays false (the option-off default for every
+    // agent — there is no per-name default like inheritProjectContext).
+    let inherit_global_context = matches!(
+        fm.get("inheritGlobalContext").map(String::as_str),
+        Some("true")
+    );
     let inherit_skills = match fm.get("inheritSkills").map(String::as_str) {
         Some("true") => true,
         Some("false") => false,
@@ -732,6 +743,7 @@ pub fn agent_from_content(
         thinking,
         system_prompt_mode,
         inherit_project_context,
+        inherit_global_context,
         inherit_skills,
         default_context,
         default_async,
@@ -1535,6 +1547,9 @@ fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOve
     if let Some(inherit) = entry.inherit_project_context {
         agent.inherit_project_context = inherit;
     }
+    if let Some(inherit) = entry.inherit_global_context {
+        agent.inherit_global_context = inherit;
+    }
     if let Some(inherit) = entry.inherit_skills {
         agent.inherit_skills = inherit;
     }
@@ -1625,6 +1640,11 @@ fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::A
         && !agent.has_frontmatter_field(&["inheritProjectContext"])
     {
         agent.inherit_project_context = inherit;
+    }
+    if let Some(inherit) = entry.inherit_global_context
+        && !agent.has_frontmatter_field(&["inheritGlobalContext"])
+    {
+        agent.inherit_global_context = inherit;
     }
     if let Some(inherit) = entry.inherit_skills
         && !agent.has_frontmatter_field(&["inheritSkills"])
@@ -1917,6 +1937,7 @@ mod tests {
         .unwrap();
         assert_eq!(agent.system_prompt_mode, "append");
         assert!(agent.inherit_project_context);
+        assert!(!agent.inherit_global_context);
         assert!(!agent.inherit_skills);
 
         let custom = agent_from_content(
@@ -1928,6 +1949,30 @@ mod tests {
         .unwrap();
         assert_eq!(custom.system_prompt_mode, "replace");
         assert!(!custom.inherit_project_context);
+        assert!(!custom.inherit_global_context);
+    }
+
+    #[test]
+    fn inherit_global_context_frontmatter_defaults_false() {
+        // agents.ts:2014 @ 0fc0eebb: strictly `=== "true"`.
+        let opted_in = agent_from_content(
+            "---\nname: mine\ndescription: d\ninheritGlobalContext: true\n---\nbody",
+            Path::new("/x/mine.md"),
+            AgentSource::User,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(opted_in.inherit_global_context);
+        for frontmatter in ["inheritGlobalContext: false", "inheritGlobalContext: maybe"] {
+            let agent = agent_from_content(
+                &format!("---\nname: mine\ndescription: d\n{frontmatter}\n---\nbody"),
+                Path::new("/x/mine.md"),
+                AgentSource::User,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!agent.inherit_global_context, "{frontmatter}");
+        }
     }
 
     #[test]

@@ -192,6 +192,13 @@ impl Sandbox {
             "---\nname: gater\ndescription: TE18 tool-face gate fixture\ntools: read, web_search\n---\n\nYou need a tool the host does not serve.\n",
         )
         .unwrap();
+        // TE18 FR-H: #1560 opt-in — the agent explicitly keeps the
+        // operator's global context segment.
+        std::fs::write(
+            agent_dir.join("agents").join("globalist.md"),
+            "---\nname: globalist\ndescription: TE18 inheritGlobalContext fixture\ntools: read\ninheritGlobalContext: true\n---\n\nYou keep the global rules.\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(&dump_root).unwrap();
         rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
         rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", fixed_child_binary());
@@ -1726,13 +1733,35 @@ fn e2e_fixed_child_full_pipeline() {
             exclude_pos > tools_pos,
             "deny-after-allow ordering: {argv_lines:?}"
         );
-        // ADR-0026 decision 3: children opt out of the global context file.
+        // ADR-0026 decision 3 + #1560: children default to opting out of
+        // the global context file via the two-state switch.
         let env_text = std::fs::read_to_string(dump.join("env.txt")).expect("env dump");
         assert!(
             env_text
                 .lines()
-                .any(|line| line == "RPI_NO_GLOBAL_CONTEXT=1"),
+                .any(|line| line == "RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT=0"),
             "child env carries the global-context opt-out: {env_text}"
+        );
+    }
+
+    // ---- TE18 Scenario: global-context opt-in (FR-H, #1560) ---------------
+    {
+        let dump = sandbox.dump("inherit-global");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
+        let result = execute(json!({
+            "agent": "globalist",
+            "task": "keep global context",
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let env_text = std::fs::read_to_string(dump.join("env.txt")).expect("env dump");
+        assert!(
+            env_text
+                .lines()
+                .any(|line| line == "RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT=1"),
+            "inheritGlobalContext: true opts the child back in: {env_text}"
         );
     }
 

@@ -173,8 +173,9 @@ fn canonicalize_path(path: &Path) -> PathBuf {
 /// `include_global: false` skips ONLY the global agent-dir segment while the
 /// ancestor (project/repo) chain still loads (ADR-0026 decision 2, TE18
 /// FR-H): subagent children opt out of the operator's global `AGENTS.md`
-/// via the `RPI_NO_GLOBAL_CONTEXT=1` env switch, matching upstream #1560
-/// where in-process children default `inheritGlobalContext` to false.
+/// via the `RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT=0` child env switch,
+/// matching upstream #1560 where children default `inheritGlobalContext`
+/// to false and an agent can opt back in.
 pub fn load_project_context_files(
     cwd: &Path,
     agent_dir: &Path,

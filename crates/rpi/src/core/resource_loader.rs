@@ -98,15 +98,31 @@ pub use crate::core::skills::{
 const LOCK_MAX_ATTEMPTS: u32 = 10;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 
-/// `RPI_NO_GLOBAL_CONTEXT` gate (ADR-0026 decision 2, TE18 FR-H): `1`/`true`
-/// skips only the global agent-dir context segment. rpi-internal switch —
-/// no CLI flag, no settings key; the subagents plugin sets it for spawned
-/// children (upstream #1560: children default `inheritGlobalContext` off).
+/// `RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT` gate (port of upstream #1560,
+/// ADR-0026 / TE18 FR-H): `0` skips only the global agent-dir context
+/// segment. rpi-internal switch — no CLI flag, no settings key; the
+/// subagents plugin renders the agent's `inheritGlobalContext` two-state
+/// into the child env (`1` = inherit, the default for every agent).
+///
+/// The switch is read only when the child marker `RPI_SUBAGENT_CHILD=1` is
+/// present: upstream's consumer was the child-only runtime extension, so a
+/// stray ambient value alone must not change a top-level session. `1`,
+/// `true`, unset, and unrecognized values keep inheriting — the old-host
+/// fallback for a host that never sees the key stays "inherit".
 pub fn no_global_context() -> bool {
-    std::env::var("RPI_NO_GLOBAL_CONTEXT")
+    let child = std::env::var("RPI_SUBAGENT_CHILD")
         .map(|value| {
             let trimmed = value.trim();
             trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+    if !child {
+        return false;
+    }
+    std::env::var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT")
+        .map(|value| {
+            let trimmed = value.trim();
+            trimmed == "0" || trimmed.eq_ignore_ascii_case("false")
         })
         .unwrap_or(false)
 }
@@ -602,11 +618,11 @@ impl DefaultResourceLoader {
         self.resources.context_files = if self.no_context_files {
             Vec::new()
         } else {
-            // ADR-0026 (TE18 FR-H): `RPI_NO_GLOBAL_CONTEXT=1` skips only the
-            // global agent-dir context segment; the project/repo ancestor
-            // chain still loads. The subagents plugin sets this env for every
-            // spawned child so subagents do not inherit the operator's
-            // global `AGENTS.md` (upstream #1560 default).
+            // ADR-0026 (TE18 FR-H): `RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT=0`
+            // (with the child marker) skips only the global agent-dir context
+            // segment; the project/repo ancestor chain still loads. The
+            // subagents plugin renders the agent's `inheritGlobalContext`
+            // into the child env (default false; upstream #1560).
             load_project_context_files(&self.cwd, &self.agent_dir, !no_global_context())
         };
 

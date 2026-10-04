@@ -159,10 +159,12 @@ track keeps the historical, emptied `expected-target-diffs.json`), or the report
    `PI_SUBAGENT_*` → `RPI_SUBAGENT_*` rename.
 6. **rpi-exclusive env keys dropped (added in TE05; TE18 addendum)**: `RPI_SUBAGENT_STEER_INBOX` and
    `RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR` — rpi-native slots for the steer inbox and the
-   supervisor channel directory (FR-P1-04/10); `RPI_NO_GLOBAL_CONTEXT` (TE18 /
-   ADR-0026 — the env-switch form on the rpi side of upstream #1560's in-process
-   `inheritGlobalContext:false` default; neither pin has an argv/env counterpart; its presence is
-   pinned by crate unit tests + an e2e env dump, not by this diff). The above keys are excluded from the diff.
+   supervisor channel directory (FR-P1-04/10); `RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT` (TE18 +
+   the #1560 opt-in increment — the two-state child switch on the rpi side of upstream #1560's
+   `inheritGlobalContext`; the frozen v0.48 argv/env golden predates the feature, so neither pin has
+   an argv/env counterpart. The host consumes it only together with `RPI_SUBAGENT_CHILD=1`, so a
+   stray ambient value cannot change a top-level session; its presence and both values are pinned by
+   crate unit tests + an e2e env dump, not by this diff). The above keys are excluded from the diff.
 7. **Prompt temp-file contents not compared**: rpi additionally prepends a boundary-instruction block at the
    file head (after `<active_agent>`, before the body — the TE-D17 mechanism-equivalent replacement);
    path-and-flag equality at the argv/env layer suffices.
