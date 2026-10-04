@@ -182,6 +182,13 @@ fn get_group_label(metadata: &ResourcePathMetadata, agent_dir: &Path) -> String 
     if metadata.origin == SourceOrigin::Package {
         return format!("{} ({})", metadata.source, scope_str(metadata.scope));
     }
+    // `getGroupLabel` builtin branch (config-selector.ts:87-89).
+    if metadata.source == "builtin" {
+        return match metadata.scope {
+            SourceScope::User => "Built-in".to_string(),
+            _ => "Built-in (project override)".to_string(),
+        };
+    }
     if metadata.source == "auto" {
         if let Some(base_dir) = &metadata.base_dir {
             let base_dir = base_dir.to_string_lossy();
@@ -326,23 +333,31 @@ fn add_to_group(
         })
     };
 
-    // displayName (config-selector.ts:131-140).
+    // displayName (config-selector.ts:131-141): built-in paths drop the
+    // `builtin:` prefix and display the bare name.
     let path = &resource.path;
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let parent_folder = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let display_name = match resource_type {
-        ResourceType::Extensions if parent_folder != "extensions" => {
-            format!("{parent_folder}/{file_name}")
+    let display_name = if metadata.source == "builtin" {
+        path.to_string_lossy()
+            .strip_prefix("builtin:")
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parent_folder = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match resource_type {
+            ResourceType::Extensions if parent_folder != "extensions" => {
+                format!("{parent_folder}/{file_name}")
+            }
+            ResourceType::Skills if file_name == "SKILL.md" => parent_folder,
+            _ => file_name,
         }
-        ResourceType::Skills if file_name == "SKILL.md" => parent_folder,
-        _ => file_name,
     };
 
     groups[group_idx].subgroups[subgroup_idx]
@@ -452,7 +467,8 @@ impl ConfigSelectorHeader {
 }
 
 /// `isLocalPath` (utils/paths.ts:41-56) — local copy (the package-manager
-/// twin is module-private).
+/// twin is module-private). `builtin:<name>` is not a local path
+/// (paths.ts:60).
 fn is_local_path(value: &str) -> bool {
     let trimmed = value.trim();
     !(trimmed.starts_with("npm:")
@@ -460,7 +476,8 @@ fn is_local_path(value: &str) -> bool {
         || trimmed.starts_with("github:")
         || trimmed.starts_with("http:")
         || trimmed.starts_with("https:")
-        || trimmed.starts_with("ssh:"))
+        || trimmed.starts_with("ssh:")
+        || trimmed.starts_with("builtin:"))
 }
 
 /// `(settings[key] ?? []) as string[]` (non-string entries dropped).
@@ -1193,7 +1210,9 @@ impl ResourceList {
             })
             .collect();
         if state != ProjectOverrideState::Inherit {
-            if inherited && !updated.contains(&pattern) {
+            // Project entries name inherited files to override them. Built-in
+            // paths need no entry (config-selector.ts:688-689).
+            if inherited && item.metadata.source != "builtin" && !updated.contains(&pattern) {
                 updated.push(pattern.clone());
             }
             let prefix = if state == ProjectOverrideState::Load {
@@ -1428,10 +1447,11 @@ impl ResourceList {
         patterns
     }
 
-    /// `getResourcePatternForScope` (config-selector.ts:796-801).
+    /// `getResourcePatternForScope` (config-selector.ts:796-801): built-in
+    /// paths stay `builtin:<name>` for every scope.
     fn get_resource_pattern_for_scope(&self, item: &ResourceItem, scope: SourceScope) -> String {
         let source_scope = get_item_scope(item);
-        if scope != source_scope {
+        if scope != source_scope || item.metadata.source == "builtin" {
             return item.path.clone();
         }
         let base_dir = item
@@ -1519,8 +1539,12 @@ impl ResourceList {
         }
     }
 
-    /// `getResourcePattern` (config-selector.ts:854-858).
+    /// `getResourcePattern` (config-selector.ts:854-858): a built-in path is
+    /// written back as-is (`builtin:<name>`, no base-dir relativization).
     fn get_resource_pattern(&self, item: &ResourceItem) -> String {
+        if item.metadata.source == "builtin" {
+            return item.path.clone();
+        }
         let scope = get_item_scope(item);
         let base_dir = item
             .metadata
@@ -1955,6 +1979,57 @@ mod tests {
         assert!(text.contains("~/.rpi/agent/settings.json"), "{text}");
         assert!(text.contains("format"), "{text}");
         assert!(text.contains("review.md"), "{text}");
+    }
+
+    // V16-13 FR-A R2 (config-selector.ts:87-89, :138-139, :688-689):
+    // built-in resources group under `Built-in` /
+    // `Built-in (project override)`, display the bare name, and write
+    // `builtin:<name>` patterns (never a bare path).
+    #[test]
+    fn builtin_resources_group_label_display_name_and_write_back() {
+        let dirs = TestDirs::new();
+        let user_metadata = ResourcePathMetadata {
+            source: "builtin".to_string(),
+            scope: SourceScope::User,
+            origin: SourceOrigin::TopLevel,
+            base_dir: None,
+        };
+        let project_metadata = ResourcePathMetadata {
+            scope: SourceScope::Project,
+            ..user_metadata.clone()
+        };
+        let paths = ScopedResolvedPaths {
+            global: ResolvedPaths {
+                extensions: vec![resource(PathBuf::from("builtin:mcp"), true, user_metadata)],
+                ..Default::default()
+            },
+            project: ResolvedPaths {
+                extensions: vec![resource(
+                    PathBuf::from("builtin:mcp"),
+                    true,
+                    project_metadata,
+                )],
+                ..Default::default()
+            },
+        };
+        let mut component = component(
+            &dirs,
+            paths,
+            manager(&dirs, true),
+            ConfigWriteScope::Project,
+            true,
+        );
+        let text = plain(component.render(100)).join("\n");
+        assert!(text.contains("Built-in (project override)"), "{text}");
+        assert!(text.contains("mcp"), "{text}");
+        assert!(!text.contains("builtin:mcp"), "{text}");
+        // Inherit -> unload writes `-builtin:mcp` with no plain entry.
+        component.handle_input(" ");
+        let settings = project_settings(&dirs);
+        assert_eq!(
+            settings["extensions"].as_array().unwrap(),
+            &vec![serde_json::json!("-builtin:mcp")]
+        );
     }
 
     #[test]

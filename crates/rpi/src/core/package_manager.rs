@@ -535,7 +535,8 @@ pub enum ParsedSource {
     GithubRelease(GithubReleaseSource),
 }
 
-/// `isLocalPath` (utils/paths.ts:41-56).
+/// `isLocalPath` (utils/paths.ts:41-56). `builtin:<name>` names no file
+/// (paths.ts:50-65, V16-13 FR-B).
 fn is_local_path(value: &str) -> bool {
     let trimmed = value.trim();
     !(trimmed.starts_with("npm:")
@@ -543,7 +544,8 @@ fn is_local_path(value: &str) -> bool {
         || trimmed.starts_with("github:")
         || trimmed.starts_with("http:")
         || trimmed.starts_with("https:")
-        || trimmed.starts_with("ssh:"))
+        || trimmed.starts_with("ssh:")
+        || trimmed.starts_with("builtin:"))
 }
 
 /// `parseNpmSpec` (package-manager.ts:1720-1728):
@@ -1073,6 +1075,11 @@ pub struct PackageManagerOptions {
     /// `RPI_REGISTRY_URL` (default `https://revpi.dev`) and uses the
     /// reqwest transport.
     pub registry: Option<RegistryChannel>,
+    /// Names of built-in extensions resolved as `builtin:<name>` extension
+    /// resources (`PackageManagerOptions.builtinExtensions`,
+    /// package-manager.ts:134-137; V16-13 FR-A). Empty for package-only
+    /// callers.
+    pub builtin_extensions: Vec<String>,
 }
 
 /// Rpi-specific: registry channel wiring (base URL + transport seam).
@@ -1102,6 +1109,9 @@ pub struct DefaultPackageManager {
     registry_base_url: Option<String>,
     registry_transport: Arc<dyn RegistryTransport>,
     install_confirm: Option<InstallConfirmCallback>,
+    /// Built-in extension names (`builtin:<name>` resources,
+    /// package-manager.ts:825).
+    builtin_extensions: Vec<String>,
 }
 
 /// `getExtensionTempFolder` (package-manager.ts:221-226): create
@@ -1128,6 +1138,7 @@ impl DefaultPackageManager {
             runner: None,
             offline: None,
             registry: None,
+            builtin_extensions: Vec::new(),
         })
     }
 
@@ -1158,6 +1169,7 @@ impl DefaultPackageManager {
             registry_base_url,
             registry_transport,
             install_confirm: None,
+            builtin_extensions: options.builtin_extensions,
         }
     }
 
@@ -3765,6 +3777,26 @@ impl DefaultPackageManager {
 
         let package_sources = self.dedupe_packages(all_packages);
         self.resolve_package_sources(&package_sources, &mut accumulator, on_missing)?;
+        // Built-in extensions are appended after the package resources
+        // (package-manager.ts:970-988): the resource loader loads them in the
+        // final pass only (V16-13 FR-A).
+        for (path, enabled, scope) in self.builtin_extension_states(
+            &global_settings,
+            &project_settings,
+            &self.agent_dir.clone(),
+            &config::get_project_config_dir(&self.cwd),
+        ) {
+            accumulator.add(
+                ResourceType::Extensions,
+                ResolvedPackageResource {
+                    path,
+                    enabled,
+                    source: "builtin".to_string(),
+                    scope,
+                    base_dir: None,
+                },
+            );
+        }
         Ok(accumulator.into_resolved())
     }
 
@@ -3853,7 +3885,73 @@ impl DefaultPackageManager {
             &project_base_dir,
         );
 
+        // Built-in extensions are enabled unless the user `extensions`
+        // setting excludes them (for example with `-builtin:mcp`). A
+        // matching `+`, `-`, or `!` entry in the project setting overrides
+        // that (package-manager.ts:970-988).
+        for (path, enabled, scope) in self.builtin_extension_states(
+            &global_settings,
+            &project_settings,
+            &global_base_dir,
+            &project_base_dir,
+        ) {
+            accumulator.add(
+                ResourceType::Extensions,
+                path,
+                ResourcePathMetadata {
+                    source: "builtin".to_string(),
+                    scope,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+                enabled,
+            );
+        }
+
         Ok(accumulator.into_resolved_paths())
+    }
+
+    /// Enabled state + scope of every `builtin:<name>` extension resource
+    /// (package-manager.ts:970-988). Project override patterns win; without
+    /// a project match the global `extensions` setting decides (default
+    /// enabled). The returned scope is `project` only when a project pattern
+    /// matched, so `rpi config` renders `Built-in` vs
+    /// `Built-in (project override)` (`config-selector.ts:87-89`).
+    fn builtin_extension_states(
+        &self,
+        global_settings: &Settings,
+        project_settings: &Settings,
+        global_base_dir: &Path,
+        project_base_dir: &Path,
+    ) -> Vec<(PathBuf, bool, SourceScope)> {
+        let project_patterns: Vec<String> = settings_string_array(project_settings, "extensions")
+            .into_iter()
+            .filter(|pattern| is_override_pattern(pattern))
+            .collect();
+        let global_patterns = settings_string_array(global_settings, "extensions");
+        self.builtin_extensions
+            .iter()
+            .map(|name| {
+                let path = PathBuf::from(format!("builtin:{name}"));
+                let project_enabled = apply_autoload_disabled_patterns(
+                    std::slice::from_ref(&path),
+                    &project_patterns,
+                    project_base_dir,
+                )
+                .into_iter()
+                .find(|(candidate, _)| candidate == &path)
+                .map(|(_, enabled)| enabled);
+                let enabled = project_enabled.unwrap_or_else(|| {
+                    is_enabled_by_overrides(&path, &global_patterns, global_base_dir)
+                });
+                let scope = if project_enabled.is_some() {
+                    SourceScope::Project
+                } else {
+                    SourceScope::User
+                };
+                (path, enabled, scope)
+            })
+            .collect()
     }
 
     /// `resolveLocalEntries` (package-manager.ts:2280-2301).
@@ -5050,6 +5148,7 @@ mod tests {
             runner: Some(runner),
             offline: Some(offline),
             registry: None,
+            builtin_extensions: Vec::new(),
         })
     }
 
@@ -6944,6 +7043,7 @@ mod update_tests {
             runner: Some(runner),
             offline: Some(offline),
             registry: None,
+            builtin_extensions: Vec::new(),
         })
     }
 
@@ -7425,6 +7525,139 @@ mod update_tests {
         );
         assert!(theme.enabled);
     }
+
+    // V16-13 FR-A/B (package-manager.ts:970-988 @ 4259686d9): builtins are
+    // appended after every other resource; project `+/-/!` overrides win
+    // over the global `extensions` setting.
+    fn builtin_manager(
+        dirs: &TestDirs,
+        runner: Arc<dyn PackageCommandRunner>,
+        project_trusted: bool,
+    ) -> DefaultPackageManager {
+        let mut manager = manager_with(dirs, runner, false, project_trusted);
+        manager.builtin_extensions = vec![
+            "llama.cpp".to_string(),
+            "codemode".to_string(),
+            "tool-search".to_string(),
+            "mcp".to_string(),
+        ];
+        manager
+    }
+
+    fn builtin_states(manager: &DefaultPackageManager) -> Vec<(String, bool, SourceScope)> {
+        manager
+            .resolve_all(None)
+            .unwrap()
+            .extensions
+            .into_iter()
+            .filter(|entry| entry.path.to_string_lossy().starts_with("builtin:"))
+            .map(|entry| {
+                (
+                    entry.path.to_string_lossy().into_owned(),
+                    entry.enabled,
+                    entry.metadata.scope,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_builtin_extensions_default_enabled_and_appended_last() {
+        let dirs = TestDirs::new();
+        let manager = builtin_manager(&dirs, FakeRunner::ok(), true);
+        let resolved = manager.resolve_all(None).unwrap();
+        assert_eq!(
+            resolved.extensions.last().unwrap().path,
+            PathBuf::from("builtin:mcp")
+        );
+        assert_eq!(
+            builtin_states(&manager),
+            [
+                ("builtin:llama.cpp".to_string(), true, SourceScope::User),
+                ("builtin:codemode".to_string(), true, SourceScope::User),
+                ("builtin:tool-search".to_string(), true, SourceScope::User),
+                ("builtin:mcp".to_string(), true, SourceScope::User),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_builtin_global_minus_disables_user_scope() {
+        let dirs = TestDirs::new();
+        let mut manager = builtin_manager(&dirs, FakeRunner::ok(), true);
+        manager
+            .settings_manager
+            .set_extension_paths(vec!["-builtin:mcp".to_string()]);
+        let states = builtin_states(&manager);
+        assert_eq!(
+            states
+                .iter()
+                .find(|state| state.0 == "builtin:mcp")
+                .cloned(),
+            Some(("builtin:mcp".to_string(), false, SourceScope::User))
+        );
+    }
+
+    #[test]
+    fn test_builtin_project_plus_overrides_global_minus() {
+        let dirs = TestDirs::new();
+        let mut manager = builtin_manager(&dirs, FakeRunner::ok(), true);
+        manager
+            .settings_manager
+            .set_extension_paths(vec!["-builtin:mcp".to_string()]);
+        manager
+            .settings_manager
+            .set_project_extension_paths(vec!["+builtin:mcp".to_string()])
+            .unwrap();
+        let states = builtin_states(&manager);
+        assert_eq!(
+            states
+                .iter()
+                .find(|state| state.0 == "builtin:mcp")
+                .cloned(),
+            Some(("builtin:mcp".to_string(), true, SourceScope::Project))
+        );
+    }
+
+    #[test]
+    fn test_builtin_project_minus_wins_over_global_default() {
+        let dirs = TestDirs::new();
+        let mut manager = builtin_manager(&dirs, FakeRunner::ok(), true);
+        manager
+            .settings_manager
+            .set_project_extension_paths(vec!["-builtin:mcp".to_string()])
+            .unwrap();
+        let states = builtin_states(&manager);
+        assert_eq!(
+            states
+                .iter()
+                .find(|state| state.0 == "builtin:mcp")
+                .cloned(),
+            Some(("builtin:mcp".to_string(), false, SourceScope::Project))
+        );
+    }
+
+    #[test]
+    fn test_builtin_package_slice_resolve_includes_builtins() {
+        let dirs = TestDirs::new();
+        let manager = builtin_manager(&dirs, FakeRunner::ok(), true);
+        let resolved = manager.resolve(None).unwrap();
+        let paths: Vec<String> = resolved
+            .extensions
+            .iter()
+            .filter(|entry| entry.path.to_string_lossy().starts_with("builtin:"))
+            .map(|entry| entry.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "builtin:llama.cpp",
+                "builtin:codemode",
+                "builtin:tool-search",
+                "builtin:mcp"
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7548,6 +7781,7 @@ mod registry_tests {
                 base_url: Some(REGISTRY_BASE.to_string()),
                 transport,
             }),
+            builtin_extensions: Vec::new(),
         });
         manager.set_install_confirm_callback(confirm);
         manager

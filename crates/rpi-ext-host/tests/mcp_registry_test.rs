@@ -17,6 +17,8 @@ fn factory(
     InlineExtension::Named {
         name: name.to_owned(),
         hidden: true,
+        replaceable: false,
+        builtin: false,
         factory: Arc::new(move |api| {
             let result = body(api);
             Box::pin(async move { result })

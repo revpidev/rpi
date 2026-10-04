@@ -425,6 +425,9 @@ pub fn inline_extension() -> InlineExtension {
     InlineExtension::Named {
         name: "tool-search".to_owned(),
         hidden: true,
+        // `extensions/index.ts:12`: replaceable builtin.
+        replaceable: true,
+        builtin: true,
         factory: Arc::new(|api| {
             Box::pin(async move {
                 api.register_tool(create_tool_search_tool_definition(api.clone()))

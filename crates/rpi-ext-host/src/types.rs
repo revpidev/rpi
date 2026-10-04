@@ -1751,6 +1751,15 @@ pub struct ExtensionLoadError {
     pub error: String,
 }
 
+/// `{ path, warning }` load-warning record
+/// (`LoadExtensionsResult["warnings"]`, resource-loader.ts:100-107) — the
+/// #10174 built-in replacement notice and future package warnings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionLoadWarning {
+    pub path: String,
+    pub warning: String,
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================

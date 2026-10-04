@@ -441,7 +441,8 @@ fn resolve_cli_paths(cwd: &Path, paths: &Option<Vec<String>>) -> Option<Vec<Stri
 }
 
 /// `isLocalPath` (utils/paths.ts:41-56): bare names, relative paths and
-/// `file:` URLs are local; package sources and remote URLs are not.
+/// `file:` URLs are local; package sources, remote URLs and
+/// `builtin:<name>` are not.
 fn is_local_path(value: &str) -> bool {
     let trimmed = value.trim();
     !(trimmed.starts_with("npm:")
@@ -449,7 +450,8 @@ fn is_local_path(value: &str) -> bool {
         || trimmed.starts_with("github:")
         || trimmed.starts_with("http:")
         || trimmed.starts_with("https:")
-        || trimmed.starts_with("ssh:"))
+        || trimmed.starts_with("ssh:")
+        || trimmed.starts_with("builtin:"))
 }
 
 /// `buildSessionOptions` (main.ts:357-453).
@@ -814,6 +816,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                 runner: None,
                 offline: None,
                 registry: None,
+                builtin_extensions: crate::extensions::builtin_extension_names(),
             },
         )
         .resolve(None)
@@ -826,15 +829,47 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         }
     }
 
-    fn enabled_extension_paths(
-        paths: &crate::core::resource_loader::PackageResourcePaths,
+    /// V16-13 FR-A/B: the extension path list handed to the extension host
+    /// (resource-loader.ts:495 `packageManager.resolve()`): settings
+    /// `extensions` entries (with `+/-` override patterns), auto-discovered
+    /// `.rpi/extensions` + `<agent_dir>/extensions`, package extensions,
+    /// and `builtin:<name>` resources — each enabled per the
+    /// project-over-user override rules. The host's own directory discovery
+    /// dedupes the overlapping entries canonically.
+    async fn resolve_host_extension_paths(
+        cwd: &Path,
+        agent_dir: &Path,
+        project_trusted: bool,
     ) -> Vec<String> {
-        paths
-            .extension_paths
-            .iter()
-            .filter(|entry| entry.enabled)
-            .map(|entry| entry.path.to_string_lossy().into_owned())
-            .collect()
+        let settings_manager = SettingsManager::create(
+            cwd,
+            Some(agent_dir),
+            SettingsManagerCreateOptions { project_trusted },
+        );
+        match crate::core::package_manager::DefaultPackageManager::with_options(
+            crate::core::package_manager::PackageManagerOptions {
+                cwd: cwd.to_path_buf(),
+                agent_dir: agent_dir.to_path_buf(),
+                settings_manager,
+                runner: None,
+                offline: None,
+                registry: None,
+                builtin_extensions: crate::extensions::builtin_extension_names(),
+            },
+        )
+        .resolve_all(None)
+        {
+            Ok(paths) => paths
+                .extensions
+                .into_iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.path.to_string_lossy().into_owned())
+                .collect(),
+            Err(message) => {
+                eprintln!("Warning: extension resolution failed: {message}");
+                Vec::new()
+            }
+        }
     }
 
     // `createRuntime` factory (main.ts:615-739).
@@ -885,11 +920,6 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                     Some(&options.agent_dir),
                     SettingsManagerCreateOptions { project_trusted },
                 );
-                // T15 W7: package resources feed the loader's rank-4 port
-                // (skills/prompts/themes) and the extension host's package
-                // paths (merge order: CLI first, packages after).
-                let package_resource_paths =
-                    resolve_package_resource_paths(&cwd, &options.agent_dir, project_trusted).await;
                 let services = create_agent_session_services(CreateAgentSessionServicesOptions {
                     cwd: cwd.clone(),
                     agent_dir: Some(options.agent_dir.clone()),
@@ -1062,7 +1092,6 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         // re-feed the loader before the reload (T15 W7).
                         let trusted_paths =
                             resolve_package_resource_paths(&cwd, &options.agent_dir, true).await;
-                        let extension_paths = enabled_extension_paths(&trusted_paths);
                         {
                             let mut loader = services
                                 .resource_loader
@@ -1071,9 +1100,11 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                             loader.set_package_resources(trusted_paths);
                             loader.reload();
                         }
-                        extension_paths
+                        // Trusted settings/auto/package/builtin extension
+                        // paths (V16-13 FR-A/B).
+                        resolve_host_extension_paths(&cwd, &options.agent_dir, true).await
                     } else {
-                        enabled_extension_paths(&package_resource_paths)
+                        resolve_host_extension_paths(&cwd, &options.agent_dir, trusted).await
                     };
 
                     // Final pass: the full set for the resolved trust state;
@@ -1099,7 +1130,8 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         .load_startup_final(
                             options.agent_dir.clone(),
                             cli_extension_paths.clone(),
-                            enabled_extension_paths(&package_resource_paths),
+                            resolve_host_extension_paths(&cwd, &options.agent_dir, project_trusted)
+                                .await,
                             builtin_extensions.clone(),
                             project_trusted,
                             parsed.no_extensions,
@@ -1151,6 +1183,18 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         message: format!(
                             "Failed to load extension \"{}\": {}",
                             error.path, error.error
+                        ),
+                    });
+                }
+                // Load warnings ride their own list
+                // (resource-loader.ts:100-107, main.ts:802-805; #10174
+                // built-in replacement notices).
+                for warning in extension_host.take_warnings() {
+                    diagnostics.push(AgentSessionRuntimeDiagnostic {
+                        level: DiagnosticLevel::Warning,
+                        message: format!(
+                            "Extension package \"{}\": {}",
+                            warning.path, warning.warning
                         ),
                     });
                 }

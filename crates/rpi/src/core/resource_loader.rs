@@ -920,6 +920,11 @@ impl DefaultResourceLoader {
     /// `resolveResourcePath` (resource-loader.ts:807-809):
     /// `resolvePath(p, cwd, { trim: true })`.
     fn resolve_resource_path(&self, p: &str) -> PathBuf {
+        // `isSyntheticPath` (resource-loader.ts:703, :1027):
+        // `builtin:<name>` and `<...>` paths name no file.
+        if rpi_ext_host::loader::is_synthetic_path(p.trim()) {
+            return PathBuf::from(p.trim());
+        }
         resolve_path(p.trim(), &self.cwd)
     }
 
@@ -1512,8 +1517,8 @@ fn split_patterns(entries: &[String]) -> (Vec<String>, Vec<String>) {
     (plain, patterns)
 }
 
-/// `isLocalPath` (paths.ts:41-56): false for package-source/URL prefixes;
-/// bare names, relative paths and `file:` URLs are local.
+/// `isLocalPath` (paths.ts:41-56): false for package-source/URL prefixes and
+/// `builtin:<name>`; bare names, relative paths and `file:` URLs are local.
 fn is_local_path(value: &str) -> bool {
     let trimmed = value.trim();
     !(trimmed.starts_with("npm:")
@@ -1521,7 +1526,8 @@ fn is_local_path(value: &str) -> bool {
         || trimmed.starts_with("github:")
         || trimmed.starts_with("http:")
         || trimmed.starts_with("https:")
-        || trimmed.starts_with("ssh:"))
+        || trimmed.starts_with("ssh:")
+        || trimmed.starts_with("builtin:"))
 }
 
 /// `[...(settings[key] ?? [])]` on a per-scope settings object

@@ -87,6 +87,8 @@ fn builtin_inline(runs: &Arc<AtomicU64>) -> InlineExtension {
     InlineExtension::Named {
         name: "llama.cpp".to_owned(),
         hidden: true,
+        replaceable: false,
+        builtin: false,
         factory: Arc::new(move |api| {
             runs.fetch_add(1, Ordering::Relaxed);
             let api = api.clone();

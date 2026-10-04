@@ -116,6 +116,8 @@ async fn loader_inline_factories_get_numbered_and_named_paths() {
             name: "gate".to_owned(),
             factory: ok_factory(),
             hidden: true,
+            replaceable: false,
+            builtin: false,
         },
         InlineExtension::Anonymous(ok_factory()),
     ];
@@ -213,6 +215,7 @@ async fn loader_load_order_cli_then_local_then_global_then_packages_then_inline(
         inline: vec![InlineExtension::Anonymous(ok_factory())],
         include_project_local: true,
         no_extensions: false,
+        include_builtins: true,
     };
 
     let result = loader.discover_and_load(&config).await;
@@ -279,4 +282,156 @@ fn loader_cache_invalidates_on_clear_and_cwd_change() {
     assert!(cache.get(Path::new("/x/e.wasm"), &token_b).is_none());
     // ... and the previous cwd's token is stale.
     assert!(cache.get(Path::new("/x/e.wasm"), &token_a2).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// `builtin:<name>` paths (resource-loader.ts:706-736, V16-13 FR-A)
+// ---------------------------------------------------------------------------
+
+fn builtin_ext(name: &str) -> InlineExtension {
+    InlineExtension::Named {
+        name: name.to_owned(),
+        factory: ok_factory(),
+        hidden: true,
+        replaceable: true,
+        builtin: true,
+    }
+}
+
+fn discover_config(
+    cwd: &Path,
+    agent_dir: PathBuf,
+    cli_paths: Vec<String>,
+    package_paths: Vec<String>,
+    inline: Vec<InlineExtension>,
+    include_builtins: bool,
+) -> rpi_ext_host::loader::DiscoverConfig {
+    rpi_ext_host::loader::DiscoverConfig {
+        cwd: cwd.to_path_buf(),
+        agent_dir,
+        cli_paths,
+        package_paths,
+        inline,
+        include_project_local: false,
+        no_extensions: false,
+        include_builtins,
+    }
+}
+
+/// A `builtin: true` factory loads from its `builtin:<name>` path in the
+/// final pass — after file/package paths, before the inline tail — with
+/// synthetic `builtin` source info and the registry's `replaceable` flag.
+#[tokio::test]
+async fn loader_loads_builtin_paths_in_final_pass() {
+    let temp = TempDir::new("builtin-final");
+    let cwd = temp.path().join("project");
+    std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+    let file = temp.write("pkg/ext.wasm", "wasm");
+    let runtime = ExtensionRuntime::new();
+    let loader = ExtensionLoader::new(runtime);
+    let config = discover_config(
+        &cwd,
+        temp.path().join("agent"),
+        Vec::new(),
+        vec![
+            file.to_string_lossy().into_owned(),
+            "builtin:codemode".to_owned(),
+        ],
+        vec![
+            builtin_ext("codemode"),
+            InlineExtension::Anonymous(ok_factory()),
+        ],
+        true,
+    );
+
+    let result = loader.discover_and_load(&config).await;
+    // The invalid wasm file errors in isolation; the builtin still loads.
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let paths: Vec<&str> = result
+        .extensions
+        .iter()
+        .map(|ext| ext.path.as_str())
+        .collect();
+    assert_eq!(paths, ["builtin:codemode", "<inline:1>"]);
+    let builtin = &result.extensions[0];
+    assert!(builtin.hidden());
+    assert!(builtin.builtin());
+    assert!(builtin.replaceable());
+    assert_eq!(builtin.source_info.source, "builtin");
+    assert_eq!(builtin.source_info.path, "builtin:codemode");
+    assert_eq!(builtin.source_info.base_dir, None);
+    // The builtin factory is not re-run as an inline extension.
+    assert!(!paths.contains(&"<inline:codemode>"));
+}
+
+/// Unknown `builtin:<name>` paths report the upstream error text
+/// (resource-loader.ts:718-720).
+#[tokio::test]
+async fn loader_reports_unknown_builtin_paths() {
+    let cwd = PathBuf::from("/cwd");
+    let runtime = ExtensionRuntime::new();
+    let loader = ExtensionLoader::new(runtime);
+    let config = discover_config(
+        &cwd,
+        PathBuf::from("/agent"),
+        Vec::new(),
+        vec!["builtin:nope".to_owned()],
+        vec![builtin_ext("codemode")],
+        true,
+    );
+    let result = loader.discover_and_load(&config).await;
+    assert!(result.extensions.is_empty());
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert_eq!(result.errors[0].path, "builtin:nope");
+    assert_eq!(
+        result.errors[0].error,
+        "Unknown built-in extension: builtin:nope"
+    );
+}
+
+/// The pre-trust bootstrap pass excludes builtins even when a CLI
+/// `-e builtin:<name>` named one (resource-loader.ts:668-671).
+#[tokio::test]
+async fn loader_pre_trust_pass_excludes_builtins() {
+    let cwd = PathBuf::from("/cwd");
+    let runtime = ExtensionRuntime::new();
+    let loader = ExtensionLoader::new(runtime);
+    let config = discover_config(
+        &cwd,
+        PathBuf::from("/agent"),
+        vec!["builtin:codemode".to_owned()],
+        vec!["builtin:mcp".to_owned()],
+        vec![builtin_ext("codemode"), builtin_ext("mcp")],
+        false,
+    );
+    let result = loader.discover_and_load(&config).await;
+    assert!(result.extensions.is_empty());
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
+/// `--no-extensions` keeps only CLI `-e` paths — including an explicit
+/// `-e builtin:<name>` (resource-loader.ts:500-504, docs/cli.md:196-197).
+#[tokio::test]
+async fn loader_no_extensions_keeps_cli_builtin_paths() {
+    let temp = TempDir::new("builtin-noext");
+    let cwd = temp.path().join("project");
+    std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+    let runtime = ExtensionRuntime::new();
+    let loader = ExtensionLoader::new(runtime);
+    let mut config = discover_config(
+        &cwd,
+        temp.path().join("agent"),
+        vec!["builtin:codemode".to_owned()],
+        vec!["builtin:mcp".to_owned()],
+        vec![builtin_ext("codemode"), builtin_ext("mcp")],
+        true,
+    );
+    config.no_extensions = true;
+    let result = loader.discover_and_load(&config).await;
+    let paths: Vec<&str> = result
+        .extensions
+        .iter()
+        .map(|ext| ext.path.as_str())
+        .collect();
+    assert_eq!(paths, ["builtin:codemode"]);
 }

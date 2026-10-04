@@ -2137,6 +2137,12 @@ pub struct LoadedExtension {
     pub path: String,
     pub resolved_path: String,
     hidden: std::sync::atomic::AtomicBool,
+    /// `replaceable` (types.ts:2010): loaded from a `builtin:<name>` path
+    /// marked replaceable in the registry (V16-13 FR-F R4).
+    replaceable: std::sync::atomic::AtomicBool,
+    /// `builtin` (V16-13 FR-A): this extension supplies a `builtin:<name>`
+    /// path rather than a file/inline path.
+    builtin: std::sync::atomic::AtomicBool,
     pub source_info: ExtSourceInfo,
     /// Handler registrations keyed by event name. Each entry carries the
     /// registration id assigned by [`Self::insert_handler`] — the
@@ -2215,8 +2221,9 @@ impl LoadedExtension {
     /// source of `<...>` paths is the inner text before `:` (default
     /// `"temporary"`), everything else is `"local"` with a `base_dir`.
     pub fn new(extension_path: &str, resolved_path: &str) -> Self {
-        let is_synthetic = extension_path.starts_with('<') && extension_path.ends_with('>');
-        let (source, base_dir) = if is_synthetic {
+        let is_angle = extension_path.starts_with('<') && extension_path.ends_with('>');
+        let is_builtin = extension_path.starts_with("builtin:");
+        let (source, base_dir) = if is_angle {
             let inner = &extension_path[1..extension_path.len() - 1];
             let source = inner.split(':').next().unwrap_or("temporary");
             let source = if source.is_empty() {
@@ -2225,6 +2232,10 @@ impl LoadedExtension {
                 source
             };
             (source.to_owned(), None)
+        } else if is_builtin {
+            // `getSyntheticPathSource` (source-info.ts:18-21): `builtin:name`
+            // is a synthetic path whose source is `builtin`.
+            ("builtin".to_owned(), None)
         } else {
             let base_dir = std::path::Path::new(resolved_path)
                 .parent()
@@ -2235,6 +2246,8 @@ impl LoadedExtension {
             path: extension_path.to_owned(),
             resolved_path: resolved_path.to_owned(),
             hidden: std::sync::atomic::AtomicBool::new(false),
+            replaceable: std::sync::atomic::AtomicBool::new(false),
+            builtin: std::sync::atomic::AtomicBool::new(is_builtin),
             source_info: ExtSourceInfo::synthetic(extension_path, &source, base_dir),
             handlers: RwLock::new(HashMap::new()),
             next_handler_id: std::sync::atomic::AtomicU64::new(0),
@@ -2265,6 +2278,27 @@ impl LoadedExtension {
     pub(crate) fn set_hidden(&self, hidden: bool) {
         self.hidden
             .store(hidden, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `replaceable` flag (types.ts:2010).
+    pub fn replaceable(&self) -> bool {
+        self.replaceable.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_replaceable(&self, replaceable: bool) {
+        self.replaceable
+            .store(replaceable, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this extension was loaded from a `builtin:<name>` path
+    /// (V16-13 FR-A).
+    pub fn builtin(&self) -> bool {
+        self.builtin.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_builtin(&self, builtin: bool) {
+        self.builtin
+            .store(builtin, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Attach the guest instance after a wasm `rpi_extension_init`
@@ -2846,6 +2880,20 @@ impl ExtensionApi {
             .to_json())
     }
 
+    /// `registerCommand` name validation (loader.ts:302-310 @
+    /// dc83372f8, #10054): an empty name fails the extension load instead
+    /// of crashing the editor when typing `/`. The handler check is
+    /// type-enforced (`CommandHandlerFn` cannot be absent).
+    fn validate_command_name(&self, name: &str) -> Result<(), ExtError> {
+        if name.is_empty() {
+            return Err(ExtError::Call(format!(
+                "Command registered by extension \"{}\" must have a non-empty string name. Use pi.registerCommand(\"name\", {{ description, handler }}).",
+                self.extension.path
+            )));
+        }
+        Ok(())
+    }
+
     /// `pi.registerCommand(name, options)` (loader.ts:254-261).
     pub fn register_command(
         &self,
@@ -2855,6 +2903,7 @@ impl ExtensionApi {
     ) -> Result<(), ExtError> {
         self.assert_api_active()?;
         self.runtime.assert_active()?;
+        self.validate_command_name(name)?;
         self.extension.insert_command(RegisteredCommand {
             name: name.to_owned(),
             source_info: self.extension.source_info.clone(),
@@ -2875,6 +2924,7 @@ impl ExtensionApi {
     ) -> Result<(), ExtError> {
         self.assert_api_active()?;
         self.runtime.assert_active()?;
+        self.validate_command_name(name)?;
         self.extension.insert_command(RegisteredCommand {
             name: name.to_owned(),
             source_info: self.extension.source_info.clone(),

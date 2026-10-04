@@ -40,6 +40,8 @@ fn inline_ext(
         name: name.to_owned(),
         factory,
         hidden: false,
+        replaceable: false,
+        builtin: false,
     }
 }
 

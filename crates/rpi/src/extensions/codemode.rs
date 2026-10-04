@@ -23,6 +23,10 @@ pub fn inline_extension(
     InlineExtension::Named {
         name: "codemode".to_owned(),
         hidden: true,
+        // `extensions/index.ts:11-12`: replaceable builtin (a third-party
+        // extension registering the tool takes over; V16-13 FR-F R4).
+        replaceable: true,
+        builtin: true,
         factory: Arc::new(move |api| {
             let settings = settings.clone();
             let model_runtime = model_runtime.clone();

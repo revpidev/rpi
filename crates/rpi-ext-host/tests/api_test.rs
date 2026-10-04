@@ -3,6 +3,7 @@
 //! anchored to `external/pi/packages/coding-agent/src/core/extensions/
 //! loader.ts` @ 2efa728.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -244,6 +245,8 @@ fn inline_ext(
         name: name.to_owned(),
         factory,
         hidden: false,
+        replaceable: false,
+        builtin: false,
     }
 }
 
@@ -269,6 +272,8 @@ fn inline_ext_async(
         name: name.to_owned(),
         factory,
         hidden: false,
+        replaceable: false,
+        builtin: false,
     }
 }
 
@@ -436,6 +441,8 @@ async fn api_register_tool_schema_error_fails_extension_load() {
             name: "schemaless".to_owned(),
             factory,
             hidden: false,
+            replaceable: false,
+            builtin: false,
         }])
         .await;
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -447,6 +454,128 @@ async fn api_register_tool_schema_error_fails_extension_load() {
         errors[0].error
     );
     assert!(host.get_all_registered_tools().is_empty());
+}
+
+/// #10054 (`dc83372f8`): a factory failing `registerCommand` with an empty
+/// name surfaces as a load error instead of crashing the editor when typing
+/// `/` (the handler check is type-enforced in Rust).
+#[tokio::test]
+async fn api_register_command_empty_name_fails_extension_load() {
+    let host = NativeExtensionHost::new("/test-cwd");
+    let handler: ext::CommandHandlerFn = Arc::new(|_args, _ctx| Box::pin(async { Ok(()) }));
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        let handler = handler.clone();
+        let result = api.register_command("", None, handler);
+        Box::pin(async move { result.map_err(|error| error.to_string()) })
+    });
+    let errors = host
+        .load_inline(&[InlineExtension::Named {
+            name: "badcmd".to_owned(),
+            factory,
+            hidden: false,
+            replaceable: false,
+            builtin: false,
+        }])
+        .await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].error.contains(
+            "Command registered by extension \"<inline:badcmd>\" must have a non-empty string name."
+        ),
+        "got: {:?}",
+        errors[0].error
+    );
+    assert!(host.get_command("").is_none());
+}
+
+/// #10174 (`9d1a65035`): a replaceable built-in whose command a
+/// non-replaceable extension also registers reports the replacement
+/// guidance (the built-in MCP extension additionally self-disables in its
+/// own `session_start` handler, V16-08 FR-H).
+#[tokio::test]
+async fn builtin_replacement_warning_names_registration_and_config_guidance() {
+    let command_factory = |api: ExtensionApi| {
+        let handler: ext::CommandHandlerFn = Arc::new(|_args, _ctx| Box::pin(async { Ok(()) }));
+        api.register_command("demo", None, handler)
+            .expect("register command");
+    };
+    let host = NativeExtensionHost::new("/cwd");
+    let errors = host
+        .load_startup_final(
+            PathBuf::from("/agent"),
+            Vec::new(),
+            vec!["builtin:demo".to_owned()],
+            vec![
+                InlineExtension::Named {
+                    name: "demo".to_owned(),
+                    factory: Arc::new(move |api| {
+                        command_factory(api);
+                        Box::pin(async { Ok(()) })
+                    }),
+                    hidden: true,
+                    replaceable: true,
+                    builtin: true,
+                },
+                InlineExtension::Named {
+                    name: "third-party".to_owned(),
+                    factory: Arc::new(move |api| {
+                        command_factory(api);
+                        Box::pin(async { Ok(()) })
+                    }),
+                    hidden: false,
+                    replaceable: false,
+                    builtin: false,
+                },
+            ],
+            false,
+            false,
+        )
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let warnings = host.take_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].path, "builtin:demo");
+    assert!(
+        warnings[0].warning.contains(
+            "Extension <inline:third-party> registers command `/demo`, so built-in extension `demo` was replaced."
+        ),
+        "got: {}",
+        warnings[0].warning
+    );
+    assert!(warnings[0].warning.contains("`rpi config`"));
+    assert!(warnings[0].warning.contains("Built-in extensions"));
+    // Nothing else replaced: the load above is idempotent.
+    assert!(host.take_warnings().is_empty());
+}
+
+/// A non-replaceable built-in never reports the replacement warning.
+#[tokio::test]
+async fn non_replaceable_builtin_does_not_warn() {
+    let host = NativeExtensionHost::new("/cwd");
+    let handler: ext::CommandHandlerFn = Arc::new(|_args, _ctx| Box::pin(async { Ok(()) }));
+    let errors = host
+        .load_startup_final(
+            PathBuf::from("/agent"),
+            Vec::new(),
+            vec!["builtin:demo".to_owned()],
+            vec![InlineExtension::Named {
+                name: "demo".to_owned(),
+                factory: Arc::new(move |api| {
+                    let handler = handler.clone();
+                    api.register_command("demo", None, handler)
+                        .expect("command");
+                    Box::pin(async { Ok(()) })
+                }),
+                hidden: true,
+                replaceable: false,
+                builtin: true,
+            }],
+            false,
+            false,
+        )
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(host.take_warnings().is_empty());
 }
 
 fn minimal_tool(name: &str) -> ext::ToolDefinition {

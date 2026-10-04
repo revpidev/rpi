@@ -17,8 +17,8 @@ use crate::error::ExtError;
 use crate::loader::{DiscoverConfig, ExtensionLoader, PreTrustRecord};
 use crate::runner::{ExtensionErrorListener, ExtensionRunnerCore};
 use crate::types::{
-    ExtensionError, ExtensionFlag, ExtensionMode, ExtensionShortcut, HostDiagnostic,
-    RegisteredTool, ResolvedCommand,
+    ExtensionError, ExtensionFlag, ExtensionLoadWarning, ExtensionMode, ExtensionShortcut,
+    HostDiagnostic, RegisteredTool, ResolvedCommand,
 };
 
 /// The last full load inputs, replayed by [`NativeExtensionHost::reload`]
@@ -48,6 +48,10 @@ pub struct NativeExtensionHost {
     pre_trust: RwLock<Option<PreTrustRecord>>,
     last_load: RwLock<Option<LoadSpec>>,
     last_ui: RwLock<Option<(Arc<dyn UiBridge>, ExtensionMode)>>,
+    /// Warnings from the most recent load (`LoadExtensionsResult.warnings`,
+    /// resource-loader.ts:100-107). Drained by the startup pipeline with
+    /// [`Self::take_warnings`].
+    last_warnings: RwLock<Vec<ExtensionLoadWarning>>,
 }
 
 fn read<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -74,7 +78,14 @@ impl NativeExtensionHost {
             pre_trust: RwLock::new(None),
             last_load: RwLock::new(None),
             last_ui: RwLock::new(None),
+            last_warnings: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Drain the load warnings from the most recent load
+    /// (resource-loader.ts:100-107 `mergeExtensionWarnings`).
+    pub fn take_warnings(&self) -> Vec<ExtensionLoadWarning> {
+        std::mem::take(&mut *write(&self.last_warnings))
     }
 
     pub fn runtime(&self) -> ExtensionRuntime {
@@ -197,7 +208,11 @@ impl NativeExtensionHost {
             inline,
             include_project_local: false,
             no_extensions,
+            // `Built-in extensions wait for the final pass`
+            // (resource-loader.ts:668-671).
+            include_builtins: false,
         };
+        *write(&self.last_warnings) = Vec::new();
         let loader = read(&self.loader).clone();
         let result = loader.discover_and_load(&config).await;
         let errors = result.errors.clone();
@@ -240,6 +255,7 @@ impl NativeExtensionHost {
             inline,
             include_project_local,
             no_extensions,
+            include_builtins: true,
         };
         *write(&self.last_load) = Some(LoadSpec {
             agent_dir: config.agent_dir.clone(),
@@ -257,6 +273,9 @@ impl NativeExtensionHost {
         };
         let mut errors = result.errors;
         self.install(result.extensions);
+        // #10174 replacement notices + package warnings
+        // (resource-loader.ts:740-746, :765-775).
+        *write(&self.last_warnings) = self.builtin_replacement_warnings();
         // `addExtensionConflictDiagnostics` (resource-loader.ts:573-581):
         // conflicts ride the error list; every extension stays loaded.
         for conflict in self.core().detect_extension_conflicts() {
@@ -266,6 +285,67 @@ impl NativeExtensionHost {
             });
         }
         errors
+    }
+
+    /// `omitReplacedExtensions` warning half (`resource-loader.ts:116-152`,
+    /// #10174): a loaded replaceable built-in whose tool, command, or flag
+    /// name another extension already registered reports the replacement
+    /// guidance. The V16-06/V16-08 ownership split did not land the
+    /// replacement (omission) semantics, so this is the diagnostic-only
+    /// path (§8-7; the built-in MCP extension additionally self-disables in
+    /// its own `session_start` handler, V16-08 FR-H).
+    fn builtin_replacement_warnings(&self) -> Vec<ExtensionLoadWarning> {
+        let core = self.core();
+        let extensions = core.extensions();
+        let name_keys = |extension: &crate::api::LoadedExtension| -> Vec<String> {
+            let mut names: Vec<String> = Vec::new();
+            for tool in extension.tools().values() {
+                names.push(format!("tool:{}", tool.definition.name));
+            }
+            for (name, _) in extension.commands().iter() {
+                names.push(format!("command:{name}"));
+            }
+            for (name, _) in extension.flags().iter() {
+                names.push(format!("flag:{name}"));
+            }
+            names
+        };
+        // `taken`: names registered by non-replaceable extensions (the
+        // built-in's own registrations never count).
+        let taken: std::collections::HashMap<String, String> = extensions
+            .iter()
+            .filter(|extension| !extension.replaceable())
+            .flat_map(|extension| {
+                name_keys(extension)
+                    .into_iter()
+                    .map(|name| (name, extension.path.clone()))
+            })
+            .collect();
+        let mut warnings = Vec::new();
+        for extension in extensions.iter().filter(|e| e.replaceable()) {
+            let Some(builtin_name) = extension.path.strip_prefix("builtin:") else {
+                continue;
+            };
+            let Some((name, owner)) = name_keys(extension)
+                .into_iter()
+                .find_map(|name| taken.get(&name).map(|owner| (name, owner.clone())))
+            else {
+                continue;
+            };
+            let (kind, raw_name) = name.split_once(':').unwrap_or(("", name.as_str()));
+            let registered_name = match kind {
+                "command" => format!("/{raw_name}"),
+                "flag" => format!("--{raw_name}"),
+                _ => raw_name.to_owned(),
+            };
+            warnings.push(ExtensionLoadWarning {
+                path: extension.path.clone(),
+                warning: format!(
+                    "Extension {owner} registers {kind} `{registered_name}`, so built-in extension `{builtin_name}` was replaced. To use `{builtin_name}`, run `rpi config` and make sure it is enabled under Built-in extensions, then disable or remove the existing extension. We recommend only having one or the other loaded at a time."
+                ),
+            });
+        }
+        warnings
     }
 
     /// Bind host action implementations (`bindCore` action half,
@@ -323,11 +403,13 @@ impl NativeExtensionHost {
             inline: spec.inline,
             include_project_local: spec.include_project_local,
             no_extensions: spec.no_extensions,
+            include_builtins: true,
         };
         let loader = read(&self.loader).clone();
         let result = loader.discover_and_load(&config).await;
         let mut errors = result.errors;
         self.install(result.extensions);
+        *write(&self.last_warnings) = self.builtin_replacement_warnings();
         for conflict in self.core().detect_extension_conflicts() {
             errors.push(crate::types::ExtensionLoadError {
                 path: conflict.path.unwrap_or_default(),

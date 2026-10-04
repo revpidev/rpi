@@ -179,7 +179,9 @@ pub async fn create_agent_session_services(
     {
         diagnostics.push(AgentSessionRuntimeDiagnostic {
             level: DiagnosticLevel::Error,
-            message: format!("Extension \"<inline:llama.cpp>\" error: {message}"),
+            // V16-13 FR-A R4: built-in diagnostics use the `builtin:`
+            // naming.
+            message: format!("Extension \"builtin:llama.cpp\" error: {message}"),
         });
     }
     // Offline refresh (agent-session-services.ts:180

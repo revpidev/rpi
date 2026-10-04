@@ -30,6 +30,9 @@ pub fn inline_extension(model_runtime: Arc<ModelRuntime>) -> InlineExtension {
     InlineExtension::Named {
         name: "mcp".to_owned(),
         hidden: true,
+        // `extensions/index.ts:13`: replaceable builtin.
+        replaceable: true,
+        builtin: true,
         factory: Arc::new(move |api| {
             let model_runtime = model_runtime.clone();
             Box::pin(async move { ui::create_mcp_extension(api, model_runtime) })

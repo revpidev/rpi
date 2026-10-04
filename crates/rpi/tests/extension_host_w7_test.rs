@@ -100,6 +100,7 @@ fn resolve_extensions(cwd: &Path, agent_dir: &Path) -> Vec<(PathBuf, bool)> {
             runner: None,
             offline: None,
             registry: None,
+            builtin_extensions: Vec::new(),
         },
     )
     .resolve(None)
@@ -545,8 +546,16 @@ async fn w7_llama_command_dispatches_through_prompt_path() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
 
     let host = NativeExtensionHost::new(&cwd.to_string_lossy());
+    // V16-13 FR-A: built-ins load as `builtin:<name>` in the final pass.
     let errors = host
-        .load_inline(&[rpi::extensions::llama::inline_extension()])
+        .load_startup_final(
+            agent_dir.clone(),
+            vec!["builtin:llama.cpp".to_owned()],
+            Vec::new(),
+            vec![rpi::extensions::llama::inline_extension()],
+            false,
+            false,
+        )
         .await;
     assert!(errors.is_empty(), "{errors:?}");
     assert!(host.get_command("llama").is_some(), "/llama registered");

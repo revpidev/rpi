@@ -187,6 +187,7 @@ fn prepare_config(
             runner: runner.clone(),
             offline: None,
             registry: None,
+            builtin_extensions: crate::extensions::builtin_extension_names(),
         })
         .resolve_all(None)
     };

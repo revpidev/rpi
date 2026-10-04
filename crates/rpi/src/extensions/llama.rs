@@ -29,6 +29,9 @@ pub fn inline_extension() -> rpi_ext_host::loader::InlineExtension {
     rpi_ext_host::loader::InlineExtension::Named {
         name: "llama.cpp".to_owned(),
         hidden: true,
+        // `extensions/index.ts:9`: builtin, not replaceable.
+        replaceable: false,
+        builtin: true,
         factory: Arc::new(|api| {
             Box::pin(async move {
                 api.register_native_provider(shared_llama_provider().provider())

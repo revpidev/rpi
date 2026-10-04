@@ -224,12 +224,23 @@ async fn session_fixture(initial_mode: CodemodeMode) -> Fixture {
         Arc::new(move || settings.lock().unwrap().clone())
     };
     let host = Arc::new(NativeExtensionHost::new(&cwd.to_string_lossy()));
+    // V16-13 FR-A: codemode/tool_search are `builtin:<name>` resources.
     let errors = host
-        .load_inline(&[
-            rpi::extensions::codemode::inline_extension(settings_fn, model_runtime.clone()),
-            rpi::extensions::tool_search::inline_extension(),
-            tools_extension(),
-        ])
+        .load_startup_final(
+            agent_dir.clone(),
+            Vec::new(),
+            vec![
+                "builtin:codemode".to_owned(),
+                "builtin:tool-search".to_owned(),
+            ],
+            vec![
+                rpi::extensions::codemode::inline_extension(settings_fn, model_runtime.clone()),
+                rpi::extensions::tool_search::inline_extension(),
+                tools_extension(),
+            ],
+            false,
+            false,
+        )
         .await;
     assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
 

@@ -21,21 +21,55 @@ pub mod llama;
 pub mod mcp;
 pub mod tool_search;
 
+/// Names of the built-in extensions (`extensions/index.ts:7-14` @
+/// a13d35a74: `llama.cpp`, `codemode`, `tool-search`, `mcp`), in the
+/// upstream registration order. The package manager resolves each as a
+/// `builtin:<name>` extension resource (V16-13 FR-A); keep in sync with the
+/// factories app.rs builds.
+pub const BUILTIN_EXTENSION_NAMES: [&str; 4] = ["llama.cpp", "codemode", "tool-search", "mcp"];
+
+/// [`BUILTIN_EXTENSION_NAMES`] as owned strings
+/// (`PackageManagerOptions.builtinExtensions`).
+pub fn builtin_extension_names() -> Vec<String> {
+    BUILTIN_EXTENSION_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     /// Upstream: "registers a native provider and /llama command"
     /// (llama-extension.test.ts) — registration shape through the real
-    /// host.
+    /// host, loaded as the `builtin:llama.cpp` resource (V16-13 FR-A).
     #[tokio::test]
     async fn registers_llama_command_and_provider_via_factory() {
         let host = rpi_ext_host::host::NativeExtensionHost::new("/x");
-        let errors = host.load_inline(&[super::llama::inline_extension()]).await;
+        // A `builtin: true` factory never loads inline (types.ts:2215).
+        let inline_errors = host.load_inline(&[super::llama::inline_extension()]).await;
+        assert!(inline_errors.is_empty(), "{inline_errors:?}");
+        assert!(host.core().extensions().is_empty());
+
+        // The final pass loads it from the `builtin:llama.cpp` path.
+        let errors = host
+            .load_startup_final(
+                std::path::PathBuf::from("/agent"),
+                vec!["builtin:llama.cpp".to_owned()],
+                Vec::new(),
+                vec![super::llama::inline_extension()],
+                false,
+                false,
+            )
+            .await;
         assert!(errors.is_empty(), "{errors:?}");
-        // Hidden built-in (not in the startup Extensions list).
+        // Hidden built-in (not in the startup Extensions list); the path
+        // and source info both use the `builtin:` naming (FR-A R4).
         let core = host.core();
         let ext = &core.extensions()[0];
-        assert_eq!(ext.path, "<inline:llama.cpp>");
+        assert_eq!(ext.path, "builtin:llama.cpp");
         assert!(ext.hidden());
+        assert!(ext.builtin());
+        assert_eq!(ext.source_info.source, "builtin");
         // Command registered with the upstream description.
         let command = host.get_command("llama").expect("llama command");
         assert_eq!(
@@ -45,5 +79,15 @@ mod tests {
         // Provider queued for the pre-bind flush.
         let pending = host.runtime().take_pending_native_provider_registrations();
         assert_eq!(pending.len(), 1);
+    }
+
+    /// `builtin_registry` ignores non-builtin named entries and keeps the
+    /// upstream order (V16-13 FR-A).
+    #[test]
+    fn builtin_names_match_the_upstream_registry() {
+        assert_eq!(
+            super::BUILTIN_EXTENSION_NAMES,
+            ["llama.cpp", "codemode", "tool-search", "mcp"]
+        );
     }
 }

@@ -942,3 +942,50 @@ async fn wasm_tool_execute_streams_on_update_to_host() {
         })
     );
 }
+
+/// WAT guest registering a command with an empty name: the shared
+/// `register_command` validation (#10054, V16-13 FR-F R3) fails the load
+/// with the same error as the native path.
+const EMPTY_COMMAND_GUEST_WAT: &str = r#"
+(module
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "rpi_alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $ptr))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
+  (func $strlen (param $ptr i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $scan
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $ptr) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $scan)))
+    (local.get $n))
+  (func (export "rpi_extension_init") (result i64)
+    (return (call $host_call (i32.const 16) (call $strlen (i32.const 16)))))
+  (func (export "rpi_dispatch") (param i32 i32) (result i64)
+    (return (i64.const 0)))
+  (data (i32.const 16) "{\"call\":\"registerCommand\",\"args\":{\"name\":\"\",\"description\":null}}\00")
+)
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_empty_command_name_fails_the_load() {
+    let tmp = TempDir::new("empty-command");
+    let wasm = tmp.write_guest(
+        "empty-command",
+        EMPTY_COMMAND_GUEST_WAT,
+        Some(r#"{"name":"empty-command","version":"0.1.0","wasm":"dist/guest.wasm","capabilities":["commands"],"rpiAbi":1}"#),
+    );
+    let (host, errors) = host_loading(&[wasm]).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("must have a non-empty string name"),
+        "got: {errors:?}"
+    );
+    assert!(host.get_command("").is_none());
+}

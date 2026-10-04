@@ -685,6 +685,7 @@ pub async fn run_update_in(
                 runner: Some(runner.clone()),
                 offline: None,
                 registry: None,
+                builtin_extensions: Vec::new(),
             },
         );
         manager.set_progress_callback(Some(Box::new(|event| {
@@ -1306,6 +1307,7 @@ pub fn run_package_command_in(
             runner,
             offline: None,
             registry: None,
+            builtin_extensions: Vec::new(),
         });
     manager.set_progress_callback(Some(Box::new(|event| {
         // Upstream prints `start` messages dim to stdout

@@ -38,18 +38,31 @@ pub type ExtensionFactory =
     Arc<dyn Fn(ExtensionApi) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
 
 /// `InlineExtension` (types.ts:1491-1499): anonymous factory, or named with
-/// an optional `hidden` flag (named only — resource-loader.ts:900-906).
-/// `Clone` (the factory is an `Arc`) so the host can replay the set on
-/// `/reload` (T15 W5).
+/// optional `hidden` / `replaceable` / `builtin` flags (named only —
+/// resource-loader.ts:900-906). `Clone` (the factory is an `Arc`) so the
+/// host can replay the set on `/reload` (T15 W5).
+///
+/// A `builtin: true` entry does NOT load as an inline extension; it supplies
+/// the code of the `builtin:<name>` resource path (types.ts:2215,
+/// resource-loader.ts:109-113 `BuiltinExtension`, V16-13 FR-A).
 #[derive(Clone)]
 pub enum InlineExtension {
     /// Bare factory; gets path `<inline:N>` (1-based load index).
     Anonymous(ExtensionFactory),
-    /// `{ name, factory, hidden? }`; gets path `<inline:name>`.
+    /// `{ name, factory, hidden?, replaceable?, builtin? }`; non-builtin
+    /// entries get path `<inline:name>`, builtin entries load as
+    /// `builtin:name` by the final pass.
     Named {
         name: String,
         factory: ExtensionFactory,
         hidden: bool,
+        /// `replaceable` (types.ts:2010): leave this extension out when a
+        /// non-replaceable extension registers one of its tool, command, or
+        /// flag names (V16-13 FR-F R4 diagnostic face).
+        replaceable: bool,
+        /// `builtin` (types.ts:2215): supply `builtin:<name>` instead of
+        /// loading inline.
+        builtin: bool,
     },
 }
 
@@ -59,6 +72,31 @@ impl InlineExtension {
         match self {
             InlineExtension::Anonymous(_) => format!("<inline:{}>", index + 1),
             InlineExtension::Named { name, .. } => format!("<inline:{name}>"),
+        }
+    }
+
+    /// Built-in name (`builtin:<name>` maps to it), if any.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            InlineExtension::Anonymous(_) => None,
+            InlineExtension::Named { name, .. } => Some(name),
+        }
+    }
+
+    /// `builtin: true` (types.ts:2215): loads as `builtin:<name>`, name
+    /// required, never as an inline factory.
+    pub fn builtin(&self) -> bool {
+        match self {
+            InlineExtension::Anonymous(_) => false,
+            InlineExtension::Named { builtin, .. } => *builtin,
+        }
+    }
+
+    /// `replaceable` (types.ts:2010).
+    pub fn replaceable(&self) -> bool {
+        match self {
+            InlineExtension::Anonymous(_) => false,
+            InlineExtension::Named { replaceable, .. } => *replaceable,
         }
     }
 
@@ -75,6 +113,48 @@ impl InlineExtension {
             InlineExtension::Named { hidden, .. } => *hidden,
         }
     }
+}
+
+/// One named built-in extension supplying the code of `builtin:<name>`
+/// (resource-loader.ts:109-113 `BuiltinExtension`).
+#[derive(Clone)]
+pub struct BuiltinExtension {
+    pub name: String,
+    pub factory: ExtensionFactory,
+    pub replaceable: bool,
+}
+
+/// `builtin:<name>` code registry, keyed by name (resource-loader.ts:320,
+/// :375). Built from the `builtin: true` [`InlineExtension`] entries of a
+/// discovery pass.
+pub type BuiltinRegistry = HashMap<String, BuiltinExtension>;
+
+/// Build the builtin registry from a mixed factory list
+/// (resource-loader.ts:375 `factories.filter(isBuiltinExtension)`).
+pub fn builtin_registry(inline: &[InlineExtension]) -> BuiltinRegistry {
+    inline
+        .iter()
+        .filter(|input| input.builtin())
+        .filter_map(|input| {
+            let name = input.name()?;
+            Some((
+                name.to_owned(),
+                BuiltinExtension {
+                    name: name.to_owned(),
+                    factory: input.factory().clone(),
+                    replaceable: input.replaceable(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// `BUILTIN_PATH_PREFIX` (source-info.ts:14).
+const BUILTIN_PATH_PREFIX: &str = "builtin:";
+
+/// Name part of a `builtin:<name>` path, or `None` for file paths.
+fn builtin_path_name(path: &str) -> Option<&str> {
+    path.strip_prefix(BUILTIN_PATH_PREFIX)
 }
 
 /// `LoadExtensionsResult` minus the runtime (the caller owns it)
@@ -302,6 +382,10 @@ pub struct DiscoverConfig {
     /// `--no-extensions`: only CLI `-e` paths load
     /// (resource-loader.ts:500-504).
     pub no_extensions: bool,
+    /// Include `builtin:<name>` paths. `false` for the pre-trust bootstrap
+    /// pass: built-in extensions wait for the final pass
+    /// (resource-loader.ts:668-671).
+    pub include_builtins: bool,
 }
 
 /// State carried from the pre-trust bootstrap load into the final pass
@@ -358,7 +442,13 @@ impl ExtensionLoader {
     ) -> LoadExtensionsResult {
         let mut result = LoadExtensionsResult::default();
 
-        for (index, input) in inline.iter().enumerate() {
+        // `builtin: true` entries supply `builtin:<name>` instead of
+        // loading inline (types.ts:2215); they are filtered out before
+        // naming, so anonymous numbering only counts inline factories
+        // (resource-loader.ts:375 `extensionFactories`).
+        let inline_factories: Vec<&InlineExtension> =
+            inline.iter().filter(|input| !input.builtin()).collect();
+        for (index, input) in inline_factories.iter().enumerate() {
             let extension_path = input.extension_path(index);
             let extension = Arc::new(LoadedExtension::new(&extension_path, &extension_path));
             let api = ExtensionApi::new(
@@ -395,34 +485,104 @@ impl ExtensionLoader {
 
     /// `loadExtension` for filesystem paths (loader.ts:454-480): `.wasm`
     /// guest modules. Errors are isolated per path — one bad extension
-    /// never blocks the rest.
+    /// never blocks the rest. `builtin:` paths are unknown here (the
+    /// discovery passes use [`Self::load_paths_with_builtins`]).
     pub async fn load_paths(&self, paths: &[PathBuf], cwd: &Path) -> LoadExtensionsResult {
+        self.load_paths_with_builtins(paths, cwd, &BuiltinRegistry::new())
+            .await
+    }
+
+    /// [`Self::load_paths`] plus the `builtin:<name>` code registry
+    /// (resource-loader.ts:706-736 `loadExtensionPaths`). The expanded
+    /// target order follows the input path order, so a `builtin:` path
+    /// keeps its position in the final extension order.
+    pub async fn load_paths_with_builtins(
+        &self,
+        paths: &[PathBuf],
+        cwd: &Path,
+        builtins: &BuiltinRegistry,
+    ) -> LoadExtensionsResult {
         let mut result = LoadExtensionsResult::default();
         let token = self.cache.use_cwd(&cwd.to_string_lossy());
         // Directory entries resolve to their declared entry points first,
         // then one-level discovery (loader.ts:705-716).
-        let mut expanded: Vec<PathBuf> = Vec::new();
+        let mut expanded: Vec<LoadTarget> = Vec::new();
         for path in paths {
-            if path.is_dir() {
+            let raw = path.to_string_lossy();
+            if let Some(name) = builtin_path_name(&raw) {
+                expanded.push(LoadTarget::Builtin(name.to_owned()));
+            } else if path.is_dir() {
                 if let Some(entries) = resolve_extension_entries(path) {
-                    expanded.extend(entries);
+                    expanded.extend(entries.into_iter().map(LoadTarget::File));
                 } else {
-                    expanded.extend(discover_extensions_in_dir(path));
+                    expanded.extend(
+                        discover_extensions_in_dir(path)
+                            .into_iter()
+                            .map(LoadTarget::File),
+                    );
                 }
             } else {
-                expanded.push(path.clone());
+                expanded.push(LoadTarget::File(path.clone()));
             }
         }
-        for path in &expanded {
-            match self.load_one_path(path, cwd, &token).await {
+        for target in &expanded {
+            let outcome = match target {
+                LoadTarget::File(path) => self.load_one_path(path, cwd, &token).await,
+                LoadTarget::Builtin(name) => self.load_builtin(name, builtins, cwd).await,
+            };
+            match outcome {
                 Ok(extension) => result.extensions.push(extension),
                 Err(error) => result.errors.push(ExtensionLoadError {
-                    path: path.to_string_lossy().into_owned(),
+                    path: match target {
+                        LoadTarget::File(path) => path.to_string_lossy().into_owned(),
+                        LoadTarget::Builtin(name) => format!("{BUILTIN_PATH_PREFIX}{name}"),
+                    },
                     error,
                 }),
             }
         }
         result
+    }
+
+    /// Load one `builtin:<name>` extension (resource-loader.ts:714-733):
+    /// unknown names report `Unknown built-in extension: <path>`; loaded
+    /// builtins are hidden and carry the registry's `replaceable` flag.
+    async fn load_builtin(
+        &self,
+        name: &str,
+        builtins: &BuiltinRegistry,
+        cwd: &Path,
+    ) -> Result<Arc<LoadedExtension>, String> {
+        let path = format!("{BUILTIN_PATH_PREFIX}{name}");
+        let Some(builtin) = builtins.get(name) else {
+            return Err(format!("Unknown built-in extension: {path}"));
+        };
+        let extension = Arc::new(LoadedExtension::new(&path, &path));
+        let api = ExtensionApi::new(
+            extension.clone(),
+            self.runtime.clone(),
+            cwd.to_string_lossy().into_owned(),
+        );
+        let outcome = async {
+            (builtin.factory)(api.clone()).await?;
+            api.commit_load().await.map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => {
+                // `extension.hidden = true` / `replaceable` post-load
+                // (resource-loader.ts:730-731).
+                extension.set_hidden(true);
+                extension.set_builtin(true);
+                extension.set_replaceable(builtin.replaceable);
+                Ok(extension)
+            }
+            Err(error) => {
+                api.discard_load();
+                Err(error)
+            }
+        }
     }
 
     /// Load one `.wasm` entry (loader.ts:454-480 `loadExtension`): resolve
@@ -591,16 +751,26 @@ impl ExtensionLoader {
             add_paths(package, &mut all_paths, &mut seen);
         }
 
+        // `Built-in extensions wait for the final pass`
+        // (resource-loader.ts:668-671): the bootstrap pass drops them even
+        // when a CLI `-e builtin:<name>` named one.
+        if !config.include_builtins {
+            all_paths.retain(|path| builtin_path_name(&path.to_string_lossy()).is_none());
+        }
+
         all_paths
     }
 
     /// Full discovery + load pass: paths in [`Self::resolve_paths`] order,
     /// then inline factories (resource-loader.ts:509-512).
     pub async fn discover_and_load(&self, config: &DiscoverConfig) -> LoadExtensionsResult {
+        let builtins = builtin_registry(&config.inline);
         let all_paths = Self::resolve_paths(config);
-        let mut result = self.load_paths(&all_paths, &config.cwd).await;
+        let mut result = self
+            .load_paths_with_builtins(&all_paths, &config.cwd, &builtins)
+            .await;
 
-        // Inline factories tail.
+        // Inline factories tail (builtin entries are skipped).
         let mut inline_result = self.load_inline(&config.inline, &config.cwd).await;
         result.extensions.append(&mut inline_result.extensions);
         result.errors.append(&mut inline_result.errors);
@@ -621,6 +791,7 @@ impl ExtensionLoader {
         config: &DiscoverConfig,
         pre_trust: &PreTrustRecord,
     ) -> LoadExtensionsResult {
+        let builtins = builtin_registry(&config.inline);
         let all_paths = Self::resolve_paths(config);
 
         // `preloadedByPath` (:543-548): pre-trust PATH extensions keyed by
@@ -649,7 +820,9 @@ impl ExtensionLoader {
             })
             .cloned()
             .collect();
-        let result = self.load_paths(&remaining, &config.cwd).await;
+        let result = self
+            .load_paths_with_builtins(&remaining, &config.cwd, &builtins)
+            .await;
 
         // `loadedByPath` (:554-555): pre-trust reuse + fresh loads.
         for ext in &result.extensions {
@@ -682,8 +855,26 @@ impl ExtensionLoader {
 /// loader.ts:704). `~` expansion lands with the config module integration
 /// (W7); relative paths resolve against `cwd`.
 fn expand_cli_path(path: &str, cwd: &Path) -> PathBuf {
+    // `resolveExtensionLoadPath` (resource-loader.ts:703): synthetic paths
+    // (`builtin:<name>` and `<...>`) are not filesystem paths.
+    if is_synthetic_path(path) {
+        return PathBuf::from(path);
+    }
     let p = PathBuf::from(path);
     if p.is_absolute() { p } else { cwd.join(p) }
+}
+
+/// `isSyntheticPath` (source-info.ts:26): `builtin:<name>` or an
+/// angle-bracket path such as `<inline:name>` names no file.
+pub fn is_synthetic_path(path: &str) -> bool {
+    path.starts_with(BUILTIN_PATH_PREFIX) || path.starts_with('<')
+}
+
+/// Expanded load target: a filesystem entry or a `builtin:<name>` code
+/// path.
+enum LoadTarget {
+    File(PathBuf),
+    Builtin(String),
 }
 
 // ============================================================================
