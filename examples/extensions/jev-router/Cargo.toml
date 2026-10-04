@@ -1,0 +1,21 @@
+[package]
+name = "rpi-wasm-extension-jev-router"
+description = "Example rpi wasm extension: a virtual model that plans on a strong model and implements on a cheap one (V16-12)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Standalone crate: built for wasm32-unknown-unknown, not the host
+# workspace's default target set.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rpi-ext-sdk = { path = "../../../crates/rpi-ext-sdk" }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = "s"
+strip = true
