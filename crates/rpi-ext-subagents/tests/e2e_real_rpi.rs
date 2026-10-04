@@ -186,6 +186,11 @@ fn capture_child_stream(rpi: &Path, agent_dir: &Path, cwd: &Path) -> String {
 
 #[test]
 fn e2e_real_rpi_child_and_stream_fixture() {
+    // Scrub any inherited subagent child env first: a leaked
+    // RPI_SUBAGENT_CHILD=1 would load the plugin in child mode and skew the
+    // real-child pipeline (G2 class). Single-test binary — process-wide
+    // scrub is safe.
+    rpi_test_env::scrub_subagent_env();
     let Some(rpi) = rpi_binary() else {
         eprintln!("skipping: rpi binary missing (cargo build --workspace first)");
         return;
@@ -230,10 +235,7 @@ fn e2e_real_rpi_child_and_stream_fixture() {
 
     // 2. Full pipeline through the plugin with the real child.
     // Env writes via the test-only helper (see rpi-test-env contract);
-    // this is the only test in this binary. Scrub any inherited subagent
-    // child env first: a leaked RPI_SUBAGENT_CHILD=1 would load the plugin
-    // in child mode and skew the real-child pipeline (G2 class).
-    rpi_test_env::scrub_subagent_env();
+    // this is the only test in this binary.
     rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
     rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", &rpi);
     rpi_test_env::set_var("RPI_SUBAGENT_EXTENSION_PATH", &cdylib);

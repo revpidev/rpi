@@ -101,8 +101,8 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// `RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT` gate (port of upstream #1560,
 /// ADR-0026 / TE18 FR-H): `0` skips only the global agent-dir context
 /// segment. rpi-internal switch — no CLI flag, no settings key; the
-/// subagents plugin renders the agent's `inheritGlobalContext` two-state
-/// into the child env (`1` = inherit, the default for every agent).
+/// subagents plugin emits it for every spawned child (`1` = inherit,
+/// `0` = opt out; the per-agent default is opt out, upstream #1560).
 ///
 /// The switch is read only when the child marker `RPI_SUBAGENT_CHILD=1` is
 /// present with the exact value the launcher writes (`plugin_mode` in the
