@@ -13,7 +13,7 @@
 //! §3.11).
 //!
 //! Mode state is an interactive-session concept: a session whose
-//! `extension_mode` is not `Tui` answers `Default` from
+//! `extension_mode` is not `Interactive` answers `Default` from
 //! [`PermissionMode`] readers and ignores `setMode` (V16-05 §8-5
 //! implementation-time decision).
 
