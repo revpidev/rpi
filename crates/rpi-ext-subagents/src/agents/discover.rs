@@ -1976,6 +1976,39 @@ mod tests {
     }
 
     #[test]
+    fn inherit_global_context_overrides_follow_sibling_semantics() {
+        let parse = |frontmatter: &str| {
+            agent_from_content(
+                &format!("---\nname: mine\ndescription: d\n{frontmatter}\n---\nbody"),
+                Path::new("/x/mine.md"),
+                AgentSource::User,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let override_true = || crate::config::AgentOverride {
+            inherit_global_context: Some(true),
+            ..Default::default()
+        };
+
+        // Builtin overrides replace wholesale (agents.ts:1483-1485).
+        let mut builtin = parse("");
+        apply_override_entry(&mut builtin, &override_true());
+        assert!(builtin.inherit_global_context);
+
+        // Custom overrides fill only while the frontmatter key is absent.
+        let mut custom = parse("");
+        apply_custom_override_entry(&mut custom, &override_true());
+        assert!(custom.inherit_global_context);
+        let mut explicit = parse("inheritGlobalContext: false");
+        apply_custom_override_entry(&mut explicit, &override_true());
+        assert!(
+            !explicit.inherit_global_context,
+            "an explicit frontmatter value survives the custom override"
+        );
+    }
+
+    #[test]
     fn invalid_async_is_fatal_like_upstream() {
         let result = agent_from_content(
             "---\nname: x\ndescription: d\nasync: maybe\n---\nb",

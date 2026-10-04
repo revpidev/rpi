@@ -53,7 +53,9 @@ pub fn remove_var<K: AsRef<std::ffi::OsStr>>(key: K) {
 /// failures before anyone scrubbed the environment.
 ///
 /// Keys are literal (this crate must not depend on the plugin crate); the
-/// plugin-side set lives in `crates/rpi-ext-subagents/src/launch/args.rs`.
+/// plugin-side sources are the launch args map
+/// (`crates/rpi-ext-subagents/src/launch/args.rs`) and the depth budget
+/// (`crates/rpi-ext-subagents/src/runner/budget.rs`).
 pub fn scrub_subagent_env() {
     const KEYS: &[&str] = &[
         "RPI_SUBAGENT_TASK_DELIVERY",
@@ -68,6 +70,8 @@ pub fn scrub_subagent_env() {
         "RPI_SUBAGENT_CHILD_INDEX",
         "RPI_SUBAGENT_PARENT_DEPTH",
         "RPI_SUBAGENT_PARENT_EVENT_SINK",
+        "RPI_SUBAGENT_DEPTH",
+        "RPI_SUBAGENT_MAX_DEPTH",
         "RPI_SUBAGENT_STEER_INBOX",
         "RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR",
         "RPI_SUBAGENT_THINKING_CEILING",

@@ -274,8 +274,8 @@ fn e2e_fixed_child_full_pipeline() {
     // run inside a subagent): the launcher derives the child depth from
     // `RPI_SUBAGENT_DEPTH`, so an inherited value would make the env dump
     // below assert depth 2. Single-test binary — the process env is
-    // contained.
-    rpi_test_env::remove_var("RPI_SUBAGENT_DEPTH");
+    // contained. Anchors set by `Sandbox::new` below.
+    rpi_test_env::scrub_subagent_env();
     let sandbox = Sandbox::new();
     let host = Arc::new(FakeHost {
         cwd: sandbox.project.clone(),
