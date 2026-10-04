@@ -328,6 +328,19 @@ impl ExtensionRunnerCore {
                 ));
             }
         }
+        // V16-05 FR-A R5: usage-provider registrations flush the same way;
+        // failures surface as `"register_usage_provider"` extension errors.
+        for registration in self.runtime.take_pending_usage_registrations() {
+            if let Err(error) =
+                actions.usage_register(&registration.provider, &registration.script_path)
+            {
+                self.emit_error(ExtensionError::new(
+                    &registration.extension_path,
+                    "register_usage_provider",
+                    error,
+                ));
+            }
+        }
         self.runtime.bind_actions(actions);
     }
 

@@ -413,8 +413,16 @@ impl Component for FooterComponent {
             pwd = format!("{pwd} • {session_name}");
         }
 
-        // Stats line (footer.ts:128-137).
+        // Stats line (footer.ts:128-137). V16-05 FR-B R2/R3: the built-in
+        // footer carries the permission-mode badge; `Default` renders
+        // nothing so every pre-V16-05 frame stays byte-identical. When a
+        // statusline plugin uses `placement: "replace"`, `ui.setFooter`
+        // swaps this whole component out of the footer region
+        // (`swap_region_component`), so the badge cannot double-render.
         let mut stats_parts: Vec<String> = Vec::new();
+        if self.session.permission_mode() == crate::core::permission_mode::PermissionMode::Plan {
+            stats_parts.push("⏸ plan".to_string());
+        }
         if usage_totals.input > 0 {
             stats_parts.push(format!("↑{}", format_tokens(usage_totals.input)));
         }
@@ -959,6 +967,51 @@ mod tests {
         assert_eq!(
             status_line, "a status with newlines z status",
             "status: {status_line}"
+        );
+    }
+
+    /// V16-05 FR-B R2/R3: the `⏸ plan` badge renders exactly in Plan mode;
+    /// `Default` output stays byte-identical to the pre-V16-05 footer.
+    #[tokio::test]
+    async fn permission_mode_badge_renders_only_in_plan() {
+        use crate::core::agent_session::ExtensionBindings;
+        use crate::core::extensions::ExtensionMode;
+        use crate::core::permission_mode::PermissionMode;
+
+        let harness = crate::modes::interactive::test_support::build_test_session().await;
+        // The permission-mode gate only lets the interactive session hold
+        // a non-default mode.
+        harness
+            .session
+            .bind_extensions(ExtensionBindings {
+                mode: Some(ExtensionMode::Interactive),
+                on_error: None,
+                shutdown: None,
+            })
+            .await;
+        let footer = FooterComponent::new(
+            harness.session.clone(),
+            Arc::new(FooterDataProvider::new(&harness.cwd)),
+            theme(),
+        );
+        let default_lines = footer.render(120);
+        assert!(
+            !default_lines.iter().any(|line| line.contains("⏸")),
+            "Default must not render the badge: {default_lines:?}"
+        );
+
+        harness.session.set_permission_mode(PermissionMode::Plan);
+        let plan_lines = footer.render(120);
+        assert!(
+            plan_lines.iter().any(|line| line.contains("⏸ plan")),
+            "Plan badge missing: {plan_lines:?}"
+        );
+
+        harness.session.set_permission_mode(PermissionMode::Default);
+        assert_eq!(
+            footer.render(120),
+            default_lines,
+            "returning to Default restores the exact previous frame"
         );
     }
 

@@ -2741,6 +2741,11 @@ impl InteractiveMode {
     /// (`/new`, `/resume`, `/clone`, `/fork`, `/import`); the runtime's
     /// `setRebindSession` hook stays `None` (module header).
     pub(crate) async fn rebind_session_ui(&mut self) {
+        // V16-05 FR-B R3: the fresh session starts `Default`; when the
+        // outgoing session was in Plan, subscribers get the
+        // `plan → default` transition after the new session's extensions
+        // are bound (below) so plan-mode extensions can drop their state.
+        let previous_permission_mode = self.session.permission_mode();
         let session = self.runtime.session().clone();
         self.session = session.clone();
 
@@ -2810,9 +2815,11 @@ impl InteractiveMode {
 
         // `bindCurrentSessionExtensions` (interactive-mode.ts:1744) — the
         // extension bindings fire `session_start` with the UI attached.
+        // V16-05: re-assert `ExtensionMode::Interactive` on every session
+        // switch (the permission-mode gate keys on it).
         session
             .bind_extensions(ExtensionBindings {
-                mode: None,
+                mode: Some(crate::core::extensions::ExtensionMode::Interactive),
                 on_error: None,
                 shutdown: Some({
                     let shutdown_tx = self.ui_state.shutdown_tx.clone();
@@ -2829,6 +2836,13 @@ impl InteractiveMode {
             &self.ui_state,
             &session,
         );
+
+        // V16-05 FR-B R3: dispatch the session-reset `mode_change` (only
+        // when the outgoing session was in Plan). The built-in footer reads
+        // the reset state directly, so it needs no separate invalidation.
+        if previous_permission_mode != crate::core::permission_mode::PermissionMode::Default {
+            session.notify_permission_mode_reset(previous_permission_mode);
+        }
 
         self.ui_state.update_available_provider_count();
         self.ui_state.update_editor_border_color();
@@ -2917,6 +2931,16 @@ impl InteractiveUi {
         Component::invalidate(&mut *lock(&self.footer));
         self.update_editor_border_color();
         self.show_status(&format!("Thinking level: {}", new_level.as_str()));
+    }
+
+    /// `app.mode.cycle` (V16-05 FR-B R1; rpi-own): cycle `Default` ↔ `Plan`
+    /// through the session's single authority, refresh the footer badge and
+    /// confirm in the status line. The `mode_change` extension event is
+    /// dispatched by [`AgentSession::cycle_permission_mode`].
+    pub(crate) fn cycle_permission_mode(&self) {
+        let mode = self.session().cycle_permission_mode();
+        Component::invalidate(&mut *lock(&self.footer));
+        self.show_status(&format!("Mode: {}", mode.as_str()));
     }
 
     /// `cycleModel` (interactive-mode.ts:3789-3826) — spawned from the

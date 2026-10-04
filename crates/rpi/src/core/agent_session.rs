@@ -23,7 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine;
 use futures::future::BoxFuture;
@@ -68,6 +68,7 @@ use crate::core::extensions::{
 };
 use crate::core::model_resolver::ScopedModel;
 use crate::core::model_runtime::ModelRuntime;
+use crate::core::permission_mode::PermissionMode;
 use crate::core::prompt_templates::expand_prompt_template;
 use crate::core::resource_loader::DefaultResourceLoader;
 use crate::core::session_manager::{NewSessionOptions, SessionManager, StoredEntry};
@@ -549,6 +550,16 @@ struct AgentSessionInner {
     allowed_tool_names: Option<HashSet<String>>,
     excluded_tool_names: Option<HashSet<String>>,
     extension_mode: Mutex<ExtensionMode>,
+    /// V16-05 FR-B: session-scoped permission mode (`Default`/`Plan`) —
+    /// the single authority behind the `app.mode.cycle` keybinding, the
+    /// `getMode`/`setMode` host calls, and the built-in footer badge.
+    /// Session-scoped: `/new` / `/resume` / `/fork` / `/clone` / `/import`
+    /// create a fresh session that starts `Default`.
+    permission_mode: Mutex<PermissionMode>,
+    /// V16-05 FR-A: session-scoped usage-provider registry, created lazily
+    /// on first use. `/reload` (same session) keeps registrations and the
+    /// cache; a new session starts fresh.
+    usage_registry: OnceLock<Arc<crate::core::usage_providers::UsageProviderRegistry>>,
     /// `_extensionErrorListener` / `_extensionErrorUnsubscriber`
     /// (agent-session.ts:2307-2314).
     extension_error_listener: Mutex<Option<crate::core::extensions::ExtensionErrorListener>>,
@@ -965,6 +976,8 @@ impl AgentSession {
                 .excluded_tool_names
                 .map(|names| names.into_iter().collect()),
             extension_mode: Mutex::new(ExtensionMode::Print),
+            permission_mode: Mutex::new(PermissionMode::Default),
+            usage_registry: OnceLock::new(),
             extension_error_listener: Mutex::new(None),
             extension_shutdown_handler: Mutex::new(None),
             extension_error_unsubscriber: Mutex::new(None),
@@ -4843,6 +4856,124 @@ impl AgentSession {
         };
         self.set_thinking_level_with_options(next_level, options);
         Some(next_level)
+    }
+
+    // ------------------------------------------------------------------
+    // Permission mode (V16-05 FR-B; rpi-own)
+    // ------------------------------------------------------------------
+
+    /// Permission mode getter (V16-05 FR-B R4; the `getMode` host call).
+    ///
+    /// Non-interactive sessions (`extension_mode != Interactive`) always
+    /// answer [`PermissionMode::Default`]: the mode is an interactive-session
+    /// concept (task §8-5 implementation-time decision).
+    pub fn permission_mode(&self) -> PermissionMode {
+        if self.extension_mode() != ExtensionMode::Interactive {
+            return PermissionMode::Default;
+        }
+        *lock(&self.inner.permission_mode)
+    }
+
+    /// `setMode(mode)` (V16-05 FR-B R4): store the value and dispatch
+    /// `mode_change` when it actually changes. Unknown wire values are
+    /// rejected by the caller; a no-op in non-interactive sessions (see
+    /// [`Self::permission_mode`]). The interactive keybinding and the host
+    /// call share this single path.
+    pub fn set_permission_mode(&self, mode: PermissionMode) {
+        if self.extension_mode() != ExtensionMode::Interactive {
+            return;
+        }
+        let previous = {
+            let mut current = lock(&self.inner.permission_mode);
+            if *current == mode {
+                return;
+            }
+            let previous = *current;
+            *current = mode;
+            previous
+        };
+        self.dispatch_permission_mode_change(previous, mode);
+    }
+
+    /// Cycle `Default` ↔ `Plan` (`app.mode.cycle`, V16-05 FR-B R1) and
+    /// return the resulting mode.
+    pub fn cycle_permission_mode(&self) -> PermissionMode {
+        let next = self.permission_mode().cycle();
+        self.set_permission_mode(next);
+        next
+    }
+
+    /// Dispatch a `mode_change` transition (V16-05 FR-B R3). Spawning
+    /// mirrors the `thinking_level_select` path: keybinding callbacks run
+    /// on the off-runtime driver thread, where `Handle::try_current()`
+    /// fails, so a dedicated current-thread runtime carries the spawn.
+    fn dispatch_permission_mode_change(&self, from: PermissionMode, to: PermissionMode) {
+        let runner = self.runner();
+        let payload = serde_json::json!({
+            "from": from.as_str(),
+            "to": to.as_str(),
+        });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    runner.emit_event("mode_change", payload).await;
+                });
+            }
+            Err(_) => {
+                std::thread::spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        runner.emit_event("mode_change", payload).await;
+                    });
+                });
+            }
+        }
+    }
+
+    /// Session-reset notification (V16-05 FR-B R3): a fresh session starts
+    /// `Default`; when the outgoing session was in `Plan`, subscribers get
+    /// the `plan → default` transition so plan-mode extensions drop their
+    /// exposure snapshot and guidance injection. The stored state is
+    /// already `Default` — this only dispatches the event.
+    pub fn notify_permission_mode_reset(&self, from: PermissionMode) {
+        if from != PermissionMode::Default {
+            self.dispatch_permission_mode_change(from, PermissionMode::Default);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Usage-provider registry (V16-05 FR-A; rpi-own)
+    // ------------------------------------------------------------------
+
+    /// The session's usage-provider registry, created lazily on first use.
+    /// The settings closure reads the live settings manager, so hot-reloaded
+    /// `usage.*` edits apply to the next call; the agent directory anchors
+    /// the `usage-providers/` user script directory.
+    pub fn usage_registry(&self) -> Arc<crate::core::usage_providers::UsageProviderRegistry> {
+        self.inner
+            .usage_registry
+            .get_or_init(|| {
+                let agent_dir = lock(&self.inner.resource_loader).agent_dir().to_path_buf();
+                let weak = self.downgrade();
+                let settings = Arc::new(move || {
+                    weak.upgrade()
+                        .map(|session| {
+                            session.settings_manager(|manager| manager.get_usage_settings())
+                        })
+                        .unwrap_or_default()
+                });
+                Arc::new(crate::core::usage_providers::UsageProviderRegistry::new(
+                    agent_dir,
+                    self.inner.cwd.clone(),
+                    settings,
+                ))
+            })
+            .clone()
     }
 
     /// `getAvailableThinkingLevels` (agent-session.ts:1721-1724).

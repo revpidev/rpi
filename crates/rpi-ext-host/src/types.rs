@@ -83,15 +83,21 @@ pub const EVENT_USER_BASH: &str = "user_bash";
 pub const EVENT_INPUT: &str = "input";
 pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
+/// V16-05 FR-B R3 (rpi-own): a session permission-mode transition
+/// (`{from, to}` with `"default"`/`"plan"` values). Appended after
+/// `input` — rpi-own events take the table tail (no upstream `on()`
+/// overload position exists).
+pub const EVENT_MODE_CHANGE: &str = "mode_change";
 
-/// All 41 event names, in the upstream `ExtensionAPI.on()` overload order
+/// All 42 event names, in the upstream `ExtensionAPI.on()` overload order
 /// (types.ts:1545-1625 @ a13d35a74 + #9668 `cache_warming_decision` —
 /// inserted between `context_with_system` and `before_provider_request`).
 /// V16-03 added `context_with_system` and `agent_before_settle`; V16-06 added
 /// the remaining two (`provider_stream_event` after `after_provider_response`,
 /// `mcp_servers_change` after `session_shutdown`) and the version-level ABI
-/// minor bump (V16-06 FR-F/FR-H).
-pub const ALL_EVENTS: [&str; 41] = [
+/// minor bump (V16-06 FR-F/FR-H). V16-05 appends the rpi-own `mode_change`
+/// at the tail (after `input`).
+pub const ALL_EVENTS: [&str; 42] = [
     EVENT_PROJECT_TRUST,
     EVENT_RESOURCES_DISCOVER,
     EVENT_SESSION_START,
@@ -133,6 +139,7 @@ pub const ALL_EVENTS: [&str; 41] = [
     EVENT_TOOL_RESULT,
     EVENT_USER_BASH,
     EVENT_INPUT,
+    EVENT_MODE_CHANGE,
 ];
 
 /// `session_before_*` events carry a `{ cancel?: boolean }` result and
@@ -338,6 +345,18 @@ pub struct SessionStartEvent {
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfoChangedEvent {
     pub name: Option<String>,
+}
+
+/// `mode_change` (V16-05 FR-B R3; rpi-own): a session permission-mode
+/// transition. `from`/`to` are the wire values `"default"` / `"plan"`.
+/// Dispatched by the `app.mode.cycle` keybinding, `setMode`, and session
+/// resets (`/new` / `/resume` / `/fork` / `/clone` / `/import` when the
+/// outgoing session was in Plan).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeChangeEvent {
+    pub from: String,
+    pub to: String,
 }
 
 /// `SessionBeforeSwitchEvent` (types.ts:572-576).

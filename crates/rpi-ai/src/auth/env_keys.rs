@@ -83,6 +83,15 @@ fn get_api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// `getApiKeyEnvVars` — the declared API-key environment variables for a
+/// provider, regardless of whether they are present in the process
+/// environment. The usage-provider framework (V16-05 FR-A) uses this to
+/// tell a script which variable name carries its credential (the value
+/// itself travels via the child process environment, never stdin).
+pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
+    get_api_key_env_vars(provider)
+}
+
 /// `findEnvKeys` — configured environment variables that can provide an API
 /// key for a provider. Only actual API key variables; ambient credential
 /// sources (AWS profiles, ADC) are intentionally excluded.

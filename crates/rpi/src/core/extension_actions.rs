@@ -121,6 +121,7 @@ pub async fn bind_session_actions(
 ) {
     let actions = Arc::new(SessionHostActions {
         session: session.downgrade(),
+        usage: session.usage_registry(),
         host_handle: tokio::runtime::Handle::current(),
     });
     host.bind_actions(actions).await;
@@ -172,6 +173,9 @@ pub async fn bind_session_actions(
 
 struct SessionHostActions {
     session: WeakAgentSession,
+    /// V16-05 FR-A: the session's usage-provider registry (created with the
+    /// session; shared across rebinds of the same session).
+    usage: Arc<crate::core::usage_providers::UsageProviderRegistry>,
     /// Host runtime handle captured at bind time. `sendMessage` /
     /// `sendUserMessage` arrive as SYNCHRONOUS extension-ABI callbacks, so
     /// the calling thread can be a plugin-owned runtime worker or even a
@@ -418,6 +422,47 @@ impl HostActions for SessionHostActions {
                 None => tracing::warn!("extension setThinkingLevel with invalid level: {level}"),
             }
         }
+    }
+
+    /// `getMode()` (V16-05 FR-B R4): the session's permission mode wire
+    /// value. Non-interactive sessions answer `"default"` (the gate lives
+    /// in `AgentSession::permission_mode`).
+    fn get_mode(&self) -> String {
+        self.session()
+            .map(|session| session.permission_mode().as_str().to_owned())
+            .unwrap_or_else(|| "default".to_owned())
+    }
+
+    /// `setMode(mode)` (V16-05 FR-B R4): unknown values are ignored; the
+    /// session path dispatches `mode_change` on an actual change.
+    fn set_mode(&self, mode: &str) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        match crate::core::permission_mode::PermissionMode::parse(mode) {
+            Some(mode) => session.set_permission_mode(mode),
+            None => tracing::warn!("extension setMode with invalid mode: {mode}"),
+        }
+    }
+
+    // -- V16-05 FR-A usage-provider framework ---------------------------
+
+    /// `ctx.usage.listProviders()`: explicit settings ∪ user dir ∪ plugin
+    /// registrations.
+    fn usage_list_providers(&self) -> Vec<String> {
+        self.usage.list_providers()
+    }
+
+    /// `ctx.usage.fetch(provider, force?)`: serialized script execution with
+    /// the last-success cache; failures answer the cached success.
+    async fn usage_fetch(&self, provider: &str, force: bool) -> Option<Value> {
+        self.usage.fetch(provider, force).await
+    }
+
+    /// `ctx.usage.register(provider, scriptPath)`: plugin registrations are
+    /// the lowest resolution priority.
+    fn usage_register(&self, provider: &str, script_path: &str) -> Result<(), String> {
+        self.usage.register(provider, script_path)
     }
 
     /// `registerProvider(name, config)` (agent-session.ts:2433-2436 +
@@ -797,63 +842,185 @@ async fn exec_command(
     cwd: &str,
     timeout_ms: Option<u64>,
 ) -> ExecResult {
-    let spawned = tokio::process::Command::new(command)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
+    let outcome = exec_script(ScriptExecRequest {
+        command,
+        args,
+        cwd,
+        timeout_ms,
+        stdin: None,
+        env: &[],
+        max_stdout_bytes: None,
+    })
+    .await;
+    ExecResult {
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        code: outcome.code,
+        killed: outcome.killed,
+    }
+}
+
+/// One request through the shared exec channel ([`exec_script`]).
+///
+/// The optional knobs are host-internal additions for the V16-05 usage
+/// provider runner (stdin context, credential environment, stdout cap);
+/// `HostActions::exec` leaves them empty and keeps the upstream shape.
+/// `ScriptExecRequest` is `pub(crate)` because spawning must stay on this
+/// channel — no second subprocess API is exposed.
+pub(crate) struct ScriptExecRequest<'a> {
+    pub command: &'a str,
+    pub args: &'a [String],
+    pub cwd: &'a str,
+    pub timeout_ms: Option<u64>,
+    pub stdin: Option<&'a str>,
+    pub env: &'a [(String, String)],
+    pub max_stdout_bytes: Option<usize>,
+}
+
+/// Outcome of [`exec_script`]. `stdout_overflow` marks a cap kill; the
+/// caller treats it as a failed run.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScriptExecOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: i32,
+    pub killed: bool,
+    pub stdout_overflow: bool,
+    pub spawn_failed: bool,
+}
+
+/// Shared exec channel: spawn without a shell, write optional stdin, read
+/// stdout/stderr (optionally capped — overflow kills the child), and reap.
+/// A timeout kills by pid and still drains/reaps the child so no zombie is
+/// left behind (V16-05 FR-A R3, statusline kill+reap precedent).
+pub(crate) async fn exec_script(request: ScriptExecRequest<'_>) -> ScriptExecOutcome {
+    use tokio::io::AsyncWriteExt;
+
+    let mut command = tokio::process::Command::new(request.command);
+    command
+        .args(request.args)
+        .current_dir(request.cwd)
+        .stdin(if request.stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
-    let child = match spawned {
+        .stderr(std::process::Stdio::piped());
+    for (name, value) in request.env {
+        command.env(name, value);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
-            return ExecResult {
-                stdout: String::new(),
-                stderr: String::new(),
+            return ScriptExecOutcome {
                 code: 1,
-                killed: false,
+                spawn_failed: true,
+                ..ScriptExecOutcome::default()
             };
         }
     };
-    // Timeout: SIGKILL by pid, then collect whatever output was produced.
-    // Deviation: upstream sends SIGTERM with a 5s SIGKILL escalation
-    // (exec.ts:50-58); the bash tool's libc kill helpers set the precedent
-    // for direct signals.
-    let child_id = child.id();
-    let wait = child.wait_with_output();
+
+    if let Some(input) = request.stdin
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let _ = stdin.write_all(input.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+
+    let pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let output_limit = request.max_stdout_bytes.unwrap_or(usize::MAX);
+    let mut stdout_task = tokio::spawn(read_capped(stdout, output_limit, pid));
+    let mut stderr_task = tokio::spawn(read_capped(stderr, output_limit, pid));
+    let wait = child.wait();
     tokio::pin!(wait);
-    let (output, killed) = match timeout_ms {
+
+    let read_and_wait = async {
+        let stdout = (&mut stdout_task).await.unwrap_or_default();
+        let stderr = (&mut stderr_task).await.unwrap_or_default();
+        let status = (&mut wait).await.ok();
+        (stdout.0, stdout.1, stderr.0, status)
+    };
+
+    let (stdout_text, stdout_overflow, stderr_text, status, timed_out) = match request.timeout_ms {
         Some(timeout_ms) if timeout_ms > 0 => {
-            tokio::select! {
-                output = &mut wait => (output, false),
-                () = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => {
-                    if let Some(pid) = child_id {
-                        #[cfg(unix)]
-                        // pid of a live child we own; SIGKILL is always safe to send.
-                        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                        #[cfg(not(unix))]
-                        let _ = pid;
-                    }
-                    (wait.await, true)
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read_and_wait)
+                .await
+            {
+                Ok((stdout, overflow, stderr, status)) => (stdout, overflow, stderr, status, false),
+                Err(_) => {
+                    // Timeout: kill by pid, then drain/reap under a short
+                    // bound so a descendant holding the pipes open cannot
+                    // hang the fetch.
+                    kill_process(pid);
+                    let drained = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        let stdout = (&mut stdout_task).await.unwrap_or_default();
+                        let stderr = (&mut stderr_task).await.unwrap_or_default();
+                        let status = (&mut wait).await.ok();
+                        (stdout.0, stdout.1, stderr.0, status)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    (drained.0, drained.1, drained.2, drained.3, true)
                 }
             }
         }
-        _ => (wait.await, false),
+        _ => {
+            let (stdout, overflow, stderr, status) = read_and_wait.await;
+            (stdout, overflow, stderr, status, false)
+        }
     };
-    match output {
-        Ok(output) => ExecResult {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            code: output.status.code().unwrap_or(0),
-            killed,
-        },
-        Err(_) => ExecResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            code: 1,
-            killed,
-        },
+
+    ScriptExecOutcome {
+        stdout: stdout_text,
+        stderr: stderr_text,
+        code: status.and_then(|status| status.code()).unwrap_or(0),
+        killed: timed_out,
+        stdout_overflow,
+        spawn_failed: false,
     }
+}
+
+/// Cap-bounded pipe reader. Overflow kills the child (so the writer stops)
+/// and reports it; the caller treats the run as failed.
+async fn read_capped<R>(reader: Option<R>, limit: usize, pid: Option<u32>) -> (String, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let Some(mut reader) = reader else {
+        return (String::new(), false);
+    };
+    let mut buffer = [0u8; 8192];
+    let mut collected: Vec<u8> = Vec::new();
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if collected.len().saturating_add(read) > limit {
+                    collected.extend_from_slice(&buffer[..limit.saturating_sub(collected.len())]);
+                    kill_process(pid);
+                    return (String::from_utf8_lossy(&collected).into_owned(), true);
+                }
+                collected.extend_from_slice(&buffer[..read]);
+            }
+        }
+    }
+    (String::from_utf8_lossy(&collected).into_owned(), false)
+}
+
+fn kill_process(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: pid belongs to a child process this function spawned and
+        // still owns; SIGKILL is always safe to send.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 fn thinking_level_str(level: rpi_agent::types::ThinkingLevel) -> &'static str {

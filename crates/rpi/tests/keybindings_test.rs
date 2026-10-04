@@ -424,7 +424,9 @@ fn test_all_app_defaults() {
     assert_eq!(mgr.get_keys("app.interrupt"), vec!["escape"]);
     assert_eq!(mgr.get_keys("app.clear"), vec!["ctrl+c"]);
     assert_eq!(mgr.get_keys("app.exit"), vec!["ctrl+d"]);
-    assert_eq!(mgr.get_keys("app.thinking.cycle"), vec!["shift+tab"]);
+    // V16-05 FR-B R1: `shift+tab` moved to `app.mode.cycle`.
+    assert_eq!(mgr.get_keys("app.mode.cycle"), vec!["shift+tab"]);
+    assert_eq!(mgr.get_keys("app.thinking.cycle"), vec!["alt+t"]);
     assert_eq!(mgr.get_keys("app.model.cycleForward"), vec!["ctrl+p"]);
     assert_eq!(
         mgr.get_keys("app.model.cycleBackward"),

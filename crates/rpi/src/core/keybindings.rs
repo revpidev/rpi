@@ -2,7 +2,7 @@
 //! `packages/coding-agent/src/core/keybindings.ts` @ pi 0.82.1 (2efa728)
 //! and `packages/tui/src/keybindings.ts`.
 //!
-//! Provides the full keybinding definitions table (90 namespace ids), the
+//! Provides the full keybinding definitions table (91 namespace ids), the
 //! legacy-name migration table (59 entries), config-file loading with
 //! migration, conflict detection, and the [`KeybindingsManager`] that merges
 //! defaults with user overrides. The 47
@@ -209,7 +209,7 @@ pub fn migrate_key_name(key: &str) -> &str {
 }
 
 // ===========================================================================
-// Keybinding Definitions (90 = 47 tui.* + 43 app.*)
+// Keybinding Definitions (91 = 47 tui.* + 44 app.*)
 // ===========================================================================
 
 static DEFINITIONS: OnceLock<Vec<(String, KeybindingDefinition)>> = OnceLock::new();
@@ -224,7 +224,7 @@ fn m(keys: &[&'static str]) -> KeyBindingValue {
     KeyBindingValue::Multiple(keys.iter().map(|k| k.to_string()).collect())
 }
 
-/// Build the full definitions table (90 entries, platform-specific defaults).
+/// Build the full definitions table (91 entries, platform-specific defaults).
 ///
 /// Order matches upstream `KEYBINDINGS` definition order (tui/src/keybindings.ts:65-216
 /// @ 9841914 + coding-agent/src/core/keybindings.ts:64-207).
@@ -419,7 +419,7 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             s("end"),
             "Scroll viewport to bottom",
         ),
-        // ---- app.* (42) ----
+        // ---- app.* (43) ----
         ("app.interrupt", s("escape"), "Cancel or abort"),
         ("app.clear", s("ctrl+c"), "Clear editor"),
         ("app.exit", s("ctrl+d"), "Exit when editor is empty"),
@@ -428,7 +428,12 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             app_suspend_default(),
             "Suspend to background",
         ),
-        ("app.thinking.cycle", s("shift+tab"), "Cycle thinking level"),
+        // V16-05 FR-B R1: permission-mode cycle (rpi-own). `shift+tab` used
+        // to belong to `app.thinking.cycle`; that action moved to `alt+t`
+        // (see `KEYBINDING_VALUE_MIGRATIONS` for the explicit-config
+        // migration).
+        ("app.mode.cycle", s("shift+tab"), "Cycle permission mode"),
+        ("app.thinking.cycle", s("alt+t"), "Cycle thinking level"),
         ("app.model.cycleForward", s("ctrl+p"), "Cycle to next model"),
         (
             "app.model.cycleBackward",
@@ -723,11 +728,38 @@ pub fn to_keybindings_config(
     config
 }
 
+/// Migrate an explicit user binding whose value followed a *default* key
+/// that has since moved to another action (V16-05 FR-B R1):
+/// `app.thinking.cycle` used to default to `shift+tab`, which is now
+/// `app.mode.cycle`'s default. A user config that explicitly pinned the old
+/// default is remapped to `alt+t` so the two actions never double-bind the
+/// same key. Only the exact old default value is rewritten — any other
+/// custom binding is left alone.
+fn migrate_keybinding_value(name: &str, value: &serde_json::Value) -> Option<serde_json::Value> {
+    if name != "app.thinking.cycle" {
+        return None;
+    }
+    match value {
+        serde_json::Value::String(key) if key == "shift+tab" => {
+            Some(serde_json::Value::String("alt+t".to_owned()))
+        }
+        serde_json::Value::Array(keys)
+            if keys.len() == 1 && keys[0].as_str() == Some("shift+tab") =>
+        {
+            Some(serde_json::Value::Array(vec![serde_json::Value::String(
+                "alt+t".to_owned(),
+            )]))
+        }
+        _ => None,
+    }
+}
+
 /// Migrate legacy key names in a raw config (keybindings.ts:289-309).
 ///
 /// Returns `(migrated_config, was_migrated)`. When both an old key and its
 /// new name exist in the input, the old key's value is discarded and the new
-/// key's value wins.
+/// key's value wins. Value-level migrations (V16-05 FR-B R1) run after the
+/// name rewrite.
 pub fn migrate_keybindings_config(
     raw_config: &serde_json::Map<String, serde_json::Value>,
 ) -> (serde_json::Map<String, serde_json::Value>, bool) {
@@ -744,7 +776,14 @@ pub fn migrate_keybindings_config(
             migrated = true;
             continue;
         }
-        config.insert(next_key.to_string(), value.clone());
+        let value = match migrate_keybinding_value(next_key, value) {
+            Some(migrated_value) => {
+                migrated = true;
+                migrated_value
+            }
+            None => value.clone(),
+        };
+        config.insert(next_key.to_string(), value);
     }
 
     let ordered = order_keybindings_config(&config);
@@ -1036,7 +1075,8 @@ mod tests {
         let defs = keybinding_definitions();
         // 84 → 90: search family + lineUp/lineDown added (tui/src/
         // keybindings.ts @ 9841914, 00121ed99 / 1279952de).
-        assert_eq!(defs.len(), 90, "expected 90 keybinding definitions");
+        // 90 → 91: `app.mode.cycle` (V16-05 FR-B R1).
+        assert_eq!(defs.len(), 91, "expected 91 keybinding definitions");
     }
 
     #[test]
@@ -1118,7 +1158,14 @@ mod tests {
     #[test]
     fn test_app_thinking_cycle() {
         let mgr = KeybindingsManager::new();
-        assert_eq!(mgr.get_keys("app.thinking.cycle"), vec!["shift+tab"]);
+        // V16-05 FR-B R1: migrated off `shift+tab` (now `app.mode.cycle`).
+        assert_eq!(mgr.get_keys("app.thinking.cycle"), vec!["alt+t"]);
+    }
+
+    #[test]
+    fn test_app_mode_cycle() {
+        let mgr = KeybindingsManager::new();
+        assert_eq!(mgr.get_keys("app.mode.cycle"), vec!["shift+tab"]);
     }
 
     #[test]
@@ -1237,6 +1284,72 @@ mod tests {
         assert_eq!(
             migrated.get("tui.editor.cursorUp"),
             Some(&serde_json::json!("ctrl+p"))
+        );
+    }
+
+    // --- Value migrations (V16-05 FR-B R1) --------------------------------
+
+    #[test]
+    fn test_migrate_config_thinking_cycle_value_string() {
+        let mut raw = serde_json::Map::new();
+        raw.insert(
+            "app.thinking.cycle".to_string(),
+            serde_json::json!("shift+tab"),
+        );
+        let (migrated, was_migrated) = migrate_keybindings_config(&raw);
+        assert!(was_migrated);
+        assert_eq!(
+            migrated.get("app.thinking.cycle"),
+            Some(&serde_json::json!("alt+t"))
+        );
+    }
+
+    #[test]
+    fn test_migrate_config_thinking_cycle_value_single_array() {
+        let mut raw = serde_json::Map::new();
+        raw.insert(
+            "app.thinking.cycle".to_string(),
+            serde_json::json!(["shift+tab"]),
+        );
+        let (migrated, was_migrated) = migrate_keybindings_config(&raw);
+        assert!(was_migrated);
+        assert_eq!(
+            migrated.get("app.thinking.cycle"),
+            Some(&serde_json::json!(["alt+t"]))
+        );
+    }
+
+    #[test]
+    fn test_migrate_config_thinking_cycle_custom_value_kept() {
+        // Only the old default value moves; a custom binding (or a custom
+        // multi-key list) stays.
+        let mut raw = serde_json::Map::new();
+        raw.insert(
+            "app.thinking.cycle".to_string(),
+            serde_json::json!(["ctrl+y", "alt+y"]),
+        );
+        let (migrated, was_migrated) = migrate_keybindings_config(&raw);
+        assert!(!was_migrated);
+        assert_eq!(
+            migrated.get("app.thinking.cycle"),
+            Some(&serde_json::json!(["ctrl+y", "alt+y"]))
+        );
+    }
+
+    #[test]
+    fn test_migrate_config_legacy_name_then_value() {
+        // Legacy name `cycleThinkingLevel` maps to `app.thinking.cycle`
+        // first; the value migration still applies to the old default.
+        let mut raw = serde_json::Map::new();
+        raw.insert(
+            "cycleThinkingLevel".to_string(),
+            serde_json::json!("shift+tab"),
+        );
+        let (migrated, was_migrated) = migrate_keybindings_config(&raw);
+        assert!(was_migrated);
+        assert_eq!(
+            migrated.get("app.thinking.cycle"),
+            Some(&serde_json::json!("alt+t"))
         );
     }
 

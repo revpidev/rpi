@@ -610,6 +610,43 @@ pub trait HostActions: Send + Sync {
     fn get_thinking_level(&self) -> String;
     fn set_thinking_level(&self, level: &str);
 
+    /// `getMode()` (V16-05 FR-B R4; rpi-own): the session's permission mode
+    /// wire value (`"default"` / `"plan"`). Unbound/legacy action sets
+    /// answer `"default"`.
+    fn get_mode(&self) -> String {
+        "default".to_owned()
+    }
+
+    /// `setMode(mode)` (V16-05 FR-B R4): set the session's permission mode.
+    /// Unknown wire values are ignored; an actual change dispatches
+    /// `mode_change`. Unbound/legacy action sets no-op.
+    fn set_mode(&self, _mode: &str) {}
+
+    // -- V16-05 usage-provider framework (rpi-own, FR-A R5) ---------------
+
+    /// `ctx.usage.listProviders()`: every provider id reachable through the
+    /// explicit settings map, the user script directory, or plugin
+    /// registration, sorted and deduplicated.
+    fn usage_list_providers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// `ctx.usage.fetch(provider, force?)`: the latest successful usage
+    /// envelope JSON, or `None` when no fetch ever succeeded. Fresh-cache
+    /// hits return without running a script; failures keep the last
+    /// success. Serialized execution, timeout, and output limits are host
+    /// governance.
+    async fn usage_fetch(&self, _provider: &str, _force: bool) -> Option<Value> {
+        None
+    }
+
+    /// `ctx.usage.register(provider, scriptPath)`: register (or replace) a
+    /// provider's script path. Pre-bind calls queue in the extension API
+    /// and flush on `bindCore`.
+    fn usage_register(&self, _provider: &str, _script_path: &str) -> Result<(), String> {
+        Err("usage providers are not bound to a session".to_owned())
+    }
+
     /// `registerProvider(name, config)` post-bind direct call
     /// (runner.ts:387-393). `config` is the `ProviderConfig` JSON. `Err` is
     /// reported as a `"register_provider"` extension error (runner.ts:358-364).
@@ -1297,6 +1334,16 @@ pub struct PendingVirtualModelRegistration {
     pub extension_path: String,
 }
 
+/// A usage-provider registration queued before bind (V16-05 FR-A R5;
+/// rpi-own). The registration flushes through
+/// `HostActions::usage_register` on `bindCore`.
+#[derive(Debug, Clone)]
+pub struct PendingUsageRegistration {
+    pub provider: String,
+    pub script_path: String,
+    pub extension_path: String,
+}
+
 /// Shared state created by the loader, bound by the host
 /// (`ExtensionRuntime`, types.ts:1660 = state + actions). Cloning shares the
 /// underlying state (the upstream runtime is a single mutable object every
@@ -1311,6 +1358,7 @@ struct RuntimeInner {
     pending_provider_registrations: RwLock<Vec<PendingProviderRegistration>>,
     pending_native_provider_registrations: RwLock<Vec<PendingNativeProviderRegistration>>,
     pending_virtual_model_registrations: RwLock<Vec<PendingVirtualModelRegistration>>,
+    pending_usage_registrations: RwLock<Vec<PendingUsageRegistration>>,
     stale_message: RwLock<Option<String>>,
     actions: RwLock<Option<Arc<dyn HostActions>>>,
     context_actions: RwLock<Option<Arc<dyn ContextActions>>>,
@@ -1344,6 +1392,7 @@ impl ExtensionRuntime {
                 pending_provider_registrations: RwLock::new(Vec::new()),
                 pending_native_provider_registrations: RwLock::new(Vec::new()),
                 pending_virtual_model_registrations: RwLock::new(Vec::new()),
+                pending_usage_registrations: RwLock::new(Vec::new()),
                 stale_message: RwLock::new(None),
                 actions: RwLock::new(None),
                 context_actions: RwLock::new(None),
@@ -1561,6 +1610,32 @@ impl ExtensionRuntime {
     /// (runner.ts:497-513).
     pub fn take_pending_virtual_model_registrations(&self) -> Vec<PendingVirtualModelRegistration> {
         std::mem::take(&mut *write(&self.inner.pending_virtual_model_registrations))
+    }
+
+    // -- usage-provider registration queue (V16-05 FR-A R5) ----------------
+
+    /// Pre-bind: queue the usage-provider registration. Post-bind: direct
+    /// call through the bound actions.
+    pub fn usage_register(
+        &self,
+        provider: &str,
+        script_path: &str,
+        extension_path: &str,
+    ) -> Result<(), String> {
+        if let Some(actions) = self.actions() {
+            return actions.usage_register(provider, script_path);
+        }
+        write(&self.inner.pending_usage_registrations).push(PendingUsageRegistration {
+            provider: provider.to_owned(),
+            script_path: script_path.to_owned(),
+            extension_path: extension_path.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Queued usage-provider registrations, drained on bind.
+    pub fn take_pending_usage_registrations(&self) -> Vec<PendingUsageRegistration> {
+        std::mem::take(&mut *write(&self.inner.pending_usage_registrations))
     }
 
     // -- host binding (bindCore / setUIContext slots) ------------------------
@@ -3183,6 +3258,55 @@ impl ExtensionApi {
         self.runtime.assert_active()?;
         self.runtime.require_actions()?.set_thinking_level(level);
         Ok(())
+    }
+
+    /// `pi.getMode()` (V16-05 FR-B R4): the session permission mode wire
+    /// value (`"default"` / `"plan"`).
+    pub fn get_mode(&self) -> Result<String, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self.runtime.require_actions()?.get_mode())
+    }
+
+    /// `pi.setMode(mode)` (V16-05 FR-B R4): unknown values are ignored by
+    /// the action layer; a change dispatches `mode_change`.
+    pub fn set_mode(&self, mode: &str) -> Result<(), ExtError> {
+        self.runtime.assert_active()?;
+        self.runtime.require_actions()?.set_mode(mode);
+        Ok(())
+    }
+
+    /// `ctx.usage.listProviders()` (V16-05 FR-A R5): provider ids reachable
+    /// through the explicit settings map, the user script directory, or
+    /// plugin registration.
+    pub fn usage_list_providers(&self) -> Result<Vec<String>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self.runtime.require_actions()?.usage_list_providers())
+    }
+
+    /// `ctx.usage.fetch(provider, force?)` (V16-05 FR-A R5): the latest
+    /// successful usage envelope JSON, or `None` when nothing succeeded yet.
+    pub async fn usage_fetch(
+        &self,
+        provider: &str,
+        force: bool,
+    ) -> Result<Option<Value>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .usage_fetch(provider, force)
+            .await)
+    }
+
+    /// `ctx.usage.register(provider, scriptPath)` (V16-05 FR-A R5):
+    /// pre-bind calls queue in the runtime and flush on `bindCore`; post-bind
+    /// they reach the session registry directly.
+    pub fn usage_register(&self, provider: &str, script_path: &str) -> Result<(), ExtError> {
+        self.assert_api_active()?;
+        self.runtime.assert_active()?;
+        self.runtime
+            .usage_register(provider, script_path, &self.extension.path)
+            .map_err(ExtError::Call)
     }
 
     /// `pi.registerProvider(name, config)` (loader.ts:374-382, name+config

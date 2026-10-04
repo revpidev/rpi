@@ -2405,17 +2405,17 @@ async fn on_unsubscribe_after_invalidate_is_harmless() {
     assert_eq!(*calls.lock().unwrap(), vec!["A"]);
 }
 
-/// V16-03 FR-B R1 + V16-06 FR-F R3: the event table is additive 37→41 and
-/// the four new entries keep their upstream `on()` overload positions; the
-/// tail order matches the upstream overload sequence
-/// (`tool_call`/`tool_result` before `user_bash`/`input`).
+/// V16-03 FR-B R1 + V16-06 FR-F R3 + V16-05 FR-B R3: the event table is
+/// additive 37→41→42; the four V16-03/V16-06 entries keep their upstream
+/// `on()` overload positions and the rpi-own `mode_change` appends at the
+/// table tail.
 #[test]
-fn all_events_is_additive_41_in_upstream_order() {
+fn all_events_is_additive_42_in_order() {
     let events: Vec<&str> = rpi_ext_host::types::ALL_EVENTS.to_vec();
     assert_eq!(
         events.len(),
-        41,
-        "V16-06 lands the version-level 39→41 segment"
+        42,
+        "V16-05 appends the rpi-own mode_change tail entry"
     );
     let index = |name: &str| {
         events
@@ -2429,7 +2429,10 @@ fn all_events_is_additive_41_in_upstream_order() {
     assert_eq!(index("agent_settled"), index("agent_before_settle") + 1);
     assert_eq!(index("tool_call") + 1, index("tool_result"));
     assert!(index("tool_result") < index("user_bash"));
-    assert_eq!(index("input"), events.len() - 1);
+    // V16-05: `mode_change` is the rpi-own tail entry (no upstream
+    // `on()` overload position).
+    assert_eq!(index("mode_change"), events.len() - 1);
+    assert_eq!(index("input"), events.len() - 2);
     // V16-06: `mcp_servers_change` after `session_shutdown`,
     // `provider_stream_event` after `after_provider_response` (upstream
     // `on()` overload order, types.ts:1545-1625 @ a13d35a74).

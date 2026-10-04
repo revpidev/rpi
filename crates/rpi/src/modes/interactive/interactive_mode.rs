@@ -4498,6 +4498,14 @@ impl InteractiveUi {
             "app.thinking.cycle",
             Box::new(move || thinking_cycle_ui.cycle_thinking_level()),
         );
+        // V16-05 FR-B R1: `shift+tab` cycles the permission mode; the
+        // thinking cycle moved to `alt+t` (value migration in
+        // `core/keybindings.rs`).
+        let mode_cycle_ui = Arc::clone(ui);
+        editor.on_action(
+            "app.mode.cycle",
+            Box::new(move || mode_cycle_ui.cycle_permission_mode()),
+        );
         let model_forward_ui = Arc::clone(ui);
         editor.on_action(
             "app.model.cycleForward",
@@ -5005,11 +5013,13 @@ impl InteractiveMode {
         }
 
         // Extension bindings (interactive-mode.ts binds via
-        // bindCurrentSessionExtensions; no explicit mode for interactive).
-        // Fires `session_start` — dispatched after the UI attach above.
+        // bindCurrentSessionExtensions). Fires `session_start` — dispatched
+        // after the UI attach above. V16-05: the interactive bind carries
+        // `ExtensionMode::Interactive` explicitly — the permission-mode
+        // gate (`AgentSession::permission_mode`) keys on it.
         self.session
             .bind_extensions(ExtensionBindings {
-                mode: None,
+                mode: Some(crate::core::extensions::ExtensionMode::Interactive),
                 on_error: None,
                 shutdown: Some({
                     let shutdown_tx = self.ui_state.shutdown_tx.clone();
@@ -9028,6 +9038,93 @@ mod tests {
             footer_box.rect.height, 0,
             "zero-line footer must not reserve a blank row"
         );
+        mode.shutdown().await;
+    }
+
+    /// V16-05 FR-B R2/R3: the built-in footer renders the `⏸ plan` badge in
+    /// Plan mode, and `ui.setFooter` (`statusline` replace) swaps the whole
+    /// built-in footer region out of the tree — the badge cannot duplicate.
+    #[tokio::test]
+    async fn plan_badge_is_replaced_not_duplicated() {
+        use crate::core::permission_mode::PermissionMode;
+        use rpi_ext_host::api::UiBridge;
+
+        let (mut mode, _terminal, session) = mode_harness().await;
+        mode.init().await;
+        // The structural tree assertions below target the regular renderer.
+        if mode.ui_state.ui.mode() != rpi_tui::tui::TuiMode::Regular {
+            assert!(mode.switch_tui_mode(rpi_tui::tui::TuiMode::Regular, false, false));
+        }
+        let ui = &mode.ui_state;
+
+        // Interactive gate + Plan state: the badge is present.
+        session.set_permission_mode(PermissionMode::Plan);
+        let badge_visible = |ui: &InteractiveUi| {
+            lock(&ui.footer)
+                .render(120)
+                .iter()
+                .any(|line| line.contains("⏸ plan"))
+        };
+        assert!(
+            badge_visible(ui),
+            "Plan badge must render in the built-in footer"
+        );
+
+        let footer_region = lock(&ui.footer_region).clone().expect("footer region");
+        assert!(
+            ui.ui
+                .children()
+                .iter()
+                .any(|child| Arc::ptr_eq(child, &footer_region)),
+            "built-in footer region is mounted"
+        );
+
+        // statusline `replace`: the entire built-in footer region leaves the
+        // tree, so the badge cannot appear next to the extension footer.
+        let bridge = ui_bridge::InteractiveUiBridge::new(ui);
+        bridge.set_footer(Some(serde_json::json!({
+            "type": "text", "props": {"text": "STATUSLINE"}
+        })));
+        assert!(
+            !ui.ui
+                .children()
+                .iter()
+                .any(|child| Arc::ptr_eq(child, &footer_region)),
+            "the built-in footer must be swapped out under replace"
+        );
+
+        // Restoring brings the built-in footer (and its badge) back.
+        bridge.set_footer(None);
+        assert!(
+            ui.ui
+                .children()
+                .iter()
+                .any(|child| Arc::ptr_eq(child, &footer_region)),
+            "restoring re-mounts the built-in footer"
+        );
+        assert!(badge_visible(ui));
+        mode.shutdown().await;
+    }
+
+    /// V16-05 FR-B R1: the `app.mode.cycle` keybinding (`shift+tab`) drives
+    /// the same authority as the API — feeding the key toggles the session
+    /// mode, and `app.thinking.cycle` no longer reacts to `shift+tab`.
+    #[tokio::test]
+    async fn shift_tab_cycles_permission_mode() {
+        use crate::core::permission_mode::PermissionMode;
+
+        let (mut mode, terminal, session) = mode_harness().await;
+        mode.init().await;
+        assert_eq!(session.permission_mode(), PermissionMode::Default);
+
+        // Kitty-protocol shift+tab (`rpi_tui::keys` parses this sequence).
+        terminal.feed("\x1b[27;2;9~");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        assert_eq!(session.permission_mode(), PermissionMode::Plan);
+
+        terminal.feed("\x1b[27;2;9~");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        assert_eq!(session.permission_mode(), PermissionMode::Default);
         mode.shutdown().await;
     }
 

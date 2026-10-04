@@ -39,7 +39,7 @@
 //!   `Number()` exotica (`"0x10"`, `"Infinity"`) parse differently. All
 //!   realistic values (decimal integers, `"disabled"`, `""`) match.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -272,6 +272,32 @@ pub struct CodemodeSettings {
     /// on tool declarations; `None` = unset (the consumer applies the 3000
     /// default).
     pub inline_budget: Option<u64>,
+}
+
+/// `UsageProviderConfig` (V16-05 FR-A; rpi-own): one explicit
+/// `usage.providers` entry. The string form is the script path shorthand;
+/// the object form additionally declares the context fields the host
+/// forwards to the script (`baseUrl` / `apiKeyEnv` / `model`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageProviderConfig {
+    pub script: String,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub model: Option<String>,
+}
+
+/// `usage` settings consumed by the host framework (V16-05 FR-A; rpi-own).
+/// Only the two keys the framework itself needs are typed here (explicit
+/// provider overrides and the execution timeout); the rpi-usage plugin
+/// reads its own `usage.enabled` / `usage.footer` / `usage.refreshMs` keys
+/// directly from settings.json (statusline precedent).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageSettings {
+    /// Explicit provider → script overrides (highest resolution priority).
+    pub providers: BTreeMap<String, UsageProviderConfig>,
+    /// Script execution timeout in milliseconds; clamped to
+    /// `[500, 60000]` by the consumer, `None` = unset (3000 default).
+    pub timeout_ms: Option<u64>,
 }
 
 /// `DefaultProjectTrust = "ask" | "always" | "never"` (settings-manager.ts:62).
@@ -2802,6 +2828,78 @@ impl SettingsManager {
         self.global_settings.set("codemode", Value::Object(object));
         self.mark_modified("codemode", None);
         self.save();
+    }
+
+    /// `usage` keys consumed by the host usage-provider framework (V16-05
+    /// FR-A; rpi-own). Malformed values follow the codemode reader
+    /// convention: a non-object `usage` section yields the defaults, a
+    /// non-string/non-object provider entry is skipped, and a
+    /// non-finite/negative `timeoutMs` counts as unset. Project values
+    /// override global ones per key (deep merge).
+    pub fn get_usage_settings(&self) -> UsageSettings {
+        let Some(object) = self
+            .settings
+            .get("usage")
+            .and_then(|value| value.as_object())
+        else {
+            return UsageSettings::default();
+        };
+        let mut providers = BTreeMap::new();
+        if let Some(entries) = object.get("providers").and_then(|value| value.as_object()) {
+            for (provider, value) in entries {
+                if provider.is_empty() {
+                    continue;
+                }
+                match value {
+                    Value::String(script) if !script.is_empty() => {
+                        providers.insert(
+                            provider.clone(),
+                            UsageProviderConfig {
+                                script: script.clone(),
+                                ..UsageProviderConfig::default()
+                            },
+                        );
+                    }
+                    Value::Object(entry) => {
+                        let Some(script) = entry
+                            .get("script")
+                            .and_then(Value::as_str)
+                            .filter(|script| !script.is_empty())
+                        else {
+                            continue;
+                        };
+                        providers.insert(
+                            provider.clone(),
+                            UsageProviderConfig {
+                                script: script.to_owned(),
+                                base_url: entry
+                                    .get("baseUrl")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                api_key_env: entry
+                                    .get("apiKeyEnv")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                model: entry
+                                    .get("model")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let timeout_ms = object
+            .get("timeoutMs")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| value.floor() as u64);
+        UsageSettings {
+            providers,
+            timeout_ms,
+        }
     }
 }
 

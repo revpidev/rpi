@@ -30,7 +30,8 @@ pub use credential_store::InMemoryCredentialStore;
 pub use env_keys::{
     ANTHROPIC_API_KEY_ENV, ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_FEDERATION_RULE_ID_ENV,
     ANTHROPIC_IDENTITY_TOKEN_FILE_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_ORGANIZATION_ID_ENV,
-    ANTHROPIC_SERVICE_ACCOUNT_ID_ENV, ANTHROPIC_WORKSPACE_ID_ENV, find_env_keys, get_env_api_key,
+    ANTHROPIC_SERVICE_ACCOUNT_ID_ENV, ANTHROPIC_WORKSPACE_ID_ENV, api_key_env_vars, find_env_keys,
+    get_env_api_key,
 };
 pub use file_store::{
     Backend, FileAuthStorageBackend, FileCredentialStore, InMemoryAuthStorageBackend,

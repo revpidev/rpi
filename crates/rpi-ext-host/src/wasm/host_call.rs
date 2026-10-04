@@ -93,6 +93,14 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "setModel"
         | "getThinkingLevel"
         | "setThinkingLevel"
+        // V16-05 FR-B R4: permission-mode read/write is session surface.
+        | "getMode"
+        | "setMode"
+        // V16-05 FR-A R5: the usage-provider framework is session surface
+        // (the script execution itself stays host-internal).
+        | "ctx.usage.listProviders"
+        | "ctx.usage.fetch"
+        | "ctx.usage.register"
         | "ctx.isIdle"
         | "ctx.isProjectTrusted"
         | "ctx.hasPendingMessages"
@@ -961,6 +969,57 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             state
                 .api
                 .set_thinking_level(str_arg(&args, "level").unwrap_or("off"))
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(Value::Null)
+        }
+        // V16-05 FR-B R4: permission-mode read/write (`getMode`/`setMode`).
+        "getMode" => Ok(Value::String(
+            state
+                .api
+                .get_mode()
+                .map_err(|e| (error_kind(&e), e.to_string()))?,
+        )),
+        "setMode" => {
+            state
+                .api
+                .set_mode(str_arg(&args, "mode").unwrap_or("default"))
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(Value::Null)
+        }
+        // V16-05 FR-A R5: usage-provider framework (`ctx.usage.*`).
+        "ctx.usage.listProviders" => Ok(json!(
+            state
+                .api
+                .usage_list_providers()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+        )),
+        "ctx.usage.fetch" => {
+            let provider = str_arg(&args, "provider").unwrap_or_default().to_owned();
+            if provider.is_empty() {
+                return err("invalidRequest", "ctx.usage.fetch: missing provider");
+            }
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let api = state.api.clone();
+            let handle = state.async_handle.clone();
+            block_on(
+                &handle,
+                async move { api.usage_fetch(&provider, force).await },
+            )?
+            .map(|value| value.unwrap_or(Value::Null))
+            .map_err(|e| (error_kind(&e), e.to_string()))
+        }
+        "ctx.usage.register" => {
+            let provider = str_arg(&args, "provider").unwrap_or_default().to_owned();
+            let script_path = str_arg(&args, "scriptPath").unwrap_or_default().to_owned();
+            if provider.is_empty() || script_path.is_empty() {
+                return err(
+                    "invalidRequest",
+                    "ctx.usage.register: provider and scriptPath are required",
+                );
+            }
+            state
+                .api
+                .usage_register(&provider, &script_path)
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
         }
@@ -2634,5 +2693,129 @@ mod execute_tool_tests {
         );
         let parsed: serde_json::Value = serde_json::from_slice(&response).expect("envelope");
         assert_eq!(parsed["error"]["kind"], "capabilityDenied");
+    }
+}
+
+/// V16-05 (permission mode + usage-provider framework) wire-table tests:
+/// the method names, their `session` capability classification, and the
+/// unbound error envelope. Behavior over bound actions is covered by the
+/// `rpi` integration tests (`tests/permission_mode_test.rs`,
+/// `tests/usage_providers_test.rs`).
+#[cfg(test)]
+mod v16_05_wire_tests {
+    use std::collections::HashSet;
+
+    use serde_json::json;
+
+    use super::{Capability, CapabilityRequirement, dispatch, required_capability};
+    use crate::wasm::{DispatchTarget, HostState, WasmForward};
+
+    /// A bare state with no actions bound (all `HostActions` calls answer
+    /// the `unbound` envelope).
+    fn unbound_state(capabilities: HashSet<Capability>) -> HostState {
+        let runtime = Box::leak(Box::new(
+            tokio::runtime::Runtime::new().expect("tokio runtime"),
+        ));
+        let api = crate::api::ExtensionApi::for_extension(
+            std::sync::Arc::new(crate::api::LoadedExtension::new(
+                "<inline:v16-05>",
+                "<inline:v16-05>",
+            )),
+            crate::api::ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        }
+    }
+
+    /// All seven V16-05 methods are classified as `session` capability
+    /// (never `unknownMethod`).
+    #[test]
+    fn v16_05_methods_require_session_capability() {
+        let methods = [
+            "getMode",
+            "setMode",
+            "ctx.usage.listProviders",
+            "ctx.usage.fetch",
+            "ctx.usage.register",
+        ];
+        for method in methods {
+            assert!(
+                matches!(
+                    required_capability(method),
+                    CapabilityRequirement::Requires(Capability::Session)
+                ),
+                "{method} must require the session capability"
+            );
+        }
+    }
+
+    /// With the capability granted but no actions bound, the read/fetch
+    /// dispatch arms exist and answer `unbound` (a misspelled method would
+    /// answer `unknownMethod`). `ctx.usage.register` is exempt: pre-bind it
+    /// queues instead (next test).
+    #[test]
+    fn v16_05_unbound_answers_the_unbound_envelope() {
+        for method in ["getMode", "setMode"] {
+            let mut state = unbound_state(HashSet::from([Capability::Session]));
+            let value =
+                dispatch(&mut state, method, json!({"mode": "plan"})).expect_err("unbound actions");
+            assert_eq!(value.0, "unbound", "{method}: {value:?}");
+        }
+        let mut state = unbound_state(HashSet::from([Capability::Session]));
+        let value = dispatch(&mut state, "ctx.usage.listProviders", json!({}))
+            .expect_err("unbound actions");
+        assert_eq!(value.0, "unbound");
+        let mut state = unbound_state(HashSet::from([Capability::Session]));
+        let value = dispatch(
+            &mut state,
+            "ctx.usage.fetch",
+            json!({"provider": "p", "force": true}),
+        )
+        .expect_err("unbound actions");
+        assert_eq!(value.0, "unbound");
+    }
+
+    /// Pre-bind `ctx.usage.register` queues in the runtime (the flush is
+    /// covered by the `rpi` integration test).
+    #[test]
+    fn usage_register_queues_pre_bind() {
+        let mut state = unbound_state(HashSet::from([Capability::Session]));
+        dispatch(
+            &mut state,
+            "ctx.usage.register",
+            json!({"provider": "p", "scriptPath": "/tmp/p.py"}),
+        )
+        .expect("queued registration");
+        let pending = state.api.runtime().take_pending_usage_registrations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].provider, "p");
+        assert_eq!(pending[0].script_path, "/tmp/p.py");
+    }
+
+    /// Missing provider / scriptPath are rejected before the queue.
+    #[test]
+    fn usage_register_validates_arguments() {
+        let mut state = unbound_state(HashSet::from([Capability::Session]));
+        let value = dispatch(
+            &mut state,
+            "ctx.usage.register",
+            json!({"provider": "", "scriptPath": "/tmp/p.py"}),
+        )
+        .expect_err("empty provider");
+        assert_eq!(value.0, "invalidRequest");
+        let value =
+            dispatch(&mut state, "ctx.usage.fetch", json!({})).expect_err("missing provider");
+        assert_eq!(value.0, "invalidRequest");
     }
 }

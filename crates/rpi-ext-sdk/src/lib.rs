@@ -463,6 +463,91 @@ impl Extension {
             .map(|value| value.as_array().cloned().unwrap_or_default())
     }
 
+    /// `pi.getMode()` (V16-05 FR-B R4; rpi-own): the session permission
+    /// mode wire value (`"default"` / `"plan"`).
+    pub fn get_mode(&self) -> Result<String, String> {
+        host_call("getMode", json!({})).and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "getMode: expected a string".to_owned())
+        })
+    }
+
+    /// `pi.setMode(mode)` (V16-05 FR-B R4; rpi-own): set the session
+    /// permission mode. Unknown values are ignored by the host.
+    pub fn set_mode(&self, mode: &str) -> Result<(), String> {
+        host_call("setMode", json!({ "mode": mode })).map(|_| ())
+    }
+
+    // -- V16-05 usage-provider framework (rpi-own, FR-A R5) ----------------
+
+    /// `ctx.usage.listProviders()`: provider ids reachable through the
+    /// explicit settings map, the user script directory, or plugin
+    /// registration.
+    pub fn usage_list_providers(&self) -> Result<Vec<String>, String> {
+        host_call("ctx.usage.listProviders", json!({})).map(|value| {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// `ctx.usage.fetch(provider, force?)`: the latest successful usage
+    /// envelope JSON, or `None` when no fetch ever succeeded. Fresh-cache
+    /// hits return without running a script; failures keep the last
+    /// success.
+    pub fn usage_fetch(&self, provider: &str, force: bool) -> Result<Option<Value>, String> {
+        host_call(
+            "ctx.usage.fetch",
+            json!({ "provider": provider, "force": force }),
+        )
+        .map(|value| if value.is_null() { None } else { Some(value) })
+    }
+
+    /// `ctx.usage.register(provider, scriptPath)`: register (or replace) a
+    /// provider's script path. Pre-bind calls queue in the extension API
+    /// and flush on `bindCore`.
+    pub fn usage_register(&self, provider: &str, script_path: &str) -> Result<(), String> {
+        host_call(
+            "ctx.usage.register",
+            json!({ "provider": provider, "scriptPath": script_path }),
+        )
+        .map(|_| ())
+    }
+
+    /// Whether the host implements the V16-05 permission-mode surface
+    /// (`getMode` / `setMode` / `mode_change`). Probes the read-only
+    /// `getMode`; an older host answers `unknownMethod` (`Ok(false)`).
+    pub fn supports_permission_mode(&self) -> Result<bool, String> {
+        match host_call_typed("getMode", json!({})) {
+            Ok(_) => Ok(true),
+            Err(error) => match error.kind {
+                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(false),
+                _ => Err(error.to_string()),
+            },
+        }
+    }
+
+    /// Whether the host implements the V16-05 usage-provider surface
+    /// (`ctx.usage.*`). Probes the read-only `ctx.usage.listProviders`; an
+    /// older host answers `unknownMethod` (`Ok(false)`).
+    pub fn supports_usage_providers(&self) -> Result<bool, String> {
+        match host_call_typed("ctx.usage.listProviders", json!({})) {
+            Ok(_) => Ok(true),
+            Err(error) => match error.kind {
+                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(false),
+                _ => Err(error.to_string()),
+            },
+        }
+    }
+
     /// Host call escape hatch for the rest of the capability surface
     /// (ui.*/ctx.*/command.*/provider/exec — docs/extension-abi.md).
     pub fn call(&self, method: &str, args: Value) -> Result<Value, String> {
