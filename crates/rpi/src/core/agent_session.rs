@@ -53,7 +53,7 @@ use rpi_ai::utils::overflow::is_context_overflow;
 use rpi_ai::utils::retry::{RetryPolicy, is_retryable_assistant_error};
 use rpi_ai::utils::text::content_text_user;
 use rpi_ext_host::types as ext;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -205,6 +205,11 @@ pub struct AgentSessionConfig {
     pub model_runtime: Arc<ModelRuntime>,
     /// Initial active built-in tool names. Default: [read, bash, edit, write].
     pub initial_active_tool_names: Option<Vec<String>>,
+    /// Whether the initial tools come from the `defaultTools` setting. When
+    /// true, reload activates tools newly added to the setting; tools
+    /// removed from it stay active (agent-session.ts:264-268, V16-13
+    /// FR-C R3).
+    pub uses_default_tools: bool,
     /// Optional allowlist of tool names.
     pub allowed_tool_names: Option<Vec<String>>,
     /// Optional denylist of tool names.
@@ -238,8 +243,39 @@ pub struct PromptOptions {
     pub streaming_behavior: Option<StreamingBehavior>,
     /// Source of input for extension input event handlers.
     pub source: Option<InputSource>,
-    /// RPC preflight observer: called once with acceptance/rejection.
-    pub preflight_result: Option<Box<dyn FnOnce(bool) + Send>>,
+    /// RPC preflight observer: called once with the prompt's disposition
+    /// (`preflightResult`, agent-session.ts:306-308 @ e473b5cd8): `handled`
+    /// (extension command or input handler consumed it), `queued` (streamed
+    /// steer/follow-up), or `started` (a run was launched). Errors never
+    /// call it (the RPC layer emits the error response instead).
+    pub preflight_result: Option<Box<dyn FnOnce(PromptDisposition) + Send>>,
+}
+
+/// `QueuedInputDisposition` (agent-session.ts:294): `handled` (an input
+/// handler consumed the message) or `queued`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueuedInputDisposition {
+    Handled,
+    Queued,
+}
+
+/// `PromptDisposition` (agent-session.ts:295): `started`, plus the queued
+/// input dispositions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptDisposition {
+    Handled,
+    Queued,
+    Started,
+}
+
+/// Outcome of the `prompt` preflight: whether a run starts, and what the
+/// preflight observer reports before it does.
+enum PromptOutcome {
+    Handled,
+    Queued,
+    Started(Vec<AgentMessage>),
 }
 
 /// `ModelCycleResult` (agent-session.ts:252-257).
@@ -508,6 +544,8 @@ struct AgentSessionInner {
     /// `_customTools` (agent-session.ts:345) — SDK-provided tools.
     custom_tools: Vec<Arc<dyn AgentTool>>,
     session_env_cell: Arc<std::sync::RwLock<crate::tools::SessionEnv>>,
+    /// `_usesDefaultTools` (agent-session.ts:432, V16-13 FR-C R3).
+    uses_default_tools: bool,
     allowed_tool_names: Option<HashSet<String>>,
     excluded_tool_names: Option<HashSet<String>>,
     extension_mode: Mutex<ExtensionMode>,
@@ -919,6 +957,7 @@ impl AgentSession {
                 model: None,
                 reasoning_level: None,
             })),
+            uses_default_tools: config.uses_default_tools,
             allowed_tool_names: config
                 .allowed_tool_names
                 .map(|names| names.into_iter().collect()),
@@ -3792,14 +3831,14 @@ impl AgentSession {
         let mut preflight_result = options.preflight_result;
         let images = options.images;
 
-        let result: Result<Option<Vec<AgentMessage>>, RpiError> = async {
+        let result: Result<PromptOutcome, RpiError> = async {
             // Extension commands first (agent-session.ts:1121-1129) — no-op
             // runner never has commands.
             if expand_prompt_templates
                 && text.starts_with('/')
                 && self.try_execute_extension_command(text).await
             {
-                return Ok(None);
+                return Ok(PromptOutcome::Handled);
             }
 
             // Reject prompts while manual compaction is in progress
@@ -3835,7 +3874,7 @@ impl AgentSession {
                 )
                 .await?
             else {
-                return Ok(None);
+                return Ok(PromptOutcome::Handled);
             };
             let images = current_images;
 
@@ -3860,7 +3899,7 @@ impl AgentSession {
                     }
                     StreamingBehavior::Steer => self.queue_steer(&expanded_text, images).await,
                 }
-                return Ok(None);
+                return Ok(PromptOutcome::Queued);
             }
 
             // Flush any pending bash and custom messages before the new
@@ -3993,26 +4032,29 @@ impl AgentSession {
                 messages.insert(0, AgentMessage::System(update));
             }
 
-            Ok(Some(messages))
+            Ok(PromptOutcome::Started(messages))
         }
         .await;
 
         match result {
-            Ok(messages) => {
-                if let Some(preflight) = preflight_result.take() {
-                    preflight(true);
-                }
-                let Some(messages) = messages else {
-                    return Ok(());
+            Ok(outcome) => {
+                let disposition = match &outcome {
+                    PromptOutcome::Handled => PromptDisposition::Handled,
+                    PromptOutcome::Queued => PromptDisposition::Queued,
+                    PromptOutcome::Started(_) => PromptDisposition::Started,
                 };
-                self.run_agent_prompt(messages).await
-            }
-            Err(error) => {
                 if let Some(preflight) = preflight_result.take() {
-                    preflight(false);
+                    preflight(disposition);
                 }
-                Err(error)
+                match outcome {
+                    PromptOutcome::Handled | PromptOutcome::Queued => Ok(()),
+                    PromptOutcome::Started(messages) => self.run_agent_prompt(messages).await,
+                }
             }
+            // Errors never call the preflight observer (upstream throws
+            // before `preflightResult`; the RPC layer emits the error
+            // response instead).
+            Err(error) => Err(error),
         }
     }
 
@@ -4112,14 +4154,15 @@ impl AgentSession {
     /// `_queueUserInput` (agent-session.ts:1392-1412 @ faa9863cb — #8718):
     /// the shared steer/followUp path — extension-command rejection, input
     /// handlers (preserving the caller's `source`), skill/template
-    /// expansion, then the queue. A `handled` input is dropped silently.
+    /// expansion, then the queue. A `handled` input is dropped silently and
+    /// reports `handled` (agent-session.ts:2125-2143 @ e473b5cd8).
     async fn queue_user_input(
         &self,
         text: &str,
         images: Option<Vec<ImageContent>>,
         behavior: StreamingBehavior,
         source: InputSource,
-    ) -> Result<(), RpiError> {
+    ) -> Result<QueuedInputDisposition, RpiError> {
         if text.starts_with('/') {
             self.throw_if_extension_command(text)?;
         }
@@ -4137,7 +4180,7 @@ impl AgentSession {
             )
             .await?
         else {
-            return Ok(());
+            return Ok(QueuedInputDisposition::Handled);
         };
 
         let mut expanded_text = self.expand_skill_command(&text);
@@ -4147,7 +4190,7 @@ impl AgentSession {
             StreamingBehavior::Steer => self.queue_steer(&expanded_text, images).await,
             StreamingBehavior::FollowUp => self.queue_follow_up(&expanded_text, images).await,
         }
-        Ok(())
+        Ok(QueuedInputDisposition::Queued)
     }
 
     /// `steer` (agent-session.ts:1335-1346 @ faa9863cb: gains `options
@@ -4158,7 +4201,7 @@ impl AgentSession {
         text: &str,
         images: Option<Vec<ImageContent>>,
         source: InputSource,
-    ) -> Result<(), RpiError> {
+    ) -> Result<QueuedInputDisposition, RpiError> {
         self.queue_user_input(text, images, StreamingBehavior::Steer, source)
             .await
     }
@@ -4169,7 +4212,7 @@ impl AgentSession {
         text: &str,
         images: Option<Vec<ImageContent>>,
         source: InputSource,
-    ) -> Result<(), RpiError> {
+    ) -> Result<QueuedInputDisposition, RpiError> {
         self.queue_user_input(text, images, StreamingBehavior::FollowUp, source)
             .await
     }
@@ -5926,6 +5969,26 @@ impl AgentSession {
                 )
                 .await;
         }
+        // `previousDefaultTools` (agent-session.ts:3616-3618): snapshot the
+        // resolved selection BEFORE the settings reload, so a tool newly
+        // added by the setting can be activated below.
+        let default_tool_names = || -> Vec<String> {
+            crate::core::settings_manager::DEFAULT_TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+        };
+        let previous_default_tools: HashSet<String> = if self.inner.uses_default_tools {
+            let loader = lock(&self.inner.resource_loader);
+            loader
+                .settings_manager()
+                .get_default_tools()
+                .unwrap_or_else(default_tool_names)
+                .into_iter()
+                .collect()
+        } else {
+            HashSet::new()
+        };
         {
             let mut loader = lock(&self.inner.resource_loader);
             loader.settings_manager_mut().reload();
@@ -5936,14 +5999,39 @@ impl AgentSession {
             for error in errors {
                 tracing::warn!("extension reload: {}: {}", error.path, error.error);
             }
+            // Load warnings (resource-loader.ts:100-107, #10174 replacement
+            // notices) are surfaced on reload like the errors above;
+            // the startup path drains them into UI diagnostics (V16-13
+            // FR-F R4).
+            for warning in host.take_warnings() {
+                tracing::warn!("extension reload: {}: {}", warning.path, warning.warning);
+            }
             // The fresh runtime is unbound — re-bind the session actions
             // (flushes provider registrations from the re-run factories).
             crate::core::extension_actions::bind_session_actions(&host, self).await;
         }
+        // `addedDefaultTools` (agent-session.ts:3626-3632): tools newly
+        // added to `defaultTools` are activated; removed ones stay active,
+        // and tools disabled during the session stay disabled unless the
+        // setting newly adds them.
+        let added_default_tools: Vec<String> = if self.inner.uses_default_tools {
+            let loader = lock(&self.inner.resource_loader);
+            loader
+                .settings_manager()
+                .get_default_tools()
+                .unwrap_or_else(default_tool_names)
+                .into_iter()
+                .filter(|name| !previous_default_tools.contains(name))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // `_buildRuntime({activeToolNames, includeAllExtensionTools: true})`
-        // (agent-session.ts:2610-2615).
+        // (agent-session.ts:2610-2615, :3630-3634).
+        let mut active_tool_names = self.get_active_tool_names();
+        active_tool_names.extend(added_default_tools);
         self.refresh_tool_registry(RefreshToolRegistryOptions {
-            active_tool_names: Some(self.get_active_tool_names()),
+            active_tool_names: Some(active_tool_names),
             include_all_extension_tools: true,
         });
         // session_start + extendResources with reason "reload"

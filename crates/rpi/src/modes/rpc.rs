@@ -835,15 +835,16 @@ async fn dispatch(
                             images,
                             streaming_behavior,
                             source: Some(InputSource::Rpc),
-                            preflight_result: Some(Box::new(move |did_succeed| {
-                                if did_succeed {
-                                    accepted_observer.store(true, Ordering::SeqCst);
-                                    output.write(&serialize_json_line(&success_response(
-                                        &response_id,
-                                        "prompt",
-                                        None,
-                                    )));
-                                }
+                            // `preflightResult` (rpc-mode.ts:401-415 @
+                            // e473b5cd8): the authoritative success response
+                            // carries the per-input disposition.
+                            preflight_result: Some(Box::new(move |disposition| {
+                                accepted_observer.store(true, Ordering::SeqCst);
+                                output.write(&serialize_json_line(&success_response(
+                                    &response_id,
+                                    "prompt",
+                                    Some(json!({ "disposition": disposition })),
+                                )));
                             })),
                             ..Default::default()
                         },
@@ -867,7 +868,7 @@ async fn dispatch(
             .session()
             .steer(&message, images, crate::core::extensions::InputSource::Rpc)
             .await
-            .map(|_| None)
+            .map(|disposition| Some(json!({ "disposition": disposition })))
             .map_err(|error| error_message(&error)),
         RpcCommand::FollowUp {
             message, images, ..
@@ -875,7 +876,7 @@ async fn dispatch(
             .session()
             .follow_up(&message, images, crate::core::extensions::InputSource::Rpc)
             .await
-            .map(|_| None)
+            .map(|disposition| Some(json!({ "disposition": disposition })))
             .map_err(|error| error_message(&error)),
         RpcCommand::Abort { .. } => {
             state.session().abort().await;

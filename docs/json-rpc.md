@@ -46,6 +46,25 @@ Note: **`start` / `done` / `error` are no longer delta-type table entries** (rem
 
 Clients that need live partial messages must assemble them: `message_start` provides the initial message, subsequent deltas apply by `contentIndex`; **`message_end.message` is the authoritative terminal state**. Do not rely on cumulative snapshots in intermediate events (they no longer exist on the wire).
 
+## Prompt dispositions (`prompt` / `steer` / `follow_up`)
+
+A successful `prompt` response means the prompt was accepted, queued, or handled — not that model work completed or started. The authoritative success response carries a per-input `data.disposition`:
+
+```json
+{"id":"req-1","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}
+```
+
+- `prompt` → `"handled"` (an extension command or an input handler consumed it; **no run started, so do not wait for `agent_settled` for this prompt**), `"queued"` (queued during streaming via `streamingBehavior`), or `"started"` (a run was launched).
+- `steer` / `follow_up` → `"handled"` (an input handler consumed the message) or `"queued"`.
+
+`prompt` accepts the optional `streamingBehavior` field (`"steer" | "followUp"`); when the agent is already streaming, one of the two is required and the message is queued accordingly:
+
+```json
+{"type":"prompt","message":"New instruction","streamingBehavior":"steer"}
+```
+
+`success: false` means the prompt was rejected before acceptance; failures after acceptance surface through the event stream, never as a second response for the same request id. After the response, keep consuming events — `agent_end` ends one run, while retries/compaction/queued work may follow; `agent_settled` marks quiescence.
+
 ## Queue commands and the Esc combination (`abort` / `clear_queue`)
 
 ### `abort`: responds only once idle
@@ -102,3 +121,4 @@ Response:
 | backpressure against a slow consumer | `crates/rpi/tests/json_rpc_backpressure_test.rs` |
 | 33-command contract | `crates/rpi` `rpc_mode_test.rs` (20 contract tests) |
 | `clear_queue` retrieve/drain + Esc combination (idle after clear_queue + abort; drained steering not consumed) | `rpc_mode_test.rs` `clear_queue_returns_and_purges_queues` |
+| `prompt` disposition (`handled`/`queued`/`started`) + `streamingBehavior`; `steer`/`follow_up` two-state disposition; this document's field names/shapes | `rpc_mode_test.rs` `prompt_lifecycle_messages_state_stats`, `steer_follow_up_abort_during_streaming`, `prompt_extension_command_reports_handled_without_agent_settled`, `json_rpc_doc_pins_prompt_dispositions` |

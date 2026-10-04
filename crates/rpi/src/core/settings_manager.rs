@@ -253,6 +253,27 @@ pub struct WarningSettings {
     pub anthropic_extra_usage: Option<bool>,
 }
 
+/// `CodemodeMode = "on" | "only"` (settings-manager.ts:95-103 @ 8562bcf66):
+/// how the codemode tool presents tools while it is active. The key
+/// registers here (V16-13 FR-D R1); its presentation behavior is consumed
+/// by the codemode tool (V16-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodemodeMode {
+    #[default]
+    On,
+    Only,
+}
+
+/// `CodemodeSettings` (settings-manager.ts:105-108).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodemodeSettings {
+    pub mode: CodemodeMode,
+    /// Estimated tokens (characters / 4) the codemode description may spend
+    /// on tool declarations; `None` = unset (the consumer applies the 3000
+    /// default).
+    pub inline_budget: Option<u64>,
+}
+
 /// `DefaultProjectTrust = "ask" | "always" | "never"` (settings-manager.ts:62).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DefaultProjectTrust {
@@ -487,13 +508,90 @@ fn deep_merge_objects(
     result
 }
 
+/// `DEFAULT_TOOL_NAMES` (settings-manager.ts:215): tools enabled at startup
+/// when `defaultTools` does not change them.
+pub const DEFAULT_TOOL_NAMES: [&str; 4] = ["read", "bash", "edit", "write"];
+
+/// `isToolModifier` (settings-manager.ts:217-219): a `+name`/`-name` entry
+/// that modifies the inherited selection instead of replacing it.
+fn is_tool_modifier(entry: &Value) -> bool {
+    entry
+        .as_str()
+        .is_some_and(|entry| entry.starts_with('+') || entry.starts_with('-'))
+}
+
+/// `mergeDefaultTools` (settings-manager.ts:225-231): a list of only
+/// `+name`/`-name` entries appends to the inherited list; any plain name
+/// (or a malformed value) replaces it.
+fn merge_default_tools(base: &Settings, overrides: &Settings) -> Option<Value> {
+    let override_value = overrides.get("defaultTools")?;
+    let (Some(base_array), Some(override_array)) = (
+        base.get("defaultTools").and_then(Value::as_array),
+        override_value.as_array(),
+    ) else {
+        // Settings files are not validated; a malformed value replaces
+        // instead of throwing (settings-manager.ts:227-228).
+        return Some(override_value.clone());
+    };
+    if !override_array.iter().all(is_tool_modifier) {
+        return Some(override_value.clone());
+    }
+    let mut merged = base_array.clone();
+    merged.extend(override_array.iter().cloned());
+    Some(Value::Array(merged))
+}
+
+/// `resolveDefaultTools` (settings-manager.ts:233-247): plain names replace
+/// `DEFAULT_TOOL_NAMES`; `+name` adds and `-name` removes a tool in list
+/// order. An explicitly empty list stays empty.
+fn resolve_default_tools(entries: &[String]) -> Vec<String> {
+    let plain: Vec<String> = entries
+        .iter()
+        .filter(|entry| !entry.starts_with('+') && !entry.starts_with('-'))
+        .cloned()
+        .collect();
+    let mut tools: Vec<String> = if !plain.is_empty() || entries.is_empty() {
+        plain
+    } else {
+        DEFAULT_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect()
+    };
+    for entry in entries {
+        let (sign, name) = entry.split_at(1);
+        if name.is_empty() {
+            continue;
+        }
+        match sign {
+            "+" => {
+                if !tools.iter().any(|tool| tool == name) {
+                    tools.push(name.to_owned());
+                }
+            }
+            "-" => {
+                if let Some(index) = tools.iter().position(|tool| tool == name) {
+                    tools.remove(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    tools
+}
+
 /// `deepMergeSettings(base, overrides)` (settings-manager.ts:164-167,
 /// commit 97f0ccdd9): project/overrides take precedence, nested objects
-/// merge recursively.
+/// merge recursively. `defaultTools` is special-cased by
+/// `mergeDefaultTools` (settings-manager.ts:250-254).
 fn deep_merge_settings(base: &Settings, overrides: &Settings) -> Settings {
-    Settings {
+    let mut merged = Settings {
         fields: deep_merge_objects(&base.fields, &overrides.fields),
+    };
+    if let Some(default_tools) = merge_default_tools(base, overrides) {
+        merged.set("defaultTools", default_tools);
     }
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -2381,13 +2479,20 @@ impl SettingsManager {
     /// Project scope replaces (not merges) the global value via the normal
     /// settings merge semantics.
     pub fn get_default_tools(&self) -> Option<Vec<String>> {
-        let array = self.settings.get("defaultTools")?.as_array()?;
-        Some(
-            array
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-        )
+        let tools = self.settings.get("defaultTools")?;
+        // `getDefaultTools` (settings-manager.ts:1433-1438): non-string
+        // entries are dropped before resolving; a non-array value resolves
+        // like an empty list.
+        let entries: Vec<String> = tools
+            .as_array()
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(resolve_default_tools(&entries))
     }
 
     /// `setEnabledModels` (settings-manager.ts:1153-1157). `None` drops the
@@ -2650,6 +2755,54 @@ impl SettingsManager {
         self.mark_modified("warnings", None);
         self.save();
     }
+
+    /// `codemode` keys (settings-manager.ts:103-108; V16-13 FR-D R1/R2).
+    /// Malformed values follow the upstream readers: mode falls back to
+    /// `on`, a non-finite/negative `inlineBudget` counts as unset. Project
+    /// values override global ones per key (deep merge).
+    pub fn get_codemode_settings(&self) -> CodemodeSettings {
+        let object = self
+            .settings
+            .get("codemode")
+            .and_then(|value| value.as_object());
+        let mode = match object
+            .and_then(|object| object.get("mode"))
+            .and_then(|value| value.as_str())
+        {
+            Some("only") => CodemodeMode::Only,
+            _ => CodemodeMode::On,
+        };
+        let inline_budget = object
+            .and_then(|object| object.get("inlineBudget"))
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value.floor() as u64);
+        CodemodeSettings {
+            mode,
+            inline_budget,
+        }
+    }
+
+    /// `codemode` key writer (global scope, like the other setters).
+    pub fn set_codemode_settings(&mut self, settings: &CodemodeSettings) {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "mode".to_string(),
+            Value::String(
+                match settings.mode {
+                    CodemodeMode::On => "on",
+                    CodemodeMode::Only => "only",
+                }
+                .to_string(),
+            ),
+        );
+        if let Some(budget) = settings.inline_budget {
+            object.insert("inlineBudget".to_string(), Value::Number(budget.into()));
+        }
+        self.global_settings.set("codemode", Value::Object(object));
+        self.mark_modified("codemode", None);
+        self.save();
+    }
 }
 
 /// `Pick<Model, "provider" | "id">` (settings-manager.ts:858 @ 46bde88a1):
@@ -2902,6 +3055,170 @@ mod tests {
             manager.get_default_tools(),
             Some(vec!["read".to_string(), "bash".to_string()])
         );
+    }
+
+    // V16-13 FR-C (settings-manager.ts:212-247 @ 30a1d1849): a modifier-only
+    // override list appends to the inherited list; plain names replace.
+    #[test]
+    fn default_tools_modifier_only_project_appends_to_global() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            serde_json::json!({"defaultTools": ["read", "bash"]}),
+        );
+        write_json(
+            &project_path(&dirs),
+            serde_json::json!({"defaultTools": ["+codemode", "-bash"]}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_default_tools(),
+            Some(vec!["read".to_string(), "codemode".to_string()])
+        );
+    }
+
+    #[test]
+    fn default_tools_modifier_only_without_global_resolves_from_defaults() {
+        let dirs = test_dirs();
+        write_json(
+            &project_path(&dirs),
+            serde_json::json!({"defaultTools": ["+tool_search", "-write"]}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_default_tools(),
+            Some(vec![
+                "read".to_string(),
+                "bash".to_string(),
+                "edit".to_string(),
+                "tool_search".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn default_tools_resolution_applies_modifiers_in_order() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            serde_json::json!({"defaultTools": ["+x", "-x", "-bash", "+bash"]}),
+        );
+        let manager = create(&dirs);
+        // `+x` adds, `-x` removes, `-bash` removes, `+bash` re-adds at the
+        // end: order is observable.
+        assert_eq!(
+            manager.get_default_tools(),
+            Some(vec![
+                "read".to_string(),
+                "edit".to_string(),
+                "write".to_string(),
+                "bash".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn default_tools_malformed_project_value_replaces() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            serde_json::json!({"defaultTools": ["read", "bash"]}),
+        );
+        write_json(
+            &project_path(&dirs),
+            serde_json::json!({"defaultTools": "nope"}),
+        );
+        let manager = create(&dirs);
+        // A non-array value resolves like an empty list (settings files are
+        // not validated).
+        assert_eq!(manager.get_default_tools(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn default_tools_plus_empty_name_and_missing_removal_are_noops() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            serde_json::json!({"defaultTools": ["+", "-missing"]}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_default_tools(),
+            Some(vec![
+                "read".to_string(),
+                "bash".to_string(),
+                "edit".to_string(),
+                "write".to_string()
+            ])
+        );
+    }
+
+    // V16-13 FR-D R1/R2: `codemode.mode` / `codemode.inlineBudget` typed
+    // accessors (settings-manager.ts:95-108 @ 8562bcf66).
+    #[test]
+    fn codemode_settings_keys_validate_and_round_trip() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"codemode": {"mode": "only", "inlineBudget": 12.9}}),
+        );
+        let manager = create(&dirs);
+        let settings = manager.get_codemode_settings();
+        assert_eq!(settings.mode, CodemodeMode::Only);
+        assert_eq!(settings.inline_budget, Some(12));
+
+        // Malformed values fall back to the upstream readers.
+        write_json(
+            &global_path(&dirs),
+            json!({"codemode": {"mode": "weird", "inlineBudget": -1}}),
+        );
+        let manager = create(&dirs);
+        let settings = manager.get_codemode_settings();
+        assert_eq!(settings.mode, CodemodeMode::On);
+        assert_eq!(settings.inline_budget, None);
+
+        // Unset object → defaults (`on`, unset budget).
+        write_json(&global_path(&dirs), json!({}));
+        let manager = create(&dirs);
+        assert_eq!(manager.get_codemode_settings(), CodemodeSettings::default());
+    }
+
+    #[test]
+    fn set_codemode_settings_writes_known_keys() {
+        let dirs = test_dirs();
+        let mut manager = create(&dirs);
+        manager.set_codemode_settings(&CodemodeSettings {
+            mode: CodemodeMode::Only,
+            inline_budget: Some(3000),
+        });
+        assert_eq!(read_json(&global_path(&dirs))["codemode"]["mode"], "only");
+        assert_eq!(
+            read_json(&global_path(&dirs))["codemode"]["inlineBudget"],
+            3000
+        );
+        assert_eq!(
+            manager.get_codemode_settings(),
+            CodemodeSettings {
+                mode: CodemodeMode::Only,
+                inline_budget: Some(3000)
+            }
+        );
+    }
+
+    // V16-13 FR-D R6: `quietStartup` tri-state (settings-manager.ts:1089-1098
+    // @ f29ea3deb).
+    #[test]
+    fn quiet_startup_tri_state_round_trips() {
+        let dirs = test_dirs();
+        let mut manager = create(&dirs);
+        assert_eq!(manager.get_quiet_startup(), QuietStartup::False);
+        manager.set_quiet_startup(QuietStartup::Header);
+        assert_eq!(manager.get_quiet_startup(), QuietStartup::Header);
+        assert_eq!(read_json(&global_path(&dirs))["quietStartup"], "header");
+        manager.set_quiet_startup(QuietStartup::True);
+        assert_eq!(manager.get_quiet_startup(), QuietStartup::True);
+        manager.set_quiet_startup(QuietStartup::False);
+        assert_eq!(manager.get_quiet_startup(), QuietStartup::False);
     }
 
     // =======================================================================
@@ -4692,7 +5009,10 @@ mod tests {
 
         for (value, expected) in [
             (json!(7.9), WheelScrollLines::lines(7)),
+            (json!(1), WheelScrollLines::lines(1)),
             (json!(0), WheelScrollLines::lines(1)),
+            (json!(100), WheelScrollLines::lines(100)),
+            (json!(101), WheelScrollLines::lines(100)),
             (json!(1000), WheelScrollLines::lines(100)),
             (json!("fast"), WheelScrollLines::Auto),
             (json!(null), WheelScrollLines::Auto),

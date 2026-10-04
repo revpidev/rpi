@@ -42,7 +42,7 @@ use rpi_tui::terminal_image::get_capabilities;
 use rpi_tui::tui::{Component, Focusable};
 
 use crate::core::settings_manager::{
-    DefaultProjectTrust, DoubleEscapeAction, MermaidRenderingMode, TransportSetting,
+    DefaultProjectTrust, DoubleEscapeAction, MermaidRenderingMode, QuietStartup, TransportSetting,
     TreeFilterMode, WarningSettings,
 };
 use crate::core::themes::Theme;
@@ -136,7 +136,9 @@ pub struct SettingsSelectorOptions {
     pub editor_padding_x: u64,
     pub output_pad: u8,
     pub autocomplete_max_visible: u64,
-    pub quiet_startup: bool,
+    /// `quietStartup` tri-state (settings-selector.ts:551-557 @
+    /// f29ea3deb): `true` / `"header"` / `false`.
+    pub quiet_startup: QuietStartup,
     pub default_project_trust: DefaultProjectTrust,
     pub clear_on_shrink: bool,
     pub show_terminal_progress: bool,
@@ -189,7 +191,7 @@ pub enum SettingsChange {
     EditorPaddingX(u64),
     OutputPad(u8),
     AutocompleteMaxVisible(u64),
-    QuietStartup(bool),
+    QuietStartup(QuietStartup),
     DefaultProjectTrust(DefaultProjectTrust),
     ClearOnShrink(bool),
     ShowTerminalProgress(bool),
@@ -1817,9 +1819,21 @@ impl SettingsSelectorComponent {
             SettingItem {
                 id: "quiet-startup".to_string(),
                 label: "Quiet startup".to_string(),
-                description: Some("Disable verbose printing at startup".to_string()),
-                current_value: if options.quiet_startup { "true" } else { "false" }.to_string(),
-                values: Some(vec!["true".to_string(), "false".to_string()]),
+                description: Some(
+                    "Disable verbose printing at startup (header: keep only the startup header)"
+                        .to_string(),
+                ),
+                current_value: match options.quiet_startup {
+                    QuietStartup::True => "true",
+                    QuietStartup::Header => "header",
+                    QuietStartup::False => "false",
+                }
+                .to_string(),
+                values: Some(vec![
+                    "true".to_string(),
+                    "header".to_string(),
+                    "false".to_string(),
+                ]),
                 submenu: None,
             },
             SettingItem {
@@ -2377,7 +2391,11 @@ impl SettingsSelectorComponent {
                 }
                 "cache-miss-notices" => SettingsChange::ShowCacheMissNotices(new_value == "true"),
                 "collapse-changelog" => SettingsChange::CollapseChangelog(new_value == "true"),
-                "quiet-startup" => SettingsChange::QuietStartup(new_value == "true"),
+                "quiet-startup" => SettingsChange::QuietStartup(match new_value {
+                    "header" => QuietStartup::Header,
+                    "true" => QuietStartup::True,
+                    _ => QuietStartup::False,
+                }),
                 "install-telemetry" => SettingsChange::EnableInstallTelemetry(new_value == "true"),
                 "default-project-trust" => match trust_from_label(new_value) {
                     Some(trust) => SettingsChange::DefaultProjectTrust(trust),
@@ -2517,7 +2535,7 @@ mod tests {
             editor_padding_x: 1,
             output_pad: 0,
             autocomplete_max_visible: 7,
-            quiet_startup: false,
+            quiet_startup: QuietStartup::False,
             default_project_trust: DefaultProjectTrust::Ask,
             clear_on_shrink: true,
             show_terminal_progress: false,

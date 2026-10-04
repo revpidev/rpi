@@ -502,14 +502,9 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
             // clamped like construction.
             lock(&ui.editor).set_autocomplete_max_visible(max_visible.min(20) as usize);
         }
-        SettingsChange::QuietStartup(enabled) => {
-            // The selector's on/off maps onto the tri-state; the `"header"`
-            // choice is registered by V16-13.
-            let quiet = if enabled {
-                crate::core::settings_manager::QuietStartup::True
-            } else {
-                crate::core::settings_manager::QuietStartup::False
-            };
+        SettingsChange::QuietStartup(quiet) => {
+            // Tri-state `quietStartup` (V16-13 FR-D R6,
+            // settings-selector.ts:924).
             session.settings_manager(|s| s.set_quiet_startup(quiet));
         }
         SettingsChange::DefaultProjectTrust(default_project_trust) => {
@@ -1549,9 +1544,7 @@ impl InteractiveUi {
             output_pad: session.settings_manager(|s| s.get_output_pad()),
             autocomplete_max_visible: session
                 .settings_manager(|s| s.get_autocomplete_max_visible()),
-            quiet_startup: session
-                .settings_manager(|s| s.get_quiet_startup())
-                .hides_header(),
+            quiet_startup: session.settings_manager(|s| s.get_quiet_startup()),
             // The local `trust_manager::DefaultProjectTrust` mirrors the
             // settings enum (trust-manager.ts); the settings value is
             // already the type the selector expects.

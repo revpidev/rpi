@@ -123,6 +123,18 @@ async fn session_fixture(
     provider_options: FauxProviderOptions,
     settings_json: Option<&str>,
 ) -> SessionFixture {
+    session_fixture_cli(responses, provider_options, settings_json, None, None).await
+}
+
+/// [`session_fixture`] plus the `--tools` / `--no-tools` CLI override inputs
+/// (V16-13 FR-C R4).
+async fn session_fixture_cli(
+    responses: Vec<FauxResponseStep>,
+    provider_options: FauxProviderOptions,
+    settings_json: Option<&str>,
+    tools: Option<Vec<String>>,
+    no_tools: Option<rpi::sdk::NoTools>,
+) -> SessionFixture {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
@@ -184,6 +196,8 @@ async fn session_fixture(
         model: Some(model),
         services: Some(services),
         session_manager: Some(session_manager),
+        tools,
+        no_tools,
         ..Default::default()
     })
     .await
@@ -693,6 +707,7 @@ async fn constructor_restores_transcript_declared_tools_without_initial_set() {
         custom_tools: Vec::new(),
         model_runtime,
         initial_active_tool_names: None,
+        uses_default_tools: false,
         allowed_tool_names: None,
         excluded_tool_names: None,
         extension_runner_ref: rpi::core::extensions::new_extension_runner_ref(Arc::new(
@@ -2580,6 +2595,7 @@ async fn agent_settled_handlers_defer_requested_runs() {
         custom_tools: Vec::new(),
         model_runtime,
         initial_active_tool_names: None,
+        uses_default_tools: false,
         allowed_tool_names: None,
         excluded_tool_names: None,
         extension_runner_ref: runner_ref,
@@ -2626,4 +2642,123 @@ async fn agent_settled_handlers_defer_requested_runs() {
         "deferred request ran after settlement"
     );
     assert!(settled_dispatches.load(AtomicOrdering::SeqCst) >= 2);
+}
+
+// ---------------------------------------------------------------------------
+// V16-13 FR-C: defaultTools merge/reload differential + CLI override
+// ---------------------------------------------------------------------------
+
+fn sorted_active(session: &rpi::core::agent_session::AgentSession) -> Vec<String> {
+    let mut names = session.get_active_tool_names();
+    names.sort();
+    names
+}
+
+fn write_default_tools(fixture: &SessionFixture, tools: &[&str]) {
+    let json = serde_json::json!({ "defaultTools": tools });
+    std::fs::write(
+        fixture.agent_dir.join("settings.json"),
+        serde_json::to_string(&json).expect("settings json"),
+    )
+    .expect("write settings");
+}
+
+/// `defaultTools` is resolved at session creation; `/reload` activates tools
+/// newly added to the setting, keeps removed ones active, and keeps
+/// session-disabled tools disabled unless the setting newly adds them
+/// (agent-session.ts:3616-3634 @ db6cc71dc).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reload_activates_tools_newly_added_to_default_tools() {
+    let fixture = session_fixture(
+        Vec::new(),
+        FauxProviderOptions::default(),
+        Some(r#"{"defaultTools": ["read", "bash"]}"#),
+    )
+    .await;
+    assert_eq!(
+        sorted_active(&fixture.session),
+        vec!["bash".to_string(), "read".to_string()]
+    );
+
+    // Added tool → activated.
+    write_default_tools(&fixture, &["read", "bash", "edit"]);
+    fixture.session.reload().await;
+    assert_eq!(
+        sorted_active(&fixture.session),
+        vec!["bash".to_string(), "edit".to_string(), "read".to_string()]
+    );
+
+    // Removed tool → stays active.
+    write_default_tools(&fixture, &["read", "bash"]);
+    fixture.session.reload().await;
+    assert!(
+        sorted_active(&fixture.session).contains(&"edit".to_string()),
+        "removed defaultTools stay active"
+    );
+
+    // Disabled during the session → stays disabled on an unchanged setting.
+    fixture
+        .session
+        .set_active_tools_by_name(vec!["read".to_string()]);
+    fixture.session.reload().await;
+    assert_eq!(sorted_active(&fixture.session), vec!["read".to_string()]);
+
+    // A setting cycle that newly adds the tool re-activates it.
+    write_default_tools(&fixture, &["read", "write"]);
+    fixture.session.reload().await;
+    assert_eq!(
+        sorted_active(&fixture.session),
+        vec!["read".to_string(), "write".to_string()]
+    );
+    write_default_tools(&fixture, &["read", "write", "bash"]);
+    fixture.session.reload().await;
+    assert!(
+        sorted_active(&fixture.session).contains(&"bash".to_string()),
+        "a newly added setting re-activates a session-disabled tool"
+    );
+}
+
+/// `--tools` is a strict, literal allowlist: no `+/-` modifier parsing, and
+/// it overrides `defaultTools` including across reload
+/// (args.ts:143-151, sdk.ts:246-252, docs/settings.md:56).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tools_cli_flag_is_literal_and_overrides_default_tools() {
+    let fixture = session_fixture_cli(
+        Vec::new(),
+        FauxProviderOptions::default(),
+        Some(r#"{"defaultTools": ["bash", "edit"]}"#),
+        Some(vec!["+read".to_string()]),
+        None,
+    )
+    .await;
+    // `+read` is a literal (unknown) tool name: `read` is not activated.
+    assert!(sorted_active(&fixture.session).is_empty());
+    assert!(!sorted_active(&fixture.session).contains(&"read".to_string()));
+
+    // The setting still cannot override the CLI allowlist on reload.
+    write_default_tools(&fixture, &["read", "bash"]);
+    fixture.session.reload().await;
+    assert!(!sorted_active(&fixture.session).contains(&"read".to_string()));
+
+    // `--no-tools` wins over the setting too.
+    let fixture = session_fixture_cli(
+        Vec::new(),
+        FauxProviderOptions::default(),
+        Some(r#"{"defaultTools": ["bash", "edit"]}"#),
+        None,
+        Some(rpi::sdk::NoTools::All),
+    )
+    .await;
+    assert!(sorted_active(&fixture.session).is_empty());
+
+    // `--no-builtin-tools` also suppresses the setting's selection.
+    let fixture = session_fixture_cli(
+        Vec::new(),
+        FauxProviderOptions::default(),
+        Some(r#"{"defaultTools": ["bash", "edit"]}"#),
+        None,
+        Some(rpi::sdk::NoTools::Builtin),
+    )
+    .await;
+    assert!(sorted_active(&fixture.session).is_empty());
 }

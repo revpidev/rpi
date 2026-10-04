@@ -400,9 +400,17 @@ async fn prompt_lifecycle_messages_state_stats() {
     rpc.send(&json!({"id": "p1", "type": "prompt", "message": "hi"}))
         .await;
     let response = rpc.next_response(Some("p1")).await;
+    // V16-13 FR-E (rpc-mode.ts:401-415 @ e473b5cd8): the authoritative
+    // success response carries the per-input disposition.
     assert_eq!(
         response,
-        json!({"id": "p1", "type": "response", "command": "prompt", "success": true})
+        json!({
+            "id": "p1",
+            "type": "response",
+            "command": "prompt",
+            "success": true,
+            "data": {"disposition": "started"}
+        })
     );
 
     // Event sequence (rpc.md §Events).
@@ -519,6 +527,48 @@ async fn prompt_lifecycle_messages_state_stats() {
     assert!(data["cost"].as_f64().is_some());
     assert!(data["contextUsage"]["contextWindow"].as_u64().is_some());
 
+    assert_eq!(rpc.close_and_wait().await, 0);
+}
+
+/// V16-13 FR-E (rpc-mode.ts:401-415 @ e473b5cd8): an extension command
+/// consumes the prompt (`disposition: "handled"`) and no run starts — the
+/// client must not wait for `agent_settled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_extension_command_reports_handled_without_agent_settled() {
+    use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+    let factory: ExtensionFactory = Arc::new(|api| {
+        let handler: rpi_ext_host::types::CommandHandlerFn =
+            Arc::new(|_args, _ctx| Box::pin(async { Ok(()) }));
+        api.register_command("extcmd", None, handler)
+            .expect("register command");
+        Box::pin(async { Ok(()) })
+    });
+    let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new(
+        "/nonexistent-rpc-cwd",
+    ));
+    let errors = host
+        .load_inline(&[InlineExtension::Anonymous(factory)])
+        .await;
+    assert!(errors.is_empty(), "load errors: {errors:?}");
+
+    let mut rpc = start_rpc_with_host(FauxProviderOptions::default(), vec![], host).await;
+    rpc.send(&json!({"id": "h1", "type": "prompt", "message": "/extcmd"}))
+        .await;
+    let (response, events) = rpc.next_response_with_events(Some("h1")).await;
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["disposition"], "handled");
+    // No run/agent events may precede the response for a handled prompt.
+    assert!(
+        events.iter().all(|event| event["type"] != "agent_start"),
+        "a run started for a handled prompt: {events:?}"
+    );
+    // The next command's response is the next value on the stream: no
+    // `agent_settled` (or any run event) follows.
+    rpc.send(&json!({"id": "h2", "type": "get_state"})).await;
+    let next = rpc.next_value().await;
+    assert_eq!(next["type"], "response");
+    assert_eq!(next["id"], "h2");
     assert_eq!(rpc.close_and_wait().await, 0);
 }
 
@@ -1121,6 +1171,8 @@ async fn steer_follow_up_abort_during_streaming() {
         .await;
     let (response, events) = rpc.next_response_with_events(Some("p3")).await;
     assert_eq!(response["success"], true);
+    // V16-13 FR-E: a streamed prompt reports `queued`.
+    assert_eq!(response["data"]["disposition"], "queued");
     let queue = events
         .iter()
         .find(|e| e["type"] == "queue_update")
@@ -1130,12 +1182,17 @@ async fn steer_follow_up_abort_during_streaming() {
     // steer command (rpc.md §steer).
     rpc.send(&json!({"id": "st1", "type": "steer", "message": "steer note"}))
         .await;
-    assert_eq!(rpc.next_response(Some("st1")).await["success"], true);
+    let response = rpc.next_response(Some("st1")).await;
+    assert_eq!(response["success"], true);
+    // V16-13 FR-E: steer/follow_up report their `QueuedInputDisposition`.
+    assert_eq!(response["data"]["disposition"], "queued");
 
     // follow_up command (rpc.md §follow_up).
     rpc.send(&json!({"id": "fu1", "type": "follow_up", "message": "later"}))
         .await;
-    assert_eq!(rpc.next_response(Some("fu1")).await["success"], true);
+    let response = rpc.next_response(Some("fu1")).await;
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["disposition"], "queued");
 
     // abort stops the in-flight run (rpc.md §abort).
     rpc.send(&json!({"id": "ab1", "type": "abort"})).await;
@@ -1614,4 +1671,30 @@ async fn prompt_in_flight_at_eof_still_lands_its_response() {
         response.is_some(),
         "prompt response must land before shutdown returns; output:\n{out}"
     );
+}
+
+/// V16-13 任务特有门禁 1: the disposition contract is documented in
+/// `docs/json-rpc.md` with the same field names and values the wire tests
+/// assert (documentation and implementation share one source of truth).
+#[test]
+fn json_rpc_doc_pins_prompt_dispositions() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/json-rpc.md"),
+    )
+    .expect("docs/json-rpc.md");
+    for needle in [
+        "data.disposition",
+        "\"disposition\":\"started\"",
+        "streamingBehavior",
+        "`\"handled\"`",
+        "`\"queued\"`",
+        "`\"started\"`",
+        "agent_settled",
+        "`steer` / `follow_up`",
+    ] {
+        assert!(
+            doc.contains(needle),
+            "docs/json-rpc.md is missing {needle:?}"
+        );
+    }
 }

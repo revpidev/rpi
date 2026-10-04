@@ -29,60 +29,23 @@ pub const CODEMODE_STORE_ENTRY_TYPE: &str = "codemode-store";
 /// Default for `inlineBudget`, in estimated tokens.
 pub const DEFAULT_CODEMODE_INLINE_BUDGET: usize = 3000;
 
-/// `codemode.mode` (settings-manager.ts:103-108; key registration/validation
-/// is V16-13's FR-D, consumed here).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CodemodeMode {
-    #[default]
-    On,
-    Only,
-}
-
-/// The consumed settings surface (`codemode.mode` / `codemode.inlineBudget`).
-#[derive(Debug, Clone, Default)]
-pub struct CodemodeSettings {
-    pub mode: CodemodeMode,
-    /// `codemode.inlineBudget`: finite, non-negative; `None` = unset.
-    pub inline_budget: Option<u64>,
-}
+/// `codemode.mode` / `codemode.inlineBudget` types (settings-manager.ts:103-108).
+/// The key registration/validation lives in the settings manager (V16-13
+/// FR-D R1/R2); these re-exports keep the codemode consumer surface stable.
+pub use crate::core::settings_manager::{CodemodeMode, CodemodeSettings};
 
 /// Reads the current settings (the app wires this to the session's settings
-/// manager; V16-13 registers the keys).
+/// manager).
 pub type CodemodeSettingsFn = Arc<dyn Fn() -> CodemodeSettings + Send + Sync>;
 
-/// Consumption-only reader for `codemode.mode` / `codemode.inlineBudget`
-/// (key registration/validation is V16-13's FR-D). Project values override
-/// global ones per key; malformed values fall back to the defaults
-/// (`readMode`/`readInlineBudget`, codemode/index.ts:20-30).
+/// Reader for `codemode.mode` / `codemode.inlineBudget`
+/// (`readMode`/`readInlineBudget`, codemode/index.ts:20-30); the settings
+/// manager applies the validation and the project-over-global merge
+/// (V16-13 FR-D).
 pub fn settings_from_manager(
     manager: &crate::core::settings_manager::SettingsManager,
 ) -> CodemodeSettings {
-    let lookup = |key: &str| -> Option<serde_json::Value> {
-        let global = manager.get_global_settings();
-        let project = manager.get_project_settings();
-        let from = |settings: &crate::core::settings_manager::Settings| {
-            settings
-                .as_map()
-                .get("codemode")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|object| object.get(key))
-                .cloned()
-        };
-        from(&project).or_else(|| from(&global))
-    };
-    let mode = match lookup("mode").as_ref().and_then(serde_json::Value::as_str) {
-        Some("only") => CodemodeMode::Only,
-        _ => CodemodeMode::On,
-    };
-    let inline_budget = lookup("inlineBudget")
-        .as_ref()
-        .and_then(serde_json::Value::as_f64)
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .map(|value| value.floor() as u64);
-    CodemodeSettings {
-        mode,
-        inline_budget,
-    }
+    manager.get_codemode_settings()
 }
 
 /// `ToolInfo` view of one registered tool (`agent-session.ts:1465-1476`).

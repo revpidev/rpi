@@ -20,7 +20,7 @@ use rpi_agent::{Agent, AgentMessage, AgentOptions, AgentTool, InitialAgentState}
 use rpi_ai::types::{Message, Model, StreamOptions, TextContent};
 
 use crate::config::{get_agent_dir, get_default_session_dir_path};
-use crate::core::agent_session::{ALL_BUILTIN_TOOL_NAMES, AgentSession, AgentSessionConfig};
+use crate::core::agent_session::{AgentSession, AgentSessionConfig};
 use crate::core::agent_session_services::CreateAgentSessionServicesOptions;
 use crate::core::auth_guidance::format_no_models_available_message;
 use crate::core::extensions::{
@@ -359,25 +359,27 @@ pub async fn create_agent_session(
 
     // Tool set (sdk.ts:245-263 @ 4d9aa837c + 541045ae0):
     // `tools` (strict allowlist) > `noTools` (all/builtin → none) >
-    // `defaultTools` setting (project replaces global) > built-in defaults;
-    // `excludeTools` filters the result last.
-    let default_active_tool_names = ["read", "bash", "edit", "write"];
+    // `defaultTools` setting (already merged/resolved by the settings
+    // manager, V16-13 FR-C) > built-in defaults; `excludeTools` filters the
+    // result last. Extension tools such as `codemode`/`tool_search` are
+    // nameable here (R3.10.3).
+    let default_active_tool_names: Vec<String> = crate::core::settings_manager::DEFAULT_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
     let configured_default_tool_names: Option<Vec<String>> = {
         let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
         loader.settings_manager().get_default_tools()
     };
-    // `defaultTools` selects built-in tools only: names outside the known
-    // built-in set are ignored with a warning (rpi: `powershell` is not
-    // implemented — V14-13 FR-G decision; upstream ships the tool).
-    let configured_default_tool_names =
-        configured_default_tool_names.map(sanitize_default_tool_names);
     let excluded: Vec<String> = options.exclude_tools.clone().unwrap_or_default();
+    let uses_default_tools = options.tools.is_none() && options.no_tools.is_none();
     let initial_active_tool_names: Vec<String> = match &options.tools {
         Some(tools) => tools.clone(),
         None => match options.no_tools {
             Some(NoTools::All) | Some(NoTools::Builtin) => Vec::new(),
-            None => configured_default_tool_names
-                .unwrap_or_else(|| default_active_tool_names.map(str::to_owned).to_vec()),
+            None => {
+                configured_default_tool_names.unwrap_or_else(|| default_active_tool_names.clone())
+            }
         },
     }
     .into_iter()
@@ -819,6 +821,7 @@ pub async fn create_agent_session(
         custom_tools: options.custom_tools,
         model_runtime,
         initial_active_tool_names: Some(initial_active_tool_names),
+        uses_default_tools,
         allowed_tool_names,
         excluded_tool_names: options.exclude_tools,
         extension_runner_ref,
@@ -1011,25 +1014,6 @@ fn thinking_level_str(level: ThinkingLevel) -> &'static str {
     }
 }
 
-/// `defaultTools` name filter (sdk.ts:257-263 @ 4d9aa837c + rpi deviation,
-/// V14-12 FR-C R1): only known built-in names pass; unknown names —
-/// including `powershell`, which upstream ships (#8512) but rpi does not
-/// (V14-13 FR-G decision) — are dropped with a warning diagnostic.
-pub(crate) fn sanitize_default_tool_names(names: Vec<String>) -> Vec<String> {
-    names
-        .into_iter()
-        .filter(|name| {
-            let known = ALL_BUILTIN_TOOL_NAMES.contains(&name.as_str());
-            if !known {
-                tracing::warn!(
-                    "Ignoring unknown built-in tool name {name:?} in defaultTools setting"
-                );
-            }
-            known
-        })
-        .collect()
-}
-
 /// `ModelRuntime` satisfies the warmer's `streamSimple` view (#9668;
 /// cache-warmer.ts:162 `Pick<ModelRuntime, "streamSimple">`).
 impl crate::core::cache_warming::WarmingModels for ModelRuntime {
@@ -1049,18 +1033,37 @@ mod default_tools_tests {
     //! intent (initial selection + precedence matrix), tested at the
     //! settings/chain layers.
 
-    use super::*;
     use crate::core::settings_manager::{Settings, SettingsManager, SettingsManagerCreateOptions};
 
     #[test]
-    fn sanitize_keeps_known_builtins_and_warns_on_unknown() {
-        let kept = sanitize_default_tool_names(vec![
-            "grep".into(),
-            "find".into(),
-            "powershell".into(),
-            "sdk_tool".into(),
-        ]);
-        assert_eq!(kept, vec!["grep".to_string(), "find".to_string()]);
+    fn get_default_tools_resolves_modifiers_and_extension_names() {
+        // A modifier-only list adds to `DEFAULT_TOOL_NAMES`; extension tool
+        // names (`codemode`/`tool_search`) pass through unchanged
+        // (R3.10.3, V16-13 FR-C).
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "defaultTools".to_string(),
+            serde_json::Value::Array(
+                ["+codemode", "-write", "+tool_search"]
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+        let manager = SettingsManager::in_memory(
+            Settings::from_map(fields),
+            SettingsManagerCreateOptions::default(),
+        );
+        assert_eq!(
+            manager.get_default_tools(),
+            Some(vec![
+                "read".to_string(),
+                "bash".to_string(),
+                "edit".to_string(),
+                "codemode".to_string(),
+                "tool_search".to_string()
+            ])
+        );
     }
 
     #[test]

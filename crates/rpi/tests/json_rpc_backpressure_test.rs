@@ -394,9 +394,16 @@ async fn rpc_mode_backpressure_slow_consumer() {
         .filter(|line| line["type"].as_str() == Some("response"))
         .collect();
     assert_eq!(responses.len(), 1);
+    // V16-13 FR-E: the success response carries the disposition.
     assert_eq!(
         responses[0],
-        &json!({"id": "p1", "type": "response", "command": "prompt", "success": true})
+        &json!({
+            "id": "p1",
+            "type": "response",
+            "command": "prompt",
+            "success": true,
+            "data": {"disposition": "started"}
+        })
     );
 
     // Event order and delta-only shape on the wire.

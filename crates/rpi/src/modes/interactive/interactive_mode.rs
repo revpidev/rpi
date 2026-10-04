@@ -5912,10 +5912,12 @@ impl InteractiveMode {
                     self.session
                         .follow_up(&message.text, None, InputSource::Interactive)
                         .await
+                        .map(|_| ())
                 } else {
                     self.session
                         .steer(&message.text, None, InputSource::Interactive)
                         .await
+                        .map(|_| ())
                 }
             };
             let result = tokio::select! {
