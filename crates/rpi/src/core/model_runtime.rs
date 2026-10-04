@@ -6143,6 +6143,102 @@ mod virtual_model_tests {
         );
     }
 
+    /// A provider whose one model restricts thinking levels through a map.
+    struct MappedProvider {
+        auth: ProviderAuth,
+    }
+
+    impl Provider for MappedProvider {
+        fn id(&self) -> &str {
+            "mapped"
+        }
+        fn name(&self) -> &str {
+            "mapped"
+        }
+        fn base_url(&self) -> Option<&str> {
+            None
+        }
+        fn headers(&self) -> Option<&ProviderHeaders> {
+            None
+        }
+        fn auth(&self) -> &ProviderAuth {
+            &self.auth
+        }
+        fn get_models(&self) -> Vec<Model> {
+            let mut model = model("m-1", "mapped");
+            model.thinking_level_map = Some(
+                [
+                    (ModelThinkingLevel::Off, Some("off".to_owned())),
+                    (ModelThinkingLevel::Minimal, None),
+                    (ModelThinkingLevel::Low, Some("low".to_owned())),
+                    (ModelThinkingLevel::Medium, None),
+                    (ModelThinkingLevel::High, None),
+                    (ModelThinkingLevel::Xhigh, None),
+                    (ModelThinkingLevel::Max, None),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            vec![model]
+        }
+        fn stream(
+            &self,
+            model: &Model,
+            _context: &TranscriptContext,
+            _options: Option<StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            unsupported_api_stream(model)
+        }
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &TranscriptContext,
+            _options: Option<SimpleStreamOptions>,
+        ) -> Result<AssistantMessageEventStream, String> {
+            Err("not used".to_owned())
+        }
+    }
+
+    /// The routed thinking level clamps to the target model's supported
+    /// levels (`clampThinkingLevel`, `models.ts:1228-1247`).
+    #[tokio::test]
+    async fn resolve_model_clamps_the_routed_thinking_level() {
+        let runtime = runtime().await;
+        runtime
+            .register_native_provider(Arc::new(MappedProvider {
+                auth: ProviderAuth {
+                    api_key: Some(Arc::new(VirtualApiKeyAuth)),
+                    oauth: None,
+                },
+            }))
+            .await
+            .expect("register mapped provider");
+        runtime
+            .register_virtual_model(
+                virtual_definition("virt", "auto"),
+                route_fn(("mapped", "m-1"), "high"),
+            )
+            .await
+            .expect("register virtual");
+        let virtual_model = runtime.get_model("virt", "auto").expect("virtual");
+        let route = runtime
+            .resolve_model(
+                &virtual_model,
+                &[],
+                ResolveVirtualModelOptions {
+                    thinking_level: Some(ModelThinkingLevel::High),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("route resolves");
+        assert_eq!(
+            route.thinking_level,
+            ModelThinkingLevel::Low,
+            "high is unsupported and clamps down to the nearest level"
+        );
+    }
+
     /// `resolveModel` rejects non-physical and credential-less targets
     /// (`model-runtime.ts:1013-1024`).
     #[tokio::test]

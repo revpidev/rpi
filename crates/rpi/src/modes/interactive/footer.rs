@@ -203,10 +203,10 @@ impl FooterDataProvider {
 /// the leaf, so the results only change with the session, leaf, entry
 /// count, or the model whose context window applies.
 ///
-/// V16-12 cross-registration: upstream keys this on
-/// `routedModel?.model ?? session.model`; rpi has no routed model yet, so
-/// the session's current model is the key. V16-12 must switch the key (and
-/// `get_context_usage` upstream of it) to the routed model when it lands.
+/// V16-12: the key is `routed_model()?.model ?? session.model`
+/// (`footer.ts:107`), so the physical model that produced the latest
+/// response supplies the limits under a virtual selection (cross-
+/// registration with V16-09 closed).
 #[derive(Clone)]
 struct SessionStats {
     session_id: String,
@@ -1036,6 +1036,19 @@ mod tests {
             crate::modes::interactive::test_support::build_test_session_with(None, Some(host))
                 .await;
 
+        let footer = FooterComponent::new(
+            harness.session.clone(),
+            Arc::new(FooterDataProvider::new(&harness.cwd)),
+            theme(),
+        );
+        // Physical selection (the fixture's `custom/m1`): no routed segment,
+        // exactly like before V16-12.
+        let physical = strip_ansi(&footer.render(120)[1]);
+        assert!(
+            physical.contains("m1") && !physical.contains("→"),
+            "physical negative case: {physical}"
+        );
+
         let virtual_model = harness
             .session
             .model_runtime()
@@ -1050,11 +1063,6 @@ mod tests {
             .session
             .set_thinking_level(rpi_ai::types::ModelThinkingLevel::High);
 
-        let footer = FooterComponent::new(
-            harness.session.clone(),
-            Arc::new(FooterDataProvider::new(&harness.cwd)),
-            theme(),
-        );
         // No successful response yet: the routed segment is absent.
         let without_response = strip_ansi(&footer.render(120)[1]);
         assert!(

@@ -76,12 +76,14 @@ impl ApiKind {
 /// Legacy config-level alias: the pre-rename `"pi-messages"` spelling reads
 /// back as `"rpi-messages"`. The kind string never appears on the wire (the
 /// pi/rpi messages API is addressed via `{baseUrl}/messages`), so this is a
-/// pure models.json/catalog compatibility shim.
+/// pure models.json/catalog compatibility shim. The virtual-model API id
+/// (`pi-virtual` upstream, V16-12 §8-6) normalizes to its branded spelling
+/// the same way.
 fn normalize_api_kind(raw: String) -> String {
-    if raw == "pi-messages" {
-        "rpi-messages".to_owned()
-    } else {
-        raw
+    match raw.as_str() {
+        "pi-messages" => "rpi-messages".to_owned(),
+        "pi-virtual" | "rpi-virtual" => "rpi-virtual".to_owned(),
+        _ => raw,
     }
 }
 
@@ -3430,6 +3432,12 @@ mod tests {
         assert_eq!(to_json(&ApiKind::from("pi-messages")), "\"rpi-messages\"");
         let from_json: ApiKind = serde_json::from_str("\"pi-messages\"").unwrap();
         assert_eq!(from_json.as_str(), "rpi-messages");
+        // V16-12 §8-6: the upstream virtual-model API id normalizes to its
+        // branded spelling on every input path too.
+        assert_eq!(ApiKind::from("pi-virtual").as_str(), "rpi-virtual");
+        assert_eq!(to_json(&ApiKind::from("pi-virtual")), "\"rpi-virtual\"");
+        let from_json: ApiKind = serde_json::from_str("\"pi-virtual\"").unwrap();
+        assert_eq!(from_json.as_str(), "rpi-virtual");
         // Custom API strings stay possible (Api = KnownApi | (string & {})).
         assert_eq!(
             to_json(&ApiKind::from("my-custom-api")),

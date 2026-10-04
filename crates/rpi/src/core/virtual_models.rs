@@ -13,11 +13,12 @@
 //! [`crate::core::model_runtime::VirtualModelProvider`].
 //!
 //! Brand note (V16-12 §8-6 decision, de-pi policy of ADR-0001): the `api`
-//! value is `rpi-virtual` (upstream `pi-virtual` is accepted as an input
-//! alias in `rpi-ai`'s `ApiKind` normalization). The session-format tag
-//! `pi.virtual-model-state` intentionally keeps the upstream literal — rpi
-//! session format tags match upstream byte-for-byte (coding-agent
-//! `session.rs` red line).
+//! value is `rpi-virtual`. `rpi-ai`'s `ApiKind` normalization maps the
+//! upstream `pi-virtual` spelling to `rpi-virtual` on every input path
+//! (legacy alias, [`is_virtual_model`] also accepts the legacy spelling as
+//! a defensive fallback). The session-format tag `pi.virtual-model-state`
+//! intentionally keeps the upstream literal — rpi session format tags match
+//! upstream byte-for-byte (coding-agent `session.rs` red line).
 
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::session::{CustomEntry, ModelChangeEntry, SessionEntry};

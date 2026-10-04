@@ -763,7 +763,7 @@ async fn rejects_virtual_missing_and_unconfigured_route_targets() {
 }
 
 #[tokio::test]
-async fn clamps_the_routed_thinking_level_to_the_target_model() {
+async fn preserves_a_supported_routed_thinking_level() {
     let fixture = session_fixture(false, true, InitialModel::Default, None).await;
     fixture
         .session
