@@ -143,6 +143,21 @@ fn lock_abort(cell: &AbortTokenCell) -> std::sync::MutexGuard<'_, Option<Cancell
 /// attempt before the post-run compaction.
 pub type OmitRecoveryFn = Arc<dyn Fn(&AssistantMessage) + Send + Sync>;
 
+/// `_failedResponse` marker (V16-12 FR-B R7): records the failed response
+/// when an overflow-recovery compaction scheduled a retry
+/// (agent-session.ts:2998).
+pub type MarkFailedResponseFn = Arc<dyn Fn(&AssistantMessage) + Send + Sync>;
+
+/// `_getSummarizationRequestAuth` route slice (V16-12 FR-B R6,
+/// agent-session.ts:549-568): resolves the model + thinking level of a
+/// summary request (a virtual selection routes with reason `direct`), so
+/// the summary sizes its input and output from the model it gets.
+pub type SummarizationModelResolver = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<(Option<Model>, ThinkingLevel), String>>
+        + Send
+        + Sync,
+>;
+
 /// `_findPersistedMessageEntryId` (agent-session.ts:1189-1207 @ a13d35a74):
 /// value-equality scan over the branch, then the projected-index fallback.
 fn find_persisted_message_entry_id(
@@ -201,6 +216,14 @@ pub struct CompactionRunner {
     /// before the post-run compaction, so the canonical projection no longer
     /// contains it. Installed by `AgentSession`; `None` in bare fixtures.
     omit_recovery: Option<OmitRecoveryFn>,
+    /// `_failedResponse` marker (V16-12 FR-B R7): the overflow-recovery
+    /// compaction scheduled a retry, so the session keeps the failed
+    /// response for the retry's route payload (agent-session.ts:2998).
+    mark_failed_response: Option<MarkFailedResponseFn>,
+    /// `_getSummarizationRequestAuth` route slice (V16-12 FR-B R6,
+    /// agent-session.ts:549-568): resolves the model + thinking level of a
+    /// summary request; a virtual selection routes with reason `direct`.
+    summarization_model_resolver: Option<SummarizationModelResolver>,
 }
 
 impl CompactionRunner {
@@ -229,6 +252,8 @@ impl CompactionRunner {
             auto_active_token: AbortTokenCell::default(),
             extension_runner: None,
             omit_recovery: None,
+            mark_failed_response: None,
+            summarization_model_resolver: None,
         }
     }
 
@@ -245,6 +270,41 @@ impl CompactionRunner {
     /// (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ a13d35a74).
     pub fn set_omit_recovery(&mut self, omit: OmitRecoveryFn) {
         self.omit_recovery = Some(omit);
+    }
+
+    /// V16-12 FR-B R7: install the `_failedResponse` marker
+    /// (agent-session.ts:2998 — `if (retry) this._failedResponse = ...`).
+    pub fn set_mark_failed_response(&mut self, mark: MarkFailedResponseFn) {
+        self.mark_failed_response = Some(mark);
+    }
+
+    /// V16-12 FR-B R6: install the summarization-model resolver
+    /// (`_getSummarizationRequestAuth` route slice, agent-session.ts:549-568).
+    pub fn set_summarization_model_resolver(&mut self, resolver: SummarizationModelResolver) {
+        self.summarization_model_resolver = Some(resolver);
+    }
+
+    /// Resolve the summary request's model + thinking level. Without a
+    /// resolver (bare fixtures) the runner's current model/level are used.
+    async fn resolve_summarization_model(&self) -> Result<(Model, ThinkingLevel), RpiError> {
+        if let Some(resolve) = &self.summarization_model_resolver {
+            let (model, thinking_level) = resolve().await.map_err(RpiError::Session)?;
+            let Some(model) = model else {
+                return Err(RpiError::Session(format_no_model_selected_message()));
+            };
+            return Ok((model, thinking_level));
+        }
+        let Some(model) = self.model.clone() else {
+            return Err(RpiError::Session(format_no_model_selected_message()));
+        };
+        Ok((model, self.thinking_level))
+    }
+
+    /// `_runAutoCompaction("threshold", false)` trigger used by the routed
+    /// threshold check in `prepareRequest` (agent-session.ts:804-812).
+    pub async fn run_threshold_compaction(&mut self) -> bool {
+        self.run_auto_compaction(CompactionReason::Threshold, false)
+            .await
     }
 
     /// Current extension runner, if installed.
@@ -505,9 +565,9 @@ impl CompactionRunner {
     ) -> Result<CompactionResult, RpiError> {
         // `if (!this.model) throw new Error(formatNoModelSelectedMessage())`
         // (agent-session.ts:1790-1792).
-        let Some(model) = self.model.clone() else {
+        if self.model.is_none() {
             return Err(RpiError::Session(format_no_model_selected_message()));
-        };
+        }
         let path_entries = self.path_entries();
         let preparation = prepare_compaction(&path_entries, &self.settings).ok_or_else(|| {
             // Check why we can't compact (agent-session.ts:1801-1807).
@@ -532,9 +592,10 @@ impl CompactionRunner {
         let result = match extension_compaction {
             Some(compaction) => compaction,
             None => {
+                let (summary_model, summary_level) = self.resolve_summarization_model().await?;
                 let args = SummarizationArgs {
                     signal: Some(token.clone()),
-                    thinking_level: Some(self.thinking_level),
+                    thinking_level: Some(summary_level),
                     retry: self.retry,
                     ..Default::default()
                 };
@@ -543,7 +604,7 @@ impl CompactionRunner {
                 });
                 run_compact(
                     &preparation,
-                    &model,
+                    &summary_model,
                     custom_instructions,
                     &self.stream_fn,
                     &args,
@@ -789,9 +850,13 @@ impl CompactionRunner {
             if let Some(omit) = &self.omit_recovery {
                 omit(assistant_message);
             }
-            return self
+            let retry = self
                 .run_auto_compaction(CompactionReason::Overflow, will_retry)
                 .await;
+            if retry && let Some(mark) = &self.mark_failed_response {
+                mark(assistant_message);
+            }
+            return retry;
         }
 
         // Case 3: threshold (agent-session.ts:3016-3051 @ a13d35a74). For
@@ -896,9 +961,9 @@ impl CompactionRunner {
 
         let outcome: Result<bool, RpiError> = async {
             // `if (!this.model) return false` (agent-session.ts:2052-2054).
-            let Some(model) = self.model.clone() else {
+            if self.model.is_none() {
                 return Ok(false);
-            };
+            }
             let path_entries = self.path_entries();
             let Some(preparation) = prepare_compaction(&path_entries, &self.settings) else {
                 return Ok(false);
@@ -946,17 +1011,26 @@ impl CompactionRunner {
             let result = match extension_compaction {
                 Some(compaction) => compaction,
                 None => {
+                    let (summary_model, summary_level) =
+                        self.resolve_summarization_model().await?;
                     let args = SummarizationArgs {
                         signal: Some(token.clone()),
-                        thinking_level: Some(self.thinking_level),
+                        thinking_level: Some(summary_level),
                         retry: self.retry,
                         ..Default::default()
                     };
                     let callbacks =
                         self.summarization_retry_callbacks(RetrySource::Compaction { reason });
-                    run_compact(&preparation, &model, None, &self.stream_fn, &args, Some(&callbacks))
-                        .await
-                        .map_err(|error| RpiError::Session(error.to_string()))?
+                    run_compact(
+                        &preparation,
+                        &summary_model,
+                        None,
+                        &self.stream_fn,
+                        &args,
+                        Some(&callbacks),
+                    )
+                    .await
+                    .map_err(|error| RpiError::Session(error.to_string()))?
                 }
             };
 

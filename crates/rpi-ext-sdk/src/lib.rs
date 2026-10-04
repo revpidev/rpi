@@ -205,9 +205,20 @@ struct ToolRegistration {
     execute: ToolExecute,
 }
 
+/// A virtual-model registration (V16-12): the catalog definition is sent to
+/// the host on init; the route handler stays guest-side and answers the
+/// host→guest `virtualModelRoute` dispatch.
+struct VirtualModelRegistration {
+    provider: String,
+    id: String,
+    definition: Value,
+    route: std::sync::Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync>,
+}
+
 struct State {
     handlers: Vec<Registration>,
     tools: Vec<ToolRegistration>,
+    virtual_models: Vec<VirtualModelRegistration>,
     next_handler_id: u64,
     host_subscriptions: HostSubscriptions,
 }
@@ -219,6 +230,7 @@ fn state() -> std::sync::MutexGuard<'static, State> {
             std::sync::Mutex::new(State {
                 handlers: Vec::new(),
                 tools: Vec::new(),
+                virtual_models: Vec::new(),
                 next_handler_id: 0,
                 host_subscriptions: HostSubscriptions(std::collections::HashMap::new()),
             })
@@ -378,6 +390,54 @@ impl Extension {
             .map(|value| value.as_bool().unwrap_or(false))
     }
 
+    /// `pi.registerVirtualModel(model)` (V16-12, R3.11;
+    /// `virtual-models.ts:84-102`): register a virtual catalog entry whose
+    /// `route` handler picks a physical model + thinking level per request.
+    /// `definition` is the `VirtualModelDefinition` JSON
+    /// (`provider`/`id`/`name`/`thinkingLevels?`/`contextWindow?`/
+    /// `maxTokens?`/`input?`); `route` receives the `ModelRouteRequest`
+    /// JSON and returns the `ModelRoute` JSON
+    /// (`{model: {provider, id}, thinkingLevel, state?}`). The host stores
+    /// the state entry on the session branch; return `request.state` or
+    /// omit `state` to keep it.
+    pub fn virtual_model(
+        &mut self,
+        definition: Value,
+        route: impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
+    ) -> &mut Self {
+        let provider = definition
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let id = definition
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        state().virtual_models.push(VirtualModelRegistration {
+            provider,
+            id,
+            definition,
+            route: std::sync::Arc::new(route),
+        });
+        self
+    }
+
+    /// `pi.unregisterVirtualModel(provider, id)` (V16-12): remove a virtual
+    /// model this extension registered; unknown provider/id pairs are a
+    /// silent no-op.
+    pub fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<(), String> {
+        state()
+            .virtual_models
+            .retain(|entry| entry.provider != provider || entry.id != id);
+        host_call(
+            "unregisterVirtualModel",
+            json!({ "provider": provider, "id": id }),
+        )
+        .map(|_| ())
+    }
+
     /// `pi.registerMcpServer(name, config)` (V16-08 FR-E): register an MCP
     /// server this extension provides. The registration is not persisted;
     /// register again on every load. A server of the same name in `mcp.json`
@@ -490,6 +550,21 @@ pub fn finish_init() -> u64 {
             init_errors.push(error);
         }
     }
+    // V16-12: virtual-model definitions register on init; the route
+    // handlers stay guest-side for the `virtualModelRoute` dispatch.
+    let virtual_models: Vec<Value> = {
+        let state = state();
+        state
+            .virtual_models
+            .iter()
+            .map(|registration| registration.definition.clone())
+            .collect()
+    };
+    for definition in virtual_models {
+        if let Err(error) = host_call("registerVirtualModel", json!({ "definition": definition })) {
+            init_errors.push(error);
+        }
+    }
     if init_errors.is_empty() {
         pack_json(&json!({"ok": true}))
     } else {
@@ -595,6 +670,32 @@ pub fn route(message: Value) -> Option<Result<Value, String>> {
                     tool_call_id,
                 })),
             }
+        }
+        // V16-12: host→guest route call for a registered virtual model. The
+        // request names the virtual model selection, which identifies the
+        // handler; the guest-side state lock is released before invoking it
+        // (the handler may host-call).
+        "virtualModelRoute" => {
+            let request = message.get("request").cloned().unwrap_or(Value::Null);
+            let provider = request
+                .get("model")
+                .and_then(|model| model.get("provider"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let id = request
+                .get("model")
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let route = {
+                let state = state();
+                state
+                    .virtual_models
+                    .iter()
+                    .find(|entry| entry.provider == provider && entry.id == id)
+                    .map(|entry| entry.route.clone())
+            };
+            route.map(|route| route(request))
         }
         _ => None,
     }
@@ -750,5 +851,37 @@ mod tests {
         static ID_SLOT: std::cell::RefCell<Option<SubscriptionId>> =
             const { std::cell::RefCell::new(None) };
         static REGISTERED_WITH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// V16-12: a registered virtual model answers the host→guest
+    /// `virtualModelRoute` dispatch by provider/id; unknown selections are
+    /// a silent `null` (the host surfaces them as a routing error).
+    #[test]
+    fn virtual_model_dispatch_routes_to_the_registered_handler() {
+        let mut ext = Extension::new();
+        ext.virtual_model(
+            json!({"provider": "router", "id": "auto", "name": "Auto"}),
+            |request| {
+                Ok(json!({
+                    "model": {"provider": "faux", "id": request["reason"]},
+                    "thinkingLevel": "medium",
+                }))
+            },
+        );
+        let reply = dispatch_message(&json!({
+            "kind": "virtualModelRoute",
+            "request": {
+                "model": {"provider": "router", "id": "auto"},
+                "reason": "user",
+            },
+        }));
+        assert_eq!(reply["model"]["id"], "user");
+        assert_eq!(reply["thinkingLevel"], "medium");
+
+        let missing = dispatch_message(&json!({
+            "kind": "virtualModelRoute",
+            "request": {"model": {"provider": "router", "id": "other"}},
+        }));
+        assert!(missing.is_null());
     }
 }

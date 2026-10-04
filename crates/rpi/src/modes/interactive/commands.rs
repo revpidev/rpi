@@ -253,7 +253,19 @@ impl InteractiveUi {
                 lock(&self.theme).fg("dim", "Total:"),
                 stats.cost
             ));
-            if usage_breakdown.len() > 1 {
+            // A single entry repeats the total, unless it names a model
+            // other than the selected one (interactive-mode.ts:6671-6672):
+            // under a virtual selection the physical bucket never matches
+            // the selection key, so the breakdown stays expanded.
+            let selected_model_key = self
+                .session()
+                .model()
+                .map(|model| format!("{}/{}", model.provider, model.id));
+            let show_breakdown = usage_breakdown.len() > 1
+                || usage_breakdown
+                    .first()
+                    .is_none_or(|entry| Some(&entry.key) != selected_model_key.as_ref());
+            if show_breakdown {
                 for entry in &usage_breakdown {
                     let key_label = lock(&self.theme).fg("dim", &format!("{}:", entry.key));
                     let tokens_label = lock(&self.theme)
@@ -768,7 +780,7 @@ mod tests {
     use super::*;
     use crate::modes::interactive::interactive_mode::InteractiveModeOptions;
     use crate::modes::interactive::test_support::{
-        TestTerminal, build_test_session, install_noop_product_transports,
+        TestTerminal, build_test_session, build_test_session_with, install_noop_product_transports,
     };
     use rpi_agent::messages::AgentMessage;
     use rpi_ai::types::{ApiKind, AssistantMessage, AssistantRole, StopReason, Usage};
@@ -1545,6 +1557,112 @@ mod tests {
         assert_eq!(
             get_path_command_argument("/import 'x.jsonl'", "/import"),
             Some("x.jsonl".to_string())
+        );
+    }
+
+    /// A mode over a test session with an inline virtual-model router whose
+    /// route targets `custom/m1`.
+    async fn mode_harness_with_router() -> (InteractiveMode, Arc<TestTerminal>) {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+        let factory: ExtensionFactory = Arc::new(move |api: ExtensionApi| {
+            Box::pin(async move {
+                let route: rpi_ext_host::types::VirtualModelRouteFn = Arc::new(move |request| {
+                    Box::pin(async move {
+                        Ok(serde_json::json!({
+                            "model": { "provider": "custom", "id": "m1" },
+                            "thinkingLevel": request
+                                .get("thinkingLevel")
+                                .cloned()
+                                .unwrap_or(serde_json::json!("off")),
+                        }))
+                    })
+                });
+                api.register_virtual_model(
+                    serde_json::json!({
+                        "provider": "router", "id": "auto", "name": "Auto",
+                        "thinkingLevels": ["off", "high"],
+                        "contextWindow": 1000, "maxTokens": 1000,
+                    }),
+                    route,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/x"));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+        let harness = build_test_session_with(None, Some(host)).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        install_noop_product_transports(&mode);
+        (mode, terminal)
+    }
+
+    fn seed_costly_assistant(ui: &InteractiveUi) {
+        let AgentMessage::Assistant(mut message) =
+            assistant_message(vec![text_content("answer")], StopReason::Stop)
+        else {
+            unreachable!()
+        };
+        message.usage.input = 100;
+        message.usage.cost.total = 0.5;
+        let manager = ui.session().session_manager();
+        manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_message(AgentMessage::Assistant(message))
+            .expect("append assistant");
+    }
+
+    /// V16-12 FR-E R2: under a virtual selection the physical bucket key
+    /// never matches the selection, so a single bucket stays expanded
+    /// (interactive-mode.ts:6671-6672).
+    #[tokio::test]
+    async fn session_command_expands_the_cost_breakdown_under_a_virtual_selection() {
+        let (mode, _terminal) = mode_harness_with_router().await;
+        let ui = &mode.ui_state;
+        let virtual_model = ui
+            .session()
+            .model_runtime()
+            .get_model("router", "auto")
+            .expect("virtual model registered before restore");
+        ui.session()
+            .set_model(virtual_model)
+            .await
+            .expect("select virtual model");
+        seed_costly_assistant(ui);
+
+        ui.handle_session_command();
+        let rendered = strip_ansi(&chat_render(ui));
+        assert!(
+            rendered.contains("custom/m1: $0.500"),
+            "breakdown must expand: {rendered}"
+        );
+    }
+
+    /// A single physical bucket matching the (physical) selection stays
+    /// collapsed.
+    #[tokio::test]
+    async fn session_command_suppresses_a_single_matching_bucket() {
+        let (mode, _terminal) = mode_harness().await;
+        let ui = &mode.ui_state;
+        seed_costly_assistant(ui);
+
+        ui.handle_session_command();
+        let rendered = strip_ansi(&chat_render(ui));
+        assert!(rendered.contains("Total: $0.500"), "rendered: {rendered}");
+        assert!(
+            !rendered.contains("custom/m1:"),
+            "a single matching bucket stays collapsed: {rendered}"
         );
     }
 }

@@ -477,6 +477,16 @@ impl rpi_ext_host::api::HostActions for BlockingExecActions {
     }
     async fn unregister_provider(&self, _name: &str) {}
 
+    async fn register_virtual_model(
+        &self,
+        _definition: serde_json::Value,
+        _route: rpi_ext_host::types::VirtualModelRouteFn,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn unregister_virtual_model(&self, _provider: &str, _id: &str) {}
+
     async fn model_registry_complete(
         &self,
         _model: serde_json::Value,
@@ -487,6 +497,24 @@ impl rpi_ext_host::api::HostActions for BlockingExecActions {
     }
 
     fn model_registry_find(&self, _provider: &str, _model_id: &str) -> Option<serde_json::Value> {
+        None
+    }
+
+    fn model_registry_find_of_type(
+        &self,
+        _model_type: &str,
+        _provider: &str,
+        _model_id: &str,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
+    async fn model_registry_classify(
+        &self,
+        _model: serde_json::Value,
+        _context: serde_json::Value,
+        _options: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
         None
     }
 

@@ -282,9 +282,14 @@ impl FooterComponent {
                 manager.entry_count(),
             )
         };
-        // V16-12 cross-registration: this key becomes the routed model when
-        // virtual models land (see [`SessionStats`]).
-        let limits_model = self.session.model().map(|model| (model.provider, model.id));
+        // Upstream keys this on `routedModel?.model ?? session.model`
+        // (footer.ts:107 @ b485fa312): under a virtual selection the last
+        // physical response supplies the limits.
+        let limits_model = self
+            .session
+            .routed_model()
+            .map(|routed| (routed.model.provider, routed.model.id))
+            .or_else(|| self.session.model().map(|model| (model.provider, model.id)));
         {
             let cached = self.session_stats.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cached.as_ref()
@@ -503,6 +508,17 @@ impl Component for FooterComponent {
             } else {
                 format!("{right_side_without_provider} • {thinking_level}")
             };
+        }
+        // A virtual model routes each request; show where the latest response
+        // went (footer.ts:240-245). No routed model (physical selection or
+        // no response yet) leaves the line byte-identical to before.
+        if let Some(routed) = self.session.routed_model() {
+            let level = routed
+                .thinking_level
+                .map(|level| format!(" • {}", level.as_str()))
+                .unwrap_or_default();
+            right_side_without_provider =
+                format!("{right_side_without_provider} → {}{level}", routed.model.id);
         }
 
         let mut right_side = right_side_without_provider.clone();
@@ -975,6 +991,93 @@ mod tests {
         assert!(
             stats.contains(&format!("?/{} (auto)", format_tokens(200_000))),
             "context percent unknown after compaction: {stats}"
+        );
+    }
+
+    /// V16-12 FR-D: a virtual selection shows where the latest response went
+    /// (`auto • high → m1 • medium`); without a successful response the line
+    /// is unchanged.
+    #[tokio::test]
+    async fn virtual_selection_appends_the_routed_model_segment() {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+        let factory: ExtensionFactory = Arc::new(move |api: ExtensionApi| {
+            Box::pin(async move {
+                let route: rpi_ext_host::types::VirtualModelRouteFn = Arc::new(move |request| {
+                    Box::pin(async move {
+                        Ok(serde_json::json!({
+                            "model": { "provider": "custom", "id": "m1" },
+                            "thinkingLevel": request
+                                .get("thinkingLevel")
+                                .cloned()
+                                .unwrap_or(serde_json::json!("off")),
+                        }))
+                    })
+                });
+                api.register_virtual_model(
+                    serde_json::json!({
+                        "provider": "router", "id": "auto", "name": "Auto",
+                        "thinkingLevels": ["off", "low", "medium", "high"],
+                        "contextWindow": 1000, "maxTokens": 1000,
+                    }),
+                    route,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/x"));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+        let harness =
+            crate::modes::interactive::test_support::build_test_session_with(None, Some(host))
+                .await;
+
+        let virtual_model = harness
+            .session
+            .model_runtime()
+            .get_model("router", "auto")
+            .expect("virtual model registered before restore");
+        harness
+            .session
+            .set_model(virtual_model)
+            .await
+            .expect("select virtual model");
+        harness
+            .session
+            .set_thinking_level(rpi_ai::types::ModelThinkingLevel::High);
+
+        let footer = FooterComponent::new(
+            harness.session.clone(),
+            Arc::new(FooterDataProvider::new(&harness.cwd)),
+            theme(),
+        );
+        // No successful response yet: the routed segment is absent.
+        let without_response = strip_ansi(&footer.render(120)[1]);
+        assert!(
+            without_response.contains("auto • high") && !without_response.contains("→"),
+            "negative case: {without_response}"
+        );
+
+        // Seed a successful physical response with a recorded thinking level.
+        let rpi_agent::AgentMessage::Assistant(mut assistant) =
+            assistant_message(usage(10, 10, 0, 0, 0.0))
+        else {
+            unreachable!()
+        };
+        assistant.thinking_level = Some(rpi_ai::types::ModelThinkingLevel::Medium);
+        harness
+            .session
+            .agent()
+            .set_messages(vec![rpi_agent::AgentMessage::Assistant(assistant)]);
+
+        let stats = strip_ansi(&footer.render(120)[1]);
+        assert!(
+            stats.contains("auto • high → m1 • medium"),
+            "routed segment missing: {stats}"
         );
     }
 }

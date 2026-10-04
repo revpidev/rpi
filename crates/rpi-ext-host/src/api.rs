@@ -215,8 +215,16 @@ pub(crate) enum PendingRuntimeChange {
     RegisterNative {
         provider: Arc<dyn rpi_ai::models::Provider>,
     },
+    RegisterVirtual {
+        definition: Value,
+        route: crate::types::VirtualModelRouteFn,
+    },
     Unregister {
         name: String,
+    },
+    UnregisterVirtual {
+        provider: String,
+        id: String,
     },
 }
 
@@ -618,6 +626,23 @@ pub trait HostActions: Send + Sync {
     /// `unregisterProvider` post-bind direct call (runner.ts:401-407).
     async fn unregister_provider(&self, name: &str);
 
+    /// `registerVirtualModel(definition)` post-bind direct call
+    /// (runner.ts:497-513; `loader.ts:493-507`): register or replace a
+    /// virtual catalog entry. `definition` is the `VirtualModelDefinition`
+    /// JSON without `route`; `route` is the host→extension callback (the
+    /// JSON boundary cannot carry the upstream in-process closure). `Err` is
+    /// reported as a `"register_virtual_model"` extension error
+    /// (runner.ts:506-512).
+    async fn register_virtual_model(
+        &self,
+        definition: Value,
+        route: crate::types::VirtualModelRouteFn,
+    ) -> Result<(), String>;
+
+    /// `unregisterVirtualModel(provider, id)` post-bind direct call
+    /// (runner.ts:538-542).
+    async fn unregister_virtual_model(&self, provider: &str, id: &str);
+
     // -- v0.11 additions (model-registry.ts @ 4181f66) -----------------------
 
     /// `ctx.modelRegistry.complete(model, context, options)` — extension
@@ -633,6 +658,29 @@ pub trait HostActions: Send + Sync {
     /// `ctx.modelRegistry.find(provider, modelId)` — provider+id lookup
     /// (model-registry.ts:70). Returns `Model` JSON or `None`.
     fn model_registry_find(&self, provider: &str, model_id: &str) -> Option<Value>;
+
+    /// `ctx.modelRegistry.findOfType(type, provider, modelId)` — non-chat
+    /// catalog lookup (model-registry.ts:76-77 @ a13d35a74). `model_type`
+    /// is the wire tag `"chat" | "image" | "classifier"`; returns the
+    /// `AnyModel` JSON or `None` for an unknown type/entry.
+    fn model_registry_find_of_type(
+        &self,
+        model_type: &str,
+        provider: &str,
+        model_id: &str,
+    ) -> Option<Value>;
+
+    /// `ctx.modelRegistry.classify(model, context, options)` — structured
+    /// classification with request-time authentication
+    /// (model-registry.ts:173-179 @ a13d35a74). Never rejects: parse
+    /// failures return an error `ClassifierResult` JSON. Callback-bearing
+    /// options cannot cross the JSON boundary and are ignored.
+    async fn model_registry_classify(
+        &self,
+        model: Value,
+        context: Value,
+        options: Option<Value>,
+    ) -> Option<Value>;
 
     /// `ctx.modelRegistry.stream(model, context, options)` (#8964,
     /// 1f78cea7a — model-registry.ts:105-110): stream through the
@@ -1238,6 +1286,17 @@ pub struct PendingNativeProviderRegistration {
     pub extension_path: String,
 }
 
+/// A virtual-model registration queued before bind
+/// (`pendingVirtualModelRegistrations`, types.ts:1577-1579).
+#[derive(Clone)]
+pub struct PendingVirtualModelRegistration {
+    /// `VirtualModelDefinition` JSON without `route`.
+    pub definition: Value,
+    /// Host→extension route callback (`virtual-models.ts:84-102`).
+    pub route: crate::types::VirtualModelRouteFn,
+    pub extension_path: String,
+}
+
 /// Shared state created by the loader, bound by the host
 /// (`ExtensionRuntime`, types.ts:1660 = state + actions). Cloning shares the
 /// underlying state (the upstream runtime is a single mutable object every
@@ -1251,6 +1310,7 @@ struct RuntimeInner {
     flag_values: RwLock<HashMap<String, FlagValue>>,
     pending_provider_registrations: RwLock<Vec<PendingProviderRegistration>>,
     pending_native_provider_registrations: RwLock<Vec<PendingNativeProviderRegistration>>,
+    pending_virtual_model_registrations: RwLock<Vec<PendingVirtualModelRegistration>>,
     stale_message: RwLock<Option<String>>,
     actions: RwLock<Option<Arc<dyn HostActions>>>,
     context_actions: RwLock<Option<Arc<dyn ContextActions>>>,
@@ -1283,6 +1343,7 @@ impl ExtensionRuntime {
                 flag_values: RwLock::new(HashMap::new()),
                 pending_provider_registrations: RwLock::new(Vec::new()),
                 pending_native_provider_registrations: RwLock::new(Vec::new()),
+                pending_virtual_model_registrations: RwLock::new(Vec::new()),
                 stale_message: RwLock::new(None),
                 actions: RwLock::new(None),
                 context_actions: RwLock::new(None),
@@ -1457,6 +1518,49 @@ impl ExtensionRuntime {
         std::mem::take(&mut *write(
             &self.inner.pending_native_provider_registrations,
         ))
+    }
+
+    // -- virtual-model registration queue (loader.ts:225-231) --------------
+
+    /// Pre-bind: queue the registration. Post-bind: direct call through the
+    /// bound actions (runner.ts:497-513).
+    pub async fn register_virtual_model(
+        &self,
+        definition: Value,
+        route: crate::types::VirtualModelRouteFn,
+        extension_path: &str,
+    ) -> Result<(), String> {
+        if let Some(actions) = self.actions() {
+            return actions.register_virtual_model(definition, route).await;
+        }
+        write(&self.inner.pending_virtual_model_registrations).push(
+            PendingVirtualModelRegistration {
+                definition,
+                route,
+                extension_path: extension_path.to_owned(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Pre-bind: drop queued registrations for the provider/id pair
+    /// (loader.ts:228-231). Post-bind: direct call (runner.ts:538-542).
+    pub async fn unregister_virtual_model(&self, provider: &str, id: &str) {
+        if let Some(actions) = self.actions() {
+            actions.unregister_virtual_model(provider, id).await;
+            return;
+        }
+        write(&self.inner.pending_virtual_model_registrations).retain(|registration| {
+            let definition = &registration.definition;
+            definition.get("provider").and_then(Value::as_str) != Some(provider)
+                || definition.get("id").and_then(Value::as_str) != Some(id)
+        });
+    }
+
+    /// Queued virtual-model registrations, drained on bind
+    /// (runner.ts:497-513).
+    pub fn take_pending_virtual_model_registrations(&self) -> Vec<PendingVirtualModelRegistration> {
+        std::mem::take(&mut *write(&self.inner.pending_virtual_model_registrations))
     }
 
     // -- host binding (bindCore / setUIContext slots) ------------------------
@@ -2056,6 +2160,54 @@ pub struct LoadedExtension {
     /// The loaded native plugin backing this extension (L0 dynamic
     /// library, T15 W7); keeps the library mapped.
     native_plugin: RwLock<Option<crate::native::NativePlugin>>,
+    /// Route-callback reentrancy marker (V16-12 §8-1): set while a host call
+    /// synchronously drains a model request, so a `virtualModelRoute`
+    /// dispatch back into this same extension fails closed instead of
+    /// deadlocking.
+    route_guard: Arc<RouteGuard>,
+}
+
+/// Per-extension marker for a host call that is synchronously draining a
+/// model request (V16-12 §8-1).
+///
+/// A route callback that dispatches into the same guest/plugin while that
+/// guest is blocked inside such a host call would deadlock (the guest can
+/// only answer after the host call returns). The route closure checks this
+/// flag and returns a routing error instead.
+#[derive(Default)]
+pub struct RouteGuard {
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl RouteGuard {
+    pub fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Mark the current host call as route-blocking; the returned scope
+    /// restores the previous value on drop (host calls are serial per
+    /// extension, so nesting is only defensive).
+    pub fn enter(self: &Arc<Self>) -> RouteGuardScope {
+        let previous = self.active.swap(true, std::sync::atomic::Ordering::SeqCst);
+        RouteGuardScope {
+            guard: self.clone(),
+            previous,
+        }
+    }
+}
+
+/// RAII scope of [`RouteGuard::enter`].
+pub struct RouteGuardScope {
+    guard: Arc<RouteGuard>,
+    previous: bool,
+}
+
+impl Drop for RouteGuardScope {
+    fn drop(&mut self) {
+        self.guard
+            .active
+            .store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl LoadedExtension {
@@ -2095,7 +2247,13 @@ impl LoadedExtension {
             markdown_transformer: RwLock::new(None),
             wasm_guest: RwLock::new(None),
             native_plugin: RwLock::new(None),
+            route_guard: Arc::new(RouteGuard::default()),
         }
+    }
+
+    /// The route-callback reentrancy marker (V16-12 §8-1).
+    pub fn route_guard(&self) -> &Arc<RouteGuard> {
+        &self.route_guard
     }
 
     /// `hidden` flag (resource-loader.ts:905): named inline extensions may
@@ -2484,8 +2642,16 @@ impl ExtensionApi {
                     .register_native_provider(provider, &self.extension.path)
                     .await
                     .map_err(ExtError::Call)?,
+                PendingRuntimeChange::RegisterVirtual { definition, route } => self
+                    .runtime
+                    .register_virtual_model(definition, route, &self.extension.path)
+                    .await
+                    .map_err(ExtError::Call)?,
                 PendingRuntimeChange::Unregister { name } => {
                     self.runtime.unregister_provider(&name).await;
+                }
+                PendingRuntimeChange::UnregisterVirtual { provider, id } => {
+                    self.runtime.unregister_virtual_model(&provider, &id).await;
                 }
             }
         }
@@ -3025,6 +3191,46 @@ impl ExtensionApi {
         Ok(())
     }
 
+    /// `pi.registerVirtualModel(model)` (loader.ts:493-507 @ upstream
+    /// v0.99.0; `virtual-models.ts:84-102`): buffered during the factory,
+    /// applied on commit, dropped on discard. `route` is the host-side
+    /// callback created by the carrier's host-call layer (the JSON boundary
+    /// cannot carry the upstream in-process closure).
+    pub async fn register_virtual_model(
+        &self,
+        definition: Value,
+        route: crate::types::VirtualModelRouteFn,
+    ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
+        self.runtime.assert_active()?;
+        if self.load.is_loading() {
+            self.load
+                .push_runtime_change(PendingRuntimeChange::RegisterVirtual { definition, route });
+            return Ok(());
+        }
+        self.runtime
+            .register_virtual_model(definition, route, &self.extension.path)
+            .await
+            .map_err(ExtError::Call)?;
+        Ok(())
+    }
+
+    /// `pi.unregisterVirtualModel(provider, id)` (loader.ts:504-507).
+    pub async fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<(), ExtError> {
+        self.assert_api_active()?;
+        self.runtime.assert_active()?;
+        if self.load.is_loading() {
+            self.load
+                .push_runtime_change(PendingRuntimeChange::UnregisterVirtual {
+                    provider: provider.to_owned(),
+                    id: id.to_owned(),
+                });
+            return Ok(());
+        }
+        self.runtime.unregister_virtual_model(provider, id).await;
+        Ok(())
+    }
+
     // -- v0.11 model-registry actions (model-registry.ts @ 4181f66) ---------
 
     /// `ctx.modelRegistry.complete(model, context, options?)` — extension
@@ -3054,6 +3260,37 @@ impl ExtensionApi {
             .runtime
             .require_actions()?
             .model_registry_find(provider, model_id))
+    }
+
+    /// `ctx.modelRegistry.findOfType(type, provider, modelId)`
+    /// (model-registry.ts:76-77 @ a13d35a74).
+    pub fn model_registry_find_of_type(
+        &self,
+        model_type: &str,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<Option<Value>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .model_registry_find_of_type(model_type, provider, model_id))
+    }
+
+    /// `ctx.modelRegistry.classify(model, context, options?)` — never rejects;
+    /// invalid model/context JSON becomes an error `ClassifierResult`.
+    pub async fn model_registry_classify(
+        &self,
+        model: Value,
+        context: Value,
+        options: Option<Value>,
+    ) -> Result<Option<Value>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .model_registry_classify(model, context, options)
+            .await)
     }
 
     /// `ctx.modelRegistry.stream(model, context, options?)` (#8964,

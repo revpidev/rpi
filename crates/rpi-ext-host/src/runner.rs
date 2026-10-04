@@ -313,6 +313,21 @@ impl ExtensionRunnerCore {
                 ));
             }
         }
+        // Virtual-model registrations flush like providers (runner.ts:497-513
+        // @ upstream v0.99.0): failures are reported as
+        // `"register_virtual_model"` extension errors.
+        for registration in self.runtime.take_pending_virtual_model_registrations() {
+            if let Err(error) = actions
+                .register_virtual_model(registration.definition.clone(), registration.route.clone())
+                .await
+            {
+                self.emit_error(ExtensionError::new(
+                    &registration.extension_path,
+                    "register_virtual_model",
+                    error,
+                ));
+            }
+        }
         self.runtime.bind_actions(actions);
     }
 

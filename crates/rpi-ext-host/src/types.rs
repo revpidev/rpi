@@ -470,6 +470,20 @@ pub struct RegisteredMcpServer {
     pub extension_path: String,
 }
 
+/// Host→extension route callback for a registered virtual model (V16-12,
+/// R3.11; `virtual-models.ts:84-102` + `loader.ts:493-507`).
+///
+/// The upstream `route(request, ctx)` is an in-process TS callback; the rpi
+/// extension boundary is JSON, so the registration carries this callback
+/// separately — created where the guest's dispatch handle lives (the wasm
+/// L1 / native L0 host-call layer). It receives the `ModelRouteRequest` JSON
+/// (`virtual-models.ts:52-70`) and resolves to the `ModelRoute` JSON
+/// (`{model, thinkingLevel, state?}`; `virtual-models.ts:73-82`). The
+/// `ExtensionContext` second argument is host-side only and does not cross
+/// the boundary.
+pub type VirtualModelRouteFn =
+    Arc<dyn Fn(Value) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
+
 /// `mcpNamespace` (mcp-servers.ts:133): `mcp__<server>` with `-` replaced.
 fn mcp_namespace(server: &str) -> String {
     format!("mcp__{}", server.replace('-', "_"))

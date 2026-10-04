@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use rpi_ai::api::anthropic_messages::AnthropicMessages;
@@ -61,7 +62,7 @@ use rpi_ai::auth::types::{
 use rpi_ai::models::{
     CreateModelsOptions, CreateProviderOptions, Models, ModelsRefreshOptions, ModelsRefreshResult,
     ModelsSimpleStreamOptions, ModelsStreamOptions, Provider, ProviderApi, ProviderStreams,
-    RefreshModelsContext, create_provider,
+    RefreshModelsContext, clamp_thinking_level, create_provider,
 };
 use rpi_ai::models_json::{
     ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider, OrderedMap,
@@ -69,13 +70,15 @@ use rpi_ai::models_json::{
 use rpi_ai::models_store::{InMemoryModelsStore, JsonFileModelsStore, ModelsStore};
 use rpi_ai::types::{
     AnyModel, ApiKind, AssistantMessage, Context, ErrorReason, Model, ModelCompat, ModelCost,
-    ModelCostRates, ProviderEnv, ProviderHeaders, SimpleStreamOptions, StreamEvent, StreamOptions,
-    TranscriptContext,
+    ModelCostRates, ModelThinkingLevel, ProviderEnv, ProviderHeaders, SimpleStreamOptions,
+    StreamEvent, StreamOptions, TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
+use rpi_ext_host::types::VirtualModelRouteFn;
 
 use crate::config::{ENV_OFFLINE, get_agent_dir};
 use crate::core::remote_catalog_provider::{model_catalog_endpoint, with_remote_catalog};
+use crate::core::virtual_models::{self, VirtualModelDefinition};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -415,6 +418,20 @@ pub struct ModelRuntime {
     /// order is observable (initial-model fallback, available listings).
     native_providers: Mutex<OrderedMap<Arc<dyn Provider>>>,
     extension_providers: Mutex<OrderedMap<ProviderConfigInput>>,
+    /// Virtual models registered by extensions, kept separately from
+    /// provider models (`virtual-models.ts:201-237`); they compose into the
+    /// provider's catalog through [`VirtualModelProvider`].
+    virtual_models: Mutex<RuntimeVirtualModelRegistry>,
+    /// Weak self-reference so `&self` methods can hand a `'static` clone to
+    /// lazy stream setup (the direct `streamSimple` route); set once in
+    /// [`ModelRuntime::create`].
+    self_ref: std::sync::OnceLock<std::sync::Weak<ModelRuntime>>,
+    /// `prepareRequest` routing failures handed to the request stream per
+    /// session (V16-12 FR-B R4): the rpi `prepareRequest` hook has no error
+    /// channel, so the failure is recorded here and the session's stream
+    /// function answers it instead of calling the router again. Cleared by
+    /// the next preparation attempt or by the matching stream read.
+    virtual_route_failures: Mutex<HashMap<String, (String, String, String)>>,
     composition_errors: Mutex<OrderedMap<String>>,
     availability_error: Mutex<Option<String>>,
     snapshot: RwLock<ModelRuntimeSnapshot>,
@@ -938,6 +955,343 @@ impl Provider for RefreshDelegatingProvider {
             )),
         }
     }
+}
+
+/// A registered virtual model: its catalog entry plus the host route
+/// callback (`virtual-models.ts:84-102`, `model-runtime.ts:955-971`).
+#[derive(Clone)]
+pub struct RegisteredVirtualModel {
+    pub model: Model,
+    pub route: VirtualModelRouteFn,
+}
+
+/// `RuntimeVirtualModelRegistry` (`model-runtime.ts:179`): provider →
+/// virtual model entries with `Map.set` replacement semantics and the
+/// provider map's insertion order preserved.
+#[derive(Default)]
+struct RuntimeVirtualModelRegistry(Vec<(String, Vec<RegisteredVirtualModel>)>);
+
+impl RuntimeVirtualModelRegistry {
+    fn provider_ids(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|(provider, _)| provider)
+    }
+
+    fn entries(&self, provider_id: &str) -> Option<&Vec<RegisteredVirtualModel>> {
+        self.0
+            .iter()
+            .find(|(provider, _)| provider == provider_id)
+            .map(|(_, entries)| entries)
+    }
+
+    fn route(&self, provider_id: &str, model_id: &str) -> Option<&VirtualModelRouteFn> {
+        self.entries(provider_id)?
+            .iter()
+            .find(|entry| entry.model.id == model_id)
+            .map(|entry| &entry.route)
+    }
+
+    /// `Map.set`: replace the same provider+id in place, otherwise append.
+    fn set(&mut self, provider_id: &str, model_id: &str, entry: RegisteredVirtualModel) {
+        if let Some((_, entries)) = self
+            .0
+            .iter_mut()
+            .find(|(provider, _)| provider == provider_id)
+        {
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|existing| existing.model.id == model_id)
+            {
+                *existing = entry;
+                return;
+            }
+            entries.push(entry);
+            return;
+        }
+        self.0.push((provider_id.to_owned(), vec![entry]));
+    }
+
+    /// `Map.delete`: removes the entry; drops the provider when it was the
+    /// last one. Returns whether an entry was removed.
+    fn remove(&mut self, provider_id: &str, model_id: &str) -> bool {
+        let Some(index) = self
+            .0
+            .iter()
+            .position(|(provider, _)| provider == provider_id)
+        else {
+            return false;
+        };
+        let entries = &mut self.0[index].1;
+        let Some(entry_index) = entries.iter().position(|entry| entry.model.id == model_id) else {
+            return false;
+        };
+        entries.remove(entry_index);
+        if entries.is_empty() {
+            self.0.remove(index);
+        }
+        true
+    }
+}
+
+/// Keyless auth of a provider defined only by virtual models
+/// (`virtual-models.ts:207-213`): the provider is configured without
+/// credentials.
+struct VirtualApiKeyAuth;
+
+#[async_trait::async_trait]
+impl ApiKeyAuth for VirtualApiKeyAuth {
+    fn name(&self) -> &str {
+        "Virtual model"
+    }
+
+    fn has_check(&self) -> bool {
+        true
+    }
+
+    async fn check(
+        &self,
+        _ctx: &dyn AuthContext,
+        _credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthCheck>, ModelsError> {
+        Ok(Some(AuthCheck {
+            source: Some("virtual".to_owned()),
+            kind: AuthType::ApiKey,
+        }))
+    }
+
+    async fn resolve(
+        &self,
+        _ctx: &dyn AuthContext,
+        _credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthResult>, ModelsError> {
+        Ok(Some(AuthResult {
+            auth: ModelAuth::default(),
+            env: None,
+            source: Some("virtual".to_owned()),
+        }))
+    }
+}
+
+/// `withVirtualModels` (`virtual-models.ts:201-237`): add virtual models to
+/// a provider's catalog. Without a base provider the result is a keyless
+/// provider that only lists the virtual models. A virtual model hides a
+/// physical chat model with the same id, which a catalog refresh can add
+/// after registration. Availability follows the provider's auth.
+pub(crate) struct VirtualModelProvider {
+    id: String,
+    base: Option<Arc<dyn Provider>>,
+    /// Precomputed virtual catalog entries in registration order.
+    virtuals: Vec<Model>,
+    /// Virtual model ids (shadow filter + stream switch).
+    virtual_ids: HashSet<String>,
+    /// Effective auth: the base's when present, otherwise the keyless
+    /// virtual auth.
+    auth: ProviderAuth,
+}
+
+impl VirtualModelProvider {
+    pub(crate) fn new(
+        provider_id: &str,
+        base: Option<Arc<dyn Provider>>,
+        virtuals: &[RegisteredVirtualModel],
+    ) -> Self {
+        let auth = match &base {
+            Some(base) => base.auth().clone(),
+            None => ProviderAuth {
+                api_key: Some(Arc::new(VirtualApiKeyAuth)),
+                oauth: None,
+            },
+        };
+        Self {
+            id: provider_id.to_owned(),
+            base,
+            virtuals: virtuals.iter().map(|entry| entry.model.clone()).collect(),
+            virtual_ids: virtuals
+                .iter()
+                .map(|entry| entry.model.id.clone())
+                .collect(),
+            auth,
+        }
+    }
+
+    /// `physical()` for chat models (`virtual-models.ts:220-221`): drop
+    /// virtual entries and chat entries whose id a virtual model shadows.
+    fn physical_chat(&self, models: Vec<Model>) -> Vec<Model> {
+        models
+            .into_iter()
+            .filter(|model| {
+                !virtual_models::is_virtual_model(model) && !self.virtual_ids.contains(&model.id)
+            })
+            .collect()
+    }
+
+    /// `physical()` for the all-types catalog: non-chat entries pass through.
+    fn physical_any(&self, models: Vec<AnyModel>) -> Vec<AnyModel> {
+        models
+            .into_iter()
+            .filter(|model| match model {
+                AnyModel::Chat(chat) => {
+                    !virtual_models::is_virtual_model(chat) && !self.virtual_ids.contains(&chat.id)
+                }
+                _ => true,
+            })
+            .collect()
+    }
+}
+
+impl Provider for VirtualModelProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        self.base
+            .as_ref()
+            .map(|base| base.name())
+            .unwrap_or(&self.id)
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        self.base.as_ref().and_then(|base| base.base_url())
+    }
+
+    fn headers(&self) -> Option<&ProviderHeaders> {
+        self.base.as_ref().and_then(|base| base.headers())
+    }
+
+    fn auth(&self) -> &ProviderAuth {
+        &self.auth
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        let mut models = self
+            .base
+            .as_ref()
+            .map(|base| self.physical_chat(base.get_models()))
+            .unwrap_or_default();
+        models.extend(self.virtuals.iter().cloned());
+        models
+    }
+
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        let mut models = self
+            .base
+            .as_ref()
+            .map(|base| self.physical_any(base.get_all_models()))
+            .unwrap_or_default();
+        models.extend(self.virtuals.iter().cloned().map(AnyModel::Chat));
+        models
+    }
+
+    fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
+        let physical = self.physical_chat(models);
+        let mut result = match &self.base {
+            Some(base) => base.filter_models(physical, credential),
+            None => physical,
+        };
+        result.extend(self.virtuals.iter().cloned());
+        result
+    }
+
+    fn refresh_models(
+        &self,
+        context: RefreshModelsContext,
+    ) -> Option<BoxFuture<'_, Result<(), ModelsError>>> {
+        // Overlays keep the base's dynamic catalog refresh
+        // (provider-composer.ts:475-478).
+        self.base
+            .as_ref()
+            .and_then(|base| base.refresh_models(context))
+    }
+
+    fn stream(
+        &self,
+        model: &Model,
+        context: &TranscriptContext,
+        options: Option<StreamOptions>,
+    ) -> AssistantMessageEventStream {
+        if virtual_models::is_virtual_model(model) {
+            return virtual_models::unrouted_stream(model);
+        }
+        match &self.base {
+            Some(base) => base.stream(model, context, options),
+            None => unsupported_api_stream(model),
+        }
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &TranscriptContext,
+        options: Option<SimpleStreamOptions>,
+    ) -> Result<AssistantMessageEventStream, String> {
+        if virtual_models::is_virtual_model(model) {
+            return Ok(virtual_models::unrouted_stream(model));
+        }
+        match &self.base {
+            Some(base) => base.stream_simple(model, context, options),
+            None => Err(format!(
+                "No API provider registered for api: {}",
+                model.api.as_str()
+            )),
+        }
+    }
+
+    fn generate_images(
+        &self,
+        model: &rpi_ai::types::ImageModel,
+        context: &rpi_ai::types::ImagesContext,
+        options: Option<&rpi_ai::types::ImagesOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::AssistantImages>> {
+        self.base
+            .as_ref()
+            .and_then(|base| base.generate_images(model, context, options))
+    }
+
+    fn classify(
+        &self,
+        model: &rpi_ai::types::ClassifierModel,
+        context: &rpi_ai::types::ClassifierContext,
+        options: Option<&rpi_ai::types::ClassifierOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::ClassifierResult>> {
+        self.base
+            .as_ref()
+            .and_then(|base| base.classify(model, context, options))
+    }
+
+    fn image_generator(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderImageGenerator>> {
+        self.base
+            .as_ref()
+            .and_then(|base| base.image_generator(api))
+    }
+
+    fn classifier(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderClassifier>> {
+        self.base.as_ref().and_then(|base| base.classifier(api))
+    }
+}
+
+/// Result of [`ModelRuntime::resolve_model`]: the routed physical model and
+/// thinking level for one request (`model-runtime.ts:994-1025`).
+#[derive(Debug, Clone)]
+pub struct ResolvedVirtualRoute {
+    pub model: Model,
+    pub thinking_level: ModelThinkingLevel,
+    /// New router state; stored on the session branch by the caller.
+    pub state: Option<Value>,
+}
+
+/// Inputs of [`ModelRuntime::resolve_model`] besides the model/messages
+/// (`model-runtime.ts:1003-1012`).
+#[derive(Default)]
+pub struct ResolveVirtualModelOptions<'a> {
+    pub reason: Option<virtual_models::ModelRouteReason>,
+    pub thinking_level: Option<ModelThinkingLevel>,
+    /// For `retry`: the failed response (its `stopReason`/`errorMessage`
+    /// ride `message`). `messages` no longer contains it.
+    pub failed: Option<&'a AssistantMessage>,
+    pub failed_thinking_level: Option<ModelThinkingLevel>,
+    /// Router state last returned on this session branch.
+    pub state: Option<Value>,
+    pub signal: Option<CancellationToken>,
 }
 
 /// `mergeCompat` (provider-composer.ts:78-98): shallow field override, with
@@ -1467,6 +1821,9 @@ impl ModelRuntime {
             model_refresh_timeout_ms,
             native_providers: Mutex::new(OrderedMap::default()),
             extension_providers: Mutex::new(OrderedMap::default()),
+            virtual_models: Mutex::new(RuntimeVirtualModelRegistry::default()),
+            self_ref: std::sync::OnceLock::new(),
+            virtual_route_failures: Mutex::new(HashMap::new()),
             composition_errors: Mutex::new(OrderedMap::default()),
             availability_error: Mutex::new(None),
             snapshot: RwLock::new(ModelRuntimeSnapshot::default()),
@@ -1476,6 +1833,9 @@ impl ModelRuntime {
             provider_availability_seq: Mutex::new(HashMap::new()),
             credential_operations: Mutex::new(HashMap::new()),
         });
+        // Allow `&self` methods to capture a `'static` clone (the direct
+        // `streamSimple` route needs the runtime across a lazy stream).
+        let _ = runtime.self_ref.set(Arc::downgrade(&runtime));
         // Seed the built-in providers (model-runtime.ts:181-190): every
         // static catalog provider is wrapped in the persisted remote-catalog
         // overlay (`withRemoteCatalog`); radius carries its own static public
@@ -1539,6 +1899,11 @@ impl ModelRuntime {
             push(id);
         }
         for id in lock(&self.extension_providers).keys() {
+            push(id);
+        }
+        // A provider defined only by virtual models still enumerates
+        // (`model-runtime.ts:283-291`).
+        for id in lock(&self.virtual_models).provider_ids() {
             push(id);
         }
         ids
@@ -1678,13 +2043,43 @@ impl ModelRuntime {
         })
     }
 
+    /// `recomposeProvider` (model-runtime.ts:280-296): compose the provider
+    /// without virtual models, then wrap with them when any are registered
+    /// (a virtual-only provider becomes a keyless provider).
     fn recompose_provider(&self, provider_id: &str) {
         let base = lock(&self.native_providers).get(provider_id).cloned();
         let config = lock(&self.config).get_provider(provider_id).cloned();
         let extension = lock(&self.extension_providers).get(provider_id).cloned();
+        let virtuals = lock(&self.virtual_models)
+            .entries(provider_id)
+            .cloned()
+            .unwrap_or_default();
 
-        if base.is_none() && config.is_none() && extension.is_none() {
+        let wrap = |provider: Arc<dyn Provider>| -> Arc<dyn Provider> {
+            if virtuals.is_empty() {
+                provider
+            } else {
+                Arc::new(VirtualModelProvider::new(
+                    provider_id,
+                    Some(provider),
+                    &virtuals,
+                ))
+            }
+        };
+
+        if base.is_none() && config.is_none() && extension.is_none() && virtuals.is_empty() {
             self.models.delete_provider(provider_id);
+            lock(&self.composition_errors).remove(provider_id);
+            return;
+        }
+        if base.is_none() && config.is_none() && extension.is_none() {
+            // A provider of only virtual models needs no credentials
+            // (`virtual-models.ts:206-214`).
+            self.models.set_provider(Arc::new(VirtualModelProvider::new(
+                provider_id,
+                None,
+                &virtuals,
+            )));
             lock(&self.composition_errors).remove(provider_id);
             return;
         }
@@ -1692,7 +2087,7 @@ impl ModelRuntime {
             // No overlays: use the native provider untouched
             // (model-runtime.ts:208-212).
             if let Some(base) = base {
-                self.models.set_provider(base);
+                self.models.set_provider(wrap(base));
             }
             lock(&self.composition_errors).remove(provider_id);
             return;
@@ -1704,13 +2099,13 @@ impl ModelRuntime {
             extension.as_ref(),
         ) {
             Ok(provider) => {
-                self.models.set_provider(provider);
+                self.models.set_provider(wrap(provider));
                 lock(&self.composition_errors).remove(provider_id);
             }
             Err(error) => {
                 lock(&self.composition_errors).insert(provider_id.to_owned(), error);
                 match base {
-                    Some(base) => self.models.set_provider(base),
+                    Some(base) => self.models.set_provider(wrap(base)),
                     None => self.models.delete_provider(provider_id),
                 }
             }
@@ -2480,14 +2875,76 @@ impl ModelRuntime {
         self.models.complete(model, context, options).await
     }
 
-    /// `streamSimple` (model-runtime.ts:492-497).
+    /// `streamSimple` (model-runtime.ts:717-735): requests outside the agent
+    /// loop are routed here when `model` is virtual — callers sized them
+    /// before routing, so the output budget is capped to the routed model,
+    /// and caller credentials resolved for the virtual model's provider are
+    /// not sent to another vendor.
     pub fn stream_simple(
         &self,
         model: &Model,
         context: &Context,
         options: Option<ModelsSimpleStreamOptions>,
     ) -> AssistantMessageEventStream {
-        self.models.stream_simple(model, context, options)
+        if !virtual_models::is_virtual_model(model) {
+            return self.models.stream_simple(model, context, options);
+        }
+        let Some(this) = self.self_arc() else {
+            // Defensive: an unseeded runtime cannot resolve a route; the
+            // unrouted provider answer names the same error.
+            return self.models.stream_simple(model, context, options);
+        };
+        let route_model = model.clone();
+        let context = context.clone();
+        rpi_ai::api::lazy::lazy_stream(model, async move {
+            let transcript = rpi_ai::utils::transcript::normalize_context(&context);
+            let requested_level = options
+                .as_ref()
+                .and_then(|options| options.simple.reasoning)
+                .map(rpi_ai::types::ThinkingLevel::to_model_level)
+                .unwrap_or(ModelThinkingLevel::Off);
+            let signal = options
+                .as_ref()
+                .and_then(|options| options.simple.stream.request.signal.clone());
+            let route = this
+                .resolve_model(
+                    &route_model,
+                    &transcript.messages,
+                    ResolveVirtualModelOptions {
+                        reason: Some(virtual_models::ModelRouteReason::Direct),
+                        thinking_level: Some(requested_level),
+                        signal,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| ModelsError::new(ModelsErrorCode::Stream, error))?;
+            let limit = route.model.max_tokens;
+            let mut next = options.unwrap_or_default();
+            if route.model.provider != route_model.provider {
+                // Another provider resolves its own, so the caller's are not
+                // sent to the wrong vendor (model-runtime.ts:729-732).
+                next.simple.stream.request.api_key = None;
+                next.simple.stream.request.headers = None;
+                next.simple.stream.request.env = None;
+            }
+            next.simple.stream.max_tokens = match next.simple.stream.max_tokens {
+                Some(requested) if limit > 0 => Some(requested.min(limit)),
+                requested => requested,
+            };
+            next.simple.reasoning = (route.thinking_level != ModelThinkingLevel::Off)
+                .then(|| rpi_ai::types::ThinkingLevel::from_model_level(route.thinking_level))
+                .flatten();
+            Ok(this
+                .models
+                .stream_simple(&route.model, &context, Some(next)))
+        })
+    }
+
+    /// Weak self-reference for `'static` captures (see
+    /// [`ModelRuntime::self_ref`]).
+    fn self_arc(&self) -> Option<Arc<ModelRuntime>> {
+        self.self_ref.get().and_then(|weak| weak.upgrade())
     }
 
     pub async fn complete_simple(
@@ -2643,6 +3100,198 @@ impl ModelRuntime {
             ..Default::default()
         }))
         .await;
+    }
+
+    // ------------------------------------------------------------------
+    // Virtual models (virtual-models.ts / model-runtime.ts:955-1025)
+    // ------------------------------------------------------------------
+
+    /// `registerVirtualModel` (model-runtime.ts:955-974): register a virtual
+    /// model under `definition.provider`, which may also list physical
+    /// models or several virtual models. Re-registering the same provider and
+    /// id replaces the virtual model. Errors when the id belongs to a
+    /// physical model of that provider.
+    ///
+    /// `route` is the host→extension callback; the JSON definition cannot
+    /// carry the upstream in-process closure.
+    pub async fn register_virtual_model(
+        &self,
+        definition: Value,
+        route: VirtualModelRouteFn,
+    ) -> Result<(), String> {
+        let definition: VirtualModelDefinition =
+            serde_json::from_value(definition).map_err(|error| error.to_string())?;
+        if definition.provider.trim().is_empty() || definition.id.trim().is_empty() {
+            return Err("Virtual model provider and id must not be empty.".to_owned());
+        }
+        if let Some(existing) = self.models.get_model(&definition.provider, &definition.id)
+            && !virtual_models::is_virtual_model(&existing)
+        {
+            return Err(format!(
+                "Virtual model {}/{} conflicts with a physical model.",
+                definition.provider, definition.id
+            ));
+        }
+        let model = virtual_models::create_virtual_model(&definition);
+        lock(&self.virtual_models).set(
+            &definition.provider,
+            &definition.id,
+            RegisteredVirtualModel { model, route },
+        );
+        self.recompose_provider(&definition.provider);
+        self.update_model_snapshot();
+        self.refresh(Some(ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: None,
+            signal: None,
+            ..Default::default()
+        }))
+        .await;
+        Ok(())
+    }
+
+    /// `unregisterVirtualModel` (model-runtime.ts:976-983): remove a virtual
+    /// model; unknown provider/id pairs are a no-op. The provider is not
+    /// deleted unless it only consisted of virtual models.
+    pub async fn unregister_virtual_model(&self, provider_id: &str, model_id: &str) {
+        if !lock(&self.virtual_models).remove(provider_id, model_id) {
+            return;
+        }
+        self.recompose_provider(provider_id);
+        self.update_model_snapshot();
+        self.refresh(Some(ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: None,
+            signal: None,
+            ..Default::default()
+        }))
+        .await;
+    }
+
+    /// `getPhysicalModel` (model-runtime.ts:1027-1030): a catalog chat model
+    /// that is not virtual. A virtual model shadows a physical chat model
+    /// with the same id, so the composed catalog never returns both.
+    pub fn get_physical_model(&self, provider_id: &str, model_id: &str) -> Option<Model> {
+        let model = self.models.get_model(provider_id, model_id)?;
+        (!virtual_models::is_virtual_model(&model)).then_some(model)
+    }
+
+    /// Record a `prepareRequest` routing failure for the session's next
+    /// request stream (V16-12 FR-B R4). The upstream hook rejects and
+    /// `handleRunFailure` synthesizes the error response; the rpi hook has
+    /// no error channel, so the request stream answers with this message.
+    pub fn record_virtual_route_failure(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        message: &str,
+    ) {
+        lock(&self.virtual_route_failures).insert(
+            session_id.to_owned(),
+            (
+                provider_id.to_owned(),
+                model_id.to_owned(),
+                message.to_owned(),
+            ),
+        );
+    }
+
+    /// Clear a pending routing failure — a new preparation attempt for the
+    /// session supersedes it.
+    pub fn clear_virtual_route_failure(&self, session_id: &str) {
+        lock(&self.virtual_route_failures).remove(session_id);
+    }
+
+    /// Take the pending routing failure for this session and virtual model;
+    /// a failure recorded for a different selection stays put.
+    pub fn take_virtual_route_failure(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<String> {
+        let mut failures = lock(&self.virtual_route_failures);
+        let matches = failures
+            .get(session_id)
+            .is_some_and(|(provider, id, _)| provider == provider_id && id == model_id);
+        if !matches {
+            return None;
+        }
+        failures.remove(session_id).map(|(_, _, message)| message)
+    }
+
+    /// `resolveModel` (model-runtime.ts:994-1025): ask a virtual model's
+    /// router for the model and thinking level of one request. The router
+    /// must return a physical catalog model whose provider has credentials;
+    /// the thinking level is clamped to that model. Errors when routing
+    /// fails.
+    ///
+    /// `messages` is the request conversation (LLM shape); `previous` is
+    /// derived from its latest successful assistant response, and
+    /// `options.failed` carries the failed response for retries (which
+    /// `messages` no longer contains).
+    pub async fn resolve_model(
+        &self,
+        model: &Model,
+        messages: &[rpi_ai::types::Message],
+        options: ResolveVirtualModelOptions<'_>,
+    ) -> Result<ResolvedVirtualRoute, String> {
+        let name = format!("Virtual model {}/{}", model.provider, model.id);
+        let Some(route) = lock(&self.virtual_models)
+            .route(&model.provider, &model.id)
+            .cloned()
+        else {
+            return Err(format!("{name} is not registered."));
+        };
+        let latest = virtual_models::find_latest_response(messages);
+        // A failed routing attempt names the virtual model; there is no
+        // physical request to report (model-runtime.ts:1009-1017).
+        let previous = latest.and_then(|assistant| {
+            self.get_physical_model(&assistant.provider, &assistant.model)
+                .map(|physical| (physical, assistant.thinking_level))
+        });
+        let failed = options.failed.and_then(|failed| {
+            self.get_physical_model(&failed.provider, &failed.model)
+                .map(|physical| (physical, options.failed_thinking_level, failed))
+        });
+        let request = virtual_models::route_request_json(
+            model,
+            options.thinking_level.unwrap_or(ModelThinkingLevel::Off),
+            options
+                .reason
+                .unwrap_or(virtual_models::ModelRouteReason::Direct),
+            previous.as_ref().map(|(model, level)| (model, *level)),
+            failed
+                .as_ref()
+                .map(|(model, level, message)| (model, *level, *message)),
+            options.state.as_ref(),
+            messages,
+        );
+        let routed = route(request)
+            .await
+            .map_err(|error| format!("{name} route failed: {error}"))?;
+        let routed = virtual_models::parse_route_result(&routed)?;
+        let target = self
+            .get_physical_model(&routed.provider, &routed.id)
+            .ok_or_else(|| {
+                format!(
+                    "{name} routed to {}/{}, which is not a physical model.",
+                    routed.provider, routed.id
+                )
+            })?;
+        if !self.has_configured_auth(&target.provider) {
+            return Err(format!(
+                "{name} routed to {}/{}, which has no credentials.",
+                target.provider, target.id
+            ));
+        }
+        let thinking_level = clamp_thinking_level(&target, routed.thinking_level);
+        Ok(ResolvedVirtualRoute {
+            model: target,
+            thinking_level,
+            state: routed.state,
+        })
     }
 }
 
@@ -5238,5 +5887,372 @@ mod tests {
             "providers filter must drop unselected providers at the Models layer"
         );
         rpi_test_env::remove_var("RPI_TEST_MODEL_RUNTIME_PROVIDERS_FILTER_KEY");
+    }
+}
+
+#[cfg(test)]
+mod virtual_model_tests {
+    //! V16-12 FR-A/B: catalog composition, route validation, and the direct
+    //! `streamSimple` route (budget cap + cross-provider credential drop).
+
+    use std::sync::{Arc, Mutex};
+
+    use rpi_ai::models::Provider;
+    use rpi_ai::types::Context;
+    use serde_json::json;
+
+    use super::*;
+
+    /// A chat model fixture for the recording providers.
+    fn model(id: &str, provider: &str) -> Model {
+        Model {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            api: ApiKind::from("openai-completions"),
+            provider: provider.to_owned(),
+            base_url: "https://example.test/v1".to_owned(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![rpi_ai::types::InputModality::Text],
+            input_limits: None,
+            cost: ModelCost::default(),
+            prompt_cache: None,
+            context_window: 50_000,
+            max_tokens: 8_000,
+            sampling_params: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    /// Records the options each routed stream request carries.
+    struct RecordingProvider {
+        id: String,
+        auth: ProviderAuth,
+        seen: Arc<Mutex<Vec<Option<SimpleStreamOptions>>>>,
+    }
+
+    impl RecordingProvider {
+        fn new(id: &str, seen: Arc<Mutex<Vec<Option<SimpleStreamOptions>>>>) -> Self {
+            Self {
+                id: id.to_owned(),
+                auth: ProviderAuth {
+                    api_key: Some(Arc::new(VirtualApiKeyAuth)),
+                    oauth: None,
+                },
+                seen,
+            }
+        }
+    }
+
+    impl Provider for RecordingProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            &self.id
+        }
+        fn base_url(&self) -> Option<&str> {
+            None
+        }
+        fn headers(&self) -> Option<&ProviderHeaders> {
+            None
+        }
+        fn auth(&self) -> &ProviderAuth {
+            &self.auth
+        }
+        fn get_models(&self) -> Vec<Model> {
+            vec![model("impl-1", &self.id)]
+        }
+        fn stream(
+            &self,
+            model: &Model,
+            _context: &TranscriptContext,
+            _options: Option<StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            unsupported_api_stream(model)
+        }
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &TranscriptContext,
+            options: Option<SimpleStreamOptions>,
+        ) -> Result<AssistantMessageEventStream, String> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(options);
+            let stream = AssistantMessageEventStream::new();
+            stream.push(StreamEvent::Error {
+                reason: ErrorReason::Error,
+                error: rpi_ai::api::lazy::create_setup_error_message_for_model(
+                    _model,
+                    "recording provider",
+                ),
+            });
+            stream.end(None);
+            Ok(stream)
+        }
+    }
+
+    fn route_fn(target: (&'static str, &'static str), level: &'static str) -> VirtualModelRouteFn {
+        Arc::new(move |_request| {
+            Box::pin(async move {
+                Ok(json!({
+                    "model": { "provider": target.0, "id": target.1 },
+                    "thinkingLevel": level,
+                }))
+            })
+        })
+    }
+
+    fn virtual_definition(provider: &str, id: &str) -> Value {
+        json!({
+            "provider": provider,
+            "id": id,
+            "name": "Auto",
+            "thinkingLevels": ["off", "high"],
+            "contextWindow": 1_000,
+            "maxTokens": 1_000,
+        })
+    }
+
+    async fn runtime() -> Arc<ModelRuntime> {
+        ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// A virtual model composes into its provider's catalog and shadows a
+    /// physical chat model with the same id after a later registration
+    /// (`virtual-models.ts:201-237`).
+    #[tokio::test]
+    async fn virtual_models_compose_and_shadow_physical_models() {
+        let runtime = runtime().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        runtime
+            .register_native_provider(Arc::new(RecordingProvider::new("phys", seen)))
+            .await
+            .expect("register provider");
+        runtime
+            .register_virtual_model(
+                virtual_definition("phys", "auto"),
+                route_fn(("phys", "impl-1"), "off"),
+            )
+            .await
+            .expect("register virtual");
+
+        // The physical catalog plus the virtual entry are listed.
+        let ids: Vec<String> = runtime
+            .get_models(Some("phys"))
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(ids, vec!["impl-1".to_owned(), "auto".to_owned()]);
+        assert!(virtual_models::is_virtual_model(
+            &runtime.get_model("phys", "auto").expect("virtual entry")
+        ));
+
+        // Re-registering the same provider+id replaces the virtual entry
+        // (one entry only).
+        runtime
+            .register_virtual_model(
+                virtual_definition("phys", "auto"),
+                route_fn(("phys", "impl-1"), "high"),
+            )
+            .await
+            .expect("re-register");
+        assert_eq!(
+            runtime
+                .get_models(Some("phys"))
+                .into_iter()
+                .filter(|model| model.id == "auto")
+                .count(),
+            1
+        );
+
+        // A later registration that adds a physical chat model with the
+        // same id is shadowed: `getModel` answers the virtual entry and
+        // `getPhysicalModel` answers none.
+        struct ShadowingProvider {
+            auth: ProviderAuth,
+        }
+        impl Provider for ShadowingProvider {
+            fn id(&self) -> &str {
+                "phys"
+            }
+            fn name(&self) -> &str {
+                "phys"
+            }
+            fn base_url(&self) -> Option<&str> {
+                None
+            }
+            fn headers(&self) -> Option<&ProviderHeaders> {
+                None
+            }
+            fn auth(&self) -> &ProviderAuth {
+                &self.auth
+            }
+            fn get_models(&self) -> Vec<Model> {
+                vec![model("auto", "phys")]
+            }
+            fn stream(
+                &self,
+                model: &Model,
+                _context: &TranscriptContext,
+                _options: Option<StreamOptions>,
+            ) -> AssistantMessageEventStream {
+                unsupported_api_stream(model)
+            }
+            fn stream_simple(
+                &self,
+                _model: &Model,
+                _context: &TranscriptContext,
+                _options: Option<SimpleStreamOptions>,
+            ) -> Result<AssistantMessageEventStream, String> {
+                let stream = AssistantMessageEventStream::new();
+                stream.end(None);
+                Ok(stream)
+            }
+        }
+        runtime
+            .register_native_provider(Arc::new(ShadowingProvider {
+                auth: ProviderAuth {
+                    api_key: Some(Arc::new(VirtualApiKeyAuth)),
+                    oauth: None,
+                },
+            }))
+            .await
+            .expect("register shadowing provider");
+        assert!(
+            virtual_models::is_virtual_model(
+                &runtime
+                    .get_model("phys", "auto")
+                    .expect("virtual wins the id")
+            ),
+            "a physical chat model with the virtual id is shadowed"
+        );
+        assert_eq!(
+            runtime.get_physical_model("phys", "auto"),
+            None,
+            "the shadowed physical chat model is not routable"
+        );
+    }
+
+    /// `resolveModel` rejects non-physical and credential-less targets
+    /// (`model-runtime.ts:1013-1024`).
+    #[tokio::test]
+    async fn resolve_model_validates_targets() {
+        let runtime = runtime().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        runtime
+            .register_native_provider(Arc::new(RecordingProvider::new("phys", seen)))
+            .await
+            .expect("register provider");
+
+        // Not registered.
+        let missing = runtime
+            .register_virtual_model(
+                virtual_definition("virt", "auto"),
+                route_fn(("phys", "missing"), "off"),
+            )
+            .await;
+        assert!(missing.is_ok(), "definition itself is valid");
+        let virtual_model = runtime.get_model("virt", "auto").expect("virtual");
+        let error = runtime
+            .resolve_model(&virtual_model, &[], ResolveVirtualModelOptions::default())
+            .await
+            .expect_err("missing target");
+        assert!(error.contains("is not a physical model"), "{error}");
+
+        // A virtual target is rejected too.
+        runtime
+            .register_virtual_model(
+                virtual_definition("virt", "b"),
+                route_fn(("virt", "auto"), "off"),
+            )
+            .await
+            .expect("register");
+        let virtual_b = runtime.get_model("virt", "b").expect("virtual b");
+        let error = runtime
+            .resolve_model(&virtual_b, &[], ResolveVirtualModelOptions::default())
+            .await
+            .expect_err("virtual target");
+        assert!(error.contains("is not a physical model"), "{error}");
+    }
+
+    /// The direct `streamSimple` route caps the output budget and drops
+    /// caller credentials on a cross-provider route
+    /// (`model-runtime.ts:717-735`).
+    #[tokio::test]
+    async fn virtual_stream_simple_routes_and_drops_cross_provider_credentials() {
+        let runtime = runtime().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        runtime
+            .register_native_provider(Arc::new(RecordingProvider::new("phys", seen.clone())))
+            .await
+            .expect("register provider");
+
+        // Cross-provider: virtual under `virt` routes to `phys`.
+        runtime
+            .register_virtual_model(
+                virtual_definition("virt", "auto"),
+                route_fn(("phys", "impl-1"), "high"),
+            )
+            .await
+            .expect("register virtual");
+        let virtual_model = runtime.get_model("virt", "auto").expect("virtual");
+
+        let mut options = ModelsSimpleStreamOptions::default();
+        options.simple.stream.request.api_key = Some("caller-key".to_owned());
+        options.simple.stream.max_tokens = Some(20_000);
+        // Drain the routed stream (it carries no events; the recording
+        // provider sees the request options during setup).
+        let _ = futures::StreamExt::collect::<Vec<rpi_ai::types::StreamEvent>>(
+            runtime.stream_simple(&virtual_model, &Context::default(), Some(options)),
+        )
+        .await;
+        {
+            let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(seen.len(), 1, "one routed request");
+            let routed = seen[0].as_ref().expect("options");
+            assert_eq!(
+                routed.stream.request.api_key, None,
+                "caller credentials resolved for the virtual provider must not cross providers"
+            );
+            assert_eq!(
+                routed.stream.max_tokens,
+                Some(8_000),
+                "the output budget caps to the routed model"
+            );
+            assert_eq!(routed.reasoning, Some(rpi_ai::types::ThinkingLevel::High));
+        }
+
+        // Same-provider: the caller credential is kept.
+        runtime
+            .register_virtual_model(
+                virtual_definition("phys", "auto"),
+                route_fn(("phys", "impl-1"), "off"),
+            )
+            .await
+            .expect("register same-provider virtual");
+        let virtual_same = runtime.get_model("phys", "auto").expect("virtual");
+        let mut options = ModelsSimpleStreamOptions::default();
+        options.simple.stream.request.api_key = Some("caller-key".to_owned());
+        let _ = futures::StreamExt::collect::<Vec<rpi_ai::types::StreamEvent>>(
+            runtime.stream_simple(&virtual_same, &Context::default(), Some(options)),
+        )
+        .await;
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[1].as_ref().expect("options").stream.request.api_key,
+            Some("caller-key".to_owned()),
+            "same-provider routes keep the caller credential"
+        );
     }
 }

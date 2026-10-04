@@ -70,6 +70,9 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "ui.editExternal" => Requires(Capability::Ui),
         "exec" => Requires(Capability::Exec),
         "registerProvider" | "unregisterProvider" => Requires(Capability::Provider),
+        // V16-12 FR-A: virtual-model registration is provider-capability
+        // surface, like `registerProvider`.
+        "registerVirtualModel" | "unregisterVirtualModel" => Requires(Capability::Provider),
         "events.emit" | "events.on" => Requires(Capability::Events),
         m if m.starts_with("ui.") => Requires(Capability::Ui),
         m if m.starts_with("command.") => Requires(Capability::Session),
@@ -110,6 +113,11 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "ctx.modelRegistry.stream"
         | "ctx.modelRegistry.streamSimple"
         | "ctx.modelRegistry.find"
+        // V16-12 FR-A (§8-7 example port): the non-chat catalog lookup and
+        // the structured classifier execution face are session-capability
+        // reads/actions, like the rest of ctx.modelRegistry.*.
+        | "ctx.modelRegistry.findOfType"
+        | "ctx.modelRegistry.classify"
         | "ctx.modelRegistry.hasConfiguredAuth"
         | "ctx.modelRegistry.getApiKeyAndHeaders"
         | "ctx.setRuntimeApiKey"
@@ -975,6 +983,53 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
         }
+        // V16-12 FR-A: `registerVirtualModel(definition)` — the route
+        // callback is created here because only the host-call layer holds
+        // the guest's dispatch handle. It round-trips
+        // `{"kind":"virtualModelRoute","request":...}` into the guest and
+        // fails closed while the same extension is blocked inside a model
+        // host call (§8-1 reentrancy guard).
+        "registerVirtualModel" => {
+            let definition = args.get("definition").cloned().unwrap_or(Value::Null);
+            let forward = state.forward.clone();
+            let route_guard = state.api.extension().route_guard().clone();
+            let route: crate::types::VirtualModelRouteFn = std::sync::Arc::new(move |request| {
+                let forward = forward.clone();
+                let route_guard = route_guard.clone();
+                Box::pin(async move {
+                    if route_guard.is_active() {
+                        return Err(
+                            "virtual model cannot be routed from within its own extension's model call"
+                                .to_owned(),
+                        );
+                    }
+                    forward
+                        .dispatch(
+                            json!({"kind": "virtualModelRoute", "request": request}),
+                            false,
+                        )
+                        .await
+                })
+            });
+            let api = state.api.clone();
+            let handle = state.async_handle.clone();
+            block_on(&handle, async move {
+                api.register_virtual_model(definition, route).await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(Value::Null)
+        }
+        "unregisterVirtualModel" => {
+            let provider = str_arg(&args, "provider").unwrap_or_default().to_owned();
+            let id = str_arg(&args, "id").unwrap_or_default().to_owned();
+            let api = state.api.clone();
+            let handle = state.async_handle.clone();
+            block_on(&handle, async move {
+                api.unregister_virtual_model(&provider, &id).await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(Value::Null)
+        }
 
         // ------------------------------------------------------------------
         // Event bus
@@ -1214,6 +1269,9 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .ok_or_else(|| ("invalidRequest", "missing context".to_owned()))?;
             let options = args.get("options").cloned();
             let api = state.api.clone();
+            // §8-1 guard: draining the request here blocks the guest thread,
+            // so a route callback must not dispatch back into this guest.
+            let _route_guard = state.api.extension().route_guard().clone().enter();
             let result = block_on(&state.async_handle.clone(), async move {
                 api.model_registry_complete(model, context, options).await
             })?;
@@ -1239,6 +1297,9 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             let options = args.get("options").cloned();
             let simple = method == "ctx.modelRegistry.streamSimple";
             let api = state.api.clone();
+            // §8-1 guard: the stream is drained while the guest thread waits,
+            // so a route callback must not dispatch back into this guest.
+            let _route_guard = state.api.extension().route_guard().clone().enter();
             let outcome = block_on(&state.async_handle.clone(), async move {
                 let stream = if simple {
                     api.model_registry_stream_simple(model, context, options)
@@ -1264,6 +1325,35 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .api
                 .model_registry_find(provider, model_id)
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(result.unwrap_or(Value::Null))
+        }
+        // V16-12 §8-7 example port: the non-chat catalog lookup and the
+        // structured classifier face (`model-registry.ts:76-77`, `:173-179`).
+        "ctx.modelRegistry.findOfType" => {
+            let model_type = str_arg(&args, "type").unwrap_or("chat");
+            let provider = str_arg(&args, "provider").unwrap_or_default();
+            let model_id = str_arg(&args, "modelId").unwrap_or_default();
+            let result = state
+                .api
+                .model_registry_find_of_type(model_type, provider, model_id)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(result.unwrap_or(Value::Null))
+        }
+        "ctx.modelRegistry.classify" => {
+            let model = args
+                .get("model")
+                .cloned()
+                .ok_or_else(|| ("invalidRequest", "missing model".to_owned()))?;
+            let context = args
+                .get("context")
+                .cloned()
+                .ok_or_else(|| ("invalidRequest", "missing context".to_owned()))?;
+            let options = args.get("options").cloned();
+            let api = state.api.clone();
+            let result = block_on(&state.async_handle.clone(), async move {
+                api.model_registry_classify(model, context, options).await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(result.unwrap_or(Value::Null))
         }
         "ctx.modelRegistry.hasConfiguredAuth" => {
@@ -2406,5 +2496,143 @@ mod execute_tool_tests {
             dispatch(&mut state, "executeTool", json!({"name": "echo"})).expect_err("rejected");
         pop_current_tool_call();
         assert_eq!(error.0, "unbound");
+    }
+
+    /// V16-12 FR-A: `registerVirtualModel` queues a registration pre-bind
+    /// and its route callback round-trips a `virtualModelRoute` dispatch into
+    /// the guest.
+    #[test]
+    fn register_virtual_model_queues_and_routes_into_the_guest() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new(
+                "<inline:vm-route>",
+                "<inline:vm-route>",
+            )),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = HostState {
+            api,
+            capabilities: HashSet::from([Capability::Provider]),
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        };
+        let guest = std::thread::spawn(move || {
+            if let Ok(crate::wasm::GuestCommand::Dispatch {
+                respond, message, ..
+            }) = rx.recv()
+            {
+                let message: serde_json::Value =
+                    serde_json::from_slice(&message).expect("dispatch json");
+                assert_eq!(message["kind"], "virtualModelRoute");
+                assert_eq!(message["request"]["reason"], "user");
+                respond
+                    .send(Ok(json!({
+                        "model": { "provider": "faux", "id": "impl-1" },
+                        "thinkingLevel": "medium",
+                        "state": { "phase": "planning" },
+                    })))
+                    .expect("respond");
+            }
+        });
+        dispatch(
+            &mut state,
+            "registerVirtualModel",
+            json!({
+                "definition": {
+                    "provider": "router", "id": "auto", "name": "Auto",
+                    "thinkingLevels": ["off"], "contextWindow": 1000, "maxTokens": 1000,
+                }
+            }),
+        )
+        .expect("registerVirtualModel");
+        let pending = state
+            .api
+            .runtime()
+            .take_pending_virtual_model_registrations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].definition["provider"], "router");
+        let route = pending[0].route.clone();
+        let result = runtime
+            .block_on(route(json!({
+                "reason": "user",
+                "model": { "provider": "router", "id": "auto" },
+            })))
+            .expect("route result");
+        assert_eq!(result["model"]["id"], "impl-1");
+        assert_eq!(result["state"]["phase"], "planning");
+        guest.join().expect("guest thread");
+    }
+
+    /// V16-12 §8-1: the route callback fails closed while the same guest is
+    /// blocked inside a model host call (a dispatch would deadlock).
+    #[test]
+    fn route_callback_fails_closed_while_the_guest_is_in_a_model_call() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new(
+                "<inline:vm-guard>",
+                "<inline:vm-guard>",
+            )),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut state = HostState {
+            api,
+            capabilities: HashSet::from([Capability::Provider]),
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        };
+        dispatch(
+            &mut state,
+            "registerVirtualModel",
+            json!({
+                "definition": {
+                    "provider": "router", "id": "auto", "name": "Auto",
+                    "thinkingLevels": ["off"], "contextWindow": 1000, "maxTokens": 1000,
+                }
+            }),
+        )
+        .expect("registerVirtualModel");
+        let pending = state
+            .api
+            .runtime()
+            .take_pending_virtual_model_registrations();
+        let route = pending[0].route.clone();
+        let guard = state.api.extension().route_guard().clone();
+        let _scope = guard.enter();
+        let error = runtime
+            .block_on(route(json!({})))
+            .expect_err("guard rejects");
+        assert!(
+            error.contains("cannot be routed from within"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// `registerVirtualModel` requires the `provider` capability (checked
+    /// before dispatch).
+    #[test]
+    fn register_virtual_model_requires_provider_capability() {
+        let mut state = host_state(HashSet::new());
+        let response = crate::wasm::handle_host_call(
+            &mut state,
+            br#"{"call":"registerVirtualModel","args":{}}"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&response).expect("envelope");
+        assert_eq!(parsed["error"]["kind"], "capabilityDenied");
     }
 }

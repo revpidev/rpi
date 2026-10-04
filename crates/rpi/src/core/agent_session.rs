@@ -454,6 +454,12 @@ struct AgentSessionInner {
     /// turn's tool results are in state and session (240eb29c4, #8537).
     pending_custom_messages: Mutex<Vec<AgentMessage>>,
     last_assistant_message: Mutex<Option<AssistantMessage>>,
+    /// `_failedResponse` (agent-session.ts:401 @ a13d35a74): the failed
+    /// response handed to the next request preparation as the route
+    /// `failed` payload (`retry` reason). Set by the auto-retry and overflow
+    /// recovery paths; consumed/cleared by `prepareRequest` and the agent
+    /// run boundaries.
+    failed_response: Mutex<Option<AssistantMessage>>,
 
     /// `_turnIndex` (agent-session.ts:344): reset to 0 on `agent_start`,
     /// incremented after each `turn_end` extension emit. Carried by the
@@ -511,6 +517,15 @@ struct AgentSessionInner {
     /// Mode-provided shutdown handler (`ExtensionBindings::shutdown`, T15 W5).
     extension_shutdown_handler: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     extension_error_unsubscriber: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// `routedModel` (agent-session.ts:1422-1427 @ a13d35a74): the physical
+/// model (and requested thinking level) of the latest successful response,
+/// returned only while the current selection is a virtual model.
+#[derive(Debug, Clone)]
+pub struct RoutedModel {
+    pub model: Model,
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 /// `AgentSession` (agent-session.ts:303-3327). Cheap to clone (Arc inner);
@@ -864,6 +879,7 @@ impl AgentSession {
             pending_next_turn_messages: Mutex::new(Vec::new()),
             pending_custom_messages: Mutex::new(Vec::new()),
             last_assistant_message: Mutex::new(None),
+            failed_response: Mutex::new(None),
             turn_index: AtomicU32::new(0),
             boundary_dispatched_messages: Mutex::new(Vec::new()),
             last_activity_outcome: Mutex::new(ext::AgentActivityOutcome::Completed),
@@ -973,6 +989,39 @@ impl AgentSession {
                 }));
             }
         }
+        // V16-12 FR-B R7: an overflow-recovery retry keeps the failed
+        // response for the retry request's route payload
+        // (`if (retry) this._failedResponse = assistantMessage`,
+        // agent-session.ts:2998).
+        {
+            let weak = Arc::downgrade(&session.inner);
+            if let Ok(mut runner) = session.inner.compaction.try_lock() {
+                runner.set_mark_failed_response(Arc::new(move |message: &AssistantMessage| {
+                    if let Some(inner) = weak.upgrade() {
+                        *lock(&inner.failed_response) = Some(message.clone());
+                    }
+                }));
+            }
+        }
+        // V16-12 FR-B R6: summary requests route first under a virtual
+        // selection (`_getSummarizationRequestAuth`, agent-session.ts:549-568).
+        {
+            let weak = Arc::downgrade(&session.inner);
+            if let Ok(mut runner) = session.inner.compaction.try_lock() {
+                runner.set_summarization_model_resolver(Arc::new(move || {
+                    let weak = weak.clone();
+                    Box::pin(async move {
+                        let Some(inner) = weak.upgrade() else {
+                            return Ok((None, ThinkingLevel::Off));
+                        };
+                        AgentSession { inner }
+                            .summarization_model()
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                }));
+            }
+        }
 
         // `_installAgentNextTurnRefresh()` (agent-session.ts:397, 563-580):
         // wrap the (optional) previous prepare chain with the threshold
@@ -1038,18 +1087,30 @@ impl AgentSession {
                     let inner = weak.upgrade()?;
                     let session = AgentSession { inner };
 
-                    // 1. Threshold compaction (agent-session.ts:543-553).
-                    // Settings resolve before the runner lock
-                    // (`getCompactionSettings(model)` inside
-                    // `_compactBeforeNextAssistantResponse`, agent-session.ts:563).
-                    session.sync_compaction_model().await;
-                    let messages = session
-                        .inner
-                        .compaction
-                        .lock()
-                        .await
-                        .compact_before_next_assistant_response(&turn.context.messages)
-                        .await;
+                    // 1. Threshold compaction (agent-session.ts:542-558). A
+                    // virtual selection is checked in prepareRequest,
+                    // against the model the request is routed to
+                    // (`_compactBeforeNextAssistantResponse` returns early
+                    // for virtual models).
+                    let selected_is_virtual = session
+                        .model()
+                        .is_some_and(|model| crate::core::virtual_models::is_virtual_model(&model));
+                    let messages = if selected_is_virtual {
+                        turn.context.messages.clone()
+                    } else {
+                        // Settings resolve before the runner lock
+                        // (`getCompactionSettings(model)` inside
+                        // `_compactBeforeNextAssistantResponse`,
+                        // agent-session.ts:563).
+                        session.sync_compaction_model().await;
+                        session
+                            .inner
+                            .compaction
+                            .lock()
+                            .await
+                            .compact_before_next_assistant_response(&turn.context.messages)
+                            .await
+                    };
                     let mut context = AgentContext {
                         messages,
                         ..turn.context.clone()
@@ -1142,6 +1203,166 @@ impl AgentSession {
     /// conversational request. Direct `agent.state.messages` assignments are
     /// superseded here (R3.1.2); recovery goes through the session append
     /// APIs + [`Self::refresh_context`].
+    /// `_consumeFailedResponse` slice of `prepareRequest`
+    /// (agent-session.ts:762-763 @ a13d35a74): the auto-retry/overflow path
+    /// stores the failed response; request preparation takes and clears it.
+    fn take_failed_response(&self) -> Option<AssistantMessage> {
+        lock(&self.inner.failed_response).take()
+    }
+
+    /// `userTurn` / route `reason` (agent-session.ts:777-787): `retry` when a
+    /// failed response is pending, `user` when a user message follows the
+    /// latest assistant message, `continuation` otherwise.
+    fn route_reason(
+        &self,
+        context_messages: &[AgentMessage],
+        has_failed: bool,
+    ) -> crate::core::virtual_models::ModelRouteReason {
+        use crate::core::virtual_models::ModelRouteReason;
+        if has_failed {
+            return ModelRouteReason::Retry;
+        }
+        let after_last_assistant = context_messages
+            .iter()
+            .rposition(|message| matches!(message, AgentMessage::Assistant(_)))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let user_turn = context_messages[after_last_assistant..]
+            .iter()
+            .any(|message| matches!(message, AgentMessage::User(_)));
+        if user_turn {
+            ModelRouteReason::User
+        } else {
+            ModelRouteReason::Continuation
+        }
+    }
+
+    /// `getVirtualModelState(branch, provider, id)` over the live branch
+    /// (agent-session.ts:788).
+    fn virtual_model_state(&self, provider: &str, model_id: &str) -> Option<Value> {
+        let branch = lock(&self.inner.session_manager).get_branch(None);
+        let typed: Vec<SessionEntry> = branch
+            .iter()
+            .filter_map(|entry| entry.known().cloned())
+            .collect();
+        crate::core::virtual_models::get_virtual_model_state(&typed, provider, model_id)
+    }
+
+    /// `_exceedsCompactionThreshold` (agent-session.ts:739-746): the
+    /// projected token estimate against `model`'s window. Per-model budgets
+    /// resolve against the selected model like upstream
+    /// (`getCompactionSettings(this.model)`).
+    fn exceeds_compaction_threshold(&self, model: &Model) -> bool {
+        if model.context_window == 0 {
+            return false;
+        }
+        let session_manager = lock(&self.inner.session_manager);
+        let branch = session_manager.get_branch(None);
+        let typed: Vec<SessionEntry> = branch
+            .iter()
+            .filter_map(|entry| entry.known().cloned())
+            .collect();
+        drop(session_manager);
+        let projection = rpi_agent::session::build_session_projection(&typed);
+        let tokens =
+            rpi_agent::compaction::estimate_projected_context_tokens(&projection, &typed).tokens;
+        let settings = lock(&self.inner.resource_loader)
+            .settings_manager_mut()
+            .get_compaction_settings(self.model().as_ref().map(compaction_model_ref));
+        rpi_agent::compaction::should_compact(
+            tokens,
+            u64::from(model.context_window),
+            &rpi_agent::compaction::CompactionSettings {
+                enabled: settings.enabled,
+                reserve_tokens: settings.reserve_tokens,
+                keep_recent_tokens: settings.keep_recent_tokens,
+            },
+        )
+    }
+
+    /// `_runAutoCompaction("threshold", false)` against the routed model
+    /// (agent-session.ts:804-812): the routed model's window drives the
+    /// summary request and its limits.
+    async fn compact_for_routed_model(&self, model: &Model) {
+        self.sync_compaction_model().await;
+        let mut runner = self.inner.compaction.lock().await;
+        runner.set_model(Some(model.clone()));
+        let _ = runner.run_threshold_compaction().await;
+    }
+
+    /// `_getSummarizationRequestAuth` route slice (agent-session.ts:549-568):
+    /// under a virtual selection, route the summary request first (reason
+    /// `direct`; router state ignored) so the summary sizes its input and
+    /// output from the model it gets. Returns the selection unchanged for a
+    /// physical model.
+    async fn summarization_model(&self) -> Result<(Option<Model>, ThinkingLevel), RpiError> {
+        let Some(model) = self.model() else {
+            return Ok((None, self.thinking_level()));
+        };
+        if !crate::core::virtual_models::is_virtual_model(&model) {
+            return Ok((Some(model), self.thinking_level()));
+        }
+        let messages = rpi_agent::messages::convert_to_llm(&self.messages());
+        let route = self
+            .inner
+            .model_runtime
+            .resolve_model(
+                &model,
+                &messages,
+                crate::core::model_runtime::ResolveVirtualModelOptions {
+                    reason: Some(crate::core::virtual_models::ModelRouteReason::Direct),
+                    thinking_level: Some(self.thinking_level()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(RpiError::Session)?;
+        Ok((Some(route.model), route.thinking_level))
+    }
+
+    /// `_recordSelection` (agent-session.ts:594-603 @ a13d35a74): record the
+    /// selection on the current branch when the branch implies another one,
+    /// so a resume restores it. Tree navigation can leave the latest
+    /// `model_change` on another branch; responses cannot record a virtual
+    /// selection because they name physical models. Physical selections are
+    /// not recorded per prompt — `prepareRequest` redirects them.
+    fn record_selection(&self) {
+        let Some(model) = self.model() else {
+            return;
+        };
+        let branch = lock(&self.inner.session_manager).get_branch(None);
+        let typed: Vec<SessionEntry> = branch
+            .iter()
+            .filter_map(|entry| entry.known().cloned())
+            .collect();
+        let runtime = self.inner.model_runtime.clone();
+        let recorded = crate::core::virtual_models::get_branch_selection(&typed, |provider, id| {
+            runtime.get_model(provider, id)
+        });
+        let Some((recorded_provider, recorded_model_id)) = recorded else {
+            return;
+        };
+        if recorded_provider == model.provider && recorded_model_id == model.id {
+            return;
+        }
+        let recorded_model = self
+            .inner
+            .model_runtime
+            .get_model(&recorded_provider, &recorded_model_id);
+        let current_virtual = crate::core::virtual_models::is_virtual_model(&model);
+        let recorded_virtual = recorded_model
+            .as_ref()
+            .is_some_and(crate::core::virtual_models::is_virtual_model);
+        if !current_virtual && !recorded_virtual {
+            return;
+        }
+        if let Err(error) =
+            lock(&self.inner.session_manager).append_model_change(&model.provider, &model.id)
+        {
+            tracing::warn!("session append failed: {error}");
+        }
+    }
+
     fn install_agent_request_projection(&self) {
         let weak = Arc::downgrade(&self.inner);
         let agent = self.inner.agent.clone();
@@ -1154,43 +1375,157 @@ impl AgentSession {
                     let inner = weak.upgrade()?;
                     let session = AgentSession { inner };
 
-                    let projection =
-                        lock(&session.inner.session_manager).build_session_projection();
-                    let state = session.inner.agent.state();
-                    let canonical_context = AgentContext {
-                        messages: projection.messages.clone(),
-                        tools: Some(state.tools.clone()),
-                    };
-                    let previous_update = match previous.as_ref() {
-                        Some(previous) => {
-                            previous(
-                                PrepareRequestContext {
-                                    context: canonical_context.clone(),
-                                    model: state.model.clone(),
-                                    thinking_level: state.thinking_level,
-                                },
-                                signal.clone(),
-                            )
-                            .await
-                        }
-                        None => None,
-                    };
-                    let context = previous_update
-                        .as_ref()
-                        .and_then(|update| update.context.clone())
-                        .unwrap_or(canonical_context);
+                    // `const failed = this._failedResponse; this._failedResponse = undefined;`
+                    // (agent-session.ts:762-763 @ a13d35a74).
+                    let failed = session.take_failed_response();
+
+                    // `prepare()` (agent-session.ts:764-776): canonical
+                    // projection, then the previously installed chain.
+                    async fn prepare(
+                        session: &AgentSession,
+                        previous: &Option<rpi_agent::PrepareRequestAgentFn>,
+                        signal: CancellationToken,
+                    ) -> (
+                        Option<AgentRequestUpdate>,
+                        AgentContext,
+                        crate::core::session_manager::SessionProjection,
+                    ) {
+                        let projection =
+                            lock(&session.inner.session_manager).build_session_projection();
+                        let state = session.inner.agent.state();
+                        let canonical_context = AgentContext {
+                            messages: projection.messages.clone(),
+                            tools: Some(state.tools.clone()),
+                        };
+                        let previous_update = match previous.as_ref() {
+                            Some(previous) => {
+                                previous(
+                                    PrepareRequestContext {
+                                        context: canonical_context.clone(),
+                                        model: state.model.clone(),
+                                        thinking_level: state.thinking_level,
+                                    },
+                                    signal,
+                                )
+                                .await
+                            }
+                            None => None,
+                        };
+                        let context = previous_update
+                            .as_ref()
+                            .and_then(|update| update.context.clone())
+                            .unwrap_or(canonical_context);
+                        (previous_update, context, projection)
+                    }
+
+                    let (mut previous_update, mut context, projection) =
+                        prepare(&session, &previous, signal.clone()).await;
                     let model = previous_update
                         .as_ref()
                         .and_then(|update| update.model.clone())
-                        .unwrap_or_else(|| state.model.clone());
+                        .unwrap_or_else(|| session.inner.agent.state().model.clone());
                     let thinking_level = previous_update
                         .as_ref()
                         .and_then(|update| update.thinking_level)
-                        .unwrap_or(state.thinking_level);
+                        .unwrap_or(session.inner.agent.state().thinking_level);
+                    if !crate::core::virtual_models::is_virtual_model(&model) {
+                        return Some(AgentRequestUpdate {
+                            context: Some(context),
+                            model: Some(model),
+                            thinking_level: Some(thinking_level),
+                        });
+                    }
+
+                    // The selection stays in agent state; only this request
+                    // uses the routed model (agent-session.ts:778-786). Only
+                    // messages the user wrote start a turn; extension
+                    // messages can follow them.
+                    let reason = session.route_reason(&context.messages, failed.is_some());
+                    let state = session.virtual_model_state(&model.provider, &model.id);
+                    let llm_messages = rpi_agent::messages::convert_to_llm(&context.messages);
+                    // Clear any stale hand-off before routing this request.
+                    session
+                        .inner
+                        .model_runtime
+                        .clear_virtual_route_failure(&session.session_id());
+                    let route = match session
+                        .inner
+                        .model_runtime
+                        .resolve_model(
+                            &model,
+                            &llm_messages,
+                            crate::core::model_runtime::ResolveVirtualModelOptions {
+                                reason: Some(reason),
+                                thinking_level: Some(thinking_level),
+                                failed: failed.as_ref(),
+                                failed_thinking_level: failed
+                                    .as_ref()
+                                    .and_then(|message| message.thinking_level),
+                                state: state.clone(),
+                                signal: Some(signal.clone()),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(route) => route,
+                        Err(error) => {
+                            // Upstream rejects the prepareRequest promise and
+                            // `handleRunFailure` synthesizes the error
+                            // response; the rpi hook has no error channel, so
+                            // the session's stream function is handed the
+                            // failure and answers it without calling the
+                            // router again.
+                            session.inner.model_runtime.record_virtual_route_failure(
+                                &session.session_id(),
+                                &model.provider,
+                                &model.id,
+                                &error,
+                            );
+                            return Some(AgentRequestUpdate {
+                                context: Some(context),
+                                model: Some(model),
+                                thinking_level: Some(thinking_level),
+                            });
+                        }
+                    };
+                    // `route.state !== undefined && route.state !== state`
+                    // (agent-session.ts:795-801): the state entry is written
+                    // before the request and does not change the projection.
+                    if let Some(new_state) = route.state.clone()
+                        && state.as_ref() != Some(&new_state)
+                    {
+                        let data = crate::core::virtual_models::VirtualModelStateData {
+                            provider: model.provider.clone(),
+                            model_id: model.id.clone(),
+                            state: new_state,
+                        };
+                        match serde_json::to_value(data) {
+                            Ok(data) => session.append_entry(
+                                crate::core::virtual_models::VIRTUAL_MODEL_STATE_ENTRY,
+                                Some(data),
+                            ),
+                            Err(error) => {
+                                tracing::warn!("virtual model state encode failed: {error}")
+                            }
+                        }
+                    }
+                    // The route stands: the router already decided this
+                    // request. A routed threshold compaction re-prepares the
+                    // context but keeps the routed model
+                    // (agent-session.ts:804-812).
+                    if session.exceeds_compaction_threshold(&route.model) {
+                        session.compact_for_routed_model(&route.model).await;
+                        let (re_prepared, re_context, _) =
+                            prepare(&session, &previous, signal.clone()).await;
+                        previous_update = re_prepared;
+                        context = re_context;
+                    }
+                    let _ = projection;
+                    let _ = previous_update;
                     Some(AgentRequestUpdate {
                         context: Some(context),
-                        model: Some(model),
-                        thinking_level: Some(thinking_level),
+                        model: Some(route.model),
+                        thinking_level: Some(route.thinking_level),
                     })
                 })
             },
@@ -2115,6 +2450,27 @@ impl AgentSession {
     /// `get model` (agent-session.ts:866-868).
     pub fn model(&self) -> Option<Model> {
         model_or_none(&self.inner.agent.state().model)
+    }
+
+    /// `get routedModel` (agent-session.ts:1422-1427): the physical model and
+    /// thinking level of the latest successful response, when the selection
+    /// is virtual. Failed, aborted, and failed-routing responses are skipped;
+    /// the lookup only succeeds for a registered physical chat model.
+    pub fn routed_model(&self) -> Option<RoutedModel> {
+        let model = self.model()?;
+        if !crate::core::virtual_models::is_virtual_model(&model) {
+            return None;
+        }
+        let state_messages = self.inner.agent.state().messages;
+        let latest = crate::core::virtual_models::find_latest_agent_response(&state_messages)?;
+        let physical = self
+            .inner
+            .model_runtime
+            .get_physical_model(&latest.provider, &latest.model)?;
+        Some(RoutedModel {
+            model: physical,
+            thinking_level: latest.thinking_level,
+        })
     }
 
     /// `get thinkingLevel` (agent-session.ts:871-873).
@@ -3240,6 +3596,10 @@ impl AgentSession {
             .agent_run_abort_requested
             .store(false, Ordering::SeqCst);
         self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
+        // `this._failedResponse = undefined; this._recordSelection();`
+        // (agent-session.ts:1778-1779 @ a13d35a74).
+        *lock(&self.inner.failed_response) = None;
+        self.record_selection();
         let result = async {
             self.inner
                 .agent
@@ -3282,8 +3642,11 @@ impl AgentSession {
             self.finish_cancelled_retry();
         }
         // #9548 (agent-session.ts:1233): the run's prompt options (including
-        // any forced prompt) end with the run.
+        // any forced prompt) end with the run. `this._failedResponse =
+        // undefined;` (agent-session.ts:1798) clears a retry record that
+        // never reached a retry request.
         *lock(&self.inner.run_system_prompt_options) = None;
+        *lock(&self.inner.failed_response) = None;
         self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
         self.emit_agent_settled().await;
@@ -3323,6 +3686,10 @@ impl AgentSession {
         };
 
         if self.is_retryable_error(&msg) && self.prepare_retry(&msg).await {
+            // `this._failedResponse = message;` (agent-session.ts:1819): the
+            // retry request's preparation reads it for the `failed` route
+            // payload.
+            *lock(&self.inner.failed_response) = Some(msg.clone());
             // A retry was scheduled, but an abort landed meanwhile: clean up
             // the stale attempt state and stop the continuation loop.
             if self.inner.agent_run_abort_requested.load(Ordering::SeqCst) {
@@ -3377,7 +3744,9 @@ impl AgentSession {
             loader.settings_manager().get_image_auto_resize()
         };
         let resize_options = self
-            .model()
+            .routed_model()
+            .map(|routed| routed.model)
+            .or_else(|| self.model())
             .as_ref()
             .and_then(crate::tools::image_process::resolved_image_resize_options);
         let mut normalized_images = Vec::new();
@@ -4154,9 +4523,15 @@ impl AgentSession {
     /// Sync the runner's model + resolved settings before a compaction
     /// trigger. Async lock (not `try_lock`): under contention a silent no-op
     /// would leave a stale per-model budget for the trigger the caller is
-    /// about to run.
+    /// about to run. The runner's limits model follows `_limitsModel()`
+    /// (agent-session.ts:612): the physical model that produced the latest
+    /// response under a virtual selection.
     async fn sync_compaction_model(&self) {
-        let model = self.model();
+        let selected = self.model();
+        let limits_model = self
+            .routed_model()
+            .map(|routed| routed.model)
+            .or_else(|| selected.clone());
         let (compaction, retry) = {
             let mut loader = lock(&self.inner.resource_loader);
             let settings = loader.settings_manager_mut();
@@ -4165,13 +4540,13 @@ impl AgentSession {
             // covers the first; `compact` / `check_compaction` sync before
             // every trigger, covering the rest). #8133.
             (
-                settings.get_compaction_settings(model.as_ref().map(compaction_model_ref)),
+                settings.get_compaction_settings(selected.as_ref().map(compaction_model_ref)),
                 retry_config_to_policy(settings.get_retry_settings()),
             )
         };
         let thinking_level = self.thinking_level();
         let mut runner = self.inner.compaction.lock().await;
-        runner.set_model(model);
+        runner.set_model(limits_model);
         runner.set_settings(rpi_agent::compaction::CompactionSettings {
             enabled: compaction.enabled,
             reserve_tokens: compaction.reserve_tokens,
@@ -4977,7 +5352,10 @@ impl AgentSession {
         let mut summary_details: Option<serde_json::Value> = None;
         let mut summary_usage: Option<Usage> = None;
         if options.summarize && !entries_to_summarize.is_empty() && extension_summary.is_none() {
-            let model = self.model().ok_or_else(|| {
+            // V16-12 FR-B R6: route the summary model first under a virtual
+            // selection (`_getSummarizationRequestAuth`, agent-session.ts:549-568).
+            let (summary_model, summary_thinking_level) = self.summarization_model().await?;
+            let model = summary_model.ok_or_else(|| {
                 RpiError::Session("No model available for summarization".to_owned())
             })?;
             let reserve_tokens = lock(&self.inner.resource_loader)
@@ -4996,7 +5374,7 @@ impl AgentSession {
                     stream_fn: &self.inner.agent.stream_function,
                     args: &SummarizationArgs {
                         signal: Some(token.clone()),
-                        thinking_level: Some(self.thinking_level()),
+                        thinking_level: Some(summary_thinking_level),
                         retry: {
                             let mut loader = lock(&self.inner.resource_loader);
                             retry_config_to_policy(
@@ -5233,9 +5611,14 @@ impl AgentSession {
         }
     }
 
-    /// `getContextUsage` (agent-session.ts:3159-3203).
+    /// `getContextUsage` (agent-session.ts:3159-3203). The window follows
+    /// `_limitsModel()` (agent-session.ts:612): the physical model that
+    /// produced the latest response under a virtual selection.
     pub fn get_context_usage(&self) -> Option<ContextUsage> {
-        let model = self.model()?;
+        let model = self
+            .routed_model()
+            .map(|routed| routed.model)
+            .or_else(|| self.model())?;
         let context_window = u64::from(model.context_window);
         if context_window == 0 {
             return None;

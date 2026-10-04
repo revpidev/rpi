@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
+use rpi_agent::session::SessionEntry;
 use rpi_agent::types::ThinkingLevel;
 use rpi_agent::{Agent, AgentMessage, AgentOptions, AgentTool, InitialAgentState};
 use rpi_ai::types::{Message, Model, StreamOptions, TextContent};
@@ -190,43 +191,105 @@ pub async fn create_agent_session(
         }
     };
 
+    // Extension-registered providers and virtual models flush into the model
+    // runtime before the session restores its model
+    // (agent-session-services.ts:159-184 @ a13d35a74): a resumed virtual
+    // selection has to resolve against the freshly registered catalog. The
+    // session's `bindCore` flush then drains an empty queue (post-bind
+    // registrations go direct).
+    if let Some(host) = &options.extension_host {
+        let runtime = host.runtime();
+        for registration in runtime.take_pending_provider_registrations() {
+            match serde_json::from_value::<crate::core::model_runtime::ProviderConfigInput>(
+                registration.config,
+            ) {
+                Ok(config) => {
+                    if let Err(error) = model_runtime
+                        .register_provider(&registration.name, config)
+                        .await
+                    {
+                        tracing::warn!(
+                            "extension \"{}\" provider error: {error}",
+                            registration.extension_path
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    "extension \"{}\" provider error: {error}",
+                    registration.extension_path
+                ),
+            }
+        }
+        for registration in runtime.take_pending_native_provider_registrations() {
+            if let Err(error) = model_runtime
+                .register_native_provider(registration.provider)
+                .await
+            {
+                tracing::warn!(
+                    "extension \"{}\" provider error: {error}",
+                    registration.extension_path
+                );
+            }
+        }
+        for registration in runtime.take_pending_virtual_model_registrations() {
+            if let Err(error) = model_runtime
+                .register_virtual_model(registration.definition, registration.route)
+                .await
+            {
+                tracing::warn!(
+                    "extension \"{}\" virtual model error: {error}",
+                    registration.extension_path
+                );
+            }
+        }
+    }
+
     // Check if the session has existing data to restore (sdk.ts:187-190).
-    let (existing_messages, existing_model, existing_thinking_level, has_thinking_entry) = {
+    let (existing_messages, existing_thinking_level, has_thinking_entry) = {
         let manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
         let context = manager.build_session_context();
         let has_thinking_entry = manager
             .get_branch(None)
             .iter()
             .any(|entry| entry.type_tag() == "thinking_level_change");
-        (
-            context.messages,
-            context.model,
-            context.thinking_level,
-            has_thinking_entry,
-        )
+        (context.messages, context.thinking_level, has_thinking_entry)
     };
     let has_existing_session = !existing_messages.is_empty();
+
+    // Assistant messages name the physical model that answered, so a virtual
+    // selection is only in `model_change` entries (sdk.ts:196-204).
+    let session_selection = {
+        let manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let branch = manager.get_branch(None);
+        let typed: Vec<SessionEntry> = branch
+            .iter()
+            .filter_map(|entry| entry.known().cloned())
+            .collect();
+        drop(manager);
+        crate::core::virtual_models::get_branch_selection(&typed, |provider, id| {
+            model_runtime.get_model(provider, id)
+        })
+    };
 
     let mut model = options.model;
     let mut model_fallback_message: Option<String> = None;
 
     // If the session has data, try to restore the model from it. The whole
-    // branch requires a saved model entry (sdk.ts:196 `existingSession.model`)
+    // branch requires a recorded selection (sdk.ts:196 `existingSession.model`)
     // — a session with messages but no model_change entry falls through to
     // findInitialModel, like upstream.
     if model.is_none()
         && has_existing_session
-        && let Some(saved) = &existing_model
+        && let Some((saved_provider, saved_model_id)) = &session_selection
     {
-        if let Some(restored) = model_runtime.get_model(&saved.provider, &saved.model_id)
+        if let Some(restored) = model_runtime.get_model(saved_provider, saved_model_id)
             && model_runtime.has_configured_auth(&restored.provider)
         {
             model = Some(restored);
         }
         if model.is_none() {
             model_fallback_message = Some(format!(
-                "Could not restore model {}/{}",
-                saved.provider, saved.model_id
+                "Could not restore model {saved_provider}/{saved_model_id}"
             ));
         }
     }
@@ -503,6 +566,34 @@ pub async fn create_agent_session(
                         }
                     })),
                 };
+                // V16-12 FR-B R4: a failed `prepareRequest` route is answered
+                // here (upstream rejects the hook promise and
+                // `handleRunFailure` synthesizes the error response; the rpi
+                // hook has no error channel). The failure names the virtual
+                // model, so the error response records it — and the router
+                // is not called a second time.
+                if let Some(message) = stream_options_with_headers
+                    .simple
+                    .stream
+                    .session_id
+                    .as_deref()
+                    .and_then(|session_id| {
+                        model_runtime.take_virtual_route_failure(
+                            session_id,
+                            &model.provider,
+                            &model.id,
+                        )
+                    })
+                {
+                    let stream = rpi_ai::api::lazy::lazy_stream(&model, async move {
+                        Err(rpi_ai::auth::resolve::ModelsError::new(
+                            rpi_ai::auth::resolve::ModelsErrorCode::Stream,
+                            message,
+                        ))
+                    });
+                    return Box::pin(stream)
+                        as rpi_agent::BoxStream<'static, rpi_ai::types::StreamEvent>;
+                }
                 // Arm the cache warmer from session requests only
                 // (sdk.ts:383-384, #9668): compaction and summaries carry
                 // their own routing ids (`session_id` differs), so only the

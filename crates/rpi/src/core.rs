@@ -40,3 +40,4 @@ pub mod themes;
 pub mod trust_manager;
 pub mod usage_totals;
 pub mod version_check;
+pub mod virtual_models;

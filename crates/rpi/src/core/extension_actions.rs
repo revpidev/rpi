@@ -21,6 +21,63 @@ use serde_json::Value;
 use crate::core::agent_session::{AgentSession, CustomDeliverAs, WeakAgentSession};
 use crate::core::extensions::StreamingBehavior;
 
+/// An error `ClassifierResult` (`classify` never rejects;
+/// model-registry.ts:173-179).
+fn classifier_error_result(message: impl Into<String>) -> Value {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let result = rpi_ai::types::ClassifierResult {
+        api: rpi_ai::types::ApiKind::from(""),
+        provider: String::new(),
+        model: String::new(),
+        answers: std::collections::BTreeMap::new(),
+        usage: None,
+        stop_reason: rpi_ai::types::ClassifierStopReason::Error,
+        error_message: Some(message.into()),
+        timestamp,
+    };
+    serde_json::to_value(result).unwrap_or(Value::Null)
+}
+
+/// Parse the portable subset of `ModelsClassifierOptions` from the JSON
+/// boundary (camelCase). Callback-bearing fields cannot cross and are
+/// ignored; `signal` is absorbed by the request-time credential paths.
+fn parse_classifier_options(options: &Value) -> Option<rpi_ai::types::ClassifierOptions> {
+    let object = options.as_object()?;
+    let mut parsed = rpi_ai::types::ClassifierOptions {
+        api_key: object
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        headers: object
+            .get("headers")
+            .and_then(|headers| serde_json::from_value(headers.clone()).ok()),
+        env: object
+            .get("env")
+            .and_then(|env| serde_json::from_value(env.clone()).ok()),
+        timeout_ms: object.get("timeoutMs").and_then(Value::as_u64),
+        max_retries: object
+            .get("maxRetries")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+        max_retry_delay_ms: object.get("maxRetryDelayMs").and_then(Value::as_u64),
+        temperature: object.get("temperature").and_then(Value::as_f64),
+        ..Default::default()
+    };
+    // An all-empty options object is equivalent to none (upstream
+    // `options?` semantics).
+    if parsed
+        .headers
+        .as_ref()
+        .is_some_and(|headers| headers.is_empty())
+    {
+        parsed.headers = None;
+    }
+    Some(parsed)
+}
+
 /// A stream that terminates immediately with an `error` event (and error
 /// result) — the `ctx.modelRegistry.stream()` answer for setup failures
 /// (#8964: "Setup failures produce error events and error results",
@@ -411,6 +468,34 @@ impl HostActions for SessionHostActions {
         }
     }
 
+    /// `registerVirtualModel(definition)` (agent-session.ts:2443-2446 @
+    /// upstream v0.99.0 + `virtual-models.ts:955-974`). The route callback is
+    /// created by the carrier's host-call layer (wasm/native), which is the
+    /// only place that holds the guest dispatch handle.
+    async fn register_virtual_model(
+        &self,
+        definition: Value,
+        route: rpi_ext_host::types::VirtualModelRouteFn,
+    ) -> Result<(), String> {
+        let Some(session) = self.session() else {
+            return Err("session is gone".to_owned());
+        };
+        session
+            .model_runtime()
+            .register_virtual_model(definition, route)
+            .await
+    }
+
+    /// `unregisterVirtualModel(provider, id)` (agent-session.ts:2447-2450).
+    async fn unregister_virtual_model(&self, provider: &str, id: &str) {
+        if let Some(session) = self.session() {
+            session
+                .model_runtime()
+                .unregister_virtual_model(provider, id)
+                .await;
+        }
+    }
+
     // -- v0.11 model-registry actions (model-registry.ts @ 4181f66) ---------
 
     /// `ctx.modelRegistry.complete(model, context, options?)`
@@ -438,6 +523,67 @@ impl HostActions for SessionHostActions {
         let session = self.session()?;
         let model = session.model_runtime().find_model(provider, model_id)?;
         serde_json::to_value(model).ok()
+    }
+
+    /// `ctx.modelRegistry.findOfType(type, provider, modelId)`
+    /// (model-registry.ts:76-77 @ a13d35a74): non-chat catalog lookup over
+    /// the runtime's typed accessors (V16-06 R2.5.2).
+    fn model_registry_find_of_type(
+        &self,
+        model_type: &str,
+        provider: &str,
+        model_id: &str,
+    ) -> Option<Value> {
+        let model_type = match model_type {
+            "chat" => rpi_ai::types::ModelType::Chat,
+            "image" => rpi_ai::types::ModelType::Image,
+            "classifier" => rpi_ai::types::ModelType::Classifier,
+            _ => return None,
+        };
+        let session = self.session()?;
+        let model = session
+            .model_runtime()
+            .get_model_of_type(model_type, provider, model_id)?;
+        serde_json::to_value(model).ok()
+    }
+
+    /// `ctx.modelRegistry.classify(model, context, options?)`
+    /// (model-registry.ts:173-179 @ a13d35a74): structured classification
+    /// with request-time authentication. Never rejects — parse failures and
+    /// an unbound session produce an error `ClassifierResult`. The
+    /// callback-bearing option fields (`signal`/`fetch`/`onPayload`/
+    /// `onResponse`) cannot cross the JSON boundary and are ignored.
+    async fn model_registry_classify(
+        &self,
+        model: Value,
+        context: Value,
+        options: Option<Value>,
+    ) -> Option<Value> {
+        let Some(session) = self.session() else {
+            return Some(classifier_error_result("session is gone"));
+        };
+        let model: rpi_ai::types::ClassifierModel = match serde_json::from_value(model) {
+            Ok(model) => model,
+            Err(error) => {
+                return Some(classifier_error_result(format!(
+                    "bad classifier model JSON: {error}"
+                )));
+            }
+        };
+        let context: rpi_ai::types::ClassifierContext = match serde_json::from_value(context) {
+            Ok(context) => context,
+            Err(error) => {
+                return Some(classifier_error_result(format!(
+                    "bad classifier context JSON: {error}"
+                )));
+            }
+        };
+        let options = options.as_ref().and_then(parse_classifier_options);
+        let result = session
+            .model_runtime()
+            .classify(&model, &context, options.as_ref())
+            .await;
+        serde_json::to_value(result).ok()
     }
 
     /// `ctx.modelRegistry.stream(model, context, options)` (#8964,

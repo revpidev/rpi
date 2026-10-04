@@ -144,6 +144,23 @@ impl HostActions for MockActions {
 
     async fn unregister_provider(&self, _name: &str) {}
 
+    async fn register_virtual_model(
+        &self,
+        definition: Value,
+        _route: rpi_ext_host::types::VirtualModelRouteFn,
+    ) -> Result<(), String> {
+        if self.fail_provider_registration {
+            return Err("virtual model rejected".to_owned());
+        }
+        self.registered_providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(("virtual".to_owned(), definition));
+        Ok(())
+    }
+
+    async fn unregister_virtual_model(&self, _provider: &str, _id: &str) {}
+
     async fn model_registry_complete(
         &self,
         _model: Value,
@@ -154,6 +171,24 @@ impl HostActions for MockActions {
     }
 
     fn model_registry_find(&self, _provider: &str, _model_id: &str) -> Option<Value> {
+        None
+    }
+
+    fn model_registry_find_of_type(
+        &self,
+        _model_type: &str,
+        _provider: &str,
+        _model_id: &str,
+    ) -> Option<Value> {
+        None
+    }
+
+    async fn model_registry_classify(
+        &self,
+        _model: Value,
+        _context: Value,
+        _options: Option<Value>,
+    ) -> Option<Value> {
         None
     }
 
