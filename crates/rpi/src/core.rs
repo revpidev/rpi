@@ -24,6 +24,7 @@ pub mod model_runtime;
 pub mod output_guard;
 pub mod package_manager;
 pub mod prompt_templates;
+pub mod radius;
 pub mod remote_catalog_provider;
 pub mod resource_loader;
 pub mod self_update;

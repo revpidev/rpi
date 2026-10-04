@@ -2099,6 +2099,13 @@ impl ModelRuntime {
             .unwrap_or(false)
     }
 
+    /// `getProviderAuthStatus` (model-runtime.ts:292-307 @ ed8b3bcc1): the
+    /// cached availability-snapshot auth check for a provider, used by the
+    /// `/login` selector rows for their status indicators.
+    pub fn get_provider_auth_status(&self, provider_id: &str) -> Option<AuthCheck> {
+        read(&self.snapshot).auth.get(provider_id).cloned()
+    }
+
     /// `hasConfiguredAuth` (model-runtime.ts:370-372).
     pub fn has_configured_auth(&self, provider_id: &str) -> bool {
         read(&self.snapshot)

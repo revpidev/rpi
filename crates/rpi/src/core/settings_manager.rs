@@ -2026,6 +2026,27 @@ impl SettingsManager {
         self.settings.get_str("trackingId").map(str::to_string)
     }
 
+    /// `getOrCreateDeviceId` (settings-manager.ts:1172-1178 @ `02eed88fd`):
+    /// stable ID of this installation, created on first use and persisted to
+    /// the **global** settings file. Project settings are ignored so a
+    /// committed project settings file cannot give every clone the same ID.
+    pub fn get_or_create_device_id(&mut self) -> String {
+        if let Some(existing) = self
+            .global_settings
+            .get_str("deviceId")
+            .map(str::to_string)
+            .filter(|id| !id.is_empty())
+        {
+            return existing;
+        }
+        let id = random_uuid_v4();
+        self.global_settings
+            .set("deviceId", Value::String(id.clone()));
+        self.mark_modified("deviceId", None);
+        self.save();
+        id
+    }
+
     /// `setEnableAnalytics` (settings-manager.ts:958-967): generates a
     /// tracking identifier (UUID v4) on first opt-in — when the stored
     /// `trackingId` is absent, null, or empty (JS falsy check).
@@ -4133,6 +4154,63 @@ mod tests {
             manager.get_model_catalog_url().as_deref(),
             Some("https://mirror.test")
         );
+    }
+
+    /// `getOrCreateDeviceId` (`02eed88fd`): first call generates a UUID and
+    /// persists it to the **global** settings file; later calls return the
+    /// same ID; project settings never supply it.
+    #[test]
+    fn test_get_or_create_device_id_generates_once_and_ignores_project() {
+        let dirs = test_dirs();
+        // A project settings file that tries to pin the ID is ignored.
+        write_json(
+            &project_path(&dirs),
+            json!({"deviceId": "11111111-2222-3333-4444-555555555555"}),
+        );
+        let mut manager = create(&dirs);
+        let first = manager.get_or_create_device_id();
+        assert_ne!(first, "11111111-2222-3333-4444-555555555555");
+        assert!(is_uuid_shape(&first));
+
+        let second = manager.get_or_create_device_id();
+        assert_eq!(first, second);
+
+        // Persisted in the global file (and only there).
+        assert_eq!(read_json(&global_path(&dirs))["deviceId"], json!(first));
+        assert_eq!(
+            read_json(&project_path(&dirs))["deviceId"],
+            json!("11111111-2222-3333-4444-555555555555")
+        );
+
+        // A fresh manager re-reads the stored ID instead of generating one.
+        let mut reopened = create(&dirs);
+        assert_eq!(reopened.get_or_create_device_id(), first);
+
+        // An empty stored value counts as missing (JS falsy).
+        let dirs = test_dirs();
+        write_json(&global_path(&dirs), json!({"deviceId": ""}));
+        let mut manager = create(&dirs);
+        let generated = manager.get_or_create_device_id();
+        assert!(!generated.is_empty());
+        assert!(is_uuid_shape(&generated));
+    }
+
+    /// UUIDv4 shape used by `deviceId` assertions.
+    fn is_uuid_shape(value: &str) -> bool {
+        let parts: Vec<&str> = value.split('-').collect();
+        parts.len() == 5
+            && [8, 4, 4, 4, 12]
+                == [
+                    parts[0].len(),
+                    parts[1].len(),
+                    parts[2].len(),
+                    parts[3].len(),
+                    parts[4].len(),
+                ]
+            && parts
+                .iter()
+                .flat_map(|part| part.chars())
+                .all(|c| c.is_ascii_hexdigit())
     }
 
     /// `InMemorySettingsStorage` round-trips writes within a manager

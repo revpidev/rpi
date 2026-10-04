@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpi_ai::auth::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
-use rpi_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType};
+use rpi_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType, LoginOptions};
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::types::{Model, ModelThinkingLevel, ThinkingLevel};
 use rpi_tui::terminal_colors::TerminalColorScheme;
@@ -58,6 +58,7 @@ use crate::core::model_resolver::{
     resolve_model_scope_with_diagnostics,
 };
 use crate::core::model_runtime::ModelRuntime;
+use crate::core::radius::RADIUS_PROVIDER_ID;
 use crate::core::session_manager::SessionManager;
 use crate::core::themes::get_available_themes;
 use crate::core::trust_manager::ProjectTrustStore;
@@ -69,6 +70,7 @@ use crate::modes::interactive::components::login_dialog::LoginDialogComponent;
 use crate::modes::interactive::components::model_selector::ModelSelectorComponent;
 use crate::modes::interactive::components::oauth_selector::{
     AuthSelectorMode, AuthSelectorProvider, OAuthSelectorComponent,
+    format_auth_selector_provider_status,
 };
 use crate::modes::interactive::components::scoped_models_selector::ScopedModelsSelectorComponent;
 use crate::modes::interactive::components::session_selector::SessionSelectorComponent;
@@ -634,16 +636,14 @@ fn find_login_provider_options(
         .collect()
 }
 
-/// `startProviderLogin` (interactive-mode.ts:4925-4933).
-fn start_provider_login(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProvider) {
+/// `startProviderLogin` (interactive-mode.ts:4925-4933). `on_back` narrows
+/// upstream's `onBack` callback to its only use: reopening the top-level
+/// auth-type selector when a Radius login is cancelled
+/// (`interactive-mode.ts:5853`).
+fn start_provider_login(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProvider, on_back: bool) {
     match provider.auth_type {
         AuthType::Oauth => {
-            // `showLoginDialog` (interactive-mode.ts:5286-5312) is a
-            // T15 / OAuth-wave hook; the flow stays stubbed.
-            ui.show_status(&format!(
-                "Provider login is not available yet (T13): {}",
-                provider.id
-            ));
+            show_oauth_login_dialog(ui, provider, on_back);
         }
         AuthType::ApiKey if provider.method_login => {
             show_api_key_login_dialog(ui, provider);
@@ -652,6 +652,168 @@ fn start_provider_login(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProvider
             show_ambient_auth_dialog(ui, provider);
         }
     }
+}
+
+/// `showLoginDialog` (interactive-mode.ts:6161-6210 @ ed8b3bcc1): mount the
+/// login dialog, run the OAuth flow through the dialog adapter (the
+/// `getDeviceId` supplier rides `LoginOptions`), complete the
+/// authentication, and offer the Radius MCP setup after a Radius login.
+/// Cancellation restores the editor and reopens the originating selector.
+fn show_oauth_login_dialog(
+    ui: &Arc<InteractiveUi>,
+    provider: &AuthSelectorProvider,
+    on_back: bool,
+) {
+    let previous_model = ui.session().model();
+    let (dialog, interaction) = login_dialog_with_interaction(ui, &provider.id, &provider.name);
+    mount_login_dialog(ui, &dialog);
+
+    let ui = Arc::clone(ui);
+    let provider_id = provider.id.clone();
+    let provider_name = provider.name.clone();
+    spawn_async(async move {
+        let runtime = ui.session().model_runtime().clone();
+        // `{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() }`
+        // (`interactive-mode.ts:6174`): generated on first use, global scope.
+        let device_ui = Arc::clone(&ui);
+        let options = LoginOptions {
+            get_device_id: Some(Arc::new(move || {
+                device_ui
+                    .session()
+                    .settings_manager(|settings| settings.get_or_create_device_id())
+            })),
+        };
+        let result = runtime
+            .login(&provider_id, AuthType::Oauth, &interaction, Some(&options))
+            .await;
+        ui.hide_selector();
+        match result {
+            Ok(_credential) => {
+                if let Err(error) = complete_provider_authentication(
+                    &ui,
+                    &provider_id,
+                    &provider_name,
+                    AuthType::Oauth,
+                    previous_model,
+                )
+                .await
+                {
+                    let message = error.message;
+                    if message.starts_with("Credential login committed for") {
+                        // `CredentialSynchronizationError` (interactive-mode.ts:6200-6202).
+                        ui.show_error(&format!(
+                            "Logged in to {provider_name}, but local model state could not be synchronized: {message}"
+                        ));
+                    } else if message != "Login cancelled" {
+                        ui.show_error(&format!("Failed to login to {provider_name}: {message}"));
+                    }
+                } else if provider_id == RADIUS_PROVIDER_ID {
+                    offer_radius_mcp_server(&ui, &provider_id, &provider_name);
+                }
+            }
+            Err(error) => {
+                if error.message == "Login cancelled" {
+                    if on_back {
+                        show_login_auth_type_selector(&ui, None);
+                    }
+                } else {
+                    ui.show_error(&format!(
+                        "Failed to login to {provider_name}: {}",
+                        error.message
+                    ));
+                }
+            }
+        }
+    });
+}
+
+/// `offerRadiusMcpServer` (interactive-mode.ts:6296-6344 @ ed8b3bcc1): offer
+/// to point the Radius MCP server in the global `mcp.json` at the Radius
+/// login, adding the server when missing. Nothing is asked when a global
+/// server already uses this login.
+fn offer_radius_mcp_server(ui: &Arc<InteractiveUi>, provider_id: &str, provider_name: &str) {
+    use crate::extensions::mcp::config::{
+        McpAuthConfig, McpHttpServerConfig, McpServerCommon, McpServerConfig,
+        add_mcp_server_config, load_mcp_config,
+    };
+
+    let agent_dir = crate::config::get_agent_dir();
+    let mcp_path = agent_dir.join("mcp.json");
+    let mcp_url = crate::core::radius::radius_mcp_url();
+    let normalize_url = |url: &str| url.trim_end_matches('/').to_owned();
+    let loaded = load_mcp_config(&agent_dir, Path::new(ui.session().cwd()), false);
+    let servers = loaded.servers;
+    let existing = servers.iter().find(|entry| match &entry.config {
+        McpServerConfig::Http(http) => normalize_url(&http.url) == normalize_url(&mcp_url),
+        McpServerConfig::Stdio(_) => false,
+    });
+    if let Some(McpServerConfig::Http(http)) = existing.map(|entry| &entry.config)
+        && http
+            .auth
+            .as_ref()
+            .is_some_and(|auth_config| auth_config.provider == provider_id)
+    {
+        return;
+    }
+
+    let mut name = existing
+        .map(|entry| entry.name.clone())
+        .unwrap_or_else(|| "radius".to_owned());
+    if existing.is_none() && servers.iter().any(|entry| entry.name == name) {
+        name = "radius-mcp".to_owned();
+    }
+    let mut config = match existing {
+        Some(entry) => entry.config.clone(),
+        None => McpServerConfig::Http(McpHttpServerConfig {
+            common: McpServerCommon::default(),
+            kind: None,
+            url: mcp_url,
+            headers: None,
+            oauth: None,
+            auth: None,
+            extra: serde_json::Map::new(),
+        }),
+    };
+    if let McpServerConfig::Http(http) = &mut config {
+        http.auth = Some(McpAuthConfig {
+            provider: provider_id.to_owned(),
+        });
+        // `auth` replaces the MCP OAuth sign-in.
+        http.oauth = None;
+    }
+
+    let path_display = mcp_path.display().to_string();
+    let select_ui = Arc::clone(ui);
+    let selector = Arc::new(Mutex::new(ExtensionSelectorComponent::new(
+        Arc::clone(&lock(&ui.theme)),
+        Some(format!("Configure {provider_name} MCP in {path_display}?")),
+        vec!["Yes".to_owned(), "No".to_owned()],
+        Box::new(move |option: Option<String>| {
+            select_ui.hide_selector();
+            if option.as_deref() != Some("Yes") {
+                return;
+            }
+            match add_mcp_server_config(&mcp_path, &name, &config) {
+                Ok(_) => select_ui.handle_reload_command(),
+                Err(error) => {
+                    select_ui.show_error(&format!("Could not update {path_display}: {error}"));
+                }
+            }
+        }),
+        Box::new({
+            let ui = Arc::clone(ui);
+            move || {
+                ui.hide_selector();
+                ui.render_handle.request_render();
+            }
+        }),
+        None,
+    )));
+    let entry = shared_component_from_boxed(Box::new(FocusableShell {
+        inner: selector,
+        focused: false,
+    }));
+    ui.show_selector(entry);
 }
 
 /// `LoginDialogComponent` wired to its `AuthInteraction` adapter: the
@@ -1205,9 +1367,37 @@ fn show_login_auth_type_selector(
     // swaps in the provider's own label, e.g. meta's "Sign in with Meta",
     // oauthLoginLabel interactive-mode.ts:5648-5650 @ 19451accd; the
     // kimi/xai/openrouter collapse precedent predates meta).
-    let subscription_label = "Sign in with an account";
-    let api_key_label = "Sign in with an API key";
-    let mut options: Vec<&str> = Vec::new();
+    let subscription_label = "Sign in with an account".to_owned();
+    let api_key_label = "Sign in with an API key".to_owned();
+    // The top-level selector offers Radius directly, as its last option
+    // (`ed8b3bcc1`); a per-provider method select never adds it. The row
+    // carries the cached auth status indicator.
+    let radius_option = if provider_options.is_none() {
+        ui.session()
+            .model_runtime()
+            .get_providers()
+            .iter()
+            .find(|provider| provider.id() == RADIUS_PROVIDER_ID)
+            .and_then(|provider| {
+                AuthSelectorProvider::from_provider(
+                    provider,
+                    ui.session()
+                        .model_runtime()
+                        .get_provider_auth_status(provider.id()),
+                )
+                .into_iter()
+                .find(|option| option.auth_type == AuthType::Oauth)
+            })
+    } else {
+        None
+    };
+    let radius_label = radius_option.as_ref().map(|option| {
+        format!(
+            "Sign in with {}{}",
+            option.name,
+            format_auth_selector_provider_status(&lock(&ui.theme), option)
+        )
+    });
     let has_oauth = provider_options
         .as_ref()
         .map(|providers| providers.iter().any(|p| p.auth_type == AuthType::Oauth))
@@ -1216,11 +1406,15 @@ fn show_login_auth_type_selector(
         .as_ref()
         .map(|providers| providers.iter().any(|p| p.auth_type == AuthType::ApiKey))
         .unwrap_or(true);
+    let mut options: Vec<String> = Vec::new();
     if has_oauth {
-        options.push(subscription_label);
+        options.push(subscription_label.clone());
     }
     if has_api_key {
-        options.push(api_key_label);
+        options.push(api_key_label.clone());
+    }
+    if let Some(label) = &radius_label {
+        options.push(label.clone());
     }
     if options.is_empty() {
         ui.show_status("No login methods available.");
@@ -1232,7 +1426,7 @@ fn show_login_auth_type_selector(
         // Only one method: start it directly (interactive-mode.ts:4957-
         // 4962).
         if let Some(provider) = providers.first() {
-            start_provider_login(ui, provider);
+            start_provider_login(ui, provider, false);
         }
         return;
     }
@@ -1244,17 +1438,22 @@ fn show_login_auth_type_selector(
         },
         None => "Select authentication method:".to_owned(),
     };
-    let options: Vec<String> = options.into_iter().map(str::to_string).collect();
     let select_ui = Arc::clone(ui);
     let selector = Arc::new(Mutex::new(ExtensionSelectorComponent::new(
         Arc::clone(&lock(&ui.theme)),
         Some(title),
-        options.clone(),
+        options,
         Box::new(move |option: Option<String>| {
             select_ui.hide_selector();
             let Some(option) = option else {
                 return;
             };
+            if radius_label.as_deref() == Some(option.as_str()) {
+                if let Some(radius) = &radius_option {
+                    start_provider_login(&select_ui, radius, true);
+                }
+                return;
+            }
             let auth_type = if option == subscription_label {
                 AuthType::Oauth
             } else {
@@ -1263,7 +1462,7 @@ fn show_login_auth_type_selector(
             match &provider_options {
                 Some(providers) => {
                     if let Some(provider) = providers.iter().find(|p| p.auth_type == auth_type) {
-                        start_provider_login(&select_ui, provider);
+                        start_provider_login(&select_ui, provider, false);
                     }
                 }
                 // Bare `/login`: filter the provider list by the chosen
@@ -1937,7 +2136,7 @@ impl InteractiveUi {
                 // (interactive-mode.ts:5010-5020).
                 select_ui.hide_selector();
                 let provider = provider.clone();
-                start_provider_login(&select_ui, &provider);
+                start_provider_login(&select_ui, &provider, false);
             }),
             Box::new({
                 let ui = Arc::clone(ui);
@@ -2112,7 +2311,7 @@ impl InteractiveUi {
 
         let matches = find_login_provider_options(&runtime, provider_ref);
         if matches.len() == 1 {
-            start_provider_login(&ui, &matches[0]);
+            start_provider_login(&ui, &matches[0], false);
             return;
         }
         if matches.len() > 1 {
@@ -3405,6 +3604,154 @@ mod tests {
             selector_mounted(&mode.ui_state),
             "login selector mounted; chat: {}",
             rendered_chat(&mode.ui_state)
+        );
+    }
+
+    /// `ed8b3bcc1`: the top-level `/login` menu offers Radius last, with its
+    /// status indicator.
+    #[tokio::test]
+    async fn login_auth_type_selector_offers_radius_last() {
+        let (mut mode, _terminal, _session, _tmp) = mode_harness().await;
+        mode.init().await;
+        mode.ui_state.handle_login_command(None).await;
+        let rendered = lock(&mode.ui_state.active_selector)
+            .as_ref()
+            .map(|entry| entry.lock().unwrap().render(70).join("\n"))
+            .unwrap_or_default();
+        assert!(
+            rendered.contains("Sign in with Radius"),
+            "radius row missing; rendered: {rendered}"
+        );
+        let radius_line = rendered
+            .lines()
+            .position(|line| line.contains("Sign in with Radius"));
+        let last_sign_in = rendered
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("Sign in with"))
+            .map(|(index, _)| index)
+            .last();
+        assert_eq!(
+            radius_line, last_sign_in,
+            "radius row must be the last option; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("not configured"),
+            "status indicator missing; rendered: {rendered}"
+        );
+    }
+
+    /// Restore `RPI_CODING_AGENT_DIR` on drop (test env hygiene).
+    struct AgentDirEnv(Option<std::ffi::OsString>);
+    impl Drop for AgentDirEnv {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => rpi_test_env::set_var("RPI_CODING_AGENT_DIR", value),
+                None => rpi_test_env::remove_var("RPI_CODING_AGENT_DIR"),
+            }
+        }
+    }
+
+    /// `ed8b3bcc1`: confirming the Radius MCP offer writes the global
+    /// `mcp.json` entry (URL + `auth.provider`) and triggers a reload.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn offer_radius_mcp_server_writes_global_config() {
+        let _env_guard = lock(&crate::modes::interactive::test_support::TEST_ENV_LOCK);
+        let (mut mode, terminal, _session, tmp) = mode_harness().await;
+        let agent_dir = tmp.path().join("agent");
+        let _restore = AgentDirEnv(std::env::var_os("RPI_CODING_AGENT_DIR"));
+        rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+        mode.init().await;
+
+        offer_radius_mcp_server(&mode.ui_state, "radius", "Radius");
+        assert!(
+            selector_mounted(&mode.ui_state),
+            "offer selector mounted; chat: {}",
+            rendered_chat(&mode.ui_state)
+        );
+        terminal.feed("\r");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let body = std::fs::read_to_string(agent_dir.join("mcp.json")).expect("mcp.json");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("mcp json");
+        assert_eq!(
+            parsed["mcpServers"]["radius"]["url"],
+            serde_json::json!(crate::core::radius::radius_mcp_url())
+        );
+        assert_eq!(
+            parsed["mcpServers"]["radius"]["auth"]["provider"],
+            serde_json::json!("radius")
+        );
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(
+            chat.contains("Reloading keybindings"),
+            "reload triggered; chat: {chat}"
+        );
+    }
+
+    /// `ed8b3bcc1`: a global Radius server already using this login asks
+    /// nothing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn offer_radius_mcp_server_skips_when_already_configured() {
+        let _env_guard = lock(&crate::modes::interactive::test_support::TEST_ENV_LOCK);
+        let (mut mode, _terminal, _session, tmp) = mode_harness().await;
+        let agent_dir = tmp.path().join("agent");
+        let _restore = AgentDirEnv(std::env::var_os("RPI_CODING_AGENT_DIR"));
+        rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+        std::fs::write(
+            agent_dir.join("mcp.json"),
+            serde_json::json!({"mcpServers": {"radius": {
+                "url": crate::core::radius::radius_mcp_url(),
+                "auth": {"provider": "radius"}
+            }}})
+            .to_string(),
+        )
+        .expect("write mcp.json");
+        mode.init().await;
+
+        offer_radius_mcp_server(&mode.ui_state, "radius", "Radius");
+        assert!(
+            !selector_mounted(&mode.ui_state),
+            "no offer when already configured"
+        );
+    }
+
+    /// `ed8b3bcc1`: a name collision with a different server shifts the new
+    /// entry to `radius-mcp`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn offer_radius_mcp_server_avoids_a_name_collision() {
+        let _env_guard = lock(&crate::modes::interactive::test_support::TEST_ENV_LOCK);
+        let (mut mode, terminal, _session, tmp) = mode_harness().await;
+        let agent_dir = tmp.path().join("agent");
+        let _restore = AgentDirEnv(std::env::var_os("RPI_CODING_AGENT_DIR"));
+        rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+        std::fs::write(
+            agent_dir.join("mcp.json"),
+            serde_json::json!({"mcpServers": {"radius": {"url": "https://other.example/mcp"}}})
+                .to_string(),
+        )
+        .expect("write mcp.json");
+        mode.init().await;
+
+        offer_radius_mcp_server(&mode.ui_state, "radius", "Radius");
+        assert!(selector_mounted(&mode.ui_state));
+        terminal.feed("\r");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let body = std::fs::read_to_string(agent_dir.join("mcp.json")).expect("mcp.json");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("mcp json");
+        assert_eq!(
+            parsed["mcpServers"]["radius-mcp"]["url"],
+            serde_json::json!(crate::core::radius::radius_mcp_url())
+        );
+        assert_eq!(
+            parsed["mcpServers"]["radius"]["url"],
+            serde_json::json!("https://other.example/mcp")
         );
     }
 

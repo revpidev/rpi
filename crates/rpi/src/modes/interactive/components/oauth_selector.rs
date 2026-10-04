@@ -336,33 +336,43 @@ impl OAuthSelectorComponent {
     /// the provider's configured kind uses the type label ("account" for
     /// non-subscription OAuth).
     fn format_status_indicator(&self, provider: &AuthSelectorProvider) -> String {
-        let Some(status) = &provider.status else {
-            return self.theme.fg("muted", " • not configured");
-        };
-        if status.kind != provider.auth_type {
-            let label = format!(
-                "{} configured",
-                format_auth_selector_provider_type(&status.kind, provider.subscription)
-            );
-            return format!(
-                "{}{}",
-                self.theme.fg("muted", " • "),
-                self.theme.fg("warning", &label)
-            );
-        }
-        let Some(source) = &status.source else {
-            return self.theme.fg("success", " ✓ configured");
-        };
-        if source == "OAuth" || source == "stored credential" {
-            return self.theme.fg("success", " ✓ configured");
-        }
-        let display = if is_env_source(source) {
-            format!("env: {source}")
-        } else {
-            source.clone()
-        };
-        self.theme.fg("success", &format!(" ✓ {display}"))
+        format_auth_selector_provider_status(&self.theme, provider)
     }
+}
+
+/// `formatAuthSelectorProviderStatus` (oauth-selector.ts:36-53 @ ed8b3bcc1):
+/// the status label appended to a provider row. Also used by the top-level
+/// `/login` Radius row (`interactive-mode.ts:5815`).
+pub fn format_auth_selector_provider_status(
+    theme: &Theme,
+    provider: &AuthSelectorProvider,
+) -> String {
+    let Some(status) = &provider.status else {
+        return theme.fg("muted", " • not configured");
+    };
+    if status.kind != provider.auth_type {
+        let label = format!(
+            "{} configured",
+            format_auth_selector_provider_type(&status.kind, provider.subscription)
+        );
+        return format!(
+            "{}{}",
+            theme.fg("muted", " • "),
+            theme.fg("warning", &label)
+        );
+    }
+    let Some(source) = &status.source else {
+        return theme.fg("success", " ✓ configured");
+    };
+    if source == "OAuth" || source == "stored credential" {
+        return theme.fg("success", " ✓ configured");
+    }
+    let display = if is_env_source(source) {
+        format!("env: {source}")
+    } else {
+        source.clone()
+    };
+    theme.fg("success", &format!(" ✓ {display}"))
 }
 
 /// `(text) => theme.fg("border", text)` (dynamic-border.ts:14).
