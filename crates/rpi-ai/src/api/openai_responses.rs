@@ -79,6 +79,27 @@ pub static OPENAI_TOOL_CALL_PROVIDERS: LazyLock<HashSet<&'static str>> =
 /// `max_output_tokens` below 16 (<https://github.com/earendil-works/pi/issues/6265>).
 pub const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: u32 = 16;
 
+/// Sign in with ChatGPT: the subscription's usage page (`02eed88fd`).
+const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/settings/usage";
+
+/// OpenAI API keys start with `sk-`; a different credential sent directly to
+/// OpenAI is a Sign in with ChatGPT access token (`02eed88fd`).
+fn is_chatgpt_sign_in(model: &Model, api_key: Option<&str>) -> bool {
+    model.provider == "openai"
+        && model.base_url == "https://api.openai.com/v1"
+        && api_key.is_some_and(|api_key| !api_key.starts_with("sk-"))
+}
+
+/// `02eed88fd`: Sign in with ChatGPT shares the subscription's usage limit
+/// with other apps — point users at the usage page.
+fn append_chatgpt_usage_hint(message: String) -> String {
+    if message.contains("subscription_sharing_usage_limit_exceeded") {
+        format!("{message}\nCheck your ChatGPT usage: {CHATGPT_USAGE_URL}")
+    } else {
+        message
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -309,6 +330,8 @@ pub fn build_params(
 
     let cache_retention =
         resolve_cache_retention(options.stream.cache_retention, options.stream.env.as_ref());
+    // Sign in with ChatGPT rejects these request fields (`02eed88fd`).
+    let omit_unsupported_fields = is_chatgpt_sign_in(model, options.stream.api_key.as_deref());
 
     let mut params = json!({
         "model": model.id,
@@ -320,10 +343,14 @@ pub fn build_params(
     {
         params["prompt_cache_key"] = json!(key);
     }
-    if let Some(retention) = get_prompt_cache_retention(compat, cache_retention) {
+    if !omit_unsupported_fields
+        && let Some(retention) = get_prompt_cache_retention(compat, cache_retention)
+    {
         params["prompt_cache_retention"] = json!(retention);
     }
-    if let Some(cache_options) = get_prompt_cache_options(compat, cache_retention) {
+    if !omit_unsupported_fields
+        && let Some(cache_options) = get_prompt_cache_options(compat, cache_retention)
+    {
         params["prompt_cache_options"] = cache_options;
     }
     params["store"] = json!(false);
@@ -332,11 +359,15 @@ pub fn build_params(
     if let Some(max_tokens) = options
         .stream
         .max_tokens
-        .filter(|_| compat.supports_max_output_tokens)
+        .filter(|_| compat.supports_max_output_tokens && !omit_unsupported_fields)
     {
         params["max_output_tokens"] = json!(max_tokens.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS));
     }
-    if let Some(temperature) = options.stream.temperature {
+    if let Some(temperature) = options
+        .stream
+        .temperature
+        .filter(|_| !omit_unsupported_fields)
+    {
         params["temperature"] = json!(temperature);
     }
     if let Some(service_tier) = &options.service_tier {
@@ -723,7 +754,7 @@ pub fn stream(
                 } else {
                     StopReason::Error
                 };
-                output.error_message = Some(message);
+                output.error_message = Some(append_chatgpt_usage_hint(message));
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
@@ -882,6 +913,64 @@ mod tests {
         let plain = model(json!({}));
         let params = params_for(&plain, &ctx, &options);
         assert_eq!(params["max_output_tokens"], json!(16), "floor applied");
+    }
+
+    /// `02eed88fd`: a Sign in with ChatGPT credential (a non-`sk-` key sent
+    /// to the OpenAI base URL) omits `prompt_cache_retention`,
+    /// `prompt_cache_options`, `max_output_tokens` and `temperature`;
+    /// `prompt_cache_key` and `store` stay.
+    #[test]
+    fn test_chatgpt_sign_in_omits_unsupported_request_fields() {
+        let chatgpt_model = model(json!({
+            "provider": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "compat": {"supportsLongCacheRetention": true, "supportsMaxOutputTokens": true}
+        }));
+        let ctx = common::context(vec![common::user_text("hi")], None);
+        let mut options = OpenAIResponsesOptions::default();
+        options.stream.api_key = Some("chatgpt-access-token".to_owned());
+        options.stream.cache_retention = Some(CacheRetention::Long);
+        options.stream.max_tokens = Some(4096);
+        options.stream.temperature = Some(0.7);
+        options.stream.session_id = Some("session".to_owned());
+        let params = params_for(&chatgpt_model, &ctx, &options);
+        assert!(params.get("prompt_cache_retention").is_none());
+        assert!(params.get("prompt_cache_options").is_none());
+        assert!(params.get("max_output_tokens").is_none());
+        assert!(params.get("temperature").is_none());
+        assert!(params.get("prompt_cache_key").is_some());
+        assert_eq!(params["store"], json!(false));
+
+        // An API key (`sk-` prefix) keeps every field.
+        let mut api_key_options = options.clone();
+        api_key_options.stream.api_key = Some("sk-test".to_owned());
+        let params = params_for(&chatgpt_model, &ctx, &api_key_options);
+        assert_eq!(params["temperature"], json!(0.7));
+        assert!(params.get("max_output_tokens").is_some());
+        assert!(params.get("prompt_cache_retention").is_some());
+
+        // Other providers keep them, even with a non-`sk-` key.
+        let codex = model(json!({
+            "provider": "openai-codex",
+            "baseUrl": "https://api.openai.com/v1",
+            "compat": {"supportsLongCacheRetention": true, "supportsMaxOutputTokens": true}
+        }));
+        let params = params_for(&codex, &ctx, &api_key_options);
+        assert_eq!(params["temperature"], json!(0.7));
+    }
+
+    /// `02eed88fd`: the usage link is appended only for the shared usage
+    /// limit code.
+    #[test]
+    fn test_append_chatgpt_usage_hint() {
+        let hinted = append_chatgpt_usage_hint(
+            "subscription_sharing_usage_limit_exceeded: usage limit reached".to_owned(),
+        );
+        assert!(hinted.ends_with("Check your ChatGPT usage: https://chatgpt.com/settings/usage"));
+        assert_eq!(
+            append_chatgpt_usage_hint("other error".to_owned()),
+            "other error"
+        );
     }
 
     /// 17de82d7b: explicit-cache-mode models get `prompt_cache_options`

@@ -31,6 +31,9 @@ fn non_retryable_provider_limit_error_pattern() -> &'static Regex {
             "out of budget",
             "quota exceeded",
             "billing",
+            // Sign in with ChatGPT: the subscription's shared usage limit,
+            // which resets after hours rather than seconds (`02eed88fd`).
+            "subscription_sharing_usage_limit_exceeded",
         ])
     });
     &PATTERN
@@ -88,6 +91,10 @@ fn retryable_provider_error_pattern() -> &'static Regex {
             "try your request again",
             "please retry your request",
             "ResourceExhausted",
+            // Sign in with ChatGPT: usage or user data temporarily
+            // unavailable (`02eed88fd`).
+            "subscription_sharing_usage_unavailable",
+            "subscription_sharing_user_unavailable",
         ])
     });
     &PATTERN
@@ -338,6 +345,24 @@ mod tests {
         assert!(!is_retryable_assistant_error(&assistant(
             StopReason::Error,
             None
+        )));
+    }
+
+    /// `02eed88fd`: the ChatGPT shared usage limit is a subscription limit
+    /// (not retryable); the usage/user unavailable codes are transient.
+    #[test]
+    fn test_chatgpt_subscription_sharing_error_classification() {
+        assert!(!is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("subscription_sharing_usage_limit_exceeded: usage limit reached")
+        )));
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("subscription_sharing_usage_unavailable: try again")
+        )));
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("subscription_sharing_user_unavailable")
         )));
     }
 

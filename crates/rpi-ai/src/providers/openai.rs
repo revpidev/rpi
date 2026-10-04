@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::api::openai_responses::OpenAiResponses;
+use crate::auth::oauth::openai_chatgpt_oauth;
 use crate::auth::{ProviderAuth, env_api_key_auth};
 use crate::generated::get_builtin_models;
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
@@ -19,7 +20,9 @@ pub fn openai_provider() -> Arc<dyn Provider> {
                 "OpenAI API key",
                 &["OPENAI_API_KEY"],
             ))),
-            oauth: None,
+            // `lazyOAuth({ name: "OpenAI (ChatGPT subscription)", ... })`
+            // (`02eed88fd`); loginLabel has no `OAuthAuth` slot in rpi.
+            oauth: Some(openai_chatgpt_oauth()),
         },
         models: get_builtin_models("openai").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiResponses)),

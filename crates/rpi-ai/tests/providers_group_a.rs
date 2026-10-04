@@ -164,7 +164,11 @@ async fn test_openai_factory_config_and_auth() {
     assert!(provider.headers().is_none());
 
     let auth = provider.auth();
-    assert!(auth.oauth.is_none());
+    // `02eed88fd`: the OpenAI provider gains the ChatGPT subscription OAuth
+    // flow alongside the API key (two parallel channels).
+    let oauth = auth.oauth.as_ref().expect("oauth auth");
+    assert_eq!(oauth.name(), "OpenAI (ChatGPT subscription)");
+    assert!(oauth.is_subscription());
     let api_key = auth.api_key.as_ref().expect("api key auth");
     assert_eq!(api_key.name(), "OpenAI API key");
 

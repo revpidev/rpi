@@ -16,8 +16,8 @@ use std::sync::Arc;
 use super::super::types::OAuthAuth;
 use super::{
     anthropic::anthropic_oauth, github_copilot::github_copilot_oauth,
-    kimi_coding::kimi_coding_oauth, meta::meta_oauth, openai_codex::openai_codex_oauth,
-    openrouter::openrouter_oauth, xai::xai_oauth,
+    kimi_coding::kimi_coding_oauth, meta::meta_oauth, openai_chatgpt::openai_chatgpt_oauth,
+    openai_codex::openai_codex_oauth, openrouter::openrouter_oauth, xai::xai_oauth,
 };
 
 /// `OAuthFlowLoaders` — a statically-bundled flow loader (upstream
@@ -32,6 +32,11 @@ pub fn load_anthropic_oauth() -> Arc<dyn OAuthAuth> {
 /// `loadOpenAICodexOAuth`.
 pub fn load_openai_codex_oauth() -> Arc<dyn OAuthAuth> {
     openai_codex_oauth()
+}
+
+/// `loadOpenAIChatGPTOAuth` (`02eed88fd`).
+pub fn load_openai_chatgpt_oauth() -> Arc<dyn OAuthAuth> {
+    openai_chatgpt_oauth()
 }
 
 /// `loadGitHubCopilotOAuth`.
@@ -65,6 +70,7 @@ pub fn oauth_flow_loaders() -> &'static [(&'static str, OAuthFlowLoader)] {
     &[
         ("anthropic", load_anthropic_oauth),
         ("openai-codex", load_openai_codex_oauth),
+        ("openai", load_openai_chatgpt_oauth),
         ("github-copilot", load_github_copilot_oauth),
         ("openrouter", load_openrouter_oauth),
         ("kimi-coding", load_kimi_coding_oauth),
@@ -94,6 +100,7 @@ mod tests {
         let expected = [
             ("anthropic", "Anthropic (Claude Pro/Max)"),
             ("openai-codex", "OpenAI (ChatGPT Plus/Pro)"),
+            ("openai", "OpenAI (ChatGPT subscription)"),
             ("github-copilot", "GitHub Copilot"),
             ("openrouter", "OpenRouter OAuth"),
             ("kimi-coding", "Kimi Code (subscription)"),
