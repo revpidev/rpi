@@ -14,9 +14,9 @@
 //!   `localeCompare`).
 //! - `on_select` receives the full selected [`AuthSelectorProvider`] (the
 //!   row carries `auth_type` / `method_name`); upstream passes
-//!   `(providerId, authType)`, oauth-selector.ts:202. The T13 login wiring
-//!   uses the row to pick the login flow (api-key dialog vs ambient info vs
-//!   the OAuth stub).
+//!   `(providerId, authType)`, oauth-selector.ts:202. The login wiring uses
+//!   the row to pick the flow (api-key dialog vs ambient info vs the OAuth
+//!   login dialog, V16-11).
 //! - `status` is injected per row; the component never queries the runtime
 //!   (upstream reads `getProviderAuthStatus` while building the list,
 //!   interactive-mode.ts:4848-4853). Statuses come from `check_auth` /

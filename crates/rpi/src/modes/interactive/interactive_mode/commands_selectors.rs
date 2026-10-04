@@ -2095,15 +2095,13 @@ impl InteractiveUi {
         ui.show_selector(entry);
     }
 
-    /// `showLoginProviderSelector` (interactive-mode.ts:4993-5034): the login
-    /// provider list. Selecting a row dispatches through
-    /// `startProviderLogin` — the api-key dialog flow, the ambient-info
-    /// dialog, or the OAuth stub. `initial_search_input` mirrors the upstream
-    /// `initialSearchInput` (pre-filled fuzzy search, e.g. the unmatched
-    /// `/login <ref>` fallback).
     /// `showLoginProviderSelector(authType?, initialSearchInput?)`
-    /// (interactive-mode.ts:4993-5034): the provider list, optionally
+    /// (interactive-mode.ts:4993-5034): the login provider list, optionally
     /// filtered to one auth method (the bare `/login` pre-selector path).
+    /// Selecting a row dispatches through `startProviderLogin` — the api-key
+    /// dialog, the ambient-info dialog, or the OAuth login dialog (V16-11).
+    /// `initial_search_input` mirrors the upstream `initialSearchInput`
+    /// (pre-filled fuzzy search, e.g. the unmatched `/login <ref>` fallback).
     pub(crate) fn show_login_selector(
         ui: &Arc<Self>,
         auth_type: Option<AuthType>,
