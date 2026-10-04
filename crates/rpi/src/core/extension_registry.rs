@@ -1785,7 +1785,7 @@ mod safe_name_tests {
     fn safe_names_pass() {
         for name in [
             "rpi-statusline",
-            "rpiv_ask_user_question",
+            "rpi_ask_user_question",
             "a".repeat(128).as_str(),
         ] {
             assert!(ensure_safe_extension_name(name).is_ok(), "{name}");

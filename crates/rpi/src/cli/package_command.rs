@@ -1035,7 +1035,7 @@ Options:
 Examples:
   {APP_NAME} install subagents
   {APP_NAME} install subagents@^0.2
-  {APP_NAME} install rpiv-ask-user-question --rc
+  {APP_NAME} install rpi-ask-user-question --rc
   {APP_NAME} install github:revpidev/rpi-subagents
   {APP_NAME} install npm:@foo/bar
   {APP_NAME} install git:github.com/user/repo
@@ -1561,9 +1561,9 @@ mod package_command_tests {
     // V14-19 增补（R6.7）：`--rc` 安装通道选择器——仅 install 接受。
     #[test]
     fn test_parse_install_rc_flag() {
-        let parsed = parse(&["install", "rpiv-ask-user-question", "--rc"]);
+        let parsed = parse(&["install", "rpi-ask-user-question", "--rc"]);
         assert!(parsed.rc);
-        assert_eq!(parsed.source.as_deref(), Some("rpiv-ask-user-question"));
+        assert_eq!(parsed.source.as_deref(), Some("rpi-ask-user-question"));
         assert!(parsed.invalid_option.is_none());
 
         // Orthogonal to the other install flags.
@@ -1649,7 +1649,7 @@ mod package_command_tests {
         assert!(install.contains("-l, --local"));
         // V14-19 增补（R6.7）：安装通道选择器在 Options 与示例里可见。
         assert!(install.contains("--rc"));
-        assert!(install.contains("rpi install rpiv-ask-user-question --rc"));
+        assert!(install.contains("rpi install rpi-ask-user-question --rc"));
         let remove = package_command_help(PackageCommandKind::Remove);
         assert!(remove.contains(REMOVE_USAGE));
         assert!(remove.contains("rpi uninstall <source> [-l]"));

@@ -4993,7 +4993,7 @@ impl InteractiveMode {
         // port split the two (host-level `set_ui` + separate
         // `bind_extensions`) and originally ran `bind_extensions` FIRST:
         // `session_start` then fired with no UI bridge, so extensions that
-        // claim UI work at session start (rpiv-todo's overlay foreground
+        // claim UI work at session start (rpi-todo's overlay foreground
         // claim) silently never ran — found in v0.1.5-rc.1 field
         // verification. Attach the bridge BEFORE binding so the dispatch
         // order matches upstream.

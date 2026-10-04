@@ -175,7 +175,7 @@ impl ContextActions for SessionContextActions {
     /// branch (root→leaf) `type:"message"` entries of the bound session
     /// whose `message.role == "toolResult"` and whose `message.toolName`
     /// matches `tool_name` exactly — the cross-ABI equivalent of upstream
-    /// `ctx.sessionManager.getBranch()` replay reads (rpiv-todo
+    /// `ctx.sessionManager.getBranch()` replay reads (rpi-todo
     /// `state/replay.ts` @ 338b264, same filter chain).
     /// Like `get_session_entries`, the projection walks the RAW stored
     /// entry so malformed-but-navigable results round-trip verbatim.

@@ -2791,7 +2791,7 @@ impl InteractiveMode {
         // (`bindExtensions({ uiContext, mode: "tui" })`), and the
         // `session_start` dispatched by `bind_extensions` must see the UI
         // (same fix as `init`; the inverted order was found in v0.1.5-rc.1
-        // field verification via rpiv-todo's never-claimed overlay).
+        // field verification via rpi-todo's never-claimed overlay).
         {
             let runner = session.extension_runner();
             if let Some(host) = runner
