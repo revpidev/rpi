@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::super::interaction::{AuthEvent, AuthInteraction};
+use super::super::interaction::{AuthEvent, AuthInteraction, AuthPrompt, SelectOption};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
 use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
 use super::callback_server::{
@@ -49,6 +49,14 @@ const CALLBACK_PATH: &str = "/callback";
 const REDIRECT_URI: &str = "http://localhost:53692/callback";
 /// `SCOPES` (verbatim).
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+/// `COPY_CODE_REDIRECT_URI` — the platform-hosted copy-code callback
+/// (`7a11fe1c7`; a non-loopback redirect exception for headless/remote
+/// browsers).
+const COPY_CODE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+/// `ANTHROPIC_BROWSER_LOGIN_METHOD`.
+const LOGIN_METHOD_BROWSER: &str = "browser";
+/// `ANTHROPIC_COPY_CODE_LOGIN_METHOD`.
+const LOGIN_METHOD_COPY_CODE: &str = "copy_code";
 /// `AbortSignal.timeout(30_000)`.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// `expires = Date.now() + expires_in * 1000 - 5 * 60 * 1000`.
@@ -284,57 +292,13 @@ impl AnthropicOAuth {
             extra: Map::new(),
         })
     }
-}
-
-/// Token endpoint JSON shape (`{ access_token, refresh_token, expires_in }`;
-/// the refresh response's optional `scope` is ignored, as upstream).
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
-    expires_in: i64,
-}
-
-/// `loginAnthropic` manual-input handling: JS truthiness applied to the
-/// parsed pieces (`OAuth state mismatch` / `Missing authorization code` /
-/// `Missing OAuth state` verbatim).
-fn finalize_manual_input(
-    parsed: ParsedAuthorizationInput,
-    verifier: &str,
-) -> Result<(String, String), ModelsError> {
-    if let Some(state) = parsed.state.as_deref()
-        && !state.is_empty()
-        && state != verifier
-    {
-        return Err(error("OAuth state mismatch"));
-    }
-    let code = parsed.code.filter(|code| !code.is_empty());
-    let state = parsed.state.or_else(|| Some(verifier.to_owned()));
-    let code = code.ok_or_else(|| error("Missing authorization code"))?;
-    let state = state
-        .filter(|state| !state.is_empty())
-        .ok_or_else(|| error("Missing OAuth state"))?;
-    Ok((code, state))
-}
-
-#[async_trait::async_trait]
-impl OAuthAuth for AnthropicOAuth {
-    fn name(&self) -> &str {
-        "Anthropic (Claude Pro/Max)"
-    }
-
-    /// `isSubscription: true` (providers/anthropic.ts:52 @ 4181f66).
-    fn is_subscription(&self) -> bool {
-        true
-    }
-
-    /// `loginAnthropic`: PKCE → shared callback server (`expected_state =
-    /// verifier`, bind failure degrades to pasted input) → notify `auth_url`
-    /// → race the `manual_code` prompt against the callback → token exchange.
-    async fn login(
+    /// `loginAnthropic` (`7a11fe1c7`): PKCE → shared callback server
+    /// (`expected_state = verifier`, bind failure degrades to pasted input)
+    /// → notify `auth_url` → race the `manual_code` prompt against the
+    /// callback → token exchange.
+    async fn login_browser(
         &self,
         interaction: &dyn AuthInteraction,
-        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         let pkce = generate_pkce();
         let verifier = pkce.verifier;
@@ -417,6 +381,143 @@ impl OAuthAuth for AnthropicOAuth {
         result
     }
 
+    /// `loginAnthropicCopyCode` (`7a11fe1c7`, #10194): the platform-hosted
+    /// copy-code redirect for headless/remote browsers. Shares the PKCE and
+    /// token-exchange surface with the browser flow; only the callback
+    /// channel differs.
+    async fn login_copy_code(
+        &self,
+        interaction: &dyn AuthInteraction,
+    ) -> Result<OAuthCredential, ModelsError> {
+        let pkce = generate_pkce();
+        let verifier = pkce.verifier;
+        let challenge = pkce.challenge;
+        // `authParams` in upstream key order.
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("code", "true"),
+                ("client_id", CLIENT_ID),
+                ("response_type", "code"),
+                ("redirect_uri", COPY_CODE_REDIRECT_URI),
+                ("scope", SCOPES),
+                ("code_challenge", challenge.as_str()),
+                ("code_challenge_method", "S256"),
+                ("state", verifier.as_str()),
+            ])
+            .finish();
+        interaction.notify(AuthEvent::AuthUrl {
+            url: format!("{AUTHORIZE_URL}?{query}"),
+            instructions: Some(
+                "Complete login in your browser, then copy the code Anthropic shows and paste it here."
+                    .to_owned(),
+            ),
+        });
+
+        let input = interaction
+            .prompt(AuthPrompt::ManualCode {
+                message: "Paste the code Anthropic shows after you sign in:".to_owned(),
+                placeholder: Some("code#state".to_owned()),
+                signal: interaction.signal(),
+            })
+            .await?;
+        let parsed = parse_authorization_input(&input);
+        if let Some(state) = parsed.state.as_deref()
+            && !state.is_empty()
+            && state != verifier
+        {
+            return Err(error("OAuth state mismatch"));
+        }
+        let code = parsed
+            .code
+            .filter(|code| !code.is_empty())
+            .ok_or_else(|| error("Missing authorization code"))?;
+        interaction.notify(AuthEvent::Progress {
+            message: "Exchanging authorization code for tokens...".to_owned(),
+        });
+        self.exchange_authorization_code(
+            &code,
+            parsed.state.as_deref().unwrap_or(&verifier),
+            &verifier,
+            COPY_CODE_REDIRECT_URI,
+        )
+        .await
+    }
+}
+
+/// Token endpoint JSON shape (`{ access_token, refresh_token, expires_in }`;
+/// the refresh response's optional `scope` is ignored, as upstream).
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    refresh_token: String,
+    expires_in: i64,
+}
+
+/// `loginAnthropic` manual-input handling: JS truthiness applied to the
+/// parsed pieces (`OAuth state mismatch` / `Missing authorization code` /
+/// `Missing OAuth state` verbatim).
+fn finalize_manual_input(
+    parsed: ParsedAuthorizationInput,
+    verifier: &str,
+) -> Result<(String, String), ModelsError> {
+    if let Some(state) = parsed.state.as_deref()
+        && !state.is_empty()
+        && state != verifier
+    {
+        return Err(error("OAuth state mismatch"));
+    }
+    let code = parsed.code.filter(|code| !code.is_empty());
+    let state = parsed.state.or_else(|| Some(verifier.to_owned()));
+    let code = code.ok_or_else(|| error("Missing authorization code"))?;
+    let state = state
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| error("Missing OAuth state"))?;
+    Ok((code, state))
+}
+
+#[async_trait::async_trait]
+impl OAuthAuth for AnthropicOAuth {
+    fn name(&self) -> &str {
+        "Anthropic (Claude Pro/Max)"
+    }
+
+    /// `isSubscription: true` (providers/anthropic.ts:52 @ 4181f66).
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
+    /// `login` — select the Anthropic login method first (`browser` default /
+    /// `copy_code`), then run the chosen flow (`7a11fe1c7`).
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
+    ) -> Result<OAuthCredential, ModelsError> {
+        let method = interaction
+            .prompt(AuthPrompt::Select {
+                message: "Select Anthropic login method:".to_owned(),
+                options: vec![
+                    SelectOption {
+                        id: LOGIN_METHOD_BROWSER.to_owned(),
+                        label: "Browser login (default)".to_owned(),
+                        description: None,
+                    },
+                    SelectOption {
+                        id: LOGIN_METHOD_COPY_CODE.to_owned(),
+                        label: "Copy code login (headless)".to_owned(),
+                        description: None,
+                    },
+                ],
+                signal: None,
+            })
+            .await?;
+        match method.as_str() {
+            LOGIN_METHOD_COPY_CODE => self.login_copy_code(interaction).await,
+            LOGIN_METHOD_BROWSER => self.login_browser(interaction).await,
+            other => Err(error(format!("Unknown Anthropic login method: {other}"))),
+        }
+    }
+
     /// `refresh: (credential) => refreshAnthropicToken(credential.refresh)`.
     /// Upstream has no per-request signal here (fetch timeout only); the
     /// trait's `signal` is accepted and ignored, as upstream ignores aborts.
@@ -440,8 +541,6 @@ impl OAuthAuth for AnthropicOAuth {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-
-    use super::super::super::interaction::AuthPrompt;
 
     use axum::http::StatusCode;
     use axum::response::Json;
@@ -550,11 +649,29 @@ mod tests {
     struct FakeInteraction {
         handle: InteractionHandle,
         on_prompt: PromptHandler,
+        /// Answer used for the login-method select (`browser` by default).
+        login_method: String,
     }
 
     impl FakeInteraction {
         fn new(handle: InteractionHandle, on_prompt: PromptHandler) -> Self {
-            Self { handle, on_prompt }
+            Self {
+                handle,
+                on_prompt,
+                login_method: LOGIN_METHOD_BROWSER.to_owned(),
+            }
+        }
+
+        fn with_login_method(
+            handle: InteractionHandle,
+            login_method: &str,
+            on_prompt: PromptHandler,
+        ) -> Self {
+            Self {
+                handle,
+                on_prompt,
+                login_method: login_method.to_owned(),
+            }
         }
     }
 
@@ -579,6 +696,12 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push(prompt.clone());
+            // The login-method select is answered by the harness; every test
+            // closure keeps handling only the flow-specific prompts.
+            if matches!(prompt, AuthPrompt::Select { .. }) {
+                let login_method = self.login_method.clone();
+                return Box::pin(async move { Ok(login_method) });
+            }
             (self.on_prompt)(self.handle.clone(), prompt)
         }
 
@@ -727,6 +850,147 @@ mod tests {
         assert!(body["client_id"].as_str().is_some_and(|v| !v.is_empty()));
         assert_eq!(body["refresh_token"], "refresh-token");
         assert!(body.get("scope").is_none(), "refresh must not send scope");
+    }
+
+    /// `7a11fe1c7`: the copy-code flow uses the platform redirect and the
+    /// pasted `code#state`, sharing PKCE/token exchange with the browser flow.
+    #[tokio::test]
+    async fn copy_code_uses_the_platform_redirect_and_pasted_code_state() {
+        let endpoint =
+            MockTokenEndpoint::start(StatusCode::OK, token_response("access", "refresh")).await;
+        let oauth = oauth_with(&endpoint, free_port());
+        let handle = InteractionHandle::default();
+        let interaction = FakeInteraction::with_login_method(
+            handle.clone(),
+            LOGIN_METHOD_COPY_CODE,
+            Box::new(|handle, prompt| {
+                Box::pin(async move {
+                    expect_manual_code(&prompt);
+                    let state = handle.auth_url_param("state").ok_or_else(|| {
+                        ModelsError::new(ModelsErrorCode::Auth, "Missing OAuth state in auth URL")
+                    })?;
+                    Ok(format!("pasted-code#{state}"))
+                })
+            }),
+        );
+
+        let credential = oauth.login(&interaction, None).await.expect("login");
+        assert_eq!(credential.access, "access");
+
+        // The authorization URL points at the platform-hosted redirect.
+        assert_eq!(
+            handle.auth_url_param("redirect_uri").as_deref(),
+            Some(COPY_CODE_REDIRECT_URI)
+        );
+        let prompts = handle.prompts.lock().expect("lock").clone();
+        let select = prompts
+            .iter()
+            .find_map(|prompt| match prompt {
+                AuthPrompt::Select { options, .. } => Some(options.clone()),
+                _ => None,
+            })
+            .expect("login-method select");
+        assert_eq!(select[0].id, LOGIN_METHOD_BROWSER, "browser is the default");
+        assert_eq!(select[1].id, LOGIN_METHOD_COPY_CODE);
+        let manual = prompts
+            .iter()
+            .find_map(|prompt| match prompt {
+                AuthPrompt::ManualCode { placeholder, .. } => Some(placeholder.clone()),
+                _ => None,
+            })
+            .expect("manual code prompt");
+        assert_eq!(manual.as_deref(), Some("code#state"));
+
+        // Token exchange stays isomorphic with the browser flow except the
+        // redirect URI and the state carried through from the paste.
+        let bodies = endpoint.bodies();
+        assert_eq!(bodies.len(), 1);
+        let body = &bodies[0];
+        assert_eq!(body["grant_type"], "authorization_code");
+        assert_eq!(body["client_id"], CLIENT_ID);
+        assert_eq!(body["code"], "pasted-code");
+        assert_eq!(body["redirect_uri"], COPY_CODE_REDIRECT_URI);
+        assert_eq!(
+            body["state"].as_str(),
+            handle.auth_url_param("state").as_deref()
+        );
+        assert!(
+            body["code_verifier"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
+    }
+
+    /// `7a11fe1c7`: a pasted state that does not match the PKCE verifier is
+    /// rejected before any token request.
+    #[tokio::test]
+    async fn copy_code_rejects_a_state_mismatch() {
+        let endpoint =
+            MockTokenEndpoint::start(StatusCode::OK, token_response("access", "refresh")).await;
+        let oauth = oauth_with(&endpoint, free_port());
+        let handle = InteractionHandle::default();
+        let interaction = FakeInteraction::with_login_method(
+            handle.clone(),
+            LOGIN_METHOD_COPY_CODE,
+            Box::new(|_handle, prompt| {
+                Box::pin(async move {
+                    expect_manual_code(&prompt);
+                    Ok("pasted-code#not-the-verifier".to_owned())
+                })
+            }),
+        );
+        let failure = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("state mismatch");
+        assert_eq!(failure.message, "OAuth state mismatch");
+        assert!(endpoint.bodies().is_empty(), "no token exchange attempted");
+    }
+
+    /// `7a11fe1c7`: malformed pastes without a code are rejected.
+    #[tokio::test]
+    async fn copy_code_rejects_a_missing_code() {
+        let endpoint =
+            MockTokenEndpoint::start(StatusCode::OK, token_response("access", "refresh")).await;
+        let oauth = oauth_with(&endpoint, free_port());
+        let handle = InteractionHandle::default();
+        let interaction = FakeInteraction::with_login_method(
+            handle.clone(),
+            LOGIN_METHOD_COPY_CODE,
+            Box::new(|_handle, prompt| {
+                Box::pin(async move {
+                    expect_manual_code(&prompt);
+                    Ok("   ".to_owned())
+                })
+            }),
+        );
+        let failure = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("missing code");
+        assert_eq!(failure.message, "Missing authorization code");
+        assert!(endpoint.bodies().is_empty());
+    }
+
+    /// An unknown login-method selection fails verbatim.
+    #[tokio::test]
+    async fn unknown_login_method_fails() {
+        let endpoint =
+            MockTokenEndpoint::start(StatusCode::OK, token_response("access", "refresh")).await;
+        let oauth = oauth_with(&endpoint, free_port());
+        let handle = InteractionHandle::default();
+        let interaction = FakeInteraction::with_login_method(
+            handle,
+            "carrier-pigeon",
+            Box::new(|_handle, _prompt| {
+                Box::pin(async move { Err(ModelsError::new(ModelsErrorCode::Auth, "unused")) })
+            }),
+        );
+        let failure = oauth.login(&interaction, None).await.expect_err("unknown");
+        assert_eq!(
+            failure.message,
+            "Unknown Anthropic login method: carrier-pigeon"
+        );
     }
 
     /// `anthropicOAuth.login resolves through the manual_code prompt and aborts it after settling`.
