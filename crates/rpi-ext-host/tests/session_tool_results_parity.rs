@@ -74,7 +74,7 @@ impl HostCall for FakeHost {
 
 fn corpus() -> Vec<NativeResult> {
     vec![
-        // Root entry, structured details snapshot (rpiv-todo envelope
+        // Root entry, structured details snapshot (rpi-todo envelope
         // shape — the ADR-0030 consumer's payload).
         NativeResult {
             id: "e1".to_owned(),

@@ -106,7 +106,7 @@ fn notify(host: &dyn crate::HostCall, message: &str, level: &str) {
         "ui.notify",
         json!({ "message": message, "notifyType": level }),
     ) {
-        tracing::warn!(%error, "rpiv-todo: ui.notify rejected");
+        tracing::warn!(%error, "rpi-todo: ui.notify rejected");
     }
 }
 

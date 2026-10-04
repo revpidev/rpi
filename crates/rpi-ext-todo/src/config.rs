@@ -1,19 +1,21 @@
-//! XDG config reading for `rpiv-todo` (maxWidgetLines / collapseKey /
+//! XDG config reading for `rpi-todo` (maxWidgetLines / collapseKey /
 //! guidance overrides).
 //!
 //! Port of upstream `packages/rpiv-todo/config.ts` @ `0fdf4f8` plus the
 //! `@juicesharp/rpiv-config` loader it calls
 //! (`loadJsonConfigWithLegacyFallback` / `validateGuidanceFields`).
 //!
-//! Path policy (R-T6 [PARITY/VARIANT], deviation TE-D43): the upstream
-//! path `~/.config/rpiv-todo/config.json` is kept verbatim — brand
-//! independent, deliberately NOT mapped to `~/.rpi` (TE-D39 precedent).
-//! Lookup order (read-only, never created):
+//! Path policy (R-T6 [VARIANT], deviation TE-D43 as amended by ADR-0033
+//! decision 6, 2026-10-05): the config directory uses the current plugin
+//! name — `~/.config/rpi-todo/config.json` — and stays deliberately NOT
+//! mapped to `~/.rpi` (TE-D39 precedent). The former `rpiv-todo`
+//! directory is no longer read (clean switch; announcement in
+//! `changes/v0.1.6.md`). Lookup order (read-only, never created):
 //!
-//! 1. `$XDG_CONFIG_HOME/rpiv-todo/config.json` — must be set, non-empty
+//! 1. `$XDG_CONFIG_HOME/rpi-todo/config.json` — must be set, non-empty
 //!    after trim and absolute (`~`/`~/…` expands first; relative falls
 //!    through);
-//! 2. else the legacy `~/.config/rpiv-todo/config.json` (intentionally
+//! 2. else the legacy `~/.config/rpi-todo/config.json` (intentionally
 //!    ignores `XDG_CONFIG_HOME`).
 //!
 //! A present XDG file wins even when malformed (corruption is surfaced,
@@ -32,7 +34,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 /// Config directory name (upstream package directory).
-pub const CONFIG_DIR_NAME: &str = "rpiv-todo";
+pub const CONFIG_DIR_NAME: &str = "rpi-todo";
 /// Config file name.
 pub const CONFIG_FILE_NAME: &str = "config.json";
 
@@ -177,7 +179,7 @@ fn load_json_config(path: &Path) -> Value {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "rpiv-todo: config read failed, using defaults");
+            tracing::warn!(path = %path.display(), %error, "rpi-todo: config read failed, using defaults");
             return Value::Object(serde_json::Map::new());
         }
     };
@@ -185,7 +187,7 @@ fn load_json_config(path: &Path) -> Value {
         Ok(value) if value.is_object() => value,
         Ok(_) => Value::Object(serde_json::Map::new()),
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "rpiv-todo: invalid JSON, using default ({{}})");
+            tracing::warn!(path = %path.display(), %error, "rpi-todo: invalid JSON, using default ({{}})");
             Value::Object(serde_json::Map::new())
         }
     }
@@ -212,7 +214,7 @@ pub fn load_config_from(xdg_config_home: Option<&str>, home: &Path) -> Value {
 /// Load the config for the current process (upstream `loadConfig`).
 /// Tests inject through [`set_test_config`] (the `__reset_state` seam
 /// installs an empty object, so the suite never reads the developer
-/// machine's real `~/.config/rpiv-todo/` — the rpi counterpart of the
+/// machine's real `~/.config/rpi-todo/` — the rpi counterpart of the
 /// upstream suite's `beforeEach(removeConfigFile())`).
 pub fn load_config() -> Value {
     #[cfg(test)]
@@ -391,7 +393,7 @@ mod tests {
     /// `write` populates the config file under the resolved location.
     fn scratch(write: Option<(Option<&str>, &Value)>) -> (PathBuf, Option<String>) {
         let home = std::env::temp_dir().join(format!(
-            "rpiv-todo-config-test-{}-{}",
+            "rpi-todo-config-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -513,8 +515,7 @@ mod tests {
 
     #[test]
     fn load_config_malformed_json_falls_back_to_an_empty_object() {
-        let home =
-            std::env::temp_dir().join(format!("rpiv-todo-config-bad-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("rpi-todo-config-bad-{}", std::process::id()));
         let path = legacy_config_path(&home);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(&path, "{not json").expect("write");
@@ -525,8 +526,7 @@ mod tests {
 
     #[test]
     fn load_config_non_object_json_falls_back_to_an_empty_object() {
-        let home =
-            std::env::temp_dir().join(format!("rpiv-todo-config-arr-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("rpi-todo-config-arr-{}", std::process::id()));
         let path = legacy_config_path(&home);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(&path, "[1,2]").expect("write");
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn xdg_file_wins_over_legacy_even_when_malformed() {
         let home = std::env::temp_dir().join(format!(
-            "rpiv-todo-config-xdg-{}-{}",
+            "rpi-todo-config-xdg-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn missing_xdg_falls_back_to_the_legacy_path() {
         let home = std::env::temp_dir().join(format!(
-            "rpiv-todo-config-legacy-{}-{}",
+            "rpi-todo-config-legacy-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn relative_xdg_value_falls_back_to_the_default_config_dir() {
         let home = std::env::temp_dir().join(format!(
-            "rpiv-todo-config-rel-{}-{}",
+            "rpi-todo-config-rel-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn tilde_xdg_value_expands_to_home() {
         let home = std::env::temp_dir().join(format!(
-            "rpiv-todo-config-tilde-{}-{}",
+            "rpi-todo-config-tilde-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

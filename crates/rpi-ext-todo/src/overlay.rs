@@ -50,8 +50,9 @@ use crate::state::selectors::{
 use crate::tool::types::{Task, TaskStatus};
 use crate::view::{AnsiTheme, TodoTheme, format_overlay_task_line};
 
-/// Widget key — verbatim (`WIDGET_KEY`).
-pub const WIDGET_KEY: &str = "rpiv-todos";
+/// Widget key — renamed from the upstream `rpiv-todos` under ADR-0033
+/// decision 6 (v0.1.6, [BREAKING]); the shape is otherwise verbatim.
+pub const WIDGET_KEY: &str = "rpi-todos";
 
 /// The event-path assembly width: no truncation (`usize::MAX` makes
 /// `truncate_to_width` a pass-through); over-wide lines wrap at the host.
@@ -350,7 +351,7 @@ impl TodoOverlay {
         if visible.is_empty() {
             if self.widget_registered {
                 if let Err(error) = push_widget(host, None) {
-                    tracing::warn!(%error, "rpiv-todo: widget removal rejected");
+                    tracing::warn!(%error, "rpi-todo: widget removal rejected");
                 }
                 self.widget_registered = false;
                 self.last_lines = None;
@@ -377,7 +378,7 @@ impl TodoOverlay {
                 // A rejected push leaves the registration state alone: the
                 // upstream factory registration cannot "fail" after
                 // acceptance, and the next refresh retries the send.
-                tracing::warn!(%error, "rpiv-todo: setWidget rejected");
+                tracing::warn!(%error, "rpi-todo: setWidget rejected");
             }
         }
     }
@@ -435,7 +436,7 @@ impl TodoOverlay {
         if self.ui_bound
             && let Err(error) = push_widget(host, None)
         {
-            tracing::warn!(%error, "rpiv-todo: dispose setWidget rejected");
+            tracing::warn!(%error, "rpi-todo: dispose setWidget rejected");
         }
         self.widget_registered = false;
         self.ui_bound = false;

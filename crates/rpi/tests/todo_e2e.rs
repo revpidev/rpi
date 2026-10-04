@@ -1,4 +1,4 @@
-//! TE36 (FR-C/FR-D) — `rpiv-todo` full-chain e2e: the real cdylib through
+//! TE36 (FR-C/FR-D) — `rpi-todo` full-chain e2e: the real cdylib through
 //! the real `NativeExtensionHost` bound to real `AgentSession`s (faux
 //! provider), covering the task file §2 FR-C scenario table:
 //!
@@ -27,7 +27,7 @@
 //!
 //! Environment: every test holds the process-wide `ENV_LOCK` (sandboxed
 //! HOME/XDG/locale/offline vars — the plugin reads
-//! `$XDG_CONFIG_HOME/rpiv-todo/config.json` at install time, so a polluted
+//! `$XDG_CONFIG_HOME/rpi-todo/config.json` at install time, so a polluted
 //! developer environment must not leak in; cleared locale pins the i18n
 //! fallback to English), and the cdylib must exist
 //! (`cargo build -p rpi-ext-todo`), otherwise the tests skip with a
@@ -190,7 +190,7 @@ fn install_plugin_for_discovery(sandbox: &Sandbox, plugin: &Path) {
         .expect("crate manifest"),
     )
     .expect("manifest json");
-    let dir = sandbox.agent_dir().join("extensions").join("rpiv-todo");
+    let dir = sandbox.agent_dir().join("extensions").join("rpi-todo");
     std::fs::create_dir_all(&dir).expect("extensions dir");
     // The manifest `native` name is the carrier filename on every platform
     // (the CI pack step renames the same way).
@@ -589,8 +589,8 @@ fn todo_tool_results(session: &rpi::core::agent_session::AgentSession) -> Vec<Va
 }
 
 /// The overlay's widget key as seen by the bridge is namespaced
-/// (`{extension}:rpiv-todos`, TE11 FR-E.1).
-const WIDGET_KEY: &str = ":rpiv-todos";
+/// (`{extension}:rpi-todos`, TE11 FR-E.1; renamed with the plugin, TE42).
+const WIDGET_KEY: &str = ":rpi-todos";
 
 // ---------------------------------------------------------------------------
 // FR-C scenario 1 — full chain: create/update/complete → collapse →
@@ -1021,7 +1021,7 @@ async fn install_path_local_rpix_loads_tool_command_and_overlay() {
     let install_dir = rpi::core::extension_registry::materialize_rpix(
         &archive,
         &sandbox.extensions_root(),
-        "rpiv-todo",
+        "rpi-todo",
         "0.1.5-rc.1",
     )
     .expect("materialize rpix");

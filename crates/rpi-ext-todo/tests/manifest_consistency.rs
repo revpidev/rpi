@@ -1,6 +1,6 @@
 //! TE36 G12 (FR-A / R-T8): the shipped `rpi-extension.json`, the registry
-//! skeleton (`registry-entry.json`, mirrored by TE36 into rpi-pages
-//! `registry/rpiv-todo.json`) and the `.rpix` ship inventory are pinned
+//! skeleton (`registry-entry.json`, mirrored by TE36/TE42 into rpi-pages
+//! `registry/rpi-todo.json`) and the `.rpix` ship inventory are pinned
 //! statically.
 //!
 //! [RPI-OWN] for the registry/ship legs — the upstream ships as an npm
@@ -69,20 +69,22 @@ fn manifest_pins_capabilities_abi_and_native_only_carrier() {
         manifest["native"], "librpi_ext_todo.so",
         "native carrier filename (renamed to this manifest name at pack time)"
     );
-    assert_eq!(manifest["name"], "rpiv-todo");
+    assert_eq!(manifest["name"], "rpi-todo");
 }
 
 #[test]
 fn registry_entry_matches_official_lockstep_shape() {
-    // TE36: the skeleton is mirrored verbatim into rpi-pages
-    // `registry/rpiv-todo.json` (official first-party entry, shared
-    // revpidev/rpi Release; index key `rpiv-todo` per the 2026-09-20 M10
-    // ruling, following the `rpiv-ask-user-question` key precedent).
-    // generate-site.py validates the same fields
-    // (name/repository/description/author/license); `lockstepHost: true`
-    // makes every version's minHostVersion = the version itself — the
-    // first release rides the host's `v0.1.5-rc.1` tag (V14-19 rc channel;
-    // `rpi install rpiv-todo --rc`), stable lands at 0.1.5 (R-T8).
+    // TE36/TE42: the skeleton is mirrored verbatim into rpi-pages
+    // `registry/rpi-todo.json` (official first-party entry, shared
+    // revpidev/rpi Release; index key `rpi-todo` per the 2026-09-20 M10
+    // ruling, following the `rpi-ask-user-question` key precedent; renamed
+    // from the `rpiv-` spelling by TE42, 2026-10-05). generate-site.py
+    // validates the same fields (name/repository/description/author/license)
+    // and matches the historical `.rpix` assets through `historicNames`;
+    // `lockstepHost: true` makes every version's minHostVersion = the
+    // version itself — the first release rides the host's `v0.1.5-rc.1`
+    // tag (V14-19 rc channel; `rpi install rpi-todo --rc`), stable lands
+    // at 0.1.5 (R-T8).
     let entry: Value =
         serde_json::from_str(&read_crate_file("registry-entry.json")).expect("registry entry json");
     let manifest: Value =
@@ -95,6 +97,11 @@ fn registry_entry_matches_official_lockstep_shape() {
     assert_eq!(entry["repository"], "revpidev/rpi");
     assert_eq!(entry["official"], serde_json::json!(true));
     assert_eq!(entry["lockstepHost"], serde_json::json!(true));
+    // TE42 (R7.2.2): the v0.1.5-and-earlier `.rpix` assets keep their old
+    // `rpiv-` names; the registry declares them as historic names so
+    // generate-site.py keeps the historical version matrix under the new
+    // key (no download redirect).
+    assert_eq!(entry["historicNames"], serde_json::json!(["rpiv-todo"]));
     for field in ["description", "author", "license", "descriptionZh"] {
         assert!(
             entry

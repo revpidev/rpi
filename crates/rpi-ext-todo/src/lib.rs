@@ -13,8 +13,9 @@
 //! renderCall/renderResult transcript renderers. Event wiring follows
 //! upstream `index.ts` @ `0fdf4f8` on both layers.
 //!
-//! Docs: `rpi-docs/extensions/rpiv-todo/{01,02}.md` and the task files
-//! `rpi-docs/plan/extensions/TE34-rpiv-todo-p0.md` / `TE35-rpiv-todo-p1.md`.
+//! Docs: `rpi-docs/extensions/rpi-todo/{01,02}.md` and the task files
+//! `rpi-docs/plan/extensions/TE34-rpiv-todo-p0.md` / `TE35-rpiv-todo-p1.md`
+//! (historical filenames — the plugin itself was renamed in v0.1.6).
 //!
 //! Native plugin runtime model (ask-user-question precedent):
 //! `rpi_extension_init` registers through the host-call handle and
@@ -292,7 +293,7 @@ fn install_with_key(calls: RpiHostCalls, cookie: PluginCookie, collapse_key: Str
         }
     }
     store_channel(cookie, host);
-    tracing::info!("rpiv-todo installed");
+    tracing::info!("rpi-todo installed");
     json!({"ok": true})
 }
 
@@ -385,10 +386,10 @@ fn replay_into_slot(host: &dyn HostCall, session_id: &str) {
     match replay_via_host(host) {
         Ok(state) => store().replace_state(session_id, state),
         Err(error) if error.is_stale() => {
-            tracing::debug!("rpiv-todo: replay skipped on stale ctx (state kept)");
+            tracing::debug!("rpi-todo: replay skipped on stale ctx (state kept)");
         }
         Err(error) => {
-            tracing::warn!(%error, "rpiv-todo: replay failed");
+            tracing::warn!(%error, "rpi-todo: replay failed");
         }
     }
 }
@@ -421,7 +422,7 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) {
                 .unwrap_or_else(|error| error.into_inner());
             controller.bind_ui(generation);
             controller.update_todo_overlay(host, current_i18n(), true);
-            tracing::debug!(sid = %sid, "rpiv-todo: foreground claimed");
+            tracing::debug!(sid = %sid, "rpi-todo: foreground claimed");
         }
         // Shared by session_compact and session_tree (verbatim-identical
         // pre-extraction upstream): re-key the session's slot, refresh the
@@ -434,7 +435,7 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 controller.update_todo_overlay(host, current_i18n(), true);
-                tracing::debug!(event, "rpiv-todo: foreground replayed after {event}");
+                tracing::debug!(event, "rpi-todo: foreground replayed after {event}");
             }
         }
         // The shutting-down session's own slot is always evicted. Overlay
@@ -452,7 +453,7 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .teardown(host);
-                tracing::debug!("rpiv-todo: foreground torn down");
+                tracing::debug!("rpi-todo: foreground torn down");
             }
         }
         // Reads the store at render time; do NOT replay here (the branch
@@ -495,7 +496,7 @@ fn pack(value: &Value) -> RVec<u8> {
 pub extern "C" fn init(calls: RpiHostCalls, cookie: PluginCookie) -> RVec<u8> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install(calls, cookie)))
         .unwrap_or_else(|panic| {
-            error_envelope("internal", format!("rpiv-todo init panicked: {panic:?}"))
+            error_envelope("internal", format!("rpi-todo init panicked: {panic:?}"))
         });
     pack(&result)
 }
@@ -511,7 +512,7 @@ pub extern "C" fn dispatch(cookie: PluginCookie, message: RVec<u8>) -> RVec<u8> 
         json!({
             "content": [{
                 "type": "text",
-                "text": "rpiv-todo panicked while handling a dispatch",
+                "text": "rpi-todo panicked while handling a dispatch",
             }],
             "isError": true,
         })
@@ -547,7 +548,7 @@ pub fn dispatch_for_test(cookie: PluginCookie, message: &Value) -> Value {
 /// call, so the overlay controller resets alongside the store). Under
 /// `cfg(test)` this also installs the empty config override (review
 /// P1-2: the suite must not read the developer machine's real
-/// `~/.config/rpiv-todo/`; individual tests may install a richer object
+/// `~/.config/rpi-todo/`; individual tests may install a richer object
 /// through [`crate::config::set_test_config`]).
 #[doc(hidden)]
 pub fn __reset_state() {
