@@ -170,7 +170,7 @@ pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
         tracing::warn!(
             kind = %error.kind,
             message = %error.message,
-            "rpiv-ask-user-question: prompt event emit failed"
+            "rpi-ask-user-question: prompt event emit failed"
         );
     }
 
@@ -228,7 +228,7 @@ fn run_rpc_path_with(
             tracing::warn!(
                 kind = %error.kind,
                 message = %error.message,
-                "rpiv-ask-user-question: rpc dialog host call failed"
+                "rpi-ask-user-question: rpc dialog host call failed"
             );
             host_error_result(&error)
         }
@@ -240,7 +240,7 @@ fn run_rpc_path_with(
 /// falls to the dialog primitives or tells the model the user never saw the
 /// questions.
 ///
-/// The component attempt is bracketed by the `rpiv:ask-user:blocked` event
+/// The component attempt is bracketed by the `rpi:ask-user:blocked` event
 /// pair (upstream `try/finally`); the terminal BEL sits between
 /// `blocked:true` and the mount (FR-Q3-G, `emitTerminalAttention()` in
 /// `execute`'s `try` — the emitter is injected so tests pin the ordering
@@ -265,7 +265,7 @@ fn resolve_undefined_result_with(
             tracing::warn!(
                 kind = %error.kind,
                 message = %error.message,
-                "rpiv-ask-user-question: component host call failed"
+                "rpi-ask-user-question: component host call failed"
             );
             component_error_result(&HostError {
                 kind: error.kind.as_str().to_owned(),
@@ -286,7 +286,7 @@ fn resolve_without_component(host: &dyn HostCall, typed: &QuestionParams, i18n: 
                 tracing::warn!(
                     kind = %error.kind,
                     message = %error.message,
-                    "rpiv-ask-user-question: fallback dialog host call failed"
+                    "rpi-ask-user-question: fallback dialog host call failed"
                 );
                 host_error_result(&error)
             }
@@ -301,7 +301,7 @@ fn emit_blocked_or_warn(host: &dyn HostCall, active: bool) {
         tracing::warn!(
             kind = %error.kind,
             message = %error.message,
-            "rpiv-ask-user-question: blocked event emit failed"
+            "rpi-ask-user-question: blocked event emit failed"
         );
     }
 }
@@ -530,7 +530,7 @@ mod tests {
                 "ctx.hasUI"
             ]
         );
-        assert_eq!(calls[1].1["channel"], "rpiv:ask-user:prompt");
+        assert_eq!(calls[1].1["channel"], "rpi:ask-user:prompt");
         assert_eq!(
             calls[1].1["data"]["questions"][0]["options"][0]["hasPreview"],
             json!(false)
@@ -620,10 +620,10 @@ mod tests {
         assert_eq!(
             timeline,
             vec![
-                "events.emit:rpiv:ask-user:blocked:true",
+                "events.emit:rpi:ask-user:blocked:true",
                 "BEL",
                 "ui.select",
-                "events.emit:rpiv:ask-user:blocked:false",
+                "events.emit:rpi:ask-user:blocked:false",
             ]
         );
     }
@@ -896,10 +896,10 @@ mod tests {
         assert_eq!(
             timeline.lock().expect("timeline").clone(),
             vec![
-                "events.emit:rpiv:ask-user:blocked:true",
+                "events.emit:rpi:ask-user:blocked:true",
                 "BEL",
                 "ui.mountComponent",
-                "events.emit:rpiv:ask-user:blocked:false",
+                "events.emit:rpi:ask-user:blocked:false",
                 "ctx.hasUI", // the no_custom_ui probe
             ]
         );
@@ -911,7 +911,7 @@ mod tests {
         emit_blocked(&host, true).expect("blocked true");
         emit_blocked(&host, false).expect("blocked false");
         let calls = host.calls();
-        assert_eq!(calls[0].1["channel"], "rpiv:ask-user:blocked");
+        assert_eq!(calls[0].1["channel"], "rpi:ask-user:blocked");
         assert_eq!(calls[0].1["data"], json!({"active": true}));
         assert_eq!(calls[1].1["data"], json!({"active": false}));
     }

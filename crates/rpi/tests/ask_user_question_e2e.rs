@@ -1,4 +1,4 @@
-//! V14-24 (C4) pilot e2e — `rpiv-ask-user-question` through the real rpi
+//! V14-24 (C4) pilot e2e — `rpi-ask-user-question` through the real rpi
 //! stacks (task `rpi-docs/plan/v0.1.4/V14-24-interactive-ui-abi-c4-pilot.md`).
 //!
 //! The ABI's acceptance moves from fixture parity (C1/C2) to full-stack
@@ -8,7 +8,7 @@
 //!
 //! - TUI pilot (§4.1): faux tool call → dialog mounts as an overlay →
 //!   scripted key bytes through the real input pipeline → tool-result
-//!   envelope + session JSONL + `rpiv:ask-user:*` bus events (payload and
+//!   envelope + session JSONL + `rpi:ask-user:*` bus events (payload and
 //!   bracket timing, R-Q4.1/R-Q4.2).
 //! - RPC / fallback (§4.2): `ctx.mode == "rpc"` routes to the dialog walker
 //!   over the real `extension_ui_request` frame loop; a legacy bridge (no
@@ -20,7 +20,7 @@
 //! The pilot found one real integration gap, fixed with this task: the
 //! plugin's `events.emit` calls used `{"event","payload"}` args while the
 //! host dispatch reads the ABI wire form `{"channel","data"}` — the
-//! `rpiv:ask-user:*` events never reached their channels on a real host
+//! `rpi:ask-user:*` events never reached their channels on a real host
 //! (see `rpi-ext-ask-user-question/src/events.rs`).
 //!
 //! Environment: every test holds the process-wide `ENV_LOCK` (sandboxed
@@ -407,20 +407,20 @@ fn assert_alpha_envelope(result: &Value) {
 }
 
 // ---------------------------------------------------------------------------
-// Bus recorder (rpiv:ask-user:* events through the real host event bus)
+// Bus recorder (rpi:ask-user:* events through the real host event bus)
 // ---------------------------------------------------------------------------
 
 type BusTimeline = Arc<Mutex<Vec<(&'static str, Value)>>>;
 
 fn record_bus(host: &NativeExtensionHost) -> BusTimeline {
     let timeline: BusTimeline = Arc::new(Mutex::new(Vec::new()));
-    for channel in ["rpiv:ask-user:prompt", "rpiv:ask-user:blocked"] {
+    for channel in ["rpi:ask-user:prompt", "rpi:ask-user:blocked"] {
         let sink = timeline.clone();
         let unsubscribe = host.event_bus().on(
             channel,
             Arc::new(move |data| {
                 let name = match channel {
-                    "rpiv:ask-user:prompt" => "prompt",
+                    "rpi:ask-user:prompt" => "prompt",
                     _ => "blocked",
                 };
                 sink.lock()

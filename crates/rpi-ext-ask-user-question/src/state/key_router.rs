@@ -12,7 +12,7 @@
 //!   manager (which honors user overrides). The interactive-UI ABI exposes no
 //!   keybinding channel, so [`Keybindings::pi_defaults`] pins the upstream
 //!   default key ids; see the TE30 landing note in
-//!   `rpi-docs/extensions/rpiv-ask-user-question/02-design.md` §4.
+//!   `rpi-docs/extensions/rpi-ask-user-question/02-design.md` §4.
 //! - `QuestionnaireRuntime.currentItem`/`items` borrow the per-tab item list
 //!   (`crate::state::build::QuestionItem`) instead of the TS structural union.
 

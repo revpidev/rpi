@@ -572,7 +572,7 @@ pub(crate) static FORCE_PANIC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// The `"render"` dispatch (`{"kind":"render","what":…}`): resolves the
-/// theme (`ui.theme`, a synchronous read — the rpiv-todo render-dispatch
+/// theme (`ui.theme`, a synchronous read — the rpi-todo render-dispatch
 /// precedent) and the process locale, then routes to the pure builders.
 /// Unknown `what`/`toolName` answer `null` — the host `render_call`
 /// closure turns `null` into an error and degrades to the per-hook
@@ -669,7 +669,7 @@ mod tests {
 
     /// Strip the wrapping codes an unstyled `AnsiRenderTheme` still emits
     /// (`\x1b[1m/22m` bold, bare `\x1b[39m` resets — the host `Theme`
-    /// channel shape, rpiv-todo overlay.rs test precedent).
+    /// channel shape, rpi-todo overlay.rs test precedent).
     fn strip_ansi(line: &str) -> String {
         line.replace("\u{1b}[39m", "")
             .replace("\u{1b}[22m", "")

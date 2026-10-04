@@ -1,9 +1,13 @@
-//! Public event contract (`rpiv:ask-user:prompt` / `rpiv:ask-user:blocked`).
+//! Public event contract (`rpi:ask-user:prompt` / `rpi:ask-user:blocked`).
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/events.ts` @ `0fdf4f8`.
-//! Stability policy (upstream header, applies to every `rpiv:*` event):
+//! Stability policy (upstream header, applies to every `rpi:*` event):
 //! channel names are immutable; payload changes are append-only; breaking
 //! changes require a new channel; payloads are JSON-safe.
+//!
+//! v0.1.6 (TE42, ADR-0033 decision 6): the channel prefix was renamed
+//! `rpiv:` → `rpi:` as a declared [BREAKING] (see `changes/v0.1.6.md`); it is
+//! the single intentional break of the immutability policy above.
 //!
 //! `prompt` is emitted after validation and before the questionnaire opens;
 //! `blocked {active:true}` brackets the wait and `{active:false}` runs in the
@@ -17,9 +21,9 @@ use crate::HostCall;
 use crate::tool::types::QuestionParams;
 
 /// `ASK_USER_PROMPT_EVENT` — emitted while the questionnaire is about to open.
-pub const ASK_USER_PROMPT_EVENT: &str = "rpiv:ask-user:prompt";
+pub const ASK_USER_PROMPT_EVENT: &str = "rpi:ask-user:prompt";
 /// `ASK_USER_BLOCKED_EVENT` — emitted while awaiting user input.
-pub const ASK_USER_BLOCKED_EVENT: &str = "rpiv:ask-user:blocked";
+pub const ASK_USER_BLOCKED_EVENT: &str = "rpi:ask-user:blocked";
 
 /// Build the `prompt` payload: `{questions:[{question,header,multiSelect,options:[{label,description,hasPreview}]}]}`.
 ///
@@ -63,7 +67,7 @@ pub fn build_blocked_payload(active: bool) -> Value {
 /// `extension-abi.md` §3, the `pi.events.emit(channel, payload)` upstream
 /// shape; `rpi-ext-subagents` precedent) rather than the JS call-site names.
 /// Found by the V14-24 pilot e2e: the earlier `{"event", "payload"}` args
-/// never reached the `rpiv:ask-user:*` channels on a real host.
+/// never reached the `rpi:ask-user:*` channels on a real host.
 pub fn emit_prompt(host: &dyn HostCall, params: &QuestionParams) -> Result<(), crate::HostError> {
     host.call(
         "events.emit",
@@ -172,7 +176,7 @@ mod tests {
 
     #[test]
     fn events_names_are_immutable() {
-        assert_eq!(ASK_USER_PROMPT_EVENT, "rpiv:ask-user:prompt");
-        assert_eq!(ASK_USER_BLOCKED_EVENT, "rpiv:ask-user:blocked");
+        assert_eq!(ASK_USER_PROMPT_EVENT, "rpi:ask-user:prompt");
+        assert_eq!(ASK_USER_BLOCKED_EVENT, "rpi:ask-user:blocked");
     }
 }

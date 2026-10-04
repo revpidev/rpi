@@ -607,7 +607,7 @@ fn notify_editor_failed(host: &dyn HostCall, i18n: &I18n, detail: &str) {
         tracing::warn!(
             kind = %error.kind,
             message = %error.message,
-            "rpiv-ask-user-question: editor-failure notify failed"
+            "rpi-ask-user-question: editor-failure notify failed"
         );
     }
 }
@@ -714,7 +714,7 @@ pub fn run(
                             tracing::warn!(
                                 kind = %error.kind,
                                 message = %error.message,
-                                "rpiv-ask-user-question: collapse guidance notify failed"
+                                "rpi-ask-user-question: collapse guidance notify failed"
                             );
                         }
                     }
@@ -724,7 +724,7 @@ pub fn run(
                         tracing::warn!(
                             kind = %error.kind,
                             message = %error.message,
-                            "rpiv-ask-user-question: setComponentHidden failed"
+                            "rpi-ask-user-question: setComponentHidden failed"
                         );
                     }
                 }

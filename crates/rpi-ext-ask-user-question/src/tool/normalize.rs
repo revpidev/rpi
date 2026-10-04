@@ -18,7 +18,7 @@
 //! [`crate::tool::validate::validate_questionnaire`], so the reserved-label
 //! and duplicate-label guards compare the text the user will actually see
 //! (`"Other\r"` must not slip past `reserved_label`), and so the TUI, the RPC
-//! dialog walker, the envelope echo and the `rpiv:ask-user:prompt` payload all
+//! dialog walker, the envelope echo and the `rpi:ask-user:prompt` payload all
 //! carry the same clean text. Pure: the input is never mutated.
 
 use crate::tool::types::{OptionData, QuestionData, QuestionParams};

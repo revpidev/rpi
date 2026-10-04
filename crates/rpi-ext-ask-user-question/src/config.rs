@@ -1,18 +1,21 @@
-//! XDG config reading for `rpiv-ask-user-question`.
+//! XDG config reading for `rpi-ask-user-question`.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/config.ts` plus the
 //! `@juicesharp/rpiv-config` loader it calls (`config.ts`/`loadJsonConfig`/
 //! `loadJsonConfigWithLegacyFallback`/`validateGuidanceFields`) @ `0fdf4f8`.
 //!
-//! Path policy (R-Q7.1 [VARIANT], deviation TE-D39): the upstream path
-//! `~/.config/rpiv-ask-user-question/config.json` is kept verbatim — it is
-//! brand-independent and deliberately NOT mapped to `~/.rpi`. Lookup order
-//! (requirements 附录 D, read-only, never created):
+//! Path policy (R-Q7.1 [VARIANT], deviation TE-D39 as amended by ADR-0033
+//! decision 6, 2026-10-05): the config directory uses the current plugin
+//! name — `~/.config/rpi-ask-user-question/config.json` — and stays
+//! deliberately NOT mapped to `~/.rpi`. The former `rpiv-ask-user-question`
+//! directory is no longer read (clean switch; announcement in
+//! `changes/v0.1.6.md`). Lookup order (requirements 附录 D, read-only, never
+//! created):
 //!
-//! 1. `$XDG_CONFIG_HOME/rpiv-ask-user-question/config.json` — `XDG_CONFIG_HOME`
+//! 1. `$XDG_CONFIG_HOME/rpi-ask-user-question/config.json` — `XDG_CONFIG_HOME`
 //!    must be set, non-empty after trim and absolute (`~`/`~/…` expands first;
 //!    relative values fall through);
-//! 2. else the legacy `~/.config/rpiv-ask-user-question/config.json`
+//! 2. else the legacy `~/.config/rpi-ask-user-question/config.json`
 //!    (intentionally ignores `XDG_CONFIG_HOME`);
 //! 3. else all defaults.
 //!
@@ -33,7 +36,7 @@ pub const DEFAULT_COLLAPSE_KEY: &str = "ctrl+]";
 /// Sentinel value disabling the collapse shortcut (`COLLAPSE_KEY_OFF`).
 pub const COLLAPSE_KEY_OFF: &str = "off";
 /// Config directory name (upstream package directory).
-pub const CONFIG_DIR_NAME: &str = "rpiv-ask-user-question";
+pub const CONFIG_DIR_NAME: &str = "rpi-ask-user-question";
 /// Config file name.
 pub const CONFIG_FILE_NAME: &str = "config.json";
 
@@ -128,7 +131,7 @@ fn load_json_config(path: &Path) -> Value {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "rpiv-ask-user-question: config read failed, using defaults");
+            tracing::warn!(path = %path.display(), %error, "rpi-ask-user-question: config read failed, using defaults");
             return Value::Object(serde_json::Map::new());
         }
     };
@@ -136,7 +139,7 @@ fn load_json_config(path: &Path) -> Value {
         Ok(value) if value.is_object() => value,
         Ok(_) => Value::Object(serde_json::Map::new()),
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "rpiv-ask-user-question: invalid JSON, using defaults");
+            tracing::warn!(path = %path.display(), %error, "rpi-ask-user-question: invalid JSON, using defaults");
             Value::Object(serde_json::Map::new())
         }
     }

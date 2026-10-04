@@ -184,7 +184,7 @@ fn parse_table(raw: &str) -> BTreeMap<String, String> {
     serde_json::from_str(raw).unwrap_or_else(|error| {
         // Embedded literals are compile-time constants; a parse failure is a
         // build-time contract violation, surfaced once at first use.
-        tracing::error!(error = %error, "rpiv-ask-user-question: embedded locale table is invalid JSON");
+        tracing::error!(error = %error, "rpi-ask-user-question: embedded locale table is invalid JSON");
         BTreeMap::new()
     })
 }

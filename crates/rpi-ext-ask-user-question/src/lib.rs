@@ -9,13 +9,13 @@
 //! options instead of free-form replies. The interactive component (route C,
 //! `interactive-ui-abi`) lands with Q2/Q3; Q0 freezes the contract layer:
 //! tool schema/description/guidance, line-terminator normalization, validation
-//! and error codes, the result envelope, the `rpiv:ask-user:*` event payloads,
+//! and error codes, the result envelope, the `rpi:ask-user:*` event payloads,
 //! the `before_agent_start` reconciler, XDG config and the 9 embedded locales.
 //! TE41 adds the rpi#52 [RPI-OWN] transcript renderers
 //! ([`render`]: collapsed summary / `Ctrl+O` expanded detail / streaming
 //! tolerance — no upstream counterpart).
 //!
-//! Docs: `rpi-docs/extensions/rpiv-ask-user-question/{00,01,02}.md` and the
+//! Docs: `rpi-docs/extensions/rpi-ask-user-question/{00,01,02}.md` and the
 //! task file `rpi-docs/plan/extensions/TE28-ask-user-question-contract.md`.
 //! Parity harness: `scripts/ask-user-question-parity/` drives the pinned
 //! upstream pure-function modules and diffs them against [`parity`].
@@ -185,7 +185,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     // i18n tables are compile-time embedded; selecting the process locale here
     // keeps the first lookup warm and surfaces a broken table early.
     let locale = i18n::I18n::detect();
-    tracing::info!(locale = locale.locale(), "rpiv-ask-user-question installed");
+    tracing::info!(locale = locale.locale(), "rpi-ask-user-question installed");
     store_channel(host);
     json!({"ok": true})
 }
@@ -199,7 +199,7 @@ fn dispatch_message(message: &Value) -> Value {
         // Render protocol (host_call.rs render arms): synchronous, pure
         // JSON on the TUI update path — the theme read (`ui.theme`) is a
         // synchronous host-side getter, never a nested dispatch
-        // (rpiv-todo render-dispatch precedent).
+        // (rpi-todo render-dispatch precedent).
         Some("render") => render::dispatch_render(&host, message),
         Some("toolExecute")
             if message.get("toolName").and_then(Value::as_str) == Some(tool::TOOL_NAME) =>
@@ -211,7 +211,7 @@ fn dispatch_message(message: &Value) -> Value {
             if message.get("event").and_then(Value::as_str) == Some("before_agent_start") =>
         {
             if let Err(error) = reconcile::handle_before_agent_start(&host) {
-                tracing::warn!(%error, "rpiv-ask-user-question: reconcile failed");
+                tracing::warn!(%error, "rpi-ask-user-question: reconcile failed");
             }
             Value::Null
         }
@@ -231,7 +231,7 @@ pub extern "C" fn init(calls: RpiHostCalls, cookie: PluginCookie) -> RVec<u8> {
         .unwrap_or_else(|panic| {
             error_envelope(
                 "internal",
-                format!("rpiv-ask-user-question init panicked: {panic:?}"),
+                format!("rpi-ask-user-question init panicked: {panic:?}"),
             )
         });
     pack(&result)
@@ -264,7 +264,7 @@ fn guarded_dispatch(parsed: &Value) -> Value {
             json!({
                 "content": [{
                     "type": "text",
-                    "text": "rpiv-ask-user-question panicked while handling a dispatch",
+                    "text": "rpi-ask-user-question panicked while handling a dispatch",
                 }],
                 "isError": true,
             })

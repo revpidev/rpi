@@ -1,6 +1,6 @@
 //! TE32 G12 (FR-Q4-G/R-Q8.2/R-Q8.3): the shipped `rpi-extension.json` and
 //! the registry skeleton (`registry-entry.json`, mirrored by TE32 into
-//! rpi-pages `registry/rpiv-ask-user-question.json`) are pinned statically.
+//! rpi-pages `registry/rpi-ask-user-question.json`) are pinned statically.
 //!
 //! [RPI-OWN] — no upstream parity leg (the upstream ships as an npm
 //! package); these assertions are the equivalent behavioral anchor
@@ -26,7 +26,7 @@ fn manifest_pins_capabilities_abi_and_native_only_carrier() {
     // R-Q8.3: exactly the four consumed capabilities — `tools` (the
     // ask_user_question registration), `ui` (interactive-ui host-calls +
     // ui.notify/editor fallbacks), `session` (events wiring), `events`
-    // (rpiv:ask-user:* emit). `exec` must NOT be declared: the external
+    // (rpi:ask-user:* emit). `exec` must NOT be declared: the external
     // editor goes through the host primitives (`ui.editExternal`).
     assert_eq!(
         manifest["capabilities"],
@@ -57,15 +57,16 @@ fn manifest_pins_capabilities_abi_and_native_only_carrier() {
         manifest["native"], "librpi_ext_ask_user_question.so",
         "native carrier filename (renamed to the manifest name at pack time)"
     );
-    assert_eq!(manifest["name"], "rpiv-ask-user-question");
+    assert_eq!(manifest["name"], "rpi-ask-user-question");
 }
 
 #[test]
 fn registry_entry_matches_official_lockstep_shape() {
-    // TE32: the skeleton is mirrored verbatim into rpi-pages
-    // `registry/rpiv-ask-user-question.json` (official first-party entry,
+    // TE32/TE42: the skeleton is mirrored verbatim into rpi-pages
+    // `registry/rpi-ask-user-question.json` (official first-party entry,
     // shared revpidev/rpi Release). generate-site.py validates the same
-    // fields (name/repository/description/author/license); `lockstepHost:
+    // fields (name/repository/description/author/license) and matches the
+    // historical `.rpix` assets through `historicNames`; `lockstepHost:
     // true` makes every version's minHostVersion = the version itself —
     // for the first release that is 0.1.4, the first host version with
     // interactive-ui-abi (R-Q8.4).
@@ -81,6 +82,14 @@ fn registry_entry_matches_official_lockstep_shape() {
     assert_eq!(entry["repository"], "revpidev/rpi");
     assert_eq!(entry["official"], serde_json::json!(true));
     assert_eq!(entry["lockstepHost"], serde_json::json!(true));
+    // TE42 (R7.2.2): the v0.1.5-and-earlier `.rpix` assets keep their old
+    // `rpiv-` names; the registry declares them as historic names so
+    // generate-site.py keeps the historical version matrix under the new
+    // key (no download redirect).
+    assert_eq!(
+        entry["historicNames"],
+        serde_json::json!(["rpiv-ask-user-question"])
+    );
     for field in ["description", "author", "license", "descriptionZh"] {
         assert!(
             entry
