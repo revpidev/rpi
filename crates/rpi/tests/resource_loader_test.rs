@@ -409,6 +409,10 @@ fn should_discover_system_md_from_project_config_dir() {
 
 #[test]
 fn should_skip_project_resources_that_require_trust_when_project_is_not_trusted() {
+    // A suite launched from inside a subagent session inherits the child
+    // context switch (`RPI_SUBAGENT_CHILD=1` + `..._INHERIT_GLOBAL_CONTEXT=0`),
+    // which would drop the global segment this test asserts (G2).
+    rpi_test_env::scrub_subagent_env();
     let fixture = Fixture::new();
     write(
         &fixture.project_dir().join("SYSTEM.md"),

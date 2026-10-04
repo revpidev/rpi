@@ -44,6 +44,59 @@ pub fn remove_var<K: AsRef<std::ffi::OsStr>>(key: K) {
     unsafe { std::env::remove_var(key) }
 }
 
+/// Remove the environment a parent subagent session injects into every child
+/// (the `RPI_SUBAGENT_*` family plus the host context switch it drives).
+/// In-process tests that load the plugin or the resource loader call this so
+/// the suite stays deterministic when it is launched from inside a subagent
+/// session — the 2026-09-30 G2 incident: leaked `RPI_SUBAGENT_CHILD=1` and
+/// `RPI_NO_GLOBAL_CONTEXT=1` turned three tests into deterministic false
+/// failures before anyone scrubbed the environment.
+///
+/// Keys are literal (this crate must not depend on the plugin crate); the
+/// plugin-side set lives in `crates/rpi-ext-subagents/src/launch/args.rs`.
+pub fn scrub_subagent_env() {
+    const KEYS: &[&str] = &[
+        "RPI_SUBAGENT_TASK_DELIVERY",
+        "RPI_SUBAGENT_CHILD",
+        "RPI_SUBAGENT_FANOUT_CHILD",
+        "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT",
+        "RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT",
+        "RPI_SUBAGENT_INHERIT_SKILLS",
+        "RPI_SUBAGENT_PARENT_SESSION",
+        "RPI_SUBAGENT_RUN_ID",
+        "RPI_SUBAGENT_CHILD_AGENT",
+        "RPI_SUBAGENT_CHILD_INDEX",
+        "RPI_SUBAGENT_PARENT_DEPTH",
+        "RPI_SUBAGENT_PARENT_EVENT_SINK",
+        "RPI_SUBAGENT_STEER_INBOX",
+        "RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR",
+        "RPI_SUBAGENT_THINKING_CEILING",
+        "RPI_SUBAGENT_SESSION_NAME",
+        "RPI_SUBAGENT_PARENT_CONTROL_INBOX",
+        "RPI_SUBAGENT_PARENT_ROOT_RUN_ID",
+        "RPI_SUBAGENT_PARENT_RUN_ID",
+        "RPI_SUBAGENT_PARENT_CHILD_INDEX",
+        "RPI_SUBAGENT_PARENT_PATH",
+        "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN",
+        "RPI_SUBAGENT_ORCHESTRATOR_SESSION_ID",
+        "RPI_SUBAGENT_REQUIRED_TOOLS",
+        "RPI_SUBAGENT_TOOL_DIAGNOSTIC_PATH",
+        "RPI_SUBAGENT_ALLOWED_AGENTS",
+        "RPI_SUBAGENT_CACHE_RETENTION",
+        "RPI_SUBAGENT_DIFF_BASELINE",
+        "RPI_SUBAGENT_TOOL_BUDGET",
+        "RPI_SUBAGENT_EXTENSION_PATH",
+        "RPI_SUBAGENT_RPI_BINARY",
+        // The retired v0.1.4/v0.1.5 host switch; scrub it too so sessions
+        // leaked from an older child cannot skew behavior in either
+        // direction.
+        "RPI_NO_GLOBAL_CONTEXT",
+    ];
+    for key in KEYS {
+        remove_var(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -526,6 +526,10 @@ fn prepare_e2e_tree(input: &Path, dest: &Path) {
 
 #[test]
 fn parity_resource_loader_e2e() {
+    // A suite launched from inside a subagent session inherits the child
+    // context switch, which would drop the global segment from the golden
+    // comparison (G2).
+    rpi_test_env::scrub_subagent_env();
     let golden = load_golden("resource-loader-e2e");
     let tmp = TestDir::new("e2e");
     let root = tmp.path();

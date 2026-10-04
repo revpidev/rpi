@@ -75,6 +75,10 @@ async fn l0_load_capability_denied_and_full_surface() {
     std::fs::create_dir_all(sandbox.join("agent")).unwrap();
     // Isolate the loaded plugin's discovery from the developer's real ~/.rpi.
     // Safety of set_var in tests: this is the only test in this binary.
+    // Running the suite from inside a subagent session leaks the child
+    // markers (`RPI_SUBAGENT_CHILD=1`), which would load the plugin in
+    // ChildPlain mode and break the capability-denied assertion (G2).
+    rpi_test_env::scrub_subagent_env();
     rpi_test_env::set_var("RPI_CODING_AGENT_DIR", sandbox.join("agent"));
     rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", "/nonexistent-rpi");
 
