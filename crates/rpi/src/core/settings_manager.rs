@@ -3303,6 +3303,64 @@ mod tests {
         );
     }
 
+    /// V16-05 FR-A: the host consumption face of `usage` (explicit provider
+    /// map + timeout), accepting the string and object provider forms.
+    #[test]
+    fn usage_settings_keys_validate_and_round_trip() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({
+                "usage": {
+                    "providers": {
+                        "str-p": "/tmp/str.py",
+                        "obj-p": {
+                            "script": "/tmp/obj.py",
+                            "baseUrl": "https://example.test",
+                            "apiKeyEnv": "OBJ_KEY",
+                            "model": "m1"
+                        },
+                        "empty": "",
+                        "missing-script": {"baseUrl": "https://x.test"},
+                        "bad": 42
+                    },
+                    "timeoutMs": 1500.9
+                }
+            }),
+        );
+        let manager = create(&dirs);
+        let settings = manager.get_usage_settings();
+        assert_eq!(
+            settings.providers.get("str-p"),
+            Some(&UsageProviderConfig {
+                script: "/tmp/str.py".to_owned(),
+                ..UsageProviderConfig::default()
+            })
+        );
+        assert_eq!(
+            settings.providers.get("obj-p"),
+            Some(&UsageProviderConfig {
+                script: "/tmp/obj.py".to_owned(),
+                base_url: Some("https://example.test".to_owned()),
+                api_key_env: Some("OBJ_KEY".to_owned()),
+                model: Some("m1".to_owned()),
+            })
+        );
+        // Malformed entries are skipped; unset fields stay absent.
+        assert!(!settings.providers.contains_key("empty"));
+        assert!(!settings.providers.contains_key("missing-script"));
+        assert!(!settings.providers.contains_key("bad"));
+        assert_eq!(settings.timeout_ms, Some(1500));
+
+        // A non-object `usage` section (or unset) yields the defaults.
+        write_json(&global_path(&dirs), json!({"usage": "nope"}));
+        let manager = create(&dirs);
+        assert_eq!(manager.get_usage_settings(), UsageSettings::default());
+        write_json(&global_path(&dirs), json!({}));
+        let manager = create(&dirs);
+        assert_eq!(manager.get_usage_settings(), UsageSettings::default());
+    }
+
     // V16-13 FR-D R6: `quietStartup` tri-state (settings-manager.ts:1089-1098
     // @ f29ea3deb).
     #[test]
