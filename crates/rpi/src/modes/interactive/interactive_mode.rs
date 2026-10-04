@@ -9113,6 +9113,10 @@ mod tests {
     async fn shift_tab_cycles_permission_mode() {
         use crate::core::permission_mode::PermissionMode;
 
+        // The `app.*` keybinding ids live in the process-global registry
+        // (`get_keybindings`); production installs it at startup, tests that
+        // feed keys must do the same (the other key-feeding tests do).
+        install_global_keybindings();
         let (mut mode, terminal, session) = mode_harness().await;
         mode.init().await;
         assert_eq!(session.permission_mode(), PermissionMode::Default);
