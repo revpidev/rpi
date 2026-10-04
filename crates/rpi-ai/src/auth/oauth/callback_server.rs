@@ -256,12 +256,20 @@ impl<T: Clone + Send + Sync + 'static> OAuthCallbackServer<T> {
             .with_state(state.clone());
         let shutdown = CancellationToken::new();
         let serve_shutdown = shutdown.clone();
+        let serve_state = state.clone();
         let serve = tokio::spawn(async move {
             let result = axum::serve(listener, app)
                 .with_graceful_shutdown(serve_shutdown.cancelled_owned())
                 .await;
             if let Err(serve_error) = result {
+                // Upstream `server.on("error", error => finish({ error }))`:
+                // a post-listen server error settles the wait instead of
+                // leaving it pending forever.
                 tracing::warn!(%serve_error, "OAuth callback server terminated with an error");
+                serve_state.finish(CallbackOutcome::Failed(ModelsError::new(
+                    ModelsErrorCode::Oauth,
+                    format!("OAuth callback server terminated: {serve_error}"),
+                )));
             }
         });
 
@@ -281,12 +289,20 @@ impl<T: Clone + Send + Sync + 'static> OAuthCallbackServer<T> {
         if let Some(timeout) = options.timeout {
             let state = state.clone();
             let provider_name = state.provider_name.clone();
+            let timeout_shutdown = shutdown.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                state.finish(CallbackOutcome::Failed(ModelsError::new(
-                    ModelsErrorCode::Oauth,
-                    format!("{provider_name} sign-in timed out"),
-                )));
+                // `setTimeout(...)` + `clearTimeout` on settle: the timer is
+                // dropped once the server shuts down so a settled login does
+                // not leave a sleeping task behind.
+                tokio::select! {
+                    _ = timeout_shutdown.cancelled() => {}
+                    _ = tokio::time::sleep(timeout) => {
+                        state.finish(CallbackOutcome::Failed(ModelsError::new(
+                            ModelsErrorCode::Oauth,
+                            format!("{provider_name} sign-in timed out"),
+                        )));
+                    }
+                }
             });
         }
 
@@ -537,6 +553,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await.expect("body");
         assert!(body.contains("Signed in to Test. You may now close this page."));
+        assert!(body.contains("fill=\"#F09082\""));
         assert_eq!(
             server.wait().await.expect("wait"),
             Some("the-code".to_owned())
@@ -705,6 +722,51 @@ mod tests {
             Ok(true),
             "idle keep-alive connection must be closed by close()"
         );
+    }
+
+    /// Non-GET requests never complete the sign-in (upstream callback-server
+    /// test).
+    #[tokio::test]
+    async fn post_request_returns_404() {
+        let (server, base) = start_test_server(Some("expected")).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base}/callback?code=c&state=expected"))
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        server.close().await;
+    }
+
+    /// `cancel()` after a claimed callback is a no-op (the claim wins).
+    #[tokio::test]
+    async fn cancel_after_claimed_does_not_settle() {
+        let (server, base) = start_test_server(Some("expected")).await;
+        let response = reqwest::get(format!("{base}/callback?code=the-code&state=expected"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        server.cancel();
+        assert_eq!(
+            server.wait().await.expect("wait"),
+            Some("the-code".to_owned())
+        );
+        server.close().await;
+    }
+
+    /// A callback arriving after `cancel()` is refused with 409 and does not
+    /// revive the wait.
+    #[tokio::test]
+    async fn late_callback_after_cancel_returns_409() {
+        let (server, base) = start_test_server(Some("expected")).await;
+        server.cancel();
+        assert_eq!(server.wait().await.expect("wait"), None);
+        let response = reqwest::get(format!("{base}/callback?code=late&state=expected"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        server.close().await;
     }
 
     #[tokio::test]

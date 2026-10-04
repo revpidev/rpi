@@ -569,7 +569,12 @@ fn build_request_headers(
     }
 
     // Workload identity federation: bearer token + the OAuth beta header,
-    // appended to any model-provided betas (SDK `prepareRequest`).
+    // appended to any model-provided betas like the SDK client's
+    // `prepareRequest` (`@anthropic-ai/sdk/lib/client.js:435-453`; the Bearer
+    // comes from `authHeaders`, `:355-362`). The upstream fake-SDK test
+    // asserts `createParams.betas` does not carry the header at the SDK
+    // options layer — rpi has no SDK options object and implements the wire
+    // behavior directly.
     if let Some(token) = federation_token {
         let mut betas = beta_features.clone();
         if !betas.iter().any(|feature| feature == OAUTH_API_BETA_HEADER) {

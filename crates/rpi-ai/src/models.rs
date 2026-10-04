@@ -2572,7 +2572,7 @@ mod tests {
     }
 
     /// OAuth auth with a working `login` (used to pin the OAuth branch shape;
-    /// the interactive OAuth dialog itself stays a T15 stub).
+    /// the interactive dialog runs it through `ModelRuntime::login`).
     struct PromptLoginOAuth;
 
     #[async_trait::async_trait]
@@ -2671,8 +2671,8 @@ mod tests {
     }
 
     /// OAuth login runs the oauth method's `login` and persists the OAuth
-    /// credential (models.ts:434-444). The interactive OAuth dialog stays a
-    /// stub, but the Models layer path is complete.
+    /// credential (models.ts:434-444); the interactive OAuth dialog consumes
+    /// this path through `ModelRuntime::login`.
     #[tokio::test]
     async fn test_models_login_oauth_writes_credential() {
         let (models, store) = models_with_store();

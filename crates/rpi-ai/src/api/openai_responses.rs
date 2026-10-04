@@ -924,7 +924,11 @@ mod tests {
         let chatgpt_model = model(json!({
             "provider": "openai",
             "baseUrl": "https://api.openai.com/v1",
-            "compat": {"supportsLongCacheRetention": true, "supportsMaxOutputTokens": true}
+            "compat": {
+                "supportsLongCacheRetention": true,
+                "supportsMaxOutputTokens": true,
+                "supportsExplicitPromptCacheMode": true
+            }
         }));
         let ctx = common::context(vec![common::user_text("hi")], None);
         let mut options = OpenAIResponsesOptions::default();
@@ -941,13 +945,15 @@ mod tests {
         assert!(params.get("prompt_cache_key").is_some());
         assert_eq!(params["store"], json!(false));
 
-        // An API key (`sk-` prefix) keeps every field.
+        // An API key (`sk-` prefix) keeps every field, including the
+        // explicit-cache `prompt_cache_options` this provider would otherwise
+        // send for a long retention window.
         let mut api_key_options = options.clone();
         api_key_options.stream.api_key = Some("sk-test".to_owned());
         let params = params_for(&chatgpt_model, &ctx, &api_key_options);
         assert_eq!(params["temperature"], json!(0.7));
         assert!(params.get("max_output_tokens").is_some());
-        assert!(params.get("prompt_cache_retention").is_some());
+        assert_eq!(params["prompt_cache_options"], json!({"ttl": "30m"}));
 
         // Other providers keep them, even with a non-`sk-` key.
         let codex = model(json!({

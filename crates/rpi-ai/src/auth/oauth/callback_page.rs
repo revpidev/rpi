@@ -9,7 +9,7 @@
 //! server and the provider flows show the same brand page.
 
 /// `LOGO_SVG` (verbatim).
-const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" aria-hidden="true"><path fill="#fff" fill-rule="evenodd" d="M165.29 165.29 H517.36 V400 H400 V517.36 H282.65 V634.72 H165.29 Z M282.65 282.65 V400 H400 V282.65 Z"/><path fill="#fff" d="M517.36 400 H634.72 V634.72 H517.36 Z"/></svg>"##;
+const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" aria-hidden="true"><path fill="#F09082" d="M165.29 165.29H517.36V400H400V282.65H165.29Z"/><path fill="#4D9ABF" d="M165.29 282.65H282.65V400H400V517.36H282.65V634.72H165.29Z"/><path fill="#F1BE58" d="M517.36 400H634.72V634.72H517.36Z"/></svg>"##;
 
 /// `escapeHtml` — the same five entity replacements, in the same order.
 fn escape_html(value: &str) -> String {
@@ -152,6 +152,10 @@ mod tests {
         assert!(html.contains("<h1>Authentication successful</h1>"));
         assert!(html.contains("<p>done &lt;b&gt;</p>"));
         assert!(html.contains(LOGO_SVG));
+        // v1.0.0 three-color badge (upstream oauth-callback-server.test.ts:74-76).
+        assert!(html.contains("fill=\"#F09082\""));
+        assert!(html.contains("fill=\"#4D9ABF\""));
+        assert!(html.contains("fill=\"#F1BE58\""));
         // No details → the interpolation line keeps its 4-space indent.
         assert!(html.contains("\n    \n  </main>"));
     }
