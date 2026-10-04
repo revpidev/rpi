@@ -1,12 +1,13 @@
-//! Port of `packages/ai/src/auth/oauth/` @ pi 0.82.1 (2efa728) — OAuth flow
+//! Port of `packages/ai/src/auth/oauth/` @ pi a13d35a74 (v1.0.0) — OAuth flow
 //! building blocks: PKCE (`pkce`), the RFC 8628 device-code polling framework
-//! (`device_code`), the localhost callback page/server (`callback_page`), the
-//! flow registry (`load`) and the provider flows (`anthropic`,
-//! `github_copilot`, `kimi_coding`, `openai_codex`, `openrouter`, `radius`,
-//! `xai`).
+//! (`device_code`), the shared loopback callback server (`callback_server`),
+//! the shared browser page (`callback_page`), the flow registry (`load`) and
+//! the provider flows (`anthropic`, `github_copilot`, `kimi_coding`,
+//! `openai_chatgpt`, `openai_codex`, `openrouter`, `radius`, `xai`).
 
 pub mod anthropic;
 pub mod callback_page;
+pub mod callback_server;
 pub mod device_code;
 pub mod github_copilot;
 pub mod kimi_coding;
@@ -19,8 +20,10 @@ pub mod radius;
 pub mod xai;
 
 pub use anthropic::anthropic_oauth;
-pub use callback_page::{
-    CallbackCode, CallbackPageCopy, OAuthCallbackServer, oauth_error_html, oauth_success_html,
+pub use callback_page::{oauth_error_html, oauth_success_html};
+pub use callback_server::{
+    CallbackOrManual, CompleteFn, ManualPrompt, OAuthCallbackServer, OAuthCallbackServerOptions,
+    default_callback_host, wait_for_callback_or_manual_input,
 };
 pub use device_code::{DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow};
 pub use github_copilot::github_copilot_oauth;

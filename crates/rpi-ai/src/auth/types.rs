@@ -346,6 +346,26 @@ pub trait ApiKeyAuth: Send + Sync {
     ) -> Result<Option<AuthResult>, ModelsError>;
 }
 
+/// `LoginOptions` (auth/types.ts:202-208 @ a13d35a74) — app-supplied
+/// context for login flows.
+#[derive(Clone, Default)]
+pub struct LoginOptions {
+    /// Returns the stable ID of this app installation, e.g. sent to OpenAI as
+    /// its agent host ID. Called only by login flows that need it, so apps
+    /// can create the ID on first use and must return the same ID on every
+    /// later call.
+    pub get_device_id: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+}
+
+// Manual Debug: the callback is not a secret, but it has no Debug impl.
+impl fmt::Debug for LoginOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginOptions")
+            .field("get_device_id", &self.get_device_id.is_some())
+            .finish()
+    }
+}
+
 /// `OAuthAuth` — the `refresh`/`toAuth` split lets `Models` own the locked
 /// refresh pattern.
 #[async_trait::async_trait]
@@ -362,11 +382,13 @@ pub trait OAuthAuth: Send + Sync {
     }
 
     /// `login` — interactive OAuth flow (PKCE / device code / localhost
-    /// callback). Required upstream; the default here errors so partial
-    /// implementations stay constructible until T04 part 2 wires the flows.
+    /// callback). `options` carries app-supplied context such as the stable
+    /// installation ID. Required upstream; the default here errors so partial
+    /// implementations stay constructible until the flows are wired.
     async fn login(
         &self,
         _interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         Err(ModelsError::new(
             ModelsErrorCode::Auth,

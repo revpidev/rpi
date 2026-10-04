@@ -56,7 +56,7 @@ use rpi_ai::auth::resolve::{
 use rpi_ai::auth::types::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthOperationOptions, AuthResult,
     AuthType, Credential, CredentialInfo, CredentialStore, CredentialType, DefaultAuthContext,
-    ModelAuth, ModifyFn, ProviderAuth,
+    LoginOptions, ModelAuth, ModifyFn, ProviderAuth,
 };
 use rpi_ai::models::{
     CreateModelsOptions, CreateProviderOptions, Models, ModelsRefreshOptions, ModelsRefreshResult,
@@ -2370,10 +2370,11 @@ impl ModelRuntime {
         provider_id: &str,
         auth_type: AuthType,
         interaction: &dyn AuthInteraction,
+        options: Option<&LoginOptions>,
     ) -> Result<Credential, ModelsError> {
         let credential = self
             .models
-            .login(provider_id, auth_type, interaction)
+            .login(provider_id, auth_type, interaction, options)
             .await?;
 
         let provider_id = provider_id.to_owned();
@@ -4013,7 +4014,7 @@ mod tests {
         let runtime = runtime.clone();
         let login = tokio::spawn(async move {
             runtime
-                .login("login-hang-test", AuthType::ApiKey, &interaction)
+                .login("login-hang-test", AuthType::ApiKey, &interaction, None)
                 .await
         });
         // Sequence on completion, not wall time: await the (fast, offline)
@@ -4091,7 +4092,7 @@ mod tests {
         let started = std::time::Instant::now();
         let credential = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            runtime.login("login-timeout-test", AuthType::ApiKey, &interaction),
+            runtime.login("login-timeout-test", AuthType::ApiKey, &interaction, None),
         )
         .await
         .expect("configured timeout must unblock the login")

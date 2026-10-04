@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::interaction::{AuthEvent, AuthInteraction};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
-use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
+use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
     CANCEL_MESSAGE, DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
@@ -483,6 +483,7 @@ impl OAuthAuth for MetaOAuth {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         self.login_meta(interaction).await
     }
@@ -731,9 +732,12 @@ mod tests {
         let started = now_ms();
         let credential = mock
             .oauth()
-            .login(&FakeInteraction {
-                handle: handle.clone(),
-            })
+            .login(
+                &FakeInteraction {
+                    handle: handle.clone(),
+                },
+                None,
+            )
             .await
             .expect("login");
         let finished = now_ms();

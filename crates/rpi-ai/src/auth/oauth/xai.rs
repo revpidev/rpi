@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::interaction::{AuthEvent, AuthInteraction};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
-use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
+use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
     CANCEL_MESSAGE, DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
@@ -425,6 +425,7 @@ impl OAuthAuth for XaiOAuth {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         self.login_xai(interaction).await
     }
@@ -815,7 +816,7 @@ mod tests {
         let interaction = FakeInteraction::new(handle.clone());
 
         let before = now_ms();
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, "access-token");
         assert_eq!(credential.refresh, "refresh-token");
         // `expires = now + expires_in * 1000 - REFRESH_SKEW_MS`.
@@ -877,7 +878,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle.clone());
 
-        oauth.login(&interaction).await.expect("login");
+        oauth.login(&interaction, None).await.expect("login");
         match handle.events().as_slice() {
             [
                 AuthEvent::DeviceCode {
@@ -918,7 +919,7 @@ mod tests {
         for _ in 0..2 {
             let handle = InteractionHandle::default();
             let interaction = FakeInteraction::new(handle);
-            let error = oauth.login(&interaction).await.expect_err("denied");
+            let error = oauth.login(&interaction, None).await.expect_err("denied");
             assert_eq!(error.message, "xAI device authorization was denied");
         }
     }
@@ -940,7 +941,11 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle);
 
-        let error = mock.oauth().login(&interaction).await.expect_err("expired");
+        let error = mock
+            .oauth()
+            .login(&interaction, None)
+            .await
+            .expect_err("expired");
         assert_eq!(error.message, "xAI device code expired");
     }
 
@@ -967,7 +972,7 @@ mod tests {
 
         let error = mock
             .oauth()
-            .login(&interaction)
+            .login(&interaction, None)
             .await
             .expect_err("server_error");
         assert_eq!(
@@ -993,7 +998,10 @@ mod tests {
             .with_signal(token.clone())
             .on_device_code(move || token.cancel());
 
-        let error = oauth.login(&interaction).await.expect_err("cancelled");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("cancelled");
         assert_eq!(error.message, "Login cancelled");
         assert_eq!(mock.requests().len(), 1, "only the device code request");
     }

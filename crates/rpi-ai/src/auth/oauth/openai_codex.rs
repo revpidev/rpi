@@ -35,22 +35,17 @@
 //! - `Date.now()` math uses `SystemTime` milliseconds; `interval` parses as
 //!   `f64` with JS `Number` semantics (`""` → 0, trim, finite, ≥ 0 required).
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use axum::extract::State;
-use axum::http::{StatusCode, Uri};
-use axum::response::Html;
-use axum::routing::get;
 use serde_json::{Map, Value, json};
-use tokio::sync::watch;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::super::interaction::{AuthEvent, AuthInteraction, AuthPrompt, SelectOption};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
-use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
-use super::callback_page::{default_callback_host, oauth_error_html, oauth_success_html};
+use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
+use super::callback_server::{
+    CallbackOrManual, CompleteFn, ManualPrompt, OAuthCallbackServer, OAuthCallbackServerOptions,
+    default_callback_host, wait_for_callback_or_manual_input,
+};
 use super::device_code::{
     CANCEL_MESSAGE, DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
@@ -390,7 +385,7 @@ async fn start_device_auth(
     .await?;
     let status = response.status();
     if !status.is_success() {
-        if status == StatusCode::NOT_FOUND {
+        if status == reqwest::StatusCode::NOT_FOUND {
             return Err(error(
                 "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL.",
             ));
@@ -561,171 +556,6 @@ async fn refresh_codex_token(
     credentials_from_token(token)
 }
 
-// ---------------------------------------------------------------------------
-// `startLocalOAuthServer` (openai-codex.ts's own `node:http` server, here
-// axum — `oauth_page` HTML from `super::callback_page`)
-// ---------------------------------------------------------------------------
-
-struct CallbackState {
-    expected_state: String,
-    /// Settle-once channel: outer `None` = waiting; `Some(None)` =
-    /// cancelled; `Some(Some(code))` = code received.
-    settle: watch::Sender<Option<Option<String>>>,
-    settled: AtomicBool,
-}
-
-impl CallbackState {
-    fn settle(&self, code: Option<String>) {
-        if self
-            .settled
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            self.settle.send_replace(Some(code));
-        }
-    }
-}
-
-/// First occurrence of each query parameter (mirrors `URLSearchParams.get`).
-fn query_params(uri: &Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
-        params
-            .entry(key.into_owned())
-            .or_insert_with(|| value.into_owned());
-    }
-    params
-}
-
-async fn handle_codex_callback(
-    State(state): State<Arc<CallbackState>>,
-    uri: Uri,
-) -> (StatusCode, Html<String>) {
-    let params = query_params(&uri);
-    if params.get("state") != Some(&state.expected_state) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(oauth_error_html("State mismatch.", None)),
-        );
-    }
-    let Some(code) = params.get("code").filter(|code| !code.is_empty()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(oauth_error_html("Missing authorization code.", None)),
-        );
-    };
-    state.settle(Some(code.clone()));
-    (
-        StatusCode::OK,
-        Html(oauth_success_html(
-            "OpenAI authentication completed. You can close this window.",
-        )),
-    )
-}
-
-async fn handle_codex_fallback() -> (StatusCode, Html<String>) {
-    (
-        StatusCode::NOT_FOUND,
-        Html(oauth_error_html("Callback route not found.", None)),
-    )
-}
-
-/// `startLocalOAuthServer` — one-shot callback server on `CALLBACK_PORT`
-/// (bind host from `RPI_OAUTH_CALLBACK_HOST`). A bind failure settles the
-/// wait with `None` and serves nothing — the login then falls back to the
-/// manual prompt (upstream's `server.once("error")` branch resolves a dummy
-/// server whose `waitForCode` yields `null`).
-struct CodexCallbackServer {
-    state: Arc<CallbackState>,
-    shutdown: CancellationToken,
-    serve: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl CodexCallbackServer {
-    async fn start(expected_state: &str, signal: Option<CancellationToken>, port: u16) -> Self {
-        let (settle, _) = watch::channel(None);
-        let state = Arc::new(CallbackState {
-            expected_state: expected_state.to_owned(),
-            settle,
-            settled: AtomicBool::new(false),
-        });
-
-        if let Some(signal) = signal {
-            let state = state.clone();
-            tokio::spawn(async move {
-                signal.cancelled().await;
-                state.settle(None);
-            });
-        }
-
-        let shutdown = CancellationToken::new();
-        let serve = match tokio::net::TcpListener::bind((default_callback_host(), port)).await {
-            Ok(listener) => {
-                let app = axum::Router::new()
-                    .route(CALLBACK_PATH, get(handle_codex_callback))
-                    .fallback(handle_codex_fallback)
-                    .with_state(state.clone());
-                let serve_shutdown = shutdown.clone();
-                Some(tokio::spawn(async move {
-                    let result = axum::serve(listener, app)
-                        .with_graceful_shutdown(serve_shutdown.cancelled_owned())
-                        .await;
-                    if let Err(serve_error) = result {
-                        tracing::warn!(%serve_error, "OpenAI Codex OAuth callback server terminated with an error");
-                    }
-                }))
-            }
-            // Upstream: `.once("error", () => { settleWait?.(null); resolve(dummy) })`.
-            Err(_) => {
-                state.settle(None);
-                None
-            }
-        };
-
-        Self {
-            state,
-            shutdown,
-            serve,
-        }
-    }
-
-    /// `waitForCode()`.
-    async fn wait_for_code(&self) -> Option<String> {
-        let mut rx = self.state.settle.subscribe();
-        if let Some(value) = rx.borrow().clone() {
-            return value;
-        }
-        loop {
-            if rx.changed().await.is_err() {
-                return None;
-            }
-            if let Some(value) = rx.borrow_and_update().clone() {
-                return value;
-            }
-        }
-    }
-
-    /// `cancelWait()`.
-    fn cancel_wait(&self) {
-        self.state.settle(None);
-    }
-
-    /// `server.close()`.
-    async fn close(mut self) {
-        self.state.settle(None);
-        self.shutdown.cancel();
-        if let Some(serve) = self.serve.take() {
-            let _ = serve.await;
-        }
-    }
-}
-
-impl Drop for CodexCallbackServer {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-    }
-}
-
 /// `openaiCodexOAuth` — the OpenAI Codex OAuth provider auth.
 pub fn openai_codex_oauth() -> Arc<dyn OAuthAuth> {
     Arc::new(OpenAiCodexOAuth::new())
@@ -789,76 +619,55 @@ impl OpenAiCodexOAuth {
         credentials_from_token(token)
     }
 
-    /// `loginOpenAICodex` — PKCE → callback server → notify `auth_url` →
-    /// race the `manual_code` prompt against the callback → exchange.
+    /// `loginOpenAICodex` — PKCE → shared callback server → notify
+    /// `auth_url` → race the `manual_code` prompt against the callback →
+    /// exchange.
     async fn login_browser(
         &self,
         interaction: &dyn AuthInteraction,
     ) -> Result<OAuthCredential, ModelsError> {
         let flow = create_authorization_flow(ORIGINATOR)?;
-        let server =
-            CodexCallbackServer::start(&flow.state, interaction.signal(), self.callback_port).await;
-        let manual_cancel = CancellationToken::new();
+        // `startOAuthCallbackServer({...}).catch(() => undefined)`: port 1455
+        // is shared with the Codex CLI, so a bind failure falls back to the
+        // pasted redirect URL (R2.6.2).
+        let complete: CompleteFn<String> = Arc::new(|code| Box::pin(async move { Ok(code) }));
+        let callback = OAuthCallbackServer::start(OAuthCallbackServerOptions {
+            provider_name: "OpenAI".to_owned(),
+            host: default_callback_host(),
+            port: self.callback_port,
+            path: CALLBACK_PATH.to_owned(),
+            // The advertised redirect uses `localhost` while the bind host is
+            // `RPI_OAUTH_CALLBACK_HOST` (upstream `redirectHost` seam).
+            redirect_host: Some("localhost".to_owned()),
+            state: Some(flow.state.clone()),
+            complete,
+            signal: interaction.signal(),
+            timeout: None,
+        })
+        .await
+        .ok();
 
         interaction.notify(AuthEvent::AuthUrl {
-            url: flow.url,
+            url: flow.url.clone(),
             instructions: Some(
                 "A browser window should open. Complete login to finish.".to_owned(),
             ),
         });
 
         let result = async {
-            let prompt = interaction.prompt(AuthPrompt::ManualCode {
-                message: "Complete login in your browser, or paste the authorization code / redirect URL here:"
-                    .to_owned(),
-                placeholder: Some(REDIRECT_URI.to_owned()),
-                signal: Some(manual_cancel.clone()),
-            });
-            tokio::pin!(prompt);
-
-            let mut manual_input: Option<String> = None;
-            let mut manual_error: Option<ModelsError> = None;
-            let mut manual_settled = false;
-
-            let code = tokio::select! {
-                // `waitForCode` settling `None` means the callback server
-                // failed to bind, or the manual prompt already settled and
-                // ran `cancelWait`; upstream then falls back to the manual
-                // input.
-                callback = server.wait_for_code() => callback,
-                manual = &mut prompt => {
-                    server.cancel_wait();
-                    manual_settled = true;
-                    match manual {
-                        Ok(input) => manual_input = Some(input),
-                        Err(prompt_error) => manual_error = Some(prompt_error),
-                    }
-                    None
-                }
-            };
-
-            // `if (manualError) throw manualError;`
-            if let Some(error) = manual_error {
-                return Err(error);
-            }
-
-            let code = match code {
-                Some(code) => code,
-                None => {
-                    // The manual prompt may still be pending (callback server
-                    // failed to bind): `await manualPromise`, then re-check.
-                    if !manual_settled {
-                        match prompt.await {
-                            Ok(input) => manual_input = Some(input),
-                            Err(prompt_error) => manual_error = Some(prompt_error),
-                        }
-                    }
-                    if let Some(error) = manual_error {
-                        return Err(error);
-                    }
-                    let Some(input) = manual_input else {
-                        return Err(error("Missing authorization code"));
-                    };
+            let outcome = wait_for_callback_or_manual_input(
+                interaction,
+                callback.as_ref(),
+                ManualPrompt {
+                    message: "Complete login in your browser, or paste the authorization code / redirect URL here:"
+                        .to_owned(),
+                    placeholder: REDIRECT_URI.to_owned(),
+                },
+            )
+            .await?;
+            let code = match outcome {
+                CallbackOrManual::Callback(code) => code,
+                CallbackOrManual::Manual(input) => {
                     manual_code_from_input(&input, &flow.state)?
                         .ok_or_else(|| error("Missing authorization code"))?
                 }
@@ -881,8 +690,9 @@ impl OpenAiCodexOAuth {
         .await;
 
         // `finally { manualAbort.abort(); server.close(); }`
-        manual_cancel.cancel();
-        server.close().await;
+        if let Some(callback) = callback {
+            callback.close().await;
+        }
         result
     }
 }
@@ -954,6 +764,7 @@ impl OAuthAuth for OpenAiCodexOAuth {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         let method = interaction
             .prompt(AuthPrompt::Select {
@@ -1609,7 +1420,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::scripted(handle.clone(), "device_code", "");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, access);
         assert_eq!(credential.refresh, "refresh-token");
         assert_eq!(
@@ -1677,7 +1488,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::scripted(handle.clone(), "device_code", "");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(
             credential.extra.get("accountId"),
             Some(&json!("account-456"))
@@ -1743,7 +1554,10 @@ mod tests {
             }),
         );
 
-        let error = oauth.login(&interaction).await.expect_err("cancelled");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("cancelled");
         assert_eq!(error.message, "Login cancelled");
     }
 
@@ -1770,7 +1584,7 @@ mod tests {
         let interaction = FakeInteraction::scripted(handle.clone(), "device_code", "")
             .with_signal(signal.clone());
 
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
         // Wait until the first poll landed, then cancel.
         for _ in 0..1000 {
             if mock
@@ -1829,7 +1643,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::scripted(handle.clone(), "device_code", "");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(
             credential.extra.get("accountId"),
             Some(&json!("account-403-404"))
@@ -1862,7 +1676,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::scripted(handle.clone(), "device_code", "");
 
-        let error = oauth.login(&interaction).await.expect_err("500");
+        let error = oauth.login(&interaction, None).await.expect_err("500");
         assert_eq!(
             error.message,
             "OpenAI Codex device auth failed with status 500: {\"error\":\"server_error\",\"error_description\":\"try again later\"}"
@@ -1901,7 +1715,7 @@ mod tests {
                 })
             }),
         );
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
 
         // Wait for the auth_url notification, then hit the callback.
         let mut state = None;
@@ -1986,7 +1800,7 @@ mod tests {
             }),
         );
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(
             credential.extra.get("accountId"),
             Some(&json!("account-manual"))
@@ -2020,7 +1834,7 @@ mod tests {
             }),
         );
 
-        let error = oauth.login(&interaction).await.expect_err("mismatch");
+        let error = oauth.login(&interaction, None).await.expect_err("mismatch");
         assert_eq!(error.message, "State mismatch");
         assert!(mock.requests().is_empty(), "no token exchange attempted");
     }
@@ -2036,7 +1850,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::scripted(handle.clone(), "browser", "");
 
-        let error = oauth.login(&interaction).await.expect_err("missing");
+        let error = oauth.login(&interaction, None).await.expect_err("missing");
         assert_eq!(error.message, "Missing authorization code");
         assert!(mock.requests().is_empty());
     }
@@ -2073,7 +1887,7 @@ mod tests {
             }),
         );
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(
             credential.extra.get("accountId"),
             Some(&json!("account-fallback"))
@@ -2190,7 +2004,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::scripted(handle.clone(), "other", "");
 
-        let error = oauth.login(&interaction).await.expect_err("unknown");
+        let error = oauth.login(&interaction, None).await.expect_err("unknown");
         assert_eq!(error.message, "Unknown OpenAI Codex login method: other");
     }
 }

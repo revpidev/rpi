@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
-use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
+use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
     DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
@@ -846,6 +846,7 @@ impl OAuthAuth for GitHubCopilotOAuth {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         self.login_github_copilot(interaction).await
     }
@@ -1407,7 +1408,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle.clone(), "");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.refresh, "ghu_refresh_token");
         assert_eq!(credential.access, COPILOT_TOKEN);
         assert_eq!(credential.expires, 9999999999_i64 * 1000 - EXPIRY_SKEW_MS);
@@ -1557,7 +1558,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle.clone(), "");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert!(handle.events().iter().any(|event| matches!(
             event,
             AuthEvent::Progress { message } if message == "Enabling models..."
@@ -1625,7 +1626,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle, "");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(
             credential.extra.get("availableModelIds"),
             Some(&json!(["gpt-5.4"]))
@@ -1668,7 +1669,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle, "");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         // Initial attempt + 2 retries, then the loop breaks.
         assert_eq!(mock.requests_matching("/policy").len(), 3);
         // No model was enabled, but the fetched availability survives.
@@ -1742,7 +1743,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle, "https://company.ghe.com/");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(
             credential.extra.get("enterpriseUrl"),
             Some(&json!("company.ghe.com"))
@@ -1785,7 +1786,10 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle.clone(), "");
 
-        let error = oauth.login(&interaction).await.expect_err("untrusted uri");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("untrusted uri");
         assert_eq!(
             error.message,
             "Untrusted verification_uri in device code response"
@@ -1833,7 +1837,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle.clone(), "");
 
-        oauth.login(&interaction).await.expect("login");
+        oauth.login(&interaction, None).await.expect("login");
         match handle.device_code_event().expect("device_code event") {
             AuthEvent::DeviceCode {
                 verification_uri, ..
@@ -1853,7 +1857,10 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle, "http://[bad");
 
-        let error = oauth.login(&interaction).await.expect_err("invalid domain");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("invalid domain");
         assert_eq!(error.message, "Invalid GitHub Enterprise URL/domain");
         assert!(mock.requests().is_empty(), "no request may leave");
     }
@@ -1903,7 +1910,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle, "");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.refresh, "ghu_refresh_token");
         let poll_count = mock.requests_matching("/login/oauth/access_token").len();
         assert_eq!(poll_count, 3);
@@ -1930,7 +1937,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle, "");
 
-        let error = oauth.login(&interaction).await.expect_err("denied");
+        let error = oauth.login(&interaction, None).await.expect_err("denied");
         assert_eq!(error.message, "Device flow failed: access_denied: denied");
     }
 

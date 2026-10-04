@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::interaction::{AuthEvent, AuthInteraction};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
-use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
+use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
     CANCEL_MESSAGE, DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
@@ -516,6 +516,7 @@ impl OAuthAuth for KimiCodingOAuth {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         self.login_kimi_coding(interaction).await
     }
@@ -868,7 +869,7 @@ mod tests {
         let interaction = FakeInteraction::new(handle.clone());
 
         let before = now_ms();
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, "access-token");
         assert_eq!(credential.refresh, "refresh-token");
         // No expiry skew (upstream `Date.now() + expires_in * 1000`).
@@ -919,7 +920,11 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle);
 
-        let error = mock.oauth().login(&interaction).await.expect_err("expired");
+        let error = mock
+            .oauth()
+            .login(&interaction, None)
+            .await
+            .expect_err("expired");
         assert_eq!(
             error.message,
             "Kimi Code device authorization expired. Please restart login."
@@ -943,7 +948,11 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle);
 
-        let error = mock.oauth().login(&interaction).await.expect_err("denied");
+        let error = mock
+            .oauth()
+            .login(&interaction, None)
+            .await
+            .expect_err("denied");
         assert_eq!(error.message, "Kimi Code login was denied.");
     }
 
@@ -967,7 +976,11 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle);
 
-        let error = mock.oauth().login(&interaction).await.expect_err("5xx");
+        let error = mock
+            .oauth()
+            .login(&interaction, None)
+            .await
+            .expect_err("5xx");
         assert!(
             error
                 .message
@@ -997,7 +1010,11 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle);
 
-        let error = mock.oauth().login(&interaction).await.expect_err("unknown");
+        let error = mock
+            .oauth()
+            .login(&interaction, None)
+            .await
+            .expect_err("unknown");
         assert_eq!(
             error.message,
             "Kimi Code device token request failed (status 400): unsupported_grant_type: nope"
@@ -1014,7 +1031,11 @@ mod tests {
         let mock = MockAuth::start(responder).await;
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle);
-        let error = mock.oauth().login(&interaction).await.expect_err("array");
+        let error = mock
+            .oauth()
+            .login(&interaction, None)
+            .await
+            .expect_err("array");
         assert_eq!(
             error.message,
             "Invalid Kimi Code device authorization response: [\"not\",\"an\",\"object\"]"
@@ -1024,7 +1045,11 @@ mod tests {
         let mock = MockAuth::start(responder).await;
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::new(handle);
-        let error = mock.oauth().login(&interaction).await.expect_err("string");
+        let error = mock
+            .oauth()
+            .login(&interaction, None)
+            .await
+            .expect_err("string");
         assert_eq!(
             error.message,
             "Invalid Kimi Code device authorization response: null"
@@ -1046,7 +1071,7 @@ mod tests {
 
         let error = mock
             .oauth()
-            .login(&interaction)
+            .login(&interaction, None)
             .await
             .expect_err("untrusted");
         assert!(
@@ -1074,7 +1099,7 @@ mod tests {
 
         let error = mock
             .oauth()
-            .login(&interaction)
+            .login(&interaction, None)
             .await
             .expect_err("http 400");
         assert!(

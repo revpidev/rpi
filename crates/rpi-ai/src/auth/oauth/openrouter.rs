@@ -28,21 +28,18 @@
 //! - the `loginLabel` ("Sign in with OpenRouter") has no `OAuthAuth` slot
 //!   and is not ported (deviation D-032).
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::State;
-use axum::http::{Method, StatusCode};
-use axum::response::Html;
 use serde_json::{Map, Value, json};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::super::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
+use super::super::interaction::{AuthEvent, AuthInteraction};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
-use super::super::types::{BoxFutureSend, ModelAuth, OAuthAuth, OAuthCredential};
-use super::callback_page::{default_callback_host, oauth_error_html, oauth_success_html};
+use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
+use super::callback_server::{
+    CallbackOrManual, CompleteFn, ManualPrompt, OAuthCallbackServer, OAuthCallbackServerOptions,
+    default_callback_host, wait_for_callback_or_manual_input,
+};
 use super::device_code::CANCEL_MESSAGE;
 use super::pkce::generate_pkce;
 
@@ -210,216 +207,6 @@ async fn exchange_authorization_code(
     })
 }
 
-// ---------------------------------------------------------------------------
-// `startCallbackServer` (openrouter.ts's own `node:http` server, here axum)
-// ---------------------------------------------------------------------------
-
-/// The key-exchange closure the callback handler runs: `exchangeAuthorizationCode`
-/// bound to the OAuth instance, the login's verifier and its signal.
-type ExchangeFn = Arc<
-    dyn Fn(String) -> BoxFutureSend<'static, Result<OAuthCredential, ModelsError>> + Send + Sync,
->;
-
-/// Settled outcome of the one-shot wait.
-#[derive(Debug, Clone)]
-enum CallbackOutcome {
-    /// `cancelWait` handed the login over to manual code entry.
-    Cancelled,
-    /// A browser callback completed the key exchange.
-    Credential(OAuthCredential),
-    /// Exchange failure, login abort, or server error.
-    Failed(ModelsError),
-}
-
-impl CallbackOutcome {
-    fn into_result(self) -> Result<Option<OAuthCredential>, ModelsError> {
-        match self {
-            CallbackOutcome::Cancelled => Ok(None),
-            CallbackOutcome::Credential(credential) => Ok(Some(credential)),
-            CallbackOutcome::Failed(error) => Err(error),
-        }
-    }
-}
-
-struct CallbackState {
-    callback_path: String,
-    exchange: ExchangeFn,
-    /// Settle-once channel: outer `None` = waiting; `Some(outcome)` = done.
-    settle: watch::Sender<Option<CallbackOutcome>>,
-    settled: AtomicBool,
-    claimed: AtomicBool,
-}
-
-impl CallbackState {
-    /// `finish` — settle once, first caller wins.
-    fn finish(&self, outcome: CallbackOutcome) {
-        if self
-            .settled
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            self.settle.send_replace(Some(outcome));
-        }
-    }
-}
-
-/// First occurrence of each query parameter (mirrors `URLSearchParams.get`).
-fn query_params(uri: &axum::http::Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
-        params
-            .entry(key.into_owned())
-            .or_insert_with(|| value.into_owned());
-    }
-    params
-}
-
-/// Every callback response carries `cache-control: no-store`
-/// (openrouter.ts:47-49) so browsers never reuse a stale OAuth page.
-fn callback_response(
-    status: StatusCode,
-    html: String,
-) -> (
-    StatusCode,
-    [(axum::http::header::HeaderName, &'static str); 1],
-    Html<String>,
-) {
-    (
-        status,
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Html(html),
-    )
-}
-
-async fn handle_openrouter_callback(
-    State(state): State<Arc<CallbackState>>,
-    request: axum::extract::Request,
-) -> (
-    StatusCode,
-    [(axum::http::header::HeaderName, &'static str); 1],
-    Html<String>,
-) {
-    let is_callback =
-        request.method() == Method::GET && request.uri().path() == state.callback_path;
-    if !is_callback {
-        return callback_response(
-            StatusCode::NOT_FOUND,
-            oauth_error_html("OAuth callback route not found.", None),
-        );
-    }
-    if state.claimed.load(Ordering::SeqCst) || state.settled.load(Ordering::SeqCst) {
-        return callback_response(
-            StatusCode::CONFLICT,
-            oauth_error_html("This OAuth callback has already been used.", None),
-        );
-    }
-
-    let params = query_params(request.uri());
-    if let Some(oauth_error) = params.get("error").filter(|value| !value.is_empty()) {
-        // `error_description ?? oauthError` — an empty description is kept.
-        let description = params
-            .get("error_description")
-            .map(String::as_str)
-            .unwrap_or(oauth_error);
-        state.finish(CallbackOutcome::Failed(error(format!(
-            "OpenRouter authorization failed: {description}"
-        ))));
-        let details = (!description.is_empty()).then_some(description);
-        return callback_response(
-            StatusCode::BAD_REQUEST,
-            oauth_error_html("OpenRouter authorization was denied.", details),
-        );
-    }
-
-    let Some(code) = params.get("code").filter(|value| !value.is_empty()) else {
-        return callback_response(
-            StatusCode::BAD_REQUEST,
-            oauth_error_html("OpenRouter returned no authorization code.", None),
-        );
-    };
-    state.claimed.store(true, Ordering::SeqCst);
-
-    match (state.exchange)(code.clone()).await {
-        Ok(credential) => {
-            state.finish(CallbackOutcome::Credential(credential));
-            callback_response(
-                StatusCode::OK,
-                oauth_success_html("Signed in to OpenRouter. You may now close this page."),
-            )
-        }
-        Err(exchange_error) => {
-            state.finish(CallbackOutcome::Failed(exchange_error.clone()));
-            callback_response(
-                StatusCode::BAD_GATEWAY,
-                oauth_error_html(
-                    "OpenRouter key exchange failed.",
-                    Some(&exchange_error.message),
-                ),
-            )
-        }
-    }
-}
-
-/// `startCallbackServer` result.
-struct OpenRouterCallbackServer {
-    state: Arc<CallbackState>,
-    callback_url: String,
-    shutdown: CancellationToken,
-    serve: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl OpenRouterCallbackServer {
-    /// `cancelWait` — hand the login over to manual code entry unless a
-    /// callback already claimed the exchange.
-    fn cancel_wait(&self) {
-        if !self.state.claimed.load(Ordering::SeqCst) {
-            self.state.finish(CallbackOutcome::Cancelled);
-        }
-    }
-
-    /// `waitForCredential` — settles with the credential once a browser
-    /// callback completes the exchange, with `None` once `cancelWait` hands
-    /// over, or with an error for a failed exchange / login abort. The
-    /// 5-minute login timeout is raced here (`setTimeout` upstream).
-    async fn wait_for_credential(&self) -> Result<Option<OAuthCredential>, ModelsError> {
-        let mut rx = self.state.settle.subscribe();
-        if let Some(outcome) = rx.borrow().clone() {
-            return outcome.into_result();
-        }
-        let outcome = tokio::time::timeout(LOGIN_TIMEOUT, async {
-            loop {
-                if rx.changed().await.is_err() {
-                    return None; // sender dropped (server closed)
-                }
-                if let Some(outcome) = rx.borrow_and_update().clone() {
-                    return Some(outcome);
-                }
-            }
-        })
-        .await;
-        match outcome {
-            Ok(Some(outcome)) => outcome.into_result(),
-            Ok(None) => Ok(None),
-            Err(_) => Err(error("OpenRouter OAuth login timed out")),
-        }
-    }
-
-    /// `close` — stop listening and release timers without settling
-    /// `waitForCredential`.
-    async fn close(mut self) {
-        self.shutdown.cancel();
-        if let Some(serve) = self.serve.take() {
-            let _ = serve.await;
-        }
-    }
-}
-
-impl Drop for OpenRouterCallbackServer {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-    }
-}
-
 /// `openRouterOAuth` — the OpenRouter OAuth provider auth.
 pub fn openrouter_oauth() -> Arc<dyn OAuthAuth> {
     Arc::new(OpenRouterOAuth::new())
@@ -460,25 +247,18 @@ impl OpenRouterOAuth {
         exchange_authorization_code(&self.client, &self.token_url, code, verifier, signal).await
     }
 
-    /// `startCallbackServer` — one-shot loopback server on an ephemeral
-    /// port with a random `/oauth/callback/{uuid}` path.
-    async fn start_callback_server(
+    /// `loginOpenRouter`.
+    async fn login_openrouter(
         &self,
-        callback_path: String,
-        verifier: String,
-        signal: Option<CancellationToken>,
-    ) -> Result<OpenRouterCallbackServer, ModelsError> {
-        // `if (signal?.aborted) throw new Error("Login cancelled")`.
-        if signal.as_ref().is_some_and(|token| token.is_cancelled()) {
-            return Err(error(CANCEL_MESSAGE));
-        }
-
-        let callback_host = default_callback_host();
-        let (settle, _) = watch::channel(None);
+        interaction: &dyn AuthInteraction,
+    ) -> Result<OAuthCredential, ModelsError> {
+        let pkce = generate_pkce();
+        let callback_path = format!("/oauth/callback/{}", random_uuid()?);
         let client = self.client.clone();
         let token_url = self.token_url.clone();
-        let signal_for_exchange = signal.clone();
-        let exchange: ExchangeFn = Arc::new(move |code: String| {
+        let verifier = pkce.verifier.clone();
+        let signal_for_exchange = interaction.signal();
+        let complete: CompleteFn<OAuthCredential> = Arc::new(move |code: String| {
             let client = client.clone();
             let token_url = token_url.clone();
             let verifier = verifier.clone();
@@ -488,100 +268,34 @@ impl OpenRouterOAuth {
                     .await
             })
         });
-        let state = Arc::new(CallbackState {
-            callback_path,
-            exchange,
-            settle,
-            settled: AtomicBool::new(false),
-            claimed: AtomicBool::new(false),
-        });
-
-        let listener = tokio::net::TcpListener::bind((&*callback_host, 0))
-            .await
-            .map_err(|bind_error| {
-                error(format!(
-                    "OpenRouter OAuth callback server failed to bind: {bind_error}"
-                ))
-            })?;
-        let local_addr = listener.local_addr().map_err(|address_error| {
-            error(format!(
-                "OpenRouter OAuth callback server failed to read its address: {address_error}"
-            ))
-        })?;
-
-        let app = axum::Router::new()
-            .fallback(handle_openrouter_callback)
-            .with_state(state.clone());
-        let shutdown = CancellationToken::new();
-        let serve_shutdown = shutdown.clone();
-        let serve = tokio::spawn(async move {
-            let result = axum::serve(listener, app)
-                .with_graceful_shutdown(serve_shutdown.cancelled_owned())
-                .await;
-            if let Err(serve_error) = result {
-                tracing::warn!(%serve_error, "OpenRouter OAuth callback server terminated with an error");
-            }
-        });
-
-        // `signal?.addEventListener("abort", () => finish({ error }))`,
-        // registered after the server is listening.
-        if let Some(signal) = signal.clone() {
-            let state = state.clone();
-            let closed = shutdown.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    () = signal.cancelled() => {
-                        state.finish(CallbackOutcome::Failed(error(CANCEL_MESSAGE)));
-                    }
-                    () = closed.cancelled() => {}
-                }
-            });
-        }
-        // `if (signal?.aborted) { close(); throw ... }` — the post-registration
-        // check.
-        if signal.as_ref().is_some_and(|token| token.is_cancelled()) {
-            shutdown.cancel();
-            return Err(error(CANCEL_MESSAGE));
-        }
-
-        Ok(OpenRouterCallbackServer {
-            callback_url: format!(
-                "http://{callback_host}:{}{}",
-                local_addr.port(),
-                state.callback_path
-            ),
-            state,
-            shutdown,
-            serve: Some(serve),
+        // `startOAuthCallbackServer` (upstream has no catch): port 0 and a
+        // random path make a bind conflict practically impossible; the
+        // 5-minute login timeout rides the shared server.
+        let callback = OAuthCallbackServer::start(OAuthCallbackServerOptions {
+            provider_name: "OpenRouter".to_owned(),
+            host: default_callback_host(),
+            port: 0,
+            path: callback_path,
+            redirect_host: None,
+            state: None,
+            complete,
+            signal: interaction.signal(),
+            timeout: Some(LOGIN_TIMEOUT),
         })
-    }
-
-    /// `loginOpenRouter`.
-    async fn login_openrouter(
-        &self,
-        interaction: &dyn AuthInteraction,
-    ) -> Result<OAuthCredential, ModelsError> {
-        let pkce = generate_pkce();
-        let callback_path = format!("/oauth/callback/{}", random_uuid()?);
-        let callback = self
-            .start_callback_server(callback_path, pkce.verifier.clone(), interaction.signal())
-            .await?;
-        let manual_cancel = CancellationToken::new();
+        .await?;
+        let callback_url = callback.redirect_uri();
 
         let result = async {
             // `authorizeUrl.search = new URLSearchParams({...}).toString()`.
             let query = url::form_urlencoded::Serializer::new(String::new())
                 .extend_pairs([
-                    ("callback_url", callback.callback_url.as_str()),
+                    ("callback_url", callback_url.as_str()),
                     ("code_challenge", pkce.challenge.as_str()),
                     ("code_challenge_method", "S256"),
                 ])
                 .finish();
             interaction.notify(AuthEvent::Progress {
-                message: format!(
-                    "Listening for OpenRouter OAuth callback on {}",
-                    callback.callback_url
-                ),
+                message: format!("Listening for OpenRouter OAuth callback on {callback_url}"),
             });
             interaction.notify(AuthEvent::AuthUrl {
                 url: format!("{AUTHORIZE_URL}?{query}"),
@@ -591,42 +305,22 @@ impl OpenRouterOAuth {
                 ),
             });
 
-            let prompt = interaction.prompt(AuthPrompt::ManualCode {
-                message: "Complete sign-in in your browser, or paste the authorization code / redirect URL here:"
-                    .to_owned(),
-                placeholder: Some(callback.callback_url.clone()),
-                signal: Some(manual_cancel.clone()),
-            });
-            tokio::pin!(prompt);
-
-            let mut manual_input: Option<String> = None;
-            let mut manual_error: Option<ModelsError> = None;
-
-            let outcome = tokio::select! {
-                credential = callback.wait_for_credential() => credential,
-                manual = &mut prompt => {
-                    callback.cancel_wait();
-                    match manual {
-                        Ok(input) => manual_input = Some(input),
-                        Err(prompt_error) => manual_error = Some(prompt_error),
-                    }
-                    // The manual branch settled the race; `cancelWait` handed
-                    // the login over unless a callback already claimed the
-                    // exchange.
-                    Ok(None)
-                }
-            };
-
+            let outcome = wait_for_callback_or_manual_input(
+                interaction,
+                Some(&callback),
+                ManualPrompt {
+                    message: "Complete sign-in in your browser, or paste the authorization code / redirect URL here:"
+                        .to_owned(),
+                    placeholder: callback_url.clone(),
+                },
+            )
+            .await?;
             match outcome {
-                Ok(Some(credential)) => Ok(credential),
-                Ok(None) => {
-                    // `if (manualError) throw manualError;`
-                    if let Some(error) = manual_error {
-                        return Err(error);
-                    }
-                    let code = manual_input
-                        .as_deref()
-                        .and_then(parse_authorization_input)
+                CallbackOrManual::Callback(credential) => Ok(credential),
+                CallbackOrManual::Manual(input) => {
+                    // `if (manualError) throw manualError;` — the helper
+                    // already propagated prompt errors.
+                    let code = parse_authorization_input(&input)
                         .ok_or_else(|| error("Missing authorization code"))?;
                     interaction.notify(AuthEvent::Progress {
                         message: "Exchanging authorization code for an API key...".to_owned(),
@@ -634,13 +328,11 @@ impl OpenRouterOAuth {
                     self.exchange(&code, &pkce.verifier, interaction.signal().as_ref())
                         .await
                 }
-                Err(error) => Err(error),
             }
         }
         .await;
 
         // `finally { manualAbort.abort(); callback.close(); }`
-        manual_cancel.cancel();
         callback.close().await;
         result
     }
@@ -655,6 +347,7 @@ impl OAuthAuth for OpenRouterOAuth {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         self.login_openrouter(interaction).await
     }
@@ -690,6 +383,7 @@ mod tests {
 
     use std::sync::Mutex;
 
+    use super::super::super::interaction::AuthPrompt;
     use axum::extract::Json;
     use axum::http::StatusCode;
     use axum::routing::post;
@@ -1113,7 +807,7 @@ mod tests {
             }),
         );
 
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
         let callback_url = wait_for_callback_url(&handle).await;
 
         // Authorize URL shape (openrouter.ts:251-257).
@@ -1206,7 +900,7 @@ mod tests {
             }),
         );
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, "sk-or-manual");
         assert_eq!(credential.refresh, "");
         let bodies = mock.bodies();
@@ -1227,7 +921,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::scripted_manual(handle.clone(), "  manual-code  ");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, "sk-or-manual");
         let bodies = mock.bodies();
         assert_eq!(bodies.len(), 1);
@@ -1245,7 +939,7 @@ mod tests {
         let handle = InteractionHandle::default();
         let interaction = FakeInteraction::scripted_manual(handle.clone(), "   ");
 
-        let error = oauth.login(&interaction).await.expect_err("empty");
+        let error = oauth.login(&interaction, None).await.expect_err("empty");
         assert_eq!(error.message, "Missing authorization code");
         assert!(mock.bodies().is_empty(), "no exchange attempted");
     }
@@ -1268,7 +962,10 @@ mod tests {
             }),
         );
 
-        let error = oauth.login(&interaction).await.expect_err("cancelled");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("cancelled");
         assert_eq!(error.message, "Login cancelled");
         assert!(mock.bodies().is_empty(), "no exchange attempted");
     }
@@ -1287,7 +984,10 @@ mod tests {
         signal.cancel();
         let interaction = FakeInteraction::scripted_manual(handle.clone(), "").with_signal(signal);
 
-        let error = oauth.login(&interaction).await.expect_err("cancelled");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("cancelled");
         assert_eq!(error.message, "Login cancelled");
         assert!(
             handle.events().is_empty(),
@@ -1326,7 +1026,7 @@ mod tests {
         )
         .with_signal(signal.clone());
 
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
         let callback_url = wait_for_callback_url(&handle).await;
 
         signal.cancel();
@@ -1372,7 +1072,7 @@ mod tests {
             }),
         );
 
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
         let callback_url = wait_for_callback_url(&handle).await;
 
         let callback_response = reqwest::get(format!("{callback_url}?code=bad-code"))
@@ -1432,7 +1132,7 @@ mod tests {
             }),
         );
 
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
         let callback_url = wait_for_callback_url(&handle).await;
 
         let first = tokio::spawn({
@@ -1488,7 +1188,7 @@ mod tests {
             }),
         );
 
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
         let callback_url = wait_for_callback_url(&handle).await;
 
         let response = reqwest::get(format!(
@@ -1498,7 +1198,10 @@ mod tests {
         .expect("callback response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let page = response.text().await.expect("page");
-        assert!(page.contains("OpenRouter authorization was denied."));
+        // Converged on the shared server page (`4df157433`): the heading is
+        // `${provider} authorization failed.` with the description as details.
+        assert!(page.contains("OpenRouter authorization failed."));
+        assert!(page.contains("denied"));
 
         let error = login.await.expect("join").expect_err("denied");
         assert_eq!(error.message, "OpenRouter authorization failed: denied");
@@ -1534,7 +1237,7 @@ mod tests {
             }),
         );
 
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
         let callback_url = wait_for_callback_url(&handle).await;
 
         let response = reqwest::get(format!("{callback_url}?state=no-code"))
@@ -1546,7 +1249,7 @@ mod tests {
                 .text()
                 .await
                 .expect("page")
-                .contains("OpenRouter returned no authorization code.")
+                .contains("Missing authorization code.")
         );
 
         // The wait was not settled: a valid callback completes the login.

@@ -31,17 +31,15 @@
 //!   missing).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::super::interaction::{AuthEvent, AuthInteraction, AuthPrompt, SelectOption};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
-use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
-use super::callback_page::{oauth_error_html, oauth_success_html};
+use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
+use super::callback_server::{CompleteFn, OAuthCallbackServer, OAuthCallbackServerOptions};
 use super::device_code::{
     DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
@@ -68,6 +66,63 @@ const OAUTH_CLIENT_ID: &str = "pi-gateway";
 const OAUTH_SCOPE: &str = "gateway offline_access";
 /// `OAUTH_DEVICE_CODE_GRANT_TYPE`.
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// `requestOAuthToken` body shared by the `OAuthAuth` methods and the
+/// callback server's `complete` hook.
+async fn request_oauth_token_with(
+    client: &reqwest::Client,
+    gateway: &str,
+    form: &[(&str, &str)],
+    signal: Option<&CancellationToken>,
+) -> Result<OAuthCredential, TokenRequestError> {
+    let url = gateway_url(gateway, "/v1/oauth/token").map_err(TokenRequestError::Other)?;
+    let send = client
+        .post(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .form(form)
+        .send();
+    let response = match signal {
+        Some(token) => {
+            tokio::select! {
+                () = token.cancelled() => {
+                    return Err(TokenRequestError::Other(error(
+                        super::device_code::CANCEL_MESSAGE,
+                    )));
+                }
+                response = send => response,
+            }
+        }
+        None => send.await,
+    };
+    let response = response
+        .map_err(|request_error| TokenRequestError::Other(error(request_error.to_string())))?;
+
+    if !response.status().is_success() {
+        return Err(TokenRequestError::OAuth(
+            read_oauth_response_error(response, "Radius OAuth token request failed").await,
+        ));
+    }
+
+    let data: TokenResponse = response
+        .json()
+        .await
+        .map_err(|json_error| TokenRequestError::Other(error(json_error.to_string())))?;
+
+    let mut extra = Map::new();
+    if let Some(scope) = data.scope {
+        extra.insert("scope".to_owned(), Value::String(scope));
+    }
+    Ok(OAuthCredential {
+        refresh: data.refresh_token,
+        access: data.access_token,
+        expires: now_ms() + (data.expires_in * 1000.0) as i64 - TOKEN_EXPIRY_SKEW_MS,
+        extra,
+    })
+}
 
 fn error(message: impl Into<String>) -> ModelsError {
     ModelsError::new(ModelsErrorCode::Oauth, message.into())
@@ -253,55 +308,7 @@ impl RadiusOAuth {
         form: &[(&str, &str)],
         signal: Option<&CancellationToken>,
     ) -> Result<OAuthCredential, TokenRequestError> {
-        let url =
-            gateway_url(&self.gateway, "/v1/oauth/token").map_err(TokenRequestError::Other)?;
-        let send = self
-            .client
-            .post(url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .form(form)
-            .send();
-        let response = match signal {
-            Some(token) => {
-                tokio::select! {
-                    () = token.cancelled() => {
-                        return Err(TokenRequestError::Other(error(
-                            super::device_code::CANCEL_MESSAGE,
-                        )));
-                    }
-                    response = send => response,
-                }
-            }
-            None => send.await,
-        };
-        let response = response
-            .map_err(|request_error| TokenRequestError::Other(error(request_error.to_string())))?;
-
-        if !response.status().is_success() {
-            return Err(TokenRequestError::OAuth(
-                read_oauth_response_error(response, "Radius OAuth token request failed").await,
-            ));
-        }
-
-        let data: TokenResponse = response
-            .json()
-            .await
-            .map_err(|json_error| TokenRequestError::Other(error(json_error.to_string())))?;
-
-        let mut extra = Map::new();
-        if let Some(scope) = data.scope {
-            extra.insert("scope".to_owned(), Value::String(scope));
-        }
-        Ok(OAuthCredential {
-            refresh: data.refresh_token,
-            access: data.access_token,
-            expires: now_ms() + (data.expires_in * 1000.0) as i64 - TOKEN_EXPIRY_SKEW_MS,
-            extra,
-        })
+        request_oauth_token_with(&self.client, &self.gateway, form, signal).await
     }
 
     /// `loadRadiusOAuthDiscovery` — GET `{gateway}/v1/oauth`; only the
@@ -461,8 +468,9 @@ impl RadiusOAuth {
         .await
     }
 
-    /// `loginWithBrowser` — PKCE + state, localhost callback server, then the
-    /// `authorization_code` token exchange.
+    /// `loginWithBrowser` — PKCE + state, shared localhost callback server
+    /// (`complete` exchanges the code before the page is sent), then the
+    /// credential comes back through `wait`.
     async fn login_with_browser(
         &self,
         authorization_endpoint: &str,
@@ -490,8 +498,45 @@ impl RadiusOAuth {
             .finish();
         authorize_url.set_query(Some(&query));
 
-        let server =
-            RadiusCallbackServer::start(state, interaction.signal(), self.callback_port).await;
+        // `startOAuthCallbackServer({...})` (no `.catch`): a bind failure
+        // fails the login; Radius offers device-code as the alternative.
+        let complete: CompleteFn<OAuthCredential> = {
+            let client = self.client.clone();
+            let gateway = self.gateway.clone();
+            let verifier = pkce.verifier.clone();
+            let signal = interaction.signal();
+            Arc::new(move |code: String| {
+                let client = client.clone();
+                let gateway = gateway.clone();
+                let verifier = verifier.clone();
+                let signal = signal.clone();
+                Box::pin(async move {
+                    let form = [
+                        ("grant_type", "authorization_code"),
+                        ("client_id", OAUTH_CLIENT_ID),
+                        ("redirect_uri", REDIRECT_URI),
+                        ("code", code.as_str()),
+                        ("code_verifier", verifier.as_str()),
+                    ];
+                    request_oauth_token_with(&client, &gateway, &form, signal.as_ref())
+                        .await
+                        .map_err(TokenRequestError::into_models_error)
+                })
+            })
+        };
+        let server = OAuthCallbackServer::start(OAuthCallbackServerOptions {
+            provider_name: "Radius".to_owned(),
+            host: CALLBACK_HOST.to_owned(),
+            port: self.callback_port,
+            path: CALLBACK_PATH.to_owned(),
+            redirect_host: None,
+            state: Some(state),
+            complete,
+            signal: interaction.signal(),
+            timeout: None,
+        })
+        .await?;
+
         interaction.notify(AuthEvent::Progress {
             message: format!("Listening for OAuth callback on {REDIRECT_URI}"),
         });
@@ -500,31 +545,12 @@ impl RadiusOAuth {
             instructions: Some("Continue in your browser.".to_owned()),
         });
 
-        let result = async {
-            let code = server.wait_for_code().await;
-            let Some(code) = code else {
-                if interaction
-                    .signal()
-                    .is_some_and(|signal| signal.is_cancelled())
-                {
-                    return Err(error(super::device_code::CANCEL_MESSAGE));
-                }
-                return Err(error("OAuth callback did not complete."));
-            };
-            self.request_oauth_token(
-                &[
-                    ("grant_type", "authorization_code"),
-                    ("client_id", OAUTH_CLIENT_ID),
-                    ("redirect_uri", REDIRECT_URI),
-                    ("code", code.as_str()),
-                    ("code_verifier", pkce.verifier.as_str()),
-                ],
-                interaction.signal().as_ref(),
-            )
-            .await
-            .map_err(TokenRequestError::into_models_error)
-        }
-        .await;
+        let result = match server.wait().await {
+            Ok(Some(credential)) => Ok(credential),
+            // `if (!credential) throw new Error("OAuth callback did not complete.")`.
+            Ok(None) => Err(error("OAuth callback did not complete.")),
+            Err(callback_error) => Err(callback_error),
+        };
 
         // `finally { callbackServer.close(); }`
         server.close().await;
@@ -543,6 +569,7 @@ impl OAuthAuth for RadiusOAuth {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         let login_method = interaction
             .prompt(AuthPrompt::Select {
@@ -603,178 +630,6 @@ impl OAuthAuth for RadiusOAuth {
             api_key: Some(credential.access.clone()),
             ..ModelAuth::default()
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// `startOAuthCallbackServer` (radius.ts's own `node:http` server, here axum)
-// ---------------------------------------------------------------------------
-
-struct CallbackState {
-    expected_state: String,
-    /// Settle-once channel: outer `None` = waiting; `Some(None)` =
-    /// aborted/closed; `Some(Some(code))` = code received.
-    settle: watch::Sender<Option<Option<String>>>,
-    settled: AtomicBool,
-}
-
-impl CallbackState {
-    fn settle(&self, code: Option<String>) {
-        if self
-            .settled
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            self.settle.send_replace(Some(code));
-        }
-    }
-}
-
-/// First occurrence of each query parameter (mirrors `URLSearchParams.get`).
-fn query_params(uri: &axum::http::Uri) -> std::collections::HashMap<String, String> {
-    let mut params = std::collections::HashMap::new();
-    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
-        params
-            .entry(key.into_owned())
-            .or_insert_with(|| value.into_owned());
-    }
-    params
-}
-
-async fn handle_radius_callback(
-    axum::extract::State(state): axum::extract::State<Arc<CallbackState>>,
-    uri: axum::http::Uri,
-) -> (axum::http::StatusCode, axum::response::Html<String>) {
-    use axum::http::StatusCode;
-    use axum::response::Html;
-    let params = query_params(&uri);
-
-    if params.get("state") != Some(&state.expected_state) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(oauth_error_html("OAuth state mismatch.", None)),
-        );
-    }
-
-    if let Some(callback_error) = params.get("error").filter(|value| !value.is_empty()) {
-        let description = params
-            .get("error_description")
-            .filter(|value| !value.is_empty());
-        let page = oauth_error_html(description.unwrap_or(callback_error), None);
-        state.settle(None);
-        return (StatusCode::BAD_REQUEST, Html(page));
-    }
-
-    let Some(code) = params.get("code").filter(|value| !value.is_empty()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(oauth_error_html("Missing authorization code.", None)),
-        );
-    };
-
-    state.settle(Some(code.clone()));
-    (
-        StatusCode::OK,
-        Html(oauth_success_html(
-            "Signed in to Radius. You may now close this page.",
-        )),
-    )
-}
-
-async fn handle_radius_fallback() -> (axum::http::StatusCode, axum::response::Html<String>) {
-    (
-        axum::http::StatusCode::NOT_FOUND,
-        axum::response::Html(oauth_error_html("Callback route not found.", None)),
-    )
-}
-
-/// `OAuthCallbackServer` — one-shot localhost callback server. A bind
-/// failure mirrors upstream's `once("error")` branch: the wait settles
-/// `None` instead of failing the login outright.
-struct RadiusCallbackServer {
-    state: Arc<CallbackState>,
-    shutdown: CancellationToken,
-    serve: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl RadiusCallbackServer {
-    async fn start(expected_state: String, signal: Option<CancellationToken>, port: u16) -> Self {
-        let (settle, _) = watch::channel(None);
-        let state = Arc::new(CallbackState {
-            expected_state,
-            settle,
-            settled: AtomicBool::new(false),
-        });
-
-        // `signal?.addEventListener("abort", () => finish(null))`.
-        if let Some(signal) = signal {
-            let state = state.clone();
-            tokio::spawn(async move {
-                signal.cancelled().await;
-                state.settle(None);
-            });
-        }
-
-        let shutdown = CancellationToken::new();
-        let serve = match tokio::net::TcpListener::bind((CALLBACK_HOST, port)).await {
-            Ok(listener) => {
-                let app = axum::Router::new()
-                    .route(CALLBACK_PATH, axum::routing::get(handle_radius_callback))
-                    .fallback(handle_radius_fallback)
-                    .with_state(state.clone());
-                let serve_shutdown = shutdown.clone();
-                Some(tokio::spawn(async move {
-                    let result = axum::serve(listener, app)
-                        .with_graceful_shutdown(serve_shutdown.cancelled_owned())
-                        .await;
-                    if let Err(serve_error) = result {
-                        tracing::warn!(%serve_error, "Radius OAuth callback server terminated with an error");
-                    }
-                }))
-            }
-            // Upstream: `.once("error", () => { finish(null); resolve(dummy) })`.
-            Err(_) => {
-                state.settle(None);
-                None
-            }
-        };
-
-        Self {
-            state,
-            shutdown,
-            serve,
-        }
-    }
-
-    /// `waitForCode()`.
-    async fn wait_for_code(&self) -> Option<String> {
-        let mut rx = self.state.settle.subscribe();
-        if let Some(value) = rx.borrow().clone() {
-            return value;
-        }
-        loop {
-            if rx.changed().await.is_err() {
-                return None;
-            }
-            if let Some(value) = rx.borrow_and_update().clone() {
-                return value;
-            }
-        }
-    }
-
-    /// `close()`.
-    async fn close(mut self) {
-        self.state.settle(None);
-        self.shutdown.cancel();
-        if let Some(serve) = self.serve.take() {
-            let _ = serve.await;
-        }
-    }
-}
-
-impl Drop for RadiusCallbackServer {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
     }
 }
 
@@ -1012,7 +867,7 @@ mod tests {
         let (interaction, handle) = interaction("device-code");
 
         let before = now_ms();
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, "access-token");
         assert_eq!(credential.refresh, "refresh-token");
         assert_eq!(
@@ -1094,7 +949,10 @@ mod tests {
         let oauth = gateway.oauth();
         let (interaction, _handle) = interaction("browser");
 
-        let error = oauth.login(&interaction).await.expect_err("invalid config");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("invalid config");
         assert_eq!(
             error.message,
             format!("Invalid Radius OAuth config from {}", gateway.url)
@@ -1148,7 +1006,7 @@ mod tests {
         let oauth =
             RadiusOAuth::new("Radius", gateway.url.clone()).with_callback_port(callback_port);
         let (interaction, handle) = interaction("browser");
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
 
         // Wait for the auth_url notification.
         let mut authorize = None;
@@ -1242,7 +1100,7 @@ mod tests {
         let oauth =
             RadiusOAuth::new("Radius", gateway.url.clone()).with_callback_port(callback_port);
         let (interaction, handle) = interaction("browser");
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
 
         let mut state = None;
         for _ in 0..1000 {
@@ -1281,7 +1139,7 @@ mod tests {
                 .text()
                 .await
                 .expect("body")
-                .contains("OAuth state mismatch.")
+                .contains("State mismatch.")
         );
 
         let response = reqwest::get(format!(
@@ -1293,9 +1151,9 @@ mod tests {
         login.await.expect("join").expect("login");
     }
 
-    /// An `error` callback settles the wait with `None` → the verbatim
-    /// "OAuth callback did not complete." failure; the page shows the
-    /// `error_description`.
+    /// An `error` callback fails the shared server wait with
+    /// `${provider} authorization failed: ${description}` (upstream
+    /// `callback-server.ts`); the page shows the same description.
     #[tokio::test]
     async fn browser_callback_error_param_fails_login() {
         let responder: Responder = Arc::new(|request: &RecordedRequest| {
@@ -1310,7 +1168,7 @@ mod tests {
         let oauth =
             RadiusOAuth::new("Radius", gateway.url.clone()).with_callback_port(callback_port);
         let (interaction, handle) = interaction("browser");
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
 
         let mut state = None;
         for _ in 0..1000 {
@@ -1347,7 +1205,7 @@ mod tests {
         assert!(response.text().await.expect("body").contains("nope"));
 
         let error = login.await.expect("join").expect_err("login must fail");
-        assert_eq!(error.message, "OAuth callback did not complete.");
+        assert_eq!(error.message, "Radius authorization failed: nope");
     }
 
     /// Device-poll error mapping: `authorization_pending` → pending,
@@ -1382,7 +1240,7 @@ mod tests {
         let oauth = gateway.oauth();
         let (interaction, _handle) = interaction("device-code");
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, "access-token");
         let poll_count = gateway
             .requests()
@@ -1417,7 +1275,10 @@ mod tests {
             let oauth = gateway.oauth();
             let (interaction, _handle) = interaction("device-code");
 
-            let error = oauth.login(&interaction).await.expect_err("terminal error");
+            let error = oauth
+                .login(&interaction, None)
+                .await
+                .expect_err("terminal error");
             assert_eq!(error.message, expected);
         }
     }
@@ -1436,7 +1297,10 @@ mod tests {
         let oauth = gateway.oauth();
         let (interaction, _handle) = interaction("device-code");
 
-        let error = oauth.login(&interaction).await.expect_err("missing fields");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("missing fields");
         assert_eq!(
             error.message,
             "Radius OAuth device authorization response is missing required fields"
@@ -1483,7 +1347,10 @@ mod tests {
         let oauth = gateway.oauth();
         let (interaction, _handle) = interaction("weird");
 
-        let error = oauth.login(&interaction).await.expect_err("unknown method");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("unknown method");
         assert_eq!(error.message, "Unknown Radius sign-in method: weird");
     }
 }

@@ -856,7 +856,7 @@ fn show_api_key_login_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorPro
     spawn_async(async move {
         let runtime = ui.session().model_runtime().clone();
         let result = runtime
-            .login(&provider_id, AuthType::ApiKey, &interaction)
+            .login(&provider_id, AuthType::ApiKey, &interaction, None)
             .await;
         ui.hide_selector();
         match result {

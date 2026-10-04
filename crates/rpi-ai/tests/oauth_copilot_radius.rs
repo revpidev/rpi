@@ -219,7 +219,7 @@ async fn radius_device_login_runs_through_the_factory_oauth() {
         events: events.clone(),
     };
 
-    let credential = oauth.login(&interaction).await.expect("login");
+    let credential = oauth.login(&interaction, None).await.expect("login");
     assert_eq!(credential.access, "access-token");
     assert_eq!(credential.refresh, "refresh-token");
     assert_eq!(

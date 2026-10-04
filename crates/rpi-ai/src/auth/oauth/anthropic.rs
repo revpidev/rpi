@@ -25,11 +25,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::super::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
+use super::super::interaction::{AuthEvent, AuthInteraction};
 use super::super::resolve::{ModelsError, ModelsErrorCode};
-use super::super::types::{ModelAuth, OAuthAuth, OAuthCredential};
-use super::callback_page::{
-    CALLBACK_PORT, CallbackPageCopy, OAuthCallbackServer, default_callback_host,
+use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
+use super::callback_server::{
+    CallbackOrManual, CompleteFn, ManualPrompt, OAuthCallbackServer, OAuthCallbackServerOptions,
+    default_callback_host, wait_for_callback_or_manual_input,
 };
 use super::pkce::generate_pkce;
 
@@ -40,6 +41,10 @@ const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 /// `TOKEN_URL`.
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+/// `CALLBACK_PORT`.
+const CALLBACK_PORT: u16 = 53692;
+/// `CALLBACK_PATH`.
+const CALLBACK_PATH: &str = "/callback";
 /// `REDIRECT_URI` = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`.
 const REDIRECT_URI: &str = "http://localhost:53692/callback";
 /// `SCOPES` (verbatim).
@@ -279,68 +284,6 @@ impl AnthropicOAuth {
             extra: Map::new(),
         })
     }
-
-    async fn login_race(
-        &self,
-        interaction: &dyn AuthInteraction,
-        server: &OAuthCallbackServer,
-        verifier: &str,
-        challenge: &str,
-        manual_cancel: &CancellationToken,
-    ) -> Result<OAuthCredential, ModelsError> {
-        // `authParams` in upstream key order; `URLSearchParams.toString()`
-        // form-urlencodes (space → `+`).
-        let query = url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs([
-                ("code", "true"),
-                ("client_id", CLIENT_ID),
-                ("response_type", "code"),
-                ("redirect_uri", REDIRECT_URI),
-                ("scope", SCOPES),
-                ("code_challenge", challenge),
-                ("code_challenge_method", "S256"),
-                ("state", verifier),
-            ])
-            .finish();
-        interaction.notify(AuthEvent::AuthUrl {
-            url: format!("{AUTHORIZE_URL}?{query}"),
-            instructions: Some(
-                "Complete login in your browser. If the browser is on another machine, paste the final redirect URL here."
-                    .to_owned(),
-            ),
-        });
-
-        let prompt = interaction.prompt(AuthPrompt::ManualCode {
-            message:
-                "Complete login in your browser, or paste the authorization code / redirect URL here:"
-                    .to_owned(),
-            placeholder: Some(REDIRECT_URI.to_owned()),
-            signal: Some(manual_cancel.clone()),
-        });
-        tokio::pin!(prompt);
-
-        let (code, state) = tokio::select! {
-            callback = server.wait_for_code() => {
-                match callback {
-                    Some(callback) => (callback.code, callback.state),
-                    // `waitForCode` settled `null` without a manual input —
-                    // upstream then fails the final `if (!code)` check.
-                    None => return Err(error("Missing authorization code")),
-                }
-            }
-            manual = &mut prompt => {
-                server.cancel_wait();
-                let input = manual?;
-                finalize_manual_input(parse_authorization_input(&input), verifier)?
-            }
-        };
-
-        interaction.notify(AuthEvent::Progress {
-            message: "Exchanging authorization code for tokens...".to_owned(),
-        });
-        self.exchange_authorization_code(&code, &state, verifier, REDIRECT_URI)
-            .await
-    }
 }
 
 /// Token endpoint JSON shape (`{ access_token, refresh_token, expires_in }`;
@@ -385,38 +328,92 @@ impl OAuthAuth for AnthropicOAuth {
         true
     }
 
-    /// `loginAnthropic`: PKCE → callback server (`expected_state = verifier`)
-    /// → notify `auth_url` → race the `manual_code` prompt against the
-    /// callback (first settle cancels the other) → token exchange.
+    /// `loginAnthropic`: PKCE → shared callback server (`expected_state =
+    /// verifier`, bind failure degrades to pasted input) → notify `auth_url`
+    /// → race the `manual_code` prompt against the callback → token exchange.
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
+        _options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         let pkce = generate_pkce();
         let verifier = pkce.verifier;
         let challenge = pkce.challenge;
 
-        let copy = CallbackPageCopy {
-            success_message: "Anthropic authentication completed. You can close this window."
-                .to_owned(),
-            failure_message: "Anthropic authentication did not complete.".to_owned(),
-        };
-        let server = OAuthCallbackServer::start_on(
-            verifier.clone(),
-            copy,
-            &default_callback_host(),
-            self.callback_port,
-        )
-        .await?;
-        let manual_cancel = CancellationToken::new();
+        // `startOAuthCallbackServer({...}).catch(() => undefined)`: a bind
+        // failure falls back to the pasted redirect URL (R2.6.2).
+        let complete: CompleteFn<String> = Arc::new(|code| Box::pin(async move { Ok(code) }));
+        let callback = OAuthCallbackServer::start(OAuthCallbackServerOptions {
+            provider_name: "Anthropic".to_owned(),
+            host: default_callback_host(),
+            port: self.callback_port,
+            path: CALLBACK_PATH.to_owned(),
+            // The advertised redirect uses `localhost` while the bind host is
+            // `RPI_OAUTH_CALLBACK_HOST` (upstream `redirectHost` seam).
+            redirect_host: Some("localhost".to_owned()),
+            state: Some(verifier.clone()),
+            complete,
+            signal: interaction.signal(),
+            timeout: None,
+        })
+        .await
+        .ok();
 
-        let result = self
-            .login_race(interaction, &server, &verifier, &challenge, &manual_cancel)
-            .await;
+        let result = async {
+            // `authParams` in upstream key order; `URLSearchParams.toString()`
+            // form-urlencodes (space → `+`).
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("code", "true"),
+                    ("client_id", CLIENT_ID),
+                    ("response_type", "code"),
+                    ("redirect_uri", REDIRECT_URI),
+                    ("scope", SCOPES),
+                    ("code_challenge", challenge.as_str()),
+                    ("code_challenge_method", "S256"),
+                    ("state", verifier.as_str()),
+                ])
+                .finish();
+            interaction.notify(AuthEvent::AuthUrl {
+                url: format!("{AUTHORIZE_URL}?{query}"),
+                instructions: Some(
+                    "Complete login in your browser. If the browser is on another machine, paste the final redirect URL here."
+                        .to_owned(),
+                ),
+            });
 
-        // `finally { manualAbort.abort(); server.server.close(); }`
-        manual_cancel.cancel();
-        server.close().await;
+            let outcome = wait_for_callback_or_manual_input(
+                interaction,
+                callback.as_ref(),
+                ManualPrompt {
+                    message: "Complete login in your browser, or paste the authorization code / redirect URL here:"
+                        .to_owned(),
+                    placeholder: REDIRECT_URI.to_owned(),
+                },
+            )
+            .await?;
+            let (code, state) = match outcome {
+                // The shared server already validated `state`; upstream uses
+                // the PKCE verifier as the exchange `state` for the callback
+                // branch too.
+                CallbackOrManual::Callback(code) => (code, verifier.clone()),
+                CallbackOrManual::Manual(input) => {
+                    finalize_manual_input(parse_authorization_input(&input), &verifier)?
+                }
+            };
+
+            interaction.notify(AuthEvent::Progress {
+                message: "Exchanging authorization code for tokens...".to_owned(),
+            });
+            self.exchange_authorization_code(&code, &state, &verifier, REDIRECT_URI)
+                .await
+        }
+        .await;
+
+        // `finally { manualAbort.abort(); callback?.close(); }`
+        if let Some(callback) = callback {
+            callback.close().await;
+        }
         result
     }
 
@@ -443,6 +440,8 @@ impl OAuthAuth for AnthropicOAuth {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use super::super::super::interaction::AuthPrompt;
 
     use axum::http::StatusCode;
     use axum::response::Json;
@@ -679,7 +678,7 @@ mod tests {
             }),
         );
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, "access-token");
         assert_eq!(credential.refresh, "refresh-token");
 
@@ -747,7 +746,7 @@ mod tests {
             }),
         );
 
-        let credential = oauth.login(&interaction).await.expect("login");
+        let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(credential.access, "access");
         assert!(
             handle
@@ -790,7 +789,7 @@ mod tests {
             }),
         );
 
-        let error = oauth.login(&interaction).await.expect_err("mismatch");
+        let error = oauth.login(&interaction, None).await.expect_err("mismatch");
         assert_eq!(error.message, "OAuth state mismatch");
         assert!(endpoint.bodies().is_empty(), "no token exchange attempted");
     }
@@ -823,7 +822,7 @@ mod tests {
             }),
         );
 
-        let login = tokio::spawn(async move { oauth.login(&interaction).await });
+        let login = tokio::spawn(async move { oauth.login(&interaction, None).await });
 
         // Wait for the auth_url notification (carries state = verifier).
         let mut state = None;
@@ -874,7 +873,10 @@ mod tests {
             }),
         );
 
-        let error = oauth.login(&interaction).await.expect_err("cancelled");
+        let error = oauth
+            .login(&interaction, None)
+            .await
+            .expect_err("cancelled");
         assert_eq!(error.message, "Login cancelled");
         assert!(endpoint.bodies().is_empty());
     }

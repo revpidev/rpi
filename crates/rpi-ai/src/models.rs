@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::{
     AuthContext, AuthInteraction, AuthOperationOptions, AuthResolutionOverrides, AuthResult,
     AuthType, Credential, CredentialStore, DefaultAuthContext, InMemoryCredentialStore,
-    ModelsError, ModelsErrorCode, ProviderAuth, resolve_provider_auth,
+    LoginOptions, ModelsError, ModelsErrorCode, ProviderAuth, resolve_provider_auth,
 };
 use crate::models_json::OrderedMap;
 use crate::models_store::{
@@ -1211,21 +1211,22 @@ impl Models {
     /// login (api-key prompt or OAuth flow) outside the store lock, then write
     /// the resulting credential through the store's serialized `modify` path.
     ///
+    /// `options` is the upstream `LoginOptions` slot (auth/types.ts:202-208
+    /// @ a13d35a74): app-supplied context such as the stable installation ID
+    /// for Sign in with ChatGPT.
+    ///
     /// **Write race** (models.ts:576-608): the credential write is queued in
     /// the store's serialization lock. If the caller's signal fires **before**
     /// the mutation function starts (i.e. while still queued), the write is
     /// rejected and the credential is not stored. Once the mutation function
     /// has started (flag set), the write runs to completion regardless of
     /// cancellation.
-    ///
-    /// OAuth support is stubbed at the trait level until T04 part 2 wires the
-    /// flows ([`OAuthAuth::login`]'s default errors), matching the interactive
-    /// layer which keeps the OAuth dialog a T15 hook.
     pub async fn login(
         &self,
         provider_id: &str,
         auth_type: AuthType,
         interaction: &dyn AuthInteraction,
+        options: Option<&LoginOptions>,
     ) -> Result<Credential, ModelsError> {
         let provider = self.get_provider(provider_id).ok_or_else(|| {
             ModelsError::new(
@@ -1253,7 +1254,7 @@ impl Models {
                         format!("{} does not support oauth login", provider.name()),
                     ));
                 };
-                Credential::OAuth(oauth.login(interaction).await?)
+                Credential::OAuth(oauth.login(interaction, options).await?)
             }
             AuthType::ApiKey => {
                 let Some(api_key) = provider.auth().api_key.clone() else {
@@ -2583,6 +2584,7 @@ mod tests {
         async fn login(
             &self,
             interaction: &dyn AuthInteraction,
+            _options: Option<&LoginOptions>,
         ) -> Result<crate::auth::OAuthCredential, ModelsError> {
             let _ = interaction.prompt(AuthPrompt::secret("Authorize")).await?;
             Ok(crate::auth::OAuthCredential {
@@ -2645,7 +2647,7 @@ mod tests {
         let interaction = RecordingInteraction::with_answer("entered-key");
 
         let credential = models
-            .login("test", AuthType::ApiKey, &interaction)
+            .login("test", AuthType::ApiKey, &interaction, None)
             .await
             .expect("login");
 
@@ -2690,7 +2692,7 @@ mod tests {
         let interaction = RecordingInteraction::with_answer("authorized");
 
         let credential = models
-            .login("test", AuthType::Oauth, &interaction)
+            .login("test", AuthType::Oauth, &interaction, None)
             .await
             .expect("login");
 
@@ -2716,6 +2718,7 @@ mod tests {
                 "ghost",
                 AuthType::ApiKey,
                 &RecordingInteraction::with_answer("k"),
+                None,
             )
             .await
             .expect_err("unknown provider must error");
@@ -2744,7 +2747,7 @@ mod tests {
         }));
         let interaction = RecordingInteraction::with_answer("k");
         let error = models
-            .login("test", AuthType::ApiKey, &interaction)
+            .login("test", AuthType::ApiKey, &interaction, None)
             .await
             .expect_err("ambient-only provider must error");
         assert_eq!(error.code, ModelsErrorCode::Auth);
@@ -2778,7 +2781,7 @@ mod tests {
         }));
         let interaction = RecordingInteraction::with_answer("k");
         let error = models
-            .login("test", AuthType::ApiKey, &interaction)
+            .login("test", AuthType::ApiKey, &interaction, None)
             .await
             .expect_err("missing api_key method must error");
         assert_eq!(error.code, ModelsErrorCode::Auth);
@@ -2790,7 +2793,7 @@ mod tests {
 
         let interaction = RecordingInteraction::with_answer("k");
         let error = models
-            .login("test", AuthType::Oauth, &interaction)
+            .login("test", AuthType::Oauth, &interaction, None)
             .await
             .expect("oauth login");
         assert!(matches!(error, Credential::OAuth(_)));
@@ -3506,6 +3509,7 @@ mod tests {
         async fn login(
             &self,
             _: &dyn AuthInteraction,
+            _options: Option<&LoginOptions>,
         ) -> Result<crate::auth::OAuthCredential, ModelsError> {
             unreachable!("not used")
         }
@@ -5322,7 +5326,7 @@ mod tests {
         let models_clone = models.clone();
         let login_task = tokio::spawn(async move {
             models_clone
-                .login("test", AuthType::ApiKey, &interaction)
+                .login("test", AuthType::ApiKey, &interaction, None)
                 .await
         });
 
@@ -5495,7 +5499,7 @@ mod tests {
         let models_clone = models.clone();
         let login_task = tokio::spawn(async move {
             models_clone
-                .login("test", AuthType::ApiKey, &interaction)
+                .login("test", AuthType::ApiKey, &interaction, None)
                 .await
         });
 

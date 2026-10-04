@@ -306,7 +306,7 @@ async fn kimi_coding_device_login_runs_end_to_end() {
         events: events.clone(),
     };
 
-    let credential = oauth.login(&interaction).await.expect("login");
+    let credential = oauth.login(&interaction, None).await.expect("login");
     assert_eq!(credential.access, "access-token");
     assert_eq!(credential.refresh, "refresh-token");
     assert_eq!(
@@ -363,7 +363,7 @@ async fn xai_device_login_runs_end_to_end() {
         events: events.clone(),
     };
 
-    let credential = oauth.login(&interaction).await.expect("login");
+    let credential = oauth.login(&interaction, None).await.expect("login");
     assert_eq!(credential.access, "access-token");
     assert_eq!(credential.refresh, "refresh-token");
     assert_eq!(
