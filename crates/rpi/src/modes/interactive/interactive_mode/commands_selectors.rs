@@ -20,8 +20,8 @@
 //!   session picks (session selector, user-message fork selector) are routed
 //!   to the run loop over the `EditorInput` channel and executed by
 //!   `InteractiveMode` (`handle_resume_command` / `handle_fork_command`).
-//! - Login/logout selectors and the api-key login flow are wired (T14 W6b);
-//!   the OAuth login dialog flow stays a stub (T13 leftover).
+//! - Login/logout selectors, the api-key login flow (T14 W6b) and the
+//!   OAuth login dialog (V16-11) are wired.
 //! - `handleBashCommand`: local `AgentSession::execute_bash` already records
 //!   the result internally (agent-session.rs:2076), so this port does not
 //!   call `record_bash_result` again (upstream interactive-mode.ts:5967).

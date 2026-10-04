@@ -553,7 +553,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await.expect("body");
         assert!(body.contains("Signed in to Test. You may now close this page."));
+        // v1.0.0 three-color badge (oauth-callback-server.test.ts:74-76).
         assert!(body.contains("fill=\"#F09082\""));
+        assert!(body.contains("fill=\"#4D9ABF\""));
+        assert!(body.contains("fill=\"#F1BE58\""));
         assert_eq!(
             server.wait().await.expect("wait"),
             Some("the-code".to_owned())
