@@ -42,6 +42,7 @@ use crate::api::simple_options::{
 };
 use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
+use crate::auth::anthropic_federation::OAUTH_API_BETA_HEADER;
 use crate::models::ProviderStreams;
 use crate::types::{
     AnthropicAllowedFallbackModel, AssistantContent, AssistantMessage, CacheRetention, DoneReason,
@@ -476,8 +477,13 @@ fn is_oauth_token(api_key: &str) -> bool {
 // headers override key-derived auth).
 
 /// `createClient` (header construction only): resolves the auth mode and the
-/// full header set. Returns the merged headers and whether the token is an
-/// OAuth token.
+/// full header set. `federation_token` is the workload-identity-federation
+/// access token minted by
+/// [`crate::auth::anthropic_federation`]: it becomes the `Authorization`
+/// bearer and appends the OAuth beta header, like the SDK's own credential
+/// provider. Returns the merged headers and whether the token is an OAuth
+/// token.
+#[allow(clippy::too_many_arguments)] // mirrors the upstream createClient inputs
 fn build_request_headers(
     model: &Model,
     context: &TranscriptContext,
@@ -486,6 +492,7 @@ fn build_request_headers(
     options: &AnthropicOptions,
     dynamic_headers: Option<HashMap<String, String>>,
     session_id: Option<&str>,
+    federation_token: Option<&str>,
 ) -> (ProviderHeaders, bool) {
     let compat = get_anthropic_compat(model);
     // The beta set comes from the single `getBetaFeatures` computation
@@ -559,6 +566,31 @@ fn build_request_headers(
             options.stream.headers.clone(),
         ]);
         return (headers, true);
+    }
+
+    // Workload identity federation: bearer token + the OAuth beta header,
+    // appended to any model-provided betas (SDK `prepareRequest`).
+    if let Some(token) = federation_token {
+        let mut betas = beta_features.clone();
+        if !betas.iter().any(|feature| feature == OAUTH_API_BETA_HEADER) {
+            betas.push(OAUTH_API_BETA_HEADER.to_owned());
+        }
+        base.insert("anthropic-beta".to_owned(), Some(betas.join(",")));
+        base.insert("authorization".to_owned(), Some(format!("Bearer {token}")));
+        let session_affinity_headers =
+            crate::api::session_affinity::anthropic_session_affinity_headers(
+                compat.send_session_affinity_headers,
+                compat.session_affinity_format,
+                session_id,
+            );
+        let headers = merge_headers_chain(&[
+            rpi_user_agent_headers(),
+            Some(base),
+            session_affinity_headers,
+            model_headers(model),
+            options.stream.headers.clone(),
+        ]);
+        return (headers, false);
     }
 
     // API key or header-owned auth.
@@ -1928,7 +1960,26 @@ async fn run(
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
     let api_key = options.stream.api_key.as_deref();
-    assert_request_auth(&model.provider, api_key, options.stream.headers.as_ref())?;
+    let federation = crate::auth::anthropic_federation::get_anthropic_federation(
+        &model.provider,
+        &model.base_url,
+        api_key,
+        options.stream.headers.as_ref(),
+        options.stream.env.as_ref(),
+    );
+    // Federation replaces the static credential: skip the "no API key" guard
+    // and mint the short-lived access token before building the headers.
+    if federation.is_none() {
+        assert_request_auth(&model.provider, api_key, options.stream.headers.as_ref())?;
+    }
+    let federation_token = match &federation {
+        Some(config) => Some(
+            crate::auth::anthropic_federation::get_access_token(config)
+                .await
+                .map_err(|mint_error| mint_error.message)?,
+        ),
+        None => None,
+    };
 
     let compat = get_anthropic_compat(model);
     let current_tools = crate::utils::transcript::get_current_tools(&context.messages);
@@ -1969,6 +2020,7 @@ async fn run(
         options,
         dynamic_headers,
         cache_session_id,
+        federation_token.as_deref(),
     );
 
     let mut params = build_params(model, context, is_oauth_token, native_tool_changes, options)?;
@@ -1996,50 +2048,100 @@ async fn run(
     }
     let client = client_builder.build().map_err(|error| error.to_string())?;
 
+    let retry_options = ProviderRetryOptions {
+        max_retries: options.stream.max_retries,
+        max_retry_delay_ms: options.stream.max_retry_delay_ms,
+    };
+    let initial_federation_token = federation_token.clone();
     let response = retry_provider_request(
         || {
-            let request = client.post(&url).headers(header_map.clone()).json(&params);
+            let client = client.clone();
+            let url = url.clone();
+            let params = params.clone();
+            let header_map = header_map.clone();
+            let federation = federation.clone();
             let signal = options.stream.signal.clone();
             let fetch = options.stream.fetch.clone();
+            let timeout_ms = options.stream.timeout_ms;
+            let mut authorization = initial_federation_token
+                .as_deref()
+                .map(|token| format!("Bearer {token}"));
             async move {
-                // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
-                // keeps the reqwest default path unchanged.
-                let result = send_provider_request(
-                    request,
-                    fetch.as_ref(),
-                    signal.as_ref(),
-                    options.stream.timeout_ms,
-                )
-                .await;
-                match result {
-                    Ok(response) => {
-                        let status = response.status();
-                        if status.is_success() {
-                            Ok(response)
-                        } else {
-                            let status = status.as_u16();
-                            let response_headers = headers_to_record(response.headers());
-                            let body = response.text().await.unwrap_or_default();
-                            let normalized = NormalizedProviderError::new(
-                                Some(status),
-                                Some(body),
-                                format!("Request failed with status {status}"),
-                            );
-                            Err(ProviderErrorInfo {
-                                status: Some(status),
-                                headers: Some(response_headers),
-                                message: format_provider_error(&normalized, None),
-                            })
+                let mut did_refresh_for_401 = false;
+                loop {
+                    let mut request_headers = header_map.clone();
+                    if let Some(value) = &authorization {
+                        match reqwest::header::HeaderValue::from_str(value) {
+                            Ok(value) => {
+                                // `insert` replaces the mapped header so the
+                                // retried request carries exactly one token.
+                                request_headers.insert(reqwest::header::AUTHORIZATION, value);
+                            }
+                            Err(header_error) => {
+                                return Err(ProviderErrorInfo {
+                                    status: None,
+                                    headers: None,
+                                    message: format!(
+                                        "Invalid federation authorization header: {header_error}"
+                                    ),
+                                });
+                            }
                         }
                     }
-                    Err(error) => Err(error.into_provider_error_info()),
+                    let request = client.post(&url).headers(request_headers).json(&params);
+                    // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
+                    // keeps the reqwest default path unchanged.
+                    let result =
+                        send_provider_request(request, fetch.as_ref(), signal.as_ref(), timeout_ms)
+                            .await;
+                    let response = match result {
+                        Ok(response) => response,
+                        Err(error) => return Err(error.into_provider_error_info()),
+                    };
+                    let status = response.status();
+                    // Reactive refresh (SDK `shouldRetry`): a 401 from a
+                    // token-authenticated request invalidates the cache and
+                    // retries once with a freshly exchanged token.
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        && !did_refresh_for_401
+                        && let Some(config) = &federation
+                    {
+                        did_refresh_for_401 = true;
+                        crate::auth::anthropic_federation::invalidate_access_token(config).await;
+                        match crate::auth::anthropic_federation::get_access_token(config).await {
+                            Ok(token) => {
+                                authorization = Some(format!("Bearer {token}"));
+                                continue;
+                            }
+                            Err(refresh_error) => {
+                                return Err(ProviderErrorInfo {
+                                    status: Some(401),
+                                    headers: None,
+                                    message: refresh_error.message,
+                                });
+                            }
+                        }
+                    }
+                    if status.is_success() {
+                        return Ok(response);
+                    }
+                    let status = status.as_u16();
+                    let response_headers = headers_to_record(response.headers());
+                    let body = response.text().await.unwrap_or_default();
+                    let normalized = NormalizedProviderError::new(
+                        Some(status),
+                        Some(body),
+                        format!("Request failed with status {status}"),
+                    );
+                    return Err(ProviderErrorInfo {
+                        status: Some(status),
+                        headers: Some(response_headers),
+                        message: format_provider_error(&normalized, None),
+                    });
                 }
             }
         },
-        ProviderRetryOptions {
-            max_retries: options.stream.max_retries,
-            max_retry_delay_ms: options.stream.max_retry_delay_ms,
-        },
+        retry_options,
         options.stream.signal.as_ref(),
     )
     .await
@@ -2209,11 +2311,22 @@ pub fn stream_simple(
     // Auth check at the entry, before any stream is constructed
     // (8b5899dce: anthropic-messages.ts streamSimple asserts request auth
     // first and throws synchronously — the Rust equivalent is `Err`).
-    assert_request_auth(
+    // Workload identity federation replaces the static credential, so the
+    // guard is skipped when it resolves (the token is minted in `run`).
+    let federation = crate::auth::anthropic_federation::get_anthropic_federation(
         &model.provider,
+        &model.base_url,
         options.as_ref().and_then(|o| o.stream.api_key.as_deref()),
         options.as_ref().and_then(|o| o.stream.headers.as_ref()),
-    )?;
+        options.as_ref().and_then(|o| o.stream.env.as_ref()),
+    );
+    if federation.is_none() {
+        assert_request_auth(
+            &model.provider,
+            options.as_ref().and_then(|o| o.stream.api_key.as_deref()),
+            options.as_ref().and_then(|o| o.stream.headers.as_ref()),
+        )?;
+    }
 
     let api_key = options.as_ref().and_then(|o| o.stream.api_key.clone());
     let base = build_base_options(model, context, options.as_ref(), api_key);
@@ -2522,6 +2635,7 @@ pub(crate) mod tests {
             &options,
             None,
             Some("session-1"),
+            None,
         );
         assert!(!is_oauth);
         assert_eq!(
@@ -2564,6 +2678,7 @@ pub(crate) mod tests {
             &options,
             None,
             None,
+            None,
         );
         assert!(is_oauth);
         assert_eq!(
@@ -2597,6 +2712,7 @@ pub(crate) mod tests {
             &AnthropicOptions::default(),
             None,
             None,
+            None,
         );
         assert!(!headers.contains_key("anthropic-beta"));
     }
@@ -2612,6 +2728,7 @@ pub(crate) mod tests {
             &AnthropicOptions::default(),
             None,
             Some("sess-9"),
+            None,
         );
         assert_eq!(
             headers.get("x-session-affinity").and_then(|v| v.as_deref()),
@@ -2650,6 +2767,7 @@ pub(crate) mod tests {
             &AnthropicOptions::default(),
             None,
             Some("openrouter-session-1"),
+            None,
         );
         assert_eq!(
             headers.get("x-session-id").and_then(|v| v.as_deref()),
@@ -2674,6 +2792,7 @@ pub(crate) mod tests {
             &AnthropicOptions::default(),
             None,
             Some("openrouter-session-3"),
+            None,
         );
         assert!(!headers.contains_key("x-session-id"));
         assert!(!headers.contains_key("x-session-affinity"));
@@ -2698,6 +2817,7 @@ pub(crate) mod tests {
             &AnthropicOptions::default(),
             None,
             Some("fireworks-session"),
+            None,
         );
         assert_eq!(
             headers.get("x-session-affinity").and_then(|v| v.as_deref()),
@@ -4229,6 +4349,7 @@ mod mid_convo_effort_tests {
             &options,
             None,
             None,
+            None,
         );
         let beta = headers
             .get("anthropic-beta")
@@ -4375,6 +4496,7 @@ mod header_semantics_tests {
             },
             None,
             None,
+            None,
         );
         assert!(!headers.contains_key("x-api-key"));
         assert_eq!(
@@ -4402,6 +4524,7 @@ mod header_semantics_tests {
                 },
                 ..Default::default()
             },
+            None,
             None,
             None,
         );
@@ -4766,6 +4889,7 @@ mod transcript_tool_changes_tests {
             true,
             Some("sk-key"),
             &AnthropicOptions::default(),
+            None,
             None,
             None,
         );

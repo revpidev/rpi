@@ -10,6 +10,7 @@
 //! (`interaction`). OAuth flows land with T04 part 2.
 
 pub mod anthropic_auth;
+pub mod anthropic_federation;
 pub mod cloudflare_auth;
 pub mod config_value;
 pub mod credential_store;
@@ -22,10 +23,14 @@ pub mod resolve;
 pub mod types;
 
 pub use anthropic_auth::{AnthropicApiKeyAuth, anthropic_api_key_auth};
+pub use anthropic_federation::{
+    AnthropicFederationConfig, get_access_token, get_anthropic_federation, invalidate_access_token,
+};
 pub use credential_store::InMemoryCredentialStore;
 pub use env_keys::{
-    ANTHROPIC_API_KEY_ENV, ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, find_env_keys,
-    get_env_api_key,
+    ANTHROPIC_API_KEY_ENV, ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_FEDERATION_RULE_ID_ENV,
+    ANTHROPIC_IDENTITY_TOKEN_FILE_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_ORGANIZATION_ID_ENV,
+    ANTHROPIC_SERVICE_ACCOUNT_ID_ENV, ANTHROPIC_WORKSPACE_ID_ENV, find_env_keys, get_env_api_key,
 };
 pub use file_store::{
     Backend, FileAuthStorageBackend, FileCredentialStore, InMemoryAuthStorageBackend,

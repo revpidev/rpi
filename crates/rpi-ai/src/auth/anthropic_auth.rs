@@ -8,11 +8,15 @@
 //! key, so [`env_api_key_auth`](super::helpers::env_api_key_auth) cannot be
 //! used.
 
-use super::env_keys::{ANTHROPIC_API_KEY_ENV, ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV};
+use super::env_keys::{
+    ANTHROPIC_API_KEY_ENV, ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_FEDERATION_RULE_ID_ENV,
+    ANTHROPIC_IDENTITY_TOKEN_FILE_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_ORGANIZATION_ID_ENV,
+    ANTHROPIC_SERVICE_ACCOUNT_ID_ENV, ANTHROPIC_WORKSPACE_ID_ENV,
+};
 use super::interaction::{AuthInteraction, AuthPrompt};
 use super::resolve::ModelsError;
 use super::types::{ApiKeyAuth, ApiKeyCredential, AuthContext, AuthResult, ModelAuth};
-use crate::types::ProviderHeaders;
+use crate::types::{ProviderEnv, ProviderHeaders};
 
 /// `anthropicApiKeyAuth()` — see module docs.
 pub struct AnthropicApiKeyAuth;
@@ -98,7 +102,32 @@ impl ApiKeyAuth for AnthropicApiKeyAuth {
                 }));
             }
         }
-        Ok(None)
+
+        // Workload identity federation (`a9424cd43`): the exchange mints a
+        // short-lived access token from the identity token. Last in line so
+        // keys and ANTHROPIC_AUTH_TOKEN keep winning, as in the SDK. The ids
+        // are provider config rather than auth, so they travel in `env`.
+        let mut federation = ProviderEnv::new();
+        for env_var in [
+            ANTHROPIC_FEDERATION_RULE_ID_ENV,
+            ANTHROPIC_ORGANIZATION_ID_ENV,
+            ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
+        ] {
+            let Some(value) = ctx.env(env_var).await.filter(|value| !value.is_empty()) else {
+                return Ok(None);
+            };
+            federation.insert(env_var.to_owned(), value);
+        }
+        for env_var in [ANTHROPIC_SERVICE_ACCOUNT_ID_ENV, ANTHROPIC_WORKSPACE_ID_ENV] {
+            if let Some(value) = ctx.env(env_var).await.filter(|value| !value.is_empty()) {
+                federation.insert(env_var.to_owned(), value);
+            }
+        }
+        Ok(Some(AuthResult {
+            auth: ModelAuth::default(),
+            env: Some(federation),
+            source: Some("workload identity federation".to_owned()),
+        }))
     }
 }
 
@@ -204,5 +233,223 @@ mod tests {
         // Nothing configured.
         let ctx = MapAuthContext(HashMap::new());
         assert!(auth.resolve(&ctx, None).await.expect("resolve").is_none());
+    }
+
+    /// `anthropic-federation.test.ts`: the federation variables resolve as
+    /// provider env with no request auth, including the optional service
+    /// account id.
+    #[tokio::test]
+    async fn resolves_federation_variables_as_provider_env() {
+        let auth = anthropic_api_key_auth();
+        let ctx = MapAuthContext(HashMap::from([
+            (
+                ANTHROPIC_FEDERATION_RULE_ID_ENV.to_owned(),
+                "fdrl_test".to_owned(),
+            ),
+            (
+                ANTHROPIC_ORGANIZATION_ID_ENV.to_owned(),
+                "org-test".to_owned(),
+            ),
+            (
+                ANTHROPIC_IDENTITY_TOKEN_FILE_ENV.to_owned(),
+                "/tmp/identity.jwt".to_owned(),
+            ),
+            (
+                ANTHROPIC_SERVICE_ACCOUNT_ID_ENV.to_owned(),
+                "svac_test".to_owned(),
+            ),
+        ]));
+        let result = auth
+            .resolve(&ctx, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert_eq!(result.auth, ModelAuth::default());
+        let env = result.env.expect("federation env");
+        assert_eq!(
+            env.get(ANTHROPIC_FEDERATION_RULE_ID_ENV)
+                .map(String::as_str),
+            Some("fdrl_test")
+        );
+        assert_eq!(
+            env.get(ANTHROPIC_ORGANIZATION_ID_ENV).map(String::as_str),
+            Some("org-test")
+        );
+        assert_eq!(
+            env.get(ANTHROPIC_IDENTITY_TOKEN_FILE_ENV)
+                .map(String::as_str),
+            Some("/tmp/identity.jwt")
+        );
+        assert_eq!(
+            env.get(ANTHROPIC_SERVICE_ACCOUNT_ID_ENV)
+                .map(String::as_str),
+            Some("svac_test")
+        );
+        assert_eq!(
+            result.source.as_deref(),
+            Some("workload identity federation")
+        );
+    }
+
+    /// `ANTHROPIC_WORKSPACE_ID` passes through when set and is absent when
+    /// unset (the SDK treats it as an optional scoping hint).
+    #[tokio::test]
+    async fn passes_workspace_id_through_when_set() {
+        let auth = anthropic_api_key_auth();
+        let mut values = HashMap::from([
+            (
+                ANTHROPIC_FEDERATION_RULE_ID_ENV.to_owned(),
+                "fdrl_test".to_owned(),
+            ),
+            (
+                ANTHROPIC_ORGANIZATION_ID_ENV.to_owned(),
+                "org-test".to_owned(),
+            ),
+            (
+                ANTHROPIC_IDENTITY_TOKEN_FILE_ENV.to_owned(),
+                "/tmp/identity.jwt".to_owned(),
+            ),
+        ]);
+        let result = auth
+            .resolve(&MapAuthContext(values.clone()), None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert!(
+            !result
+                .env
+                .expect("env")
+                .contains_key(ANTHROPIC_WORKSPACE_ID_ENV)
+        );
+
+        values.insert(
+            ANTHROPIC_WORKSPACE_ID_ENV.to_owned(),
+            "wrkspc_test".to_owned(),
+        );
+        let result = auth
+            .resolve(&MapAuthContext(values), None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert_eq!(
+            result
+                .env
+                .expect("env")
+                .get(ANTHROPIC_WORKSPACE_ID_ENV)
+                .map(String::as_str),
+            Some("wrkspc_test")
+        );
+    }
+
+    /// A missing required federation variable leaves the provider
+    /// unconfigured (no partial resolution).
+    #[tokio::test]
+    async fn federation_requires_all_three_variables() {
+        let auth = anthropic_api_key_auth();
+        let ctx = MapAuthContext(HashMap::from([
+            (
+                ANTHROPIC_FEDERATION_RULE_ID_ENV.to_owned(),
+                "fdrl_test".to_owned(),
+            ),
+            (
+                ANTHROPIC_ORGANIZATION_ID_ENV.to_owned(),
+                "org-test".to_owned(),
+            ),
+        ]));
+        assert!(auth.resolve(&ctx, None).await.expect("resolve").is_none());
+    }
+
+    /// `ANTHROPIC_SERVICE_ACCOUNT_ID` is optional, like the SDK.
+    #[tokio::test]
+    async fn service_account_id_is_optional() {
+        let auth = anthropic_api_key_auth();
+        let ctx = MapAuthContext(HashMap::from([
+            (
+                ANTHROPIC_FEDERATION_RULE_ID_ENV.to_owned(),
+                "fdrl_test".to_owned(),
+            ),
+            (
+                ANTHROPIC_ORGANIZATION_ID_ENV.to_owned(),
+                "org-test".to_owned(),
+            ),
+            (
+                ANTHROPIC_IDENTITY_TOKEN_FILE_ENV.to_owned(),
+                "/tmp/identity.jwt".to_owned(),
+            ),
+        ]));
+        let result = auth
+            .resolve(&ctx, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        let env = result.env.expect("env");
+        assert!(!env.contains_key(ANTHROPIC_SERVICE_ACCOUNT_ID_ENV));
+        assert_eq!(
+            result.source.as_deref(),
+            Some("workload identity federation")
+        );
+    }
+
+    /// Keys and `ANTHROPIC_AUTH_TOKEN` keep precedence over federation.
+    #[tokio::test]
+    async fn keys_and_auth_token_keep_precedence_over_federation() {
+        let auth = anthropic_api_key_auth();
+        let ctx = MapAuthContext(HashMap::from([
+            (
+                ANTHROPIC_FEDERATION_RULE_ID_ENV.to_owned(),
+                "fdrl_test".to_owned(),
+            ),
+            (
+                ANTHROPIC_ORGANIZATION_ID_ENV.to_owned(),
+                "org-test".to_owned(),
+            ),
+            (
+                ANTHROPIC_IDENTITY_TOKEN_FILE_ENV.to_owned(),
+                "/tmp/identity.jwt".to_owned(),
+            ),
+            (ANTHROPIC_API_KEY_ENV.to_owned(), "api-key".to_owned()),
+            (ANTHROPIC_AUTH_TOKEN_ENV.to_owned(), "auth-token".to_owned()),
+        ]));
+        let result = auth
+            .resolve(&ctx, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert_eq!(result.source.as_deref(), Some(ANTHROPIC_AUTH_TOKEN_ENV));
+
+        let mut without_auth_token = HashMap::from([
+            (
+                ANTHROPIC_FEDERATION_RULE_ID_ENV.to_owned(),
+                "fdrl_test".to_owned(),
+            ),
+            (
+                ANTHROPIC_ORGANIZATION_ID_ENV.to_owned(),
+                "org-test".to_owned(),
+            ),
+            (
+                ANTHROPIC_IDENTITY_TOKEN_FILE_ENV.to_owned(),
+                "/tmp/identity.jwt".to_owned(),
+            ),
+            (ANTHROPIC_API_KEY_ENV.to_owned(), "api-key".to_owned()),
+        ]);
+        let result = auth
+            .resolve(&MapAuthContext(without_auth_token.clone()), None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert_eq!(result.source.as_deref(), Some(ANTHROPIC_API_KEY_ENV));
+        assert_eq!(result.auth.api_key.as_deref(), Some("api-key"));
+
+        without_auth_token.remove(ANTHROPIC_API_KEY_ENV);
+        let result = auth
+            .resolve(&MapAuthContext(without_auth_token), None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert_eq!(result.auth, ModelAuth::default());
+        assert_eq!(
+            result.source.as_deref(),
+            Some("workload identity federation")
+        );
     }
 }
