@@ -104,16 +104,16 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// subagents plugin renders the agent's `inheritGlobalContext` two-state
 /// into the child env (`1` = inherit, the default for every agent).
 ///
-/// The switch is read only when the exact child marker `RPI_SUBAGENT_CHILD=1`
-/// is present (the launcher's sentinel, read strictly like `plugin_mode` in
-/// the subagents crate): upstream's consumer was the child-only runtime
-/// extension, so a stray ambient value alone must not change a top-level
-/// session. `0`/`false` opt out; `1`, `true`, unset, and unrecognized values
-/// keep inheriting — the old-host fallback for a host that never sees the
-/// key stays "inherit".
+/// The switch is read only when the child marker `RPI_SUBAGENT_CHILD=1` is
+/// present with the exact value the launcher writes (`plugin_mode` in the
+/// subagents crate matches the same literal): upstream's consumer was the
+/// child-only runtime extension, so a stray ambient value alone must not
+/// change a top-level session. `0`/`false` opt out; `1`, `true`, unset, and
+/// unrecognized values keep inheriting — the old-host fallback for a host
+/// that never sees the key stays "inherit".
 pub fn no_global_context() -> bool {
     let child = std::env::var("RPI_SUBAGENT_CHILD")
-        .map(|value| value.trim() == "1")
+        .map(|value| value == "1")
         .unwrap_or(false);
     if !child {
         return false;

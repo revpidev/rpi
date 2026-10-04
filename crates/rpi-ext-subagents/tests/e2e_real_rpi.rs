@@ -230,7 +230,10 @@ fn e2e_real_rpi_child_and_stream_fixture() {
 
     // 2. Full pipeline through the plugin with the real child.
     // Env writes via the test-only helper (see rpi-test-env contract);
-    // this is the only test in this binary.
+    // this is the only test in this binary. Scrub any inherited subagent
+    // child env first: a leaked RPI_SUBAGENT_CHILD=1 would load the plugin
+    // in child mode and skew the real-child pipeline (G2 class).
+    rpi_test_env::scrub_subagent_env();
     rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
     rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", &rpi);
     rpi_test_env::set_var("RPI_SUBAGENT_EXTENSION_PATH", &cdylib);

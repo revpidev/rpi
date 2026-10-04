@@ -509,6 +509,14 @@ fn no_global_context_env_gate_requires_child_marker_and_false_value() {
     }
     rpi_test_env::remove_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT");
     assert!(!no_global_context(), "unset env keeps default inheritance");
+    // Only the exact launcher sentinel activates the gate (plugin_mode
+    // matches the same literal): whitespace/case variants stay inert.
+    for marker in ["true", "TRUE", "yes", " 1 ", ""] {
+        rpi_test_env::set_var("RPI_SUBAGENT_CHILD", marker);
+        rpi_test_env::set_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT", "0");
+        assert!(!no_global_context(), "marker {marker:?} must not gate");
+    }
+    rpi_test_env::remove_var("RPI_SUBAGENT_INHERIT_GLOBAL_CONTEXT");
     rpi_test_env::remove_var("RPI_SUBAGENT_CHILD");
 }
 
