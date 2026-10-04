@@ -350,10 +350,16 @@ impl ToolExecutionComponent {
         }
     }
 
-    /// `createCallFallback` (tool-execution.ts:135-137).
+    /// `createCallFallback` (tool-execution.ts:135-137 @ 5257d0d5f): the
+    /// generic header with the arguments (V16-13 FR-F R1).
     fn create_call_fallback(&self) -> Text {
         Text::new(
-            self.theme.fg("toolTitle", &Theme::bold(&self.tool_name)),
+            super::super::tool_renderers::render_utils::format_tool_call_with_args(
+                &self.tool_name,
+                &self.args,
+                &self.theme,
+                self.expanded,
+            ),
             0,
             0,
             None,
@@ -1003,6 +1009,44 @@ mod tests {
         assert!(stripped.contains("src/main.rs"));
         // Pending bg while partial.
         assert!(lines.iter().any(|l| l.contains("\u{1b}[48;")));
+    }
+
+    /// V16-13 FR-F R1 (render-utils.ts:74-96 @ 5257d0d5f): a definition
+    /// without a `renderCall` hook falls back to `formatToolCallWithArgs`
+    /// — collapsed `key=value` on the title line, expanded per-line.
+    #[test]
+    fn call_fallback_shows_arguments_without_a_render_call_hook() {
+        let component = ToolExecutionComponent::new(
+            "extension-tool",
+            "call_1",
+            serde_json::json!({"path": "src/main.rs", "count": 2}),
+            ToolExecutionOptions::default(),
+            Some(Arc::new(ShellStub(None))),
+            theme(),
+            RenderHandle::new(|| {}),
+            "/cwd",
+        );
+        let collapsed = strip_ansi(&component.render(80).join("\n"));
+        assert!(
+            collapsed.contains("extension-tool path=\"src/main.rs\" count=2"),
+            "{collapsed:?}"
+        );
+
+        let mut expanded = ToolExecutionComponent::new(
+            "extension-tool",
+            "call_2",
+            serde_json::json!({"path": "src/main.rs", "count": 2}),
+            ToolExecutionOptions::default(),
+            Some(Arc::new(ShellStub(None))),
+            theme(),
+            RenderHandle::new(|| {}),
+            "/cwd",
+        );
+        expanded.set_expanded(true);
+        let expanded = strip_ansi(&expanded.render(80).join("\n"));
+        assert!(expanded.contains("extension-tool"), "{expanded:?}");
+        assert!(expanded.contains("path: src/main.rs"), "{expanded:?}");
+        assert!(expanded.contains("count: 2"), "{expanded:?}");
     }
 
     #[test]

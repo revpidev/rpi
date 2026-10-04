@@ -39,6 +39,72 @@ pub fn invalid_arg_text(theme: &Theme) -> String {
     theme.fg("error", "[invalid arg]")
 }
 
+/// `COLLAPSED_ARGS_CHARS` (render-utils.ts:71).
+const COLLAPSED_ARGS_CHARS: usize = 100;
+
+/// `formatToolCallWithArgs` (render-utils.ts:74-96 @ 5257d0d5f): the title
+/// followed by the arguments. Collapsed, they are `key=value` pairs on the
+/// title line, cut to [`COLLAPSED_ARGS_CHARS`]; expanded, each is a
+/// `key: value` line below the title, with strings shown raw and
+/// continuation lines indented. Non-object arguments render as `args=…`.
+pub fn format_tool_call_with_args(
+    title: &str,
+    args: &Value,
+    theme: &Theme,
+    expanded: bool,
+) -> String {
+    let header = theme.fg("toolTitle", &Theme::bold(title));
+    if args.is_null() {
+        return header;
+    }
+    let entries: Vec<(String, &Value)> = match args {
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| (key.clone(), value))
+            .collect(),
+        other => vec![("args".to_string(), other)],
+    };
+    if entries.is_empty() {
+        return header;
+    }
+    if expanded {
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|(key, value)| {
+                let text = match value {
+                    Value::String(text) => text.clone(),
+                    other => {
+                        serde_json::to_string_pretty(other).unwrap_or_else(|_| js_value_text(other))
+                    }
+                };
+                // `replaceTabs(text).replace(/\r/g, "").split("\n").join("\n    ")`.
+                let text = normalize_display_text(&replace_tabs(&text))
+                    .split('\n')
+                    .collect::<Vec<_>>()
+                    .join("\n    ");
+                format!("  {key}: {text}")
+            })
+            .collect();
+        return format!("{header}\n{}", theme.fg("muted", &lines.join("\n")));
+    }
+    // `JSON.stringify(value) ?? String(value)` (render-utils.ts:93).
+    let pairs = entries
+        .iter()
+        .map(|(key, value)| {
+            let rendered = serde_json::to_string(value).unwrap_or_else(|_| js_value_text(value));
+            format!("{key}={rendered}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let preview = if pairs.chars().count() > COLLAPSED_ARGS_CHARS {
+        let truncated: String = pairs.chars().take(COLLAPSED_ARGS_CHARS - 3).collect();
+        format!("{truncated}...")
+    } else {
+        pairs
+    };
+    format!("{header} {}", theme.fg("muted", &preview))
+}
+
 /// JS template-literal coercion of a JSON value, used for the `limit`
 /// suffixes (grep.ts:89, find.ts:85-86, ls.ts:62-63) where upstream tests
 /// `limit !== undefined` and interpolates whatever value is present.
@@ -133,4 +199,115 @@ pub fn render_tool_path(
 /// free of `tools` internals).
 pub fn resolve_to_cwd(path: &str, cwd: &str) -> PathBuf {
     crate::tools::path_utils::resolve_to_cwd(path, Path::new(cwd))
+}
+
+#[cfg(test)]
+mod tests {
+    //! `formatToolCallWithArgs` (render-utils.ts:71-96 @ 5257d0d5f, V16-13
+    //! FR-F R1): collapsed `key=value` truncation and expanded per-line
+    //! rendering.
+
+    use super::*;
+    use crate::core::themes::load_theme;
+    use serde_json::json;
+
+    fn theme() -> Theme {
+        load_theme("dark", None).expect("builtin dark theme")
+    }
+
+    /// Strip CSI SGR sequences so assertions are independent of colors.
+    fn plain(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn collapsed_renders_key_value_pairs_on_the_title_line() {
+        let text = format_tool_call_with_args(
+            "custom-tool",
+            &json!({"path": "src/main.rs", "count": 2}),
+            &theme(),
+            false,
+        );
+        assert_eq!(plain(&text), "custom-tool path=\"src/main.rs\" count=2");
+    }
+
+    #[test]
+    fn collapsed_truncates_pairs_at_100_chars() {
+        let long = "x".repeat(200);
+        let text =
+            format_tool_call_with_args("custom-tool", &json!({"path": long}), &theme(), false);
+        let plain = plain(&text);
+        let pairs = plain.strip_prefix("custom-tool ").expect("header");
+        assert_eq!(pairs.chars().count(), 100);
+        assert!(pairs.ends_with("..."), "{pairs}");
+    }
+
+    #[test]
+    fn expanded_renders_one_line_per_argument() {
+        let text = format_tool_call_with_args(
+            "custom-tool",
+            &json!({"path": "src/main.rs", "count": 2, "options": {"a": true}}),
+            &theme(),
+            true,
+        );
+        assert_eq!(
+            plain(&text),
+            "custom-tool\n  path: src/main.rs\n  count: 2\n  options: {\n      \"a\": true\n    }"
+        );
+    }
+
+    #[test]
+    fn expanded_replaces_tabs_strips_cr_and_indents_continuations() {
+        let text = format_tool_call_with_args(
+            "custom-tool",
+            &json!({"text": "a\tb\r\nc"}),
+            &theme(),
+            true,
+        );
+        assert_eq!(plain(&text), "custom-tool\n  text: a   b\n    c");
+    }
+
+    #[test]
+    fn non_object_args_render_under_args() {
+        let collapsed = format_tool_call_with_args("custom-tool", &json!([1, 2]), &theme(), false);
+        assert_eq!(plain(&collapsed), "custom-tool args=[1,2]");
+        let expanded = format_tool_call_with_args("custom-tool", &json!("raw"), &theme(), true);
+        assert_eq!(plain(&expanded), "custom-tool\n  args: raw");
+    }
+
+    #[test]
+    fn null_args_and_empty_objects_show_the_title_only() {
+        assert_eq!(
+            plain(&format_tool_call_with_args(
+                "custom-tool",
+                &Value::Null,
+                &theme(),
+                false
+            )),
+            "custom-tool"
+        );
+        assert_eq!(
+            plain(&format_tool_call_with_args(
+                "custom-tool",
+                &json!({}),
+                &theme(),
+                true
+            )),
+            "custom-tool"
+        );
+    }
 }
