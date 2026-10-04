@@ -1,10 +1,17 @@
 //! Child binary + self extension path resolution.
 //!
 //! Port of pi-subagents `src/runs/shared/pi-spawn.ts` @ v0.48.0 (56f97234)
-//! `getPiSpawnCommand` (139-163), reduced to the two rpi-relevant steps:
-//! `RPI_SUBAGENT_RPI_BINARY` → current executable when it is `rpi` → `rpi`
-//! from PATH. Upstream's node/package-root branch has no rpi equivalent (the
-//! rpi binary is self-contained).
+//! `getPiSpawnCommand` (139-163), reduced to the rpi-relevant steps:
+//! `RPI_SUBAGENT_RPI_BINARY` → the running executable itself → `rpi` from
+//! PATH. Upstream's node/package-root branch has no rpi equivalent (the rpi
+//! binary is self-contained), and the v0.48 `isStandalonePiExecutable` name
+//! check is dropped: it existed because upstream's host may be the `node`
+//! binary, while the rpi host is always the self-contained rpi image. Always
+//! preferring the running image also closes the PATH-shim hole for renamed
+//! or versioned binaries; current upstream's session spawn takes the same
+//! self-first route (`resolveBunPiExecutable` → `execPath`;
+//! `async-execution.ts:693` @ b6bda32f). Non-rpi hosts embedding this cdylib
+//! must set `RPI_SUBAGENT_RPI_BINARY`.
 //!
 //! The self-extension path (`dladdr` on this cdylib) is rpi-specific: upstream
 //! injects its runtime extensions by source-file path inside the installed
@@ -24,8 +31,8 @@ pub struct SpawnCommand {
     pub args: Vec<String>,
 }
 
-/// `getPiSpawnCommand` order: env override → `process.execPath` when its file
-/// name is `rpi` → bare `rpi` (PATH lookup at spawn time).
+/// Child-executable resolution order: `RPI_SUBAGENT_RPI_BINARY` → the
+/// running executable itself → bare `rpi` (PATH lookup at spawn time).
 pub fn resolve_spawn_command(args: &[String]) -> SpawnCommand {
     if let Some(binary) = std::env::var(SUBAGENT_RPI_BINARY_ENV)
         .ok()
@@ -38,16 +45,10 @@ pub fn resolve_spawn_command(args: &[String]) -> SpawnCommand {
         };
     }
     if let Ok(current) = std::env::current_exe() {
-        let is_rpi = current
-            .file_name()
-            .map(|n| {
-                let name = n.to_string_lossy().to_lowercase();
-                name == "rpi" || name == "rpi.exe"
-            })
-            .unwrap_or(false);
-        if is_rpi {
+        let program = current.to_string_lossy().to_string();
+        if !program.is_empty() {
             return SpawnCommand {
-                program: current.to_string_lossy().to_string(),
+                program,
                 args: args.to_vec(),
             };
         }
@@ -103,10 +104,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_override_wins_and_path_fallback() {
-        // Not setting the env (or an empty value) exercises the current-exe /
-        // PATH branches without depending on the test runner's binary name.
+    fn env_override_wins_and_running_image_is_preferred() {
+        rpi_test_env::remove_var(SUBAGENT_RPI_BINARY_ENV);
         let resolved = resolve_spawn_command(&["--mode".into(), "json".into()]);
         assert_eq!(resolved.args, vec!["--mode", "json"]);
+        // Without the env override the running image wins unconditionally —
+        // no basename check, no PATH lookup (the v0.48 fallback hole).
+        assert_eq!(
+            resolved.program,
+            std::env::current_exe()
+                .expect("current exe")
+                .to_string_lossy()
+        );
+        rpi_test_env::set_var(SUBAGENT_RPI_BINARY_ENV, "/opt/custom/rpi");
+        let overridden = resolve_spawn_command(&[]);
+        assert_eq!(overridden.program, "/opt/custom/rpi");
+        rpi_test_env::remove_var(SUBAGENT_RPI_BINARY_ENV);
     }
 }
