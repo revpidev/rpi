@@ -2136,6 +2136,16 @@ mod tests {
         let worker = found.iter().find(|a| a.name == "worker").unwrap();
         assert_eq!(worker.advertise, None);
     }
+
+    #[test]
+    fn builtin_worker_defaults_match_v074() {
+        // TE45 (#2384): the packaged worker declares the writer acceptance
+        // role and starts with fresh context instead of forking the parent.
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let worker = agents.iter().find(|a| a.name == "worker").unwrap();
+        assert_eq!(worker.acceptance_role.as_deref(), Some("writer"));
+        assert_eq!(worker.default_context, Some(ContextMode::Fresh));
+    }
 }
 
 /// TE15 discovery robustness tests (R7.1.3.1–.4). The fixture tree is the
