@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.6] - 2026-10-05
+
+### Main line
+
+- **Upstream parity to v1.0.0** (V16-01…V16-13, ADR-0034 + ADR-0035): the behavioral gold standard moves from v0.86.1+ to `a13d35a74` (v1.0.0; the v0.99.x increments folded in — model-catalog schema v6, codemode + built-in MCP, the system theme default, virtual models, and ChatGPT sign-in). Per-domain summaries live in `changes/v0.1.6.md` (the release changelog single source of truth); key user-observable surfaces:
+  - **Protocol & sessions**: **[BREAKING]** canonical session context — `SessionManager` is now the single authority for provider context (rebuilt from the session projection; new append-only `context_edit` entries), the agent boundary moved to `finishTurn` + the `agent_before_settle` pipeline, and tool results carry a bounded `nestedCalls` snapshot; per-model image input limits; session files created at the first user message; the session/compaction/RPC fix family (V16-03/V16-04/V16-09).
+  - **Tools & extension API (mostly additive; `rpiAbi` stays 1)**: **[BREAKING]** codemode scripts now probe tools with `"x" in tools` (`typeof` throws); the `codemode` script tool and BM25 `tool_search` (QuickJS-in-WASM sandbox, `models.*` classify/generateImages, `codemode-store`); structured bash results (`outputSchema`/`structuredContent`/`isError`); tool exposure/loadout, `executeTool` with `parentToolCallId`+`nestedCalls`, session-scoped `setToolExposures`; `builtin:<name>` governance, `defaultTools` `+`/`-`, RPC prompt dispositions, and the two new events — the extension event table grows 39 → 42 (V16-06/V16-07/V16-08/V16-13/V16-14/V16-05).
+  - **TUI**: **[BREAKING]** the single-pass `queryTerminalColors()` replaces the two terminal-color query APIs; `theme` defaults to `system` (OKHSL-derived dark/light rewritten, >= 4.5:1 contrast) and **`tuiMode` defaults to `fullscreen`** (v1.0.0); `fullscreenWheelScrollLines` acceleration; `quietStartup`; the fullscreen/selection/ANSI-slice fix family and the streaming CPU optimizations (V16-10/V16-09).
+  - **Providers, auth & catalog**: **[BREAKING]** MCP tool names `-` → `_` (V16-08) and the `mcp-auth.json` credential-key migration (`mcp__<name>|<url>`, taken over atomically); Sign in with ChatGPT (+ stable `deviceId`), the shared OAuth callback server (Anthropic/Codex/OpenRouter/Radius), Anthropic workload identity federation and copy-code login, Radius `/login` with one-click MCP configuration; virtual models (experimental, `registerVirtualModel` + per-request routing); the v1.0.0 provider fixes (`--provider` fail-fast, Retry-After, catalog defaults) and the schema-v6 catalog regenerated with all model types (V16-11/V16-12/V16-02).
+  - **Built-in extensions & rpi-own**: the built-in MCP extension (`mcp.json` stdio/streamable HTTP, exposure classes, resource tools, `/mcp`, `rpi mcp`, project trust, OAuth 2.1) and the `codemode`/`tool_search` built-ins; the rpi-own surfaces — permission modes (`Shift+Tab` cycle, `⏸ plan` footer badge, `getMode`/`setMode` + `mode_change`; the thinking cycle moved to `Alt+T`) and the scripted usage-provider framework (`ctx.usage.listProviders/fetch/register`, `usage` settings, script governance) (V16-05/V16-08/V16-13).
+
+### Plugin line (eight-plugin lockstep)
+
+- **Two new first-party plugins**: `rpi-plan-mode` (TE43 — `/plan` toggles a read-only planning mode through the V16-14 exposure overrides, `write_plan` writes the session's plan file, and the review dialog approves/revises/abandons) and `rpi-usage` (TE44 — `/usage` plus DeepSeek / GLM Coding Plan / MiniMax Token Plan / Kimi Code scripts over the usage-provider framework, with a footer status line and user-script extension).
+- **Renamed (clean switch, ADR-0033)**: two first-party extensions moved to the `rpi-` prefix (`rpi-ask-user-question`, `rpi-todo`); every published release asset was renamed in place and the registry serves `rpi-`-named files only — there is no alias, automatic migration or index redirect (remove the old install and reinstall). Internal identifiers were normalized the same way (event channels `rpi:ask-user:*`, the todo widget key `rpi-todos`, the XDG paths `~/.config/rpi-*`), and the `rpi-` prefix is now reserved for official extensions.
+- **Rebased**: `rpi-subagents` → pi-subagents v0.74.0 (TE45 — `scoped` model scope, provider-prefixed catalog id resolution, the timeout cap, Git routing environment stripping, project-trust propagation, chain step pre-resolution, and fork `context_edit` thinking sanitization); `rpi-mcp-adapter` → v4.0.0 (TE46 — now an **optional replacement for the built-in MCP extension**, sharing the same `mcp.json` layout with the project trust/approval gate and the RFC 8252 OAuth callback default).
+- **Distribution**: eight `.rpix` archives ride this Release (native carrier only, `minHostVersion` = the lockstep version injected at pack time); the two new plugins first ship on the RC channel, while the renamed six keep their historical version matrices under the new keys.
+
+### Internal
+
+- workspace version bumped to 0.1.6-rc.1 with Cargo.lock synced (eight lockstep extensions propagate via `version.workspace`).
+- deviations TE-D44 (MCP config layout [VARIANT], TE46), TE-D45 (plan-mode XDG config path) and TE-D46 (plan-mode exposure-hidden boundary) promoted; D-105+ / TE-D47+ reserved and unused.
+
 ## [0.1.5] - 2026-09-29
 
 ### Main line
