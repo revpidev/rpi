@@ -1,0 +1,10 @@
+{
+  "name": "rpi-plan-mode",
+  "repository": "revpidev/rpi",
+  "description": "Plan mode: /plan (or Shift+Tab) switches the session to a read-only research state where write tools are hidden; the model writes a structured plan with write_plan, and a review dialog approves it (returning to default mode to execute), requests revisions, or abandons it.",
+  "author": "revpidev",
+  "license": "MIT",
+  "official": true,
+  "lockstepHost": true,
+  "descriptionZh": "计划模式:/plan(或 Shift+Tab)把会话切到只读研究态,写类工具对模型隐藏;模型经 write_plan 产出结构化计划,批准流三选(批准并执行 / 继续修订 / 放弃)回到默认态执行。"
+}

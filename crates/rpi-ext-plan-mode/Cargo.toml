@@ -1,0 +1,25 @@
+[package]
+name = "rpi-ext-plan-mode"
+description = "Plan mode (L0 native plugin, TE43): /plan toggles a read-only planning mode (exposure overrides hide write tools), write_plan captures the plan file, and an approval dialog returns to default mode to execute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# rlib: all logic lives in the library for unit tests; cdylib is the
+# distributed artifact loaded by rpi-ext-host's native loader
+# (rpi-ext-todo / rpi-ext-ask-user-question Cargo.toml precedent; plugin
+# 02-design §1).
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# Native ABI types (RpiNativeModule / RpiHostCalls) for the cdylib thin shell.
+rpi-ext-host.workspace = true
+toml.workspace = true
+abi_stable = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rpi-test-env.workspace = true

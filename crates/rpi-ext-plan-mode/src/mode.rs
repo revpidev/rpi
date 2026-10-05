@@ -1,0 +1,549 @@
+//! Plan-mode state machine: the host permission mode is the single
+//! authority (01 §2 R-PM-1.3); this module mirrors it into the exposure
+//! override boundary and the editor hint.
+//!
+//! Events (`mode_change` / `session_start` / `session_tree` /
+//! `mcp_servers_change` / `before_agent_start`) all funnel into
+//! [`reconcile`], which:
+//!
+//! - reads the host mode and re-derives the Plan boundary from the live
+//!   `getAllTools` surface (so tools registered mid-plan — codemode, MCP,
+//!   subagents — are re-tightened before the next request);
+//! - on the first Plan reconcile, snapshots `getActiveTools` and applies
+//!   the whitelist active set; on leaving Plan, clears the recorded
+//!   exposure names and restores the snapshot;
+//! - keeps the plan-file path and the editor hint in step.
+//!
+//! State is keyed by session id, so it survives an extension reload (the
+//! native library stays mapped) and fresh sessions start clean. No lock
+//! is held across a host call (host calls can re-enter this plugin).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use serde_json::{Map, Value, json};
+
+use crate::HostCall;
+use crate::config;
+use crate::plan_file;
+use crate::view;
+use crate::whitelist;
+
+/// Widget key for the Plan-mode editor hint (the host namespaces it per
+/// extension).
+pub const HINT_WIDGET_KEY: &str = "plan-mode-hint";
+
+/// Per-session Plan-mode mirror state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionPlanState {
+    /// Whether this plugin instance applied the boundary for the session.
+    pub in_plan: bool,
+    /// The active-tool snapshot captured on entry (restored on exit).
+    pub active_snapshot: Option<Vec<String>>,
+    /// The exposure names to clear on exit (the full boundary complement,
+    /// including entries already hidden before entry — clearing a name
+    /// without an override is a no-op).
+    pub hidden_targets: Vec<String>,
+    /// Whether the editor hint widget is currently registered.
+    pub hint_shown: bool,
+    /// The current plan file for the session; `None` until the first
+    /// write (or after a new Plan entry). Kept across exit so `/plan file`
+    /// can report the last plan.
+    pub plan_path: Option<PathBuf>,
+}
+
+static STATES: OnceLock<Mutex<HashMap<String, SessionPlanState>>> = OnceLock::new();
+
+/// Serializes reconciles: the `/plan` command runs one synchronously and
+/// the spawned `mode_change` event may race it; without the lock both
+/// snapshots could predate the other's commit (double entry would
+/// re-snapshot the already-rewritten active set).
+static RECONCILE_LOCK: Mutex<()> = Mutex::new(());
+
+fn states() -> &'static Mutex<HashMap<String, SessionPlanState>> {
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn snapshot(session: &str) -> SessionPlanState {
+    states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(session)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn commit(session: &str, state: SessionPlanState) {
+    states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(session.to_owned(), state);
+}
+
+/// Recompute the Plan boundary from the host mode + live tool surface.
+/// Returns whether the session is in Plan mode after the reconcile.
+pub fn reconcile(host: &dyn HostCall) -> bool {
+    let _guard = RECONCILE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let session = crate::host::sid_of(host);
+    let plan = crate::host::get_mode(host) == "plan";
+    let mut state = snapshot(&session);
+
+    if plan {
+        let config = config::load_config();
+        let tools = whitelist::parse_tools(&crate::host::get_all_tools(host));
+        let targets = whitelist::boundary_targets(&tools, &config);
+        let active = whitelist::active_whitelist(&tools, &config);
+        let entering = !state.in_plan;
+        let current_active = crate::host::get_active_tools(host);
+        if entering {
+            state.active_snapshot = Some(current_active.clone());
+            // A Plan entry starts a fresh plan file (revisions within the
+            // entry overwrite it); session events reset it the same way.
+            state.plan_path = None;
+            state.hint_shown = false;
+        }
+        let newly = whitelist::newly_hidden(&tools, &config);
+        if !entering {
+            // Config hot change: a name we hid earlier that is whitelisted
+            // again returns to its natural exposure before new targets are
+            // hidden.
+            let release: Vec<String> = state
+                .hidden_targets
+                .iter()
+                .filter(|name| !targets.contains(name))
+                .cloned()
+                .collect();
+            if !release.is_empty()
+                && let Err(error) = host.call("clearToolExposures", json!({ "names": release }))
+            {
+                tracing::warn!(%error, "rpi-plan-mode: exposure release failed");
+            }
+        }
+        if !newly.is_empty() {
+            let mut exposures = Map::new();
+            for name in &newly {
+                exposures.insert(name.clone(), Value::String("hidden".to_owned()));
+            }
+            if let Err(error) = host.call("setToolExposures", json!({ "exposures": exposures })) {
+                tracing::warn!(%error, "rpi-plan-mode: setToolExposures failed");
+            }
+        }
+        // Keep the active set equal to the whitelist (late-registered or
+        // hot-re-allowed tools become usable; a user edit mid-plan is
+        // re-asserted at the next trigger — the Plan boundary is the
+        // authority while the mode is active).
+        if current_active != active
+            && let Err(error) = host.call("setActiveTools", json!({ "toolNames": active }))
+        {
+            tracing::warn!(%error, "rpi-plan-mode: setActiveTools failed");
+        }
+        if !state.hint_shown && crate::host::has_ui(host) {
+            let content = Value::Array(view::hint_lines().into_iter().map(Value::String).collect());
+            match host.call(
+                "ui.setWidget",
+                json!({
+                    "key": HINT_WIDGET_KEY,
+                    "content": content,
+                    "placement": "aboveEditor",
+                }),
+            ) {
+                Ok(_) => state.hint_shown = true,
+                Err(error) => {
+                    tracing::warn!(%error, "rpi-plan-mode: hint widget push failed");
+                }
+            }
+        }
+        state.in_plan = true;
+        state.hidden_targets = targets;
+        commit(&session, state);
+        return true;
+    }
+
+    if state.in_plan {
+        if !state.hidden_targets.is_empty()
+            && let Err(error) = host.call(
+                "clearToolExposures",
+                json!({ "names": state.hidden_targets }),
+            )
+        {
+            tracing::warn!(%error, "rpi-plan-mode: clearToolExposures failed");
+        }
+        if let Some(snapshot) = state.active_snapshot.clone()
+            && let Err(error) = host.call("setActiveTools", json!({ "toolNames": snapshot }))
+        {
+            tracing::warn!(%error, "rpi-plan-mode: active-set restore failed");
+        }
+        if state.hint_shown && crate::host::has_ui(host) {
+            let _ = host.call(
+                "ui.setWidget",
+                json!({
+                    "key": HINT_WIDGET_KEY,
+                    "content": Value::Null,
+                    "placement": "aboveEditor",
+                }),
+            );
+        }
+        state.in_plan = false;
+        state.active_snapshot = None;
+        state.hidden_targets.clear();
+        state.hint_shown = false;
+        // `plan_path` deliberately survives: `/plan file` reports the last
+        // plan after exit, and a new Plan entry resets it.
+        commit(&session, state);
+    }
+    false
+}
+
+/// A `session_start` (including the reload replay) invalidates host-side
+/// widget chrome: re-arm the hint so the next reconcile re-pushes it on
+/// the rebuilt UI, then reconcile.
+pub fn on_session_start(host: &dyn HostCall) -> bool {
+    let session = crate::host::sid_of(host);
+    let mut state = snapshot(&session);
+    state.hint_shown = false;
+    commit(&session, state);
+    reconcile(host)
+}
+
+/// The plan path for this session: the remembered file, or the next free
+/// `<session>-<n>.md` path without creating anything.
+pub fn current_plan_path(host: &dyn HostCall) -> Option<String> {
+    let session = crate::host::sid_of(host);
+    let state = snapshot(&session);
+    if let Some(path) = state.plan_path {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    let cwd = crate::host::cwd_of(host)?;
+    let key = plan_file::session_key(&session);
+    let dir = plan_file::plan_dir(
+        std::path::Path::new(&cwd),
+        config::load_config().plan_dir.as_deref(),
+    );
+    Some(
+        plan_file::next_path(&dir, &key)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Remember the plan file written for this session.
+pub fn remember_plan_path(host: &dyn HostCall, path: PathBuf) {
+    let session = crate::host::sid_of(host);
+    let mut state = snapshot(&session);
+    state.plan_path = Some(path);
+    commit(&session, state);
+}
+
+/// The remembered plan path (may not exist on disk yet), for the first
+/// write of a Plan entry.
+pub fn cached_plan_path(host: &dyn HostCall) -> Option<PathBuf> {
+    let session = crate::host::sid_of(host);
+    snapshot(&session).plan_path
+}
+
+/// The remembered plan path (existing file only), for `/plan file|edit`.
+pub fn existing_plan_path(host: &dyn HostCall) -> Option<PathBuf> {
+    let session = crate::host::sid_of(host);
+    snapshot(&session).plan_path.filter(|path| path.is_file())
+}
+
+/// Test seam: read one session's state.
+#[cfg(test)]
+pub fn state_for_test(session: &str) -> SessionPlanState {
+    snapshot(session)
+}
+
+/// Test seam: clear all state.
+#[cfg(test)]
+pub fn reset_for_test() {
+    states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TEST_LOCK;
+    use crate::config;
+    use crate::test_host::SessionFakeHost;
+
+    fn serialized() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Fake host with the plugin's write_plan registered, in Default mode.
+    fn base_host() -> SessionFakeHost {
+        let host = SessionFakeHost::new();
+        host.register_tool("write_plan", "direct", false);
+        host
+    }
+
+    #[test]
+    fn enter_plan_hides_targets_and_sets_the_whitelist() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        assert!(reconcile(&host));
+        assert_eq!(
+            host.view().exposures,
+            vec![
+                ("read".to_owned(), "direct".to_owned()),
+                ("edit".to_owned(), "hidden".to_owned()),
+                ("write".to_owned(), "hidden".to_owned()),
+                ("bash".to_owned(), "hidden".to_owned()),
+                ("write_plan".to_owned(), "direct".to_owned()),
+            ]
+        );
+        assert_eq!(host.view().active, vec!["read", "write_plan"]);
+        assert_eq!(
+            host.view().widget,
+            Some(crate::view::hint_lines()),
+            "editor hint registered"
+        );
+        let state = state_for_test("s-1");
+        assert!(state.in_plan);
+        assert_eq!(state.hidden_targets, vec!["edit", "write", "bash"]);
+        assert_eq!(
+            state.active_snapshot,
+            Some(vec![
+                "read".to_owned(),
+                "edit".to_owned(),
+                "bash".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn exit_plan_clears_the_recorded_names_and_restores_the_snapshot() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        reconcile(&host);
+        host.set_mode("default");
+        assert!(!reconcile(&host));
+        assert_eq!(
+            host.view().exposures,
+            vec![
+                ("read".to_owned(), "direct".to_owned()),
+                ("edit".to_owned(), "direct".to_owned()),
+                ("write".to_owned(), "direct".to_owned()),
+                ("bash".to_owned(), "direct".to_owned()),
+                ("write_plan".to_owned(), "direct".to_owned()),
+            ],
+            "natural exposures return"
+        );
+        assert_eq!(
+            host.view().active,
+            vec!["read", "edit", "bash"],
+            "the entry snapshot is restored"
+        );
+        assert_eq!(host.view().widget, None, "hint removed");
+        let state = state_for_test("s-1");
+        assert!(!state.in_plan);
+        assert!(state.hidden_targets.is_empty());
+        assert!(state.active_snapshot.is_none());
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_while_in_plan() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        reconcile(&host);
+        let before = host.calls().len();
+        reconcile(&host);
+        let calls = host.calls();
+        let after = calls[before..]
+            .iter()
+            .map(|(method, _)| method.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after,
+            vec![
+                "ctx.sessionFile",
+                "getMode",
+                "getAllTools",
+                "getActiveTools"
+            ]
+        );
+        assert_eq!(host.view().active, vec!["read", "write_plan"]);
+    }
+
+    #[test]
+    fn late_registered_tools_are_re_tightened_and_cleared() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        reconcile(&host);
+        host.register_tool("mcp_thing", "direct", true);
+        reconcile(&host);
+        assert_eq!(
+            host.view()
+                .exposures
+                .iter()
+                .find(|(name, _)| name == "mcp_thing")
+                .map(|(_, exposure)| exposure.as_str()),
+            Some("hidden")
+        );
+        assert_eq!(
+            state_for_test("s-1").hidden_targets,
+            vec!["edit", "write", "bash", "mcp_thing"]
+        );
+        host.set_mode("default");
+        reconcile(&host);
+        assert_eq!(
+            host.view()
+                .exposures
+                .iter()
+                .find(|(name, _)| name == "mcp_thing")
+                .map(|(_, exposure)| exposure.as_str()),
+            Some("direct"),
+            "late tool returns to its natural exposure"
+        );
+    }
+
+    #[test]
+    fn hot_config_changes_recompute_the_boundary_on_the_next_trigger() {
+        let _guard = serialized();
+        crate::__reset_state();
+        config::set_test_config(Some(Some("allowTools = [\"read\", \"edit\"]".to_owned())));
+        let host = base_host();
+        host.set_mode("plan");
+        reconcile(&host);
+        assert_eq!(
+            host.view()
+                .exposures
+                .iter()
+                .find(|(name, _)| name == "edit")
+                .map(|(_, exposure)| exposure.as_str()),
+            Some("direct"),
+            "edit is allowed by the first config"
+        );
+        config::set_test_config(Some(Some("allowTools = [\"read\"]".to_owned())));
+        reconcile(&host);
+        assert_eq!(
+            host.view()
+                .exposures
+                .iter()
+                .find(|(name, _)| name == "edit")
+                .map(|(_, exposure)| exposure.as_str()),
+            Some("hidden"),
+            "the hot edit hides edit at the next trigger"
+        );
+        // The reverse direction: a re-allowed name is released back to its
+        // natural exposure (not left hidden from the previous config).
+        config::set_test_config(Some(Some("allowTools = [\"read\", \"edit\"]".to_owned())));
+        reconcile(&host);
+        assert_eq!(
+            host.view()
+                .exposures
+                .iter()
+                .find(|(name, _)| name == "edit")
+                .map(|(_, exposure)| exposure.as_str()),
+            Some("direct"),
+            "re-allowed names are released"
+        );
+        assert_eq!(
+            host.view().active,
+            vec!["read", "edit", "write_plan"],
+            "re-allowed names rejoin the active whitelist"
+        );
+    }
+
+    #[test]
+    fn naturally_hidden_tools_are_skipped_but_recovered() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.register_tool("secret", "hidden", false);
+        host.set_mode("plan");
+        reconcile(&host);
+        let state = state_for_test("s-1");
+        assert!(
+            state.hidden_targets.contains(&"secret".to_owned()),
+            "recovery list keeps the natural hidden name"
+        );
+        // The fake's `updated`/`cleared` lists model the layer: a natural
+        // hidden tool never receives an override, so clearing it is a
+        // no-op (the effective exposure is unchanged either way).
+        host.set_mode("default");
+        reconcile(&host);
+        assert_eq!(
+            host.view()
+                .exposures
+                .iter()
+                .find(|(name, _)| name == "secret")
+                .map(|(_, exposure)| exposure.as_str()),
+            Some("hidden")
+        );
+    }
+
+    #[test]
+    fn no_ui_skips_the_hint_widget() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_has_ui(false);
+        host.set_mode("plan");
+        reconcile(&host);
+        assert_eq!(host.view().widget, None);
+        assert!(!state_for_test("s-1").hint_shown);
+    }
+
+    #[test]
+    fn current_plan_path_derives_after_the_cwd_and_respects_the_override() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        assert_eq!(
+            current_plan_path(&host).as_deref(),
+            Some("/work/cwd/.rpi/plans/s-1-1.md")
+        );
+        config::set_test_config(Some(Some("planDir = \"plans\"".to_owned())));
+        assert_eq!(
+            current_plan_path(&host).as_deref(),
+            Some("/work/cwd/plans/s-1-1.md")
+        );
+    }
+
+    #[test]
+    fn session_start_rearms_the_hint() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        reconcile(&host);
+        assert!(state_for_test("s-1").hint_shown);
+        // The fake records the widget push; a re-arm must push it again.
+        on_session_start(&host);
+        let pushes = host
+            .calls()
+            .into_iter()
+            .filter(|(method, _)| method == "ui.setWidget")
+            .count();
+        assert_eq!(pushes, 2, "session_start re-pushes the hint");
+    }
+
+    #[test]
+    fn remember_and_cached_path_are_session_scoped() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        assert!(cached_plan_path(&host).is_none());
+        remember_plan_path(&host, PathBuf::from("/tmp/x/s-1-1.md"));
+        assert_eq!(
+            cached_plan_path(&host),
+            Some(PathBuf::from("/tmp/x/s-1-1.md"))
+        );
+        host.set_session_id("s-2");
+        assert!(cached_plan_path(&host).is_none(), "state is session-scoped");
+    }
+}

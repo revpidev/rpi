@@ -3277,6 +3277,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpi-ext-plan-mode"
+version = "0.1.5"
+dependencies = [
+ "abi_stable",
+ "rpi-ext-host",
+ "rpi-test-env",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "rpi-ext-sdk"
 version = "0.1.0"
 dependencies = [

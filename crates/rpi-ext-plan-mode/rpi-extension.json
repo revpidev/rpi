@@ -1,0 +1,8 @@
+{
+  "name": "rpi-plan-mode",
+  "version": "0.1.0",
+  "description": "Plan mode: /plan toggles a read-only planning mode (write tools hidden), write_plan captures the plan file, and an approval dialog returns to default mode to execute",
+  "native": "librpi_ext_plan_mode.so",
+  "capabilities": ["commands", "tools", "ui", "session", "events"],
+  "rpiAbi": 1
+}

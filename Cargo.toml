@@ -16,6 +16,7 @@ members = [
     "crates/rpi-ext-smart-fetch",
     "crates/rpi-ext-statusline",
     "crates/rpi-ext-todo",
+    "crates/rpi-ext-plan-mode",
     "crates/rpi-test-native-plugin",
     "crates/rpi-test-support",
     "crates/rpi-test-env",
@@ -48,6 +49,8 @@ rpi-test-env = { path = "crates/rpi-test-env" }
 # rc: Arc<T> serializes transparently as T (V15-13 L3 — shared streaming
 # partials in StreamEvent/AgentEvent keep the exact pre-Arc wire shape).
 serde = { version = "1", features = ["derive", "rc"] }
+# TOML parsing for the rpi-plan-mode XDG config.toml (TE43/TE-D45).
+toml = "0.9"
 # preserve_order: JSON object key order must survive round-trips (insertion order,
 # like JS objects) for byte-level wire-format parity with upstream.
 serde_json = { version = "1", features = ["preserve_order"] }
