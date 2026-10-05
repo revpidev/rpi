@@ -1,8 +1,9 @@
 //! rpi MCP adapter extension (L0 native plugin).
 //!
-//! Port of pi-mcp-adapter @ v2.32.1 (`10a45367e033a32026987a75d6f401e37340c86f`,
-//! v0.1.4 rebase; originally ported from v2.24.0/`3d953f90`, per-file provenance
-//! headers record the source snapshot of each module), `rpi/external/pi-mcp-adapter`).
+//! Port of pi-mcp-adapter @ v4.0.0 (`5884ac4e45f5834f51ab8914f61b6a36a6a0a51b`,
+//! v0.1.6 rebase/TE46; originally ported from v2.24.0, rebased via v2.32.1 and
+//! v2.34.0+9, per-file provenance headers record the source snapshot of each
+//! module), `rpi/external/pi-mcp-adapter`).
 //! This file mirrors `index.ts`: plugin
 //! entry, `mcp` proxy tool + `mcp-config` flag registration, `tool_result`
 //! error re-flagging, and the session lifecycle wiring.

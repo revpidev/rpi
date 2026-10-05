@@ -161,6 +161,18 @@ pub fn project_approval_scope(cwd: &str) -> String {
     }
 }
 
+/// `path.resolve(base, value)`: absolute values pass through; relative
+/// values join onto `base` (upstream Node path resolution for git's admin
+/// back-link, project-server-trust.ts:115).
+fn resolve_from(base: &Path, value: &str) -> PathBuf {
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    }
+}
+
 fn join_scope(scope: &str, relative: &str) -> String {
     Path::new(scope)
         .join(relative)
@@ -169,7 +181,10 @@ fn join_scope(scope: &str, relative: &str) -> String {
 }
 
 fn linked_worktree_repo_scope(dot_git: &Path) -> Option<String> {
-    if !std::fs::metadata(dot_git).ok()?.is_file() {
+    // Upstream `lstatSync(dotGit).isFile()`: a SYMLINK must not count as the
+    // `.git` file — otherwise a planted symlink could borrow another
+    // checkout's approvals (project-server-trust.ts:110 @ 5884ac4e).
+    if !std::fs::symlink_metadata(dot_git).ok()?.is_file() {
         return None;
     }
     let pointer = std::fs::read_to_string(dot_git).ok()?;
@@ -181,24 +196,30 @@ fn linked_worktree_repo_scope(dot_git: &Path) -> Option<String> {
     let base = dot_git.parent()?;
     let admin_dir = std::fs::canonicalize(base.join(pointer)).ok()?;
     let back_link = std::fs::read_to_string(admin_dir.join("gitdir")).ok()?;
-    let back_link = std::fs::canonicalize(base.join(back_link.trim())).ok()?;
+    // Upstream resolves the back-link against the ADMIN dir:
+    // `resolve(adminDir, backLink)` (project-server-trust.ts:115).
+    let back_link = std::fs::canonicalize(resolve_from(&admin_dir, back_link.trim())).ok()?;
     if back_link != std::fs::canonicalize(dot_git).ok()? {
         return None;
     }
     let common_dir = admin_dir.parent()?.parent()?.to_path_buf();
-    let bare = std::fs::read_to_string(common_dir.join("config"))
-        .map(|config| {
-            config.lines().any(|line| {
-                line.trim()
-                    .strip_prefix("bare")
-                    .map(|rest| {
-                        let rest = rest.trim_start_matches([' ', '=']).trim().to_lowercase();
-                        matches!(rest.as_str(), "true" | "yes" | "on" | "1")
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
+    // Upstream reads `<commonDir>/config` and a failure aborts the scope
+    // resolution (the caller falls back to the checkout root). Parse
+    // case-insensitively via `eq_ignore_ascii_case` (the upstream regex has
+    // the `i` flag, so `BARE = true` counts too).
+    let config = std::fs::read_to_string(common_dir.join("config")).ok()?;
+    let bare = config.lines().any(|line| {
+        let trimmed = line.trim();
+        match trimmed.split_once('=') {
+            Some((key, value)) if key.trim().eq_ignore_ascii_case("bare") => {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1"
+                )
+            }
+            _ => false,
+        }
+    });
     if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") && !bare {
         common_dir
             .parent()
@@ -684,6 +705,21 @@ mod tests {
             canonical_project_root(&worktree.to_string_lossy()),
             "a forged .git file falls back to its own root"
         );
+
+        // A symlinked `.git` file must not be followed into another
+        // checkout (lstat check; upstream lstatSync).
+        #[cfg(unix)]
+        {
+            let alias = sandbox.join("alias");
+            std::fs::create_dir_all(&alias).expect("alias dir");
+            std::fs::write(repo.join(".git/config"), "bare = false\n").expect("config");
+            std::os::unix::fs::symlink(worktree.join(".git"), alias.join(".git")).expect("symlink");
+            assert_eq!(
+                project_approval_scope(&alias.to_string_lossy()),
+                canonical_project_root(&alias.to_string_lossy()),
+                "a symlinked .git file does not borrow the target's scope"
+            );
+        }
 
         // A linked admin dir whose common dir is bare uses a `git-dir:` key
         // that no canonical path equals (upstream shared-scope guard).

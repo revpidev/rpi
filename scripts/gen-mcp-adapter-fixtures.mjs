@@ -779,6 +779,17 @@ const CONFIG_CASES = [
       "shared-project": { "mcp-servers": { legacy: { command: "x" } } },
     },
   },
+  {
+    // #697 (TE46): a UTF-8 BOM in front of the first token must not break
+    // the JSONC parse on either side (utils.ts stripUtf8Bom).
+    name: "utf8-bom-config",
+    rawLayers: {
+      "pi-global":
+        '\uFEFF{ "mcpServers": { "bom": { "command": "bom-server" } } }',
+      "shared-project":
+        '\uFEFF{ "mcpServers": { "projectBom": { "command": "project-bom-server" } } }',
+    },
+  },
 ];
 
 if (haveRealStrip) {

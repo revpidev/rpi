@@ -694,6 +694,24 @@
       }
     },
     {
+      "name": "utf8-bom-config",
+      "layers": {},
+      "rawLayers": {
+        "pi-global": "﻿{ \"mcpServers\": { \"bom\": { \"command\": \"bom-server\" } } }",
+        "shared-project": "﻿{ \"mcpServers\": { \"projectBom\": { \"command\": \"project-bom-server\" } } }"
+      },
+      "expected": {
+        "mcpServers": {
+          "bom": {
+            "command": "bom-server"
+          },
+          "projectBom": {
+            "command": "project-bom-server"
+          }
+        }
+      }
+    },
+    {
       "name": "jsonc-comments-and-trailing-commas",
       "layers": {},
       "rawLayers": {
