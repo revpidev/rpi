@@ -433,13 +433,27 @@ fn run_worktree_setup_hook(
         "agent": agent,
     })
     .to_string();
-    let child = Command::new(hook)
+    // ETXTBSY hardening (V16-04/workspace flake family): another thread's
+    // fork can inherit a write FD for a freshly written hook, so the first
+    // exec fails with "Text file busy" even though the writer closed it.
+    // Retry the spawn briefly instead of failing setup.
+    let mut command = Command::new(hook);
+    command
         .current_dir(worktree_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("worktree setup hook failed to start: {e}"))?;
+        .stderr(std::process::Stdio::piped());
+    let mut attempt = 0u32;
+    let child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if is_text_file_busy(&error) && attempt < 5 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+            }
+            Err(error) => return Err(format!("worktree setup hook failed to start: {error}")),
+        }
+    };
     // Timeout via a watchdog thread (spawnSync-equivalent): the waiter runs
     // on its own thread, the watchdog polls it. On timeout the hook process
     // is killed (Node spawnSync {timeout} sends its killSignal) — a runaway
@@ -508,6 +522,21 @@ fn run_worktree_setup_hook(
         }
     }
     Ok(unique)
+}
+
+/// Unix `ETXTBSY` (os error 26): a just-written executable is still held
+/// open for writing by an inherited FD in another threaded fork. Hardened
+/// by the retry loop in [`run_worktree_setup_hook`].
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ETXTBSY)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn wait_with_timeout(
