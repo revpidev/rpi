@@ -3372,6 +3372,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpi-ext-usage"
+version = "0.1.5"
+dependencies = [
+ "abi_stable",
+ "rpi-ext-host",
+ "rpi-test-env",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "rpi-mcp"
 version = "0.1.5"
 dependencies = [

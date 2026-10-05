@@ -1,0 +1,3 @@
+{
+  "base_resp": { "status_code": 1001, "status_msg": "user has no token plan" }
+}

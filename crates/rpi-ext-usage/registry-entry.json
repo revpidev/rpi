@@ -1,0 +1,10 @@
+{
+  "name": "rpi-usage",
+  "repository": "revpidev/rpi",
+  "description": "Usage lookup: /usage queries the current model provider's balance or plan quota through the host scripted usage-provider framework — built-in DeepSeek, GLM Coding Plan, MiniMax Token Plan and Kimi Code scripts — and keeps a footer status line; custom providers drop in as user scripts.",
+  "author": "revpidev",
+  "license": "MIT",
+  "official": true,
+  "lockstepHost": true,
+  "descriptionZh": "用量查询:/usage 经宿主脚本化 usage-provider 框架查询当前接入 provider 的余额/套餐配额(内置 DeepSeek/GLM Coding Plan/MiniMax Token Plan/Kimi Code 四家脚本),footer 自动展示;用户脚本可扩展自定义 provider。"
+}

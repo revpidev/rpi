@@ -1,0 +1,8 @@
+{
+  "name": "rpi-usage",
+  "version": "0.1.0",
+  "description": "Usage lookup: /usage queries the current provider's balance or plan quota through the host scripted usage-provider framework (built-in DeepSeek / GLM Coding Plan / MiniMax Token Plan / Kimi Code scripts) and keeps a footer status line; user scripts extend it with custom providers",
+  "native": "librpi_ext_usage.so",
+  "capabilities": ["commands", "ui", "session", "events"],
+  "rpiAbi": 1
+}

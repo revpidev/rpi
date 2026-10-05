@@ -17,6 +17,7 @@ members = [
     "crates/rpi-ext-statusline",
     "crates/rpi-ext-todo",
     "crates/rpi-ext-plan-mode",
+    "crates/rpi-ext-usage",
     "crates/rpi-test-native-plugin",
     "crates/rpi-test-support",
     "crates/rpi-test-env",

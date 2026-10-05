@@ -1,0 +1,25 @@
+[package]
+name = "rpi-ext-usage"
+description = "Usage lookup (L0 native plugin, TE44): /usage queries the current provider's balance or plan quota through the host scripted usage-provider framework (built-in DeepSeek / GLM Coding Plan / MiniMax Token Plan / Kimi Code scripts) and keeps a footer status line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# rlib: all logic lives in the library for unit tests; cdylib is the
+# distributed artifact loaded by rpi-ext-host's native loader
+# (rpi-ext-todo / rpi-ext-plan-mode Cargo.toml precedent; plugin
+# 02-design §1). No HTTP client dependency: every provider call runs
+# through the host's scripted usage-provider framework.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# Native ABI types (RpiNativeModule / RpiHostCalls) for the cdylib thin shell.
+rpi-ext-host.workspace = true
+abi_stable = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rpi-test-env.workspace = true
