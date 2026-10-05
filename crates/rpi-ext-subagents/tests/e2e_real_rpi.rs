@@ -233,7 +233,22 @@ fn e2e_real_rpi_child_and_stream_fixture() {
     // this is the only test in this binary.
     rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
     rpi_test_env::set_var("RPI_SUBAGENT_RPI_BINARY", &rpi);
-    rpi_test_env::set_var("RPI_SUBAGENT_EXTENSION_PATH", &cdylib);
+    // Stage the cdylib together with its manifest so the child resolves the
+    // extension through the real install layout. The host keys capabilities
+    // off the package manifest: a bare `.so` without an adjacent
+    // `rpi-extension.json` loads with an empty capability set and the
+    // `registerTool` call is denied (TE45-era harness gap found by the TE47
+    // review).
+    let extension_dir = sandbox.join("extension");
+    std::fs::create_dir_all(&extension_dir).unwrap();
+    let staged_cdylib = extension_dir.join(cdylib.file_name().unwrap());
+    std::fs::copy(&cdylib, &staged_cdylib).unwrap();
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rpi-extension.json"),
+        extension_dir.join("rpi-extension.json"),
+    )
+    .unwrap();
+    rpi_test_env::set_var("RPI_SUBAGENT_EXTENSION_PATH", &staged_cdylib);
     rpi_test_env::set_var("STUBPAR_API_KEY", "stub-key");
     // TE05: pin the P0 foreground default in the sandbox config
     // (asyncByDefault defaults to true with FR-P1-04).
