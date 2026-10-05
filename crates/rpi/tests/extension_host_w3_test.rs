@@ -1239,6 +1239,11 @@ async fn w3_set_tool_exposures_hides_until_cleared_and_survives_rebuild() {
             .get_callable_tool_names()
             .contains(&"bash".to_owned())
     );
+    // The declared prompt carries bash's snippet/guideline while it is
+    // exposed (the #9548 declaration surface).
+    let prompt_exposed = fixture.session.system_prompt();
+    assert!(prompt_exposed.contains("Execute bash commands"));
+    assert!(prompt_exposed.contains("- You can inspect RPI_*"));
 
     let updated = api
         .set_tool_exposures(vec![
@@ -1263,6 +1268,19 @@ async fn w3_set_tool_exposures_hides_until_cleared_and_survives_rebuild() {
             .get_callable_tool_names()
             .contains(&"bash".to_owned())
     );
+    // The prompt declaration converges too: bash's snippet and guideline
+    // leave the rebuilt system prompt while hidden.
+    let prompt_hidden = fixture.session.system_prompt();
+    assert!(!prompt_hidden.contains("Execute bash commands"));
+    assert!(!prompt_hidden.contains("- You can inspect RPI_*"));
+
+    // Idempotent re-set of the same value: the name is reported again and
+    // the effective state is unchanged.
+    let again = api
+        .set_tool_exposures(vec![("bash".to_owned(), ext::ToolExposure::Hidden)])
+        .expect("re-set");
+    assert_eq!(again, vec!["bash".to_owned()]);
+    assert_eq!(tool_exposure(&api, "bash"), Some(ext::ToolExposure::Hidden));
 
     // The override survives a registry rebuild (registerTool triggers
     // refreshTools -> refresh_tool_registry).
@@ -1299,6 +1317,10 @@ async fn w3_set_tool_exposures_hides_until_cleared_and_survives_rebuild() {
             .get_callable_tool_names()
             .contains(&"bash".to_owned())
     );
+    // clear restored the declared prompt surface (snippet + guideline).
+    let prompt_restored = fixture.session.system_prompt();
+    assert!(prompt_restored.contains("Execute bash commands"));
+    assert!(prompt_restored.contains("- You can inspect RPI_*"));
 
     // Empty calls are no-ops (no overrides written, nothing to clear).
     assert!(
@@ -1373,4 +1395,81 @@ async fn w3_exposure_override_reaches_the_loadout_hook() {
     assert_eq!(last.get("bash"), Some(&ext::ToolExposure::Hidden));
     assert_eq!(last.get("edit"), Some(&ext::ToolExposure::ModelOnly));
     assert_eq!(last.get("read"), Some(&ext::ToolExposure::Direct));
+
+    // Empty set/clear calls answer without a registry rebuild: the loadout
+    // hook (which runs on every rebuild) must not observe another pass.
+    let runs_after_set = seen.lock().unwrap_or_else(|e| e.into_inner()).len();
+    assert!(
+        api.set_tool_exposures(Vec::new())
+            .expect("empty set")
+            .is_empty()
+    );
+    assert!(
+        api.clear_tool_exposures(Vec::new())
+            .expect("empty clear")
+            .is_empty()
+    );
+    assert_eq!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        runs_after_set,
+        "empty calls must not rebuild"
+    );
+}
+
+/// V16-14 FR-E: the exposure override feeds the `tool_search` discovery face
+/// — a `deferred` tool is discoverable/loadable while exposed, and invisible
+/// to `search_and_load` once overridden to `hidden`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w3_hidden_tools_are_invisible_to_tool_search() {
+    let (host, slot) = host_with_api(Vec::new()).await;
+    let _fixture = session_fixture(Vec::new(), host, FauxProviderOptions::default()).await;
+    let api = slot_api(&slot);
+
+    api.register_tool(ext::ToolDefinition {
+        name: "v16_14_searchprobe".to_owned(),
+        label: "searchprobe".to_owned(),
+        description: "v16_14 searchprobe discovery".to_owned(),
+        prompt_snippet: None,
+        prompt_guidelines: None,
+        parameters: json!({"type": "object"}),
+        constrained_sampling: None,
+        output_schema: None,
+        exposure: ext::ToolExposure::Deferred,
+        namespace: None,
+        annotations: None,
+        default_active: None,
+        prepare_loadout: None,
+        render_shell: None,
+        prepare_arguments: None,
+        execution_mode: None,
+        execute: Arc::new(|_req, _ctx| {
+            Box::pin(async { Ok(rpi_agent::types::AgentToolResult::default()) })
+        }),
+        render_call: None,
+        render_result: None,
+    })
+    .expect("register deferred probe");
+
+    let found = rpi::extensions::tool_search::search_and_load(&api, "searchprobe", 8);
+    assert_eq!(
+        found
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["v16_14_searchprobe"]
+    );
+
+    api.set_tool_exposures(vec![(
+        "v16_14_searchprobe".to_owned(),
+        ext::ToolExposure::Hidden,
+    )])
+    .expect("hide the probe");
+    assert_eq!(
+        tool_exposure(&api, "v16_14_searchprobe"),
+        Some(ext::ToolExposure::Hidden)
+    );
+    assert!(
+        rpi::extensions::tool_search::search_and_load(&api, "searchprobe", 8).is_empty(),
+        "hidden tools must be invisible to tool_search"
+    );
 }
