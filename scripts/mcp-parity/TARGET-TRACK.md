@@ -43,7 +43,7 @@ each task's document).
 | config-merge goldens | **re-recorded @ `97435aab`** | `gen-mcp-adapter-fixtures.mjs` gained the TE40 cases (`command-switch-drops-bearer-store-and-cafile` #552/#539, `socket-switch-drops-bearer-store-and-cafile`, `url-change-strips-cafile` #539, `blank-optional-config-is-absent` #568, `ancestor-config-roots-opt-in` / `-not-opted-in` #556 with the `projectSubdir`/`ancestorLayers` harness fields); `golden_config_merge.rs` consumes `ancestorLayers`/`projectSubdir` |
 | Other goldens | unchanged | names/glob/search/config-hash/tsshape/truncate faces are untouched by the 59-commit span (verified: all green without re-record) |
 
-## 1c. TE46 rotation record (2026-10-06) — the v4.0.0 pin switch
+## 1c. TE46 rotation record (2026-10-05) — the v4.0.0 pin switch
 
 > `external/pi-mcp-adapter` moved `97435aab` (v2.34.0+9) → **`5884ac4e` (v4.0.0)** with the
 > TE46 rebase (ADR-0034's plugin pin table, unchanged by ADR-0035). The default driver = the

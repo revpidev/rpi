@@ -1194,8 +1194,13 @@ fn disabled_result(state: &McpRuntime, mode: &str, server_name: &str) -> Value {
 /// `serverBackoffResult` (proxy-modes.ts:82-90 @ 10a45367, #434): the server is
 /// inside its failure window — the tool surface must not advertise it.
 fn server_backoff_result(state: &McpRuntime, mode: &str, server_name: &str) -> Value {
-    let failed_ago = state.failures.failure_age_seconds(server_name).unwrap_or(0);
-    let message = format!("Server \"{server_name}\" not available (last failed {failed_ago}s ago)");
+    // #706 (8d5daea, proxy-modes.ts:114-118 @ 5884ac4e): the blocked call
+    // text carries the connection error (bounded) after the age.
+    let describe = state
+        .failures
+        .describe_failure(server_name)
+        .unwrap_or_else(|| "failed 0s ago".to_string());
+    let message = format!("Server \"{server_name}\" not available (last {describe})");
     text_result(
         message,
         json!({ "mode": mode, "error": "server_backoff", "server": server_name }),
@@ -1472,8 +1477,15 @@ pub fn execute_status(state: &McpRuntime) -> Value {
             "needs-auth" => text.push_str(&format!("⚠ {name} (needs auth)\n")),
             "cached" => text.push_str(&format!("○ {name} ({tool_count} tools, cached)\n")),
             "failed" => text.push_str(&format!(
-                "✗ {name} (failed {}s ago)\n",
-                server["failedAgo"].as_u64().unwrap_or(0)
+                // #706: the connection reason rides the status text too.
+                "✗ {name} ({})\n",
+                state
+                    .failures
+                    .describe_failure(name)
+                    .unwrap_or_else(|| format!(
+                        "failed {}s ago",
+                        server["failedAgo"].as_u64().unwrap_or(0)
+                    ))
             )),
             _ => text.push_str(&format!("○ {name} (not connected)\n")),
         }

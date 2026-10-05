@@ -710,8 +710,12 @@ async fn register_client(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
+        // #750 (71280b1, mcp-auth-flow.ts:447-453 @ 5884ac4e): a rejected
+        // registration explains the pre-registered-client path instead of
+        // surfacing a bare HTTP failure. (The Figma-host hint is not ported:
+        // rpi has no `/mcp setup` preset flow.)
         return Err(AdapterError::InvalidConfigValue(format!(
-            "DCR failed ({status}): {text}"
+            "Dynamic Client Registration rejected (HTTP {status}): {text}. This server only accepts pre-registered OAuth clients. If the provider gave you a client ID, set oauth.clientId (and oauth.clientSecret if required) for this server."
         )));
     }
 

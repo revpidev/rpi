@@ -978,7 +978,34 @@ impl FailureTracker {
             .get(server_name)
             .cloned()
     }
+
+    /// `describeFailure` (failure-backoff.ts:22-28 @ 5884ac4e, #706 8d5daea):
+    /// `"failed 12s ago: <reason>"` for agent-facing text, the reason
+    /// sanitized and bounded to 300 chars; bare age when no reason is stored.
+    /// `None` outside the backoff window.
+    pub fn describe_failure(&self, server_name: &str) -> Option<String> {
+        let failed_ago = self.failure_age_seconds(server_name)?;
+        let reason = crate::utils::sanitize_terminal_text(
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(server_name)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+        if reason.is_empty() {
+            return Some(format!("failed {failed_ago}s ago"));
+        }
+        Some(format!(
+            "failed {failed_ago}s ago: {}",
+            crate::utils::truncate_at_word(&reason, AGENT_FAILURE_REASON_CHARS)
+        ))
+    }
 }
+
+/// `AGENT_FAILURE_REASON_CHARS` (failure-backoff.ts:7): stored failures can
+/// hold 8 KiB of stderr; agents see a bounded reason on every blocked call.
+const AGENT_FAILURE_REASON_CHARS: usize = 300;
 
 #[cfg(test)]
 mod tests {
@@ -1000,6 +1027,32 @@ mod tests {
         assert!(LifecycleMode::LazyKeepAlive.persists_after_first_spawn());
         assert!(!LifecycleMode::KeepAlive.persists_after_first_spawn());
         assert!(!LifecycleMode::Lazy.persists_after_first_spawn());
+    }
+
+    /// #706 (8d5daea): `describeFailure` appends the bounded, sanitized
+    /// connection reason; a bare age when no reason was stored.
+    #[tokio::test]
+    async fn describe_failure_carries_a_bounded_sanitized_reason() {
+        let tracker = Arc::new(FailureTracker::new());
+        tracker.record("srv", "connect refused\u{1b}[31m", CancellationToken::new());
+        let text = tracker.describe_failure("srv").expect("inside backoff");
+        assert!(text.starts_with("failed 0s ago: "), "{text}");
+        assert!(!text.contains('\u{1b}'), "control bytes sanitized: {text}");
+
+        tracker.record("bare", "   ", CancellationToken::new());
+        assert_eq!(
+            tracker.describe_failure("bare").as_deref(),
+            Some("failed 0s ago")
+        );
+
+        let long = "x".repeat(500);
+        tracker.record("long", &long, CancellationToken::new());
+        let text = tracker.describe_failure("long").expect("inside backoff");
+        assert!(
+            text.len() < 400,
+            "reason is bounded to 300 chars (+ prefix/ellipsis): {}",
+            text.len()
+        );
     }
 
     #[tokio::test]
