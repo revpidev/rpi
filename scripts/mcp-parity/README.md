@@ -1,7 +1,7 @@
 # MCP adapter cross-implementation parity harness (design §5.2)
 
 The same fixture MCP server drives both client sides — the pinned upstream Node `McpServerManager`
-(`rpi/external/pi-mcp-adapter` @ `10a45367` (v2.32.1, the baseline after the TE27 pin switch), read-only) and this crate's Rust
+(`rpi/external/pi-mcp-adapter` @ `5884ac4e` (v4.0.0, the TE46 pin switch), read-only) and this crate's Rust
 manager — and diffs the normalized frame sequences and result JSON. Any difference is attributable to the client
 implementation itself (the fixture server is byte-identically constructed on both sides).
 
@@ -51,7 +51,7 @@ adapter dependency closure.
 
 ## Target track (TE13 skeleton, ADR-0025)
 
-The default = the submodule worktree (after the TE27 pin switch = `10a45367` / v2.32.1, i.e. the rebase target baseline). The old-pin regression track (`3d953f90` / v2.24.0) reached end-of-life with TE27; for archaeological re-runs, point the upstream root at an old-pin worktree
+The default = the submodule worktree (after the TE46 pin switch = `5884ac4e` / v4.0.0, i.e. the rebase target baseline). Older pins (`97435aab` / v2.34.0+9, `10a45367` / v2.32.1) can be replayed from snapshots; for archaeological re-runs, point the upstream root at an old-pin worktree
 snapshot outside the repository (zero writes to `external/`):
 
 ```bash

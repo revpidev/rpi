@@ -750,7 +750,8 @@ async fn oauth_invalid_grant_reregisters_stale_dynamic_client() {
         1
     );
     let registered_redirect = body["redirect_uris"][0].as_str().unwrap_or_default();
-    assert!(registered_redirect.starts_with("http://localhost:"));
+    // #715 (TE46): the default callback is the 127.0.0.1 IP literal.
+    assert!(registered_redirect.starts_with("http://127.0.0.1:"));
     assert!(registered_redirect.ends_with("/callback"));
     assert_ne!(registered_redirect, "http://localhost:1/callback");
     assert_eq!(body["client_name"], json!("rpi"));
@@ -1108,7 +1109,9 @@ async fn runtime_persists_tools_list_cache_hints() {
     let hints_entry = entry_value.expect("cache entry written");
     assert_eq!(hints_entry.ttl_ms, Some(12_345));
     assert_eq!(hints_entry.cache_scope.as_deref(), Some("private"));
-    assert!(rpi_ext_mcp_adapter::cache::is_server_cache_valid(
+    // #743 (TE46): a private listing's metadata is persisted with its scope
+    // but is never reused across sessions — the validity gate rejects it.
+    assert!(!rpi_ext_mcp_adapter::cache::is_server_cache_valid(
         &hints_entry,
         &definition,
         rpi_ext_mcp_adapter::cache::CACHE_MAX_AGE_MS,

@@ -387,6 +387,8 @@ async function genSearch() {
   );
 
   const tool = (name, description) => ({ name, originalName: name, description });
+  // #613: a run longer than the bigram bound falls back to the whole run.
+  const longCjkRun = "记录".repeat(34);
   const servers = [
     {
       name: "demo",
@@ -414,6 +416,21 @@ async function genSearch() {
       definition: { command: "npx", disabled: true },
       tools: [tool("hidden_tool", "Should never rank")],
     },
+    // TE46 #613: CJK lexical search runs — adjacent-bigram tokens plus one
+    // run above the 64-bigram bound (whole-run fallback).
+    {
+      name: "cjk",
+      definition: { command: "npx" },
+      tools: [
+        { name: "记录查询", originalName: "记录查询", description: "插旗 查询 记录" },
+        { name: "插旗记录", originalName: "插旗记录", description: "数据库 记录" },
+        {
+          name: longCjkRun,
+          originalName: longCjkRun,
+          description: "超长单字符运行",
+        },
+      ],
+    },
   ];
 
   const config = {
@@ -436,7 +453,16 @@ async function genSearch() {
   const queries = [
     "search", "search missing", "simulator", "synchronize", "fuzzy lookup",
     "lookup legacy", "fuzzy", "advanced", "records", "icon", "sync",
+    // TE46 parity additions: repeated query tokens must be deduped (#686,
+    // c9eca7e) — upstream scores `[...new Set(tokenize(query))]`.
+    "search search", "records records records", "fuzzy lookup fuzzy",
+    // TE46 parity additions: non-ASCII (CJK) runs tokenize as adjacent
+    // bigrams, bounded at 64 bigrams per run (#613, 12461cf).
+    "查询", "记录查询", "记录搜索", "插旗查询", "查询插旗记录",
+    "数据库", "数据库数据库数据库",
   ];
+  // #613: a run longer than the bigram bound falls back to the whole run.
+  queries.push(longCjkRun, longCjkRun.slice(0, 65), longCjkRun.slice(0, 64));
   const rankCases = [];
   for (const query of queries) {
     for (const includeKeywords of [true, false]) {
@@ -518,13 +544,20 @@ async function genSearch() {
 // Layer -> upstream path mapping (the rpi side maps `pi-global` to
 // `~/.rpi/agent/mcp.json` and `pi-project` to `<cwd>/.rpi/mcp.json`, ADR-0001;
 // the merge semantics under test are identical).
+//
+// v4.0.0 (TE46 rebase): the adapter renamed its own config to
+// `mcp-adapter.json` (#680). The rpi side deliberately keeps `mcp.json`
+// (TE-D44 [VARIANT]); the `pi-global`/`pi-project` layers below point at the
+// v4.0.0 upstream file names so the golden expected values are produced by
+// the pinned implementation, and the Rust golden maps the same layer names
+// onto the rpi // paths.
 const LAYERS = {
   "shared-global": (home, proj) => join(home, ".config", "mcp", "mcp.json"),
   "agents-global": (home) => join(home, ".agents", "mcp.json"),
   "agents-nested-global": (home) => join(home, ".agents", "mcp", "mcp.json"),
-  "pi-global": (home) => join(home, ".pi", "agent", "mcp.json"),
+  "pi-global": (home) => join(home, ".pi", "agent", "mcp-adapter.json"),
   "shared-project": (_home, proj) => join(proj, ".mcp.json"),
-  "pi-project": (_home, proj) => join(proj, ".pi", "mcp.json"),
+  "pi-project": (_home, proj) => join(proj, ".pi", "mcp-adapter.json"),
 };
 
 const URL_A = "https://litellm.internal/mcp/";
@@ -1058,7 +1091,15 @@ async function genGlob() {
 // "upstream bytes → plugin read" and "plugin write → upstream bytes".
 async function genCacheCompact() {
   const source = readFileSync(join(UPSTREAM, "metadata-cache.ts"), "utf-8");
-  if (!source.includes("writeFileSync(tmpPath, JSON.stringify(merged), ")) {
+  // v4.0.0 (TE46 rebase): saveMetadataCache now delegates to
+  // `updateMetadataCacheFile`, which still serializes the merged store with
+  // a compact `JSON.stringify({ version: CACHE_VERSION, servers: next })`
+  // (metadata-cache.ts:82-90 @ 5884ac4e). Accept either shape.
+  const compactWrite =
+    source.includes("writeFileSync(tmpPath, JSON.stringify(merged), ") ||
+    (source.includes("function updateMetadataCacheFile") &&
+      source.includes("JSON.stringify({ version: CACHE_VERSION, servers: next })"));
+  if (!compactWrite) {
     throw new Error(
       "[gen-fixtures] upstream saveMetadataCache is no longer a compact JSON.stringify write " +
         "(see #395); update the cache golden before re-recording",

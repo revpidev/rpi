@@ -1,7 +1,7 @@
 # OAuth cross-implementation parity report (TE02 item 5 / TE03 groundwork)
 
-Generated: 2026-09-25T21:41:48.952Z (rerun: `node scripts/mcp-parity/run-oauth-parity.mjs`)
-Upstream: pi-mcp-adapter @ 97435aab (mcp-auth-flow.ts via SDK 2.0 auth)
+Generated: 2026-10-05T09:19:12.990Z (rerun: `node scripts/mcp-parity/run-oauth-parity.mjs`)
+Upstream: pi-mcp-adapter @ 5884ac4e (mcp-auth-flow.ts via SDK 2.0 auth)
 rpi: crates/rpi-ext-mcp-adapter oauth.rs
 
 Stub AS transcript (authorization URL params + token form params),
@@ -17,7 +17,7 @@ Verdict: MATCH
     "kind": "registration",
     "params": {
       "redirect_uris": [
-        "http://localhost:$port/callback"
+        "http://127.0.0.1:$port/callback"
       ],
       "client_name": "$client_name",
       "client_uri": "$client_uri",
@@ -39,7 +39,7 @@ Verdict: MATCH
       "client_id": "stub-dcr-client",
       "code_challenge": "$challenge",
       "code_challenge_method": "S256",
-      "redirect_uri": "http://localhost:$port/callback",
+      "redirect_uri": "http://127.0.0.1:$port/callback",
       "state": "$state"
     }
   },
@@ -49,7 +49,7 @@ Verdict: MATCH
       "grant_type": "authorization_code",
       "code": "$code",
       "code_verifier": "$verifier",
-      "redirect_uri": "http://localhost:$port/callback",
+      "redirect_uri": "http://127.0.0.1:$port/callback",
       "client_id": "stub-dcr-client",
       "client_secret": "stub-dcr-secret"
     }
@@ -65,7 +65,7 @@ Verdict: MATCH
     "kind": "registration",
     "params": {
       "redirect_uris": [
-        "http://localhost:$port/callback"
+        "http://127.0.0.1:$port/callback"
       ],
       "client_name": "$client_name",
       "client_uri": "$client_uri",
@@ -85,7 +85,7 @@ Verdict: MATCH
     "params": {
       "response_type": "code",
       "client_id": "stub-dcr-client",
-      "redirect_uri": "http://localhost:$port/callback",
+      "redirect_uri": "http://127.0.0.1:$port/callback",
       "code_challenge": "$challenge",
       "code_challenge_method": "S256",
       "state": "$state"
@@ -96,7 +96,7 @@ Verdict: MATCH
     "params": {
       "grant_type": "authorization_code",
       "code": "$code",
-      "redirect_uri": "http://localhost:$port/callback",
+      "redirect_uri": "http://127.0.0.1:$port/callback",
       "client_id": "stub-dcr-client",
       "code_verifier": "$verifier",
       "client_secret": "stub-dcr-secret"

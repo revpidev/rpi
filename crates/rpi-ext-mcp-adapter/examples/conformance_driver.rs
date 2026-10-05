@@ -74,7 +74,7 @@ async fn call_tool(
         let connection = connect(manager, definition).await?;
         if let Some(client) = &connection.client {
             match client
-                .call_tool(name, args.clone(), Duration::from_secs(60))
+                .call_tool(name, args.clone(), Duration::from_secs(60), None)
                 .await
             {
                 Ok(result) => {

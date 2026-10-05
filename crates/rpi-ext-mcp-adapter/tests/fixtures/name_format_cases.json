@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/types.ts @ 10a45367, executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/types.ts @ 5884ac4e, executed by gen-mcp-adapter-fixtures.mjs",
   "formatToolName": [
     {
       "server": "searxng",

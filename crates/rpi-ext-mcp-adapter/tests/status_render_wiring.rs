@@ -132,8 +132,9 @@ async fn status_bar_and_render_result_are_wired_to_the_host() {
 
     // settings 未设置 mcpFooterStatus → 上游默认 full。
     // demo2：lazy 档、不可连接（127.0.0.1:9），用于懒连接瞬态断言。
+    // TE46 #681/#714: load-time prewarm only sees the GLOBAL layer.
     std::fs::write(
-        dir.join(".mcp.json"),
+        agent_dir.join("mcp.json"),
         serde_json::to_string_pretty(&json!({
             "mcpServers": {
                 "demo": entry,

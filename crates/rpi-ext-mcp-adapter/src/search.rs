@@ -23,6 +23,9 @@ use serde_json::Value;
 /// (search-ranking.ts:6-10).
 const MIN_STEM_LENGTH: usize = 4;
 
+/// `MAX_UNICODE_BIGRAMS_PER_RUN` (search-ranking.ts:13).
+const MAX_UNICODE_BIGRAMS_PER_RUN: usize = 64;
+
 const WEIGHT_NAME: i64 = 12;
 const WEIGHT_ORIGINAL_NAME: i64 = 10;
 const WEIGHT_SERVER: i64 = 8;
@@ -81,13 +84,85 @@ pub fn normalize_search_text(value: &str) -> String {
     collapsed.to_lowercase()
 }
 
-/// `tokenize` (search-ranking.ts:63-65): split on non-`[a-z0-9]` runs.
+/// `tokenize` (search-ranking.ts:92-110 @ 5884ac4e, #613 + #689): ASCII
+/// alnum runs stay whole; a non-ASCII Unicode word run (letters, numbers,
+/// marks) becomes its adjacent bigrams — one-character runs and runs longer
+/// than 64 bigrams fall back to the whole run — and the result is deduped
+/// with first-occurrence order (#689 moved the `[...new Set(...)]` dedupe
+/// from the call sites into `tokenize`).
 pub fn tokenize(value: &str) -> Vec<String> {
-    normalize_search_text(value)
-        .split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit()))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    let normalized = normalize_search_text(value);
+    let mut tokens: Vec<String> = Vec::new();
+    for word in unicode_word_run_re().find_iter(&normalized) {
+        let mut ascii_run = String::new();
+        let mut unicode_run: Vec<char> = Vec::new();
+        let flush_ascii = |ascii_run: &mut String, tokens: &mut Vec<String>| {
+            if !ascii_run.is_empty() {
+                tokens.push(std::mem::take(ascii_run));
+            }
+        };
+        let flush_unicode = |unicode_run: &mut Vec<char>, tokens: &mut Vec<String>| {
+            if unicode_run.is_empty() {
+                return;
+            }
+            let characters = std::mem::take(unicode_run);
+            if characters.len() == 1 || characters.len() > MAX_UNICODE_BIGRAMS_PER_RUN + 1 {
+                tokens.push(characters.into_iter().collect());
+                return;
+            }
+            let mut previous: Option<char> = None;
+            for character in characters {
+                if let Some(previous) = previous {
+                    tokens.push(format!("{previous}{character}"));
+                }
+                previous = Some(character);
+            }
+        };
+        for ch in word.as_str().chars() {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+                flush_unicode(&mut unicode_run, &mut tokens);
+                ascii_run.push(ch);
+            } else {
+                flush_ascii(&mut ascii_run, &mut tokens);
+                unicode_run.push(ch);
+            }
+        }
+        flush_ascii(&mut ascii_run, &mut tokens);
+        flush_unicode(&mut unicode_run, &mut tokens);
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    tokens.retain(|token| seen.insert(token.clone()));
+    tokens
+}
+
+/// The JS `SEARCH_RUN` regex `[a-z0-9]+|(?:(?![a-z0-9])[\p{L}\p{N}\p{M}])+`
+/// (search-ranking.ts:15) without its negative lookahead (the Rust `regex`
+/// crate has none): the word-run alternation is matched as one
+/// `[\p{L}\p{N}\p{M}]+` run and [`tokenize`] then splits it into the ASCII
+/// alnum and non-ASCII segments the lookahead produced. Consecutive ASCII
+/// alnum characters therefore never join a Unicode run, exactly like the
+/// lookahead-version.
+static UNICODE_WORD_RUN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+fn unicode_word_run_re() -> &'static regex::Regex {
+    UNICODE_WORD_RUN.get_or_init(|| {
+        regex::Regex::new(r"[\p{L}\p{N}\p{M}]+").expect("unicode word run regex compiles")
+    })
+}
+
+/// `matchesAsciiStem` (search-ranking.ts:112-116 @ 5884ac4e): prefix/stem
+/// matching only applies when BOTH tokens are ASCII; CJK bigrams compare by
+/// equality or substring, never by stem.
+fn matches_ascii_stem(field_token: &str, query_token: &str) -> bool {
+    let is_ascii = |token: &str| {
+        token
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    };
+    is_ascii(field_token)
+        && is_ascii(query_token)
+        && (starts_with(field_token, query_token)
+            || (field_token.len() >= MIN_STEM_LENGTH && starts_with(query_token, field_token)))
 }
 
 fn starts_with(haystack: &str, needle: &str) -> bool {
@@ -262,9 +337,7 @@ fn score_prepared_tool_match(
                 if !matched_tokens.contains(&token) {
                     matched_tokens.push(token);
                 }
-            } else if field_tokens.iter().any(|ft| {
-                starts_with(ft, token) || (ft.len() >= MIN_STEM_LENGTH && starts_with(token, ft))
-            }) {
+            } else if field_tokens.iter().any(|ft| matches_ascii_stem(ft, token)) {
                 score += weight * 2;
                 if !matched_tokens.contains(&token) {
                     matched_tokens.push(token);
@@ -304,9 +377,11 @@ fn score_prepared_tool_match(
                 if !matched_tokens.contains(&token) {
                     matched_tokens.push(token);
                 }
-            } else if prepared.keyword_tokens.iter().any(|kt| {
-                starts_with(kt, token) || (kt.len() >= MIN_STEM_LENGTH && starts_with(token, kt))
-            }) {
+            } else if prepared
+                .keyword_tokens
+                .iter()
+                .any(|kt| matches_ascii_stem(kt, token))
+            {
                 score += weight * 2;
                 if !matched_tokens.contains(&token) {
                     matched_tokens.push(token);

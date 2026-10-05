@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/config.ts loadMcpConfig @ 97435aab, executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/config.ts loadMcpConfig @ 5884ac4e, executed by gen-mcp-adapter-fixtures.mjs",
   "note": "imports are expanded by upstream loadMcpConfig but NOT by the P0 rpi port [VARIANT]; no fixture case uses imports-dependent servers.",
   "cases": [
     {
@@ -691,6 +691,27 @@
             "command": "x"
           }
         }
+      }
+    },
+    {
+      "name": "jsonc-comments-and-trailing-commas",
+      "layers": {},
+      "rawLayers": {
+        "pi-global": "{\n        // leading comment\n        \"imports\": [\"vscode\",],\n        \"mcpServers\": {\n          \"global\": { \"command\": \"global-server\", },\n        },\n      }",
+        "shared-project": "{\n        /* block\n           comment */\n        \"mcpServers\": {\n          \"project\": { \"command\": \"project-server\", },\n        },\n      }"
+      },
+      "expected": {
+        "mcpServers": {
+          "global": {
+            "command": "global-server"
+          },
+          "project": {
+            "command": "project-server"
+          }
+        },
+        "imports": [
+          "vscode"
+        ]
       }
     }
   ]

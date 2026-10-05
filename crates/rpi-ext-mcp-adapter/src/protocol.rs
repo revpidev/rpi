@@ -223,6 +223,11 @@ pub struct McpClient {
     closed: AtomicBool,
 }
 
+/// `TOOL_CALL_ID_REQUEST_META_KEY` (utils.ts:345-350 @ 5884ac4e): the `_meta`
+/// key carrying the id of the Pi tool call that made an MCP `tools/call`
+/// request. Branded for rpi ([VARIANT]: upstream uses `pi-mcp-adapter/...`).
+pub const TOOL_CALL_ID_REQUEST_META_KEY: &str = "rpi-mcp-adapter/toolCallId";
+
 impl McpClient {
     /// Start the client over an already-started transport: spawn the
     /// dispatcher task draining `incoming`.
@@ -928,18 +933,22 @@ impl McpClient {
     }
 
     /// `client.callTool` — `tools/call` with `{ name, arguments }`.
+    /// #674 (4b7e310, utils.ts withToolCallIdMeta @ 5884ac4e): the calling
+    /// Pi tool call id rides the request `_meta` so a server can correlate
+    /// the MCP request with the host's own record. The key is branded for
+    /// rpi (`rpi-mcp-adapter/toolCallId`, [VARIANT] name mapping).
     pub async fn call_tool(
         &self,
         name: &str,
         arguments: Value,
         timeout: Duration,
+        tool_call_id: Option<&str>,
     ) -> Result<Value, ProtocolError> {
-        self.call(
-            "tools/call",
-            Some(json!({ "name": name, "arguments": arguments })),
-            timeout,
-        )
-        .await
+        let mut params = json!({ "name": name, "arguments": arguments });
+        if let Some(tool_call_id) = tool_call_id {
+            params["_meta"] = json!({ (TOOL_CALL_ID_REQUEST_META_KEY): tool_call_id });
+        }
+        self.call("tools/call", Some(params), timeout).await
     }
 
     /// `client.readResource` — `resources/read` with `{ uri }`.

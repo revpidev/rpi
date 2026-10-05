@@ -25,6 +25,10 @@ fn main() {
         let _ = std::fs::write(path, std::process::id().to_string());
     }
     let log_path = std::env::var("RPI_MCP_FIXTURE_LOG").ok();
+    // `RPI_MCP_FIXTURE_LOG_FRAMES=1` logs the full raw JSON frame instead of
+    // the method name (the Node fixture-server.mjs convention; #674 asserts
+    // request `_meta` on the raw frame).
+    let log_frames = std::env::var("RPI_MCP_FIXTURE_LOG_FRAMES").ok().as_deref() == Some("1");
     let log = |frame: &str| {
         if let Some(path) = &log_path
             && let Ok(mut file) = std::fs::OpenOptions::new()
@@ -51,7 +55,11 @@ fn main() {
             continue;
         };
         let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        log(method);
+        if log_frames {
+            log(&line);
+        } else {
+            log(method);
+        }
         let id = message.get("id").cloned();
         let flush_notifications = |queue: &mut Vec<serde_json::Value>| {
             let mut out = stdout.lock();

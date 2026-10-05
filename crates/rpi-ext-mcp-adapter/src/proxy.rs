@@ -38,7 +38,6 @@ use crate::cache::{
     load_metadata_cache, reconstruct_prompt_metadata, reconstruct_tool_metadata,
     save_metadata_cache, serialize_resources, serialize_tools,
 };
-use crate::config::load_mcp_config;
 use crate::lifecycle::{
     DEFAULT_IDLE_TIMEOUT_MINUTES, FailureTracker, LifecycleManager, LifecycleMode,
 };
@@ -104,6 +103,10 @@ pub struct McpRuntime {
     pub approval: crate::approval::ApprovalCache,
     /// TUI approval dialog handler (R7.2.2.3); `None` = headless fail-closed.
     pub approval_ui: Mutex<Option<Arc<dyn crate::approval::ApprovalHandler>>>,
+    /// #681 (5d645df): project-scope servers blocked by the trust gate, by
+    /// name — the status snapshot and disabled-server error text use the
+    /// block reason (project-server-trust.ts:37-45 @ 5884ac4e).
+    pub project_blocked: crate::project_trust::BlockedServers,
 }
 
 /// Callback fired before a lazy connect attempt (init.ts:588-591).
@@ -213,7 +216,19 @@ pub async fn initialize_mcp(
     config_path: Option<&str>,
     cache_path: Option<PathBuf>,
 ) -> Arc<McpRuntime> {
-    let config = load_mcp_config(config_path, cwd);
+    // #681/#714: a session gate built from the host trust context (set by
+    // lib.rs on session_start) supplies the already-approved/rejected
+    // config; without one (load-time prewarm, tests) project-scope servers
+    // are excluded entirely (project-server-trust.ts:240-247).
+    let (config, project_blocked) = match crate::project_trust::take_session_gate(cwd) {
+        Some(gate) => (gate.config, gate.blocked),
+        None => (
+            crate::project_trust::exclude_project_servers_at_load_time(
+                &crate::config::load_mcp_config_with_sources(config_path, cwd),
+            ),
+            crate::project_trust::BlockedServers::new(),
+        ),
+    };
     let cache_path = cache_path.unwrap_or_else(get_metadata_cache_path);
     let owner_cancel = CancellationToken::new();
 
@@ -253,6 +268,7 @@ pub async fn initialize_mcp(
         on_connecting: Mutex::new(None),
         approval: crate::approval::ApprovalCache::new(),
         approval_ui: Mutex::new(None),
+        project_blocked,
     });
 
     let enabled: Vec<(&String, &ServerEntry)> = config
@@ -743,21 +759,23 @@ pub(crate) fn overlay_live_tool_surface_cache(
 }
 
 /// The overlay cache entry for one live connection (#566, 464337b —
-/// index.ts loadToolSurfaceCache @ 97435aab). The overlaid entry NEVER
-/// carries the server's declared `ttlMs`: a zero-TTL declaration would
-/// make `is_server_cache_valid` reject the entry (`ttlMs == 0` always
-/// expires) and drop the LIVE server's tools from the tool surface,
-/// defeating the overlay's "zero-TTL servers keep their tools while
-/// connected" contract. Freshness comes from `cached_at: now` under the
-/// global max age instead (the upstream overlay strips `ttlMs` the same
-/// way); `cacheScope` is display-only and rides along.
+/// index.ts loadToolSurfaceCache @ 97435aab; #743 update @ 5884ac4e). The
+/// overlaid entry NEVER carries the server's declared `ttlMs`: a zero-TTL
+/// declaration would make `is_server_cache_valid` reject the entry
+/// (`ttlMs == 0` always expires) and drop the LIVE server's tools from the
+/// tool surface, defeating the overlay's "zero-TTL servers keep their tools
+/// while connected" contract. Freshness comes from `cached_at: now` under
+/// the global max age instead (the upstream overlay strips `ttlMs` the same
+/// way). #743 also strips `cacheScope`: a private live listing stays usable
+/// in-session (the persisted entry keeps the private scope), while the
+/// validity check rejects private entries across sessions.
 fn overlay_cache_entry(
     config_hash: String,
     tools: Vec<crate::cache::CachedTool>,
     resources: Vec<crate::cache::CachedResource>,
     prompts: Option<Vec<crate::cache::CachedPrompt>>,
     instructions: Option<String>,
-    hints: Option<crate::protocol::ToolListHints>,
+    _hints: Option<crate::protocol::ToolListHints>,
 ) -> crate::cache::ServerCacheEntry {
     crate::cache::ServerCacheEntry {
         config_hash,
@@ -766,7 +784,7 @@ fn overlay_cache_entry(
         prompts,
         instructions,
         ttl_ms: None,
-        cache_scope: hints.and_then(|h| h.cache_scope.clone()),
+        cache_scope: None,
         cached_at: now_ms(),
     }
 }
@@ -790,6 +808,19 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
     };
     let existing = load_metadata_cache(&state.cache_path);
     let existing_entry = existing.as_ref().and_then(|c| c.servers.get(server_name));
+    let cache_scope = connection
+        .tool_list_hints_snapshot()
+        .as_ref()
+        .and_then(|h| h.cache_scope.clone());
+    // #743 (0ff0b85, init.ts:608-620 @ 5884ac4e): a persisted entry may back
+    // the prompt/resource fallback only while it still matches the running
+    // config, and metadata from a private listing may only fill an entry
+    // that is private too (it can never leak into a public one).
+    let existing_usable = existing_entry.is_some_and(|e| {
+        e.config_hash == config_hash
+            && (e.cache_scope.as_deref() != Some("private")
+                || cache_scope.as_deref() == Some("private"))
+    });
 
     let tools = serialize_tools(&wire_tools(&connection.tools_snapshot()));
     let mut resources = if definition.exposes_resources() {
@@ -798,7 +829,7 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
         Vec::new()
     };
     let prompts = if connection.prompt_discovery_failed {
-        if existing_entry.is_some_and(|e| e.config_hash == config_hash) {
+        if existing_usable {
             existing_entry.and_then(|e| e.prompts.clone())
         } else {
             None
@@ -808,7 +839,8 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
     };
     if definition.exposes_resources()
         && resources.is_empty()
-        && existing_entry.is_some_and(|e| !e.resources.is_empty() && e.config_hash == config_hash)
+        && existing_usable
+        && existing_entry.is_some_and(|e| !e.resources.is_empty())
     {
         resources = existing_entry
             .map(|e| e.resources.clone())
@@ -827,10 +859,7 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
             .tool_list_hints_snapshot()
             .as_ref()
             .and_then(|h| h.ttl_ms),
-        cache_scope: connection
-            .tool_list_hints_snapshot()
-            .as_ref()
-            .and_then(|h| h.cache_scope.clone()),
+        cache_scope,
         cached_at: now_ms(),
     };
     let mut servers = IndexMap::new();
@@ -1149,10 +1178,13 @@ fn text_result(text: String, details: Value) -> Value {
     })
 }
 
-fn disabled_result(mode: &str, server_name: &str) -> Value {
-    let message = format!(
-        "Server \"{server_name}\" is disabled. Run /mcp enable {server_name} and /reload to enable it."
-    );
+fn disabled_result(state: &McpRuntime, mode: &str, server_name: &str) -> Value {
+    // #681 (5d645df, proxy-modes.ts:215 @ 5884ac4e): a project-scope server
+    // blocked by the trust gate reports its block reason instead of the
+    // generic disabled text.
+    let reason =
+        crate::project_trust::disabled_server_reason(Some(&state.project_blocked), server_name);
+    let message = format!("Server \"{server_name}\" is {reason}");
     text_result(
         message.clone(),
         json!({ "mode": mode, "error": "server_disabled", "server": server_name, "message": message }),
@@ -1477,7 +1509,7 @@ pub fn execute_search(
     let show_schemas = include_schemas != Some(false);
     if let Some(server) = server {
         if state.config.is_server_disabled(server) {
-            return disabled_result("search", server);
+            return disabled_result(state, "search", server);
         }
         // proxy-modes.ts:603 @ 10a45367: a server-scoped search against a
         // server in backoff reports the backoff instead of cached tools.
@@ -2088,7 +2120,7 @@ pub fn execute_describe(
             return ambiguous_server_tool_result("describe", tool_name, server_override);
         }
         if state.config.is_server_disabled(server_override) {
-            return disabled_result("describe", server_override);
+            return disabled_result(state, "describe", server_override);
         }
         if state.is_server_in_active_failure_backoff(server_override) {
             return server_backoff_result(state, "describe", server_override);
@@ -2184,7 +2216,7 @@ fn describe_found_or_missing(
 ) -> Value {
     let (Some(server_name), Some(tool_meta)) = (server_name, tool_meta) else {
         if let Some(disabled) = disabled_match {
-            return disabled_result("describe", &disabled);
+            return disabled_result(state, "describe", &disabled);
         }
         if let Some(failed) = failed_match {
             return server_backoff_result(state, "describe", &failed);
@@ -2281,7 +2313,7 @@ pub fn execute_list(state: &McpRuntime, server: &str) -> Value {
         );
     };
     if definition.is_disabled() {
-        return disabled_result("list", server);
+        return disabled_result(state, "list", server);
     }
     let metadata = state
         .tool_metadata
@@ -2415,7 +2447,7 @@ pub fn execute_instructions(state: &McpRuntime, server: &str) -> Value {
         );
     }
     if state.config.is_server_disabled(server) {
-        return disabled_result("instructions", server);
+        return disabled_result(state, "instructions", server);
     }
     // proxy-modes.ts:825 @ 10a45367: instructions for a server in backoff
     // report the backoff rather than cached text.
@@ -2461,7 +2493,7 @@ pub async fn execute_connect(state: &McpRuntime, server_name: &str) -> Value {
         );
     };
     if definition.is_disabled() {
-        return disabled_result("connect", server_name);
+        return disabled_result(state, "connect", server_name);
     }
 
     let current = state.manager.get_connection(server_name);
@@ -2544,6 +2576,7 @@ pub async fn run_tool_call(
     original_name: &str,
     args: Value,
     request_timeout: std::time::Duration,
+    tool_call_id: Option<&str>,
 ) -> Result<(Value, bool), crate::protocol::ProtocolError> {
     if let Some(uri) = resource_uri {
         client
@@ -2552,7 +2585,7 @@ pub async fn run_tool_call(
             .map(|value| (value, true))
     } else {
         client
-            .call_tool(original_name, args, request_timeout)
+            .call_tool(original_name, args, request_timeout, tool_call_id)
             .await
             .map(|value| (value, false))
     }
@@ -2578,14 +2611,17 @@ pub async fn execute_call(
     args: Option<serde_json::Map<String, Value>>,
     server_override: Option<&str>,
     native_tools: NativeToolsResolver,
+    tool_call_id: Option<&str>,
 ) -> Value {
     let prefix_mode = state.config.global_tool_prefix();
     // proxy-modes.ts:783-799 — identity keys sit between `error` and
     // `message` (upstream `{ mode, error, ...identity, message }`).
     let disabled_call_result = |disabled_server: &str, metadata: Option<&ToolMetadata>| -> Value {
-        let message = format!(
-            "Server \"{disabled_server}\" is disabled. Run /mcp enable {disabled_server} and /reload to enable it."
+        let reason = crate::project_trust::disabled_server_reason(
+            Some(&state.project_blocked),
+            disabled_server,
         );
+        let message = format!("Server \"{disabled_server}\" is {reason}");
         let mut ordered = serde_json::Map::new();
         ordered.insert("mode".to_string(), json!("call"));
         ordered.insert("error".to_string(), json!("server_disabled"));
@@ -2984,9 +3020,20 @@ pub async fn execute_call(
         );
     };
 
+    // #670 (c2eeb54 @ 5884ac4e): the successful-call identity carries the
+    // canonical (prefixed) tool name so the caller can activate the matching
+    // held-out search-mode tool.
     let call_identity = match &tool_meta.resource_uri {
-        Some(uri) => json!({ "server": server_name, "resourceUri": uri }),
-        None => json!({ "server": server_name, "tool": tool_meta.original_name }),
+        Some(uri) => json!({
+            "server": server_name,
+            "resourceUri": uri,
+            "canonicalTool": tool_meta.name,
+        }),
+        None => json!({
+            "server": server_name,
+            "tool": tool_meta.original_name,
+            "canonicalTool": tool_meta.name,
+        }),
     };
 
     let mut connection = state.manager.get_connection(&server_name);
@@ -3233,6 +3280,7 @@ pub async fn execute_call(
             &tool_meta.original_name,
             Value::Object(args.clone().unwrap_or_default()),
             request_timeout,
+            tool_call_id,
         )
         .await;
 
@@ -3264,6 +3312,7 @@ pub async fn execute_call(
                                 &tool_meta.original_name,
                                 Value::Object(args.clone().unwrap_or_default()),
                                 request_timeout,
+                                tool_call_id,
                             )
                             .await
                             .map_err(|e| e.to_string())
@@ -3289,6 +3338,7 @@ pub async fn execute_call(
                                                     &tool_meta.original_name,
                                                     Value::Object(args.clone().unwrap_or_default()),
                                                     request_timeout,
+                                                    tool_call_id,
                                                 )
                                                 .await
                                                 .map_err(|e| e.to_string());
@@ -3994,9 +4044,21 @@ impl ProxyDispatcher {
 
     /// The proxy tool's execute body (index.ts:720-839).
     pub async fn execute(self: &Arc<Self>, params: &Value, native_tools: &[String]) -> Value {
+        self.execute_with_call_id(params, native_tools, None).await
+    }
+
+    /// [`Self::execute`] with the Pi tool call id forwarded to `tools/call`
+    /// request `_meta` (#674).
+    pub async fn execute_with_call_id(
+        self: &Arc<Self>,
+        params: &Value,
+        native_tools: &[String],
+        tool_call_id: Option<String>,
+    ) -> Value {
         let owned = native_tools.to_vec();
         let resolver: NativeToolsResolver = Arc::new(move || owned.clone());
-        self.execute_with_resolver(params, resolver).await
+        self.execute_with_resolver(params, resolver, tool_call_id)
+            .await
     }
 
     /// V13-07 S3: `execute` with the native-tool list resolved LAZILY — the
@@ -4007,6 +4069,7 @@ impl ProxyDispatcher {
         self: &Arc<Self>,
         params: &Value,
         native_tools: NativeToolsResolver,
+        tool_call_id: Option<String>,
     ) -> Value {
         // args parsing (index.ts:735-756) — upstream throws; the ABI has no
         // throw channel, so the same message rides a normal result (TE-D04).
@@ -4134,7 +4197,44 @@ impl ProxyDispatcher {
 
         if let Some(tool) = params.get("tool").and_then(Value::as_str) {
             let server = params.get("server").and_then(Value::as_str);
-            return execute_call(&runtime, tool, parsed_args, server, native_tools).await;
+            let mut result = execute_call(
+                &runtime,
+                tool,
+                parsed_args,
+                server,
+                native_tools,
+                tool_call_id.as_deref(),
+            )
+            .await;
+            // #670 (c2eeb54, index.ts:1936-1955 @ 5884ac4e): a successful
+            // proxy call is as clear a signal as a search hit — activate the
+            // named held-out search-mode tool additively and report it.
+            // Failed calls carry details.error and activate nothing; the
+            // content is returned untouched.
+            let details = result.get("details");
+            let failed = details.and_then(|d| d.get("error")).is_some();
+            let call_server = details
+                .and_then(|d| d.get("server"))
+                .and_then(Value::as_str);
+            let canonical = details
+                .and_then(|d| d.get("canonicalTool"))
+                .and_then(Value::as_str);
+            let (Some(call_server), Some(canonical)) = (call_server, canonical) else {
+                return result;
+            };
+            if failed {
+                return result;
+            }
+            let added =
+                self.activate_search_matches(&[(call_server.to_string(), canonical.to_string())]);
+            if added.is_empty() {
+                return result;
+            }
+            if let Some(details) = result.get_mut("details").and_then(Value::as_object_mut) {
+                details.insert("activated".to_string(), json!(added));
+            }
+            result["addedToolNames"] = json!(added);
+            return result;
         }
         if let Some(connect) = params.get("connect").and_then(Value::as_str) {
             let mut result = execute_connect(&runtime, connect).await;
@@ -4310,7 +4410,10 @@ mod tests {
             Some(hints),
         );
         assert_eq!(entry.ttl_ms, None, "overlay entries strip the declared ttl");
-        assert_eq!(entry.cache_scope.as_deref(), Some("private"));
+        // #743 (TE46): upstream's session overlay also strips the session
+        // `cacheScope` — the live entry validates as a normal (non-private)
+        // entry; the persisted entry keeps its private scope.
+        assert_eq!(entry.cache_scope, None);
         // The stripped entry must validate for the live window (this is
         // exactly what `direct` specs consult).
         assert!(crate::cache::is_server_cache_valid(
@@ -4323,6 +4426,7 @@ mod tests {
         // the strip (not a validity change) is what keeps live tools.
         let mut persistent_shape = entry.clone();
         persistent_shape.ttl_ms = Some(0);
+        persistent_shape.cache_scope = Some("private".to_string());
         assert!(!crate::cache::is_server_cache_valid(
             &persistent_shape,
             &definition,

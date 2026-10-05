@@ -6,7 +6,7 @@
       "kind": "registration",
       "params": {
         "redirect_uris": [
-          "http://localhost:$port/callback"
+          "http://127.0.0.1:$port/callback"
         ],
         "client_name": "$client_name",
         "client_uri": "$client_uri",
@@ -26,7 +26,7 @@
       "params": {
         "response_type": "code",
         "client_id": "stub-dcr-client",
-        "redirect_uri": "http://localhost:$port/callback",
+        "redirect_uri": "http://127.0.0.1:$port/callback",
         "code_challenge": "$challenge",
         "code_challenge_method": "S256",
         "state": "$state"
@@ -37,7 +37,7 @@
       "params": {
         "grant_type": "authorization_code",
         "code": "$code",
-        "redirect_uri": "http://localhost:$port/callback",
+        "redirect_uri": "http://127.0.0.1:$port/callback",
         "client_id": "stub-dcr-client",
         "code_verifier": "$verifier",
         "client_secret": "stub-dcr-secret"

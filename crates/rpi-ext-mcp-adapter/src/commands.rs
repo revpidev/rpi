@@ -272,9 +272,35 @@ pub fn format_status_text(
     tool_metadata: &[(String, Vec<crate::metadata::ToolMetadata>)],
     failures: &crate::lifecycle::FailureTracker,
 ) -> String {
+    format_status_text_with_blocked(
+        config,
+        manager,
+        tool_metadata,
+        failures,
+        &crate::project_trust::BlockedServers::new(),
+    )
+}
+
+/// [`format_status_text`] with the #681 project trust gate results: a
+/// blocked server shows the block reason (`commands.ts:157-167 @ 5884ac4e`)
+/// instead of the generic disabled text.
+pub fn format_status_text_with_blocked(
+    config: &McpConfig,
+    manager: &crate::manager::McpServerManager,
+    tool_metadata: &[(String, Vec<crate::metadata::ToolMetadata>)],
+    failures: &crate::lifecycle::FailureTracker,
+    blocked: &crate::project_trust::BlockedServers,
+) -> String {
     let mut lines = vec!["MCP Server Status:".to_string(), String::new()];
 
     for (name, definition) in &config.mcp_servers {
+        if let Some(block) = blocked.get(name) {
+            lines.push(format!(
+                "⊘ {name}: {}",
+                crate::project_trust::describe_project_server_block(block.reason)
+            ));
+            continue;
+        }
         if definition.is_disabled() {
             lines.push(format!(
                 "⊘ {name}: disabled (run /mcp enable {name}, then /reload)"

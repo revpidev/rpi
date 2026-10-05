@@ -17,25 +17,16 @@ fn normalize_params(params: &serde_json::Map<String, Value>) -> Value {
         let normalized = match (key.as_str(), value) {
             ("code_challenge", Value::String(v)) if v.len() >= 40 => json!("$challenge"),
             ("state", Value::String(v)) if v.len() >= 8 => json!("$state"),
-            ("redirect_uri", Value::String(v)) => {
-                json!(v.replace(
-                    &format!("localhost:{}/", extract_port(v)),
-                    "localhost:$port/"
-                ))
-            }
+            // #715 (TE46): the default callback host is the 127.0.0.1 IP
+            // literal; explicit redirectUri values may still use localhost.
+            ("redirect_uri", Value::String(v)) => json!(normalize_callback_url(v, "$port")),
             ("code", Value::String(v)) if v == "stub-code" => json!("$code"),
             ("code_verifier", Value::String(v)) if v.len() >= 40 => json!("$verifier"),
-            ("resource", Value::String(v)) => json!(v.replace(
-                &format!("localhost:{}/", extract_port(v)),
-                "localhost:$asport/",
-            )),
+            ("resource", Value::String(v)) => json!(normalize_callback_url(v, "$asport")),
             ("redirect_uris", Value::Array(uris)) => json!(
                 uris.iter()
                     .map(|u| match u.as_str() {
-                        Some(s) => json!(s.replace(
-                            &format!("localhost:{}/", extract_port(s)),
-                            "localhost:$port/",
-                        )),
+                        Some(s) => json!(normalize_callback_url(s, "$port")),
                         None => u.clone(),
                     })
                     .collect::<Vec<_>>()
@@ -51,12 +42,17 @@ fn normalize_params(params: &serde_json::Map<String, Value>) -> Value {
     Value::Object(out)
 }
 
-fn extract_port(url: &str) -> String {
-    url.split("localhost:")
-        .nth(1)
-        .and_then(|rest| rest.split(['/', '?']).next())
-        .unwrap_or("0")
-        .to_string()
+/// Replace an ephemeral callback port with a marker, keeping the host
+/// (`localhost` or `127.0.0.1`) in the normalized value (#715, TE46).
+fn normalize_callback_url(url: &str, marker: &str) -> String {
+    for host in ["127.0.0.1", "localhost"] {
+        if let Some(rest) = url.split(&format!("{host}:")).nth(1)
+            && let Some(port) = rest.split(['/', '?']).next()
+        {
+            return url.replace(&format!("{host}:{port}"), &format!("{host}:{marker}"));
+        }
+    }
+    url.to_string()
 }
 
 #[tokio::main]

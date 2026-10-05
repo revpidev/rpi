@@ -780,8 +780,13 @@ async fn authenticate_client_credentials(
                     info.client_id.clone()
                 }
                 None => {
+                    // #715 (3d10b4c, mcp-oauth-provider.ts:13-17 @ 5884ac4e):
+                    // the default callback is the IP literal 127.0.0.1 per
+                    // RFC 8252 §7.3 (servers like Lovable reject
+                    // `localhost`). An explicit `oauth.redirectUri` still
+                    // binds exactly the host it names.
                     let default_redirect =
-                        format!("http://localhost:0{DEFAULT_OAUTH_CALLBACK_PATH}");
+                        format!("http://127.0.0.1:0{DEFAULT_OAUTH_CALLBACK_PATH}");
                     let (id, secret) =
                         register_client(metadata, server_name, &default_redirect, fetch).await?;
                     // Persist the registration so refreshes can use the
@@ -1119,7 +1124,8 @@ pub async fn authenticate_with_store(
     let redirect_uri = match &config.redirect_uri {
         Some(uri) if uri.contains("{port}") => uri.replace("{port}", &actual_port.to_string()),
         Some(uri) => uri.clone(),
-        None => format!("http://localhost:{actual_port}{DEFAULT_OAUTH_CALLBACK_PATH}"),
+        // #715 (3d10b4c): IP-literal default callback (see the DCR default).
+        None => format!("http://127.0.0.1:{actual_port}{DEFAULT_OAUTH_CALLBACK_PATH}"),
     };
 
     // Client identity ladder (#571 + #503 + stored-DCR reuse, ordered as

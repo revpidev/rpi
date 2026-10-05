@@ -181,15 +181,24 @@ impl StdioChild {
         incoming: mpsc::UnboundedSender<Value>,
         env: Vec<(String, String)>,
     ) -> Result<Arc<Self>, ProtocolError> {
+        // #661 (ce74163, server-manager.ts:1045-1060 @ 5884ac4e): stdio
+        // command/args/cwd support a leading home marker — command via
+        // `resolveConfigPath` (interpolate + expand), each arg via
+        // `expandHomePath(interpolateEnvVars(arg))`.
         let command = definition
             .get_str("command")
             .filter(|c| !c.is_empty())
             .ok_or_else(|| ProtocolError::Transport("missing command".to_string()))?;
+        let command = crate::utils::expand_home_path(&crate::utils::interpolate_env_vars(command))
+            .unwrap_or_else(|| command.to_string());
         let args: Vec<String> = match definition.get("args") {
             Some(Value::Array(list)) => list
                 .iter()
                 .filter_map(Value::as_str)
-                .map(crate::utils::interpolate_env_vars)
+                .map(|arg| {
+                    crate::utils::expand_home_path(&crate::utils::interpolate_env_vars(arg))
+                        .unwrap_or_else(|| arg.to_string())
+                })
                 .collect(),
             _ => Vec::new(),
         };
@@ -199,7 +208,7 @@ impl StdioChild {
             .or_else(|| default_cwd.map(str::to_string));
         let debug = definition.get("debug") == Some(&Value::Bool(true));
 
-        let mut cmd = Command::new(command);
+        let mut cmd = Command::new(&command);
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

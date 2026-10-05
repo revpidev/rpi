@@ -209,17 +209,30 @@ pub fn resolve_config_path(value: Option<&Value>) -> Result<Option<String>, Adap
             "config path value must be a string".to_string(),
         ));
     };
-    let resolved = interpolate_env_vars(raw);
-    if resolved == "~" {
-        return Ok(home_dir().map(|h| h.to_string_lossy().into_owned()));
+    Ok(expand_home_path(&interpolate_env_vars(raw)))
+}
+
+/// `expandHomePath` (#661, ce74163; utils.ts:258-268 @ 5884ac4e): expand a
+/// leading home-directory marker without interpolating environment
+/// variables. `~` alone becomes the home directory; `~/...` joins the
+/// suffix. The Windows `~\` form is accepted on Windows only — on POSIX a
+/// backslash stays a literal filename character. `None` when the home
+/// directory is unresolvable (upstream `os.homedir()` never is, but rpi's
+/// env-only resolver can be).
+pub fn expand_home_path(value: &str) -> Option<String> {
+    if value == "~" {
+        return home_dir().map(|h| h.to_string_lossy().into_owned());
     }
-    if let Some(rest) = resolved
+    #[cfg(windows)]
+    let rest = value
         .strip_prefix("~/")
-        .or_else(|| resolved.strip_prefix("~\\"))
-    {
-        return Ok(home_dir().map(|h| h.join(rest).to_string_lossy().into_owned()));
+        .or_else(|| value.strip_prefix("~\\"));
+    #[cfg(not(windows))]
+    let rest = value.strip_prefix("~/");
+    match rest {
+        Some(rest) => home_dir().map(|h| h.join(rest).to_string_lossy().into_owned()),
+        None => Some(value.to_string()),
     }
-    Ok(Some(resolved))
 }
 
 /// `os.homedir()` equivalent, restricted to process env (unix: `HOME`,

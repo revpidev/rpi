@@ -105,13 +105,18 @@ async fn stdio_full_flow_frame_sequence_and_calls() {
 
     let client = connection.client.clone().expect("client");
     let result = client
-        .call_tool("echo", json!({ "query": "hello" }), Duration::from_secs(5))
+        .call_tool(
+            "echo",
+            json!({ "query": "hello" }),
+            Duration::from_secs(5),
+            None,
+        )
         .await
         .expect("call");
     assert_eq!(result["content"][0]["text"], json!("hello"));
 
     let result = client
-        .call_tool("fail", json!({}), Duration::from_secs(5))
+        .call_tool("fail", json!({}), Duration::from_secs(5), None)
         .await
         .expect("call");
     assert_eq!(result["isError"], json!(true));
@@ -166,6 +171,74 @@ async fn stdio_connection_failure_includes_stderr_tail() {
         error.to_string().contains("fixture-boom-line"),
         "error should carry the stderr tail: {error}"
     );
+}
+
+/// #674 (4b7e310 @ 5884ac4e): the calling Pi tool call id rides the
+/// `tools/call` request `_meta` under `rpi-mcp-adapter/toolCallId`
+/// ([VARIANT]: upstream key `pi-mcp-adapter/toolCallId`).
+#[tokio::test]
+async fn stdio_tool_call_id_is_forwarded_in_request_meta() {
+    let dir = temp_dir("call-id");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    let entry = ServerEntry(
+        json!({
+            "command": fixture_server_exe().to_string_lossy(),
+            "env": {
+                "RPI_MCP_FIXTURE_LOG": log.to_string_lossy(),
+                "RPI_MCP_FIXTURE_LOG_FRAMES": "1",
+                "RPI_MCP_FIXTURE_PID": pid.to_string_lossy(),
+            },
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+    );
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let connection = manager.connect("fixture", &entry).await.expect("connect");
+    let client = connection.client.clone().expect("client");
+    client
+        .call_tool(
+            "echo",
+            json!({ "query": "id" }),
+            Duration::from_secs(5),
+            Some("call-abc"),
+        )
+        .await
+        .expect("call");
+    // Without an id, no `_meta` is added (the request stays byte-identical
+    // to the pre-#674 shape).
+    client
+        .call_tool(
+            "echo",
+            json!({ "query": "no-id" }),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .expect("call");
+
+    let frames = std::fs::read_to_string(&log).expect("frame log");
+    let calls: Vec<Value> = frames
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("tools/call"))
+        .collect();
+    assert_eq!(calls.len(), 2, "two tools/call frames recorded: {frames}");
+    assert_eq!(
+        calls[0]["params"]["_meta"]["rpi-mcp-adapter/toolCallId"],
+        json!("call-abc")
+    );
+    assert!(
+        calls[1]["params"].get("_meta").is_none(),
+        "a call without an id adds no _meta: {}",
+        calls[1]
+    );
+
+    manager.close_all().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_alive(&pid), "fixture child must be reaped (G4)");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ----------------------------------------------------------------- lifecycle
@@ -304,6 +377,22 @@ async fn proxy_end_to_end_five_modes() {
 
     std::panic::AssertUnwindSafe(async {
         let dispatcher = Arc::new(proxy::ProxyDispatcher::new());
+        // #681 (TE46): a project-scope config needs a session trust gate —
+        // this test drives init directly (no session_start), so it installs
+        // the approved-trusted gate the host binding would build.
+        {
+            let loaded = rpi_ext_mcp_adapter::config::load_mcp_config_with_sources(
+                None,
+                &project,
+            );
+            rpi_ext_mcp_adapter::project_trust::set_session_gate(
+                &project,
+                rpi_ext_mcp_adapter::project_trust::TrustResult {
+                    config: loaded.config,
+                    blocked: std::collections::HashMap::new(),
+                },
+            );
+        }
         dispatcher.start_init(project.clone(), None);
 
         // status: not connected yet (lazy default), cached after bootstrap
@@ -405,6 +494,7 @@ async fn proxy_end_to_end_five_modes() {
             .execute_with_resolver(
                 &json!({ "tool": "fixture_echo", "args": { "query": "lazy" } }),
                 resolver.clone(),
+                None,
             )
             .await;
         assert_eq!(lazy["content"][0]["text"], json!("lazy"), "{lazy}");
@@ -414,7 +504,7 @@ async fn proxy_end_to_end_five_modes() {
             "known-tool dispatch must pay zero getAllTools host calls"
         );
         let missing = dispatcher
-            .execute_with_resolver(&json!({ "tool": "no_such_tool_xyz" }), resolver.clone())
+            .execute_with_resolver(&json!({ "tool": "no_such_tool_xyz" }), resolver.clone(), None)
             .await;
         assert_eq!(
             missing["details"]["error"],
@@ -1002,6 +1092,19 @@ async fn direct_tools_resolve_execute_and_sync() {
 
     std::panic::AssertUnwindSafe(async {
         let dispatcher = Arc::new(proxy::ProxyDispatcher::new());
+        // #681 (TE46): a project-scope config needs a session trust gate —
+        // this test drives init directly (no session_start), so it installs
+        // the approved-trusted gate the host binding would build.
+        {
+            let loaded = rpi_ext_mcp_adapter::config::load_mcp_config_with_sources(None, &project);
+            rpi_ext_mcp_adapter::project_trust::set_session_gate(
+                &project,
+                rpi_ext_mcp_adapter::project_trust::TrustResult {
+                    config: loaded.config,
+                    blocked: std::collections::HashMap::new(),
+                },
+            );
+        }
         dispatcher.start_init(project.clone(), None);
         let runtime = dispatcher
             .current_direct()
@@ -1121,6 +1224,69 @@ async fn direct_tools_resolve_execute_and_sync() {
                 .and_then(|d| d.get("addedToolNames"))
                 .is_none(),
             "the old details.addedToolNames position must stay gone"
+        );
+
+        // #670 (c2eeb54): a successful proxy call activates the named
+        // search-mode tool additively; a failing call activates nothing.
+        type ActivatedLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+        let activated: ActivatedLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let activated_hook = activated.clone();
+        dispatcher.set_hooks(rpi_ext_mcp_adapter::proxy::DispatcherHooks {
+            on_search_activations: Some(Arc::new(move |matches: &[(String, String)]| {
+                activated_hook
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(matches.to_vec());
+                matches.iter().map(|(_, name)| name.clone()).collect()
+            })),
+            ..Default::default()
+        });
+        let call = dispatcher
+            .execute(
+                &json!({ "tool": "fixture_echo", "args": { "query": "pong" } }),
+                &[],
+            )
+            .await;
+        assert_eq!(call["details"]["server"], json!("fixture"), "{call}");
+        assert!(
+            call["details"]["canonicalTool"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("echo"),
+            "canonicalTool rides the call identity: {call}"
+        );
+        let recorded = activated.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "one successful-call activation: {recorded:?}"
+        );
+        assert_eq!(recorded[0][0].0, "fixture");
+        let added = call["addedToolNames"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(added.len(), 1, "activated list rides the result: {call}");
+        assert_eq!(
+            call["details"]["activated"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            added
+        );
+
+        let failed = dispatcher
+            .execute(&json!({ "tool": "fixture_fail" }), &[])
+            .await;
+        assert_eq!(failed["details"]["error"], json!("tool_error"));
+        assert!(
+            failed.get("addedToolNames").is_none(),
+            "a failing call activates nothing: {failed}"
+        );
+        assert_eq!(
+            activated.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "the failing call must not reach the activation hook"
         );
 
         dispatcher.shutdown().await;

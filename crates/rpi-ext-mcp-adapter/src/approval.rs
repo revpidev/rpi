@@ -32,6 +32,10 @@ pub const MCP_TOOL_APPROVAL_REQUEST_EVENT: &str = "rpi-mcp-adapter:tool-approval
 pub enum ApprovalDecision {
     AllowOnce,
     AllowForSession,
+    /// #628 (4becf97 @ 5884ac4e): "Allow server for this session" — every
+    /// tool/argument on this server, including tools discovered later.
+    /// In-memory only: never persisted to session entries.
+    AllowServerForSession,
     Deny,
     Abstain,
 }
@@ -75,6 +79,11 @@ pub trait ApprovalHandler: Send + Sync {
 #[derive(Default)]
 pub struct ApprovalCache {
     approved: Mutex<HashSet<String>>,
+    /// #628 (4becf97): runtime-only server-wide grants. Memory-only by
+    /// design — reload/session replacement clears them (the cache lives on
+    /// the per-init runtime) and a changed server definition never matches
+    /// because the runtime config is rebuilt.
+    approved_servers: Mutex<HashSet<String>>,
     sink: Mutex<Option<Arc<dyn SessionApprovalSink>>>,
 }
 
@@ -128,6 +137,22 @@ impl ApprovalCache {
         true
     }
 
+    /// #628: record a server-wide session grant (never persisted).
+    pub fn grant_server(&self, server_name: &str) {
+        self.approved_servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server_name.to_string());
+    }
+
+    /// #628: whether the whole server is approved for this runtime.
+    pub fn is_server_approved(&self, server_name: &str) -> bool {
+        self.approved_servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(server_name)
+    }
+
     /// `restoreSessionApprovalState` (session-approvals.ts:178-199 @ 928c30c):
     /// clear, then replay the branch entries (idempotent rebuild).
     pub fn restore(&self, entries: &[SessionApprovalEntry]) {
@@ -137,9 +162,13 @@ impl ApprovalCache {
         approved.extend(keys);
     }
 
-    /// Clear all session approvals.
+    /// Clear all session approvals (including the #628 server-wide grants).
     pub fn clear(&self) {
         self.approved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.approved_servers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -400,6 +429,15 @@ where
 {
     let identity = get_tool_approval_identity(server_name, tool, args);
 
+    // #628 (4becf97, tool-approval.ts:104-165 @ 5884ac4e): a runtime-wide
+    // server approval permits every tool and argument on that server,
+    // including tools discovered later. It is checked before the per-tool
+    // identity gate; broker denials still win (a broker that answers first
+    // is consulted below and may deny).
+    if cache.is_server_approved(server_name) {
+        return ToolCallApprovalResult::Ok;
+    }
+
     // #536 (45757f5, tool-approval.ts ensureToolCallApproved @ 97435aab):
     // approval BROKERS are consulted BEFORE the session-grant cache — a
     // broker's allow/deny must win over an earlier session grant (the
@@ -409,6 +447,10 @@ where
             ApprovalDecision::AllowOnce => return ToolCallApprovalResult::Ok,
             ApprovalDecision::AllowForSession => {
                 cache.grant_session(server_name, &tool.original_name, &identity);
+                return ToolCallApprovalResult::Ok;
+            }
+            ApprovalDecision::AllowServerForSession => {
+                cache.grant_server(server_name);
                 return ToolCallApprovalResult::Ok;
             }
             ApprovalDecision::Deny => return ToolCallApprovalResult::Denied,
@@ -434,6 +476,10 @@ where
         ApprovalDecision::AllowOnce => ToolCallApprovalResult::Ok,
         ApprovalDecision::AllowForSession => {
             cache.grant_session(server_name, &tool.original_name, &identity);
+            ToolCallApprovalResult::Ok
+        }
+        ApprovalDecision::AllowServerForSession => {
+            cache.grant_server(server_name);
             ToolCallApprovalResult::Ok
         }
         ApprovalDecision::Deny | ApprovalDecision::Abstain => ToolCallApprovalResult::Denied,
@@ -912,6 +958,77 @@ mod tests {
         assert_eq!(other, ToolCallApprovalResult::ApprovalRequiredHeadless);
         assert_eq!(cache.len(), 1);
         assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+
+    /// #628 (4becf97, tool-approval.ts @ 5884ac4e): "Allow server for this
+    /// session" approves every tool and argument combination on that server
+    /// (including a different tool), stays memory-only (no session entry),
+    /// never leaks to another server, and clears with the cache.
+    #[test]
+    fn server_wide_session_approval_is_memory_only_and_server_scoped() {
+        let mut config = config_with_approval(Some(json!(true)));
+        config
+            .mcp_servers
+            .insert("other".to_string(), server_entry(Some(json!(true))));
+        let cache = ApprovalCache::new();
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        cache.set_sink(sink.clone());
+
+        let handler = FixedHandler(ApprovalDecision::AllowServerForSession);
+        let first = ensure_tool_call_approved(
+            &config,
+            &cache,
+            "demo",
+            &tool(),
+            &json!({ "q": "a" }),
+            ApprovalOrigin::Proxy,
+            None,
+            Some(&handler),
+            no_context,
+        );
+        assert_eq!(first, ToolCallApprovalResult::Ok);
+        assert!(cache.is_server_approved("demo"));
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "server-wide grants are never persisted to session entries"
+        );
+
+        // A different tool and different arguments on the same server pass
+        // without another dialog.
+        let mut other_tool = tool();
+        other_tool.original_name = "write".to_string();
+        let second = ensure_tool_call_approved(
+            &config,
+            &cache,
+            "demo",
+            &other_tool,
+            &json!({ "x": 1 }),
+            ApprovalOrigin::Direct,
+            None,
+            None,
+            no_context,
+        );
+        assert_eq!(second, ToolCallApprovalResult::Ok);
+
+        // Another server stays gated.
+        let other_server = ensure_tool_call_approved(
+            &config,
+            &cache,
+            "other",
+            &tool(),
+            &json!({}),
+            ApprovalOrigin::Proxy,
+            None,
+            None,
+            no_context,
+        );
+        assert_eq!(
+            other_server,
+            ToolCallApprovalResult::ApprovalRequiredHeadless
+        );
+
+        cache.clear();
+        assert!(!cache.is_server_approved("demo"));
     }
 
     /// A10: headless matching calls fail closed; UI decisions map to the

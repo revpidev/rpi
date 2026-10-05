@@ -170,8 +170,11 @@ async fn command_wiring_end_to_end() {
 
     // Fixture config: one lazy server, one disabled server, one OAuth HTTP
     // server. No eager/keep-alive server, so init performs no connections.
+    // TE46 #681: the fixture lives in the GLOBAL layer — project-scope
+    // servers are trust-gated at session_start, which this command-surface
+    // test does not drive (the gate has its own integration test below).
     std::fs::write(
-        dir.join(".mcp.json"),
+        agent_dir.join("mcp.json"),
         serde_json::to_string_pretty(&json!({
             "mcpServers": {
                 "demo": { "command": "node", "lifecycle": "lazy" },
@@ -185,7 +188,7 @@ async fn command_wiring_end_to_end() {
         }))
         .expect("json"),
     )
-    .expect("write .mcp.json");
+    .expect("write global mcp.json");
 
     // Isolation: config discovery + metadata cache + direct-tools env.
     let saved_home = std::env::var_os("HOME");

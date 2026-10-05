@@ -41,12 +41,12 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..");
 // Default = the submodule worktree, which since the TE27 pin switch IS
-// v2.34.0+9 (97435aab since TE40; was 10a45367 across v0.1.4-TE27..v0.1.5-TE40).
+// v4.0.0 (5884ac4e since TE46; 97435aab across v0.1.5-TE40..v0.1.6-TE45).
 // The pre-switch regression track (old pin 3d953f90)
 // ended its lifecycle there; driving it now requires checking out the old
 // pin manually.
 const UPSTREAM = process.env.RPI_MCP_PARITY_UPSTREAM ?? join(REPO, "external", "pi-mcp-adapter");
-const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "97435aab";
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "5884ac4e"; // TE46 pin switch (v4.0.0)
 const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
 const CARGO = process.env.RPI_MCP_PARITY_CARGO ?? "cargo";
 

@@ -174,8 +174,11 @@ async fn resume_rebinds_second_host_and_republishes_status() {
 
     // 单个 lazy 服务器：未连接也显示 "🔌 MCP: 1 server enabled"（用户
     // 报告的原文），且不会触发 load-time prewarm。
+    // TE46 #681/#714: load-time prewarm/early discovery only sees the GLOBAL
+    // layer; the fixture lives in the agent-dir mcp.json (the trust gate has
+    // its own integration test).
     std::fs::write(
-        dir.join(".mcp.json"),
+        agent_dir.join("mcp.json"),
         serde_json::to_string_pretty(&json!({
             "mcpServers": {
                 "demo": { "url": "http://127.0.0.1:9/mcp" }

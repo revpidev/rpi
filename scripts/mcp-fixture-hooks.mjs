@@ -18,6 +18,9 @@ const here = new URL(".", import.meta.url);
 const STUBS = {
   zod: new URL("mcp-fixture-stub-zod.mjs", here).href,
   "smol-toml": new URL("mcp-fixture-stub-smol-toml.mjs", here).href,
+  // v4.0.0: config.ts -> jev-client.ts imports the TypeSafe SDK; only the
+  // import surface is needed by the pure config fixtures (TE46 rebase).
+  "@typesafe-ai/sdk": new URL("mcp-fixture-stub-typesafe-ai.mjs", here).href,
 };
 
 // Set by the generator before `module.register()`.

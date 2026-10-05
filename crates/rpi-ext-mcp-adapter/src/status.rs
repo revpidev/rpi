@@ -31,6 +31,9 @@ pub enum ServerRuntimeStatus {
     #[serde(rename = "not-connected")]
     NotConnected,
     Disabled,
+    /// #681 (5d645df, types.ts @ 5884ac4e): a project-scope server blocked
+    /// by the trust gate (untrusted / approval-required / denied).
+    Blocked,
 }
 
 /// `McpServerStatusSnapshot` (types.ts:28-35).
@@ -47,6 +50,9 @@ pub struct ServerStatusSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_ago_seconds: Option<u64>,
     pub disabled: bool,
+    /// Present only for `blocked` servers (mcp-status.ts:68 @ 5884ac4e).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
 }
 
 /// `McpStatusSnapshot` (types.ts:37-44).
@@ -234,6 +240,29 @@ pub fn create_mcp_status_snapshot(
     resource_counts: &[(String, usize)],
     failure_tracker: &[(String, u64)],
 ) -> McpStatusSnapshot {
+    create_mcp_status_snapshot_with_blocked(
+        config,
+        manager,
+        tool_metadata,
+        direct_tool_counts,
+        resource_counts,
+        failure_tracker,
+        &crate::project_trust::BlockedServers::new(),
+    )
+}
+
+/// [`create_mcp_status_snapshot`] with the #681 project trust gate results:
+/// a blocked server reports `status: "blocked"` + `blockedReason` and
+/// counts as disabled.
+pub fn create_mcp_status_snapshot_with_blocked(
+    config: &McpConfig,
+    manager: &McpServerManager,
+    tool_metadata: &[(String, usize)],
+    direct_tool_counts: &[(String, usize)],
+    resource_counts: &[(String, usize)],
+    failure_tracker: &[(String, u64)],
+    blocked: &crate::project_trust::BlockedServers,
+) -> McpStatusSnapshot {
     let mut servers = Vec::new();
     let mut total_tools = 0u64;
     let mut total_resources = 0u64;
@@ -323,7 +352,13 @@ pub fn create_mcp_status_snapshot(
             }
         };
 
-        let status = if disabled {
+        let blocked_reason = blocked.get(name).map(|block| {
+            crate::project_trust::describe_project_server_block(block.reason).to_string()
+        });
+        let status = if blocked_reason.is_some() {
+            disabled_count += 1;
+            ServerRuntimeStatus::Blocked
+        } else if disabled {
             disabled_count += 1;
             ServerRuntimeStatus::Disabled
         } else if connected {
@@ -360,6 +395,7 @@ pub fn create_mcp_status_snapshot(
                 None
             },
             disabled,
+            blocked_reason,
         });
     }
 
@@ -465,6 +501,7 @@ mod tests {
                 resource_count: Some(2),
                 failed_ago_seconds: None,
                 disabled: false,
+                blocked_reason: None,
             }],
             total_tools: 5,
             total_resources: 2,

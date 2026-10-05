@@ -113,6 +113,15 @@ pub fn get_project_rpi_config_path(cwd: &Path) -> PathBuf {
     cwd.join(PROJECT_RPI_CONFIG_NAME)
 }
 
+/// `ConfigSourceSpec.scope` (config.ts:84-93 @ 5884ac4e): global sources
+/// define machine-wide servers; project sources are the trust-gated layer
+/// (#681).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    Global,
+    Project,
+}
+
 /// One discovery source (upstream `ConfigSourceSpec`, config.ts:84-93). Only
 /// the fields the P0 loader needs are modeled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +129,7 @@ pub struct ConfigSource {
     pub id: &'static str,
     pub read_path: PathBuf,
     pub write_path: PathBuf,
+    pub scope: ConfigScope,
 }
 
 /// `getConfigSources` (config.ts:389-457): the six sources in ascending
@@ -142,6 +152,7 @@ pub fn get_config_sources(override_path: Option<&str>, cwd: &Path) -> Vec<Config
             id: "shared-global",
             read_path: generic_global.clone(),
             write_path: user_path.clone(),
+            scope: ConfigScope::Global,
         });
     }
     for (index, agents_path) in AGENTS_GLOBAL_CONFIG_PATHS.iter().enumerate() {
@@ -157,12 +168,14 @@ pub fn get_config_sources(override_path: Option<&str>, cwd: &Path) -> Vec<Config
             },
             read_path: agents_path,
             write_path: user_path.clone(),
+            scope: ConfigScope::Global,
         });
     }
     sources.push(ConfigSource {
         id: "rpi-global", // upstream id: "pi-global"
         read_path: user_path.clone(),
         write_path: user_path.clone(),
+        scope: ConfigScope::Global,
     });
     // #556 (f0b83bc, config.ts getConfigSources @ 97435aab): opt-in
     // ancestor project config roots sit between the user-global sources and
@@ -364,6 +377,7 @@ fn ancestor_sources(
                     id,
                     read_path: path.clone(),
                     write_path: path,
+                    scope: ConfigScope::Project,
                 },
             );
         }
@@ -400,6 +414,7 @@ fn sources_extend_project(
             id: "shared-project",
             read_path: project_path.clone(),
             write_path: project_path.clone(),
+            scope: ConfigScope::Project,
         });
     }
     if project_rpi_path != user_path && project_rpi_path != project_path {
@@ -407,6 +422,7 @@ fn sources_extend_project(
             id: "rpi-project", // upstream id: "pi-project"
             read_path: project_rpi_path.clone(),
             write_path: project_rpi_path,
+            scope: ConfigScope::Project,
         });
     }
     sources
@@ -515,7 +531,14 @@ fn blank_trailing_commas(raw: &str) -> String {
 
 /// `parseJsonConfig` (config.ts:577-579).
 pub fn parse_json_config(raw: &str) -> Result<Value, serde_json::Error> {
-    serde_json::from_str(&strip_json_comments(raw))
+    serde_json::from_str(&strip_json_comments(strip_utf8_bom(raw)))
+}
+
+/// `stripUtf8Bom` (#697, 1416386; utils.ts:9-11 @ 5884ac4e): a config file
+/// saved by an editor with a UTF-8 BOM still parses. `stripJsonComments`
+/// alone would leave the BOM in front of the first token and fail.
+pub fn strip_utf8_bom(raw: &str) -> &str {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw)
 }
 
 /// `validateConfig` (config.ts:640-650): non-record roots become an empty
@@ -849,12 +872,111 @@ pub fn write_shared_config_text(path: &Path, text: &str) -> Result<(), crate::er
 /// and Agent Plugin layers are not expanded here (VARIANT / P2); `imports`
 /// survives on the returned config.
 pub fn load_mcp_config(override_path: Option<&str>, cwd: &Path) -> McpConfig {
+    load_mcp_config_with_sources(override_path, cwd).config
+}
+
+/// Where a project-scope server was defined (`ProjectServerSource`,
+/// types.ts): the trust prompt names the config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectServerSource {
+    pub path: String,
+}
+
+/// `settings.projectServers` policy (`ProjectServerPolicy`): only the
+/// user-global sources may set it; a project file that tries is ignored with
+/// a warning (config.ts:452-460 @ 5884ac4e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectServerPolicy {
+    #[default]
+    Ask,
+    Allow,
+}
+
+/// `loadMcpConfigWithSources` (config.ts:424-511 @ 5884ac4e) reduced to the
+/// rpi layers: fold the six sources and record which servers came from a
+/// PROJECT-scope source (plus the global `settings.projectServers` policy)
+/// for the #681 trust gate. `imports` are parsed but not expanded (P0
+/// [VARIANT]); the Claude-plugin/package/agent-plugin layers are P2/absent.
+pub struct LoadedMcpConfig {
+    pub config: McpConfig,
+    pub project_servers: IndexMap<String, ProjectServerSource>,
+    pub project_server_policy: ProjectServerPolicy,
+}
+
+pub fn load_mcp_config_with_sources(override_path: Option<&str>, cwd: &Path) -> LoadedMcpConfig {
     let mut config = McpConfig::default();
+    let mut project_servers: IndexMap<String, ProjectServerSource> = IndexMap::new();
+    let mut project_server_policy = ProjectServerPolicy::Ask;
     for source in get_config_sources(override_path, cwd) {
         let Some(loaded) = read_validated_config(&source.read_path) else {
             continue;
         };
+        let mut loaded = loaded;
+        match source.scope {
+            ConfigScope::Project => {
+                // Every server this project source defines is project-scoped,
+                // even when a later higher-precedence source overrides its
+                // fields (config.ts:452-456 @ 5884ac4e).
+                for name in loaded.mcp_servers.keys() {
+                    project_servers.insert(
+                        name.clone(),
+                        ProjectServerSource {
+                            path: source.read_path.display().to_string(),
+                        },
+                    );
+                }
+                if let Some(settings) = loaded.settings.as_mut()
+                    && settings.remove("projectServers").is_some()
+                {
+                    warn!(
+                        path = %source.read_path.display(),
+                        "Ignoring settings.projectServers in project config; set it in the user-global MCP config instead"
+                    );
+                }
+            }
+            ConfigScope::Global => {
+                if let Some(policy) = loaded
+                    .settings
+                    .as_ref()
+                    .and_then(|settings| settings.get("projectServers"))
+                    .and_then(Value::as_str)
+                {
+                    match policy {
+                        "allow" => project_server_policy = ProjectServerPolicy::Allow,
+                        "ask" => project_server_policy = ProjectServerPolicy::Ask,
+                        _ => {}
+                    }
+                }
+            }
+        }
         config = merge_configs(&config, &loaded);
+    }
+    LoadedMcpConfig {
+        config: apply_setting_defaults(config),
+        project_servers,
+        project_server_policy,
+    }
+}
+
+/// `applySettingDefaults` (#636, d417fb8; config.ts:532-544 @ 5884ac4e): a
+/// global `settings.exposeResources` becomes the per-server default for
+/// every entry that does not set the key itself. Applied at the end of the
+/// load fold; explicit per-server values always win.
+fn apply_setting_defaults(mut config: McpConfig) -> McpConfig {
+    let Some(global) = config
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.get("exposeResources"))
+        .cloned()
+    else {
+        return config;
+    };
+    for entry in config.mcp_servers.values_mut() {
+        if !entry.as_map().contains_key("exposeResources") {
+            entry
+                .as_map_mut()
+                .insert("exposeResources".to_string(), global.clone());
+        }
     }
     config
 }

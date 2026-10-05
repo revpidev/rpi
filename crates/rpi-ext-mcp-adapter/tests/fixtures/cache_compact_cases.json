@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/metadata-cache.ts:78 @ 10a45367 saveMetadataCache write path (JSON.stringify merged), executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/metadata-cache.ts:78 @ 5884ac4e saveMetadataCache write path (JSON.stringify merged), executed by gen-mcp-adapter-fixtures.mjs",
   "merged": {
     "version": 1,
     "servers": {

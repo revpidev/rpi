@@ -39,13 +39,19 @@ register(pathToFileURL(join(fileURLToPath(import.meta.url), "..", "parity-hooks.
 const normalizeMap = {
   code_challenge: (v) => (typeof v === "string" && v.length >= 40 ? "$challenge" : v),
   state: (v) => (typeof v === "string" && v.length >= 8 ? "$state" : v),
+  // #715 (TE46): the default callback host is the 127.0.0.1 IP literal now
+  // (an explicit oauth.redirectUri may still use localhost), so the port
+  // marker accepts both hosts and keeps the host in the normalized value.
   redirect_uri: (v) =>
-    typeof v === "string" ? v.replace(/localhost:\d+/, "localhost:$port") : v,
+    typeof v === "string" ? v.replace(/(localhost|127\.0\.0\.1):\d+/, "$1:$port") : v,
   code: (v) => (v === "stub-code" ? "$code" : v),
   code_verifier: (v) => (typeof v === "string" && v.length >= 40 ? "$verifier" : v),
-  resource: (v) => (typeof v === "string" ? v.replace(/localhost:\d+/, "localhost:$asport") : v),
+  resource: (v) =>
+    typeof v === "string" ? v.replace(/(localhost|127\.0\.0\.1):\d+/, "$1:$asport") : v,
   redirect_uris: (v) =>
-    Array.isArray(v) ? v.map((u) => String(u).replace(/localhost:\d+/, "localhost:$port")) : v,
+    Array.isArray(v)
+      ? v.map((u) => String(u).replace(/(localhost|127\.0\.0\.1):\d+/, "$1:$port"))
+      : v,
   // O1 brand exemption (design §6): upstream registers as "Pi Coding Agent"
   // with the adapter repo as client_uri; rpi uses its own product identity.
   client_name: () => "$client_name",

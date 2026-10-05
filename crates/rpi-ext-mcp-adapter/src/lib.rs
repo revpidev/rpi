@@ -30,6 +30,7 @@ pub mod lifecycle;
 pub mod manager;
 pub mod metadata;
 pub mod oauth;
+pub mod project_trust;
 pub mod protocol;
 pub mod proxy;
 pub mod render;
@@ -113,6 +114,9 @@ struct DirectSurface {
     /// `proxyToolDescription`): `syncProxyTool` re-registers when the pure
     /// description changes (R7.2.5.1/#432).
     proxy_description: Option<String>,
+    /// #634 (60aa1c6): the large direct-tools advisory is delivered once per
+    /// session (`session_start` resets it).
+    advisory_delivered: bool,
     /// #484/#502: per-server direct-tool counts from the last sync and the
     /// connect-scoped addedToolNames (each server's discovery names are
     /// consumed once; deactivation re-opens the report).
@@ -194,6 +198,58 @@ impl crate::direct::ToolSurface for HostSurface<'_> {
     }
 }
 
+/// Load-time config (no ExtensionContext yet): project-scope servers are
+/// excluded entirely (#714, 4ed656e; `excludeProjectServersAtLoadTime`),
+/// so a load-time prewarm can never run an untrusted project server.
+fn load_load_time_config(config_path: Option<&str>, cwd: &std::path::Path) -> metadata::McpConfig {
+    crate::project_trust::exclude_project_servers_at_load_time(
+        &config::load_mcp_config_with_sources(config_path, cwd),
+    )
+}
+
+/// `applyProjectServerTrust` host binding (#681, 5d645df +
+/// #709/#688/#701): resolve the session's trust context through the host
+/// channel and run the per-server gate. The UI confirm blocks the calling
+/// thread (the host answers the synchronous `ui.confirm` call).
+fn build_session_trust_gate(
+    state: &PluginState,
+    cwd: &std::path::Path,
+    config_path: Option<&str>,
+) -> crate::project_trust::TrustResult {
+    let loaded = config::load_mcp_config_with_sources(config_path, cwd);
+    if loaded.project_servers.is_empty() {
+        return crate::project_trust::TrustResult {
+            config: loaded.config,
+            blocked: crate::project_trust::BlockedServers::new(),
+        };
+    }
+    let channel = state.channel();
+    let calls = channel.calls();
+    let has_ui = host_call_ok(&calls, channel.cookie, "ctx.hasUI", json!({}))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let trusted = host_call_ok(&calls, channel.cookie, "ctx.isProjectTrusted", json!({}))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let project_root = crate::project_trust::project_approval_scope(&cwd.to_string_lossy());
+    crate::project_trust::apply_project_server_trust(
+        &loaded,
+        &project_root,
+        trusted,
+        has_ui,
+        |title, message| {
+            host_call_ok(
+                &calls,
+                channel.cookie,
+                "ui.confirm",
+                json!({"title": title, "message": message}),
+            )
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        },
+    )
+}
+
 /// `syncToolSurface` (index.ts:248-260): resolve direct tools from the
 /// current config + cache, sync the surface, then apply the proxy-tool
 /// truth table.
@@ -249,6 +305,33 @@ fn sync_tool_surface(state: &PluginState) {
             &unavailable,
         )
     };
+    // #634 (60aa1c6, index.ts:641-652 @ 5884ac4e): deliver the large
+    // direct-tools advisory once per session — through `ui.notify` when the
+    // host has UI, otherwise as a tracing warning (upstream console.warn).
+    {
+        let mut surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
+        if !surface.advisory_delivered
+            && let Some(message) = direct::large_direct_tools_advisory(&config, &specs)
+        {
+            surface.advisory_delivered = true;
+            drop(surface);
+            let calls = channel.calls();
+            let has_ui = host_call_ok(&calls, channel.cookie, "ctx.hasUI", json!({}))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if has_ui {
+                host_call(
+                    &calls,
+                    channel.cookie,
+                    "ui.notify",
+                    json!({"message": message, "notifyType": "warning"}),
+                );
+            } else {
+                tracing::warn!(message = %message, "MCP: large direct-tools advisory");
+            }
+        }
+    }
+
     let missing = cache::get_missing_configured_direct_tool_servers(
         &config,
         cache.as_ref(),
@@ -360,6 +443,29 @@ fn sync_tool_surface(state: &PluginState) {
             proxy_description = None;
         }
     }
+    // #665 (7bf2332, index.ts:1996-2008 @ 5884ac4e): respect host ownership
+    // of the gateway name. A host re-activation ends the adapter's fallback
+    // ownership; only a fallback deactivation the adapter still owns is
+    // undone (a host that intentionally hides `mcp` must not see it
+    // reappear on every metadata refresh). Hosts with `unregisterTool` never
+    // enter this state.
+    {
+        let mut surface = HostSurface {
+            calls: &channel.calls(),
+            cookie: channel.cookie,
+        };
+        if let Some(active) = surface.get_active_tools() {
+            let mut direct = state.direct.lock().unwrap_or_else(|e| e.into_inner());
+            if active.iter().any(|name| name == "mcp") {
+                direct.registry.fallback_deactivated.remove("mcp");
+            } else if direct.registry.fallback_deactivated.remove("mcp") {
+                let mut next = active;
+                next.push("mcp".to_string());
+                surface.set_active_tools(next);
+            }
+        }
+    }
+
     if report.added.len() + report.updated.len() + report.deactivated.len() > 0 {
         tracing::debug!(
             added = report.added.len(),
@@ -551,6 +657,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                 early_config,
                 proxy_registered: false,
                 proxy_description: None,
+                advisory_delivered: false,
                 direct_tool_counts: std::collections::HashMap::new(),
                 connect_additions: std::collections::HashMap::new(),
                 reported_connect_names: std::collections::HashMap::new(),
@@ -563,7 +670,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         {
             let mut surface = plugin.direct.lock().unwrap_or_else(|e| e.into_inner());
             surface.early_config =
-                config::load_mcp_config(crate::utils::get_config_path_from_argv().as_deref(), &cwd);
+                load_load_time_config(crate::utils::get_config_path_from_argv().as_deref(), &cwd);
         }
         sync_tool_surface(plugin);
         update_status_bar(plugin);
@@ -596,7 +703,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     // after the final extension load (agent-session-services.ts:81-127), so
     // a getFlag read here would miss the override and the install-time
     // prewarm would connect servers from the wrong config layer stack.
-    let early_config = config::load_mcp_config(
+    let early_config = load_load_time_config(
         crate::utils::get_config_path_from_argv().as_deref(),
         &cwd_hint,
     );
@@ -624,6 +731,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             early_config,
             proxy_registered: false,
             proxy_description: None,
+            advisory_delivered: false,
             direct_tool_counts: std::collections::HashMap::new(),
             connect_additions: std::collections::HashMap::new(),
             reported_connect_names: std::collections::HashMap::new(),
@@ -639,7 +747,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     let cwd = session_cwd(&state);
     {
         let mut surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
-        surface.early_config = config::load_mcp_config(None, &cwd);
+        surface.early_config = load_load_time_config(None, &cwd);
     }
     if STATE.set(state).is_err() {
         return json!({"error": {"kind": "init", "message": "plugin already initialized"}});
@@ -886,10 +994,23 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                     return pack(&Value::Null);
                 };
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
+                // #674: forward the Pi tool call id to the MCP request `_meta`.
+                let tool_call_id = message
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let dispatcher = state.dispatcher.clone();
                 let result = state.runtime.block_on(async move {
                     match dispatcher.current_direct().await {
-                        Ok(runtime) => direct::execute_direct_tool(&runtime, &spec, &params).await,
+                        Ok(runtime) => {
+                            direct::execute_direct_tool_with_call_id(
+                                &runtime,
+                                &spec,
+                                &params,
+                                tool_call_id.as_deref(),
+                            )
+                            .await
+                        }
                         Err(error_result) => error_result,
                     }
                 });
@@ -919,9 +1040,14 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                     .unwrap_or_default()
             });
             let dispatcher = state.dispatcher.clone();
+            // #674: forward the Pi tool call id to the MCP request `_meta`.
+            let tool_call_id = message
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let result = state.runtime.block_on(async move {
                 dispatcher
-                    .execute_with_resolver(&params, native_tools)
+                    .execute_with_resolver(&params, native_tools, tool_call_id)
                     .await
             });
             pack(&result)
@@ -1050,11 +1176,25 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                 // (`buildSessionPath` default) unless a `session_tree` event
                 // arrives before init completes.
                 *state.pending_leaf.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                // #634 (index.ts:1146 @ 5884ac4e): a new session re-arms the
+                // once-per-session direct-tools advisory.
+                state
+                    .direct
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .advisory_delivered = false;
                 state
                     .runtime
                     .block_on(state.dispatcher.clone().shutdown_owned());
                 let cwd = session_cwd(state);
                 let config_path = current_config_path(state);
+                // #681 (5d645df): gate PROJECT-scope servers on project
+                // trust + per-server approval before the runtime loads the
+                // config (an interactive trusted session prompts here and
+                // remembers the answer; untrusted/non-interactive sessions
+                // block with a reason).
+                let gate = build_session_trust_gate(state, &cwd, config_path.as_deref());
+                crate::project_trust::set_session_gate(&cwd, gate);
                 let dispatcher = state.dispatcher.clone();
                 state.runtime.spawn(async move {
                     dispatcher.start_init(cwd, config_path);
@@ -1305,7 +1445,7 @@ impl session_approvals::SessionApprovalSink for HostSessionApprovalSink {
     }
 }
 
-/// Built-in three-choice dialog (tool-approval.ts:150-165 @ 928c30c):
+/// Built-in four-choice dialog (tool-approval.ts:150-170 @ 4becf97, #628):
 /// sanitized server/tool title + bounded pretty-printed argument preview.
 struct TuiApprovalHandler;
 
@@ -1327,9 +1467,12 @@ impl approval::ApprovalHandler for TuiApprovalHandler {
             utils::sanitize_terminal_text(server_name),
             utils::sanitize_terminal_text(&tool.original_name)
         );
+        // #628 (4becf97): the fourth choice grants every tool/argument on
+        // this server for the current runtime (memory-only).
         let options = vec![
             "Allow once".to_string(),
             "Allow for session".to_string(),
+            "Allow server for this session".to_string(),
             "Deny".to_string(),
         ];
         let selected = host_call_ok(
@@ -1344,6 +1487,9 @@ impl approval::ApprovalHandler for TuiApprovalHandler {
         {
             Some("Allow once") => approval::ApprovalDecision::AllowOnce,
             Some("Allow for session") => approval::ApprovalDecision::AllowForSession,
+            Some("Allow server for this session") => {
+                approval::ApprovalDecision::AllowServerForSession
+            }
             _ => approval::ApprovalDecision::Deny,
         }
     }
@@ -1456,11 +1602,12 @@ fn handle_mcp_command(state: &PluginState, args: &str) -> Value {
                 Err(result) => return result,
             };
             let (config, metadata, _) = proxy::search_state_snapshot(&runtime);
-            let text = commands::format_status_text(
+            let text = commands::format_status_text_with_blocked(
                 &config,
                 &runtime.manager,
                 &metadata,
                 &runtime.failures,
+                &runtime.project_blocked,
             );
             if host.can_render_panel() {
                 let mut options: Vec<String> = text
@@ -1538,7 +1685,7 @@ fn handle_mcp_command(state: &PluginState, args: &str) -> Value {
                     {
                         let cwd_for_reload = session_cwd(state);
                         let mut surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
-                        surface.early_config = config::load_mcp_config(
+                        surface.early_config = load_load_time_config(
                             crate::utils::get_config_path_from_argv().as_deref(),
                             &cwd_for_reload,
                         );

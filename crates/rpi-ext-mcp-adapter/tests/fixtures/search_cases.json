@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/search-ranking.ts @ 7a7b01b, executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/search-ranking.ts @ 5884ac4e, executed by gen-mcp-adapter-fixtures.mjs",
   "state": {
     "servers": [
       {
@@ -64,6 +64,29 @@
             "name": "hidden_tool",
             "originalName": "hidden_tool",
             "description": "Should never rank"
+          }
+        ]
+      },
+      {
+        "name": "cjk",
+        "definition": {
+          "command": "npx"
+        },
+        "tools": [
+          {
+            "name": "记录查询",
+            "originalName": "记录查询",
+            "description": "插旗 查询 记录"
+          },
+          {
+            "name": "插旗记录",
+            "originalName": "插旗记录",
+            "description": "数据库 记录"
+          },
+          {
+            "name": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+            "originalName": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+            "description": "超长单字符运行"
           }
         ]
       }
@@ -364,6 +387,360 @@
       ]
     },
     {
+      "query": "search search",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 141
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 121
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 121
+        },
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 45
+        }
+      ]
+    },
+    {
+      "query": "search search",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 141
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 121
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 121
+        },
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 45
+        }
+      ]
+    },
+    {
+      "query": "records records records",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 161
+        },
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 151
+        },
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 141
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 89
+        }
+      ]
+    },
+    {
+      "query": "records records records",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 141
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 141
+        },
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 131
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 89
+        }
+      ]
+    },
+    {
+      "query": "fuzzy lookup fuzzy",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 65
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 65
+        },
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 65
+        }
+      ]
+    },
+    {
+      "query": "fuzzy lookup fuzzy",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 65
+        }
+      ]
+    },
+    {
+      "query": "查询",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录查询",
+          "score": 303
+        }
+      ]
+    },
+    {
+      "query": "查询",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录查询",
+          "score": 303
+        }
+      ]
+    },
+    {
+      "query": "记录查询",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录查询",
+          "score": 665
+        }
+      ]
+    },
+    {
+      "query": "记录查询",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录查询",
+          "score": 665
+        }
+      ]
+    },
+    {
+      "query": "记录搜索",
+      "includeKeywords": true,
+      "expected": []
+    },
+    {
+      "query": "记录搜索",
+      "includeKeywords": false,
+      "expected": []
+    },
+    {
+      "query": "插旗查询",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录查询",
+          "score": 135
+        }
+      ]
+    },
+    {
+      "query": "插旗查询",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录查询",
+          "score": 135
+        }
+      ]
+    },
+    {
+      "query": "查询插旗记录",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "插旗记录",
+          "score": 290
+        },
+        {
+          "server": "cjk",
+          "tool": "记录查询",
+          "score": 250
+        }
+      ]
+    },
+    {
+      "query": "查询插旗记录",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "插旗记录",
+          "score": 290
+        },
+        {
+          "server": "cjk",
+          "tool": "记录查询",
+          "score": 250
+        }
+      ]
+    },
+    {
+      "query": "数据库",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "插旗记录",
+          "score": 110
+        }
+      ]
+    },
+    {
+      "query": "数据库",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "插旗记录",
+          "score": 110
+        }
+      ]
+    },
+    {
+      "query": "数据库数据库数据库",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "插旗记录",
+          "score": 47
+        }
+      ]
+    },
+    {
+      "query": "数据库数据库数据库",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "插旗记录",
+          "score": 47
+        }
+      ]
+    },
+    {
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+          "score": 449
+        }
+      ]
+    },
+    {
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+          "score": 449
+        }
+      ]
+    },
+    {
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+          "score": 267
+        }
+      ]
+    },
+    {
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+          "score": 267
+        }
+      ]
+    },
+    {
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+          "score": 267
+        }
+      ]
+    },
+    {
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "cjk",
+          "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+          "score": 267
+        }
+      ]
+    },
+    {
       "query": "search",
       "server": "demo",
       "includeKeywords": true,
@@ -446,6 +823,27 @@
       "expected": null
     },
     {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "search",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "search",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "search",
+      "expected": null
+    },
+    {
       "server": "demo",
       "tool": "search_records",
       "description": "Find records",
@@ -499,6 +897,27 @@
       "expected": null
     },
     {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "search missing",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "search missing",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "search missing",
+      "expected": null
+    },
+    {
       "server": "demo",
       "tool": "search_records",
       "description": "Find records",
@@ -548,6 +967,27 @@
       "server": "disabled-srv",
       "tool": "hidden_tool",
       "description": "Should never rank",
+      "query": "simulator",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "simulator",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "simulator",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
       "query": "simulator",
       "expected": null
     },
@@ -605,6 +1045,27 @@
       "expected": null
     },
     {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "synchronize",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "synchronize",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "synchronize",
+      "expected": null
+    },
+    {
       "server": "demo",
       "tool": "search_records",
       "description": "Find records",
@@ -654,6 +1115,27 @@
       "server": "disabled-srv",
       "tool": "hidden_tool",
       "description": "Should never rank",
+      "query": "fuzzy lookup",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "fuzzy lookup",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "fuzzy lookup",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
       "query": "fuzzy lookup",
       "expected": null
     },
@@ -711,6 +1193,27 @@
       "expected": null
     },
     {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "lookup legacy",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "lookup legacy",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "lookup legacy",
+      "expected": null
+    },
+    {
       "server": "demo",
       "tool": "search_records",
       "description": "Find records",
@@ -760,6 +1263,27 @@
       "server": "disabled-srv",
       "tool": "hidden_tool",
       "description": "Should never rank",
+      "query": "fuzzy",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "fuzzy",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "fuzzy",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
       "query": "fuzzy",
       "expected": null
     },
@@ -817,6 +1341,27 @@
       "expected": null
     },
     {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "advanced",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "advanced",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "advanced",
+      "expected": null
+    },
+    {
       "server": "demo",
       "tool": "search_records",
       "description": "Find records",
@@ -866,6 +1411,27 @@
       "server": "disabled-srv",
       "tool": "hidden_tool",
       "description": "Should never rank",
+      "query": "records",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "records",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "records",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
       "query": "records",
       "expected": null
     },
@@ -923,6 +1489,27 @@
       "expected": null
     },
     {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "icon",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "icon",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "icon",
+      "expected": null
+    },
+    {
       "server": "demo",
       "tool": "search_records",
       "description": "Find records",
@@ -976,6 +1563,989 @@
       "expected": null
     },
     {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "sync",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "sync",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "sync",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "search search",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": 121
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "search search",
+      "keywords": [],
+      "expected": 45
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "search search",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 141
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "search search",
+      "keywords": [],
+      "expected": 121
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "search search",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "search search",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "search search",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "search search",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "search search",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "records records records",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": 161
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "records records records",
+      "keywords": [],
+      "expected": 141
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "records records records",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 151
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "records records records",
+      "keywords": [],
+      "expected": 89
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "records records records",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "records records records",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "records records records",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "records records records",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "records records records",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "fuzzy lookup fuzzy",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": 65
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "fuzzy lookup fuzzy",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "fuzzy lookup fuzzy",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 65
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "fuzzy lookup fuzzy",
+      "keywords": [],
+      "expected": 65
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "fuzzy lookup fuzzy",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "fuzzy lookup fuzzy",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "fuzzy lookup fuzzy",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "fuzzy lookup fuzzy",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "fuzzy lookup fuzzy",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "查询",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "查询",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "查询",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "查询",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "查询",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "查询",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "查询",
+      "expected": 303
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "查询",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "查询",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "记录查询",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "记录查询",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "记录查询",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "记录查询",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "记录查询",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "记录查询",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "记录查询",
+      "expected": 665
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "记录查询",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "记录查询",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "记录搜索",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "记录搜索",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "记录搜索",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "记录搜索",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "记录搜索",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "记录搜索",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "记录搜索",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "记录搜索",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "记录搜索",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "插旗查询",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "插旗查询",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "插旗查询",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "插旗查询",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "插旗查询",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "插旗查询",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "插旗查询",
+      "expected": 135
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "插旗查询",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "插旗查询",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "查询插旗记录",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "查询插旗记录",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "查询插旗记录",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "查询插旗记录",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "查询插旗记录",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "查询插旗记录",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "查询插旗记录",
+      "expected": 250
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "查询插旗记录",
+      "expected": 290
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "查询插旗记录",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "数据库",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "数据库",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "数据库",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "数据库",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "数据库",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "数据库",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "数据库",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "数据库",
+      "expected": 110
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "数据库",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "数据库数据库数据库",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "数据库数据库数据库",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "数据库数据库数据库",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "数据库数据库数据库",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "数据库数据库数据库",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "数据库数据库数据库",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "数据库数据库数据库",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "数据库数据库数据库",
+      "expected": 47
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "数据库数据库数据库",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": 449
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记",
+      "expected": 267
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "expected": 267
+    },
+    {
       "server": "demo",
       "tool": "search_records",
       "description": "Find records",
@@ -1029,6 +2599,27 @@
       "expected": null
     },
     {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
+      "query": "",
+      "expected": null
+    },
+    {
       "server": "demo",
       "tool": "search_records",
       "description": "Find records",
@@ -1078,6 +2669,27 @@
       "server": "disabled-srv",
       "tool": "hidden_tool",
       "description": "Should never rank",
+      "query": "  ",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录查询",
+      "description": "插旗 查询 记录",
+      "query": "  ",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "插旗记录",
+      "description": "数据库 记录",
+      "query": "  ",
+      "expected": null
+    },
+    {
+      "server": "cjk",
+      "tool": "记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录记录",
+      "description": "超长单字符运行",
       "query": "  ",
       "expected": null
     }

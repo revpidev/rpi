@@ -414,8 +414,15 @@ async fn session_recovery_404_reconnects_and_retries_once() {
     assert_eq!(client.session_id().as_deref(), Some("sess-stale"));
 
     // 走 proxy::run_tool_call + is_terminated_session 的重放链路。
-    let result =
-        proxy::run_tool_call(&client, None, "echo", json!({}), Duration::from_secs(5)).await;
+    let result = proxy::run_tool_call(
+        &client,
+        None,
+        "echo",
+        json!({}),
+        Duration::from_secs(5),
+        None,
+    )
+    .await;
     // 直接调用不走恢复；恢复链路在 execute_call 中。这里先证明第一跳
     // 会话 id 存在且 404 被识别为 terminated：
     match result {
@@ -442,6 +449,7 @@ async fn session_recovery_404_reconnects_and_retries_once() {
         "echo",
         json!({}),
         Duration::from_secs(5),
+        None,
     )
     .await
     .expect("retry on fresh session");
@@ -510,8 +518,15 @@ async fn session_recovery_second_404_propagates() {
     let connection = manager.connect("http", &entry).await.expect("connect");
     let client = connection.client.clone().expect("client");
 
-    let first =
-        proxy::run_tool_call(&client, None, "echo", json!({}), Duration::from_secs(5)).await;
+    let first = proxy::run_tool_call(
+        &client,
+        None,
+        "echo",
+        json!({}),
+        Duration::from_secs(5),
+        None,
+    )
+    .await;
     assert!(first.is_err());
     let fresh = manager
         .reconnect("http", &entry, &connection)
@@ -524,6 +539,7 @@ async fn session_recovery_second_404_propagates() {
         "echo",
         json!({}),
         Duration::from_secs(5),
+        None,
     )
     .await;
     assert!(second.is_err(), "second 404 must propagate, not loop");
@@ -993,11 +1009,13 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
     )
     .expect("cache");
 
-    // 会话 cwd 下的 .mcp.json：freezeDirectTools=true + eager 服务器
-    // （触发 install 的 load-time prewarm）。stub 连接成功，后台 init
+    // TE46 #681/#714: load-time prewarm only sees GLOBAL-layer servers
+    // (project servers are trust-gated at session_start), so the fixture
+    // lives in the agent-dir mcp.json: freezeDirectTools=true + eager
+    // server triggers install's load-time prewarm. stub 连接成功，后台 init
     // 完成并发布 Ready。
     std::fs::write(
-        dir.join(".mcp.json"),
+        agent_dir.join("mcp.json"),
         serde_json::to_string_pretty(&json!({
             "settings": { "freezeDirectTools": true },
             "mcpServers": { "demo": entry }
@@ -1254,6 +1272,7 @@ async fn proxy_call_approval_scopes_by_argument_payload() {
         args("a"),
         None,
         proxy::no_native_tools(),
+        None,
     )
     .await;
     assert_eq!(
@@ -1267,6 +1286,7 @@ async fn proxy_call_approval_scopes_by_argument_payload() {
         args("a"),
         None,
         proxy::no_native_tools(),
+        None,
     )
     .await;
     assert_eq!(
@@ -1286,6 +1306,7 @@ async fn proxy_call_approval_scopes_by_argument_payload() {
         args("b"),
         None,
         proxy::no_native_tools(),
+        None,
     )
     .await;
     assert_eq!(
@@ -1338,6 +1359,7 @@ async fn proxy_call_validates_arguments_before_approval() {
         invalid,
         None,
         proxy::no_native_tools(),
+        None,
     )
     .await;
     assert_eq!(
@@ -1384,6 +1406,7 @@ async fn proxy_call_approval_headless_fails_closed_before_transport() {
         args("a"),
         None,
         proxy::no_native_tools(),
+        None,
     )
     .await;
     assert_eq!(result["details"]["mode"], json!("call"));
@@ -1430,6 +1453,7 @@ async fn proxy_call_approval_denied_returns_denial_details() {
         args("a"),
         None,
         proxy::no_native_tools(),
+        None,
     )
     .await;
     assert_eq!(result["details"]["error"], json!("approval_denied"));

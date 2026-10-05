@@ -27,7 +27,7 @@ const OUT_DIR = resolve(
 );
 const FIXTURES = resolve(HERE, "render-call-fixtures.json");
 const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
-const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "97435aab"; // TE27 pin switch (v2.32.1)
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "5884ac4e"; // TE46 pin switch (v4.0.0)
 const tsxLoader = join(DEPS, "node_modules", "tsx", "dist", "loader.mjs");
 if (!existsSync(tsxLoader)) {
 	console.error(`tsx not installed under ${DEPS}; run scripts/mcp-parity/setup-deps.sh first`);

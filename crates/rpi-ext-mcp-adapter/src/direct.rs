@@ -287,25 +287,33 @@ pub fn resolve_direct_tools(
             .collect()
     };
 
-    // #358/#412 (direct-tools.ts:288-290 @ 10a45367): the advisory is
-    // gated by `warnOnLargeDirectTools !== false` and its text explains
-    // how to hide it.
+    // #358/#412/#634 (direct-tools.ts:288-292 @ 10a45367; index.ts:641-652
+    // @ 5884ac4e): the advisory is computed here but DELIVERED by the caller
+    // once per session (through `ui.notify` when the host has UI, otherwise
+    // a tracing warning) — resolving tools must stay silent.
+    emitted
+}
+
+/// `getLargeDirectToolsAdvisory` (#634, 60aa1c6; direct-tool-surface.ts @
+/// 5884ac4e): the once-per-session advisory text when the resolved ACTIVE
+/// direct-tool count reaches the threshold, gated by
+/// `settings.warnOnLargeDirectTools !== false`. Search-mode held-out tools do
+/// not count (#525).
+pub fn large_direct_tools_advisory(config: &McpConfig, specs: &[DirectToolSpec]) -> Option<String> {
     let advisory_enabled = config
         .settings
         .as_ref()
         .and_then(|s| s.get("warnOnLargeDirectTools"))
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    // #525: search-mode tools do not count toward the advisory.
-    let active_count = emitted.iter().filter(|spec| !spec.held_out).count();
-    if advisory_enabled && active_count >= DIRECT_TOOLS_ADVISORY_THRESHOLD {
-        warn!(
-            count = emitted.len(),
-            "MCP: {} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered. Set settings.warnOnLargeDirectTools to false to hide this advisory.",
-            emitted.len()
-        );
+    let active_count = specs.iter().filter(|spec| !spec.held_out).count();
+    if !advisory_enabled || active_count < DIRECT_TOOLS_ADVISORY_THRESHOLD {
+        return None;
     }
-    emitted
+    Some(format!(
+        "MCP: {} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered. Set settings.warnOnLargeDirectTools to false to hide this advisory.",
+        active_count
+    ))
 }
 
 enum ToolFilter {
@@ -501,46 +509,48 @@ impl DirectToolRegistry {
         report
     }
 
-    /// `deactivateTools` (index.ts:182-199): host `unregisterTool` first;
-    /// leftovers go through the active-tools fallback and are tracked for
-    /// re-activation on re-registration.
+    /// `deactivateTools` (index.ts:182-199 @ 5884ac4e, #665 7bf2332): host
+    /// `unregisterTool` first; leftovers go through the active-tools fallback
+    /// and are tracked for re-activation on re-registration. Only names that
+    /// WERE in the host's active set are tracked (a host that already removed
+    /// the gateway keeps ownership — the adapter must not re-add it later).
     fn deactivate(&mut self, tool_names: &[String], surface: &mut dyn ToolSurface) {
         if tool_names.is_empty() {
             return;
         }
-        let mut unregistered: Vec<&str> = Vec::new();
         let mut fallback: Vec<&str> = Vec::new();
         for name in tool_names {
-            if surface.unregister_tool(name) {
-                unregistered.push(name);
-            } else {
+            if !surface.unregister_tool(name) {
                 fallback.push(name);
             }
         }
-        let remove: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
         match surface.get_active_tools() {
             None => {
                 for name in fallback {
                     self.fallback_deactivated.insert(name.to_string());
                 }
             }
-            Some(active) if active.is_empty() => {
-                for name in fallback {
-                    self.fallback_deactivated.insert(name.to_string());
-                }
-            }
             Some(active) => {
+                // #665: only fallback names that are actually active are
+                // removed and tracked; host-owned names stay untouched.
+                let removed: Vec<&str> = fallback
+                    .iter()
+                    .copied()
+                    .filter(|name| active.iter().any(|active| active == name))
+                    .collect();
+                if removed.is_empty() {
+                    return;
+                }
+                let removed_set: HashSet<&str> = removed.iter().copied().collect();
                 let next: Vec<String> = active
                     .iter()
-                    .filter(|name| !remove.contains(name.as_str()))
+                    .filter(|name| !removed_set.contains(name.as_str()))
                     .cloned()
                     .collect();
-                if next.len() != active.len() {
-                    for name in fallback {
-                        self.fallback_deactivated.insert(name.to_string());
-                    }
-                    surface.set_active_tools(next);
+                for name in removed {
+                    self.fallback_deactivated.insert(name.to_string());
                 }
+                surface.set_active_tools(next);
             }
         }
     }
@@ -605,7 +615,11 @@ pub fn should_register_proxy_tool(
 /// deliberately absent so re-registering the proxy tool never rewrites the
 /// cached prompt prefix; `mcp({ })` carries the runtime counts.
 pub fn build_proxy_description(config: &McpConfig) -> String {
-    let mut desc = "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. When one request needs several MCP calls with logic between them, use mcpScript. Non-MCP rpi tools should be called directly, not through mcp.\n".to_string();
+    // #664 (#664/7569fbc @ v3.2.0, mirrored in v4.0.0's `scriptHint` @
+    // direct-tool-surface.ts:203): the mcpScript pointer only appears when
+    // the script tool is available. rpi does not port mcpScript (TE46
+    // [DEFER], see §7.2), so the default description carries no pointer.
+    let mut desc = "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. Non-MCP rpi tools should be called directly, not through mcp.\n".to_string();
 
     let server_names: Vec<&str> = config
         .mcp_servers
@@ -660,6 +674,17 @@ pub async fn execute_direct_tool(
     spec: &DirectToolSpec,
     params: &Value,
 ) -> Value {
+    execute_direct_tool_with_call_id(runtime, spec, params, None).await
+}
+
+/// [`execute_direct_tool`] with the calling Pi tool id forwarded to the MCP
+/// request `_meta` (#674, 4b7e310 @ 5884ac4e).
+pub async fn execute_direct_tool_with_call_id(
+    runtime: &crate::proxy::McpRuntime,
+    spec: &DirectToolSpec,
+    params: &Value,
+    tool_call_id: Option<&str>,
+) -> Value {
     let config = &runtime.config;
 
     // #430 (direct-tools.ts:40-89 @ 10a45367,
@@ -680,7 +705,8 @@ pub async fn execute_direct_tool(
     if strict_args {
         match prepare_direct_tool_arguments(&spec.input_schema, params) {
             Ok(prepared) => {
-                return execute_direct_tool_inner(runtime, spec, &prepared, config).await;
+                return execute_direct_tool_inner(runtime, spec, &prepared, config, tool_call_id)
+                    .await;
             }
             Err(message) => {
                 return json!({
@@ -694,7 +720,7 @@ pub async fn execute_direct_tool(
             }
         }
     }
-    execute_direct_tool_inner(runtime, spec, params, config).await
+    execute_direct_tool_inner(runtime, spec, params, config, tool_call_id).await
 }
 
 /// `prepareDirectToolArguments` (direct-tools.ts:40-89 @ 10a45367):
@@ -808,6 +834,7 @@ async fn execute_direct_tool_inner(
     spec: &DirectToolSpec,
     params: &Value,
     config: &crate::metadata::McpConfig,
+    tool_call_id: Option<&str>,
 ) -> Value {
     // The non-strict path's `config` binding is the same runtime config;
     // re-bound here so the inner body keeps one variable.
@@ -819,10 +846,11 @@ async fn execute_direct_tool_inner(
         });
     };
     if definition.is_disabled() {
-        let message = format!(
-            "MCP server \"{}\" is disabled. Run /mcp enable {} and /reload to enable it.",
-            spec.server_name, spec.server_name
+        let reason = crate::project_trust::disabled_server_reason(
+            Some(&runtime.project_blocked),
+            &spec.server_name,
         );
+        let message = format!("MCP server \"{}\" is {reason}", spec.server_name);
         return json!({
             "content": [{ "type": "text", "text": message }],
             "details": { "error": "server_disabled", "server": spec.server_name, "message": message },
@@ -979,6 +1007,7 @@ async fn execute_direct_tool_inner(
             &spec.original_name,
             params.clone(),
             request_timeout,
+            tool_call_id,
         )
         .await;
 
@@ -1004,6 +1033,7 @@ async fn execute_direct_tool_inner(
                                 &spec.original_name,
                                 params.clone(),
                                 request_timeout,
+                                tool_call_id,
                             )
                             .await
                             .map_err(|e| e.to_string())
@@ -1036,6 +1066,7 @@ async fn execute_direct_tool_inner(
                                                     &spec.original_name,
                                                     params.clone(),
                                                     request_timeout,
+                                                    tool_call_id,
                                                 )
                                                 .await
                                                 .map_err(|e| e.to_string());
@@ -2067,6 +2098,47 @@ mod tests {
         )
         .expect("non-object schema passes");
         assert_eq!(passthrough, json!({ "anything": 1 }));
+    }
+
+    /// #634 (60aa1c6): the advisory gates on the ACTIVE spec count
+    /// (held-out search-mode tools do not count) and on
+    /// `warnOnLargeDirectTools !== false`.
+    #[test]
+    fn large_direct_tools_advisory_gates_on_active_count_and_setting() {
+        let mut config = McpConfig::default();
+        let specs: Vec<DirectToolSpec> = (0..DIRECT_TOOLS_ADVISORY_THRESHOLD - 1)
+            .map(|i| spec(&format!("t{i}"), "s"))
+            .collect();
+        assert!(
+            large_direct_tools_advisory(&config, &specs).is_none(),
+            "74 active tools stay below the threshold"
+        );
+        let mut at_threshold = specs.clone();
+        at_threshold.push(spec("extra", "s"));
+        let message = large_direct_tools_advisory(&config, &at_threshold).expect("advisory fires");
+        assert!(message.contains("75 direct tools resolved"), "{message}");
+
+        // Held-out search-mode tools do not count.
+        let mut held = at_threshold.clone();
+        for entry in held.iter_mut() {
+            entry.held_out = true;
+        }
+        assert!(large_direct_tools_advisory(&config, &held).is_none());
+
+        config.settings = Some(
+            json!({ "warnOnLargeDirectTools": false })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        assert!(large_direct_tools_advisory(&config, &at_threshold).is_none());
+        config.settings = Some(
+            json!({ "warnOnLargeDirectTools": true })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        assert!(large_direct_tools_advisory(&config, &at_threshold).is_some());
     }
 
     #[test]

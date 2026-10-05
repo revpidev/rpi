@@ -132,12 +132,17 @@ async fn main() {
         let client = connection.client.as_ref().expect("connected client");
 
         let echo = client
-            .call_tool("echo", json!({ "query": "hello" }), Duration::from_secs(10))
+            .call_tool(
+                "echo",
+                json!({ "query": "hello" }),
+                Duration::from_secs(10),
+                None,
+            )
             .await?;
         document["results"]["echo"] = normalize(&echo);
 
         let fail = match client
-            .call_tool("fail", json!({}), Duration::from_secs(10))
+            .call_tool("fail", json!({}), Duration::from_secs(10), None)
             .await
         {
             Ok(result) => json!({ "threw": false, "result": normalize(&result) }),

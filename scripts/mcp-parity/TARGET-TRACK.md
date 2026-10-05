@@ -43,6 +43,20 @@ each task's document).
 | config-merge goldens | **re-recorded @ `97435aab`** | `gen-mcp-adapter-fixtures.mjs` gained the TE40 cases (`command-switch-drops-bearer-store-and-cafile` #552/#539, `socket-switch-drops-bearer-store-and-cafile`, `url-change-strips-cafile` #539, `blank-optional-config-is-absent` #568, `ancestor-config-roots-opt-in` / `-not-opted-in` #556 with the `projectSubdir`/`ancestorLayers` harness fields); `golden_config_merge.rs` consumes `ancestorLayers`/`projectSubdir` |
 | Other goldens | unchanged | names/glob/search/config-hash/tsshape/truncate faces are untouched by the 59-commit span (verified: all green without re-record) |
 
+## 1c. TE46 rotation record (2026-10-06) — the v4.0.0 pin switch
+
+> `external/pi-mcp-adapter` moved `97435aab` (v2.34.0+9) → **`5884ac4e` (v4.0.0)** with the
+> TE46 rebase (ADR-0034's plugin pin table, unchanged by ADR-0035). The default driver = the
+> submodule worktree now serves v4.0.0, so the regression and target tracks converge again.
+
+| Leg | Result @ `5884ac4e` | Notes |
+|----|------------|-------|
+| Protocol leg (7 scenarios) | **7/7 MATCH** | re-verified post-switch (stdio / http-streamable / 404/405/406/415 / auth-401); per-scenario JSONs byte-stable |
+| renderCall leg (24 cases) | **24/24 byte-identical** | re-verified post-switch |
+| OAuth leg | **MATCH** | `#715` callback default moved to `127.0.0.1` (rpi side ported in TE46) |
+| Pure-function goldens | **re-recorded @ `5884ac4e`** | `gen-mcp-adapter-fixtures.mjs` gained: `#697` BOM handling, `#734`-era search dedupe (`#686`) + CJK bigrams (`#613`) fixture cases, `#661`/`#687` config-hash identity (command resolution + `inheritEnv`/`literalEnv`), the v4.0.0 `mcp-adapter.json` layer paths (TE-D44 mapping), and `#743` private-cache validity; the `saveMetadataCache` compact-write guard accepts the v4.0.0 `updateMetadataCacheFile` shape |
+| Proxy-description fixture | **re-pinned manually** | hand-frozen v2.32.1 surface, rebranded; TE46 removed the `mcpScript` pointer (#664/FR-E) |
+
 ## 2. Running the target track (skeleton verification)
 
 ```bash

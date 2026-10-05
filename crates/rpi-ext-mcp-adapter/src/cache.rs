@@ -250,10 +250,26 @@ fn stable_field(value: Option<Value>) -> String {
 /// URL after interpolation, ...); callers treat an error as "cache invalid".
 pub fn compute_server_hash(definition: &ServerEntry) -> Result<String, AdapterError> {
     let map = definition.as_map();
-    let env = crate::utils::interpolate_env_record(map.get("env"))?.map(Value::Object);
+    // #687 (34df4ed, metadata-cache.ts:85-97 @ 5884ac4e): stdio env MODE
+    // joins the identity — `inheritEnv` (default true) and `literalEnv`
+    // change which environment the server sees, so a mode flip must
+    // invalidate the cached metadata. JS `!!definition.command` truthiness:
+    // absent / null / "" all count as non-stdio.
+    let is_stdio = map
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| !command.is_empty());
+    let literal_env = is_stdio && map.get("literalEnv") == Some(&Value::Bool(true));
+    let raw_env = map.get("env").cloned();
+    let env = if literal_env {
+        raw_env
+    } else {
+        crate::utils::interpolate_env_record(map.get("env"))?.map(Value::Object)
+    };
     let headers = crate::utils::interpolate_env_record(map.get("headers"))?.map(Value::Object);
     let socket = crate::utils::resolve_config_path(map.get("socket"))?.map(Value::String);
     let cwd = crate::utils::resolve_config_path(map.get("cwd"))?.map(Value::String);
+    let command = crate::utils::resolve_config_path(map.get("command"))?.map(Value::String);
     let url = crate::utils::resolve_server_url(map.get("url"))?.map(Value::String);
     let bearer_token = crate::utils::resolve_bearer_token(map)?.map(Value::String);
     // `requestHeadersCommand` (metadata-cache.ts:98-105 @ 10a45367): the
@@ -304,7 +320,7 @@ pub fn compute_server_hash(definition: &ServerEntry) -> Result<String, AdapterEr
     // identity object (metadata-cache.ts:85-100). Sorting happens here via
     // the same UTF-16 rule as `stableStringify` (all keys are ASCII).
     let fields: Vec<(&str, Option<Value>)> = vec![
-        ("command", raw("command")),
+        ("command", command),
         ("args", raw("args")),
         ("socket", socket),
         ("env", env),
@@ -320,6 +336,17 @@ pub fn compute_server_hash(definition: &ServerEntry) -> Result<String, AdapterEr
         ("includeTools", raw("includeTools")),
         ("excludeTools", raw("excludeTools")),
     ];
+    let mut fields = fields;
+    if is_stdio {
+        // `...(isStdio ? { inheritEnv, literalEnv } : {})`.
+        fields.push((
+            "inheritEnv",
+            Some(Value::Bool(
+                map.get("inheritEnv") != Some(&Value::Bool(false)),
+            )),
+        ));
+        fields.push(("literalEnv", Some(Value::Bool(literal_env))));
+    }
     let mut sorted = fields;
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     let rendered: Vec<String> = sorted
@@ -353,6 +380,12 @@ pub fn is_server_cache_valid(
     max_age_ms: u64,
     now_ms: u64,
 ) -> bool {
+    // #743 (0ff0b85, metadata-cache.ts:114-121 @ 5884ac4e): metadata from a
+    // `private` listing is tied to that authorization context and is never
+    // reused across sessions (the current session keeps it in memory).
+    if entry.cache_scope.as_deref() == Some("private") {
+        return false;
+    }
     let Ok(config_hash) = compute_server_hash(definition) else {
         return false;
     };
@@ -758,7 +791,6 @@ mod tests {
         // Declared ttl shorter than maxAge → min() wins (4ms declared).
         let short = ServerCacheEntry {
             ttl_ms: Some(4),
-            cache_scope: Some("private".to_string()),
             ..base.clone()
         };
         assert!(is_server_cache_valid(
@@ -773,6 +805,31 @@ mod tests {
             CACHE_MAX_AGE_MS,
             1_004
         ));
+
+        // #743 (0ff0b85, metadata-cache.ts:114-121 @ 5884ac4e): metadata
+        // from a private listing is never reused across sessions — invalid
+        // even at age 0 with no max age, and regardless of ttl.
+        let private_entry = ServerCacheEntry {
+            cache_scope: Some("private".to_string()),
+            ..base.clone()
+        };
+        assert!(!is_server_cache_valid(
+            &private_entry,
+            &definition,
+            0,
+            1_000
+        ));
+        assert!(!is_server_cache_valid(
+            &private_entry,
+            &definition,
+            CACHE_MAX_AGE_MS,
+            1_000
+        ));
+        let public_entry = ServerCacheEntry {
+            cache_scope: Some("public".to_string()),
+            ..base.clone()
+        };
+        assert!(is_server_cache_valid(&public_entry, &definition, 0, 1_000));
 
         // Declared ttl longer than maxAge → maxAge still caps. The ttl path
         // uses a strict `<` (upstream `ageMs < effectiveMaxAge`), so the
