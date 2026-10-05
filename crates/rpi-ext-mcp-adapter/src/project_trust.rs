@@ -623,6 +623,85 @@ mod tests {
         assert!(!result.config.mcp_servers["proj"].is_disabled());
     }
 
+    /// #709 (1f540b9): approvals are shared per repository across git
+    /// worktrees; a planted `.git` file without a matching admin back-link
+    /// must NOT borrow another checkout's approvals.
+    #[test]
+    fn approval_scope_shares_worktrees_and_rejects_forged_git_links() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "rpi-mcp-trust-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let repo = sandbox.join("repo");
+        let worktree = sandbox.join("wt");
+        let sub = repo.join("packages").join("app");
+        std::fs::create_dir_all(repo.join(".git").join("worktrees").join("wt")).expect("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        std::fs::write(repo.join(".git").join("config"), "bare = false\n").expect("config");
+        // A linked worktree: `.git` is a regular file pointing at the admin
+        // dir, and the admin dir has a `gitdir` file linking back.
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", repo.join(".git/worktrees/wt").display()),
+        )
+        .expect("worktree git file");
+        std::fs::write(
+            repo.join(".git/worktrees/wt/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .expect("back link");
+
+        let repo_scope = project_approval_scope(&repo.to_string_lossy());
+        let worktree_scope = project_approval_scope(&worktree.to_string_lossy());
+        let repo_sub_scope = project_approval_scope(&sub.to_string_lossy());
+        let canonical_repo = canonical_project_root(&repo.to_string_lossy());
+        assert_eq!(repo_scope, canonical_repo);
+        assert_eq!(
+            worktree_scope, canonical_repo,
+            "a linked worktree shares the repository's approval scope"
+        );
+        assert_eq!(
+            repo_sub_scope,
+            std::path::Path::new(&canonical_repo)
+                .join("packages/app")
+                .to_string_lossy(),
+            "a subdirectory keeps the repository-relative key"
+        );
+
+        // Forged back-link: the admin entry points at a different checkout.
+        std::fs::write(
+            repo.join(".git/worktrees/wt/gitdir"),
+            format!("{}\n", repo.join(".git").display()),
+        )
+        .expect("forged back link");
+        assert_eq!(
+            project_approval_scope(&worktree.to_string_lossy()),
+            canonical_project_root(&worktree.to_string_lossy()),
+            "a forged .git file falls back to its own root"
+        );
+
+        // A linked admin dir whose common dir is bare uses a `git-dir:` key
+        // that no canonical path equals (upstream shared-scope guard).
+        std::fs::write(
+            repo.join(".git/worktrees/wt/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .expect("restore back link");
+        std::fs::write(repo.join(".git/config"), "bare = true\n").expect("bare config");
+        let bare_scope = project_approval_scope(&worktree.to_string_lossy());
+        assert!(
+            bare_scope.starts_with("git-dir:"),
+            "a linked bare admin dir keys the scope by git-dir: {bare_scope}"
+        );
+
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
     #[test]
     fn disabled_reason_falls_back_to_the_generic_text() {
         let blocked = std::collections::HashMap::from([(

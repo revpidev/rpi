@@ -992,6 +992,17 @@ mod tests {
     }
 
     #[test]
+    fn utf8_bom_is_stripped_before_parsing() {
+        // #697 (1416386): an editor-saved BOM must not break the JSONC parse.
+        let parsed =
+            parse_json_config("\u{feff}{ \"mcpServers\": { \"a\": { \"command\": \"x\" } } }")
+                .expect("BOM-prefixed JSONC parses");
+        assert_eq!(parsed["mcpServers"]["a"]["command"], serde_json::json!("x"));
+        assert_eq!(strip_utf8_bom("\u{feff}abc"), "abc");
+        assert_eq!(strip_utf8_bom("abc"), "abc");
+    }
+
+    #[test]
     fn strip_comments_and_trailing_commas() {
         let raw =
             "{\n  // line comment\n  \"a\": 1, /* block\n  comment */ \"b\": \"http://x\", \n}";
