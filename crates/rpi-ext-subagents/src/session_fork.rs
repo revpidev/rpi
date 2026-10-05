@@ -15,6 +15,7 @@
 //! keeps its requested thinking level — a signature cannot replay into a
 //! branch, so sanitizing is not a downgrade).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -45,41 +46,86 @@ pub fn wrap_fork_task(task: &str, preamble: Option<&str>) -> String {
     }
 }
 
-/// `sanitizeUnsafeThinkingBlocks` (fork-context.ts:73-118): drop
-/// `redacted_thinking` blocks and Anthropic `thinking` blocks carrying a
-/// signature or redaction flag. Returns true when anything was removed.
+/// `sanitizeUnsafeThinkingBlocks` (fork-context.ts:87-118 @ b6bda32f, #2381):
+/// drop `redacted_thinking` blocks and Anthropic `thinking` blocks carrying a
+/// signature or redaction flag from assistant messages **and from
+/// `context_edit` replacements** (the v0.74 branch: the edit's `targetId`
+/// resolves the target message supplying role/provider/api/model; the
+/// edit's `replacement.content` owns the blocks). Returns true when anything
+/// was removed.
 fn sanitize_unsafe_thinking_blocks(entries: &mut [Value]) -> bool {
-    let mut sanitized = false;
-    for entry in entries.iter_mut() {
-        if entry.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
+    struct TargetMeta {
+        provider: String,
+        api: String,
+        model: String,
+    }
+    // Precompute the target assistant metadata per entry: the entry itself for
+    // message entries, or the `targetId`-resolved message for `context_edit`.
+    let mut entry_ids: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+            entry_ids.insert(id, index);
         }
-        let Some(message) = entry.get_mut("message").and_then(Value::as_object_mut) else {
+    }
+    let mut targets: Vec<Option<usize>> = Vec::with_capacity(entries.len());
+    let mut metas: Vec<Option<TargetMeta>> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let is_context_edit = entry.get("type").and_then(Value::as_str) == Some("context_edit");
+        let target_index = if is_context_edit {
+            entry
+                .get("targetId")
+                .and_then(Value::as_str)
+                .and_then(|id| entry_ids.get(id).copied())
+        } else {
+            Some(index)
+        };
+        targets.push(target_index);
+        metas.push(target_index.and_then(|target| {
+            let message = entries[target].get("message")?;
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                return None;
+            }
+            Some(TargetMeta {
+                provider: message
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase(),
+                api: message
+                    .get("api")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase(),
+                model: message
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase(),
+            })
+        }));
+    }
+    let mut sanitized = false;
+    for (index, entry) in entries.iter_mut().enumerate() {
+        let Some(meta) = metas[index].as_ref() else {
             continue;
         };
-        if message.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let provider = message
-            .get("provider")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
-        let api = message
-            .get("api")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
-        let model = message
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
-        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        let is_context_edit = entry.get("type").and_then(Value::as_str) == Some("context_edit");
+        let content = if is_context_edit {
+            entry
+                .get_mut("replacement")
+                .and_then(|replacement| replacement.get_mut("content"))
+        } else {
+            entry
+                .get_mut("message")
+                .and_then(|message| message.get_mut("content"))
+        };
+        let Some(content) = content.and_then(Value::as_array_mut) else {
             continue;
         };
         let before = content.len();
-        content.retain(|block| !is_unsafe_anthropic_thinking_block(&provider, &api, &model, block));
+        content.retain(|block| {
+            !is_unsafe_anthropic_thinking_block(&meta.provider, &meta.api, &meta.model, block)
+        });
         if content.len() != before {
             sanitized = true;
         }
@@ -374,6 +420,61 @@ mod tests {
         assert_eq!(content.len(), 2);
         // Unsigned thinking blocks stay.
         assert_eq!(content[0].get("type").unwrap(), "thinking");
+    }
+
+    #[test]
+    fn context_edit_replacements_are_sanitized_too() {
+        // #2381 (fork-context.ts:87-118 @ b6bda32f): a `context_edit`'s
+        // replacement content is sanitized using the TARGET message's
+        // provider metadata; non-assistant targets stay untouched.
+        let mut entries = vec![
+            serde_json::json!({
+                "type": "message", "id": "m1",
+                "message": {"role": "assistant", "provider": "anthropic", "content": [
+                    {"type": "thinking", "thinking": "h", "signature": "sig"},
+                    {"type": "text", "text": "final"}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "context_edit", "id": "e1", "targetId": "m1",
+                "replacement": {"content": [
+                    {"type": "redacted_thinking", "data": "x"},
+                    {"type": "thinking", "thinking": "h2", "thinkingSignature": "sig2"},
+                    {"type": "thinking", "thinking": "unsigned"},
+                    {"type": "text", "text": "edited"}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "message", "id": "m2",
+                "message": {"role": "user", "content": [{"type": "text", "text": "u"}]}
+            }),
+            serde_json::json!({
+                "type": "context_edit", "id": "e2", "targetId": "m2",
+                "replacement": {"content": [{"type": "redacted_thinking", "data": "keep"}]}
+            }),
+        ];
+        assert!(sanitize_unsafe_thinking_blocks(&mut entries));
+        // The assistant message lost its signed thinking block.
+        assert_eq!(
+            entries[0]["message"]["content"].as_array().unwrap().len(),
+            1
+        );
+        // The replacement lost the redacted + signed blocks; the unsigned
+        // thinking and the text stay.
+        let replacement = entries[1]["replacement"]["content"].as_array().unwrap();
+        assert_eq!(replacement.len(), 2);
+        assert_eq!(replacement[0]["type"], "thinking");
+        assert_eq!(replacement[1]["type"], "text");
+        // The user-target replacement is not an assistant message.
+        assert_eq!(
+            entries[3]["replacement"]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // Idempotent: a second pass finds nothing to remove.
+        assert!(!sanitize_unsafe_thinking_blocks(&mut entries));
     }
 
     #[test]
