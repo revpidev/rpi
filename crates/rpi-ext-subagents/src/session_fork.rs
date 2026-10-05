@@ -46,7 +46,7 @@ pub fn wrap_fork_task(task: &str, preamble: Option<&str>) -> String {
     }
 }
 
-/// `sanitizeUnsafeThinkingBlocks` (fork-context.ts:87-118 @ b6bda32f, #2381):
+/// `sanitizeUnsafeThinkingBlocks` (fork-context.ts:100-127 @ b6bda32f, #2381):
 /// drop `redacted_thinking` blocks and Anthropic `thinking` blocks carrying a
 /// signature or redaction flag from assistant messages **and from
 /// `context_edit` replacements** (the v0.74 branch: the edit's `targetId`
@@ -69,7 +69,6 @@ fn sanitize_unsafe_thinking_blocks(entries: &mut [Value]) -> bool {
             entry_ids.insert(id, index);
         }
     }
-    let mut targets: Vec<Option<usize>> = Vec::with_capacity(entries.len());
     let mut metas: Vec<Option<TargetMeta>> = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let is_context_edit = entry.get("type").and_then(Value::as_str) == Some("context_edit");
@@ -81,7 +80,6 @@ fn sanitize_unsafe_thinking_blocks(entries: &mut [Value]) -> bool {
         } else {
             Some(index)
         };
-        targets.push(target_index);
         metas.push(target_index.and_then(|target| {
             let message = entries[target].get("message")?;
             if message.get("role").and_then(Value::as_str) != Some("assistant") {
@@ -430,7 +428,7 @@ mod tests {
 
     #[test]
     fn context_edit_replacements_are_sanitized_too() {
-        // #2381 (fork-context.ts:87-118 @ b6bda32f): a `context_edit`'s
+        // #2381 (fork-context.ts:100-127 @ b6bda32f): a `context_edit`'s
         // replacement content is sanitized using the TARGET message's
         // provider metadata; non-assistant targets stay untouched.
         let mut entries = vec![
