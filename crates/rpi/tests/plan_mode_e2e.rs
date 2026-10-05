@@ -200,7 +200,11 @@ fn install_plugin_for_discovery(sandbox: &Sandbox, plugin: &Path) {
 // Scripted dialog + recording bridge
 // ---------------------------------------------------------------------------
 
-type WidgetRecord = (String, Option<WidgetContent>, Option<ExtensionWidgetOptions>);
+type WidgetRecord = (
+    String,
+    Option<WidgetContent>,
+    Option<ExtensionWidgetOptions>,
+);
 
 #[derive(Default)]
 struct ScriptedBridge {
@@ -234,7 +238,10 @@ impl ScriptedBridge {
     }
 
     fn widget_present(&self, key_suffix: &str) -> bool {
-        let widgets = self.widgets.lock().unwrap_or_else(|error| error.into_inner());
+        let widgets = self
+            .widgets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         widgets
             .iter()
             .rev()
@@ -353,7 +360,9 @@ impl UiBridge for ScriptedBridge {
 // ---------------------------------------------------------------------------
 
 struct Fixture {
-    host: Arc<NativeExtensionHost>,
+    /// Kept alive for the extension pipeline; the session holds its own
+    /// handle (tests drive the session, not the host directly).
+    _host: Arc<NativeExtensionHost>,
     session: rpi::core::agent_session::AgentSession,
     bridge: Arc<ScriptedBridge>,
     sandbox: Sandbox,
@@ -362,7 +371,10 @@ struct Fixture {
 async fn build_model_runtime(
     agent_dir: &Path,
     steps: Vec<FauxResponseStep>,
-) -> (Arc<rpi::core::model_runtime::ModelRuntime>, rpi_ai::types::Model) {
+) -> (
+    Arc<rpi::core::model_runtime::ModelRuntime>,
+    rpi_ai::types::Model,
+) {
     let provider = FauxProvider::new(FauxProviderOptions {
         models: Some(vec![FauxModelDefinition {
             id: "faux-1".to_owned(),
@@ -472,7 +484,7 @@ async fn boot(
         .await;
 
     Fixture {
-        host,
+        _host: host,
         session,
         bridge,
         sandbox,
@@ -585,15 +597,24 @@ async fn plan_toggle_hides_and_restores_the_boundary() {
 
     // Natural state before entering.
     assert_eq!(exposure_of(session, "edit").as_deref(), Some("direct"));
-    assert_eq!(exposure_of(session, "write_plan").as_deref(), Some("direct"));
+    assert_eq!(
+        exposure_of(session, "write_plan").as_deref(),
+        Some("direct")
+    );
     assert!(
-        !session.get_active_tool_names().iter().any(|name| name == "write_plan"),
+        !session
+            .get_active_tool_names()
+            .iter()
+            .any(|name| name == "write_plan"),
         "write_plan defaults to inactive outside Plan mode"
     );
     assert!(!fixture.bridge.widget_present("plan-mode-hint"));
 
     enter_plan(&fixture).await;
-    assert_eq!(session.permission_mode(), rpi::core::permission_mode::PermissionMode::Plan);
+    assert_eq!(
+        session.permission_mode(),
+        rpi::core::permission_mode::PermissionMode::Plan
+    );
 
     // Non-whitelist tools are hidden; the whitelist keeps natural exposures.
     for name in ["bash", "edit", "write"] {
@@ -650,7 +671,10 @@ async fn plan_toggle_hides_and_restores_the_boundary() {
         exposure_of(session, "edit").as_deref() == Some("direct")
     })
     .await;
-    assert_eq!(session.permission_mode(), rpi::core::permission_mode::PermissionMode::Default);
+    assert_eq!(
+        session.permission_mode(),
+        rpi::core::permission_mode::PermissionMode::Default
+    );
     for name in ["bash", "edit", "write"] {
         assert_eq!(
             exposure_of(session, name).as_deref(),
@@ -692,9 +716,7 @@ async fn write_plan_approve_writes_the_file_and_injects_the_summary() {
     let session = &fixture.session;
     enter_plan(&fixture).await;
 
-    fixture
-        .bridge
-        .queue_select(json!("Approve and execute"));
+    fixture.bridge.queue_select(json!("Approve and execute"));
 
     turn(session, "plan the change").await;
 
@@ -771,9 +793,7 @@ async fn write_plan_revision_routes_feedback_and_stays_in_plan_mode() {
     let session = &fixture.session;
     enter_plan(&fixture).await;
 
-    fixture
-        .bridge
-        .queue_select(json!("Continue revising"));
+    fixture.bridge.queue_select(json!("Continue revising"));
     fixture.bridge.queue_input(json!("add rollback notes"));
 
     turn(session, "plan it").await;
@@ -1044,7 +1064,9 @@ async fn late_registered_tools_are_re_tightened_and_restored() {
         "hidden tools are not callable"
     );
     assert!(
-        !session.system_prompt().contains("late_mutator: mutates state"),
+        !session
+            .system_prompt()
+            .contains("late_mutator: mutates state"),
         "the declaration drops the late tool"
     );
 
@@ -1075,7 +1097,9 @@ async fn config_hot_change_applies_at_the_next_trigger() {
     )
     .await;
     let session = &fixture.session;
-    fixture.sandbox.write_config("allowTools = [\"read\", \"bash\"]");
+    fixture
+        .sandbox
+        .write_config("allowTools = [\"read\", \"bash\"]");
     enter_plan(&fixture).await;
 
     // bash is allowed by the config: stays direct. edit is not: hidden.
@@ -1090,7 +1114,9 @@ async fn config_hot_change_applies_at_the_next_trigger() {
 
     // Hot edit: bash leaves the allow list, edit joins it. The next
     // before_agent_start trigger (a prompt turn) applies it.
-    fixture.sandbox.write_config("allowTools = [\"read\", \"edit\"]");
+    fixture
+        .sandbox
+        .write_config("allowTools = [\"read\", \"edit\"]");
     turn(session, "recheck the boundary").await;
     assert_eq!(
         exposure_of(session, "bash").as_deref(),
