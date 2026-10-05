@@ -65,11 +65,10 @@ fn registry_entry_matches_official_lockstep_shape() {
     // TE32/TE42: the skeleton is mirrored verbatim into rpi-pages
     // `registry/rpi-ask-user-question.json` (official first-party entry,
     // shared revpidev/rpi Release). generate-site.py validates the same
-    // fields (name/repository/description/author/license) and matches the
-    // historical `.rpix` assets through `historicNames`; `lockstepHost:
-    // true` makes every version's minHostVersion = the version itself —
-    // for the first release that is 0.1.4, the first host version with
-    // interactive-ui-abi (R-Q8.4).
+    // fields (name/repository/description/author/license) and the official
+    // `rpi-` prefix; `lockstepHost: true` makes every version's
+    // minHostVersion = the version itself — for the first release that is
+    // 0.1.4, the first host version with interactive-ui-abi (R-Q8.4).
     let entry: Value =
         serde_json::from_str(&read_crate_file("registry-entry.json")).expect("registry entry json");
     let manifest: Value =
@@ -82,14 +81,6 @@ fn registry_entry_matches_official_lockstep_shape() {
     assert_eq!(entry["repository"], "revpidev/rpi");
     assert_eq!(entry["official"], serde_json::json!(true));
     assert_eq!(entry["lockstepHost"], serde_json::json!(true));
-    // TE42 (R7.2.2): the v0.1.5-and-earlier `.rpix` assets keep their old
-    // `rpiv-` names; the registry declares them as historic names so
-    // generate-site.py keeps the historical version matrix under the new
-    // key (no download redirect).
-    assert_eq!(
-        entry["historicNames"],
-        serde_json::json!(["rpiv-ask-user-question"])
-    );
     for field in ["description", "author", "license", "descriptionZh"] {
         assert!(
             entry

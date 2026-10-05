@@ -50,8 +50,8 @@ use crate::state::selectors::{
 use crate::tool::types::{Task, TaskStatus};
 use crate::view::{AnsiTheme, TodoTheme, format_overlay_task_line};
 
-/// Widget key — renamed from the upstream `rpiv-todos` under ADR-0033
-/// decision 6 (v0.1.6, [BREAKING]); the shape is otherwise verbatim.
+/// Widget key — renamed under ADR-0033 decision 6 (v0.1.6, [BREAKING]);
+/// the shape is otherwise verbatim.
 pub const WIDGET_KEY: &str = "rpi-todos";
 
 /// The event-path assembly width: no truncation (`usize::MAX` makes

@@ -5,9 +5,9 @@
 //! channel names are immutable; payload changes are append-only; breaking
 //! changes require a new channel; payloads are JSON-safe.
 //!
-//! v0.1.6 (TE42, ADR-0033 decision 6): the channel prefix was renamed
-//! `rpiv:` → `rpi:` as a declared [BREAKING] (see `changes/v0.1.6.md`); it is
-//! the single intentional break of the immutability policy above.
+//! v0.1.6 (TE42, ADR-0033 decision 6): the channel prefix was normalized
+//! to `rpi:` (declared [BREAKING] in `changes/v0.1.6.md`); it is the single
+//! intentional break of the immutability policy above.
 //!
 //! `prompt` is emitted after validation and before the questionnaire opens;
 //! `blocked {active:true}` brackets the wait and `{active:false}` runs in the

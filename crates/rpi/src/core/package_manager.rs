@@ -2207,21 +2207,6 @@ impl DefaultPackageManager {
             .ok_or_else(|| "The extension registry is disabled (RPI_REGISTRY_URL=off)".to_string())
     }
 
-    /// Old first-party extension names renamed in v0.1.6 (R7.2.3/TE42):
-    /// resolving one fails with a rename pointer layered onto the registry
-    /// 404 instead of the bare not-found text. Clean switch — this is
-    /// guidance only, never alias resolution (the new name is not fetched,
-    /// mapped or installed automatically). The `No extension named` prefix
-    /// is preserved so [`Self::is_registry_not_found`] keeps classifying
-    /// the error for the untracked-update skip path.
-    fn renamed_extension_guidance(name: &str) -> Option<&'static str> {
-        match name {
-            "rpiv-ask-user-question" => Some("rpi-ask-user-question"),
-            "rpiv-todo" => Some("rpi-todo"),
-            _ => None,
-        }
-    }
-
     /// Everything needed for install steps 6–7, resolved upfront.
     /// Registry channel: index fetch → version selection → compatibility
     /// precheck → artifact selection (design §7.2 steps 1–4).
@@ -2242,17 +2227,10 @@ impl DefaultPackageManager {
             .get(&index_url, extension_registry::REGISTRY_REQUEST_TIMEOUT)
             .map_err(|error| {
                 if error.contains("HTTP 404") {
-                    match Self::renamed_extension_guidance(&source.name) {
-                        Some(new_name) => format!(
-                            "No extension named \"{}\" in the registry ({index_url}); it was \
-                             renamed to \"{}\" in v0.1.6 — install \"{}\" instead",
-                            source.name, new_name, new_name
-                        ),
-                        None => format!(
-                            "No extension named \"{}\" in the registry ({index_url})",
-                            source.name
-                        ),
-                    }
+                    format!(
+                        "No extension named \"{}\" in the registry ({index_url})",
+                        source.name
+                    )
                 } else {
                     format!(
                         "Could not resolve \"{}\" from the registry: {error}. If the registry \
@@ -8804,52 +8782,6 @@ mod registry_tests {
         assert!(!DefaultPackageManager::is_registry_not_found(
             "request failed: HTTP 500"
         ));
-    }
-
-    /// TE42 FR-D (R7.2.3): a bare-name install of a renamed first-party
-    /// extension surfaces the rename pointer layered onto the registry 404;
-    /// the error still classifies as not-found (the untracked-update skip
-    /// stays intact), and other missing names carry no rename hint.
-    #[test]
-    fn test_renamed_extension_guidance_points_to_new_name() {
-        let dirs = TestDirs::new();
-        let transport = MapTransport::new(); // no routes -> HTTP 404
-        let manager = manager_ok(&dirs, transport);
-        for (old, new) in [
-            ("rpiv-ask-user-question", "rpi-ask-user-question"),
-            ("rpiv-todo", "rpi-todo"),
-        ] {
-            let ParsedSource::Registry(registry) = parse_source(old) else {
-                panic!("bare name must parse as a registry source");
-            };
-            let error = manager
-                .resolve_registry_install_with_channel(&registry, UpdateChannel::Stable)
-                .unwrap_err();
-            assert!(
-                error.starts_with(&format!("No extension named \"{old}\" in the registry")),
-                "{old}: {error}"
-            );
-            assert!(
-                error.contains(&format!("renamed to \"{new}\" in v0.1.6")),
-                "{old}: {error}"
-            );
-            assert!(
-                error.contains(&format!("install \"{new}\" instead")),
-                "{old}: {error}"
-            );
-            assert!(
-                DefaultPackageManager::is_registry_not_found(&error),
-                "{old} must stay classified as registry-not-found: {error}"
-            );
-        }
-        // A missing name that was never renamed stays hint-free.
-        let ParsedSource::Registry(registry) = parse_source("never-published") else {
-            panic!("bare name must parse as a registry source");
-        };
-        let error = manager
-            .resolve_registry_install_with_channel(&registry, UpdateChannel::Stable)
-            .unwrap_err();
-        assert!(!error.contains("renamed to"), "{error}");
     }
 
     // ---- github: channel (design §7.1) ----

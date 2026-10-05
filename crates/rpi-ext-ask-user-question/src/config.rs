@@ -7,9 +7,8 @@
 //! Path policy (R-Q7.1 [VARIANT], deviation TE-D39 as amended by ADR-0033
 //! decision 6, 2026-10-05): the config directory uses the current plugin
 //! name — `~/.config/rpi-ask-user-question/config.json` — and stays
-//! deliberately NOT mapped to `~/.rpi`. The former `rpiv-ask-user-question`
-//! directory is no longer read (clean switch; announcement in
-//! `changes/v0.1.6.md`). Lookup order (requirements 附录 D, read-only, never
+//! deliberately NOT mapped to `~/.rpi`; no legacy directory is read
+//! (clean switch; announcement in `changes/v0.1.6.md`). Lookup order (requirements 附录 D, read-only, never
 //! created):
 //!
 //! 1. `$XDG_CONFIG_HOME/rpi-ask-user-question/config.json` — `XDG_CONFIG_HOME`

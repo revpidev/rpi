@@ -13,9 +13,9 @@
 //! renderCall/renderResult transcript renderers. Event wiring follows
 //! upstream `index.ts` @ `0fdf4f8` on both layers.
 //!
-//! Docs: `rpi-docs/extensions/rpi-todo/{01,02}.md` and the task files
-//! `rpi-docs/plan/extensions/TE34-rpiv-todo-p0.md` / `TE35-rpiv-todo-p1.md`
-//! (historical filenames — the plugin itself was renamed in v0.1.6).
+//! Docs: `rpi-docs/extensions/rpi-todo/{01,02}.md` and the TE34–TE36 task
+//! records under `rpi-docs/plan/extensions/` (the plugin was renamed in
+//! v0.1.6).
 //!
 //! Native plugin runtime model (ask-user-question precedent):
 //! `rpi_extension_init` registers through the host-call handle and

@@ -8,9 +8,9 @@
 //! Path policy (R-T6 [VARIANT], deviation TE-D43 as amended by ADR-0033
 //! decision 6, 2026-10-05): the config directory uses the current plugin
 //! name — `~/.config/rpi-todo/config.json` — and stays deliberately NOT
-//! mapped to `~/.rpi` (TE-D39 precedent). The former `rpiv-todo`
-//! directory is no longer read (clean switch; announcement in
-//! `changes/v0.1.6.md`). Lookup order (read-only, never created):
+//! mapped to `~/.rpi` (TE-D39 precedent); no legacy directory is read
+//! (clean switch; announcement in `changes/v0.1.6.md`). Lookup order
+//! (read-only, never created):
 //!
 //! 1. `$XDG_CONFIG_HOME/rpi-todo/config.json` — must be set, non-empty
 //!    after trim and absolute (`~`/`~/…` expands first; relative falls
@@ -324,8 +324,8 @@ fn is_printable_base(key: char) -> bool {
 }
 
 /// Validate a collapse-key spec against pi-tui's `KeyId` grammar
-/// (upstream `isValidCollapseKeySpec`, itself a verbatim port from
-/// rpiv-ask-user-question): zero or more distinct modifiers, then a base
+/// (upstream `isValidCollapseKeySpec`, itself a verbatim port shared with
+/// the questionnaire plugin): zero or more distinct modifiers, then a base
 /// key that is a single printable character or a named special key.
 ///
 /// A loose check is not enough — pi-tui's `parseKeyId` takes the LAST

@@ -1,6 +1,5 @@
 {
   "name": "rpi-todo",
-  "historicNames": ["rpiv-todo"],
   "repository": "revpidev/rpi",
   "description": "Task-list todo tool: a live overlay panel above the editor the model keeps current with one tool call (six actions, four-state machine, dependency tracking), rebuilt from the session branch so it survives compaction and /reload, plus a /todos command and a collapse shortcut.",
   "author": "revpidev",

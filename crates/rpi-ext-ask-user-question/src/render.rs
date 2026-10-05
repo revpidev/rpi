@@ -30,8 +30,8 @@
 //! Multi-color single lines are not expressible as declarative v1 props
 //! (one `fg` per text node, no `row`), so the segments are embedded as
 //! ANSI wraps inside the text value — the same channel as the upstream
-//! `Text` component's pre-wrapped strings (rpiv-todo `view/format.ts`
-//! port precedent in `rpi-ext-todo/src/view.rs`).
+//! `Text` component's pre-wrapped strings (the upstream todo plugin's
+//! `view/format.ts` port precedent in `rpi-ext-todo/src/view.rs`).
 //!
 //! Streaming tolerance (FR-A): `renderCall` fires while args are still
 //! streaming (`context.argsComplete === false`), so every parse here is
