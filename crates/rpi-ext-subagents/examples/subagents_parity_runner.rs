@@ -195,6 +195,15 @@ fn run_model_case(case: &Value) -> Value {
         })
     });
     let registry_ref = registry.as_deref();
+    let scoped_models: Option<Vec<String>> = case.get("scopedModels").and_then(|s| {
+        s.as_array().map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        })
+    });
+    let scope = case.get("scope");
     let kind = case.get("kind").and_then(Value::as_str).unwrap_or("");
     match kind {
         "override" => {
@@ -207,6 +216,8 @@ fn run_model_case(case: &Value) -> Value {
                 case.get("parentModel").and_then(Value::as_str),
                 registry_ref,
                 case.get("preferredProvider").and_then(Value::as_str),
+                scope,
+                scoped_models.as_deref(),
                 source,
             ) {
                 Ok(resolved) => json!({ "resolved": resolved }),
@@ -223,6 +234,9 @@ fn run_model_case(case: &Value) -> Value {
                 case.get("primary").and_then(Value::as_str),
                 registry_ref,
                 case.get("preferredProvider").and_then(Value::as_str),
+                scope,
+                scoped_models.as_deref(),
+                case.get("agentName").and_then(Value::as_str),
                 origin,
             ) {
                 Ok(candidates) => json!({ "candidates": candidates }),

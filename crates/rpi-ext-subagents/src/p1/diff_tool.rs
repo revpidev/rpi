@@ -25,6 +25,48 @@ const MAX_UNTRACKED_FILES: usize = 50;
 /// Env carrying the parent-captured baseline: `<root>\t<ref>`.
 pub const DIFF_BASELINE_ENV: &str = "RPI_SUBAGENT_DIFF_BASELINE";
 
+/// Sentinel env value meaning "the tool is registered, but this cwd has no
+/// valid Git HEAD baseline" (#2426, diff-tool.ts:9 @ b6bda32f).
+pub const DIFF_BASELINE_UNAVAILABLE: &str = "__unavailable__";
+
+/// `WATCHDOG_DIFF_UNAVAILABLE_BASELINE` (diff-tool.ts:9 @ b6bda32f): the
+/// no-baseline tool result, returned instead of failing the review.
+pub const WATCHDOG_DIFF_UNAVAILABLE_BASELINE: &str = "watchdog_diff unavailable: this cwd has no valid Git HEAD baseline. No diff can be shown; inspect files with independent read-only tools instead.";
+
+/// Registration/execution state decoded from the env value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffBaselineState {
+    Available(DiffBaseline),
+    Unavailable,
+    None,
+}
+
+/// `WATCHDOG_DIFF_UNAVAILABLE_BASELINE` description shown when no baseline
+/// could be captured (diff-tool.ts:70-73 @ b6bda32f).
+pub fn unavailable_tool_description() -> String {
+    "Report that a Git HEAD diff baseline is unavailable in this cwd. No diff is generated."
+        .to_string()
+}
+
+/// Decode the env form (pure; tests pin the tri-state without touching the
+/// process environment).
+pub fn baseline_state_from_env_value(raw: Option<&str>) -> DiffBaselineState {
+    match raw {
+        None => DiffBaselineState::None,
+        Some(DIFF_BASELINE_UNAVAILABLE) => DiffBaselineState::Unavailable,
+        Some(raw) => match DiffBaseline::from_env_value(raw) {
+            Some(baseline) => DiffBaselineState::Available(baseline),
+            None => DiffBaselineState::None,
+        },
+    }
+}
+
+/// The child's current diff-baseline state.
+pub fn baseline_state() -> DiffBaselineState {
+    let raw = std::env::var(DIFF_BASELINE_ENV).ok();
+    baseline_state_from_env_value(raw.as_deref())
+}
+
 /// The launch baseline (repo root + HEAD at reviewer launch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffBaseline {
@@ -61,10 +103,6 @@ impl DiffBaseline {
             root: root.to_string(),
             ref_: ref_.to_string(),
         })
-    }
-
-    fn from_env() -> Option<DiffBaseline> {
-        DiffBaseline::from_env_value(&std::env::var(DIFF_BASELINE_ENV).ok()?)
     }
 }
 
@@ -155,17 +193,27 @@ fn bound(text: &str) -> String {
     format!("{}{}", &text[..cut], marker)
 }
 
-/// Whether the child should register the tool (baseline env present).
-pub fn baseline_from_env() -> Option<DiffBaseline> {
-    DiffBaseline::from_env()
-}
-
+/// Whether the child should register the tool (env present in any mode;
+/// #2426: the no-baseline mode still registers).
 /// Tool execution (diff-tool.ts:59-96, workingTreeAtLaunch mode).
 pub fn execute(params: &Value) -> Value {
-    let Some(baseline) = DiffBaseline::from_env() else {
-        return error_result(
-            "watchdog_diff is unavailable: no diff baseline was configured for this session.",
-        );
+    let baseline = match baseline_state() {
+        DiffBaselineState::Available(baseline) => baseline,
+        // #2426: a reviewer in a non-Git cwd gets the documented unavailable
+        // result instead of a failing tool call.
+        DiffBaselineState::Unavailable => {
+            let text = WATCHDOG_DIFF_UNAVAILABLE_BASELINE;
+            return json!({
+                "content": [{ "type": "text", "text": text }],
+                "details": { "chars": text.len() },
+                "isError": false,
+            });
+        }
+        DiffBaselineState::None => {
+            return error_result(
+                "watchdog_diff is unavailable: no diff baseline was configured for this session.",
+            );
+        }
     };
     let path_filter = match validate_path(params.get("path").and_then(Value::as_str)) {
         Ok(filter) => filter,
@@ -298,5 +346,36 @@ mod tests {
         assert!(bounded.contains(" characters omitted; call again with a narrower path ...]"));
         // Within budget: unchanged.
         assert_eq!(bound("short"), "short");
+    }
+
+    #[test]
+    fn baseline_state_tri_state_matches_upstream() {
+        // #2426: the unavailable sentinel registers the tool in no-baseline
+        // mode; absent env stays unregistered; malformed values fail closed.
+        assert_eq!(baseline_state_from_env_value(None), DiffBaselineState::None);
+        assert_eq!(
+            baseline_state_from_env_value(Some(DIFF_BASELINE_UNAVAILABLE)),
+            DiffBaselineState::Unavailable
+        );
+        assert_eq!(
+            baseline_state_from_env_value(Some("/repo\tabc123\t")),
+            DiffBaselineState::Available(DiffBaseline {
+                root: "/repo".to_string(),
+                ref_: "abc123".to_string(),
+            })
+        );
+        assert_eq!(
+            baseline_state_from_env_value(Some("junk")),
+            DiffBaselineState::None
+        );
+        assert_eq!(
+            baseline_state_from_env_value(Some("\tabc")),
+            DiffBaselineState::None
+        );
+        // The unavailable message matches the upstream constant.
+        assert_eq!(
+            WATCHDOG_DIFF_UNAVAILABLE_BASELINE,
+            "watchdog_diff unavailable: this cwd has no valid Git HEAD baseline. No diff can be shown; inspect files with independent read-only tools instead."
+        );
     }
 }

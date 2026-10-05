@@ -1506,6 +1506,10 @@ fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOve
     if let Some(description) = &entry.description {
         agent.description = description.clone();
     }
+    // #2534 (agents.ts:1467 @ b6bda32f): settings can advertise a builtin agent.
+    if let Some(advertise) = entry.advertise {
+        agent.advertise = Some(advertise);
+    }
     if let Some(model) = &entry.model {
         agent.model = model.clone();
     }
@@ -2100,6 +2104,37 @@ mod tests {
         assert_eq!(researcher.mcp_direct_tools.len(), 0);
         // Builtins without an explicit model inherit subagents.defaultModel.
         assert_eq!(researcher.model.as_deref(), Some("model-x"));
+    }
+
+    #[test]
+    fn builtin_override_advertise_lists_in_catalog() {
+        // #2534: `agentOverrides.<name>.advertise` advertises a builtin agent
+        // without copying its definition file.
+        let mut user_settings = crate::config::SubagentSettings::default();
+        user_settings.overrides.insert(
+            "researcher".to_string(),
+            crate::config::AgentOverride {
+                advertise: Some(true),
+                ..Default::default()
+            },
+        );
+        let settings = crate::config::SettingsPair {
+            user: user_settings,
+            ..Default::default()
+        };
+        let found = discover_agents_with_user_dirs(
+            Path::new("/nonexistent"),
+            "both",
+            &settings,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let researcher = found.iter().find(|a| a.name == "researcher").unwrap();
+        assert_eq!(researcher.advertise, Some(true));
+        // An override on another agent leaves the field untouched.
+        let worker = found.iter().find(|a| a.name == "worker").unwrap();
+        assert_eq!(worker.advertise, None);
     }
 }
 

@@ -439,6 +439,23 @@ fn terminal_step_progress(
     Value::Object(map)
 }
 
+/// #2507 (TE45): resolve every step's literal agent name before any child
+/// launches. The structural chain surface has no runtime-computed agent
+/// names, so every name is checkable up front; a misspelled later step fails
+/// the chain before the earlier steps run.
+fn resolve_step_agents<'a>(
+    steps: &[StepSpec],
+    agents: &'a [AgentConfig],
+) -> Result<Vec<&'a AgentConfig>, String> {
+    steps
+        .iter()
+        .map(|step| {
+            discover::resolve_agent_name(agents, &step.agent_name)?
+                .ok_or_else(|| format!("Unknown agent: {}", step.agent_name))
+        })
+        .collect()
+}
+
 /// Async core (see [`run_chain`]) — direct call from runtime tasks.
 pub async fn run_chain_async(
     steps: &[StepSpec],
@@ -461,13 +478,15 @@ pub async fn run_chain_async(
     // chainAgents (types.ts:1052): the declared step agent list.
     let chain_agents: Vec<String> = steps.iter().map(|step| step.agent_name.clone()).collect();
     let total_steps = steps.len();
+    // #2507 (TE45): resolve every step's literal agent name before the first
+    // child launches — a misspelled name in a later step must not run the
+    // earlier steps first.
+    let resolved_step_agents = resolve_step_agents(steps, agents)?;
     let mut completed: Vec<StepOutcome> = Vec::new();
     let mut previous_output: Option<String> = None;
     let mut first_progress_seen = false;
     for (index, step) in steps.iter().enumerate() {
-        let agent = discover::resolve_agent_name(agents, &step.agent_name)?
-            .cloned()
-            .ok_or_else(|| format!("Unknown agent: {}", step.agent_name))?;
+        let agent = resolved_step_agents[index];
         let default_template = if index == 0 { "{task}" } else { "{previous}" };
         let outputs_snapshot = outputs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let task = interpolate_task(
@@ -577,7 +596,7 @@ pub async fn run_chain_async(
                 sink(text, &chain_details);
             }));
         }
-        let outcome = launch_child::run_child_async(&spec, &agent, &step_ctx).await?;
+        let outcome = launch_child::run_child_async(&spec, agent, &step_ctx).await?;
         accumulated_cost += outcome
             .result
             .usage
@@ -734,5 +753,28 @@ mod tests {
         assert_eq!(parsed[1].skills.as_deref().map(|v| v.len()), Some(2));
         assert!(parse_steps(&json!([])).is_err());
         assert!(parse_steps(&json!([{"task": "no agent"}])).is_err());
+    }
+
+    #[test]
+    fn chain_step_agents_resolve_before_any_child_launch() {
+        // #2507: a misspelled later step fails the whole chain up front.
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let steps = parse_steps(&json!([
+            {"agent": "scout", "task": "scan"},
+            {"agent": "workr", "task": "ship"}
+        ]))
+        .unwrap();
+        let error = resolve_step_agents(&steps, &agents).unwrap_err();
+        assert_eq!(error, "Unknown agent: workr");
+        // Valid chains resolve in order; aliases map to canonical names.
+        let steps = parse_steps(&json!([
+            {"agent": "scout", "task": "scan"},
+            {"agent": "advisor", "task": "review"}
+        ]))
+        .unwrap();
+        let resolved = resolve_step_agents(&steps, &agents).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "scout");
+        assert_eq!(resolved[1].name, "oracle");
     }
 }

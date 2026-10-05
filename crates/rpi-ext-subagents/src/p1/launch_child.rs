@@ -194,6 +194,9 @@ pub struct RunCtx {
     /// uuidv7 tail of the fallback file stem).
     pub parent_session_id: Option<String>,
     pub parent_model: Option<String>,
+    /// Parent session's project-trust decision (#2570); `None` when the host
+    /// cannot answer (children keep the trusted default).
+    pub project_trusted: Option<bool>,
     pub registry: Vec<AvailableModel>,
     /// Host tool names from `getAllTools` (R7.1.4.3 / #2034): `Ok` = the
     /// authoritative host set (possibly empty), `Err(reason)` = the host
@@ -310,6 +313,7 @@ impl RunCtx {
             parent_session_file,
             parent_session_id,
             parent_model: host.parent_model(),
+            project_trusted: host.project_trusted(),
             registry: host.scoped_models(),
             host_builtin_tool_names: host.host_tool_names(),
             run_id,
@@ -561,6 +565,14 @@ pub async fn run_child_async(
     });
     let registry_ref: Option<&[AvailableModel]> =
         (!ctx.registry.is_empty()).then_some(&ctx.registry[..]);
+    // #2538: the parent session's scoped-model snapshot (`ctx.scopedModels`)
+    // backs the `scoped` modelScope token; an empty snapshot degrades it to
+    // `inherit` (model-scope.ts @ b6bda32f).
+    let scoped_model_ids: Vec<String> = ctx
+        .registry
+        .iter()
+        .map(|entry| entry.full_id.clone())
+        .collect();
     // R7.1.4.4 (TE18 FR-D): an empty `ctx.scopedModels` registry is NOT
     // "no usable models" — model strings pass through verbatim and fuzzy
     // resolution is explicitly skipped. The branch must stay visible in
@@ -594,6 +606,7 @@ pub async fn run_child_async(
         registry_ref,
         preferred_provider,
         scope,
+        &scoped_model_ids,
         &mut warn_sink,
     )?;
     let candidates = model::build_model_candidates(
@@ -601,6 +614,7 @@ pub async fn run_child_async(
         registry_ref,
         preferred_provider,
         scope,
+        &scoped_model_ids,
         Some(&agent.name),
         parent_ref,
         model_origin,
@@ -814,6 +828,8 @@ pub async fn run_child_async(
 
     // Reviewer diff baseline (#2333): `watchdog_diff` in the agent's tools
     // gates the capture (upstream `requiredTools.includes`), HEAD at launch.
+    // #2426: when the capture fails (no Git HEAD), the child still registers
+    // the tool in unavailable mode and reports the documented message.
     let diff_baseline = agent_tools
         .as_ref()
         .is_some_and(|tools| {
@@ -824,8 +840,8 @@ pub async fn run_child_async(
         .then(|| {
             crate::p1::diff_tool::DiffBaseline::capture(&effective_cwd)
                 .map(|baseline| baseline.to_env_value())
-        })
-        .flatten();
+                .unwrap_or_else(|| crate::p1::diff_tool::DIFF_BASELINE_UNAVAILABLE.to_string())
+        });
 
     // Pre-spawn tool-face gate (R7.1.4.3 / #2034, TE18 FR-C): the declared
     // builtin allowlist must be covered by the host's tool set before the
@@ -883,6 +899,8 @@ pub async fn run_child_async(
         agent_allowed_agents: agent.allowed_agents.clone(),
         diff_baseline,
         tool_budget_env,
+        // #2570: children follow the parent session's project trust.
+        project_trusted: ctx.project_trusted,
         agent_inherit_project_context: agent.inherit_project_context,
         agent_inherit_skills: agent.inherit_skills,
         task: task_text,
@@ -1151,6 +1169,7 @@ mod te18_fork_tests {
             parent_session_file: parent_file,
             parent_session_id: None,
             parent_model: None,
+            project_trusted: None,
             registry: Vec::new(),
             host_builtin_tool_names: Ok(Vec::new()),
             run_id: "te18fork1".to_string(),
@@ -1323,6 +1342,7 @@ mod te18_gate_budget_tests {
             parent_session_file: None,
             parent_session_id: None,
             parent_model: None,
+            project_trusted: None,
             registry: Vec::new(),
             // Empty host set: every declared builtin tool is missing.
             host_builtin_tool_names: Ok(Vec::new()),

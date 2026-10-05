@@ -30,6 +30,46 @@ use crate::paths;
 pub const TASK_ARG_LIMIT: usize = 8000;
 pub const SUBAGENT_TASK_DELIVERY_ENV: &str = "RPI_SUBAGENT_TASK_DELIVERY";
 pub const SUBAGENT_CHILD_ENV: &str = "RPI_SUBAGENT_CHILD";
+
+/// Git routing variables that can point a child's Git commands at the parent
+/// repository (git-environment.ts:1-15 @ b6bda32f / #2440). Names are compared
+/// case-insensitively (Git for Windows reads them that way).
+const GIT_ROUTING_VARIABLES: [&str; 16] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
+
+/// `isGitRoutingVariable` (git-environment.ts:17-21 @ b6bda32f): the fixed
+/// list plus numbered `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` entries.
+pub fn is_git_routing_variable(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if GIT_ROUTING_VARIABLES.contains(&upper.as_str()) {
+        return true;
+    }
+    for prefix in ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"] {
+        if let Some(index) = upper.strip_prefix(prefix)
+            && !index.is_empty()
+            && index.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
 /// Host-side global-context opt-out (ADR-0026 decision 2; the host reads
 /// the same name in `resource_loader::no_global_context`).
 pub const NO_GLOBAL_CONTEXT_ENV: &str = "RPI_NO_GLOBAL_CONTEXT";
@@ -327,6 +367,12 @@ pub struct BuildArgsInput {
     pub diff_baseline: Option<String>,
     /// Resolved tool budget env value (#2302); `None` leaves the env unset.
     pub tool_budget_env: Option<String>,
+    /// Parent session's project-trust decision (#2570): `Some(false)` passes
+    /// `--no-approve` so the child does not load an untrusted project's
+    /// settings/system prompt/skills; `None`/`Some(true)` keep the CLI default
+    /// ("a session without a trust decision is trusted", child-session.ts @
+    /// b6bda32f).
+    pub project_trusted: Option<bool>,
     /// Effective thinking ceiling (#1397 `subagents.maxThinking` + inherited
     /// env intersection): propagated to the child so grandchildren stay
     /// under the tightest ancestor ceiling (launch-contract
@@ -527,6 +573,13 @@ fn random_suffix() -> String {
 /// (0600 prompt/task) as the upstream function.
 pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsResult> {
     let mut args = input.base_args.clone();
+
+    // --- project trust (#2570): propagate an untrusted parent decision so
+    // the child follows it (omitted = trusted default, keeping the v0.48
+    // argv golden unchanged for the common case) ---
+    if input.project_trusted == Some(false) {
+        args.push("--no-approve".into());
+    }
 
     // --- session (552-563) ---
     if let Some(session_file) = &input.session_file {
@@ -1474,5 +1527,62 @@ mod te18_args_tests {
         );
         cleanup_temp_dir(&result.temp_dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_routing_variables_are_detected_case_insensitively() {
+        // #2440 (git-environment.test.ts @ b6bda32f): the fixed list, numbered
+        // GIT_CONFIG_KEY_/VALUE_ entries, Windows casing, and non-matches.
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            assert!(is_git_routing_variable(name), "{name}");
+        }
+        assert!(is_git_routing_variable("GIT_CONFIG_KEY_17"));
+        assert!(is_git_routing_variable("GIT_CONFIG_VALUE_17"));
+        assert!(is_git_routing_variable("git_dir"));
+        assert!(is_git_routing_variable("Git_Work_Tree"));
+        assert!(is_git_routing_variable("git_config_key_0"));
+        // Not routing variables: author identity, unrelated keys, malformed
+        // numbered suffixes, and unrelated Git-adjacent names.
+        for name in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "KEEP_ME",
+            "GIT_CONFIG_KEY_",
+            "GIT_CONFIG_KEY_X",
+            "MY_GIT_DIR",
+        ] {
+            assert!(!is_git_routing_variable(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn project_trust_untrusted_parent_passes_no_approve() {
+        // #2570: an untrusted parent decision rides the child argv; trusted or
+        // unknown parents keep the CLI default (no flag).
+        let base = BuildArgsInput {
+            base_args: vec!["--mode".into(), "json".into(), "-p".into()],
+            task: "t".into(),
+            session_enabled: true,
+            ..Default::default()
+        };
+        let build = |trusted: Option<bool>| {
+            let result = build_rpi_args(&BuildArgsInput {
+                project_trusted: trusted,
+                ..base.clone()
+            })
+            .expect("args build");
+            cleanup_temp_dir(&result.temp_dir);
+            result.args
+        };
+        assert!(!build(Some(true)).contains(&"--no-approve".to_string()));
+        assert!(!build(None).contains(&"--no-approve".to_string()));
+        assert!(build(Some(false)).contains(&"--no-approve".to_string()));
     }
 }

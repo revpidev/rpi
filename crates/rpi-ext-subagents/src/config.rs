@@ -630,6 +630,9 @@ pub struct AgentOverride {
     pub acceptance_role: Option<Option<String>>,
     /// `systemPrompt` override (agents.ts:1104-1106).
     pub system_prompt: Option<String>,
+    /// `advertise` override (#2534, agents.ts:1014-1017 @ b6bda32f): list a
+    /// builtin agent in the parent's advertised catalog from settings.
+    pub advertise: Option<bool>,
     /// `defaultProvider` builtin override (#1393, agents.ts:1087-1090):
     /// non-empty string sets the agent's preferred provider; `false`
     /// (`Some(None)`) clears it so the settings default does not apply.
@@ -950,6 +953,12 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                     "disabled" => {
                         parsed_entry.disabled = Some(field.as_bool().ok_or_else(|| {
                             invalid_override_field(path, name, "disabled", "a boolean")
+                        })?);
+                    }
+                    // #2534: `advertise` accepts only booleans (agents.ts:1014).
+                    "advertise" => {
+                        parsed_entry.advertise = Some(field.as_bool().ok_or_else(|| {
+                            invalid_override_field(path, name, "advertise", "a boolean")
                         })?);
                     }
                     "tools" => {
@@ -1492,8 +1501,8 @@ mod tests {
         std::fs::write(
             &override_path,
             r#"{"subagents":{"agentOverrides":{
-                "scout":{"defaultProvider":"openai","allowNestedSubagents":true,"outputMode":"file-only"},
-                "worker":{"defaultProvider":false,"outputMode":"inline"}
+                "scout":{"defaultProvider":"openai","allowNestedSubagents":true,"outputMode":"file-only","advertise":true},
+                "worker":{"defaultProvider":false,"outputMode":"inline","advertise":false}
             }}}"#,
         )
         .unwrap();
@@ -1507,8 +1516,23 @@ mod tests {
             parsed.overrides["scout"].output_mode.as_deref(),
             Some("file-only")
         );
+        // #2534: `advertise` is a boolean override (true advertises, false
+        // removes the catalog entry; absent leaves the definition untouched).
+        assert_eq!(parsed.overrides["scout"].advertise, Some(true));
+        assert_eq!(parsed.overrides["worker"].advertise, Some(false));
         // `false` clears the provider (Some(None)).
         assert_eq!(parsed.overrides["worker"].default_provider, Some(None));
+        let bad_advertise = dir.join("bad-advertise.json");
+        std::fs::write(
+            &bad_advertise,
+            r#"{"subagents":{"agentOverrides":{"x":{"advertise":"yes"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            read_subagent_settings(&bad_advertise)
+                .unwrap_err()
+                .contains("advertise")
+        );
         let bad_mode = dir.join("bad-mode.json");
         std::fs::write(
             &bad_mode,

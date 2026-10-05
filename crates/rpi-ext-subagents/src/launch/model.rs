@@ -17,6 +17,15 @@ use serde_json::Value;
 /// session's model (`INHERIT_MODEL`, model-resolution.ts:37 (INHERIT_MODEL)).
 pub const INHERIT_MODEL: &str = "inherit";
 
+/// Reserved scope pattern standing for the parent session's scoped models
+/// (`SCOPED_PATTERN`, model-scope.ts:51 @ b6bda32f / #2538). An empty scoped
+/// snapshot degrades it to `inherit`.
+pub const SCOPED_PATTERN: &str = "scoped";
+
+/// `MAX_RENDERED_PATTERNS` (model-scope.ts:52 @ b6bda32f / #2538): scope
+/// violation messages list at most this many allow patterns, then summarize.
+const MAX_RENDERED_PATTERNS: usize = 8;
+
 /// One registry entry for fuzzy resolution (`AvailableModelInfo`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableModel {
@@ -147,6 +156,51 @@ fn strip_date_suffix_compact(segment: &str) -> Option<String> {
     Some(segment[..n - 9].to_string())
 }
 
+/// `isRegisteredProvider` (model-resolution.ts:100 @ b6bda32f): a slash is a
+/// provider prefix only when that prefix is a registered provider.
+fn is_registered_provider(provider: &str, available_models: &[AvailableModel]) -> bool {
+    let normalized = normalize_model_segment(provider);
+    available_models
+        .iter()
+        .any(|entry| normalize_model_segment(&entry.provider) == normalized)
+}
+
+/// `splitQualifiedModelQuery` (model-resolution.ts:107 @ b6bda32f): split
+/// `provider/id` only when the first path segment is a registered provider.
+/// Hugging Face-style `owner/name` ids therefore stay intact unless `owner` is
+/// itself a provider in the active registry; `:` and `.` keep the same rule.
+fn split_qualified_model_query<'a>(
+    base_model: &'a str,
+    available_models: &[AvailableModel],
+) -> (Option<String>, &'a str) {
+    if let Some(slash_idx) = base_model.find('/') {
+        let provider_part = &base_model[..slash_idx];
+        if is_registered_provider(provider_part, available_models) {
+            return (
+                Some(normalize_model_segment(provider_part)),
+                &base_model[slash_idx + 1..],
+            );
+        }
+        return (None, base_model);
+    }
+    for separator in [':', '.'] {
+        if let Some(separator_idx) = base_model.find(separator) {
+            if separator_idx == 0 {
+                continue;
+            }
+            let provider_part = &base_model[..separator_idx];
+            if !is_registered_provider(provider_part, available_models) {
+                continue;
+            }
+            return (
+                Some(normalize_model_segment(provider_part)),
+                &base_model[separator_idx + 1..],
+            );
+        }
+    }
+    (None, base_model)
+}
+
 /// `fuzzyResolveModel` (model-resolution.ts:157-187): resolve a base model id
 /// (thinking suffix already stripped) against the registry tolerating
 /// separator/case/date-stamp differences. A qualified `provider/id` query only
@@ -157,31 +211,7 @@ pub fn fuzzy_resolve_model(
     available_models: &[AvailableModel],
     preferred_provider: Option<&str>,
 ) -> Option<String> {
-    let mut query_provider: Option<String> = None;
-    let mut query_id_raw = base_model;
-    if let Some(slash_idx) = base_model.find('/') {
-        query_provider = Some(normalize_model_segment(&base_model[..slash_idx]));
-        query_id_raw = &base_model[slash_idx + 1..];
-    } else {
-        // Try `:` / `.` prefixes, but only when the prefix is a known provider.
-        for separator in [':', '.'] {
-            if let Some(separator_idx) = base_model.find(separator) {
-                if separator_idx == 0 {
-                    continue;
-                }
-                let provider_part = normalize_model_segment(&base_model[..separator_idx]);
-                let known = available_models
-                    .iter()
-                    .any(|entry| normalize_model_segment(&entry.provider) == provider_part);
-                if !known {
-                    continue;
-                }
-                query_provider = Some(provider_part);
-                query_id_raw = &base_model[separator_idx + 1..];
-                break;
-            }
-        }
-    }
+    let (query_provider, query_id_raw) = split_qualified_model_query(base_model, available_models);
     let query_id = normalize_model_segment(query_id_raw);
     let query_id_no_date = strip_trailing_date_stamp(&query_id);
 
@@ -220,20 +250,22 @@ pub fn fuzzy_resolve_model(
 
 /// `resolveBaseModelCandidate` (model-resolution.ts:129-155 (resolveBaseModelCandidate)): exact match first
 /// (qualified wins for `provider/id`; unqualified requires a unique id unless
-/// the preferred provider matches), then fuzzy.
+/// the preferred provider matches), then fuzzy, then the v0.74 provider-prefixed
+/// id fallback (#2491: a catalog whose entry id already starts with the
+/// provider name, e.g. OpenRouter's `openrouter/auto-beta`).
 pub fn resolve_base_model_candidate(
     base_model: &str,
     available_models: &[AvailableModel],
     preferred_provider: Option<&str>,
 ) -> Option<String> {
-    if base_model.contains('/') {
-        if let Some(exact) = available_models
-            .iter()
-            .find(|entry| entry.full_id == base_model)
-        {
-            return Some(exact.full_id.clone());
-        }
-    } else {
+    if let Some(exact) = available_models
+        .iter()
+        .find(|entry| entry.full_id == base_model)
+    {
+        return Some(exact.full_id.clone());
+    }
+    let (query_provider, _) = split_qualified_model_query(base_model, available_models);
+    if query_provider.is_none() {
         let exact_matches: Vec<&AvailableModel> = available_models
             .iter()
             .filter(|entry| entry.id == base_model)
@@ -249,7 +281,26 @@ pub fn resolve_base_model_candidate(
             return Some(exact_matches[0].full_id.clone());
         }
     }
-    fuzzy_resolve_model(base_model, available_models, preferred_provider)
+    let fuzzy = fuzzy_resolve_model(base_model, available_models, preferred_provider);
+    if fuzzy.is_some() {
+        return fuzzy;
+    }
+    let query_provider = query_provider?;
+    // Some catalogs (OpenRouter's `openrouter/auto-beta`) repeat the provider
+    // inside the id (#2491, model-resolution.ts:160-164 @ b6bda32f).
+    let query_id = normalize_model_segment(base_model);
+    let prefixed_id_matches: Vec<&AvailableModel> = available_models
+        .iter()
+        .filter(|entry| {
+            normalize_model_segment(&entry.id) == query_id
+                && normalize_model_segment(&entry.provider) == query_provider
+        })
+        .collect();
+    if prefixed_id_matches.len() == 1 {
+        Some(prefixed_id_matches[0].full_id.clone())
+    } else {
+        None
+    }
 }
 
 /// `resolveModelCandidate` (model-resolution.ts:189-205): resolve a possibly
@@ -454,19 +505,13 @@ impl ModelScopeConfig {
         &self,
         agent_name: &str,
         parent_model: Option<(&str, &str)>,
+        scoped_model_ids: &[String],
     ) -> Vec<(ModelScopeConfig, String)> {
         let expand = |patterns: &[String]| -> Vec<String> {
             patterns
                 .iter()
-                .map(|pattern| {
-                    if pattern == "inherit" {
-                        match parent_model {
-                            Some((provider, id)) => format!("{provider}/{id}"),
-                            None => pattern.clone(),
-                        }
-                    } else {
-                        pattern.clone()
-                    }
+                .flat_map(|pattern| {
+                    expand_reserved_patterns(pattern, parent_model, scoped_model_ids)
                 })
                 .collect()
         };
@@ -543,6 +588,46 @@ pub struct ModelScopeViolation {
     pub allowed_patterns: Vec<String>,
 }
 
+/// `expandReservedPatterns` (model-scope.ts:110-123 @ b6bda32f / #2538):
+/// expand `scoped`/`inherit` reserved patterns against the parent model and the
+/// session's scoped-model snapshot. An empty scoped snapshot degrades `scoped`
+/// to `inherit`; absent inputs stay literal so enforced resolution fails closed.
+fn expand_reserved_patterns(
+    pattern: &str,
+    parent_model: Option<(&str, &str)>,
+    scoped_model_ids: &[String],
+) -> Vec<String> {
+    if pattern == SCOPED_PATTERN {
+        if !scoped_model_ids.is_empty() {
+            return scoped_model_ids.to_vec();
+        }
+        return match parent_model {
+            Some((provider, id)) => vec![format!("{provider}/{id}")],
+            None => vec![pattern.to_string()],
+        };
+    }
+    if pattern == INHERIT_MODEL {
+        return match parent_model {
+            Some((provider, id)) => vec![format!("{provider}/{id}")],
+            None => vec![pattern.to_string()],
+        };
+    }
+    vec![pattern.to_string()]
+}
+
+/// `renderAllowedPatterns` (model-scope.ts:93-95 @ b6bda32f / #2538): list at
+/// most `MAX_RENDERED_PATTERNS`, then summarize the total count.
+fn render_allowed_patterns(allow: &[String]) -> String {
+    if allow.len() <= MAX_RENDERED_PATTERNS {
+        return allow.join(", ");
+    }
+    format!(
+        "{}, … ({} patterns total)",
+        allow[..MAX_RENDERED_PATTERNS].join(", "),
+        allow.len()
+    )
+}
+
 /// `checkModelScope` (model-scope.ts:62-82): pure scope decision (one rule).
 pub fn check_model_scope(
     model: Option<&str>,
@@ -571,7 +656,7 @@ pub fn check_model_scope(
         is_error,
         message: format!(
             "Model '{base}' is outside the configured subagent model scope. Allowed patterns: {}.",
-            allow.join(", ")
+            render_allowed_patterns(allow)
         ),
         allowed_patterns: allow.clone(),
     })
@@ -666,18 +751,65 @@ pub fn parse_model_scope_config(value: Option<&Value>) -> Result<Option<ModelSco
 // Override resolution (model-resolution.ts:305+)
 // ---------------------------------------------------------------------------
 
-/// `resolveSubagentModelOverride` (model-resolution.ts:305-338 @ b72714de):
+/// `throwForUnresolvedEnforcedReservedScope` (model-resolution.ts:287-295
+/// @ b6bda32f): enforced rules whose allow list still contains an unexpanded
+/// reserved token need a parent session model (or a scoped snapshot).
+fn throw_for_unresolved_enforced_reserved_scope(
+    scope: Option<&ModelScopeConfig>,
+    parent_model: Option<(&str, &str)>,
+    scoped_model_ids: &[String],
+    include_mixed: bool,
+) -> Result<(), String> {
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    let resolved = scope.resolved_scopes_for_agent("", parent_model, scoped_model_ids);
+    for (rule, origin) in &resolved {
+        if origin != "modelScope" || rule.enforce != Some(true) {
+            continue;
+        }
+        let Some(allow) = rule.allow.as_ref() else {
+            continue;
+        };
+        let reserved = |pattern: &String| {
+            pattern.as_str() == INHERIT_MODEL || pattern.as_str() == SCOPED_PATTERN
+        };
+        let unresolved = if include_mixed {
+            allow.iter().any(reserved)
+        } else {
+            allow.len() == 1 && reserved(&allow[0])
+        };
+        if unresolved {
+            let token = if allow
+                .iter()
+                .any(|pattern| pattern.as_str() == INHERIT_MODEL)
+            {
+                INHERIT_MODEL
+            } else {
+                SCOPED_PATTERN
+            };
+            return Err(format!(
+                "Cannot enforce subagent model scope ({origin}): '{token}' requires a current parent session model."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `resolveSubagentModelOverride` (model-resolution.ts:305-338 @ b6bda32f):
 /// resolve the `--model` override for a spawned child. Empty/`inherit` →
 /// parent session model. An explicit string is strict-resolved; when the
 /// request source is `explicit` the #1093 required check fail-closes on a
 /// registry miss, inherited sources keep the verbatim passthrough. Out of
 /// scope: `Err` for explicit + strict scope, warn callback otherwise.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_subagent_model_override(
     requested_model: Option<&str>,
     parent_model: Option<(&str, &str)>,
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
     scope: Option<&ModelScopeConfig>,
+    scoped_model_ids: &[String],
     source: ModelSource,
     on_warn: &mut dyn FnMut(&ModelScopeViolation),
 ) -> Result<Option<String>, String> {
@@ -687,6 +819,14 @@ pub fn resolve_subagent_model_override(
     } else {
         Some(trimmed)
     };
+    if parent_model.is_none() {
+        throw_for_unresolved_enforced_reserved_scope(
+            scope,
+            parent_model,
+            scoped_model_ids,
+            explicit.is_none() || source == ModelSource::Inherited,
+        )?;
+    }
     let resolved = match explicit {
         None => parent_model.map(|(provider, id)| format!("{provider}/{id}")),
         Some(explicit) => {
@@ -714,12 +854,32 @@ pub fn resolve_subagent_model_override(
     };
     if let Some(resolved) = resolved.as_deref()
         && scope.is_some_and(|s| s.enforced())
-        && let Some(violation) = check_model_scope(Some(resolved), scope, source)
     {
-        if violation.is_error {
-            return Err(violation.message);
+        // Upstream receives already-resolved scopes from the caller
+        // (`resolveModelScopesForAgent`); expand the global rule here so
+        // reserved patterns (`inherit`/`scoped`) compare as their concrete
+        // ids instead of literal tokens (model-scope.ts @ b6bda32f).
+        let resolved_scopes = scope
+            .map(|scope| scope.resolved_scopes_for_agent("", parent_model, scoped_model_ids))
+            .unwrap_or_default();
+        for (rule, origin) in &resolved_scopes {
+            if let Some(mut violation) = check_model_scope(Some(resolved), Some(rule), source) {
+                // The upstream violation message carries the rule origin
+                // (model-scope.ts:100-104 @ b6bda32f).
+                violation.message = format!(
+                    "Model '{}' is outside the configured subagent model scope ({}). Allowed patterns: {}.",
+                    violation.model,
+                    origin,
+                    render_allowed_patterns(
+                        rule.allow.as_deref().unwrap_or(&violation.allowed_patterns)
+                    )
+                );
+                if violation.is_error {
+                    return Err(violation.message);
+                }
+                on_warn(&violation);
+            }
         }
-        on_warn(&violation);
     }
     Ok(resolved)
 }
@@ -735,6 +895,7 @@ pub fn resolve_effective_subagent_model(
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
     scope: Option<&ModelScopeConfig>,
+    scoped_model_ids: &[String],
     on_warn: &mut dyn FnMut(&ModelScopeViolation),
 ) -> Result<Option<String>, String> {
     let resolved = resolve_subagent_model_override(
@@ -743,6 +904,7 @@ pub fn resolve_effective_subagent_model(
         available_models,
         preferred_provider,
         scope,
+        scoped_model_ids,
         if explicit_model.is_some() {
             ModelSource::Explicit
         } else {
@@ -759,6 +921,7 @@ pub fn resolve_effective_subagent_model(
         available_models,
         preferred_provider,
         scope,
+        scoped_model_ids,
         ModelSource::Inherited,
         on_warn,
     )
@@ -809,6 +972,7 @@ pub fn build_model_candidates(
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
     scope: Option<&ModelScopeConfig>,
+    scoped_model_ids: &[String],
     agent_name: Option<&str>,
     parent_model: Option<(&str, &str)>,
     origin: ModelOrigin,
@@ -816,9 +980,9 @@ pub fn build_model_candidates(
 ) -> Result<Vec<String>, String> {
     let resolved_scopes: Vec<(ModelScopeConfig, String)> = scope
         .map(|scope| match agent_name {
-            Some(name) => scope.resolved_scopes_for_agent(name, parent_model),
+            Some(name) => scope.resolved_scopes_for_agent(name, parent_model, scoped_model_ids),
             None => scope
-                .resolved_scopes_for_agent("", parent_model)
+                .resolved_scopes_for_agent("", parent_model, scoped_model_ids)
                 .into_iter()
                 .filter(|(_rule, origin)| origin == "modelScope")
                 .collect(),
@@ -834,7 +998,9 @@ pub fn build_model_candidates(
                     "Model '{}' is outside the configured subagent model scope ({}). Allowed patterns: {}.",
                     violation.model,
                     rule_origin,
-                    violation.allowed_patterns.join(", ")
+                    render_allowed_patterns(
+                        rule.allow.as_deref().unwrap_or(&violation.allowed_patterns)
+                    )
                 );
                 if violation.is_error {
                     return Err(violation.message);
@@ -1122,6 +1288,7 @@ mod tests {
                 Some(&registry),
                 None,
                 None,
+                &[],
                 &mut sink
             )
             .unwrap(),
@@ -1136,6 +1303,7 @@ mod tests {
                 Some(&registry),
                 None,
                 None,
+                &[],
                 &mut sink
             )
             .unwrap(),
@@ -1150,6 +1318,7 @@ mod tests {
                 Some(&registry),
                 None,
                 None,
+                &[],
                 &mut sink
             )
             .unwrap(),
@@ -1176,6 +1345,7 @@ mod tests {
             Some(&registry),
             None,
             Some(&scope),
+            &[],
             None,
             None,
             ModelOrigin::Configured,
@@ -1287,6 +1457,7 @@ mod te18_model_tests {
             Some(&registry),
             None,
             None,
+            &[],
             ModelSource::Explicit,
             &mut sink,
         )
@@ -1301,6 +1472,7 @@ mod te18_model_tests {
                 Some(&registry),
                 None,
                 None,
+                &[],
                 ModelSource::Inherited,
                 &mut sink,
             )
@@ -1315,6 +1487,7 @@ mod te18_model_tests {
                 Some(&registry),
                 None,
                 None,
+                &[],
                 ModelSource::Explicit,
                 &mut sink,
             )
@@ -1357,6 +1530,7 @@ mod te18_model_tests {
             Some(&registry),
             None,
             None,
+            &[],
             None,
             None,
             ModelOrigin::Explicit,
@@ -1371,6 +1545,7 @@ mod te18_model_tests {
             Some(&registry),
             None,
             None,
+            &[],
             None,
             None,
             ModelOrigin::Configured,
@@ -1385,6 +1560,7 @@ mod te18_model_tests {
             None,
             None,
             None,
+            &[],
             None,
             None,
             ModelOrigin::Inherited,
@@ -1450,12 +1626,12 @@ mod te18_model_tests {
         .unwrap();
         let scope = parse_model_scope_config(Some(&value)).unwrap().unwrap();
         // Global rule for an agent without its own rule.
-        let scopes = scope.resolved_scopes_for_agent("worker", Some(("openai", "gpt")));
+        let scopes = scope.resolved_scopes_for_agent("worker", Some(("openai", "gpt")), &[]);
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].1, "modelScope");
         // Per-agent rule: agent gets global + its own; `inherit` expands to
         // the parent's provider/id.
-        let scopes = scope.resolved_scopes_for_agent("researcher", Some(("openai", "gpt")));
+        let scopes = scope.resolved_scopes_for_agent("researcher", Some(("openai", "gpt")), &[]);
         assert_eq!(scopes.len(), 2, "{scopes:?}");
         assert_eq!(scopes[1].1, "modelScope.agents.researcher");
         let allow = scopes[1].0.allow.as_deref().unwrap();
@@ -1474,6 +1650,7 @@ mod te18_model_tests {
             None,
             None,
             Some(&scope),
+            &[],
             Some("worker"),
             Some(("openai", "gpt")),
             ModelOrigin::Explicit,
@@ -1486,6 +1663,7 @@ mod te18_model_tests {
             None,
             None,
             Some(&scope),
+            &[],
             Some("researcher"),
             Some(("openai", "gpt")),
             ModelOrigin::Inherited,
@@ -1493,5 +1671,135 @@ mod te18_model_tests {
         )
         .unwrap();
         assert_eq!(candidates, vec!["openai/gpt".to_string()]);
+    }
+
+    // ---- TE45 (R10): v0.74 model-resolution increments (#2491/#2538) ----
+
+    #[test]
+    fn scoped_model_scope_token_uses_the_session_snapshot() {
+        let scope = ModelScopeConfig {
+            enforce: Some(true),
+            strict: None,
+            allow: Some(vec![SCOPED_PATTERN.to_string()]),
+            agents: Default::default(),
+        };
+        let scoped = vec![
+            "openai/gpt-5.5".to_string(),
+            "anthropic/claude-5".to_string(),
+        ];
+        let mut sink = |_violation: &ModelScopeViolation| {};
+        // A model inside the scoped snapshot passes (parent request included).
+        assert_eq!(
+            resolve_subagent_model_override(
+                None,
+                Some(("openai", "gpt-5.5")),
+                None,
+                None,
+                Some(&scope),
+                &scoped,
+                ModelSource::Inherited,
+                &mut sink,
+            )
+            .unwrap(),
+            Some("openai/gpt-5.5".to_string())
+        );
+        // An explicit model outside the snapshot fails closed, listing the
+        // expanded snapshot patterns.
+        let error = resolve_subagent_model_override(
+            Some("google/gemini-3-pro"),
+            None,
+            None,
+            None,
+            Some(&scope),
+            &scoped,
+            ModelSource::Explicit,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(error.contains("openai/gpt-5.5"), "{error}");
+        assert!(error.contains("anthropic/claude-5"), "{error}");
+        // An empty snapshot degrades `scoped` to `inherit` (the parent model).
+        assert_eq!(
+            resolve_subagent_model_override(
+                None,
+                Some(("anthropic", "claude-5")),
+                None,
+                None,
+                Some(&scope),
+                &[],
+                ModelSource::Inherited,
+                &mut sink,
+            )
+            .unwrap(),
+            Some("anthropic/claude-5".to_string())
+        );
+        // Scoped-only enforcement without a snapshot and without a parent
+        // fails closed with the upstream reserved-token message.
+        let error = resolve_subagent_model_override(
+            None,
+            None,
+            None,
+            None,
+            Some(&scope),
+            &[],
+            ModelSource::Inherited,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("'scoped' requires a current parent session model"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn scope_violation_renders_at_most_eight_patterns() {
+        let allow: Vec<String> = (0..10).map(|index| format!("provider{index}/*")).collect();
+        let scope = ModelScopeConfig {
+            enforce: Some(true),
+            strict: None,
+            allow: Some(allow),
+            agents: Default::default(),
+        };
+        let violation = check_model_scope(Some("other/model"), Some(&scope), ModelSource::Explicit)
+            .expect("out-of-scope model");
+        assert!(
+            violation.message.contains(
+                "provider0/*, provider1/*, provider2/*, provider3/*, provider4/*, provider5/*, provider6/*, provider7/*, … (10 patterns total)"
+            ),
+            "{}",
+            violation.message
+        );
+    }
+
+    #[test]
+    fn provider_prefixed_catalog_id_fallback_matches_upstream() {
+        // #2491: some catalogs (OpenRouter) repeat the provider inside the id;
+        // the entry id matches the whole query even though fuzzy looks at the
+        // id segment only.
+        let registry = vec![AvailableModel {
+            full_id: "openrouter/openrouter/auto-beta".into(),
+            provider: "openrouter".into(),
+            id: "openrouter/auto-beta".into(),
+        }];
+        assert_eq!(
+            resolve_base_model_candidate("openrouter/auto-beta", &registry, None),
+            Some("openrouter/openrouter/auto-beta".to_string())
+        );
+        assert_eq!(
+            fuzzy_resolve_model("openrouter/auto-beta", &registry, None),
+            None
+        );
+        // Hugging Face-style `owner/name` stays a whole-id query when `owner`
+        // is not a registered provider (v0.70+ splitQualifiedModelQuery).
+        let hugging_face = vec![AvailableModel {
+            full_id: "hf/owner/name".into(),
+            provider: "hf".into(),
+            id: "owner/name".into(),
+        }];
+        assert_eq!(
+            fuzzy_resolve_model("owner/name", &hugging_face, None),
+            Some("hf/owner/name".to_string())
+        );
     }
 }

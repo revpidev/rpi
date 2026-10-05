@@ -241,6 +241,9 @@ pub struct ForegroundRunInput {
     pub diff_baseline: Option<String>,
     /// Resolved tool budget env value (#2302); `None` leaves the env unset.
     pub tool_budget_env: Option<String>,
+    /// Parent session's project-trust decision (#2570); `Some(false)` adds
+    /// `--no-approve` to the child argv.
+    pub project_trusted: Option<bool>,
     pub agent_inherit_project_context: bool,
     pub agent_inherit_skills: bool,
     pub task: String,
@@ -381,6 +384,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         ),
         diff_baseline: input.diff_baseline.clone(),
         tool_budget_env: input.tool_budget_env.clone(),
+        project_trusted: input.project_trusted,
     });
 
     let launch = match launch {
@@ -388,8 +392,12 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         Err(error) => return failed_result(input, artifact_paths, start, error.to_string()),
     };
 
-    // Depth env rides on top of the shared env (execution.ts:476).
-    let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    // Depth env rides on top of the shared env (execution.ts:476). #2440:
+    // strip inherited Git routing variables so a child's Git commands act on
+    // its own cwd, not the parent repository (git-environment.ts @ b6bda32f).
+    let mut env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(key, _)| !args::is_git_routing_variable(key))
+        .collect();
     for (key, value) in &launch.env {
         match value {
             Some(value) => {
@@ -1511,6 +1519,7 @@ mod terminal_classification_tests {
             agent_allowed_agents: None,
             diff_baseline: None,
             tool_budget_env: None,
+            project_trusted: None,
             agent_inherit_project_context: true,
             agent_inherit_skills: false,
             task: "replay".to_string(),

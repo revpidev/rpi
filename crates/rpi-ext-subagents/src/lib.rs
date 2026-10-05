@@ -1,8 +1,9 @@
 //! rpi-subagents: delegation extension (L0 native plugin, TE04 P0 core).
 //!
-//! Port of pi-subagents v0.66.0 (0fc0eebb, v0.1.4 rebase; originally ported
-//! from v0.48.0/56f97234, see per-file provenance headers) — registers the
-//! `subagent` tool
+//! Port of pi-subagents v0.74.0 (b6bda32f, TE45/M0.75 rebase under ADR-0034;
+//! previously v0.70.0/b72714de at v0.1.5 and v0.66.0/0fc0eebb at v0.1.4,
+//! originally ported from v0.48.0/56f97234 — see per-file provenance
+//! headers) — registers the `subagent` tool
 //! (structured single delegation + management actions) and the `/run`,
 //! `/subagents`, `/subagents-doctor` commands; spawns child `rpi --mode json
 //! -p` sessions with per-agent prompts, tool allowlists and depth limits.
@@ -175,6 +176,13 @@ pub trait HostContext {
     fn has_ui(&self) -> bool {
         false
     }
+    /// `ctx.isProjectTrusted` (#2570): the parent session's project-trust
+    /// decision, passed to children so they do not load an untrusted
+    /// project's resources. `None` means the host cannot answer (default
+    /// trusted, matching a session without a trust decision).
+    fn project_trusted(&self) -> Option<bool> {
+        None
+    }
     /// `ctx.scopedModels` projection: `(provider, id)` pairs for
     /// `launch::model` fuzzy resolution (FR-P1-05). Returns an empty list
     /// when the host reports none — resolution then falls back to verbatim.
@@ -293,6 +301,11 @@ impl HostContext for HostCallsContext<'_> {
         host_call_ok(self.calls, self.cookie, "ctx.hasUI", json!({}))
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
+    }
+
+    fn project_trusted(&self) -> Option<bool> {
+        host_call_ok(self.calls, self.cookie, "ctx.isProjectTrusted", json!({}))
+            .and_then(|value| value.as_bool())
     }
 
     /// Authoritative parent session identity (V13-02, closes TE-D16):
@@ -557,26 +570,37 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
-            // #2333 reviewer diff tool: register when the parent captured a
-            // launch baseline (gated by the agent's tools naming it).
-            if crate::p1::diff_tool::baseline_from_env().is_some()
-                && let Err(error) = register(
-                    "registerTool",
-                    json!({
-                        "name": crate::p1::diff_tool::WATCHDOG_DIFF_TOOL_NAME,
-                        "label": "Watchdog diff",
-                        "description": crate::p1::diff_tool::tool_description(),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string", "description": "Restrict the diff to one file or directory, relative to the repo root." },
-                                "stat": { "type": "boolean", "description": "Return per-file change counts instead of the full diff." }
-                            },
-                            "additionalProperties": false
-                        }
-                    }),
-                )
-            {
+            // #2333/#2426 reviewer diff tool: register whenever the parent
+            // requested it (gated by the agent's tools naming it) — a child
+            // without a Git baseline registers in unavailable mode instead of
+            // failing the review (diff-tool.ts @ b6bda32f).
+            let diff_tool_state = crate::p1::diff_tool::baseline_state();
+            if !matches!(
+                diff_tool_state,
+                crate::p1::diff_tool::DiffBaselineState::None
+            ) && let Err(error) = register(
+                "registerTool",
+                json!({
+                    "name": crate::p1::diff_tool::WATCHDOG_DIFF_TOOL_NAME,
+                    "label": "Watchdog diff",
+                    "description": if matches!(
+                        diff_tool_state,
+                        crate::p1::diff_tool::DiffBaselineState::Unavailable
+                    ) {
+                        crate::p1::diff_tool::unavailable_tool_description()
+                    } else {
+                        crate::p1::diff_tool::tool_description()
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Restrict the diff to one file or directory, relative to the repo root." },
+                            "stat": { "type": "boolean", "description": "Return per-file change counts instead of the full diff." }
+                        },
+                        "additionalProperties": false
+                    }
+                }),
+            ) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
             // #1615: the parent named this child at launch — surface it
@@ -1613,6 +1637,7 @@ pub mod parity {
             descendant_allowed_agents: None,
             diff_baseline: None,
             tool_budget_env: None,
+            project_trusted: None,
         };
         let result = crate::launch::args::build_rpi_args(&internal)?;
         Ok(BuildArgsResultPublic {
@@ -1681,13 +1706,16 @@ pub mod parity {
             .unwrap_or_default()
     }
 
-    /// Upstream `resolveSubagentModelOverride` shape (scope checks omitted —
-    /// the harness passes no scope).
+    /// Upstream `resolveSubagentModelOverride` shape (TE45: optional scope +
+    /// scoped-model snapshot inputs added for the #2538/#2491 parity cases).
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_subagent_model_override_public(
         requested_model: Option<&str>,
         parent_model: Option<&str>,
         available_models: Option<&[AvailableModelPublic]>,
         preferred_provider: Option<&str>,
+        scope: Option<&serde_json::Value>,
+        scoped_models: Option<&[String]>,
         source: ModelSourcePublic,
     ) -> Result<Option<String>, String> {
         let registry = to_available(available_models);
@@ -1700,24 +1728,31 @@ pub mod parity {
             ModelSourcePublic::Explicit => crate::launch::model::ModelSource::Explicit,
             ModelSourcePublic::Inherited => crate::launch::model::ModelSource::Inherited,
         };
+        let parsed_scope = crate::launch::model::parse_model_scope_config(scope)?;
+        let scoped_ids: Vec<String> = scoped_models.unwrap_or(&[]).to_vec();
         let mut sink = |_violation: &crate::launch::model::ModelScopeViolation| {};
         crate::launch::model::resolve_subagent_model_override(
             requested_model,
             parent_ref,
             registry_ref,
             preferred_provider,
-            None,
+            parsed_scope.as_ref(),
+            &scoped_ids,
             source,
             &mut sink,
         )
     }
 
     /// Launch candidate shape (post-#2270: single-candidate resolution —
-    /// scope omitted, the harness passes none).
+    /// TE45 adds optional scope/scoped/agent inputs for the #2538 cases).
+    #[allow(clippy::too_many_arguments)]
     pub fn build_model_candidates_public(
         primary_model: Option<&str>,
         available_models: Option<&[AvailableModelPublic]>,
         preferred_provider: Option<&str>,
+        scope: Option<&serde_json::Value>,
+        scoped_models: Option<&[String]>,
+        agent_name: Option<&str>,
         origin: ModelOriginPublic,
     ) -> Result<Vec<String>, String> {
         let registry = to_available(available_models);
@@ -1727,13 +1762,16 @@ pub mod parity {
             ModelOriginPublic::Inherited => crate::launch::model::ModelOrigin::Inherited,
             ModelOriginPublic::Configured => crate::launch::model::ModelOrigin::Configured,
         };
+        let parsed_scope = crate::launch::model::parse_model_scope_config(scope)?;
+        let scoped_ids: Vec<String> = scoped_models.unwrap_or(&[]).to_vec();
         let mut sink = |_violation: &crate::launch::model::ModelScopeViolation| {};
         crate::launch::model::build_model_candidates(
             primary_model,
             registry_ref,
             preferred_provider,
-            None,
-            None,
+            parsed_scope.as_ref(),
+            &scoped_ids,
+            agent_name,
             None,
             origin,
             &mut sink,

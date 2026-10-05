@@ -467,12 +467,26 @@ fn execute_subagent_tool_inner(
     }
 }
 
-/// Timeout alias agreement (`resolveForegroundTimeout` alias rule).
+/// `MAX_TIMER_DELAY_MS` (subagent-executor.ts:2948 @ b6bda32f / #2517): the
+/// Node.js timer ceiling. Values above it overflow `setTimeout`, which clamps
+/// the delay to ~1ms; rpi rejects them before launch for parity.
+pub const MAX_TIMER_DELAY_MS: u64 = 2_147_483_647;
+
+/// Timeout alias agreement (`resolveForegroundTimeout` alias rule + the #2517
+/// timer-overflow ceiling).
 fn check_timeout_aliases(object: &serde_json::Map<String, Value>) -> Result<(), String> {
     let positive = |value: Option<&Value>, name: &str| -> Result<Option<u64>, String> {
         match value {
             None => Ok(None),
-            Some(Value::Number(n)) if n.is_u64() && n.as_u64().unwrap_or(0) > 0 => Ok(n.as_u64()),
+            Some(Value::Number(n)) if n.is_u64() && n.as_u64().unwrap_or(0) > 0 => {
+                let timeout = n.as_u64().unwrap_or(0);
+                if timeout > MAX_TIMER_DELAY_MS {
+                    return Err(format!(
+                        "{name} must be a positive integer no larger than {MAX_TIMER_DELAY_MS}."
+                    ));
+                }
+                Ok(Some(timeout))
+            }
             _ => Err(format!("{name} must be a positive integer.")),
         }
     };
@@ -1115,6 +1129,7 @@ mod tests {
             parent_session_file: None,
             parent_session_id: None,
             parent_model: None,
+            project_trusted: None,
             registry: Vec::new(),
             host_builtin_tool_names: Ok(Vec::new()),
             run_id: "te38plan1".to_string(),
@@ -1179,6 +1194,17 @@ mod tests {
             parse(r#"{"timeoutMs":0}"#).unwrap_err(),
             "timeoutMs must be a positive integer."
         );
+        // #2517: values above the Node timer ceiling are rejected by name.
+        assert_eq!(
+            parse(r#"{"timeoutMs":2147483648}"#).unwrap_err(),
+            "timeoutMs must be a positive integer no larger than 2147483647."
+        );
+        assert_eq!(
+            parse(r#"{"maxRuntimeMs":2147483648}"#).unwrap_err(),
+            "maxRuntimeMs must be a positive integer no larger than 2147483647."
+        );
+        // The exact ceiling still passes.
+        assert!(parse(r#"{"timeoutMs":2147483647}"#).is_ok());
     }
 
     #[test]
