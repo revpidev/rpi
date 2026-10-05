@@ -34,7 +34,7 @@ use crate::interactive_ui::{
 use crate::types::{
     ArgumentCompletionsFn, CommandHandlerFn, ComponentTree, EntryRenderFn, ExtSourceInfo,
     ExtensionFlag, ExtensionMode, ExtensionShortcut, FlagType, FlagValue, MessageRenderFn,
-    RegisteredCommand, RegisteredTool, ShortcutHandlerFn, ToolDefinition,
+    RegisteredCommand, RegisteredTool, ShortcutHandlerFn, ToolDefinition, ToolExposure,
 };
 
 /// Boxed future used throughout the host boundary.
@@ -597,6 +597,23 @@ pub trait HostActions: Send + Sync {
     /// `refreshTools` (types.ts:1556) — rebuild tool-dependent state after
     /// `registerTool` post-bind; a no-op pre-bind (loader.ts:191-192).
     fn refresh_tools(&self);
+
+    /// `setToolExposures` (V16-14, rpi-own additive): apply session-scoped
+    /// exposure overrides for the named tools; unknown names are ignored
+    /// and one registry rebuild runs per non-empty call. Returns the
+    /// applied names in input order. Legacy/unbound action sets answer
+    /// empty.
+    fn set_tool_exposures(&self, _exposures: Vec<(String, ToolExposure)>) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// `clearToolExposures` (V16-14, rpi-own additive): drop the exposure
+    /// overrides for the named tools so they return to their registered
+    /// exposure (one rebuild per call). Returns the cleared names in input
+    /// order. Legacy/unbound action sets answer empty.
+    fn clear_tool_exposures(&self, _names: Vec<String>) -> Vec<String> {
+        Vec::new()
+    }
 
     /// `getCommands` (types.ts:1323) — `SlashCommandInfo[]` JSON.
     fn get_commands(&self) -> Vec<Value>;
@@ -3233,6 +3250,26 @@ impl ExtensionApi {
         self.runtime.assert_active()?;
         self.runtime.require_actions()?.set_active_tools(tool_names);
         Ok(())
+    }
+
+    /// `pi.setToolExposures(exposures)` (V16-14, rpi-own additive): apply
+    /// session-scoped exposure overrides; returns the applied names.
+    pub fn set_tool_exposures(
+        &self,
+        exposures: Vec<(String, ToolExposure)>,
+    ) -> Result<Vec<String>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .set_tool_exposures(exposures))
+    }
+
+    /// `pi.clearToolExposures(names)` (V16-14, rpi-own additive): remove the
+    /// overrides; returns the cleared names.
+    pub fn clear_tool_exposures(&self, names: Vec<String>) -> Result<Vec<String>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self.runtime.require_actions()?.clear_tool_exposures(names))
     }
 
     /// `pi.getCommands()` (loader.ts:354-357) — `SlashCommandInfo[]` JSON.

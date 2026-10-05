@@ -539,6 +539,10 @@ struct AgentSessionInner {
     /// hooks. They stay active and callable, and the transcript still
     /// declares them, so the active set survives `/tree` and resume.
     hidden_declarations: Mutex<HashSet<String>>,
+    /// V16-14 (TE43 dependency): session-scoped tool exposure overrides,
+    /// re-applied after every registry rebuild so `setToolExposures`
+    /// survives register/unregister/reload. Cleared with the session.
+    tool_exposure_overrides: Mutex<HashMap<String, ext::ToolExposure>>,
     /// `_nestedToolCalls` (agent-session.ts:450-451 @ a13d35a74): created on
     /// the first `ctx.executeTool()` call (V16-06 FR-E).
     nested_tool_calls: Mutex<Option<Arc<NestedCallRunner>>>,
@@ -959,6 +963,7 @@ impl AgentSession {
             tool_registry: Mutex::new(OrderedMap::default()),
             tool_definitions: Mutex::new(OrderedMap::default()),
             hidden_declarations: Mutex::new(HashSet::new()),
+            tool_exposure_overrides: Mutex::new(HashMap::new()),
             nested_tool_calls: Mutex::new(None),
             custom_tools: config.custom_tools.clone(),
             session_env_cell: Arc::new(std::sync::RwLock::new(crate::tools::SessionEnv {
@@ -2850,6 +2855,19 @@ impl AgentSession {
             registry.insert(name, tool);
         }
 
+        // V16-14: session-scoped exposure overrides win over the registered
+        // definitions and are re-applied on every rebuild (setToolExposures).
+        {
+            let overrides = lock(&self.inner.tool_exposure_overrides);
+            for (name, exposure) in overrides.iter() {
+                if let Some(entry) = definitions.get(name) {
+                    let mut entry = entry.clone();
+                    entry.exposure = *exposure;
+                    definitions.insert(name.clone(), entry);
+                }
+            }
+        }
+
         let registry_names: Vec<String> = registry.keys().cloned().collect();
         *lock(&self.inner.tool_definitions) = definitions;
         *lock(&self.inner.tool_registry) = registry;
@@ -3038,6 +3056,54 @@ impl AgentSession {
     /// registered tools, so `registerTool` at runtime takes effect.
     pub fn refresh_extension_tools(&self) {
         self.refresh_tool_registry(RefreshToolRegistryOptions::default());
+    }
+
+    /// `setToolExposures` (V16-14, rpi-own additive): apply session-scoped
+    /// exposure overrides for the named tools; unknown names are ignored.
+    /// The override layer re-applies after every registry rebuild, so it
+    /// survives register/unregister/reload. Returns the applied names in
+    /// input order (deduplicated). One registry rebuild per non-empty call.
+    pub fn set_tool_exposures(&self, exposures: &[(String, ext::ToolExposure)]) -> Vec<String> {
+        let applied: Vec<String> = {
+            let definitions = lock(&self.inner.tool_definitions);
+            let mut overrides = lock(&self.inner.tool_exposure_overrides);
+            let mut applied: Vec<String> = Vec::new();
+            for (name, exposure) in exposures {
+                if !definitions.contains_key(name) {
+                    continue;
+                }
+                overrides.insert(name.clone(), *exposure);
+                if !applied.contains(name) {
+                    applied.push(name.clone());
+                }
+            }
+            applied
+        };
+        if !applied.is_empty() {
+            self.refresh_tool_registry(RefreshToolRegistryOptions::default());
+        }
+        applied
+    }
+
+    /// `clearToolExposures` (V16-14, rpi-own additive): drop the exposure
+    /// overrides for the named tools and rebuild once so each tool returns
+    /// to its registered (natural) exposure. Returns the cleared names in
+    /// input order (deduplicated); unknown/non-overridden names are ignored.
+    pub fn clear_tool_exposures(&self, names: &[String]) -> Vec<String> {
+        let cleared: Vec<String> = {
+            let mut overrides = lock(&self.inner.tool_exposure_overrides);
+            let mut cleared: Vec<String> = Vec::new();
+            for name in names {
+                if overrides.remove(name).is_some() && !cleared.contains(name) {
+                    cleared.push(name.clone());
+                }
+            }
+            cleared
+        };
+        if !cleared.is_empty() {
+            self.refresh_tool_registry(RefreshToolRegistryOptions::default());
+        }
+        cleared
     }
 
     /// `getAllTools` (agent-session.ts:1465-1476; `ToolInfo` =

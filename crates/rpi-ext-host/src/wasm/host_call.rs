@@ -45,9 +45,11 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         // ADR-0015 additions: unregisterTool (registry removal) and
         // toolUpdate (partial-result report) belong to the same capability
         // as registerTool — they write/affect only this extension's tools.
-        "registerTool" | "unregisterTool" | "toolUpdate" | "executeTool" => {
-            Requires(Capability::Tools)
-        }
+        // V16-14 additions: setToolExposures/clearToolExposures write the
+        // session exposure override layer (the same surface setActiveTools
+        // already exposes through the tools capability).
+        "registerTool" | "unregisterTool" | "toolUpdate" | "executeTool" | "setToolExposures"
+        | "clearToolExposures" => Requires(Capability::Tools),
         // V16-08 FR-E: MCP server registration is tools-capability surface.
         "registerMcpServer" | "unregisterMcpServer" | "getMcpServers" => {
             Requires(Capability::Tools)
@@ -945,6 +947,23 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
         }
+        // V16-14: session-scoped exposure overrides (TE43 dependency).
+        "setToolExposures" => {
+            let exposures = parse_tool_exposures(&args)?;
+            let applied = state
+                .api
+                .set_tool_exposures(exposures)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(json!({ "updated": applied }))
+        }
+        "clearToolExposures" => {
+            let names = parse_tool_names(&args)?;
+            let cleared = state
+                .api
+                .clear_tool_exposures(names)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(json!({ "cleared": cleared }))
+        }
         "getCommands" => Ok(json!(
             state
                 .api
@@ -1563,6 +1582,56 @@ fn parse_send_message_options(options: Value) -> SendMessageOptions {
     }
 }
 
+/// `setToolExposures` args (V16-14): `{"exposures": {"<name>": "<exposure>"}}`.
+/// The whole map is validated before any override is applied
+/// (all-or-nothing: an invalid value rejects the call before the host
+/// touches session state).
+fn parse_tool_exposures(
+    args: &Value,
+) -> Result<Vec<(String, ext::ToolExposure)>, (&'static str, String)> {
+    let object = args
+        .get("exposures")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            (
+                "invalidRequest",
+                "setToolExposures: missing exposures object".to_owned(),
+            )
+        })?;
+    let mut parsed: Vec<(String, ext::ToolExposure)> = Vec::with_capacity(object.len());
+    for (name, value) in object {
+        let exposure: ext::ToolExposure = serde_json::from_value(value.clone()).map_err(|_| {
+            (
+                "invalidRequest",
+                format!("setToolExposures: invalid exposure for tool \"{name}\""),
+            )
+        })?;
+        parsed.push((name.clone(), exposure));
+    }
+    Ok(parsed)
+}
+
+/// `clearToolExposures` args (V16-14): `{"names": ["<name>", ...]}`.
+fn parse_tool_names(args: &Value) -> Result<Vec<String>, (&'static str, String)> {
+    let values = args.get("names").and_then(Value::as_array).ok_or_else(|| {
+        (
+            "invalidRequest",
+            "clearToolExposures: missing names array".to_owned(),
+        )
+    })?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                (
+                    "invalidRequest",
+                    "clearToolExposures: names must be strings".to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1661,6 +1730,67 @@ mod tests {
                 "{method}"
             );
         }
+        // V16-14 additions are `tools`-gated (same family as registerTool).
+        assert!(matches!(
+            required_capability("setToolExposures"),
+            Requires(Capability::Tools)
+        ));
+        assert!(matches!(
+            required_capability("clearToolExposures"),
+            Requires(Capability::Tools)
+        ));
+    }
+
+    /// V16-14: the whole `exposures` map is validated before the host
+    /// applies anything (all-or-nothing), and the `codemode-deferred`
+    /// alias parses like it does in tool registration.
+    #[test]
+    fn parse_tool_exposures_accepts_wire_names_and_the_alias() {
+        let parsed = parse_tool_exposures(&json!({
+            "exposures": {
+                "read": "direct",
+                "run": "model-only",
+                "scripted": "codemode",
+                "late": "deferred",
+                "secret": "hidden",
+                "alias": "codemode-deferred",
+            }
+        }))
+        .expect("parsed");
+        let mut pairs = parsed;
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            pairs,
+            vec![
+                ("alias".to_owned(), ext::ToolExposure::Codemode),
+                ("late".to_owned(), ext::ToolExposure::Deferred),
+                ("read".to_owned(), ext::ToolExposure::Direct),
+                ("run".to_owned(), ext::ToolExposure::ModelOnly),
+                ("scripted".to_owned(), ext::ToolExposure::Codemode),
+                ("secret".to_owned(), ext::ToolExposure::Hidden),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tool_exposures_rejects_missing_and_invalid_values() {
+        assert!(parse_tool_exposures(&json!({})).is_err());
+        assert!(parse_tool_exposures(&json!({"exposures": []})).is_err());
+        let error = parse_tool_exposures(&json!({"exposures": {"read": "nope"}}))
+            .expect_err("invalid value");
+        assert_eq!(error.0, "invalidRequest");
+        assert!(error.1.contains("read"));
+    }
+
+    #[test]
+    fn parse_tool_names_requires_a_string_array() {
+        assert!(parse_tool_names(&json!({})).is_err());
+        assert!(parse_tool_names(&json!({"names": "read"})).is_err());
+        assert!(parse_tool_names(&json!({"names": ["read", 4]})).is_err());
+        assert_eq!(
+            parse_tool_names(&json!({"names": ["read", "bash"]})).expect("parsed"),
+            vec!["read".to_owned(), "bash".to_owned()]
+        );
     }
 }
 
@@ -2817,5 +2947,305 @@ mod v16_05_wire_tests {
         let value =
             dispatch(&mut state, "ctx.usage.fetch", json!({})).expect_err("missing provider");
         assert_eq!(value.0, "invalidRequest");
+    }
+}
+
+/// V16-14: `setToolExposures` / `clearToolExposures` dispatch-level behavior —
+/// argument validation runs before the action surface, the method names route
+/// to the action layer (`unbound` instead of `unknownMethod`), and a bound
+/// action set receives the parsed pairs and answers the `updated`/`cleared`
+/// envelopes.
+#[cfg(test)]
+mod tool_exposure_tests {
+    use super::*;
+    use crate::api::{
+        ExecOptions, ExecResult, ExtensionApi, ExtensionRuntime, HostActions, LoadedExtension,
+    };
+    use crate::error::ExtError;
+    use crate::wasm::{Capability, DispatchTarget, HostState, WasmForward};
+    use std::collections::HashSet;
+
+    /// Records the exposure calls. Every other action is unused by these
+    /// tests (`unimplemented!()` keeps the mock minimal).
+    #[derive(Default)]
+    struct ExposureRecorder {
+        exposures: std::sync::Mutex<Vec<(String, ext::ToolExposure)>>,
+        cleared: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostActions for ExposureRecorder {
+        fn set_tool_exposures(&self, exposures: Vec<(String, ext::ToolExposure)>) -> Vec<String> {
+            let applied: Vec<String> = exposures.iter().map(|(name, _)| name.clone()).collect();
+            self.exposures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(exposures);
+            applied
+        }
+
+        fn clear_tool_exposures(&self, names: Vec<String>) -> Vec<String> {
+            self.cleared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(names.clone());
+            names
+        }
+        fn send_message(&self, _message: Value, _options: Option<SendMessageOptions>) {
+            unimplemented!()
+        }
+        fn send_user_message(&self, _content: Value, _options: Option<SendUserMessageOptions>) {
+            unimplemented!()
+        }
+        fn append_entry(&self, _custom_type: &str, _data: Option<Value>) {
+            unimplemented!()
+        }
+        fn set_session_name(&self, _name: &str) {
+            unimplemented!()
+        }
+        fn get_session_name(&self) -> Option<String> {
+            unimplemented!()
+        }
+        fn set_label(&self, _entry_id: &str, _label: Option<&str>) {
+            unimplemented!()
+        }
+        async fn exec(
+            &self,
+            _command: &str,
+            _args: &[String],
+            _options: Option<ExecOptions>,
+        ) -> Result<ExecResult, ExtError> {
+            unimplemented!()
+        }
+        fn get_active_tools(&self) -> Vec<String> {
+            unimplemented!()
+        }
+        fn get_all_tools(&self) -> Vec<Value> {
+            unimplemented!()
+        }
+        fn set_active_tools(&self, _tool_names: Vec<String>) {
+            unimplemented!()
+        }
+        fn refresh_tools(&self) {
+            unimplemented!()
+        }
+        fn get_commands(&self) -> Vec<Value> {
+            unimplemented!()
+        }
+        async fn set_model(&self, _model: Value) -> bool {
+            unimplemented!()
+        }
+        fn get_thinking_level(&self) -> String {
+            unimplemented!()
+        }
+        fn set_thinking_level(&self, _level: &str) {
+            unimplemented!()
+        }
+        async fn register_provider(&self, _name: &str, _config: Value) -> Result<(), String> {
+            unimplemented!()
+        }
+        async fn register_native_provider(
+            &self,
+            _provider: Arc<dyn rpi_ai::models::Provider>,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+        async fn unregister_provider(&self, _name: &str) {
+            unimplemented!()
+        }
+        async fn register_virtual_model(
+            &self,
+            _definition: Value,
+            _route: crate::types::VirtualModelRouteFn,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+        async fn unregister_virtual_model(&self, _provider: &str, _id: &str) {
+            unimplemented!()
+        }
+        async fn model_registry_complete(
+            &self,
+            _model: Value,
+            _context: Value,
+            _options: Option<Value>,
+        ) -> Option<Value> {
+            unimplemented!()
+        }
+        fn model_registry_find(&self, _provider: &str, _model_id: &str) -> Option<Value> {
+            unimplemented!()
+        }
+        fn model_registry_find_of_type(
+            &self,
+            _model_type: &str,
+            _provider: &str,
+            _model_id: &str,
+        ) -> Option<Value> {
+            unimplemented!()
+        }
+        async fn model_registry_classify(
+            &self,
+            _model: Value,
+            _context: Value,
+            _options: Option<Value>,
+        ) -> Option<Value> {
+            unimplemented!()
+        }
+        fn model_registry_stream(
+            &self,
+            _model: rpi_ai::types::Model,
+            _context: rpi_ai::types::Context,
+            _options: Option<rpi_ai::models::ModelsStreamOptions>,
+        ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+            unimplemented!()
+        }
+        fn model_registry_stream_simple(
+            &self,
+            _model: rpi_ai::types::Model,
+            _context: rpi_ai::types::Context,
+            _options: Option<rpi_ai::models::ModelsSimpleStreamOptions>,
+        ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+            unimplemented!()
+        }
+        fn model_registry_has_configured_auth(&self, _provider_id: &str) -> bool {
+            unimplemented!()
+        }
+        async fn get_api_key_and_headers(&self, _model: Value) -> Value {
+            unimplemented!()
+        }
+        async fn set_runtime_api_key(
+            &self,
+            _provider_id: &str,
+            _api_key: &str,
+            _options: Option<crate::types::AuthOperationOptions>,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+        async fn remove_runtime_api_key(&self, _provider_id: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+    }
+
+    fn host_state(capabilities: HashSet<Capability>, actions: Arc<dyn HostActions>) -> HostState {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:v16-14>", "<inline:v16-14>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        api.runtime().bind_actions(actions);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        }
+    }
+
+    #[test]
+    fn set_tool_exposures_validates_before_the_action_layer() {
+        let actions = Arc::new(ExposureRecorder::default());
+        let mut state = host_state(HashSet::from([Capability::Tools]), actions.clone());
+
+        let error = dispatch(&mut state, "setToolExposures", json!({})).expect_err("missing");
+        assert_eq!(error.0, "invalidRequest");
+        let error = dispatch(
+            &mut state,
+            "setToolExposures",
+            json!({"exposures": {"read": "bogus"}}),
+        )
+        .expect_err("invalid exposure");
+        assert_eq!(error.0, "invalidRequest");
+        assert!(error.1.contains("read"), "{error:?}");
+        // Nothing reached the action layer.
+        assert!(
+            actions
+                .exposures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn set_and_clear_tool_exposures_round_trip_through_a_bound_action_set() {
+        let actions = Arc::new(ExposureRecorder::default());
+        let mut state = host_state(HashSet::from([Capability::Tools]), actions.clone());
+
+        let result = dispatch(
+            &mut state,
+            "setToolExposures",
+            json!({"exposures": {"read": "hidden", "scripted": "codemode-deferred"}}),
+        )
+        .expect("set ok");
+        assert_eq!(result, json!({"updated": ["read", "scripted"]}));
+        assert_eq!(
+            *actions.exposures.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![
+                ("read".to_owned(), ext::ToolExposure::Hidden),
+                ("scripted".to_owned(), ext::ToolExposure::Codemode),
+            ]
+        );
+
+        let result = dispatch(&mut state, "clearToolExposures", json!({"names": ["read"]}))
+            .expect("clear ok");
+        assert_eq!(result, json!({"cleared": ["read"]}));
+        assert_eq!(
+            *actions.cleared.lock().unwrap_or_else(|e| e.into_inner()),
+            vec!["read".to_owned()]
+        );
+    }
+
+    #[test]
+    fn clear_tool_exposures_validates_before_the_action_layer() {
+        let actions = Arc::new(ExposureRecorder::default());
+        let mut state = host_state(HashSet::from([Capability::Tools]), actions.clone());
+
+        let error = dispatch(&mut state, "clearToolExposures", json!({})).expect_err("missing");
+        assert_eq!(error.0, "invalidRequest");
+        let error = dispatch(&mut state, "clearToolExposures", json!({"names": "read"}))
+            .expect_err("shape");
+        assert_eq!(error.0, "invalidRequest");
+        assert!(
+            actions
+                .cleared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn valid_calls_on_unbound_actions_report_unbound() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:v16-14>", "<inline:v16-14>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut state = HostState {
+            api,
+            capabilities: HashSet::from([Capability::Tools]),
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        };
+        for (method, args) in [
+            ("setToolExposures", json!({"exposures": {"read": "hidden"}})),
+            ("clearToolExposures", json!({"names": ["read"]})),
+        ] {
+            let error = dispatch(&mut state, method, args).expect_err("unbound");
+            assert_eq!(error.0, "unbound", "{method}");
+        }
     }
 }

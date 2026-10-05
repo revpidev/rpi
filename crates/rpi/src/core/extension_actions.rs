@@ -373,6 +373,25 @@ impl HostActions for SessionHostActions {
         }
     }
 
+    /// `setToolExposures` (V16-14): session-scoped exposure overrides; the
+    /// session rebuilds the registry once and answers the applied names.
+    fn set_tool_exposures(
+        &self,
+        exposures: Vec<(String, rpi_ext_host::types::ToolExposure)>,
+    ) -> Vec<String> {
+        self.session()
+            .map(|session| session.set_tool_exposures(&exposures))
+            .unwrap_or_default()
+    }
+
+    /// `clearToolExposures` (V16-14): drop the overrides so the named tools
+    /// return to their registered exposure.
+    fn clear_tool_exposures(&self, names: Vec<String>) -> Vec<String> {
+        self.session()
+            .map(|session| session.clear_tool_exposures(&names))
+            .unwrap_or_default()
+    }
+
     /// `refreshTools` (agent-session.ts:2395 → `_refreshToolRegistry`).
     fn refresh_tools(&self) {
         if let Some(session) = self.session() {

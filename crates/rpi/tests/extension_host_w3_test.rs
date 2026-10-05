@@ -1204,3 +1204,173 @@ async fn w3_before_agent_start_set_active_tools_applies_to_same_turn() {
     let text = result["content"][0]["text"].as_str().unwrap_or_default();
     assert!(text.contains("Tool stripped not found"), "{result}");
 }
+
+// ---------------------------------------------------------------------------
+// V16-14: setToolExposures / clearToolExposures (TE43 dependency)
+// ---------------------------------------------------------------------------
+
+/// The effective exposure of one registered tool (`ToolInfo.exposure`).
+fn tool_exposure(api: &ExtensionApi, name: &str) -> Option<ext::ToolExposure> {
+    api.get_all_tools()
+        .expect("all tools")
+        .into_iter()
+        .find(|tool| tool["name"] == name)
+        .and_then(|tool| serde_json::from_value(tool["exposure"].clone()).ok())
+}
+
+/// V16-14 FR-A: a `hidden` override removes the tool from the active and
+/// callable sets, survives a registry rebuild, and `clear` returns the tool
+/// to its registered exposure (re-activating it like a new registration).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w3_set_tool_exposures_hides_until_cleared_and_survives_rebuild() {
+    let (host, slot) = host_with_api(Vec::new()).await;
+    let fixture = session_fixture(Vec::new(), host, FauxProviderOptions::default()).await;
+    let api = slot_api(&slot);
+
+    assert_eq!(tool_exposure(&api, "bash"), Some(ext::ToolExposure::Direct));
+    assert!(
+        api.get_active_tools()
+            .expect("active")
+            .contains(&"bash".to_owned())
+    );
+    assert!(
+        fixture
+            .session
+            .get_callable_tool_names()
+            .contains(&"bash".to_owned())
+    );
+
+    let updated = api
+        .set_tool_exposures(vec![
+            ("bash".to_owned(), ext::ToolExposure::Hidden),
+            ("edit".to_owned(), ext::ToolExposure::Hidden),
+            ("missing".to_owned(), ext::ToolExposure::Hidden),
+        ])
+        .expect("set_tool_exposures");
+    // Unknown names are ignored; applied names come back in input order.
+    assert_eq!(updated, vec!["bash".to_owned(), "edit".to_owned()]);
+    assert_eq!(tool_exposure(&api, "bash"), Some(ext::ToolExposure::Hidden));
+    assert_eq!(tool_exposure(&api, "edit"), Some(ext::ToolExposure::Hidden));
+    assert_eq!(tool_exposure(&api, "read"), Some(ext::ToolExposure::Direct));
+    assert!(
+        !api.get_active_tools()
+            .expect("active")
+            .contains(&"bash".to_owned())
+    );
+    assert!(
+        !fixture
+            .session
+            .get_callable_tool_names()
+            .contains(&"bash".to_owned())
+    );
+
+    // The override survives a registry rebuild (registerTool triggers
+    // refreshTools -> refresh_tool_registry).
+    register_tool(
+        &api,
+        "v16_14_probe",
+        Arc::new(|_req, _ctx| Box::pin(async { Ok(rpi_agent::types::AgentToolResult::default()) })),
+    );
+    assert_eq!(tool_exposure(&api, "bash"), Some(ext::ToolExposure::Hidden));
+    assert_eq!(
+        tool_exposure(&api, "v16_14_probe"),
+        Some(ext::ToolExposure::Direct)
+    );
+
+    let cleared = api
+        .clear_tool_exposures(vec![
+            "bash".to_owned(),
+            "edit".to_owned(),
+            "read".to_owned(),
+        ])
+        .expect("clear_tool_exposures");
+    // Only overridden names report as cleared.
+    assert_eq!(cleared, vec!["bash".to_owned(), "edit".to_owned()]);
+    assert_eq!(tool_exposure(&api, "bash"), Some(ext::ToolExposure::Direct));
+    assert_eq!(tool_exposure(&api, "edit"), Some(ext::ToolExposure::Direct));
+    assert!(
+        api.get_active_tools()
+            .expect("active")
+            .contains(&"bash".to_owned())
+    );
+    assert!(
+        fixture
+            .session
+            .get_callable_tool_names()
+            .contains(&"bash".to_owned())
+    );
+
+    // Empty calls are no-ops (no overrides written, nothing to clear).
+    assert!(
+        api.set_tool_exposures(Vec::new())
+            .expect("empty set")
+            .is_empty()
+    );
+    assert!(
+        api.clear_tool_exposures(Vec::new())
+            .expect("empty clear")
+            .is_empty()
+    );
+}
+
+/// V16-14 FR-A R4: `prepareLoadout` hooks read the effective (overridden)
+/// exposures through `ToolLoadout.exposures` (the V16-06 foundation surface
+/// TE43's boundary consumes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w3_exposure_override_reaches_the_loadout_hook() {
+    let (host, slot) = host_with_api(Vec::new()).await;
+    let _fixture = session_fixture(Vec::new(), host, FauxProviderOptions::default()).await;
+    let api = slot_api(&slot);
+
+    type Snapshot = std::collections::HashMap<String, ext::ToolExposure>;
+    let seen: Arc<Mutex<Vec<Snapshot>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    api.register_tool(ext::ToolDefinition {
+        name: "v16_14_hook".to_owned(),
+        label: "hook".to_owned(),
+        description: "records the loadout exposures".to_owned(),
+        prompt_snippet: None,
+        prompt_guidelines: None,
+        parameters: json!({"type": "object"}),
+        constrained_sampling: None,
+        output_schema: None,
+        exposure: ext::ToolExposure::Direct,
+        namespace: None,
+        annotations: None,
+        default_active: None,
+        prepare_loadout: Some(Arc::new(
+            move |loadout: &ext::ToolLoadout| -> Result<Option<ext::ToolLoadoutChanges>, String> {
+                recorder
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(loadout.exposures.clone());
+                Ok(None)
+            },
+        )),
+        render_shell: None,
+        prepare_arguments: None,
+        execution_mode: None,
+        execute: Arc::new(|_req, _ctx| {
+            Box::pin(async { Ok(rpi_agent::types::AgentToolResult::default()) })
+        }),
+        render_call: None,
+        render_result: None,
+    })
+    .expect("register hook tool");
+
+    api.set_tool_exposures(vec![
+        ("bash".to_owned(), ext::ToolExposure::Hidden),
+        ("edit".to_owned(), ext::ToolExposure::ModelOnly),
+    ])
+    .expect("set_tool_exposures");
+
+    let last = seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .last()
+        .cloned()
+        .expect("the hook ran during the rebuild");
+    assert_eq!(last.get("bash"), Some(&ext::ToolExposure::Hidden));
+    assert_eq!(last.get("edit"), Some(&ext::ToolExposure::ModelOnly));
+    assert_eq!(last.get("read"), Some(&ext::ToolExposure::Direct));
+}

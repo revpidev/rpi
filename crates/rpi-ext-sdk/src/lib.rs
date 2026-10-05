@@ -480,6 +480,48 @@ impl Extension {
         host_call("setMode", json!({ "mode": mode })).map(|_| ())
     }
 
+    // -- V16-14 tool exposure overrides (rpi-own, TE43 dependency) ---------
+
+    /// `pi.setToolExposures(exposures)` (V16-14; rpi-own): apply
+    /// session-scoped exposure overrides for the tools named in `exposures`
+    /// (`{"<toolName>": "<exposure>"}`; exposure is one of `direct` /
+    /// `model-only` / `codemode` / `deferred` / `hidden`, plus the
+    /// `codemode-deferred` alias). Unknown tool names are ignored; the whole
+    /// map is validated before anything is applied. Returns the applied
+    /// names.
+    pub fn set_tool_exposures(&self, exposures: Value) -> Result<Vec<String>, String> {
+        host_call("setToolExposures", json!({ "exposures": exposures })).map(|value| {
+            value
+                .get("updated")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(|name| name.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// `pi.clearToolExposures(names)` (V16-14; rpi-own): drop the exposure
+    /// overrides for the named tools so they return to their registered
+    /// exposure. Returns the cleared names.
+    pub fn clear_tool_exposures(&self, names: Vec<String>) -> Result<Vec<String>, String> {
+        host_call("clearToolExposures", json!({ "names": names })).map(|value| {
+            value
+                .get("cleared")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(|name| name.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
     // -- V16-05 usage-provider framework (rpi-own, FR-A R5) ----------------
 
     /// `ctx.usage.listProviders()`: provider ids reachable through the

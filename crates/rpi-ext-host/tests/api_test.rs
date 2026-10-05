@@ -26,6 +26,8 @@ struct MockActions {
     sent_messages: Mutex<Vec<(Value, Option<SendMessageOptions>)>>,
     session_name: Mutex<Option<String>>,
     active_tools: Mutex<Vec<String>>,
+    tool_exposures: Mutex<Vec<(String, ext::ToolExposure)>>,
+    cleared_exposures: Mutex<Vec<String>>,
     thinking_level: Mutex<String>,
     refresh_count: Mutex<usize>,
     registered_providers: Mutex<Vec<(String, Value)>>,
@@ -97,6 +99,23 @@ impl HostActions for MockActions {
 
     fn set_active_tools(&self, tool_names: Vec<String>) {
         *self.active_tools.lock().unwrap_or_else(|e| e.into_inner()) = tool_names;
+    }
+
+    fn set_tool_exposures(&self, exposures: Vec<(String, ext::ToolExposure)>) -> Vec<String> {
+        let applied: Vec<String> = exposures.iter().map(|(name, _)| name.clone()).collect();
+        self.tool_exposures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(exposures);
+        applied
+    }
+
+    fn clear_tool_exposures(&self, names: Vec<String>) -> Vec<String> {
+        self.cleared_exposures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(names.clone());
+        names
     }
 
     fn refresh_tools(&self) {
@@ -305,6 +324,14 @@ async fn api_actions_throw_unbound_before_host_binds() {
     assert!(matches!(api.get_session_name(), Err(ExtError::Unbound(_))));
     assert!(matches!(api.get_active_tools(), Err(ExtError::Unbound(_))));
     assert!(matches!(
+        api.set_tool_exposures(vec![("bash".to_owned(), ext::ToolExposure::Hidden)]),
+        Err(ExtError::Unbound(_))
+    ));
+    assert!(matches!(
+        api.clear_tool_exposures(vec!["bash".to_owned()]),
+        Err(ExtError::Unbound(_))
+    ));
+    assert!(matches!(
         api.set_model(json!({})).await,
         Err(ExtError::Unbound(_))
     ));
@@ -333,6 +360,15 @@ async fn api_actions_forward_after_bind() {
     .unwrap();
     api.set_session_name("session-1").unwrap();
     api.set_active_tools(vec!["bash".to_owned()]).unwrap();
+    assert_eq!(
+        api.set_tool_exposures(vec![("bash".to_owned(), ext::ToolExposure::Hidden)])
+            .unwrap(),
+        ["bash"]
+    );
+    assert_eq!(
+        api.clear_tool_exposures(vec!["bash".to_owned()]).unwrap(),
+        ["bash"]
+    );
     api.set_thinking_level("high").unwrap();
     assert!(api.set_model(json!({"id": "m"})).await.unwrap());
     assert_eq!(api.exec("ls", &[], None).await.unwrap().stdout, "out");
@@ -353,6 +389,20 @@ async fn api_actions_forward_after_bind() {
     );
     assert_eq!(api.get_active_tools().unwrap(), ["bash"]);
     assert_eq!(api.get_thinking_level().unwrap(), "high");
+    assert_eq!(
+        actions
+            .tool_exposures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())[0],
+        ("bash".to_owned(), ext::ToolExposure::Hidden)
+    );
+    assert_eq!(
+        actions
+            .cleared_exposures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())[0],
+        "bash"
+    );
     assert_eq!(
         actions
             .appended_entries
