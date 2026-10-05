@@ -1,29 +1,31 @@
 // Orchestrator of the subagents parity harness (TE04 G3; dual-track TE13;
-// re-rotated by TE37 for the v0.1.5 rebase window under ADR-0029).
+// re-rotated by TE37 for v0.1.5 under ADR-0029 and by TE45 for v0.1.6 under
+// ADR-0034).
 //
 //   node scripts/subagents-parity/run-parity.mjs [--track=regression|target]
 //   node scripts/subagents-parity/run-parity.mjs --record-args-golden
 //
-// v0.1.5 rotation (TE37; the pin flipped with TE39 on 2026-09-27):
-//   - `target` (DEFAULT since the TE39 pin switch, 2026-09-27) = the
-//     CURRENT-pin snapshot, pi-subagents v0.70.0 @ b72714de (ADR-0029),
-//     extracted read-only by setup-target-source.sh into
-//     /tmp/rpi-subagents-parity-target-v070. Writes
-//     fixtures/generated/subagents-parity-v070/. Diffs are attributed
-//     through expected-target-diffs-v070.json (`upstream-semantics` vs
-//     `rpi-deviation`, each with R + owner task); the manifest stays empty
-//     while every case MATCHes. Non-zero exit = any UNATTRIBUTED diff.
-//   - `regression` = the retired v0.66.0 snapshot @ 0fc0eebb (the window's
-//     zero-regression baseline; its mission ended with the TE39 switch).
-//     Archaeology only; writes fixtures/generated/subagents-parity-v066/.
+// v0.1.6 rotation (TE45; the pin moved with M0.75 on 2026-10-01):
+//   - `target` (DEFAULT) = the CURRENT-pin snapshot, pi-subagents v0.74.0 @
+//     b6bda32f (ADR-0034), extracted read-only by setup-target-source.sh
+//     into /tmp/rpi-subagents-parity-target-v074. Writes
+//     fixtures/generated/subagents-parity-v074/. Diffs are attributed
+//     through expected-target-diffs-v074.json (`upstream-semantics` vs
+//     `rpi-deviation`, each with R + owner task).
+//   - `regression` = the retired v0.70.0 snapshot @ b72714de (the v0.1.5
+//     zero-regression baseline). Writes
+//     fixtures/generated/subagents-parity-v070/; attributed through the
+//     historical expected-target-diffs.json.
 //   - Both tracks share the same fixture set (fixtures.json +
 //     fixtures-target.json) and the frozen argv/env golden
 //     (args-golden-v048.json, [RPI-OWN] per ADR-0025 §4 — upstream deleted
-//     pi-args.ts in v0.65 and it stayed deleted at v0.70).
+//     pi-args.ts in v0.65 and it stayed deleted at v0.74).
 //   - Upstream v0.70 removed automatic model fallback entirely (#2270,
-//     f58dfcb5). TE39 followed the removal: the retryable/attempt fixtures
-//     retired, and the fallback/model legs re-anchored at v0.70
-//     model-resolution.ts on BOTH tracks (see upstream-runner.mjs).
+//     f58dfcb5); TE39 followed the removal and re-anchored the fallback/
+//     model legs at model-resolution.ts. v0.74 added the `scoped` model
+//     scope token (#2538) and provider-prefixed catalog ids (#2491); the
+//     legs stay anchored at TARGET_ROOT's model-resolution.ts on both
+//     tracks (see upstream-runner.mjs).
 //
 // The Rust leg is built by this script and copied to a private path before
 // execution: both plugin crates ship an example named `subagents_parity_runner`, and
@@ -40,25 +42,24 @@ const TSX = "/tmp/rpi-subagents-parity-deps/node_modules/.bin/tsx";
 const GOLDEN_PATH = `${HERE}/args-golden-v048.json`;
 
 const TRACK_FLAG = process.argv.find((arg) => arg.startsWith("--track="));
-// TE39 pin switch (2026-09-27): the default track is `target` (v0.70 = the
-// submodule pin); `--track=regression` still drives the retired v0.66
-// snapshot for archaeology.
+// TE45 rotation (2026-10-01): the default track is `target` (v0.74 = the
+// submodule pin); `--track=regression` drives the retired v0.70 snapshot.
 const TRACK = TRACK_FLAG ? TRACK_FLAG.slice("--track=".length) : "target";
 if (!["regression", "target"].includes(TRACK)) {
 	console.error(`unknown track: ${TRACK}`);
 	process.exit(2);
 }
-// Per-track attribution manifests (TE37 rotation): the v066 manifest is the
-// historical (converged-to-empty) TE13-era list kept for the regression
-// track; the v070 manifest starts empty and is filled by TE38/TE39.
-const TARGET_MANIFEST = `${HERE}/expected-target-diffs${TRACK === "target" ? "-v070" : ""}.json`;
+// Per-track attribution manifests (TE37 rotation): the unscoped manifest is
+// the historical (converged-to-empty) TE13-era list kept for the regression
+// track; the v074 manifest is the v0.1.6 target list (TE45 seed).
+const TARGET_MANIFEST = `${HERE}/expected-target-diffs${TRACK === "target" ? "-v074" : ""}.json`;
 const RECORD_ARGS_GOLDEN = process.argv.includes("--record-args-golden");
 
 const GENERATED = resolve(
 	REPO,
 	TRACK === "target"
-		? "fixtures/generated/subagents-parity-v070"
-		: "fixtures/generated/subagents-parity-v066",
+		? "fixtures/generated/subagents-parity-v074"
+		: "fixtures/generated/subagents-parity-v070",
 );
 // Both tracks run the full mode set (the v0.48-only archaeology face was
 // removed with the TE37 rotation; the args leg is golden-based on both
@@ -410,8 +411,8 @@ if (RECORD_ARGS_GOLDEN) {
 mkdirSync(GENERATED, { recursive: true });
 const report = [
 	TRACK === "target"
-		? "# subagents parity report (target track: pi-subagents v0.70.0 @ b72714de snapshot, ADR-0029)"
-		: "# subagents parity report (regression track: pi-subagents v0.66.0 @ 0fc0eebb, submodule pin)",
+		? "# subagents parity report (target track: pi-subagents v0.74.0 @ b6bda32f snapshot, ADR-0034)"
+		: "# subagents parity report (regression track: pi-subagents v0.70.0 @ b72714de snapshot, ADR-0029)",
 	"",
 	`generated: ${new Date().toISOString()}`,
 	"",

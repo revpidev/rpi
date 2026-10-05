@@ -1,23 +1,18 @@
 // Upstream leg of the subagents parity harness (TE04 G3; dual-track TE13;
-// re-rotated by TE37 for the v0.1.5 window, ADR-0029).
+// re-rotated by TE37 for v0.1.5 and by TE45 for v0.1.6, ADR-0034).
 //
-// Track `target` (default since the TE39 pin switch, 2026-09-27): the
-// v0.70.0 snapshot = the current pin (see setup-target-source.sh).
+// Track `target` (default since the TE45 rotation): the v0.74.0 snapshot =
+// the current pin (see setup-target-source.sh).
 //
-// Track `target`: the v0.70.0 snapshot extracted by `setup-target-source.sh`
-// (never a checkout of `external/`) into /tmp/rpi-subagents-parity-target-v070.
-//
-// Mode roots (TE37 skeleton facts, verified against both pins):
+// Mode roots (verified against both pins):
 //   - frontmatter / final-output / discovery / notify: the track root
-//     (all four module faces exist unchanged at v0.70).
+//     (all four module faces exist unchanged at v0.74).
 //   - argv/env (`args`): the frozen v0.48 golden on BOTH tracks
 //     ([RPI-OWN], ADR-0025 §4 — upstream deleted pi-args.ts in v0.65 and it
-//     stayed deleted at v0.70; there is no live upstream face to drive).
-//   - fallback / model: re-anchored at v0.70 on both tracks (TE39 followed
-//     the #2270 removal — src/runs/shared/model-fallback.ts deleted; the
-//     retained surface lives in model-resolution.ts: isContextOverflow +
-//     resolveSubagentModelOverride + resolveModelSelection for the surviving
-//     single-candidate vectors; the retryable/attempt fixtures retired).
+//     stayed deleted at v0.74; there is no live upstream face to drive).
+//   - fallback / model: anchored at TARGET_ROOT's model-resolution.ts on both
+//     tracks (TE39 followed #2270 and re-anchored; v0.74 added the `scoped`
+//     token (#2538) and provider-prefixed catalog ids (#2491)).
 //
 // Prints normalized JSON lines that the orchestrator diffs against the Rust
 // parity_runner example.
@@ -31,13 +26,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TRACK = process.env.RPI_SUBAGENTS_PARITY_TRACK ?? "regression";
-// regression = the retired v0.66.0 snapshot (0fc0eebb; archaeology only);
-// target = the v0.70.0 snapshot = the current pin
-// (TE37, ADR-0029). Both are extracted by setup-target-source.sh.
+// regression = the retired v0.70.0 snapshot (b72714de);
+// target = the v0.74.0 snapshot = the current pin (TE45, ADR-0034).
+// Both are extracted by setup-target-source.sh.
 const REGRESSION_ROOT =
-	process.env.RPI_SUBAGENTS_REGRESSION_SRC ?? "/tmp/rpi-subagents-parity-regression-v066";
+	process.env.RPI_SUBAGENTS_REGRESSION_SRC ?? "/tmp/rpi-subagents-parity-regression-v070";
 const TARGET_ROOT =
-	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v070";
+	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v074";
 const ARGS_GOLDEN = resolve(HERE, "args-golden-v048.json");
 
 // Normalize an argv array the same way the Rust runner does.
@@ -94,7 +89,7 @@ async function loadUpstream() {
 	const root = trackRoot();
 	const frontmatter = await import(moduleUrl(root, "src/agents/frontmatter.ts"));
 	const utils = await import(moduleUrl(root, "src/shared/utils.ts"));
-	// fallback/model face: re-anchored at v0.70 by TE39 (#2270 deleted
+	// fallback/model face: anchored at the target pin by TE45 (#2270 deleted
 	// src/runs/shared/model-fallback.ts; model-resolution.ts keeps
 	// resolveSubagentModelOverride / isContextOverflow and the single-model
 	// launch path — buildModelCandidates is gone, so the candidates
@@ -102,7 +97,13 @@ async function loadUpstream() {
 	const modelResolution = await import(
 		moduleUrl(TARGET_ROOT, "src/runs/shared/model-resolution.ts"),
 	);
-	return { frontmatter, utils, modelResolution };
+	// #2538/#2491 (TE45): the model-scope resolver expands `inherit`/`scoped`
+	// into concrete ids; the model-resolution functions receive the resolved
+	// rules, mirroring the production call chain.
+	const modelScope = await import(
+		moduleUrl(TARGET_ROOT, "src/runs/shared/model-scope.ts"),
+	);
+	return { frontmatter, utils, modelResolution, modelScope };
 }
 
 // The track's expectation root: the current-pin regression snapshot or the
@@ -205,7 +206,7 @@ function fallbackCase(modelResolution, fixture) {
 // single-model launch resolution matching the Rust single-candidate shape
 // post-#2270. Throws surface as { error } so a fail-closed throw on this
 // side diffs against a value (or error) from the Rust leg.
-function modelCase(modelResolution, fixture) {
+function modelCase(modelResolution, fixture, modelScope) {
 	const registry = fixture.registry === undefined || fixture.registry === null
 		? undefined
 		: fixture.registry.map((entry) => ({
@@ -219,6 +220,12 @@ function modelCase(modelResolution, fixture) {
 			return { provider, id: rest.join("/") };
 		})()
 		: undefined;
+	// `scope` is the raw settings shape; production resolves it per agent with
+	// the parent model + scoped-model snapshot before model resolution.
+	const scopedModelIds = Array.isArray(fixture.scopedModels) ? fixture.scopedModels : undefined;
+	const resolvedScopes = fixture.scope && modelScope
+		? modelScope.resolveModelScopesForAgent(fixture.scope, fixture.agentName, parentModel, scopedModelIds)
+		: undefined;
 	if (fixture.kind === "override") {
 		try {
 			const resolved = modelResolution.resolveSubagentModelOverride(
@@ -226,7 +233,7 @@ function modelCase(modelResolution, fixture) {
 				parentModel,
 				registry,
 				fixture.preferredProvider ?? undefined,
-				{ source: fixture.source === "explicit" ? "explicit" : "inherited" },
+				{ scope: resolvedScopes, source: fixture.source === "explicit" ? "explicit" : "inherited" },
 			);
 			return { resolved };
 		} catch (error) {
@@ -238,7 +245,7 @@ function modelCase(modelResolution, fixture) {
 			const origin = ["explicit", "inherited", "configured"].includes(fixture.origin)
 				? fixture.origin
 				: "configured";
-			const selection = modelResolution.resolveModelSelection(fixture.primary ?? undefined, registry, fixture.preferredProvider ?? undefined, { origin });
+			const selection = modelResolution.resolveModelSelection(fixture.primary ?? undefined, registry, fixture.preferredProvider ?? undefined, { origin, scope: resolvedScopes });
 			const candidates = selection.model === undefined ? [] : [selection.model];
 			return { candidates };
 		} catch (error) {
@@ -280,8 +287,8 @@ function loadArgsGolden() {
 
 // TE15 discovery-tree leg (R7.1.3): materialize the case tree under a sandbox
 // user-agent dir with the upstream config-dir name (`.pi`; the Rust leg uses
-// `.rpi`, both map back to `<CFGDIR>`), then drive the real v0.66
-// `discoverAgents` in `user` scope. Scope `user` keeps discovery uncached
+// `.rpi`, both map back to `<CFGDIR>`), then drive the real
+// track-snapshot `discoverAgents` in `user` scope. Scope `user` keeps discovery uncached
 // (`discoverAgentsUncached`), so repeated cases in one process stay isolated.
 // Returns normalized agents + diagnostics; the Rust runner emits the same
 // shape.
@@ -357,7 +364,7 @@ async function main() {
 		);
 		process.exit(2);
 	}
-	const { frontmatter, utils, modelResolution } = await loadUpstream();
+	const { frontmatter, utils, modelResolution, modelScope } = await loadUpstream();
 	// TE17: the notify module exists on both pins (face unchanged at v0.70),
 	// loaded from the track root.
 	const notify = mode === "notify"
@@ -381,7 +388,7 @@ async function main() {
 		} else if (mode === "fallback") {
 			output = fallbackCase(modelResolution, fixture);
 		} else if (mode === "model") {
-			output = modelCase(modelResolution, fixture);
+			output = modelCase(modelResolution, fixture, modelScope);
 		} else if (mode === "discovery") {
 			output = await discoveryCase(fixture);
 		} else if (mode === "notify") {

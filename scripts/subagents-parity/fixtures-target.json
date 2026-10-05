@@ -588,6 +588,92 @@
           }
         ],
         "origin": "configured"
+      },
+      {
+        "name": "scoped-token-expands-snapshot",
+        "kind": "override",
+        "model": "google/gemini-3-pro",
+        "parentModel": "openai/gpt-5.5",
+        "registry": null,
+        "scope": { "enforce": true, "allow": ["scoped"] },
+        "scopedModels": ["openai/gpt-5.5", "anthropic/claude-5"],
+        "source": "explicit"
+      },
+      {
+        "name": "scoped-token-in-snapshot-passes",
+        "kind": "override",
+        "model": null,
+        "parentModel": "openai/gpt-5.5",
+        "registry": null,
+        "scope": { "enforce": true, "allow": ["scoped"] },
+        "scopedModels": ["openai/gpt-5.5", "anthropic/claude-5"],
+        "source": "inherited"
+      },
+      {
+        "name": "scoped-token-empty-degrades-inherit",
+        "kind": "override",
+        "model": null,
+        "parentModel": "anthropic/claude-5",
+        "registry": null,
+        "scope": { "enforce": true, "allow": ["scoped"] },
+        "scopedModels": [],
+        "source": "inherited"
+      },
+      {
+        "name": "scoped-token-unresolved-fails-closed",
+        "kind": "override",
+        "model": null,
+        "parentModel": null,
+        "registry": null,
+        "scope": { "enforce": true, "allow": ["scoped"] },
+        "source": "inherited"
+      },
+      {
+        "name": "scoped-token-agent-rule-candidates",
+        "kind": "candidates",
+        "primary": "openai/gpt",
+        "registry": null,
+        "scope": { "enforce": true, "agents": { "researcher": { "allow": ["scoped"] } } },
+        "scopedModels": ["openai/gpt"],
+        "agentName": "researcher",
+        "origin": "explicit"
+      },
+      {
+        "name": "provider-prefixed-catalog-id",
+        "kind": "override",
+        "model": "openrouter/auto-beta",
+        "registry": [
+          {
+            "fullId": "openrouter/openrouter/auto-beta",
+            "provider": "openrouter",
+            "id": "openrouter/auto-beta"
+          }
+        ],
+        "source": "explicit"
+      },
+      {
+        "name": "huggingface-owner-name-whole-id",
+        "kind": "override",
+        "model": "owner/name",
+        "registry": [
+          {
+            "fullId": "hf/owner/name",
+            "provider": "hf",
+            "id": "owner/name"
+          }
+        ],
+        "source": "explicit"
+      },
+      {
+        "name": "scope-renders-eight-patterns",
+        "kind": "override",
+        "model": "other/model",
+        "registry": null,
+        "scope": {
+          "enforce": true,
+          "allow": ["p0/*", "p1/*", "p2/*", "p3/*", "p4/*", "p5/*", "p6/*", "p7/*", "p8/*", "p9/*"]
+        },
+        "source": "explicit"
       }
     ]
   }

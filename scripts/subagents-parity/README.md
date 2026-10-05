@@ -4,20 +4,20 @@ Drives the pinned upstream pi-subagents and this crate's `build_rpi_args` / fron
 `get_finalOutput` / context-overflow classifier / model-resolution vectors / discovery entry
 points with the same fixture set, then diffs the normalized outputs item by item.
 
-## Dual tracks (v0.1.5 rotation, TE37 / ADR-0029)
+## Dual tracks (v0.1.6 rotation, TE45 / ADR-0034)
 
 | Track | Upstream | Purpose | Report directory |
 |----|------|------|----------|
-| `target` (**default since the TE39 pin switch**) | the current pin v0.70.0 (`b72714de`, an out-of-repo snapshot) | active parity baseline (full mode set) | `fixtures/generated/subagents-parity-v070/` |
-| `regression` | the retired v0.66.0 snapshot (`0fc0eebb`) | archaeology only (the zero-regression mission ended with the pin switch) | `fixtures/generated/subagents-parity-v066/` (historical) |
+| `target` (**default since the TE45 rotation**) | the current pin v0.74.0 (`b6bda32f`, an out-of-repo snapshot) | active parity baseline (full mode set) | `fixtures/generated/subagents-parity-v074/` |
+| `regression` | the retired v0.70.0 snapshot (`b72714de`, the v0.1.5 zero-regression baseline) | archaeology only | `fixtures/generated/subagents-parity-v070/` |
 
 Track names rotate each rebase cycle (TE13 convention): the v0.1.5 window named the then-current
-pin `regression` (default) and the new pin `target`; **TE39 flipped the default back to `target`
-together with the pin switch** (2026-09-27). The retired v0.48
+pin `regression` (default) and the new pin `target`; **TE45 kept the default on `target` and moved
+the tracks one release window forward** (2026-10, pin v0.70.0 -> v0.74.0 with M0.75). The retired v0.48
 archaeology face (live `pi-args.ts`) was removed with the TE37 rotation — the args leg is the
 frozen v0.48 golden on both tracks. The two fixture files (`fixtures.json`, `fixtures-target.json`)
 are shared and concatenated on both tracks. Both upstream legs read **snapshots** extracted by
-`setup-target-source.sh` (the live worktree cannot serve: v0.66's discovery chain imports `yaml`,
+`setup-target-source.sh` (the live worktree cannot serve: the discovery chain imports `yaml`,
 unresolvable from a pristine `external/`).
 
 ## Running
@@ -29,11 +29,11 @@ mkdir -p /tmp/rpi-subagents-parity-deps && cd /tmp/rpi-subagents-parity-deps \
 
 cd <repo-root>
 
-# Default track (v0.70.0 snapshot = the submodule pin since TE39)
-bash scripts/subagents-parity/setup-target-source.sh   # extracts BOTH snapshots (target v0.70 + regression v0.66) + prod deps
+# Default track (v0.74.0 snapshot = the submodule pin since M0.75/TE45)
+bash scripts/subagents-parity/setup-target-source.sh   # extracts BOTH snapshots (target v0.74 + regression v0.70) + prod deps
 node scripts/subagents-parity/run-parity.mjs
 
-# The retired v0.66.0 snapshot track (archaeology)
+# The retired v0.70.0 snapshot track (archaeology)
 node scripts/subagents-parity/run-parity.mjs --track=regression
 
 # Re-record the argv/env frozen baseline ([RPI-OWN], ADR-0025 §4; v0.48-era worktree + RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1 required)
@@ -53,11 +53,11 @@ difference is triaged in the track's manifest.
 
 `--track=target` runs an extra `discovery` mode: the same tree case is materialized **by both sides** —
 the upstream leg places the fixture's `<CFGDIR>` as `.pi`, the Rust leg as `.rpi`, and the output normalizes that
-segment back to `<CFGDIR>`; both sides call the **real discovery entry points** (upstream v0.66
-`discoverAgents(cwd, "user")`, rpi `discover_agents_with_user_dirs_with_diagnostics`), comparing
+segment back to `<CFGDIR>`; both sides call the **real discovery entry points** (upstream
+`discoverAgents(cwd, "user")` from each track snapshot, rpi `discover_agents_with_user_dirs_with_diagnostics`), comparing
 `agents` (name/source/path) and `diagnostics` (path/source/error) filtered to that tree. The upstream leg points HOME /
 USERPROFILE / `PI_CODING_AGENT_DIR` at an out-of-repo sandbox and sets `PI_OFFLINE=1` (skipping
-`npm root -g`); scope `user` makes v0.66 take the `discoverAgentsUncached` path, so multiple cases
+`npm root -g`); scope `user` makes the upstream snapshot take the `discoverAgentsUncached` path, so multiple cases
 within one process don't pollute each other; built-in agents and `~/.agents` are filtered out by
 path on both sides. Symlink cases are created on non-Windows platforms only (both sides skip
 them consistently; see `fixtures/subagents-v066/discovery/materialize.json`).
@@ -65,8 +65,8 @@ them consistently; see `fixtures/subagents-v066/discovery/materialize.json`).
 ## Target-track upstream source (out-of-repo; zero writes to external/)
 
 `setup-target-source.sh` uses `git -C external/pi-subagents archive <pin>` to extract BOTH snapshots —
-the v0.70 target into `/tmp/rpi-subagents-parity-target-v070` and the current-pin (v0.66)
-regression source into `/tmp/rpi-subagents-parity-regression-v066` (each overridable via
+the v0.74 target into `/tmp/rpi-subagents-parity-target-v074` and the v0.70
+regression source into `/tmp/rpi-subagents-parity-regression-v070` (each overridable via
 `RPI_SUBAGENTS_TARGET_SRC` / `RPI_SUBAGENTS_REGRESSION_SRC`; `--skip-regression` skips the latter) —
 no checkout,
 no `git worktree add`, no submodule HEAD changes — so
@@ -104,7 +104,7 @@ thinking-suffix retry / miss fail-closed (#1093) and the origin-aware candidate 
 
 ## Attribution rules (target track)
 
-Every target-track difference must hit `expected-target-diffs-v070.json` (the v0.1.5 manifest; the regression
+Every target-track difference must hit `expected-target-diffs-v074.json` (the v0.1.6 manifest; the regression
 track keeps the historical, emptied `expected-target-diffs.json`), or the report lands in `### unattributed` with a non-zero exit code:
 
 - `upstream-semantics`: new-tag behavior rpi hasn't adopted yet (attached R entry + owning task);
@@ -129,9 +129,10 @@ track keeps the historical, emptied `expected-target-diffs.json`), or the report
 | `fixtures-target.json` | Target-track additions: frontmatter (inherit/false, excludeTools, broken frontmatter, thinking), final-output, fallback vectors (post-#2270/TE39: context-overflow only), discovery tree (TE15), notify (TE17), **inline argv [RPI-OWN] goldens (TE18: the excludeTools surface, no upstream recorder; expectations inline in the cases) and model-resolution vectors (TE18 R7.1.4.4/.5, re-anchored by TE39 at v0.70 `model-resolution.ts`)** |
 | `args-golden-v048.json` | The frozen argv/env golden file ([RPI-OWN]; covers only the 9 cases of fixtures.json; `--record-args-golden` re-records only the non-inline cases) |
 | `expected-target-diffs.json` | The regression-track difference attribution list (historical, emptied by TE14) |
-| `expected-target-diffs-v070.json` | The v0.1.5 target-track attribution manifest (TE37 seed, empty by design; TE38/TE39 append) |
-| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (live submodule = regression; v0.70 snapshot = target); args via the golden file on both tracks; fallback/model re-anchored at v0.70 `model-resolution.ts` (TE39 followed the #2270 removal) |
-| `setup-target-source.sh` | Extracts the v0.70 snapshot out-of-repo + installs its prod dependencies (zero writes to external/) |
+| `expected-target-diffs-v074.json` | The v0.1.6 target-track attribution manifest (TE45 seed, empty by design) |
+| `expected-target-diffs-v070.json` | The v0.1.5 target-track attribution manifest (TE37 seed; closed empty by TE38/TE39; historical) |
+| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (v0.74 snapshot = target; v0.70 snapshot = regression); args via the golden file on both tracks; fallback/model anchored at the target's `model-resolution.ts` (TE39 followed the #2270 removal; TE45 re-anchored the `scoped` token + provider-prefixed id work) |
+| `setup-target-source.sh` | Extracts the v0.74 target snapshot out-of-repo + installs its prod dependencies (zero writes to external/) |
 | `examples/subagents_parity_runner.rs` | Drives this crate with the same fixtures (parity facade, `lib.rs::parity`); built by the orchestrator and executed from a private copy |
 | `run-parity.mjs` | Orchestration + normalized diff + attribution + report writing; fixture materialization and the Rust binary copy land in out-of-repo temp directories |
 
@@ -184,8 +185,32 @@ track keeps the historical, emptied `expected-target-diffs.json`), or the report
 - `src/runs/shared/pi-args.ts` stays absent (deleted v0.65) — the argv/env face remains the frozen
   v0.48 golden ([RPI-OWN], ADR-0025 §4).
 - Unchanged faces at v0.70 (verified): `src/agents/frontmatter.ts` (`parseFrontmatter`),
-  `src/shared/utils.ts` (`getFinalOutput`), `src/agents/agents.ts` (`discoverAgents`),
-  `src/runs/background/notify.ts` (`formatSingleCompletion` / `parseSubagentNotifyContent`).
+  `src/shared/utils.ts` (`getFinalOutput`); `src/agents/agents.ts` and
+  `src/runs/background/notify.ts` were unchanged at v0.70 but changed by v0.74 (below).
+
+## v0.74 skeleton facts (TE45 close reads, ADR-0034)
+
+- `src/agents/frontmatter.ts` and `src/shared/utils.ts` are **byte-identical** v0.70→v0.74
+  (`git diff b72714de b6bda32f -- <file>` empty) — the frontmatter/final-output legs are unaffected.
+- `src/agents/agents.ts` changed (advertise through `agentOverrides` #2534, runtime-agent settings
+  #2369, the `globalNpmRoot` option for non-blocking startup discovery #2477, `completionGuard`
+  removal #2356) — the discovery fixture compares name/source/path items only and the user-scope
+  `discoverAgents` path it drives is unchanged.
+- `src/runs/background/notify.ts` gained an optional `revival` child line and an internal
+  completion-send dedupe registry (#2543-adjacent fixes); the `formatSingleCompletion` /
+  `parseSubagentNotifyContent` shapes the notify leg drives are unchanged.
+- `src/runs/shared/model-resolution.ts` / `model-scope.ts` gained the `scoped` model-scope token
+  and the provider-prefixed id fallback (#2491/#2538) — **implemented in rpi (TE45 W1/W2)** and
+  covered by new target-track parity cases; the model leg runs against the target's
+  `model-resolution.ts` on both tracks.
+- `src/runs/shared/git-environment.ts` is new (#2440, strip Git routing env) — rpi implements the
+  same filter in the child spawn env (TE45 W4); the face is not part of the argv golden
+  (the golden records the v0.48 argv/env contract, and the filter applies to the spawned process
+  environment, not to `buildPiArgs` output).
+- `src/extension/(agentOverrides|schemas)/…`, `child-session.ts`, `child-tool-plan.ts`, and the
+  `mcp-*` family carry the v0.74 faces owned by the MCP/adapter rebase (TE46: MCP direct tool
+  resolution, builtin-MCP priority, config hash) — registered in the TE45 four-tuple as
+  [DEFER→TE46] so TE45's parity scope stays on the faces it can drive.
 
 ## v0.66 shared-surface changes (target-track close reads, ADR-0025 appendix D)
 
