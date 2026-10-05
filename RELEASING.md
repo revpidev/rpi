@@ -36,7 +36,7 @@ V14-19 (an rpi-native requirement with no upstream counterpart; design in the rp
 - `<stable>-rc.<N>` (e.g. `0.1.5-rc.1`), tag `v0.1.5-rc.1`; the baseline must be the **candidate target version** (`0.1.5-rc.1` is a candidate for 0.1.5, not a suffix of 0.1.4);
 - lowercase `rc`, dotted numeric fields (`rc.10 > rc.9`; without the dot, `rc10` sorts wrong under ASCII ordering); N starts at 1, increases monotonically, and is never reused;
 - SemVer mandates apply: numeric identifiers must not have leading zeros (`rc.01` is invalid);
-- the workspace version and the four lockstep extensions bump together (`version.workspace = true` propagates naturally).
+- the workspace version and the lockstep extensions bump together (`version.workspace = true` propagates naturally).
 
 ### Release sequence (isomorphic to stable; the ordering constraint applies equally to the RC endpoint)
 
