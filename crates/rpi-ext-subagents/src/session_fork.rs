@@ -63,7 +63,9 @@ fn sanitize_unsafe_thinking_blocks(entries: &mut [Value]) -> bool {
     // message entries, or the `targetId`-resolved message for `context_edit`.
     let mut entry_ids: BTreeMap<&str, usize> = BTreeMap::new();
     for (index, entry) in entries.iter().enumerate() {
-        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+        if let Some(id) = entry.get("id").and_then(Value::as_str)
+            && !id.is_empty()
+        {
             entry_ids.insert(id, index);
         }
     }
@@ -153,10 +155,14 @@ fn is_unsafe_anthropic_thinking_block(
     if !is_anthropic {
         return false;
     }
-    let signature = block
-        .get("thinkingSignature")
-        .or_else(|| block.get("signature"))
-        .and_then(Value::as_str);
+    // Upstream precedence (`"thinkingSignature" in record ? … : record.signature`
+    // + the `typeof signature === "string"` gate): a present-but-non-string
+    // `thinkingSignature` suppresses the `signature` fallback entirely.
+    let signature = if block.get("thinkingSignature").is_some() {
+        block.get("thinkingSignature").and_then(Value::as_str)
+    } else {
+        block.get("signature").and_then(Value::as_str)
+    };
     block.get("redacted") == Some(&Value::Bool(true)) || signature.is_some_and(|s| !s.is_empty())
 }
 
@@ -474,6 +480,60 @@ mod tests {
             1
         );
         // Idempotent: a second pass finds nothing to remove.
+        assert!(!sanitize_unsafe_thinking_blocks(&mut entries));
+    }
+
+    #[test]
+    fn context_edit_edge_shapes_are_safe() {
+        // Review N5: malformed/edge edits must not panic and must not be
+        // touched when they have no resolvable assistant target.
+        let mut entries = vec![
+            serde_json::json!({
+                "type": "message", "id": "m1",
+                "message": {"role": "assistant", "provider": "anthropic", "content": [
+                    {"type": "thinking", "thinking": "h", "signature": "sig"}
+                ]}
+            }),
+            // ① Unknown targetId.
+            serde_json::json!({
+                "type": "context_edit", "id": "e3", "targetId": "missing",
+                "replacement": {"content": [{"type": "redacted_thinking", "data": "x"}]}
+            }),
+            // ② Missing targetId.
+            serde_json::json!({
+                "type": "context_edit", "id": "e4",
+                "replacement": {"content": [{"type": "redacted_thinking", "data": "x"}]}
+            }),
+            // ③ null replacement.
+            serde_json::json!({"type": "context_edit", "id": "e5", "targetId": "m1", "replacement": null}),
+            // ④ String replacement content (ContextEditableContent::Text).
+            serde_json::json!({
+                "type": "context_edit", "id": "e6", "targetId": "m1",
+                "replacement": {"content": "plain string"}
+            }),
+        ];
+        // Only the m1 message block is removable; the edge edits stay as-is.
+        assert!(sanitize_unsafe_thinking_blocks(&mut entries));
+        assert_eq!(
+            entries[0]["message"]["content"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(
+            entries[1]["replacement"]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            entries[2]["replacement"]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(entries[3]["replacement"].is_null());
+        assert_eq!(entries[4]["replacement"]["content"], "plain string");
         assert!(!sanitize_unsafe_thinking_blocks(&mut entries));
     }
 
