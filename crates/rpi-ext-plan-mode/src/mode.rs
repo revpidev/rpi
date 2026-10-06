@@ -59,6 +59,11 @@ pub struct SessionPlanState {
     /// write (or after a new Plan entry). Kept across exit so `/plan file`
     /// can report the last plan.
     pub plan_path: Option<PathBuf>,
+    /// Whether the user was already warned that leaving Plan mode could not
+    /// restore the boundary (or the active snapshot was unavailable); the
+    /// warning fires once per entry so a persistent host outage does not
+    /// re-notify on every event (round-2 review note).
+    pub exit_cleanup_notified: bool,
 }
 
 static STATES: OnceLock<Mutex<HashMap<String, SessionPlanState>>> = OnceLock::new();
@@ -132,6 +137,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
             // entry overwrite it); session events reset it the same way.
             state.plan_path = None;
             state.hint_shown = false;
+            state.exit_cleanup_notified = false;
         }
         let newly = whitelist::newly_hidden(&tools, &config);
         if !entering {
@@ -233,18 +239,34 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
             tracing::warn!(
                 "rpi-plan-mode: no active-set snapshot was captured on entry; keeping the active set"
             );
+            state.exit_cleanup_notified = true;
+            let _ = host.call(
+                "ui.notify",
+                json!({
+                    "message": i18n::ACTIVE_SET_NOT_RESTORED,
+                    "notifyType": "warning",
+                }),
+            );
         }
         if cleanup_failed {
             // Keep the mirror state so the next event retries the release
             // instead of leaking the hidden overrides for the rest of the
-            // session (v0.1.6 review round 2, O6), and tell the user.
-            let _ = host.call(
-                "ui.notify",
-                json!({
-                    "message": i18n::EXIT_CLEANUP_FAILED,
-                    "notifyType": "warning",
-                }),
-            );
+            // session (v0.1.6 review round 2, O6), and tell the user once
+            // per Plan entry (a persistent outage would otherwise re-notify
+            // on every before_agent_start; round-2 review note).
+            if !state.exit_cleanup_notified {
+                let _ = host.call(
+                    "ui.notify",
+                    json!({
+                        "message": i18n::EXIT_CLEANUP_FAILED,
+                        "notifyType": "warning",
+                    }),
+                );
+                state.exit_cleanup_notified = true;
+            }
+            // Persist the notification latch while keeping the boundary
+            // state untouched for the retry.
+            commit(&session, state);
             return false;
         }
         if state.hint_shown && crate::host::has_ui(host) {
@@ -262,6 +284,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
         state.hidden_targets.clear();
         state.entry_known.clear();
         state.hint_shown = false;
+        state.exit_cleanup_notified = false;
         // `plan_path` deliberately survives: `/plan file` reports the last
         // plan after exit, and a new Plan entry resets it.
         commit(&session, state);
@@ -735,6 +758,14 @@ mod tests {
             vec!["read", "write_plan"],
             "without a snapshot the active set is left as-is"
         );
+        assert!(
+            host.view()
+                .notifications
+                .iter()
+                .any(|message| message.contains("could not be restored")),
+            "the degraded exit must warn: {:?}",
+            host.view().notifications
+        );
     }
 
     /// Round-2 O6: an exit whose cleanup fails keeps the mirror state,
@@ -766,6 +797,15 @@ mod tests {
                 .map(|(_, exposure)| exposure.as_str()),
             Some("hidden"),
             "the boundary is still applied until the retry succeeds"
+        );
+        // A second failure retries but does not re-notify (one warning per
+        // Plan entry; round-2 review note).
+        let notifications_after_first = host.view().notifications.len();
+        assert!(!reconcile(&host));
+        assert_eq!(
+            host.view().notifications.len(),
+            notifications_after_first,
+            "a persistent outage must not re-notify on every event"
         );
         // Recovery: the retry releases the boundary and clears the state.
         host.clear_failed_methods();

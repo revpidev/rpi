@@ -36,6 +36,10 @@ pub const NON_INTERACTIVE_NOTE: &str = "plan mode is only available in interacti
 /// mirror state is kept so the next event retries.
 pub const EXIT_CLEANUP_FAILED: &str = "plan mode is off, but some tool restrictions could not be restored; the cleanup will be retried";
 
+/// Warning when the entry active-set snapshot is unavailable on exit: the
+/// boundary is released, but the pre-plan active set cannot be restored.
+pub const ACTIVE_SET_NOT_RESTORED: &str = "plan mode is off, but the pre-plan active tool set could not be restored; the active set stays at its plan-mode value";
+
 /// External-editor fallback title (`ui.editor` after `ui.editExternal`).
 pub const EDIT_PLAN_TITLE: &str = "Edit the plan";
 
