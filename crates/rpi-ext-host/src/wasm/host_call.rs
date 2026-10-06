@@ -344,6 +344,15 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         let execute_guard = execute_guard.clone();
                         Box::pin(async move {
                             if execute_guard.is_active() {
+                                // Deliberately conservative (round-2 review):
+                                // the guard is per-extension, so every tool
+                                // of an extension blocked in a synchronous
+                                // host call fails closed, including a
+                                // dispatch from an independent caller that
+                                // could not deadlock. The alternative —
+                                // answering some callers while the guest
+                                // thread is blocked — cannot be
+                                // distinguished safely at this layer.
                                 return Err(format!(
                                     "tool \"{tool_name}\" cannot run while its extension is blocked in a host call"
                                 ));
