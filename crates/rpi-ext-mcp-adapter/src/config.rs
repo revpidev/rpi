@@ -798,6 +798,7 @@ pub fn get_shared_config_path(target: &str, cwd: &Path) -> Option<PathBuf> {
 /// crash never truncates the config.
 pub fn write_config_text(write_path: &Path, text: &str) -> Result<(), crate::error::AdapterError> {
     let mut write_path = write_path.to_path_buf();
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut mode: Option<u32> = None;
     if let Ok(resolved) = std::fs::canonicalize(&write_path) {
         if let Ok(metadata) = std::fs::metadata(&resolved) {

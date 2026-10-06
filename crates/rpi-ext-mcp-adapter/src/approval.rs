@@ -59,7 +59,7 @@ pub enum ToolCallApprovalResult {
 
 /// A handler that decides tool approval. The broker role mirrors the
 /// upstream `pi-mcp-adapter:tool-approval-request` claim handler; the UI role
-/// mirrors the built-in three-choice dialog (`ui.select`). In headless mode
+/// mirrors the built-in four-choice dialog (`ui.select`). In headless mode
 /// both are absent so [`ensure_tool_call_approved`] returns fail-closed.
 pub trait ApprovalHandler: Send + Sync {
     fn decide(
