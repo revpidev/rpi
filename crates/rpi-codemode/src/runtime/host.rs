@@ -192,7 +192,14 @@ impl CodemodeSandbox {
             token.cancel();
         }
         loop {
+            // Register the waiter before re-checking the running set
+            // (v0.1.6 review round 2, O1): `Notified` joins the wait queue
+            // only on its first poll, so the old check→await order could
+            // miss the last `notify_waiters` (which stores no permit) in
+            // the window between the check and the await and wait forever.
             let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if lock(&self.running).is_empty() {
                 break;
             }
@@ -621,7 +628,12 @@ fn parse_deep_value(text: &str) -> Result<Value, serde_json::Error> {
     }
     let mut deserializer = serde_json::Deserializer::from_str(text);
     deserializer.disable_recursion_limit();
-    serde::Deserialize::deserialize(&mut deserializer)
+    let value = serde::Deserialize::deserialize(&mut deserializer)?;
+    // The recursion limit was disabled for this deserializer; `end()` still
+    // enforces a single complete document so trailing garbage is rejected
+    // (round-2).
+    deserializer.end()?;
+    Ok(value)
 }
 
 /// `handleDone` error branch (host.ts:201-208): `{name?, message, stack?}`.
@@ -835,6 +847,13 @@ mod tests {
     /// v0.1.6 review P3: two concurrent `close()` callers must both return
     /// once the in-flight execution settles (`notify_one` left one of them
     /// waiting forever).
+    ///
+    /// Round-2 review O1 fixed the companion missed-wakeup window
+    /// (`Notified` only registers on its first poll, so close() now pins
+    /// and enables the waiter before re-checking `running`). That window is
+    /// an instruction-level multi-thread preemption between the check and
+    /// the await; it cannot be opened deterministically from a test, so
+    /// this test does not claim to cover it.
     #[tokio::test]
     async fn concurrent_close_callers_both_return() {
         let (called_tx, mut called_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -872,6 +891,17 @@ mod tests {
         .await
         .expect("both close callers must return");
         let _ = running.await.expect("join");
+    }
+
+    /// Round-2: the depth-disabled deserializer still requires one complete
+    /// JSON document; trailing garbage must be rejected.
+    #[test]
+    fn parse_deep_value_rejects_trailing_garbage() {
+        assert!(parse_deep_value("{\"ok\":true} trailing").is_err());
+        assert!(parse_deep_value("1 2").is_err());
+        assert!(parse_deep_value("[1,2] extra").is_err());
+        assert!(parse_deep_value("{\"ok\":true}").is_ok());
+        assert!(parse_deep_value("[1,2]").is_ok());
     }
 
     /// v0.1.6 review P3: deep store values survive the default 128-level
