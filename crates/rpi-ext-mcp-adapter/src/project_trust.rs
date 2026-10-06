@@ -291,6 +291,7 @@ fn save_approval(path: &Path, record: ApprovalRecord) {
     }))
     .unwrap_or_else(|_| "{}".to_string());
     if let Some(parent) = path.parent() {
+        #[cfg(unix)]
         let existed = parent.exists();
         let _ = std::fs::create_dir_all(parent);
         // Only tighten a directory this code created: forcing 0700 on every
@@ -326,6 +327,8 @@ fn sync_parent_dir(path: &Path) {
     {
         let _ = dir.sync_all();
     }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Create `temp` exclusively and write the full payload before the caller

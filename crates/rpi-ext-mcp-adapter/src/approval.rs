@@ -459,8 +459,13 @@ where
                 return ToolCallApprovalResult::Ok;
             }
             ApprovalDecision::AllowServerForSession => {
-                cache.grant_server(server_name);
-                return ToolCallApprovalResult::Ok;
+                // Upstream's broker contract has four decisions
+                // (`allow_once|allow_for_session|deny|abstain`); a server-wide
+                // value is not part of it and an unknown broker value counts
+                // as deny. Fail closed instead of granting a whole server
+                // from a broker that cannot express that choice (round-2
+                // review note).
+                return ToolCallApprovalResult::Denied;
             }
             ApprovalDecision::Deny => return ToolCallApprovalResult::Denied,
             ApprovalDecision::Abstain => {}
@@ -1278,6 +1283,34 @@ mod tests {
                 no_context,
             ),
             ToolCallApprovalResult::Ok
+        );
+    }
+
+    /// Round-2 note: a broker returning the UI-only server-wide value fails
+    /// closed (upstream's broker contract has four values and unknown values
+    /// count as deny) instead of granting a whole server.
+    #[test]
+    fn broker_server_scope_value_fails_closed() {
+        let config = config_with_approval(Some(json!(true)));
+        let cache = ApprovalCache::new();
+        let broker = FixedHandler(ApprovalDecision::AllowServerForSession);
+        assert_eq!(
+            ensure_tool_call_approved(
+                &config,
+                &cache,
+                "demo",
+                &tool(),
+                &json!({"query": "x"}),
+                ApprovalOrigin::Proxy,
+                Some(&broker),
+                None,
+                no_context,
+            ),
+            ToolCallApprovalResult::Denied
+        );
+        assert!(
+            !cache.is_server_approved("demo"),
+            "a broker must not create a server-wide grant"
         );
     }
 
