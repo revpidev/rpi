@@ -102,6 +102,15 @@ impl<T> CallbackState<T> {
             self.settle.send_replace(Some(outcome));
         }
     }
+
+    /// Claim the one allowed callback. `swap` publishes and reads the
+    /// previous value atomically; the old `load` guard + `store` pair let
+    /// two concurrent callbacks both proceed to the token exchange
+    /// (v0.1.6 review P2-1). The atomicity is pinned by the
+    /// `claim_is_atomic_under_concurrency` unit test.
+    fn try_claim(&self) -> bool {
+        !self.claimed.swap(true, Ordering::SeqCst)
+    }
 }
 
 /// First occurrence of each query parameter (mirrors `URLSearchParams.get`).
@@ -182,7 +191,7 @@ async fn handle_callback<T: Clone + Send + Sync + 'static>(
     // Claim the callback atomically (v0.1.6 review P2-1): a load-then-store
     // check let two concurrent callbacks with the same code both proceed to
     // the token exchange.
-    if state.claimed.swap(true, Ordering::SeqCst) {
+    if !state.try_claim() {
         return callback_response(
             StatusCode::CONFLICT,
             oauth_error_html("This sign-in has already been handled.", None),
@@ -540,9 +549,12 @@ mod tests {
         server.close().await;
     }
 
-    /// v0.1.6 review P2-1: two concurrent callbacks carrying the same code
-    /// must not both run the token exchange.
-    #[tokio::test]
+    /// v0.1.6 review P2-1: concurrent callbacks carrying the same code
+    /// must not both run the token exchange. A multi-thread runtime plus a
+    /// burst makes the old load-then-store check race in practice; the
+    /// claim primitive itself is pinned deterministically by
+    /// `claim_is_atomic_under_concurrency`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_callbacks_exchange_the_code_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
@@ -570,12 +582,22 @@ mod tests {
         .expect("bind");
         let base = format!("http://{}", server.local_addr());
         let url = format!("{base}/callback?code=the-code&state=expected");
-        let (first, second) = tokio::join!(reqwest::get(&url), reqwest::get(&url));
-        let first = first.expect("first response");
-        let second = second.expect("second response");
-        let statuses = [first.status(), second.status()];
-        assert!(statuses.contains(&StatusCode::OK), "{statuses:?}");
-        assert!(statuses.contains(&StatusCode::CONFLICT), "{statuses:?}");
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            tasks.push(tokio::spawn(reqwest::get(url.clone())));
+        }
+        let mut ok = 0usize;
+        let mut conflict = 0usize;
+        for task in tasks {
+            let response = task.await.expect("join").expect("response");
+            match response.status() {
+                StatusCode::OK => ok += 1,
+                StatusCode::CONFLICT => conflict += 1,
+                other => panic!("unexpected callback status {other}"),
+            }
+        }
+        assert_eq!(ok, 1, "exactly one callback wins");
+        assert_eq!(conflict, 7, "every other callback is rejected as claimed");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1043,5 +1065,52 @@ mod tests {
         }
 
         fn notify(&self, _event: AuthEvent) {}
+    }
+
+    /// A minimal `CallbackState` for the claim primitive test.
+    fn claim_test_state() -> Arc<CallbackState<()>> {
+        let (settle, _receiver) = watch::channel(None);
+        Arc::new(CallbackState {
+            provider_name: "Test".to_owned(),
+            expected_state: None,
+            complete: Arc::new(|_code: String| Box::pin(async { Ok(()) })),
+            path: "/callback".to_owned(),
+            settle,
+            settled: AtomicBool::new(false),
+            claimed: AtomicBool::new(false),
+        })
+    }
+
+    /// The claim is a single atomic swap: exactly one racer may win. The
+    /// old load-guard + store shape admitted several winners under a
+    /// barrier release, which is what let two callbacks exchange the code
+    /// twice.
+    #[test]
+    fn claim_is_atomic_under_concurrency() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+        const RACERS: usize = 32;
+        for round in 0..128 {
+            let state = claim_test_state();
+            let barrier = Arc::new(Barrier::new(RACERS));
+            let winners = Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..RACERS {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                let winners = winners.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    if state.try_claim() {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("racer thread");
+            }
+            assert_eq!(winners.load(Ordering::SeqCst), 1, "round {round}");
+            assert!(state.claimed.load(Ordering::SeqCst));
+        }
     }
 }
