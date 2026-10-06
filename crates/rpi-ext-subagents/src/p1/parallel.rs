@@ -434,6 +434,20 @@ pub fn validate_output_collisions(claims: &[OutputClaim]) -> Result<(), String> 
     ))
 }
 
+/// Reject unknown task agents before any dispatch-side side effect
+/// (v0.1.6 review round 2, B1): the dispatch paths call this before budget
+/// reservation and run-directory creation, and `run_parallel_async` runs it
+/// before it acquires a global permit, so a misspelled later task cannot
+/// let the earlier tasks start.
+pub fn validate_task_agents(entries: &[TaskEntry], agents: &[AgentConfig]) -> Result<(), String> {
+    entries.iter().try_for_each(|entry| {
+        match discover::resolve_agent_name(agents, &entry.spec.agent_name)? {
+            Some(_) => Ok(()),
+            None => Err(format!("Unknown agent: {}", entry.spec.agent_name)),
+        }
+    })
+}
+
 /// Sink receiving `(submission index, event)`. The async runner mirrors
 /// these into the run status document as they happen so `subagent_wait`
 /// shows live per-child states instead of a batch-long `queued`.
@@ -475,6 +489,10 @@ pub async fn run_parallel_async(
     on_step: Option<ParallelStepSink>,
     control_probe: Option<RunControlProbe>,
 ) -> Result<Vec<ParallelTaskOutcome>, String> {
+    // Upstream canonicalizes every task agent up front; this is the
+    // defense-in-depth twin of the dispatch-side preflight (the permit and
+    // the first `Started` event follow).
+    validate_task_agents(entries, agents)?;
     let concurrency = concurrency.max(1);
     // rpi#30: the run-wide global child cap (upstream per-run Semaphore,
     // subagent-runner.ts:1932 + parallel-utils.ts:167-226): every child
@@ -957,6 +975,28 @@ mod tests {
         let entries = parse_tasks(&many, 8).unwrap();
         assert_eq!(entries[0].key, "task-0");
         assert_eq!(entries[2].key, "task-2");
+    }
+
+    #[test]
+    fn task_agents_validate_before_any_launch() {
+        // B1: the batch preflight rejects a misspelled later task; the
+        // per-entry skip in `launch_one` stays as defense in depth.
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let entries = parse_tasks(
+            &json!([
+                {"key": "a", "agent": "scout", "task": "scan"},
+                {"key": "b", "agent": "scoutt", "task": "ship"},
+            ]),
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_task_agents(&entries, &agents).unwrap_err(),
+            "Unknown agent: scoutt"
+        );
+        let entries =
+            parse_tasks(&json!([{"key": "a", "agent": "scout", "task": "scan"}]), 8).unwrap();
+        assert!(validate_task_agents(&entries, &agents).is_ok());
     }
 
     #[test]

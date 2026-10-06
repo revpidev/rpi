@@ -194,6 +194,64 @@ fn tool_surface_integration() {
     assert_eq!(result["details"]["mode"], "single");
     assert_eq!(result["details"]["timeoutMs"], json!(2000));
 
+    // Round-2 review B1/B2: every task/step agent resolves before any
+    // dispatch-side side effect, in both the foreground and the async
+    // paths — a misspelled later name is an immediate tool error with no
+    // receipt and no chain directory.
+    let chain_root = dir.join("proj/.rpi/subagents/chain-runs");
+    let chain_dirs_before = std::fs::read_dir(&chain_root)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    for params in [
+        json!({
+            "tasks": [
+                {"agent": "scout", "task": "t"},
+                {"agent": "nonexistent", "task": "t"}
+            ]
+        }),
+        json!({
+            "tasks": [
+                {"agent": "scout", "task": "t"},
+                {"agent": "nonexistent", "task": "t"}
+            ],
+            "async": true
+        }),
+        json!({
+            "steps": [
+                {"agent": "scout", "task": "t"},
+                {"agent": "nonexistent", "task": "t"}
+            ]
+        }),
+        json!({
+            "steps": [
+                {"agent": "scout", "task": "t"},
+                {"agent": "nonexistent", "task": "t"}
+            ],
+            "async": true
+        }),
+    ] {
+        let result = execute(params.clone());
+        assert_eq!(result["isError"], Value::Bool(true), "{params}: {result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown agent: nonexistent"),
+            "{params}: {result}"
+        );
+        assert!(
+            result["details"]["statusFile"].is_null(),
+            "{params}: a failed preflight must not return a run receipt: {result}"
+        );
+    }
+    let chain_dirs_after = std::fs::read_dir(&chain_root)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        chain_dirs_before, chain_dirs_after,
+        "a failed step preflight must not create a chain directory"
+    );
+
     // subagent_wait nonBlocking: the receipt must carry `details` — the
     // host deserializes every tool result into AgentToolResult, where a
     // missing details used to fail the whole execution with

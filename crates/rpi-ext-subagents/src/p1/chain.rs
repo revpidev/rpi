@@ -456,6 +456,15 @@ fn resolve_step_agents<'a>(
         .collect()
 }
 
+/// Reject unknown step agents before any dispatch-side side effect
+/// (v0.1.6 review round 2, B1/B2): the dispatch paths call this before
+/// budget reservation and run-directory creation, and `run_chain_async`
+/// runs its own resolution first so a direct call cannot create the chain
+/// directory for a chain that cannot start.
+pub fn validate_step_agents(steps: &[StepSpec], agents: &[AgentConfig]) -> Result<(), String> {
+    resolve_step_agents(steps, agents).map(|_| ())
+}
+
 /// Async core (see [`run_chain`]) — direct call from runtime tasks.
 pub async fn run_chain_async(
     steps: &[StepSpec],
@@ -463,6 +472,10 @@ pub async fn run_chain_async(
     ctx: &RunCtx,
     original_task: &str,
 ) -> Result<(Vec<StepOutcome>, Option<StepOutcome>), String> {
+    // #2507 (TE45) + v0.1.6 review round 2 (B2): resolve every step's
+    // literal agent name before the chain directory (and its progress file)
+    // is created — a misspelled name must have no side effects at all.
+    let resolved_step_agents = resolve_step_agents(steps, agents)?;
     let chain_dir = create_chain_dir(ctx);
     let progress_requested = steps.iter().any(|s| s.progress);
     if progress_requested {
@@ -478,10 +491,6 @@ pub async fn run_chain_async(
     // chainAgents (types.ts:1052): the declared step agent list.
     let chain_agents: Vec<String> = steps.iter().map(|step| step.agent_name.clone()).collect();
     let total_steps = steps.len();
-    // #2507 (TE45): resolve every step's literal agent name before the first
-    // child launches — a misspelled name in a later step must not run the
-    // earlier steps first.
-    let resolved_step_agents = resolve_step_agents(steps, agents)?;
     let mut completed: Vec<StepOutcome> = Vec::new();
     let mut previous_output: Option<String> = None;
     let mut first_progress_seen = false;
@@ -766,6 +775,18 @@ mod tests {
         .unwrap();
         let error = resolve_step_agents(&steps, &agents).unwrap_err();
         assert_eq!(error, "Unknown agent: workr");
+        assert_eq!(
+            validate_step_agents(&steps, &agents).unwrap_err(),
+            "Unknown agent: workr",
+            "the dispatch-side preflight sees the same miss"
+        );
+        // A valid chain preflights clean; aliases still pass.
+        let steps = parse_steps(&json!([
+            {"agent": "scout", "task": "scan"},
+            {"agent": "advisor", "task": "review"}
+        ]))
+        .unwrap();
+        assert!(validate_step_agents(&steps, &agents).is_ok());
         // Valid chains resolve in order; aliases map to canonical names.
         let steps = parse_steps(&json!([
             {"agent": "scout", "task": "scan"},
@@ -776,5 +797,65 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "scout");
         assert_eq!(resolved[1].name, "oracle");
+    }
+
+    /// B2: `run_chain_async` resolves every step agent before it creates
+    /// the chain directory, so a misspelled later step has no side effects
+    /// (the old order left `.rpi/subagents/chain-runs/<run_id>` behind).
+    #[test]
+    fn unknown_later_step_creates_no_chain_dir() {
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let steps = parse_steps(&json!([
+            {"agent": "scout", "task": "scan"},
+            {"agent": "workr", "task": "ship"}
+        ]))
+        .unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "rpi-chain-preflight-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: base.clone(),
+            parent_session: None,
+            parent_session_file: None,
+            parent_session_id: None,
+            parent_model: None,
+            project_trusted: None,
+            registry: Vec::new(),
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "preflight1".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: None,
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: None,
+            artifacts_dir: None,
+            session_root: base.join("sessions"),
+            frame_sink: None,
+            step_status: None,
+            abort_probe: None,
+            detach_ctx: None,
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let error = runtime
+            .block_on(run_chain_async(&steps, &agents, &ctx, "task"))
+            .expect_err("unknown agent must fail the chain");
+        assert_eq!(error, "Unknown agent: workr");
+        let chain_dir = project_chain_runs_dir(&base).join(&ctx.run_id);
+        assert!(
+            !chain_dir.exists(),
+            "failed preflight left {}",
+            chain_dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

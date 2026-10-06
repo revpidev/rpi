@@ -717,6 +717,12 @@ fn dispatch_tasks(
         Ok(entries) => entries,
         Err(error) => return ToolOutcome::error(error),
     };
+    // Upstream canonicalizes every task agent before any execution
+    // (`canonicalizeExecutionParams`): a typo in a later task must not let
+    // the earlier tasks start (v0.1.6 review round 2, B1).
+    if let Err(error) = crate::p1::parallel::validate_task_agents(&entries, agents) {
+        return ToolOutcome::error(error);
+    }
     // R7.1.6.3: reject explicit output collisions before any spawn.
     if let Err(error) =
         crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries, agents))
@@ -782,6 +788,12 @@ fn dispatch_steps(
         Ok(steps) => steps,
         Err(error) => return ToolOutcome::error(error),
     };
+    // Upstream canonicalizes every step agent before any execution: a typo
+    // in a later step must not run the earlier steps first (v0.1.6 review
+    // round 2, B2).
+    if let Err(error) = crate::p1::chain::validate_step_agents(&steps, agents) {
+        return ToolOutcome::error(error);
+    }
     // R7.1.6.3: reject explicit output collisions before any spawn.
     if let Err(error) =
         crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps, agents))
@@ -867,6 +879,13 @@ fn dispatch_async(
             Ok(entries) => entries,
             Err(error) => return ToolOutcome::error(error),
         };
+        // Upstream canonicalizes every task agent before the receipt is
+        // returned (v0.1.6 review round 2, B1/B2): the async path must not
+        // consume the spawn budget, create a run directory, or answer
+        // "started" for a batch that cannot launch.
+        if let Err(error) = crate::p1::parallel::validate_task_agents(&entries, agents) {
+            return ToolOutcome::error(error);
+        }
         // R7.1.6.3: fail closed before the receipt is returned.
         if let Err(error) =
             crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries, agents))
@@ -891,6 +910,11 @@ fn dispatch_async(
             Ok(steps) => steps,
             Err(error) => return ToolOutcome::error(error),
         };
+        // Upstream canonicalizes every step agent before the receipt is
+        // returned (v0.1.6 review round 2, B1/B2).
+        if let Err(error) = crate::p1::chain::validate_step_agents(&steps, agents) {
+            return ToolOutcome::error(error);
+        }
         // R7.1.6.3: fail closed before the receipt is returned.
         if let Err(error) =
             crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps, agents))
