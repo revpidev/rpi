@@ -197,6 +197,12 @@ fn worker_loop(
 }
 
 /// The refresh decision + pipeline (pure of threads; testable).
+///
+/// `force` bypasses the framework's 60s cache; production dispatch never
+/// sets it — the `/usage` command forces its direct `ctx.usage.fetch`
+/// calls and then refreshes from the cache, and the event triggers keep the
+/// cache. The parameter stays for the tests and a future manual bypass
+/// (round-2 review note).
 pub fn refresh(
     host: &dyn HostCall,
     config: &config::UsageConfig,
