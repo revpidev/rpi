@@ -1027,10 +1027,12 @@ fn create_compaction_summary_message(summary: &str, tokens_before: u64) -> Agent
 }
 
 /// Convert a `ToolResultMessage` into the loose result state the component
-/// renders (tool-execution.ts `updateResult` input shape).
+/// renders (tool-execution.ts `updateResult` input shape). The error flag is
+/// read from the message: a caller-supplied constant made the transcript
+/// rebuild render persisted failures as successes (v0.1.6 review round-2
+/// blocker).
 fn tool_result_state_from_message(
     tool_result: &rpi_ai::types::ToolResultMessage,
-    is_error: bool,
 ) -> ToolResultState {
     ToolResultState {
         content: tool_result
@@ -1043,7 +1045,7 @@ fn tool_result_state_from_message(
                 }
             })
             .collect(),
-        is_error,
+        is_error: tool_result.is_error,
         details: tool_result.details.clone(),
     }
 }
@@ -4043,10 +4045,8 @@ impl InteractiveUi {
                     if let Some(component) =
                         rendered_pending_tools.remove(&tool_result.tool_call_id)
                     {
-                        lock(&component).update_result(
-                            tool_result_state_from_message(tool_result, false),
-                            false,
-                        );
+                        lock(&component)
+                            .update_result(tool_result_state_from_message(tool_result), false);
                     }
                 } else {
                     self.add_message_to_chat(message.clone(), options.populate_history);
@@ -11013,5 +11013,30 @@ mod tests {
         mode.show_startup_diagnostics();
         let after = chat_children(&mode.ui_state);
         assert_eq!(after, before + 1, "warning appended to the transcript");
+    }
+
+    /// Round-2 blocker: the transcript rebuild must carry the persisted
+    /// `isError` into the render state (it used to hard-code false, so
+    /// errored cards re-rendered as successes after resume/rebuild).
+    #[test]
+    fn tool_result_state_from_message_carries_the_error_flag() {
+        let message = |is_error: bool| rpi_ai::types::ToolResultMessage {
+            role: rpi_ai::types::ToolResultRole::ToolResult,
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "subagent".to_owned(),
+            content: Vec::new(),
+            details: Some(serde_json::json!({"mode": "parallel", "results": []})),
+            usage: None,
+            nested_calls: None,
+            is_error,
+            timestamp: 0,
+        };
+        assert!(!tool_result_state_from_message(&message(false)).is_error);
+        let failed = tool_result_state_from_message(&message(true));
+        assert!(
+            failed.is_error,
+            "a persisted error must rebuild as an error card"
+        );
+        assert_eq!(failed.details.as_ref().unwrap()["mode"], "parallel");
     }
 }
