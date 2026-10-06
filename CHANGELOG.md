@@ -18,10 +18,20 @@
 - **Rebased**: `rpi-subagents` → pi-subagents v0.74.0 (TE45 — `scoped` model scope, provider-prefixed catalog id resolution, the timeout cap, Git routing environment stripping, project-trust propagation, chain step pre-resolution, and fork `context_edit` thinking sanitization); `rpi-mcp-adapter` → v4.0.0 (TE46 — now an **optional replacement for the built-in MCP extension**, sharing the same `mcp.json` layout with the project trust/approval gate and the RFC 8252 OAuth callback default).
 - **Distribution**: eight `.rpix` archives ride this Release (native carrier only, `minHostVersion` = the lockstep version injected at pack time); the two new plugins first ship on the RC channel, while the renamed six keep their historical version matrices under the new keys.
 
+### RC review hardening (rounds 1–2)
+
+- Two full pre-stable review rounds on the rc.1 surface landed as revert-red fixes (per-domain detail and the per-fix regression notes in `changes/v0.1.6.md`): codemode output capped at 16 MiB with an explicit notice, cancel/Esc settling scripts that never settle and timeout-killing scripts that catch the interrupt, store writes persisted without a return value, JSON depth/trailing-garbage guards, and the sandbox close race family.
+- **MCP**: numeric response ids match by value (`1` == `1.0`) so an answered response is not retried or reported as unknown; the built-in OAuth store keeps rotated refresh tokens, refuses to overwrite a corrupt store, writes atomically (0600 + parent sync, lock dir 0700), distinguishes lock contention from local setup errors, and reports a sign-in whose credentials could not be persisted instead of asking for another login; the adapter drops server-wide session grants on branch navigation (upstream `restoreSessionApprovalState`) and now fails closed on non-array `approveTools` values (including the still-deferred `"destructive"`), with the upstream server-scope note in the approval dialog.
+- **Plan mode**: a transient host-call failure (`getMode`/`getAllTools`/`getActiveTools`) keeps the hidden boundary and retries instead of releasing it; failed exit cleanup notifies and retries; `planDir` expands `~/`; `/plan edit` writes atomically; `session_shutdown` drops the per-session state.
+- **Subagents**: a misspelled later task/step agent fails the whole call before any child starts (foreground and background), per-agent `modelScope.agents.<name>` reserved tokens fail closed without a parent model, Git routing env vars are stripped from children, and an untrusted project's children get `--no-approve`.
+- **Extension host / ABI**: unknown tool `exposure` values are `invalidRequest` (no silent `direct`); native host calls on an unloaded plugin answer a stale-context error; re-entrant `executeTool`/virtual-model dispatches fail closed; events for an extension blocked in a synchronous host call are skipped (D-105, the blocking-ABI substitute for upstream's JS event loop).
+- **Usage providers**: the host's enforced timeout is injected into the provider scripts; `/usage` while disabled clears the stale footer; `auth.json` `${VAR}` resolves like `$VAR`; a Windows `.cmd` launcher write failure is a hard error.
+- **Themes/CLI**: non-ASCII theme colors no longer panic, unknown theme keys are ignored like upstream, `system` themes keep their styling in `/export`, script children are killed on drop, and Windows kills use the full process tree from System32.
+
 ### Internal
 
 - workspace version bumped to 0.1.6-rc.1 with Cargo.lock synced (eight lockstep extensions propagate via `version.workspace`).
-- deviations TE-D44 (MCP config layout [VARIANT], TE46), TE-D45 (plan-mode XDG config path) and TE-D46 (plan-mode exposure-hidden boundary) promoted; D-105+ / TE-D47+ reserved and unused.
+- deviations TE-D44 (MCP config layout [VARIANT], TE46), TE-D45 (plan-mode XDG config path) and TE-D46 (plan-mode exposure-hidden boundary) promoted; D-105 (events skipped while an extension is blocked in a synchronous host call) promoted; TE-D47+ reserved and unused.
 
 ## [0.1.5] - 2026-09-29
 
