@@ -130,27 +130,7 @@ impl ToolDefinition for HostToolRenderDefinition {
         context: &super::components::tool_execution::ToolRenderContext,
     ) -> Option<Box<dyn Component>> {
         let render = self.render_result.as_ref()?;
-        let content = result
-            .content
-            .iter()
-            .map(|block| {
-                serde_json::json!({
-                    "type": block.kind,
-                    "text": block.text,
-                    "data": block.data,
-                    "mimeType": block.mime_type,
-                })
-            })
-            .collect::<Vec<_>>();
-        let agent_result = rpi_agent::types::AgentToolResult {
-            content: serde_json::from_value(serde_json::Value::Array(content)).unwrap_or_default(),
-            details: result.details.clone().unwrap_or(serde_json::Value::Null),
-            usage: None,
-            terminate: None,
-
-            structured_content: None,
-            is_error: None,
-        };
+        let agent_result = bridge_tool_result(result);
         let tree = render(
             agent_result,
             ext::ToolRenderResultOptions {
@@ -172,5 +152,60 @@ impl ToolDefinition for HostToolRenderDefinition {
             Some("default") => Some(RenderShell::Default),
             _ => None,
         }
+    }
+}
+
+/// Build the `AgentToolResult` an extension `renderResult` hook receives.
+/// The error flag must ride along: renderers branch on `result.isError`
+/// (alongside the render context's `isError`), and dropping it made an
+/// errored tool result render as a success (v0.1.6 review round-2 blocker).
+fn bridge_tool_result(result: &ToolResultState) -> rpi_agent::types::AgentToolResult {
+    let content = result
+        .content
+        .iter()
+        .map(|block| {
+            serde_json::json!({
+                "type": block.kind,
+                "text": block.text,
+                "data": block.data,
+                "mimeType": block.mime_type,
+            })
+        })
+        .collect::<Vec<_>>();
+    rpi_agent::types::AgentToolResult {
+        content: serde_json::from_value(serde_json::Value::Array(content)).unwrap_or_default(),
+        details: result.details.clone().unwrap_or(serde_json::Value::Null),
+        usage: None,
+        terminate: None,
+        structured_content: None,
+        is_error: Some(result.is_error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The renderResult bridge must carry the tool result's error bit; the
+    /// subagent composite card (and any other renderer that branches on
+    /// `result.isError`) would otherwise render errors as success.
+    #[test]
+    fn bridge_tool_result_carries_the_error_flag() {
+        let ok = ToolResultState {
+            content: Vec::new(),
+            is_error: false,
+            details: None,
+        };
+        assert_eq!(bridge_tool_result(&ok).is_error, Some(false));
+        let failed = ToolResultState {
+            content: Vec::new(),
+            is_error: true,
+            details: None,
+        };
+        assert_eq!(
+            bridge_tool_result(&failed).is_error,
+            Some(true),
+            "an errored result must serialize isError for render hooks"
+        );
     }
 }
