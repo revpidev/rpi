@@ -309,10 +309,7 @@ impl std::fmt::Display for StoreLockFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable(detail) => {
-                write!(
-                    formatter,
-                    "the credential-store lock is unavailable: {detail}"
-                )
+                write!(formatter, "the credential store is unavailable: {detail}")
             }
             Self::Corrupted => write!(
                 formatter,
@@ -1308,7 +1305,9 @@ mod tests {
 
     /// Round-2 O10: a write failure is reported to the caller instead of
     /// being swallowed (the sign-in flow turns it into a user-visible
-    /// error).
+    /// error). Unix-only: the setup simulates the failure with a read-only
+    /// parent directory.
+    #[cfg(unix)]
     #[tokio::test]
     async fn save_reports_write_failures() {
         #[cfg(unix)]

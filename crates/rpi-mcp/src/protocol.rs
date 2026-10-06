@@ -2,7 +2,6 @@
 //! `packages/mcp/src/protocol/jsonrpc.ts` @ a13d35a74).
 
 use std::fmt;
-use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,8 +14,10 @@ pub const JSON_RPC_ERROR_INVALID_PARAMS: i64 = -32602;
 pub const JSON_RPC_ERROR_INTERNAL: i64 = -32603;
 
 /// `JsonRpcId` (jsonrpc.ts:1): a string or a finite number. Numbers keep
-/// their exact JSON representation (integers stay integers).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// their exact JSON representation (integers stay integers); the derived
+/// `Hash` matches the derived equality (`serde_json::Number` implements
+/// `Hash` with the same ±0.0 normalization as its `Eq`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcId {
     Number(serde_json::Number),
@@ -57,17 +58,6 @@ pub fn matching_key<V>(
         return Some(id.clone());
     }
     map.keys().find(|key| key.numerically_eq(id)).cloned()
-}
-
-impl Hash for JsonRpcId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            // Numbers hash through their canonical JSON text; `Number` is not
-            // `Hash` because of its float representation.
-            JsonRpcId::Number(number) => number.to_string().hash(state),
-            JsonRpcId::String(value) => value.hash(state),
-        }
-    }
 }
 
 impl fmt::Display for JsonRpcId {
