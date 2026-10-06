@@ -32,6 +32,10 @@ pub const COMMAND_USAGE: &str =
 /// Non-interactive `/plan` note (the host gate keeps the mode `default`).
 pub const NON_INTERACTIVE_NOTE: &str = "plan mode is only available in interactive sessions";
 
+/// Warning when leaving Plan mode could not release the tool boundary; the
+/// mirror state is kept so the next event retries.
+pub const EXIT_CLEANUP_FAILED: &str = "plan mode is off, but some tool restrictions could not be restored; the cleanup will be retried";
+
 /// External-editor fallback title (`ui.editor` after `ui.editExternal`).
 pub const EDIT_PLAN_TITLE: &str = "Edit the plan";
 

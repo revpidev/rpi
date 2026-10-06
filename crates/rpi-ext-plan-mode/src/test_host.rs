@@ -140,6 +140,8 @@ struct SessionState {
     inputs: VecDeque<Value>,
     editor_texts: VecDeque<Value>,
     editor_errors: bool,
+    /// Methods answered with a transport failure (test injection).
+    failed_methods: Vec<String>,
     registered: Vec<Value>,
     events: Vec<String>,
     calls: Vec<(String, Value)>,
@@ -197,6 +199,7 @@ impl SessionFakeHost {
                 inputs: VecDeque::new(),
                 editor_texts: VecDeque::new(),
                 editor_errors: false,
+                failed_methods: Vec::new(),
                 registered: Vec::new(),
                 events: Vec::new(),
                 calls: Vec::new(),
@@ -294,6 +297,17 @@ impl SessionFakeHost {
     pub fn fail_edit_external(&self) {
         self.with(|state| state.editor_errors = true);
     }
+
+    /// Make one host method answer with a transport-shaped failure (models
+    /// a transient host-call outage).
+    pub fn fail_method(&self, method: &str) {
+        self.with(|state| state.failed_methods.push(method.to_owned()));
+    }
+
+    /// Clear every injected method failure.
+    pub fn clear_failed_methods(&self) {
+        self.with(|state| state.failed_methods.clear());
+    }
 }
 
 impl Default for SessionFakeHost {
@@ -306,6 +320,12 @@ impl HostCall for SessionFakeHost {
     fn call(&self, method: &str, args: Value) -> Reply {
         self.with(|state| {
             state.calls.push((method.to_owned(), args.clone()));
+            if state.failed_methods.iter().any(|failed| failed == method) {
+                return Err(HostError {
+                    kind: "transport".to_owned(),
+                    message: format!("{method} failed (test injection)"),
+                });
+            }
             match method {
                 "ctx.sessionFile" => Ok(json!({
                     "path": state.session_path,

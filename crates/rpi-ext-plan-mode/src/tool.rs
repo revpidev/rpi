@@ -71,7 +71,7 @@ pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
     // Defense in depth (v0.1.6 review P3): the tool is only active inside
     // Plan mode, but a nested `executeTool`/manual dispatch must not write a
     // plan or leave Plan mode outside it.
-    if host::get_mode(host) != "plan" {
+    if host::get_mode(host).as_deref() != Some("plan") {
         return error_result("write_plan: only available in plan mode".to_owned());
     }
     let Some(content) = params.get("content").and_then(Value::as_str) else {

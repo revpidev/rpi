@@ -15,8 +15,10 @@
 //! - keeps the plan-file path and the editor hint in step.
 //!
 //! State is keyed by session id, so it survives an extension reload (the
-//! native library stays mapped) and fresh sessions start clean. No lock
-//! is held across a host call (host calls can re-enter this plugin).
+//! native library stays mapped) and fresh sessions start clean. The state
+//! mutex is never held across a host call (host calls can re-enter this
+//! plugin); [`RECONCILE_LOCK`] serializes boundary application and is held
+//! across host calls on purpose.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +28,7 @@ use serde_json::{Map, Value, json};
 
 use crate::HostCall;
 use crate::config;
+use crate::i18n;
 use crate::plan_file;
 use crate::view;
 use crate::whitelist;
@@ -93,18 +96,37 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let session = crate::host::sid_of(host);
-    let plan = crate::host::get_mode(host) == "plan";
+    // An unreadable host mode must not be treated as `default`: that would
+    // look like leaving Plan mode and release the boundary (O4). Keep the
+    // mirror state and retry on the next event.
+    let Some(mode) = crate::host::get_mode(host) else {
+        tracing::warn!("rpi-plan-mode: getMode failed; leaving the Plan boundary untouched");
+        return snapshot(&session).in_plan;
+    };
+    let plan = mode == "plan";
     let mut state = snapshot(&session);
 
     if plan {
         let config = config::load_config();
-        let tools = whitelist::parse_tools(&crate::host::get_all_tools(host));
+        // A failed tool snapshot is not an empty tool surface: releasing the
+        // hidden targets against it would fail open (O4). Keep the current
+        // boundary and retry on the next event.
+        let Some(raw_tools) = crate::host::get_all_tools(host) else {
+            tracing::warn!(
+                "rpi-plan-mode: getAllTools failed; keeping the current boundary and retrying"
+            );
+            return state.in_plan;
+        };
+        let tools = whitelist::parse_tools(&raw_tools);
         let targets = whitelist::boundary_targets(&tools, &config);
         let active = whitelist::active_whitelist(&tools, &config);
         let entering = !state.in_plan;
         let current_active = crate::host::get_active_tools(host);
         if entering {
-            state.active_snapshot = Some(current_active.clone());
+            // The snapshot backs the exit restore; a failed call leaves it
+            // None and the exit keeps the active set instead of restoring a
+            // wrong one.
+            state.active_snapshot = current_active.clone();
             state.entry_known = tools.iter().map(|tool| tool.name.clone()).collect();
             // A Plan entry starts a fresh plan file (revisions within the
             // entry overwrite it); session events reset it the same way.
@@ -140,8 +162,12 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
         // Keep the active set equal to the whitelist (late-registered or
         // hot-re-allowed tools become usable; a user edit mid-plan is
         // re-asserted at the next trigger — the Plan boundary is the
-        // authority while the mode is active).
-        if current_active != active
+        // authority while the mode is active). A failed `getActiveTools`
+        // still asserts the whitelist (the boundary is the safe default).
+        let active_mismatch = current_active
+            .as_ref()
+            .is_none_or(|current| *current != active);
+        if active_mismatch
             && let Err(error) = host.call("setActiveTools", json!({ "toolNames": active }))
         {
             tracing::warn!(%error, "rpi-plan-mode: setActiveTools failed");
@@ -169,6 +195,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
     }
 
     if state.in_plan {
+        let mut cleanup_failed = false;
         if !state.hidden_targets.is_empty()
             && let Err(error) = host.call(
                 "clearToolExposures",
@@ -176,6 +203,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
             )
         {
             tracing::warn!(%error, "rpi-plan-mode: clearToolExposures failed");
+            cleanup_failed = true;
         }
         // Restore the entry snapshot AFTER the release, augmented with the
         // tools that were hidden only after entry (for example an MCP server
@@ -199,7 +227,25 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
             }
             if let Err(error) = host.call("setActiveTools", json!({ "toolNames": restored })) {
                 tracing::warn!(%error, "rpi-plan-mode: active-set restore failed");
+                cleanup_failed = true;
             }
+        } else if !state.hidden_targets.is_empty() {
+            tracing::warn!(
+                "rpi-plan-mode: no active-set snapshot was captured on entry; keeping the active set"
+            );
+        }
+        if cleanup_failed {
+            // Keep the mirror state so the next event retries the release
+            // instead of leaking the hidden overrides for the rest of the
+            // session (v0.1.6 review round 2, O6), and tell the user.
+            let _ = host.call(
+                "ui.notify",
+                json!({
+                    "message": i18n::EXIT_CLEANUP_FAILED,
+                    "notifyType": "warning",
+                }),
+            );
+            return false;
         }
         if state.hint_shown && crate::host::has_ui(host) {
             let _ = host.call(
@@ -232,6 +278,20 @@ pub fn on_session_start(host: &dyn HostCall) -> bool {
     state.hint_shown = false;
     commit(&session, state);
     reconcile(host)
+}
+
+/// Drop the session's mirror state (`session_shutdown`). The boundary
+/// should already be released; dropping the entry keeps [`STATES`] bounded
+/// across the sessions one process hosts (v0.1.6 review round 2).
+pub fn forget_session(host: &dyn HostCall) {
+    let session = crate::host::sid_of(host);
+    if session.is_empty() {
+        return;
+    }
+    states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&session);
 }
 
 /// The plan path for this session: the remembered file, or the next free
@@ -609,5 +669,143 @@ mod tests {
         );
         host.set_session_id("s-2");
         assert!(cached_plan_path(&host).is_none(), "state is session-scoped");
+    }
+
+    /// Round-2 O4: a failed `getAllTools` is not an empty tool surface;
+    /// the boundary must survive and the next event retries. The old
+    /// empty-vec folding released every hidden override (fail open).
+    #[test]
+    fn failed_tool_snapshot_keeps_the_boundary() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        assert!(reconcile(&host));
+        let entered = host.view();
+        host.fail_method("getAllTools");
+        assert!(reconcile(&host), "the host mode is still plan");
+        assert_eq!(
+            host.view().exposures,
+            entered.exposures,
+            "a failed snapshot must not release the hidden overrides"
+        );
+        assert_eq!(host.view().active, entered.active);
+        // Recovery: the retry is idempotent with the entry boundary.
+        host.clear_failed_methods();
+        assert!(reconcile(&host));
+        assert_eq!(host.view().exposures, entered.exposures);
+        assert_eq!(host.view().active, entered.active);
+    }
+
+    /// Round-2 O4: a failed `getMode` must not look like an exit; the
+    /// boundary survives until the host answers again.
+    #[test]
+    fn failed_get_mode_keeps_the_boundary() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        assert!(reconcile(&host));
+        let entered = host.view();
+        host.fail_method("getMode");
+        assert!(reconcile(&host), "the mirror state is still in plan");
+        assert_eq!(host.view().exposures, entered.exposures);
+        assert_eq!(host.view().active, entered.active);
+        host.clear_failed_methods();
+        assert!(reconcile(&host));
+    }
+
+    /// Round-2 O4: a failed `getActiveTools` still asserts the whitelist
+    /// (the boundary is the safe default) and the exit keeps the active set
+    /// instead of restoring a wrong snapshot.
+    #[test]
+    fn failed_active_snapshot_keeps_the_whitelist() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        host.fail_method("getActiveTools");
+        assert!(reconcile(&host));
+        assert_eq!(host.view().active, vec!["read", "write_plan"]);
+        host.clear_failed_methods();
+        host.set_mode("default");
+        assert!(!reconcile(&host));
+        assert_eq!(
+            host.view().active,
+            vec!["read", "write_plan"],
+            "without a snapshot the active set is left as-is"
+        );
+    }
+
+    /// Round-2 O6: an exit whose cleanup fails keeps the mirror state,
+    /// warns the user, and retries on the next event instead of leaking the
+    /// hidden overrides for the rest of the session.
+    #[test]
+    fn failed_exit_cleanup_is_notified_and_retried() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        assert!(reconcile(&host));
+        host.set_mode("default");
+        host.fail_method("clearToolExposures");
+        assert!(!reconcile(&host));
+        assert!(
+            host.view()
+                .notifications
+                .iter()
+                .any(|message| message.contains("could not be restored")),
+            "the user must see the failed cleanup: {:?}",
+            host.view().notifications
+        );
+        assert_eq!(
+            host.view()
+                .exposures
+                .iter()
+                .find(|(name, _)| name == "edit")
+                .map(|(_, exposure)| exposure.as_str()),
+            Some("hidden"),
+            "the boundary is still applied until the retry succeeds"
+        );
+        // Recovery: the retry releases the boundary and clears the state.
+        host.clear_failed_methods();
+        assert!(!reconcile(&host));
+        assert_eq!(
+            host.view().exposures,
+            vec![
+                ("read".to_owned(), "direct".to_owned()),
+                ("edit".to_owned(), "direct".to_owned()),
+                ("write".to_owned(), "direct".to_owned()),
+                ("bash".to_owned(), "direct".to_owned()),
+                ("write_plan".to_owned(), "direct".to_owned()),
+            ]
+        );
+        assert_eq!(host.view().active, vec!["read", "edit", "bash"]);
+        assert!(!state_for_test("s-1").in_plan);
+    }
+
+    /// Round-2: `session_shutdown` evicts the entry so STATES stays bounded
+    /// across the sessions one process hosts.
+    #[test]
+    fn session_shutdown_forgets_the_mirror_state() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        assert!(reconcile(&host));
+        assert!(
+            states()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key("s-1")
+        );
+        forget_session(&host);
+        assert!(
+            !states()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key("s-1"),
+            "session_shutdown must drop the per-session state"
+        );
     }
 }

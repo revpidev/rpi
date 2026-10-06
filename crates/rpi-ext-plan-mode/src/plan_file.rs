@@ -35,12 +35,29 @@ pub fn session_key(session_id: &str) -> String {
         .collect()
 }
 
+/// Expand a leading `~` (alone or `~/...`) with the user's home directory
+/// (v0.1.6 review round 2). `~user` forms are left untouched (a relative
+/// path), matching the mcp-adapter `~/` convention.
+fn expand_tilde(path: &str) -> Option<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed == "~" {
+        return crate::config::home_dir();
+    }
+    trimmed
+        .strip_prefix("~/")
+        .and_then(|rest| crate::config::home_dir().map(|home| home.join(rest)))
+}
+
 /// Resolve the plan directory: an absolute `planDir` override is used
-/// verbatim; a relative one (and the default `.rpi/plans`) resolves
-/// against the session cwd.
+/// verbatim; `~`/`~/...` expands against the user's home directory; a
+/// relative one (and the default `.rpi/plans`) resolves against the session
+/// cwd.
 pub fn plan_dir(cwd: &Path, plan_dir: Option<&str>) -> PathBuf {
     match plan_dir {
         Some(dir) if !dir.trim().is_empty() => {
+            if let Some(expanded) = expand_tilde(dir) {
+                return expanded;
+            }
             let path = PathBuf::from(dir);
             if path.is_absolute() {
                 path
@@ -82,9 +99,11 @@ pub fn next_path(dir: &Path, key: &str) -> PathBuf {
 }
 
 /// Write `content` to `path` (creating parent directories), returning the
-/// byte count. Revisions go through a temp file plus rename so a crash
-/// cannot leave a torn plan (v0.1.6 review P3); `allocate_and_write` keeps
-/// its `create_new` allocation.
+/// byte count. Revisions go through an exclusively created temp file plus
+/// rename so a crash cannot leave a torn plan (v0.1.6 review P3; the temp
+/// also uses `create_new` like the OAuth/approval writers), and the parent
+/// directory is synced best-effort after the rename so the replacement
+/// itself is durable.
 pub fn write_file(path: &Path, content: &str) -> std::io::Result<usize> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -95,7 +114,9 @@ pub fn write_file(path: &Path, content: &str) -> std::io::Result<usize> {
         .unwrap_or(0);
     let temp = path.with_extension(format!("md.{}.{unique}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&temp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(&temp)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()
     };
@@ -107,7 +128,20 @@ pub fn write_file(path: &Path, content: &str) -> std::io::Result<usize> {
         let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
+    sync_parent_dir(path);
     Ok(content.len())
+}
+
+/// Best-effort parent-directory sync after a rename (the file data was
+/// already flushed); a failure here cannot corrupt the plan, so it is
+/// ignored. Windows cannot open a directory as a file, so it is unix-only.
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
 }
 
 /// Allocate the next plan file for `key` and write `content` into it.
@@ -196,6 +230,21 @@ mod tests {
     }
 
     #[test]
+    fn plan_dir_expands_a_leading_tilde() {
+        let Some(home) = crate::config::home_dir() else {
+            return;
+        };
+        let cwd = Path::new("/work/project");
+        assert_eq!(plan_dir(cwd, Some("~")), home);
+        assert_eq!(plan_dir(cwd, Some("~/plans")), home.join("plans"));
+        // `~user` is not a home reference and stays relative.
+        assert_eq!(
+            plan_dir(cwd, Some("~user/plans")),
+            PathBuf::from("/work/project/~user/plans")
+        );
+    }
+
+    #[test]
     fn index_scans_existing_files_and_ignores_other_sessions() {
         let temp = TempDir::new("index");
         let dir = temp.0.clone();
@@ -235,22 +284,69 @@ mod tests {
         assert_eq!(bytes, "v2 longer".len());
     }
 
-    /// v0.1.6 review P3: a failed revision write must keep the previous
-    /// plan and leave no temp file behind.
+    /// v0.1.6 review round 2 (O5): the revision write must keep the
+    /// previous plan when it fails. A read-only plan directory makes
+    /// `create_new` fail (the old direct `File::create` on the existing
+    /// file would still have overwritten it), so this is a true
+    /// revert-the-source test. Environments that ignore directory
+    /// permission bits (root, some filesystems) are detected with a canary
+    /// write and skipped.
+    #[cfg(unix)]
     #[test]
     fn failed_revision_write_keeps_the_previous_plan() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = TempDir::new("revision-failure");
-        let path = temp.0.join("plans/s1-1.md");
+        let dir = temp.0.join("plans");
+        let path = dir.join("s1-1.md");
         write_file(&path, "v1").expect("first");
         write_file(&path, "v2").expect("second");
-        // Renaming the temp file onto an existing directory fails after the
-        // temp write succeeded; the previous plan must survive.
-        let blocked = temp.0.join("s1-2.md");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only plans dir");
+        // Probe: root (and some filesystems) bypass the directory mode.
+        let canary = dir.join("permission-probe");
+        if std::fs::write(&canary, b"probe").is_ok() {
+            let _ = std::fs::remove_file(&canary);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore plans dir");
+            return;
+        }
+        let result = write_file(&path, "v3 longer");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore plans dir");
+        assert!(
+            result.is_err(),
+            "a read-only plan dir must fail the revision write"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "v2");
+        let temps: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read plans")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "stale temp files: {temps:?}");
+    }
+
+    /// The rename-failure branch cleans its temp file up in the plan
+    /// directory (the blocked target lives next to the plan, not in the
+    /// temp root).
+    #[test]
+    fn failed_rename_cleans_up_in_the_plan_dir() {
+        let temp = TempDir::new("rename-failure");
+        let dir = temp.0.join("plans");
+        let path = dir.join("s1-1.md");
+        write_file(&path, "v1").expect("first");
+        write_file(&path, "v2").expect("second");
+        // Renaming the temp file onto an existing directory fails after
+        // the temp write succeeded; the previous plan must survive and the
+        // temp must be removed from `plans/`.
+        let blocked = dir.join("s1-2.md");
         std::fs::create_dir_all(&blocked).expect("blocked dir");
         assert!(write_file(&blocked, "v3").is_err());
         assert!(blocked.is_dir(), "the blocking target is untouched");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "v2");
-        let temps: Vec<String> = std::fs::read_dir(temp.0.join("plans"))
+        let temps: Vec<String> = std::fs::read_dir(&dir)
             .expect("read plans")
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())

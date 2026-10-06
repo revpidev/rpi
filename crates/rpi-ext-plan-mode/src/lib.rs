@@ -199,6 +199,9 @@ fn install_with_host(host: &dyn HostCall) -> Value {
         "session_tree",
         "before_agent_start",
         "mcp_servers_change",
+        // Round-2: evict the per-session mirror state at shutdown so STATES
+        // does not grow with every session the process hosts.
+        "session_shutdown",
     ] {
         if let Err(error) = host.call("on", json!({ "event": event })) {
             return error_envelope("init", error);
@@ -213,7 +216,7 @@ fn handle_plan_command(host: &dyn HostCall, args: &str) {
     match args.trim() {
         "" => toggle_plan_mode(host),
         "status" => {
-            let mode = get_mode(host);
+            let mode = get_mode(host).unwrap_or_else(|| "(unavailable)".to_owned());
             let path = mode::current_plan_path(host).unwrap_or_else(|| "(unavailable)".to_owned());
             notify(host, &format!("plan mode: {mode} · plan file: {path}"));
         }
@@ -227,14 +230,17 @@ fn handle_plan_command(host: &dyn HostCall, args: &str) {
 }
 
 fn toggle_plan_mode(host: &dyn HostCall) {
-    let current = get_mode(host);
-    let target = if current == "plan" { "default" } else { "plan" };
+    let target = if get_mode(host).as_deref() == Some("plan") {
+        "default"
+    } else {
+        "plan"
+    };
     if let Err(error) = host.call("setMode", json!({ "mode": target })) {
         tracing::warn!(%error, "rpi-plan-mode: setMode failed");
         return;
     }
     mode::reconcile(host);
-    if target == "plan" && get_mode(host) != "plan" {
+    if target == "plan" && get_mode(host).as_deref() != Some("plan") {
         notify(host, i18n::NON_INTERACTIVE_NOTE);
     }
 }
@@ -274,8 +280,8 @@ fn edit_plan_file(host: &dyn HostCall) {
     if edited == text {
         return;
     }
-    match std::fs::write(&path, edited) {
-        Ok(()) => notify(host, &format!("plan file updated: {path_text}")),
+    match plan_file::write_file(&path, &edited) {
+        Ok(_) => notify(host, &format!("plan file updated: {path_text}")),
         Err(error) => notify(host, &format!("plan file write failed: {error}")),
     }
 }
@@ -291,6 +297,10 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) -> Value {
         }
         "mode_change" | "session_tree" | "mcp_servers_change" => {
             mode::reconcile(host);
+            Value::Null
+        }
+        "session_shutdown" => {
+            mode::forget_session(host);
             Value::Null
         }
         _ => Value::Null,
@@ -447,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn install_registers_the_tool_command_and_five_events() {
+    fn install_registers_the_tool_command_and_six_events() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         __reset_state();
         let host = FakeHost::new();
@@ -462,6 +472,7 @@ mod tests {
             vec![
                 "registerTool",
                 "registerCommand",
+                "on",
                 "on",
                 "on",
                 "on",
@@ -483,6 +494,7 @@ mod tests {
                 "session_tree",
                 "before_agent_start",
                 "mcp_servers_change",
+                "session_shutdown",
             ]
         );
     }

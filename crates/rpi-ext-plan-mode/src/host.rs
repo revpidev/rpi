@@ -14,13 +14,14 @@ pub fn sid_of(host: &dyn HostCall) -> String {
         .unwrap_or_default()
 }
 
-/// `ctx.getMode()` → the host permission mode wire value; transport
-/// failures degrade to `default`.
-pub fn get_mode(host: &dyn HostCall) -> String {
+/// `ctx.getMode()` → the host permission mode wire value; `None` on a
+/// transport failure. Callers must not degrade an unreadable mode to
+/// `default`: that looks like leaving Plan mode and would drop the boundary
+/// (v0.1.6 review round 2, O4).
+pub fn get_mode(host: &dyn HostCall) -> Option<String> {
     host.call("getMode", json!({}))
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "default".to_owned())
 }
 
 /// `ctx.hasUI` → transport failures degrade to `false`.
@@ -46,18 +47,18 @@ pub fn cwd_of(host: &dyn HostCall) -> Option<String> {
         .and_then(|value| value.as_str().map(str::to_owned))
 }
 
-/// `ctx.getAllTools` → the raw `ToolInfo[]` JSON (empty on failure).
-pub fn get_all_tools(host: &dyn HostCall) -> Vec<Value> {
+/// `ctx.getAllTools` → the raw `ToolInfo[]` JSON; `None` on failure. An
+/// empty `Some([])` is a real empty surface; `None` must not be treated as
+/// one — the boundary release would fail open (O4).
+pub fn get_all_tools(host: &dyn HostCall) -> Option<Vec<Value>> {
     host.call("getAllTools", json!({}))
         .ok()
         .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
 }
 
-/// `ctx.getActiveTools` → the active tool names (empty on failure).
-pub fn get_active_tools(host: &dyn HostCall) -> Vec<String> {
+/// `ctx.getActiveTools` → the active tool names; `None` on failure (O4).
+pub fn get_active_tools(host: &dyn HostCall) -> Option<Vec<String>> {
     host.call("getActiveTools", json!({}))
         .ok()
         .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
 }
