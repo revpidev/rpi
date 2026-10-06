@@ -217,10 +217,23 @@ fn write_private_atomic(path: &Path, text: &str) -> std::io::Result<()> {
             let _ = std::fs::remove_file(&temp);
             return Err(error);
         }
+        sync_parent_dir(path);
         return Ok(());
     }
     Err(last_error
         .unwrap_or_else(|| std::io::Error::other("could not create a unique mcp-auth temp file")))
+}
+
+/// Best-effort parent-directory sync after the atomic rename (the file data
+/// was already flushed); unix-only because Windows cannot open a directory
+/// as a file. A failure here cannot corrupt the store.
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
 }
 
 fn serialize_states(states: &HashMap<String, McpOAuthState>) -> String {
@@ -247,6 +260,52 @@ pub struct McpOAuthServerStore {
     lock_dir: Option<PathBuf>,
     key: String,
     legacy_key: String,
+}
+
+/// Why the cross-process refresh lock was not taken. The two cases carry
+/// different user-facing diagnoses: a held lock means another process is
+/// refreshing; an unavailable lock is a local setup error (v0.1.6 review
+/// round 2, O10 — `None` used to collapse both into "another process holds
+/// the credential refresh lock").
+#[derive(Debug)]
+pub enum RefreshLockFailure {
+    /// Another process held the lock past the retry budget.
+    Held,
+    /// The lock directory or file could not be set up (permissions, IO).
+    Unavailable(String),
+}
+
+/// Failure modes of the store lock/read/write path. `save` reports them to
+/// the caller; `load` and the credential-store reads keep their fail-soft
+/// fallbacks.
+#[derive(Debug)]
+enum StoreLockFailure {
+    Unavailable(String),
+    Corrupted,
+    Write(String),
+}
+
+impl std::fmt::Display for StoreLockFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(detail) => {
+                write!(
+                    formatter,
+                    "the credential-store lock is unavailable: {detail}"
+                )
+            }
+            Self::Corrupted => write!(
+                formatter,
+                "the credential store is corrupted; refusing to overwrite it"
+            ),
+            Self::Write(detail) => {
+                write!(
+                    formatter,
+                    "the credential store could not be written: {detail}"
+                )
+            }
+        }
+    }
 }
 
 impl McpOAuthServerStore {
@@ -276,31 +335,44 @@ impl McpOAuthServerStore {
         })
     }
 
-    /// `save`.
-    pub async fn save(&self, state: McpOAuthState) {
-        self.with_file_lock((), |states| {
+    /// `save`. A write failure is reported so the sign-in flow can surface
+    /// it instead of silently losing the credentials (v0.1.6 review round
+    /// 2, O10).
+    pub async fn save(&self, state: McpOAuthState) -> Result<(), String> {
+        self.with_file_lock_result(|states| {
             states.insert(self.key.clone(), state);
             ((), Some(serialize_states(states)))
-        });
+        })
+        .map_err(|error| error.to_string())
     }
 
     /// `withRefreshLock` (oauth.ts:162): a lock file per server, released on
     /// drop, so another process can take over after a crash.
     ///
-    /// Lock acquisition failures fail closed (`None`): upstream's
-    /// proper-lockfile throws and the refresh aborts; proceeding unlocked
-    /// could race a rotating refresh token (v0.1.6 review P2-3).
-    pub async fn with_refresh_lock<T, F, Fut>(&self, action: F) -> Option<T>
+    /// Lock acquisition failures fail closed: upstream's proper-lockfile
+    /// throws and the refresh aborts; proceeding unlocked could race a
+    /// rotating refresh token (v0.1.6 review P2-3). The lock directory is
+    /// created 0700 like upstream `mkdirSync(..., { mode: 0o700 })`.
+    pub async fn with_refresh_lock<T, F, Fut>(&self, action: F) -> Result<T, RefreshLockFailure>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T>,
     {
         let Some(lock_dir) = &self.lock_dir else {
-            return Some(action().await);
+            return Ok(action().await);
         };
-        if std::fs::create_dir_all(lock_dir).is_err() {
-            return None;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(lock_dir)
+                .map_err(|error| RefreshLockFailure::Unavailable(error.to_string()))?;
         }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(lock_dir)
+            .map_err(|error| RefreshLockFailure::Unavailable(error.to_string()))?;
         use sha2::Digest;
         let digest = sha2::Sha256::digest(self.key.as_bytes());
         let name = format!("mcp-auth-refresh-{}", &format!("{digest:x}")[..16]);
@@ -311,76 +383,84 @@ impl McpOAuthServerStore {
             .read(true)
             .write(true)
             .open(&lock_path)
-            .ok()?;
+            .map_err(|error| RefreshLockFailure::Unavailable(error.to_string()))?;
         let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(REFRESH_LOCK_WAIT_MS);
+            tokio::time::Instant::now() + std::time::Duration::from_millis(REFRESH_LOCK_WAIT_MS);
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
+                    if tokio::time::Instant::now() >= deadline {
                         // A lock that is never released must not stall the
                         // flow forever; upstream's retry budget is exhausted
                         // here and the refresh fails closed.
-                        return None;
+                        return Err(RefreshLockFailure::Held);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(REFRESH_LOCK_RETRY_MS))
                         .await;
                 }
-                Err(_) => return None,
+                Err(error) => {
+                    return Err(RefreshLockFailure::Unavailable(error.to_string()));
+                }
             }
         }
         let result = action().await;
         let _ = FileExt::unlock(&lock);
-        Some(result)
+        Ok(result)
     }
 
-    fn with_file_lock<T, F>(&self, fallback: T, action: F) -> T
+    /// Lock/read/action/write with the failures surfaced to the caller.
+    fn with_file_lock_result<T, F>(&self, action: F) -> Result<T, StoreLockFailure>
     where
         F: FnOnce(&mut HashMap<String, McpOAuthState>) -> (T, Option<String>),
     {
         let lock_path = self.path.with_extension("json.lock");
         if let Some(parent) = lock_path.parent()
             && !parent.as_os_str().is_empty()
-            && std::fs::create_dir_all(parent).is_err()
         {
-            tracing::warn!(dir = %parent.display(), "MCP: OAuth store lock dir unavailable; refusing to touch credentials");
-            return fallback;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| StoreLockFailure::Unavailable(error.to_string()))?;
         }
-        let lock = match std::fs::OpenOptions::new()
+        let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
-        {
-            Ok(lock) => lock,
-            Err(error) => {
-                tracing::warn!(%error, "MCP: OAuth store lock unavailable; refusing to touch credentials");
-                return fallback;
-            }
-        };
-        if let Err(error) = lock.lock_exclusive() {
-            tracing::warn!(%error, "MCP: OAuth store lock failed; refusing to touch credentials");
-            return fallback;
-        }
+            .map_err(|error| StoreLockFailure::Unavailable(error.to_string()))?;
+        lock.lock_exclusive()
+            .map_err(|error| StoreLockFailure::Unavailable(error.to_string()))?;
         let content = std::fs::read_to_string(&self.path).ok();
         let mut states = match parse_states(content.as_deref()) {
             Ok(states) => states,
             Err(()) => {
-                tracing::warn!(path = %self.path.display(), "MCP: OAuth store is corrupted; refusing to overwrite it");
                 let _ = FileExt::unlock(&lock);
-                return fallback;
+                return Err(StoreLockFailure::Corrupted);
             }
         };
         let (result, next) = action(&mut states);
         if let Some(next) = next
             && let Err(error) = write_private_atomic(&self.path, &next)
         {
-            tracing::warn!(%error, path = %self.path.display(), "MCP: OAuth store write failed");
+            let _ = FileExt::unlock(&lock);
+            return Err(StoreLockFailure::Write(error.to_string()));
         }
         let _ = FileExt::unlock(&lock);
-        result
+        Ok(result)
+    }
+
+    /// Fail-soft wrapper for the read paths (`load`, credential lookups).
+    fn with_file_lock<T, F>(&self, fallback: T, action: F) -> T
+    where
+        F: FnOnce(&mut HashMap<String, McpOAuthState>) -> (T, Option<String>),
+    {
+        match self.with_file_lock_result(action) {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(%error, path = %self.path.display(), "MCP: OAuth store access failed; refusing to touch credentials");
+                fallback
+            }
+        }
     }
 }
 
@@ -543,7 +623,7 @@ impl McpAuthProvider {
     ) -> Result<(), McpError> {
         let _in_process = self.refreshing.lock().await;
         let store = &self.store;
-        let Some(result) = store
+        store
             .with_refresh_lock(|| async {
                 let state = store.load().await;
                 let Some(tokens) = state.as_ref().and_then(|state| state.tokens.clone()) else {
@@ -605,12 +685,14 @@ impl McpAuthProvider {
                 }
             })
             .await
-        else {
-            return Err(McpError::Transport(
-                "another process holds the credential refresh lock".to_owned(),
-            ));
-        };
-        result
+            .map_err(|failure| match failure {
+                RefreshLockFailure::Held => McpError::Transport(
+                    "another process holds the credential refresh lock".to_owned(),
+                ),
+                RefreshLockFailure::Unavailable(detail) => McpError::Transport(format!(
+                    "the credential refresh lock is unavailable: {detail}"
+                )),
+            })?
     }
 }
 
@@ -637,7 +719,14 @@ impl McpOAuthStateStore for StoreAdapter {
             key: self.0.clone(),
             legacy_key: self.0.clone(),
         };
-        store.save(state).await;
+        if let Err(error) = store.save(state).await {
+            // The provider trait cannot propagate a save failure; at least
+            // make it visible in the logs instead of losing the credentials
+            // silently (v0.1.6 review round 2, O10). The sign-in flow
+            // additionally verifies the persisted tokens before reporting
+            // success.
+            tracing::warn!(%error, path = %self.1.display(), "MCP: OAuth credentials could not be persisted");
+        }
     }
 }
 
@@ -805,6 +894,23 @@ async fn listen_for_callback(
     }
 }
 
+/// A silent credential write failure must not report a successful sign-in
+/// (v0.1.6 review round 2, O10): read the store back and require the
+/// tokens to be present before returning success to the user.
+async fn verify_sign_in_persisted(store: &McpOAuthServerStore) -> Result<(), String> {
+    match store.load().await {
+        Some(state) if state.tokens.is_some() => Ok(()),
+        Some(_) => Err(
+            "signed in, but the OAuth credentials were not persisted; check the MCP auth store write permissions"
+                .to_owned(),
+        ),
+        None => Err(
+            "signed in, but the OAuth credential store could not be read back; check the MCP auth store write permissions"
+                .to_owned(),
+        ),
+    }
+}
+
 /// `signInMcpServer` (oauth.ts:434): uses the stored refresh token when
 /// possible; otherwise runs the browser authorization code flow.
 pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String> {
@@ -859,7 +965,10 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
                 next.tokens = None;
                 next.tokens_expire_at = None;
             }
-            store.save(next).await;
+            store
+                .save(next)
+                .await
+                .map_err(|error| format!("the stored OAuth state could not be saved: {error}"))?;
         }
         let authorization_url: Arc<std::sync::Mutex<Option<Url>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -916,7 +1025,7 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
             .map_err(|error| error.to_string())?
             == OAuthFlowResult::Authorized
         {
-            return Ok(());
+            return verify_sign_in_persisted(store).await;
         }
         let authorization_url = authorization_url
             .lock()
@@ -939,7 +1048,7 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
         )
         .await
         .map_err(|error| error.to_string())?;
-        Ok(())
+        verify_sign_in_persisted(store).await
     }
     .await;
     callback.close().await;
@@ -1094,7 +1203,8 @@ mod tests {
                 oauth_state: None,
                 discovery: None,
             })
-            .await;
+            .await
+            .expect("the credential save must succeed");
         assert_eq!(
             server.load().await.unwrap().tokens.unwrap().access_token,
             "a"
@@ -1123,7 +1233,7 @@ mod tests {
             server.load().await.is_none(),
             "a corrupt store must not read as empty"
         );
-        server
+        let error = server
             .save(McpOAuthState {
                 server_url: "https://mcp.example/mcp".to_owned(),
                 client_information: None,
@@ -1137,11 +1247,133 @@ mod tests {
                 oauth_state: None,
                 discovery: None,
             })
-            .await;
+            .await
+            .expect_err("a corrupted store must fail the save closed");
+        assert!(error.contains("corrupted"), "{error}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             torn,
             "the corrupt store must be preserved, not overwritten"
         );
+    }
+
+    fn sample_state(access_token: &str) -> McpOAuthState {
+        McpOAuthState {
+            server_url: "https://mcp.example/mcp".to_owned(),
+            client_information: None,
+            tokens: Some(OAuthTokens {
+                access_token: access_token.to_owned(),
+                token_type: "bearer".to_owned(),
+                ..Default::default()
+            }),
+            tokens_expire_at: None,
+            code_verifier: None,
+            oauth_state: None,
+            discovery: None,
+        }
+    }
+
+    /// Round-2 O10: a write failure is reported to the caller instead of
+    /// being swallowed (the sign-in flow turns it into a user-visible
+    /// error).
+    #[tokio::test]
+    async fn save_reports_write_failures() {
+        let dir = TempDir::new();
+        let path = dir.path.join("mcp-auth.json");
+        // The store path is a directory: the temp write succeeds but the
+        // final rename fails, which `save` must report.
+        std::fs::create_dir_all(&path).unwrap();
+        let server = McpOAuthServerStore {
+            path,
+            lock_dir: None,
+            key: "k".to_owned(),
+            legacy_key: "k".to_owned(),
+        };
+        let error = server
+            .save(sample_state("a"))
+            .await
+            .expect_err("a failed write must be reported");
+        assert!(error.contains("could not be written"), "{error}");
+        assert!(
+            !error.contains("another process"),
+            "a write failure is not lock contention: {error}"
+        );
+    }
+
+    /// Round-2 O10: the refresh lock reports contention and local setup
+    /// failures distinctly.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_lock_reports_contention_distinctly() {
+        let dir = TempDir::new();
+        let path = dir.path.join("mcp-auth.json");
+        let lock_dir = dir.path.join("locks");
+        let server = McpOAuthServerStore {
+            path: path.clone(),
+            lock_dir: Some(lock_dir.clone()),
+            key: "docs|https://mcp.example/mcp".to_owned(),
+            legacy_key: "https://mcp.example/mcp".to_owned(),
+        };
+        // Uncontended: the action runs under the lock.
+        assert_eq!(
+            server.with_refresh_lock(|| async { 7u8 }).await.unwrap(),
+            7u8
+        );
+
+        // Contended: hold the lock file like a concurrent process. Paused
+        // time advances the retry sleeps to the 25s budget instantly.
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(server.key.as_bytes());
+        let name = format!("mcp-auth-refresh-{}", &format!("{digest:x}")[..16]);
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_dir.join(name))
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        let failure = server
+            .with_refresh_lock(|| async { 9u8 })
+            .await
+            .expect_err("a held lock must fail closed");
+        assert!(matches!(failure, RefreshLockFailure::Held), "{failure:?}");
+        FileExt::unlock(&held).unwrap();
+
+        // Unavailable: the lock directory path is an existing file.
+        std::fs::write(&path, "{}").unwrap();
+        let blocked = McpOAuthServerStore {
+            path,
+            lock_dir: Some(dir.path.join("mcp-auth.json")),
+            key: "docs|https://mcp.example/mcp".to_owned(),
+            legacy_key: "https://mcp.example/mcp".to_owned(),
+        };
+        let failure = blocked
+            .with_refresh_lock(|| async { 9u8 })
+            .await
+            .expect_err("an unavailable lock must fail closed");
+        assert!(
+            matches!(failure, RefreshLockFailure::Unavailable(_)),
+            "{failure:?}"
+        );
+    }
+
+    /// Round-2 O10: the sign-in read-back requires persisted tokens.
+    #[tokio::test]
+    async fn verify_sign_in_requires_persisted_tokens() {
+        let dir = TempDir::new();
+        let server = McpOAuthServerStore {
+            path: dir.path.join("mcp-auth.json"),
+            lock_dir: None,
+            key: "k".to_owned(),
+            legacy_key: "k".to_owned(),
+        };
+        let error = verify_sign_in_persisted(&server)
+            .await
+            .expect_err("no persisted tokens must fail the read-back");
+        assert!(error.contains("could not be read back"), "{error}");
+        server.save(sample_state("tok")).await.expect("save");
+        verify_sign_in_persisted(&server)
+            .await
+            .expect("persisted tokens verify");
     }
 }
