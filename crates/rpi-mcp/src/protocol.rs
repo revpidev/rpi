@@ -45,6 +45,20 @@ impl JsonRpcId {
     }
 }
 
+/// Find the stored key matching `id` by value in a map keyed by
+/// [`JsonRpcId`]: an exact hit first, then a `numerically_eq` scan. Upstream
+/// uses JS `Map` (SameValueZero), so server-echoed ids like `1.0` must find
+/// the `1` key (v0.1.6 review round 2, O2 follow-up).
+pub fn matching_key<V>(
+    map: &std::collections::HashMap<JsonRpcId, V>,
+    id: &JsonRpcId,
+) -> Option<JsonRpcId> {
+    if map.contains_key(id) {
+        return Some(id.clone());
+    }
+    map.keys().find(|key| key.numerically_eq(id)).cloned()
+}
+
 impl Hash for JsonRpcId {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
@@ -359,6 +373,32 @@ mod tests {
         assert!(!one.numerically_eq(&text));
         assert!(text.numerically_eq(&text));
         assert!(!text.numerically_eq(&one));
+    }
+
+    /// Round-2: server-echoed ids in id-keyed maps resolve numerically
+    /// (exact first, then a scan), matching upstream JS `Map`.
+    #[test]
+    fn matching_key_resolves_numeric_spellings() {
+        let one: JsonRpcId = serde_json::from_value(json!(1)).expect("id");
+        let one_point_zero: JsonRpcId = serde_json::from_value(json!(1.0)).expect("id");
+        let two: JsonRpcId = serde_json::from_value(json!(2)).expect("id");
+        let mut map = std::collections::HashMap::new();
+        map.insert(one_point_zero, "float key");
+        assert_eq!(
+            matching_key(&map, &one).and_then(|key| map.get(&key).copied()),
+            Some("float key"),
+            "an integer lookup finds the float-spelled key"
+        );
+        assert_eq!(
+            matching_key(&map, &two).and_then(|key| map.get(&key).copied()),
+            None
+        );
+        let mut exact = std::collections::HashMap::new();
+        exact.insert(one.clone(), "integer key");
+        assert_eq!(
+            matching_key(&exact, &one).and_then(|key| exact.get(&key).copied()),
+            Some("integer key")
+        );
     }
 
     #[test]

@@ -818,10 +818,7 @@ impl McpClient {
     /// to leave a response unclaimed until its timeout fired.
     fn take_pending(&self, id: &JsonRpcId) -> Option<PendingRequest> {
         let mut pending = lock(&self.pending);
-        if let Some(entry) = pending.remove(id) {
-            return Some(entry);
-        }
-        let key = pending.keys().find(|key| key.numerically_eq(id)).cloned()?;
+        let key = crate::protocol::matching_key(&pending, id)?;
         pending.remove(&key)
     }
 
@@ -935,7 +932,11 @@ impl McpClient {
         if params.get("progress").and_then(Value::as_f64).is_none() {
             return;
         }
-        let Some(request_id) = lock(&self.progress_requests).get(&token).cloned() else {
+        let Some(request_id) = ({
+            let progress_requests = lock(&self.progress_requests);
+            crate::protocol::matching_key(&progress_requests, &token)
+                .and_then(|key| progress_requests.get(&key).cloned())
+        }) else {
             return;
         };
         let on_progress = {
@@ -959,9 +960,11 @@ impl McpClient {
         let Some(request_id) = params.get("requestId").filter(|value| !value.is_null()) else {
             return;
         };
-        let Some(controller) = crate::protocol::parse_json_rpc_id(request_id)
-            .and_then(|id| lock(&self.incoming).get(&id).cloned())
-        else {
+        let Some(controller) = crate::protocol::parse_json_rpc_id(request_id).and_then(|id| {
+            let incoming = lock(&self.incoming);
+            crate::protocol::matching_key(&incoming, &id)
+                .and_then(|key| incoming.get(&key).cloned())
+        }) else {
             return;
         };
         controller.cancel();

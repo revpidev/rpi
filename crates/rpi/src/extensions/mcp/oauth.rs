@@ -234,6 +234,8 @@ fn sync_parent_dir(path: &Path) {
     {
         let _ = dir.sync_all();
     }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn serialize_states(states: &HashMap<String, McpOAuthState>) -> String {
@@ -273,6 +275,24 @@ pub enum RefreshLockFailure {
     Held,
     /// The lock directory or file could not be set up (permissions, IO).
     Unavailable(String),
+}
+
+/// Whether a `try_lock_exclusive` failure means the lock is held elsewhere.
+/// fs2 maps Windows `ERROR_LOCK_VIOLATION` to a raw os error instead of
+/// `WouldBlock`, so both shapes are accepted (round-2 review note).
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // `ERROR_LOCK_VIOLATION`.
+        return error.raw_os_error() == Some(33);
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Failure modes of the store lock/read/write path. `save` reports them to
@@ -389,7 +409,7 @@ impl McpOAuthServerStore {
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if is_lock_contended(&error) => {
                     if tokio::time::Instant::now() >= deadline {
                         // A lock that is never released must not stall the
                         // flow forever; upstream's retry budget is exhausted
@@ -430,7 +450,20 @@ impl McpOAuthServerStore {
             .map_err(|error| StoreLockFailure::Unavailable(error.to_string()))?;
         lock.lock_exclusive()
             .map_err(|error| StoreLockFailure::Unavailable(error.to_string()))?;
-        let content = std::fs::read_to_string(&self.path).ok();
+        let content = match std::fs::read_to_string(&self.path) {
+            Ok(text) => Some(text),
+            // A missing store is an empty store.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            // Any other read failure (permissions, IO) must not read as an
+            // empty store: the next save would drop every other server's
+            // credentials (round-2 review note).
+            Err(error) => {
+                let _ = FileExt::unlock(&lock);
+                return Err(StoreLockFailure::Unavailable(format!(
+                    "the credential store could not be read: {error}"
+                )));
+            }
+        };
         let mut states = match parse_states(content.as_deref()) {
             Ok(states) => states,
             Err(()) => {
@@ -1278,10 +1311,57 @@ mod tests {
     /// error).
     #[tokio::test]
     async fn save_reports_write_failures() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = TempDir::new();
         let path = dir.path.join("mcp-auth.json");
-        // The store path is a directory: the temp write succeeds but the
-        // final rename fails, which `save` must report.
+        // A readable store and a pre-created lock file in a read-only
+        // directory: opening the existing files succeeds, but the temp file
+        // cannot be created, which `save` must report as a write failure
+        // (not lock contention).
+        std::fs::write(&path, r#"{"k": {"serverUrl": "https://mcp.example/mcp"}}"#).unwrap();
+        std::fs::write(dir.path.join("mcp-auth.json.lock"), b"").unwrap();
+        let server = McpOAuthServerStore {
+            path,
+            lock_dir: None,
+            key: "k".to_owned(),
+            legacy_key: "k".to_owned(),
+        };
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&dir.path, std::fs::Permissions::from_mode(0o555)).unwrap();
+            // Root (or a mode-ignoring filesystem) bypasses the permission
+            // check; the write would succeed, so skip the assertion there.
+            let probe = dir.path.join(".probe");
+            let enforced = std::fs::write(&probe, b"x").is_err();
+            let _ = std::fs::remove_file(&probe);
+            if !enforced {
+                std::fs::set_permissions(&dir.path, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                return;
+            }
+        }
+        let error = server
+            .save(sample_state("a"))
+            .await
+            .expect_err("a failed write must be reported");
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir.path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(error.contains("could not be written"), "{error}");
+        assert!(
+            !error.contains("another process"),
+            "a write failure is not lock contention: {error}"
+        );
+    }
+
+    /// Round-2 note: an unreadable store must not read as empty (the next
+    /// save would drop every other server's credentials).
+    #[tokio::test]
+    async fn unreadable_store_fails_closed_instead_of_reading_empty() {
+        let dir = TempDir::new();
+        let path = dir.path.join("mcp-auth.json");
+        // A directory cannot be read as a file (EISDIR, not NotFound).
         std::fs::create_dir_all(&path).unwrap();
         let server = McpOAuthServerStore {
             path,
@@ -1289,15 +1369,24 @@ mod tests {
             key: "k".to_owned(),
             legacy_key: "k".to_owned(),
         };
+        assert!(server.load().await.is_none(), "load stays fail-soft");
         let error = server
             .save(sample_state("a"))
             .await
-            .expect_err("a failed write must be reported");
-        assert!(error.contains("could not be written"), "{error}");
-        assert!(
-            !error.contains("another process"),
-            "a write failure is not lock contention: {error}"
-        );
+            .expect_err("an unreadable store must fail the save");
+        assert!(error.contains("could not be read"), "{error}");
+    }
+
+    /// Round-2 note: contention classification accepts `WouldBlock` (the
+    /// Unix shape) and, on Windows, fs2's raw `ERROR_LOCK_VIOLATION`.
+    #[test]
+    fn lock_contention_classification() {
+        assert!(is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
     }
 
     /// Round-2 O10: the refresh lock reports contention and local setup
