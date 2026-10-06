@@ -3095,7 +3095,7 @@ dependencies = [
 
 [[package]]
 name = "rpi"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3141,7 +3141,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -3164,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -3196,7 +3196,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-codemode"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "chrono",
  "futures",
@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-ask-user-question"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "async-trait",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-host"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "async-trait",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-mcp-adapter"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "aes-gcm",
@@ -3279,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-plan-mode"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "rpi-ext-host",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-smart-fetch"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "deunicode",
@@ -3328,7 +3328,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-statusline"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "rpi-ext-host",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-subagents"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "futures",
@@ -3362,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-todo"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "rpi-ext-host",
@@ -3374,7 +3374,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-usage"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "rpi-ext-host",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-mcp"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -3410,11 +3410,11 @@ dependencies = [
 
 [[package]]
 name = "rpi-test-env"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 
 [[package]]
 name = "rpi-test-native-plugin"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "abi_stable",
  "rpi-ext-host",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-test-support"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3438,7 +3438,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.1.6-rc.1"
+version = "0.1.6-rc.2"
 dependencies = [
  "base64",
  "comrak",
