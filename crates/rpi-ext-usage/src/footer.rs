@@ -80,20 +80,52 @@ pub enum RefreshOutcome {
     Skipped,
 }
 
-/// Start the per-session worker; returns its job sender.
+/// One live worker per cookie. The generation makes a stale worker's exit
+/// harmless: it removes the map entry only when the generation still
+/// matches its own (a restarted session's worker must not be unregistered
+/// by the previous session's shutdown — v0.1.6 review P1-6).
+#[derive(Clone)]
+struct WorkerEntry {
+    generation: u64,
+    sender: Sender<Job>,
+}
+
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Start (or restart) the per-session worker; returns its job sender.
+///
+/// Every `session_start` starts a fresh worker: the previous session's
+/// `session_shutdown` stopped the old one, and without this the plugin ran
+/// jobs inline (blocking dispatch, no throttle, no last-good retention) for
+/// the rest of the process (v0.1.6 review P1-6). A previous worker is told
+/// to stop, and it removes only its own map entry (generation check), so a
+/// stale shutdown can never unregister the new session's worker.
 pub fn start_worker(cookie: PluginCookie, host: NativeHostCall) -> Sender<Job> {
     let (tx, rx) = std::sync::mpsc::channel();
     let key = cookie as usize;
+    let generation = next_generation();
+    let previous = workers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            key,
+            WorkerEntry {
+                generation,
+                sender: tx.clone(),
+            },
+        );
+    if let Some(previous) = previous {
+        let _ = previous.sender.send(Job::Shutdown);
+    }
     let spawned = std::thread::Builder::new()
         .name("rpi-usage-refresh".to_owned())
-        .spawn(move || worker_loop(key, host, rx));
+        .spawn(move || worker_loop(key, generation, host, rx));
     if let Err(error) = spawned {
         tracing::warn!(%error, "rpi-usage: refresh worker could not start");
     }
-    workers()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(key, tx.clone());
     tx
 }
 
@@ -104,7 +136,7 @@ pub fn send_job(cookie: PluginCookie, job: Job) {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&(cookie as usize))
-        .cloned();
+        .map(|entry| entry.sender.clone());
     if let Some(sender) = sender
         && sender.send(job).is_err()
     {
@@ -118,24 +150,34 @@ pub fn worker_for(cookie: PluginCookie) -> Option<Sender<Job>> {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&(cookie as usize))
-        .cloned()
+        .map(|entry| entry.sender.clone())
 }
 
-fn workers() -> &'static Mutex<HashMap<usize, Sender<Job>>> {
-    static WORKERS: OnceLock<Mutex<HashMap<usize, Sender<Job>>>> = OnceLock::new();
+fn workers() -> &'static Mutex<HashMap<usize, WorkerEntry>> {
+    static WORKERS: OnceLock<Mutex<HashMap<usize, WorkerEntry>>> = OnceLock::new();
     WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn stop_worker_key(key: usize) {
-    workers()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&key);
+/// Remove the cookie's worker entry only when it still belongs to
+/// `generation` (see [`start_worker`]).
+fn stop_worker_key(key: usize, generation: u64) {
+    let mut workers = workers().lock().unwrap_or_else(|error| error.into_inner());
+    if workers
+        .get(&key)
+        .is_some_and(|entry| entry.generation == generation)
+    {
+        workers.remove(&key);
+    }
 }
 
 /// The worker loop: coalesce pending jobs, then run the last command or one
 /// merged refresh.
-fn worker_loop(key: usize, host: NativeHostCall, rx: std::sync::mpsc::Receiver<Job>) {
+fn worker_loop(
+    key: usize,
+    generation: u64,
+    host: NativeHostCall,
+    rx: std::sync::mpsc::Receiver<Job>,
+) {
     let mut state = FooterState::default();
     while let Ok(first) = rx.recv() {
         let mut command: Option<String> = None;
@@ -169,7 +211,7 @@ fn worker_loop(key: usize, host: NativeHostCall, rx: std::sync::mpsc::Receiver<J
             tracing::warn!("rpi-usage: refresh worker recovered from a panic");
         }
     }
-    stop_worker_key(key);
+    stop_worker_key(key, generation);
 }
 
 /// The refresh decision + pipeline (pure of threads; testable).
@@ -264,7 +306,13 @@ pub fn install_worker_for_test(cookie: usize, sender: Sender<Job>) {
     workers()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .insert(cookie, sender);
+        .insert(
+            cookie,
+            WorkerEntry {
+                generation: next_generation(),
+                sender,
+            },
+        );
 }
 
 /// Test seam: clear every worker entry.
@@ -422,5 +470,37 @@ mod tests {
             RefreshOutcome::Skipped
         );
         assert_eq!(host.statuses().len(), 0);
+    }
+    /// v0.1.6 review P1-6: a stale worker's exit must not unregister the
+    /// worker a new session started.
+    #[test]
+    fn stale_worker_stop_does_not_remove_the_new_worker() {
+        clear_workers_for_test();
+        let cookie = 7usize;
+        let (old_tx, _old_rx) = std::sync::mpsc::channel();
+        install_worker_for_test(cookie, old_tx);
+        let old_generation = workers()
+            .lock()
+            .unwrap()
+            .get(&cookie)
+            .expect("old worker")
+            .generation;
+        let (new_tx, _new_rx) = std::sync::mpsc::channel();
+        install_worker_for_test(cookie, new_tx);
+        let new_generation = workers()
+            .lock()
+            .unwrap()
+            .get(&cookie)
+            .expect("new worker")
+            .generation;
+        assert_ne!(old_generation, new_generation);
+        stop_worker_key(cookie, old_generation);
+        assert!(
+            worker_for(cookie as PluginCookie).is_some(),
+            "the new session's worker must survive the stale shutdown"
+        );
+        stop_worker_key(cookie, new_generation);
+        assert!(worker_for(cookie as PluginCookie).is_none());
+        clear_workers_for_test();
     }
 }

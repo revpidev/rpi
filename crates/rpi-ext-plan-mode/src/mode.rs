@@ -45,6 +45,11 @@ pub struct SessionPlanState {
     /// including entries already hidden before entry — clearing a name
     /// without an override is a no-op).
     pub hidden_targets: Vec<String>,
+    /// Every registered tool name captured on entry: tools hidden later that
+    /// are not in this set registered during Plan and return to the active
+    /// set on exit (v0.1.6 review P2-10). A pre-entry tool that only enters
+    /// the boundary through a hot config change stays out of the late set.
+    pub entry_known: Vec<String>,
     /// Whether the editor hint widget is currently registered.
     pub hint_shown: bool,
     /// The current plan file for the session; `None` until the first
@@ -100,6 +105,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
         let current_active = crate::host::get_active_tools(host);
         if entering {
             state.active_snapshot = Some(current_active.clone());
+            state.entry_known = tools.iter().map(|tool| tool.name.clone()).collect();
             // A Plan entry starts a fresh plan file (revisions within the
             // entry overwrite it); session events reset it the same way.
             state.plan_path = None;
@@ -171,10 +177,29 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
         {
             tracing::warn!(%error, "rpi-plan-mode: clearToolExposures failed");
         }
-        if let Some(snapshot) = state.active_snapshot.clone()
-            && let Err(error) = host.call("setActiveTools", json!({ "toolNames": snapshot }))
-        {
-            tracing::warn!(%error, "rpi-plan-mode: active-set restore failed");
+        // Restore the entry snapshot AFTER the release, augmented with the
+        // tools that were hidden only after entry (for example an MCP server
+        // that connected mid-plan): the release re-activates them in the
+        // session, and restoring the bare snapshot afterwards wiped them
+        // again (v0.1.6 review P2-10). Tools that existed at entry keep
+        // exactly their pre-plan active state — including ones that were
+        // inactive before entry.
+        let late_registered: Vec<String> = state
+            .hidden_targets
+            .iter()
+            .filter(|name| !state.entry_known.contains(name))
+            .cloned()
+            .collect();
+        if let Some(snapshot) = state.active_snapshot.clone() {
+            let mut restored = snapshot;
+            for name in &late_registered {
+                if !restored.contains(name) {
+                    restored.push(name.clone());
+                }
+            }
+            if let Err(error) = host.call("setActiveTools", json!({ "toolNames": restored })) {
+                tracing::warn!(%error, "rpi-plan-mode: active-set restore failed");
+            }
         }
         if state.hint_shown && crate::host::has_ui(host) {
             let _ = host.call(
@@ -189,6 +214,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
         state.in_plan = false;
         state.active_snapshot = None;
         state.hidden_targets.clear();
+        state.entry_known.clear();
         state.hint_shown = false;
         // `plan_path` deliberately survives: `/plan file` reports the last
         // plan after exit, and a new Plan entry resets it.
@@ -347,7 +373,45 @@ mod tests {
         let state = state_for_test("s-1");
         assert!(!state.in_plan);
         assert!(state.hidden_targets.is_empty());
+        assert!(state.entry_known.is_empty());
         assert!(state.active_snapshot.is_none());
+    }
+
+    /// v0.1.6 review P2-10: a tool registered while Plan is active (for
+    /// example an MCP server that connected mid-plan) is hidden by the
+    /// boundary and must return to the active set on exit; restoring the
+    /// bare entry snapshot afterwards dropped it.
+    #[test]
+    fn exit_plan_activates_tools_registered_during_plan() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        reconcile(&host);
+        // A server connects mid-plan and registers a direct tool; the next
+        // reconcile hides it with the rest of the boundary.
+        host.register_tool("mcp_extra", "direct", false);
+        reconcile(&host);
+        let state = state_for_test("s-1");
+        assert!(state.hidden_targets.contains(&"mcp_extra".to_owned()));
+        assert!(!state.entry_known.contains(&"mcp_extra".to_owned()));
+        assert_eq!(
+            host.view().exposures.last(),
+            Some(&("mcp_extra".to_owned(), "hidden".to_owned()))
+        );
+
+        host.set_mode("default");
+        assert!(!reconcile(&host));
+        assert_eq!(
+            host.view().active,
+            vec![
+                "read".to_owned(),
+                "edit".to_owned(),
+                "bash".to_owned(),
+                "mcp_extra".to_owned(),
+            ],
+            "late-registered tool is active after exit"
+        );
     }
 
     #[test]

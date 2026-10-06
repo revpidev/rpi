@@ -82,13 +82,31 @@ pub fn next_path(dir: &Path, key: &str) -> PathBuf {
 }
 
 /// Write `content` to `path` (creating parent directories), returning the
-/// byte count.
+/// byte count. Revisions go through a temp file plus rename so a crash
+/// cannot leave a torn plan (v0.1.6 review P3); `allocate_and_write` keeps
+/// its `create_new` allocation.
 pub fn write_file(path: &Path, content: &str) -> std::io::Result<usize> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(content.as_bytes())?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = path.with_extension(format!("md.{}.{unique}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    };
+    if let Err(error) = write() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
     Ok(content.len())
 }
 
@@ -215,5 +233,29 @@ mod tests {
         let bytes = write_file(&path, "v2 longer").expect("second");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "v2 longer");
         assert_eq!(bytes, "v2 longer".len());
+    }
+
+    /// v0.1.6 review P3: a failed revision write must keep the previous
+    /// plan and leave no temp file behind.
+    #[test]
+    fn failed_revision_write_keeps_the_previous_plan() {
+        let temp = TempDir::new("revision-failure");
+        let path = temp.0.join("plans/s1-1.md");
+        write_file(&path, "v1").expect("first");
+        write_file(&path, "v2").expect("second");
+        // Renaming the temp file onto an existing directory fails after the
+        // temp write succeeded; the previous plan must survive.
+        let blocked = temp.0.join("s1-2.md");
+        std::fs::create_dir_all(&blocked).expect("blocked dir");
+        assert!(write_file(&blocked, "v3").is_err());
+        assert!(blocked.is_dir(), "the blocking target is untouched");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "v2");
+        let temps: Vec<String> = std::fs::read_dir(temp.0.join("plans"))
+            .expect("read plans")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "stale temp files: {temps:?}");
     }
 }

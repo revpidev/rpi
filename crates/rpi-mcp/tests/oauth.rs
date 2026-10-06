@@ -204,12 +204,55 @@ async fn refresh_keeps_the_granted_scope() {
     assert_eq!(result, OAuthFlowResult::Authorized);
     let tokens = provider.tokens().await.unwrap();
     assert_eq!(tokens.access_token, "access-2");
-    // A refresh without `scope` keeps the grant's scope.
+    // A refresh without `scope` keeps the grant's scope; without a rotated
+    // `refresh_token` the old one is kept (flow.ts:263).
     assert_eq!(tokens.scope.as_deref(), Some("read write"));
+    assert_eq!(tokens.refresh_token.as_deref(), Some("refresh-1"));
     let forms = state.forms.lock().unwrap();
     assert_eq!(
         forms[0].get("grant_type").map(String::as_str),
         Some("refresh_token")
+    );
+}
+
+/// v0.1.6 review P1-1: a rotated refresh token returned by the
+/// authorization server must replace the old one; keeping the old token
+/// forces a fresh browser login as soon as the server invalidates it.
+#[tokio::test]
+async fn refresh_keeps_the_rotated_refresh_token() {
+    let (as_url, state) = start_as().await;
+    let store: Arc<dyn McpOAuthStateStore> = Arc::new(MemoryOAuthStateStore::default());
+    let provider = provider(&as_url, store);
+    provider
+        .save_tokens(rpi_mcp::oauth::OAuthTokens {
+            access_token: "old".to_owned(),
+            token_type: "bearer".to_owned(),
+            refresh_token: Some("refresh-1".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    *state.token_body.lock().unwrap() = json!({
+        "access_token": "access-2",
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "refresh_token": "refresh-2",
+    });
+    let result = authorize_mcp(
+        &provider,
+        &OAuthFlowOptions {
+            server_url: format!("{as_url}/mcp"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, OAuthFlowResult::Authorized);
+    let tokens = provider.tokens().await.unwrap();
+    assert_eq!(tokens.access_token, "access-2");
+    assert_eq!(
+        tokens.refresh_token.as_deref(),
+        Some("refresh-2"),
+        "the rotated refresh token must win over the old one"
     );
 }
 

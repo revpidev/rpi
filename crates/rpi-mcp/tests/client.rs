@@ -2,6 +2,7 @@
 //! `packages/mcp/test/client.test.ts` @ a13d35a74.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -43,6 +44,9 @@ struct TestServer {
     transport: Arc<InMemoryTransport>,
     messages: Arc<Mutex<Vec<Value>>>,
     handlers: Arc<Mutex<HashMap<String, Handler>>>,
+    /// Methods whose responses echo the request id as a JSON float
+    /// (`1` -> `1.0`), exercising numeric id matching.
+    float_id_methods: Arc<Mutex<HashSet<String>>>,
     _subscription: rpi_mcp::Unsubscribe,
 }
 
@@ -57,16 +61,25 @@ impl TestServer {
     fn messages(&self) -> Vec<Value> {
         self.messages.lock().unwrap().clone()
     }
+
+    fn set_float_id(&self, method: &str) {
+        self.float_id_methods
+            .lock()
+            .unwrap()
+            .insert(method.to_owned());
+    }
 }
 
 async fn create_server() -> (Arc<InMemoryTransport>, TestServer) {
     let (client_transport, server_transport) = create_in_memory_transport_pair();
     let messages: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let handlers: Arc<Mutex<HashMap<String, Handler>>> = Arc::new(Mutex::new(HashMap::new()));
+    let float_id_methods: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let subscription = {
         let transport = server_transport.clone();
         let messages = messages.clone();
         let handlers = handlers.clone();
+        let float_id_methods = float_id_methods.clone();
         server_transport.events().on_message(Arc::new(move |message: &JsonRpcMessage| {
             messages.lock().unwrap().push(message.to_json());
             let JsonRpcMessage::Request { id, method, params } = message else {
@@ -77,6 +90,7 @@ async fn create_server() -> (Arc<InMemoryTransport>, TestServer) {
             let params = params.clone();
             let transport = transport.clone();
             let handlers = handlers.clone();
+            let float_id_methods = float_id_methods.clone();
             tokio::spawn(async move {
                 let handler = handlers.lock().unwrap().get(&method).cloned();
                 let response = match handler {
@@ -95,6 +109,12 @@ async fn create_server() -> (Arc<InMemoryTransport>, TestServer) {
                         "error": {"code": -32601, "message": format!("Method not found: {method}")},
                     }),
                 };
+                let mut response = response;
+                if float_id_methods.lock().unwrap().contains(&method)
+                    && let Some(number) = response.get("id").and_then(Value::as_f64)
+                {
+                    response["id"] = Value::from(number);
+                }
                 let _ = transport.send(response).await;
             });
         }))
@@ -104,6 +124,7 @@ async fn create_server() -> (Arc<InMemoryTransport>, TestServer) {
         transport: server_transport,
         messages,
         handlers,
+        float_id_methods,
         _subscription: subscription,
     };
     server.set_handler(
@@ -125,6 +146,21 @@ async fn connect() -> (Arc<McpClient>, TestServer) {
     let client = McpClient::new(McpClientOptions::new("test-client", "2.0.0"));
     client.connect(client_transport).await.unwrap();
     (client, server)
+}
+
+/// v0.1.6 review P3: a server answering with `1.0` must settle the request
+/// sent with id `1` (upstream compares JS numbers).
+#[tokio::test]
+async fn numeric_response_ids_match_by_value() {
+    let (client, server) = connect().await;
+    server.set_handler("tools/echo", ok(|_| json!({"ok": true})));
+    server.set_float_id("tools/echo");
+    let result = client
+        .request("tools/echo", None, McpRequestOptions::default())
+        .await
+        .expect("1.0 must match the pending request id 1");
+    assert_eq!(result, json!({"ok": true}));
+    client.close().await.unwrap();
 }
 
 #[tokio::test]

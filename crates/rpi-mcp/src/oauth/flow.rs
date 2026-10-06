@@ -491,12 +491,13 @@ pub async fn refresh_authorization(
         ],
     )
     .await?;
-    // A response without a new refresh token keeps the old one.
-    let mut merged = OAuthTokens {
-        refresh_token: Some(options.refresh_token.clone()),
-        ..tokens
-    };
-    if merged.refresh_token.as_deref() == Some("") {
+    // `{ refresh_token: options.refreshToken, ...tokens }` (flow.ts:263): a
+    // rotated refresh token from the authorization server WINS; the old one
+    // is only kept when the response has none. Getting this backwards
+    // discarded every rotated token and forced a fresh login on the next
+    // expiry (v0.1.6 review P1-1).
+    let mut merged = tokens;
+    if merged.refresh_token.is_none() {
         merged.refresh_token = Some(options.refresh_token.clone());
     }
     Ok(merged)

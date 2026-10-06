@@ -159,11 +159,68 @@ pub fn store_keys(name: &str, server_url: &str) -> (String, String) {
     )
 }
 
-fn parse_states(content: Option<&str>) -> HashMap<String, McpOAuthState> {
+/// Parse the credential store. A missing/empty file is an empty store; a
+/// corrupt file is an error, not an empty store: treating a torn file as
+/// empty made the next save drop every other server's credentials
+/// (v0.1.6 review P2-3; upstream `JSON.parse` throws).
+fn parse_states(content: Option<&str>) -> Result<HashMap<String, McpOAuthState>, ()> {
     let Some(content) = content.filter(|content| !content.trim().is_empty()) else {
-        return HashMap::new();
+        return Ok(HashMap::new());
     };
-    serde_json::from_str(content).unwrap_or_default()
+    serde_json::from_str(content).map_err(|_| ())
+}
+
+/// Write the store atomically and privately: the temp file is created 0600
+/// (no world-readable window; v0.1.6 review P2-3) and renamed over the
+/// destination after a successful flush. The temp name carries a random
+/// suffix and `create_new`, so a stale temp from a crash can never be
+/// truncated into a torn store.
+fn write_private_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("mcp-auth.json");
+    let mut last_error = None;
+    for _ in 0..8 {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let temp = parent.join(format!(".{file_name}.{}.{unique}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let mut write = || -> std::io::Result<()> {
+            use std::io::Write;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        };
+        if let Err(error) = write() {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    Err(last_error
+        .unwrap_or_else(|| std::io::Error::other("could not create a unique mcp-auth temp file")))
 }
 
 fn serialize_states(states: &HashMap<String, McpOAuthState>) -> String {
@@ -203,9 +260,10 @@ impl McpOAuthServerStore {
     }
 
     /// `load` (oauth.ts:131): the first server to load legacy state takes it
-    /// over inside the storage lock.
+    /// over inside the storage lock. `None` also covers an unreadable store
+    /// (the lock/corruption branches fail closed).
     pub async fn load(&self) -> Option<McpOAuthState> {
-        self.with_file_lock(|states| {
+        self.with_file_lock(None, |states| {
             if states.contains_key(&self.key) || !states.contains_key(&self.legacy_key) {
                 return (states.get(&self.key).cloned(), None);
             }
@@ -220,7 +278,7 @@ impl McpOAuthServerStore {
 
     /// `save`.
     pub async fn save(&self, state: McpOAuthState) {
-        self.with_file_lock(|states| {
+        self.with_file_lock((), |states| {
             states.insert(self.key.clone(), state);
             ((), Some(serialize_states(states)))
         });
@@ -228,29 +286,32 @@ impl McpOAuthServerStore {
 
     /// `withRefreshLock` (oauth.ts:162): a lock file per server, released on
     /// drop, so another process can take over after a crash.
-    pub async fn with_refresh_lock<T, F, Fut>(&self, action: F) -> T
+    ///
+    /// Lock acquisition failures fail closed (`None`): upstream's
+    /// proper-lockfile throws and the refresh aborts; proceeding unlocked
+    /// could race a rotating refresh token (v0.1.6 review P2-3).
+    pub async fn with_refresh_lock<T, F, Fut>(&self, action: F) -> Option<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T>,
     {
         let Some(lock_dir) = &self.lock_dir else {
-            return action().await;
+            return Some(action().await);
         };
-        let _ = std::fs::create_dir_all(lock_dir);
+        if std::fs::create_dir_all(lock_dir).is_err() {
+            return None;
+        }
         use sha2::Digest;
         let digest = sha2::Sha256::digest(self.key.as_bytes());
         let name = format!("mcp-auth-refresh-{}", &format!("{digest:x}")[..16]);
         let lock_path = lock_dir.join(name);
-        let lock = match std::fs::OpenOptions::new()
+        let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(_) => return action().await,
-        };
+            .ok()?;
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(REFRESH_LOCK_WAIT_MS);
         loop {
@@ -259,57 +320,66 @@ impl McpOAuthServerStore {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
                         // A lock that is never released must not stall the
-                        // flow forever; proceed best-effort (the storage
-                        // write is still atomic under the file lock).
-                        break;
+                        // flow forever; upstream's retry budget is exhausted
+                        // here and the refresh fails closed.
+                        return None;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(REFRESH_LOCK_RETRY_MS))
                         .await;
                 }
-                Err(_) => break,
+                Err(_) => return None,
             }
         }
         let result = action().await;
         let _ = FileExt::unlock(&lock);
-        result
+        Some(result)
     }
 
-    fn with_file_lock<T, F>(&self, action: F) -> T
+    fn with_file_lock<T, F>(&self, fallback: T, action: F) -> T
     where
         F: FnOnce(&mut HashMap<String, McpOAuthState>) -> (T, Option<String>),
     {
         let lock_path = self.path.with_extension("json.lock");
-        if let Some(parent) = lock_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            tracing::warn!(dir = %parent.display(), "MCP: OAuth store lock dir unavailable; refusing to touch credentials");
+            return fallback;
         }
-        let lock = std::fs::OpenOptions::new()
+        let lock = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
-            .ok();
-        if let Some(lock) = &lock {
-            let _ = lock.lock_exclusive();
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(%error, "MCP: OAuth store lock unavailable; refusing to touch credentials");
+                return fallback;
+            }
+        };
+        if let Err(error) = lock.lock_exclusive() {
+            tracing::warn!(%error, "MCP: OAuth store lock failed; refusing to touch credentials");
+            return fallback;
         }
         let content = std::fs::read_to_string(&self.path).ok();
-        let mut states = parse_states(content.as_deref());
+        let mut states = match parse_states(content.as_deref()) {
+            Ok(states) => states,
+            Err(()) => {
+                tracing::warn!(path = %self.path.display(), "MCP: OAuth store is corrupted; refusing to overwrite it");
+                let _ = FileExt::unlock(&lock);
+                return fallback;
+            }
+        };
         let (result, next) = action(&mut states);
-        if let Some(next) = next {
-            if let Some(parent) = self.path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&self.path, next);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-            }
+        if let Some(next) = next
+            && let Err(error) = write_private_atomic(&self.path, &next)
+        {
+            tracing::warn!(%error, path = %self.path.display(), "MCP: OAuth store write failed");
         }
-        if let Some(lock) = &lock {
-            let _ = FileExt::unlock(lock);
-        }
+        let _ = FileExt::unlock(&lock);
         result
     }
 }
@@ -364,7 +434,7 @@ impl McpOAuthCredentialStore {
             key,
             legacy_key,
         };
-        store.with_file_lock(|states| {
+        store.with_file_lock(None, |states| {
             let tokens = states
                 .get(&store.key)
                 .or_else(|| states.get(&store.legacy_key))
@@ -383,7 +453,7 @@ impl McpOAuthCredentialStore {
             key,
             legacy_key,
         };
-        store.with_file_lock(|states| {
+        store.with_file_lock(false, |states| {
             let stored = if states.contains_key(&store.key) {
                 Some(store.key.clone())
             } else if states.contains_key(&store.legacy_key) {
@@ -473,7 +543,7 @@ impl McpAuthProvider {
     ) -> Result<(), McpError> {
         let _in_process = self.refreshing.lock().await;
         let store = &self.store;
-        store
+        let Some(result) = store
             .with_refresh_lock(|| async {
                 let state = store.load().await;
                 let Some(tokens) = state.as_ref().and_then(|state| state.tokens.clone()) else {
@@ -535,6 +605,12 @@ impl McpAuthProvider {
                 }
             })
             .await
+        else {
+            return Err(McpError::Transport(
+                "another process holds the credential refresh lock".to_owned(),
+            ));
+        };
+        result
     }
 }
 
@@ -1032,5 +1108,40 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// v0.1.6 review P2-3: a torn store must not read as empty (the next
+    /// save would then drop every other server's credentials).
+    #[tokio::test]
+    async fn corrupt_store_fails_closed_and_is_not_overwritten() {
+        let (credentials, dir) = store("docs");
+        let path = dir.path.join("mcp-auth.json");
+        let torn = "{\"a|url\": {\"serverUrl\":";
+        std::fs::write(&path, torn).unwrap();
+        let server = credentials.for_server("docs", "https://mcp.example/mcp");
+        assert!(
+            server.load().await.is_none(),
+            "a corrupt store must not read as empty"
+        );
+        server
+            .save(McpOAuthState {
+                server_url: "https://mcp.example/mcp".to_owned(),
+                client_information: None,
+                tokens: Some(OAuthTokens {
+                    access_token: "new".to_owned(),
+                    token_type: "bearer".to_owned(),
+                    ..Default::default()
+                }),
+                tokens_expire_at: None,
+                code_verifier: None,
+                oauth_state: None,
+                discovery: None,
+            })
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            torn,
+            "the corrupt store must be preserved, not overwritten"
+        );
     }
 }

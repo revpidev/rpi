@@ -23,6 +23,28 @@ pub enum JsonRpcId {
     String(String),
 }
 
+impl JsonRpcId {
+    /// Numeric identity for response matching: JSON `1` and `1.0` are the
+    /// same JavaScript number and upstream matches them (`1 === 1.0`). The
+    /// Rust `serde_json::Number` equality distinguishes the two spellings,
+    /// which used to leave an answered request waiting for its timeout
+    /// (v0.1.6 review P3). The `as_f64` fallback is exact for the ids this
+    /// client issues (a small `u64` counter); integers above 2^53 could in
+    /// principle compare equal by rounding.
+    pub fn numerically_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (JsonRpcId::Number(a), JsonRpcId::Number(b)) => {
+                if a == b {
+                    return true;
+                }
+                matches!((a.as_f64(), b.as_f64()), (Some(a), Some(b)) if a == b)
+            }
+            (JsonRpcId::String(a), JsonRpcId::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl Hash for JsonRpcId {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
@@ -318,6 +340,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// v0.1.6 review P3: JSON `1` and `1.0` are the same id for response
+    /// matching (upstream `1 === 1.0`).
+    #[test]
+    fn numeric_ids_compare_by_value() {
+        let one: JsonRpcId = serde_json::from_value(json!(1)).expect("id");
+        let one_point_zero: JsonRpcId = serde_json::from_value(json!(1.0)).expect("id");
+        assert_ne!(
+            one, one_point_zero,
+            "serde_json keeps the spellings distinct"
+        );
+        assert!(one.numerically_eq(&one_point_zero));
+        assert!(one_point_zero.numerically_eq(&one));
+        let two: JsonRpcId = serde_json::from_value(json!(2)).expect("id");
+        assert!(!one.numerically_eq(&two));
+        let text: JsonRpcId = serde_json::from_value(json!("1")).expect("id");
+        assert!(!one.numerically_eq(&text));
+        assert!(text.numerically_eq(&text));
+        assert!(!text.numerically_eq(&one));
+    }
 
     #[test]
     fn classifies_messages_like_upstream() {

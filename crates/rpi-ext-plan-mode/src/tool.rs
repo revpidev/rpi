@@ -68,6 +68,12 @@ pub fn command_definition() -> Value {
 
 /// Execute one `write_plan` call.
 pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
+    // Defense in depth (v0.1.6 review P3): the tool is only active inside
+    // Plan mode, but a nested `executeTool`/manual dispatch must not write a
+    // plan or leave Plan mode outside it.
+    if host::get_mode(host) != "plan" {
+        return error_result("write_plan: only available in plan mode".to_owned());
+    }
     let Some(content) = params.get("content").and_then(Value::as_str) else {
         return error_result("write_plan: 'content' (string) is required".to_owned());
     };

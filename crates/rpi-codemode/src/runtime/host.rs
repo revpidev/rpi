@@ -28,6 +28,15 @@ use crate::types::{
 #[cfg(test)]
 static LIVE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Hard cap on the output the host accumulates before the script settles
+/// (v0.1.6 review P1-5). Upstream accumulates unbounded and truncates to the
+/// token budget only after the run, so a runaway `text()` loop can exhaust
+/// host memory; this cap drops further items instead of terminating the
+/// script (review decision: drop excess, do not kill). The end-of-run
+/// token-budget truncation and full-output spill still apply to what was
+/// collected.
+pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Decrements [`LIVE_WORKERS`] when a worker thread exits (test builds).
 #[cfg(test)]
 struct WorkerThreadGuard;
@@ -167,7 +176,10 @@ impl CodemodeSandbox {
         lock(&self.running).insert(execution_id, abort.clone());
         let result = self.run_execution(code, options, abort).await;
         lock(&self.running).remove(&execution_id);
-        self.idle.notify_one();
+        // `notify_waiters` (not `notify_one`): every concurrent `close()`
+        // caller must observe the last execution settling, otherwise one of
+        // them hangs forever (v0.1.6 review P3).
+        self.idle.notify_waiters();
         result
     }
 
@@ -214,6 +226,24 @@ impl CodemodeSandbox {
             .map(|ms| Instant::now() + Duration::from_millis(ms));
 
         let interrupt = Arc::new(AtomicBool::new(false));
+        // The caller's cancellation signal joins the sandbox-internal abort
+        // token (v0.1.6 review P0-2): upstream attaches an `abort` listener
+        // to the signal that finishes the execution, so Esc must settle the
+        // host future even when the script never settles on its own.
+        let external_signal = options.signal.clone();
+        let abort_for_cancel = abort.clone();
+        let cancelled = async move {
+            match external_signal {
+                Some(signal) => {
+                    tokio::select! {
+                        _ = abort_for_cancel.cancelled() => {}
+                        _ = signal.cancelled() => {}
+                    }
+                }
+                None => abort_for_cancel.cancelled().await,
+            }
+        };
+        tokio::pin!(cancelled);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (replies_tx, replies_rx) = std::sync::mpsc::channel();
         let worker_input = WorkerInput {
@@ -248,6 +278,10 @@ impl CodemodeSandbox {
 
         let calls = Arc::new(Mutex::new(CallTable::default()));
         let mut output: Vec<CodemodeOutputItem> = Vec::new();
+        // Cumulative output bytes; items past `MAX_OUTPUT_BYTES` are dropped
+        // with a single warning item (see the constant).
+        let mut output_bytes: usize = 0;
+        let mut output_overflowed = false;
         let abort_message = |closed: bool| {
             if closed {
                 "Sandbox closed"
@@ -270,7 +304,7 @@ impl CodemodeSandbox {
             };
             tokio::select! {
                 biased;
-                _ = abort.cancelled() => {
+                _ = &mut cancelled => {
                     interrupt.store(true, Ordering::SeqCst);
                     abandoned = true;
                     outcome = CodemodeResult::Err {
@@ -305,7 +339,26 @@ impl CodemodeSandbox {
                 }
                 message = events_rx.recv() => {
                     match message {
-                        Some(WorkerToHost::Output(item)) => output.push(item),
+                        Some(WorkerToHost::Output(item)) => {
+                            let size = match &item {
+                                CodemodeOutputItem::Text { text } => text.len(),
+                                CodemodeOutputItem::Image { data, .. } => data.len(),
+                            };
+                            if output_bytes.saturating_add(size) > MAX_OUTPUT_BYTES {
+                                if !output_overflowed {
+                                    output_overflowed = true;
+                                    output.push(CodemodeOutputItem::Text {
+                                        text: format!(
+                                            "Warning: script output exceeded {} MiB; further output was discarded.",
+                                            MAX_OUTPUT_BYTES / (1024 * 1024)
+                                        ),
+                                    });
+                                }
+                            } else {
+                                output_bytes += size;
+                                output.push(item);
+                            }
+                        }
                         Some(WorkerToHost::Call { id, target, name, args }) => {
                             let source = if target == CallTarget::Tool {
                                 lookup_tool(&tools, &name)
@@ -341,7 +394,7 @@ impl CodemodeSandbox {
                             };
                             let parsed = match args {
                                 None => Ok(Value::Null),
-                                Some(text) => serde_json::from_str::<Value>(&text).map_err(|error| error.to_string()),
+                                Some(text) => parse_deep_value(&text).map_err(|error| error.to_string()),
                             };
                             let args_value = match parsed {
                                 Ok(value) => value,
@@ -363,14 +416,38 @@ impl CodemodeSandbox {
                             });
                         }
                         Some(WorkerToHost::Done { ok, value, writes, error }) => {
+                            let (store_writes, store_warning) =
+                                parse_store_writes(writes.as_deref());
+                            if let Some(warning) = store_warning {
+                                output.push(CodemodeOutputItem::Text { text: warning });
+                            }
+                            // A return value that cannot be decoded (over the
+                            // nesting bound) is reported, not silently NULLed
+                            // (v0.1.6 review follow-up).
+                            let parsed_value = if ok {
+                                match value {
+                                    Some(text) => match parse_deep_value(&text) {
+                                        Ok(value) => Some(value),
+                                        Err(_) => {
+                                            output.push(CodemodeOutputItem::Text {
+                                                text: format!(
+                                                    "Warning: the script return value was discarded (JSON nesting limit {MAX_JSON_DEPTH})."
+                                                ),
+                                            });
+                                            None
+                                        }
+                                    },
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
                             outcome = if ok {
                                 CodemodeResult::Ok {
-                                    value: value.map(|text| {
-                                        serde_json::from_str::<Value>(&text).unwrap_or(Value::Null)
-                                    }),
+                                    value: parsed_value,
                                     output: std::mem::take(&mut output),
                                     calls: finish_calls(&calls),
-                                    store_writes: parse_store_writes(writes.as_deref()),
+                                    store_writes,
                                 }
                             } else {
                                 CodemodeResult::Err {
@@ -457,14 +534,17 @@ fn serialize_store(store: Option<&Value>) -> serde_json::Map<String, Value> {
 }
 
 /// `parseStoreWrites` (host.ts:49-56): entries of `[key, json]` (set) and
-/// `[key]` (delete).
-fn parse_store_writes(json: Option<&str>) -> CodemodeStoreWrites {
+/// `[key]` (delete). Returns a warning when a value could not be decoded
+/// (deep nesting), so the loss is visible instead of silent (v0.1.6 review
+/// P3).
+fn parse_store_writes(json: Option<&str>) -> (CodemodeStoreWrites, Option<String>) {
     let mut writes = CodemodeStoreWrites::default();
+    let mut failed: Vec<String> = Vec::new();
     let Some(json) = json else {
-        return writes;
+        return (writes, None);
     };
-    let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(json) else {
-        return writes;
+    let Ok(Value::Array(entries)) = parse_deep_value(json) else {
+        return (writes, None);
     };
     for entry in entries {
         let Some(entry) = entry.as_array() else {
@@ -478,12 +558,70 @@ fn parse_store_writes(json: Option<&str>) -> CodemodeStoreWrites {
         } else if let Some(Value::String(value)) = entry.get(1) {
             // The worker sends `[key, json]` where `json` is the value's JSON
             // text; `parseStoreWrites` parses it back (host.ts:49-56).
-            if let Ok(parsed) = serde_json::from_str::<Value>(value) {
-                writes.set.insert(key.to_owned(), parsed);
+            match parse_deep_value(value) {
+                Ok(parsed) => {
+                    writes.set.insert(key.to_owned(), parsed);
+                }
+                Err(_) => failed.push(key.to_owned()),
             }
         }
     }
-    writes
+    let warning = (!failed.is_empty()).then(|| {
+        format!(
+            "Warning: codemode store values for {:?} were not persisted (JSON nesting limit {MAX_JSON_DEPTH}).",
+            failed
+        )
+    });
+    (writes, warning)
+}
+
+/// Maximum JSON nesting accepted from the sandbox. serde_json's default
+/// limit (128) silently dropped deep codemode store and return values;
+/// upstream `JSON.parse` handles roughly 10^4 levels but fails beyond that,
+/// so this keeps a bounded, explicit limit (v0.1.6 review P3).
+const MAX_JSON_DEPTH: usize = 1024;
+
+/// Nesting depth of a JSON document (string/escape aware, iterative).
+fn json_depth(text: &str) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
+/// Parse a JSON value with [`MAX_JSON_DEPTH`] as the recursion bound
+/// (serde_json's recursion limit is disabled only after this guard).
+fn parse_deep_value(text: &str) -> Result<Value, serde_json::Error> {
+    if json_depth(text) > MAX_JSON_DEPTH {
+        return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+            "JSON nesting exceeds {MAX_JSON_DEPTH} levels"
+        )));
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    deserializer.disable_recursion_limit();
+    serde::Deserialize::deserialize(&mut deserializer)
 }
 
 /// `handleDone` error branch (host.ts:201-208): `{name?, message, stack?}`.
@@ -692,5 +830,219 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// v0.1.6 review P3: two concurrent `close()` callers must both return
+    /// once the in-flight execution settles (`notify_one` left one of them
+    /// waiting forever).
+    #[tokio::test]
+    async fn concurrent_close_callers_both_return() {
+        let (called_tx, mut called_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sandbox = Arc::new(
+            CodemodeSandbox::new(CodemodeSandboxOptions {
+                tools: vec![hanging_tool(called_tx)],
+                timeout_ms: CodemodeTimeout::Milliseconds(60_000),
+                ..Default::default()
+            })
+            .expect("sandbox"),
+        );
+        let running = {
+            let sandbox = sandbox.clone();
+            tokio::spawn(async move {
+                sandbox
+                    .execute(
+                        "await tools.hang(); return 'never'",
+                        CodemodeExecuteOptions::default(),
+                    )
+                    .await
+                    .expect("execution")
+            })
+        };
+        called_rx.recv().await.expect("tool invoked");
+        let first = sandbox.clone();
+        let second = sandbox.clone();
+        let closes = async move {
+            let (a, b) = tokio::join!(first.close(), second.close());
+            (a, b)
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let _ = &running;
+            closes.await;
+        })
+        .await
+        .expect("both close callers must return");
+        let _ = running.await.expect("join");
+    }
+
+    /// v0.1.6 review P3: deep store values survive the default 128-level
+    /// serde limit; beyond the bounded limit the loss is reported.
+    #[test]
+    fn deep_store_values_round_trip_and_overflows_are_reported() {
+        let deep = format!("{}1{}", "[".repeat(512), "]".repeat(512));
+        let writes_json = serde_json::json!([["k", deep]]).to_string();
+        let (writes, warning) = parse_store_writes(Some(&writes_json));
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(writes.set.contains_key("k"));
+        let too_deep = format!(
+            "{}1{}",
+            "[".repeat(MAX_JSON_DEPTH + 10),
+            "]".repeat(MAX_JSON_DEPTH + 10)
+        );
+        let writes_json = serde_json::json!([["k", too_deep]]).to_string();
+        let (writes, warning) = parse_store_writes(Some(&writes_json));
+        assert!(writes.set.is_empty());
+        assert!(
+            warning.unwrap().contains("not persisted"),
+            "the dropped value must be reported"
+        );
+        // The scanner ignores brackets inside strings.
+        assert_eq!(json_depth(r#"{"a":"[[[[","b":[[1]]}"#), 3);
+    }
+
+    /// v0.1.6 review follow-up: a return value beyond the nesting bound is
+    /// discarded with a visible warning, not silently NULLed.
+    #[tokio::test]
+    async fn over_deep_return_values_are_reported() {
+        let sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+            timeout_ms: CodemodeTimeout::Milliseconds(60_000),
+            ..Default::default()
+        })
+        .expect("sandbox");
+        let result = sandbox
+            .execute(
+                "let v = 1; for (let i = 0; i < 1200; i++) { v = [v]; } return v;",
+                CodemodeExecuteOptions::default(),
+            )
+            .await
+            .expect("execution");
+        let CodemodeResult::Ok { value, output, .. } = result else {
+            panic!("expected ok, got {result:?}");
+        };
+        assert!(value.is_none(), "over-deep return value must be discarded");
+        assert!(
+            output.iter().any(|item| matches!(item, CodemodeOutputItem::Text { text } if text.contains("return value was discarded"))),
+            "expected the return-value warning in {output:?}"
+        );
+    }
+
+    /// v0.1.6 review P0-2: the caller's cancellation signal must settle the
+    /// host execution even when the script never settles on its own
+    /// (upstream attaches an `abort` listener to the signal).
+    #[tokio::test]
+    async fn external_signal_aborts_a_spinning_script() {
+        let sandbox = Arc::new(
+            CodemodeSandbox::new(CodemodeSandboxOptions {
+                timeout_ms: CodemodeTimeout::Infinite,
+                ..Default::default()
+            })
+            .expect("sandbox"),
+        );
+        let before = LIVE_WORKERS.load(Ordering::SeqCst);
+        let signal = CancellationToken::new();
+        let running = {
+            let sandbox = sandbox.clone();
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                sandbox
+                    .execute(
+                        "while (true) {}",
+                        CodemodeExecuteOptions {
+                            signal: Some(signal),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("execution")
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        signal.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("abort must settle the execution")
+            .expect("join");
+        let CodemodeResult::Err { error, .. } = result else {
+            panic!("expected aborted, got {result:?}");
+        };
+        assert_eq!(error.kind, CodemodeErrorKind::Aborted);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while LIVE_WORKERS.load(Ordering::SeqCst) > before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker thread leaked after the signal abort"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// v0.1.6 review P1-4: a script that catches the QuickJS interrupt and
+    /// keeps calling `console.log` (which replenishes fuel) must not spin
+    /// the abandoned worker thread forever — the interrupt now leaves one
+    /// unit of fuel, so the next wasm instruction traps uncatchably.
+    #[tokio::test]
+    async fn timeout_kills_a_script_that_catches_the_interrupt() {
+        let sandbox = Arc::new(
+            CodemodeSandbox::new(CodemodeSandboxOptions {
+                timeout_ms: CodemodeTimeout::Milliseconds(100),
+                ..Default::default()
+            })
+            .expect("sandbox"),
+        );
+        let before = LIVE_WORKERS.load(Ordering::SeqCst);
+        let result = sandbox
+            .execute(
+                "while (true) { try { console.log('x'); } catch (error) {} }",
+                CodemodeExecuteOptions::default(),
+            )
+            .await
+            .expect("execution");
+        let CodemodeResult::Err { error, .. } = result else {
+            panic!("expected timeout, got {result:?}");
+        };
+        assert_eq!(error.kind, CodemodeErrorKind::Timeout);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while LIVE_WORKERS.load(Ordering::SeqCst) > before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker thread spun after the timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// v0.1.6 review P1-5: output past `MAX_OUTPUT_BYTES` is dropped with a
+    /// warning instead of accumulating without bound.
+    #[tokio::test]
+    async fn output_past_the_cap_is_dropped_with_a_warning() {
+        let sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+            timeout_ms: CodemodeTimeout::Milliseconds(60_000),
+            ..Default::default()
+        })
+        .expect("sandbox");
+        let result = sandbox
+            .execute(
+                "for (let i = 0; i < 64; i++) { text('x'.repeat(1 << 20)); }",
+                CodemodeExecuteOptions::default(),
+            )
+            .await
+            .expect("execution");
+        let CodemodeResult::Ok { output, .. } = result else {
+            panic!("expected ok, got {result:?}");
+        };
+        let bytes: usize = output
+            .iter()
+            .map(|item| match item {
+                CodemodeOutputItem::Text { text } => text.len(),
+                CodemodeOutputItem::Image { data, .. } => data.len(),
+            })
+            .sum();
+        assert!(
+            bytes <= MAX_OUTPUT_BYTES + 256,
+            "output cap not enforced: {bytes} bytes"
+        );
+        assert!(
+            output.iter().any(|item| matches!(item, CodemodeOutputItem::Text { text } if text.contains("exceeded"))),
+            "expected the overflow warning in {output:?}"
+        );
     }
 }

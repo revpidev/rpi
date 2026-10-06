@@ -176,7 +176,7 @@ fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), 
     quickjs::set_interrupt_handler(&mut vm.store, &vm.funcs);
 
     let prelude = {
-        let _ = vm.store.set_fuel(FUEL_BUDGET);
+        replenish_fuel(vm);
         match vm.eval(PRELUDE_SOURCE, "codemode-prelude.js") {
             Ok(value) => value,
             Err(thrown) => return crash_from(vm, thrown),
@@ -212,7 +212,7 @@ fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), 
     let store_value = vm.new_string(&store_json)?;
     let undefined = vm.undefined();
     let api = {
-        let _ = vm.store.set_fuel(FUEL_BUDGET);
+        replenish_fuel(vm);
         match vm.call(
             prelude,
             undefined,
@@ -235,7 +235,7 @@ fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), 
     // The prefix shares the first line with the script so reported line
     // numbers match the script as written.
     let source = format!("(async (tools, console) => {{{}\n}})", input.code);
-    let _ = vm.store.set_fuel(FUEL_BUDGET);
+    replenish_fuel(vm);
     let script = match vm.eval(&source, "codemode.js") {
         Ok(value) => value,
         Err(Thrown::Exception(exception)) => {
@@ -256,7 +256,7 @@ fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), 
         return crash_from(vm, thrown);
     }
     vm.free_value(script);
-    let _ = vm.store.set_fuel(FUEL_BUDGET);
+    replenish_fuel(vm);
     if let Err(thrown) = drain(vm, api, stalled) {
         return crash_from(vm, thrown);
     }
@@ -284,7 +284,7 @@ fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), 
         if has_payload {
             vm.free_value(payload_value);
         }
-        let _ = vm.store.set_fuel(FUEL_BUDGET);
+        replenish_fuel(vm);
         if let Err(thrown) = result {
             return crash_from(vm, thrown);
         }
@@ -299,12 +299,25 @@ fn run_script(vm: &mut QuickJsVm<WorkerHost>, input: WorkerInput) -> Result<(), 
     Ok(())
 }
 
+/// Replenish the wasm fuel backstop at a boundary, unless the host has
+/// abandoned this execution. After a timeout/abort the QuickJS interrupt
+/// handler raises a catchable `InternalError`; a script that catches it and
+/// keeps looping (for example `while(true){try{console.log("x")}catch{}}`)
+/// would otherwise replenish its budget at every bridge call and spin the
+/// worker thread forever (v0.1.6 review P1-4). Leaving one unit of fuel in
+/// the store makes the next wasm instruction trap with an uncatchable
+/// wasmtime error, so the thread exits.
+fn replenish_fuel(vm: &mut QuickJsVm<WorkerHost>) {
+    let interrupted = vm.store.data().interrupt.load(Ordering::SeqCst);
+    let _ = vm.store.set_fuel(if interrupted { 1 } else { FUEL_BUDGET });
+}
+
 /// Run queued jobs, then fail a script that waits on nothing that can ever
 /// resume it (`drain` in worker.ts:118-122).
 fn drain(vm: &mut QuickJsVm<WorkerHost>, api: u32, stalled: u32) -> Result<(), Thrown> {
-    let _ = vm.store.set_fuel(FUEL_BUDGET);
+    replenish_fuel(vm);
     vm.execute_pending_jobs()?;
-    let _ = vm.store.set_fuel(FUEL_BUDGET);
+    replenish_fuel(vm);
     let result = vm.call(stalled, api, &[])?;
     vm.free_value(result);
     Ok(())
@@ -337,8 +350,15 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
         .func_wrap(
             "env",
             "host_interrupt",
-            |caller: Caller<'_, WorkerHost>| -> i32 {
-                i32::from(caller.data().interrupt.load(Ordering::SeqCst))
+            |mut caller: Caller<'_, WorkerHost>| -> i32 {
+                let interrupted = caller.data().interrupt.load(Ordering::SeqCst);
+                if interrupted {
+                    // Make the interruption an uncatchable wasm trap at the
+                    // next instruction instead of a catchable JS error
+                    // (v0.1.6 review P1-4).
+                    let _ = caller.as_context_mut().set_fuel(1);
+                }
+                i32::from(interrupted)
             },
         )
         .map_err(|error| error.to_string())?;
@@ -594,8 +614,12 @@ fn host_call(
     let Some(kind_value) = args.first().copied() else {
         return throw_host_error(&mut caller, &qjs, "bridge() expects a kind");
     };
-    // Replenish the CPU backstop at the bridge boundary.
-    let _ = caller.as_context_mut().set_fuel(FUEL_BUDGET);
+    // Replenish the CPU backstop at the bridge boundary. A tiny budget
+    // after abandonment forces the worker to trap out (P1-4).
+    let interrupted = caller.data().interrupt.load(Ordering::SeqCst);
+    let _ = caller
+        .as_context_mut()
+        .set_fuel(if interrupted { 1 } else { FUEL_BUDGET });
     let kind = match quickjs::read_string_value(&mut caller, &qjs.funcs, &qjs.memory, kind_value) {
         Ok(kind) => kind,
         Err(_) => return 0,

@@ -1258,8 +1258,17 @@ fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) ->
         Some(crate::core::themes::terminal_color_mode()),
     )
     .unwrap_or_else(|_| {
-        load_theme("dark", Some(crate::core::themes::terminal_color_mode()))
-            .expect("builtin dark theme must load")
+        // Upstream replaces a failed load with the generated system theme
+        // (theme-controller.ts:180), not with `dark` (v0.1.6 review P2-5);
+        // `dark` stays as the final built-in safety net.
+        crate::core::themes::load_theme(
+            crate::core::themes::SYSTEM_THEME_NAME,
+            Some(crate::core::themes::terminal_color_mode()),
+        )
+        .unwrap_or_else(|_| {
+            load_theme("dark", Some(crate::core::themes::terminal_color_mode()))
+                .expect("builtin dark theme must load")
+        })
     });
     Arc::new(theme)
 }

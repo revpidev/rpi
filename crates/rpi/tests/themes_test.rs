@@ -306,6 +306,19 @@ fn test_resolved_theme_colors_dark() {
     assert!(colors.contains_key("thinkingMax"));
 }
 
+/// v0.1.6 review P2-5: `system` is generated (no theme file), so resolving
+/// it through the file loader returned an empty map and `/export` produced
+/// unstyled HTML. It must resolve like any other theme.
+#[test]
+fn test_resolved_theme_colors_system_is_not_empty() {
+    let colors = get_resolved_theme_colors("system").expect("system theme resolves");
+    assert!(!colors.is_empty(), "system theme must resolve colors");
+    assert!(colors.contains_key("accent"));
+    for hex in colors.values() {
+        assert!(hex.starts_with('#'), "expected hex, got: {hex}");
+    }
+}
+
 // --- COLORFGBG index classification ----------------------------------------
 
 #[test]

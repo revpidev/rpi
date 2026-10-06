@@ -2263,15 +2263,22 @@ pub struct LoadedExtension {
     /// dispatch back into this same extension fails closed instead of
     /// deadlocking.
     route_guard: Arc<RouteGuard>,
+    /// Tool-dispatch reentrancy marker (v0.1.6 review P1-2): set while a
+    /// host call synchronously waits on nested tool work (`executeTool`).
+    /// A dispatch back into this extension during that window could never
+    /// be answered (the guest/plugin thread is blocked in the host call),
+    /// so the tool execute closure fails closed instead of deadlocking.
+    host_call_guard: Arc<RouteGuard>,
 }
 
-/// Per-extension marker for a host call that is synchronously draining a
-/// model request (V16-12 §8-1).
+/// Per-extension marker for a host call that synchronously blocks this
+/// guest/plugin (V16-12 §8-1 model routes; v0.1.6 review P1-2 nested tool
+/// dispatch).
 ///
-/// A route callback that dispatches into the same guest/plugin while that
-/// guest is blocked inside such a host call would deadlock (the guest can
-/// only answer after the host call returns). The route closure checks this
-/// flag and returns a routing error instead.
+/// While the marker is active the extension's thread is inside the host call
+/// and cannot answer another dispatch; a nested dispatch back into it (a
+/// virtual-model route, or a tool call from `executeTool`) would deadlock, so
+/// the entry point checks this flag and fails closed instead.
 #[derive(Default)]
 pub struct RouteGuard {
     active: std::sync::atomic::AtomicBool,
@@ -2353,12 +2360,21 @@ impl LoadedExtension {
             wasm_guest: RwLock::new(None),
             native_plugin: RwLock::new(None),
             route_guard: Arc::new(RouteGuard::default()),
+            host_call_guard: Arc::new(RouteGuard::default()),
         }
     }
 
     /// The route-callback reentrancy marker (V16-12 §8-1).
+    /// Route-callback reentrancy marker (V16-12 §8-1); see
+    /// [`LoadedExtension::route_guard`].
     pub fn route_guard(&self) -> &Arc<RouteGuard> {
         &self.route_guard
+    }
+
+    /// Tool-dispatch reentrancy marker (v0.1.6 review P1-2); see
+    /// [`LoadedExtension::host_call_guard`].
+    pub fn host_call_guard(&self) -> &Arc<RouteGuard> {
+        &self.host_call_guard
     }
 
     /// `hidden` flag (resource-loader.ts:905): named inline extensions may

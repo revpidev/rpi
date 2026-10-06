@@ -12,8 +12,11 @@
 // abi_stable's `#[sabi(kind(Prefix(...)))]` generates a `<Name>_Ref` type.
 #![allow(non_camel_case_types)]
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use abi_stable::library::RootModule;
 use abi_stable::sabi_types::VersionStrings;
@@ -94,11 +97,63 @@ struct NativeCallContext {
     subscriptions: crate::wasm::HostCallSubscriptions,
 }
 
+/// Live plugin contexts by cookie id.
+///
+/// The cookie is a value, not an address: the context is owned by this
+/// registry for as long as the plugin is loaded, and every trampoline call
+/// clones the `Arc` for the duration of the call. A plugin thread that calls
+/// back after `/reload` dropped the plugin (for example the rpi-usage
+/// refresh worker mid-fetch) gets a stale-context error envelope instead of
+/// dereferencing freed memory (v0.1.6 review P2-12).
+static CONTEXTS: OnceLock<Mutex<HashMap<usize, Arc<NativeCallContext>>>> = OnceLock::new();
+
+fn contexts() -> &'static Mutex<HashMap<usize, Arc<NativeCallContext>>> {
+    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_cookie_id() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
+
+fn lookup_context(cookie: PluginCookie) -> Option<Arc<NativeCallContext>> {
+    let id = cookie as usize;
+    if id == 0 {
+        return None;
+    }
+    contexts()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&id)
+        .cloned()
+}
+
+fn remove_context(id: usize) {
+    contexts()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&id);
+}
+
+/// Response for a call on an unloaded plugin's context (the native ABI's
+/// error envelope shape).
+fn stale_context_response() -> RVec<u8> {
+    let envelope = serde_json::json!({
+        "error": {
+            "kind": "stale",
+            "message": "the extension was unloaded while this call was in flight",
+        }
+    });
+    RVec::from(serde_json::to_vec(&envelope).unwrap_or_else(|_| b"null".to_vec()))
+}
+
 /// The host-side trampoline handed to plugins as `PluginHostCall`.
 extern "C" fn host_call_trampoline(cookie: PluginCookie, request: RVec<u8>) -> RVec<u8> {
-    // The cookie lives in the NativePlugin holder on the LoadedExtension
-    // (outlives every call); align/validity is guaranteed by construction.
-    let context = unsafe { &*(cookie as *const NativeCallContext) };
+    // The registry owns the context; the clone keeps it alive for this call
+    // even when the plugin is dropped concurrently (P2-12).
+    let Some(context) = lookup_context(cookie) else {
+        return stale_context_response();
+    };
     let mut state = crate::wasm::HostState {
         api: context.api.clone(),
         capabilities: context.capabilities.clone(),
@@ -114,12 +169,21 @@ extern "C" fn host_call_trampoline(cookie: PluginCookie, request: RVec<u8>) -> R
     RVec::from(response)
 }
 
-/// A loaded native plugin (keeps the library and call context alive).
+/// A loaded native plugin (keeps the library mapped and its host-call
+/// context registered).
 pub struct NativePlugin {
     #[allow(dead_code)] // the field keeps the library mapped
     module: RpiNativeModule_Ref,
-    #[allow(dead_code)] // owns the cookie pointee
-    context: Box<NativeCallContext>,
+    /// Registry key; the context itself lives in [`CONTEXTS`].
+    cookie: usize,
+}
+
+impl Drop for NativePlugin {
+    fn drop(&mut self) {
+        // Only this plugin's entry; in-flight trampolines keep their cloned
+        // `Arc` and finish safely, and later calls answer `stale`.
+        remove_context(self.cookie);
+    }
 }
 
 /// Per-path `RpiNativeModule_Ref` load (no per-type memoization): open the
@@ -168,26 +232,24 @@ pub async fn load_native_plugin(
     let dispatch_fn = module.rpi_dispatch();
     let init_fn = module.rpi_extension_init();
 
-    let cookie_box = Box::new(NativeCallContext {
+    let cookie_id = next_cookie_id();
+    let cookie_ptr = cookie_id as PluginCookie;
+    let context = Arc::new(NativeCallContext {
         api: api.clone(),
         capabilities,
         async_handle: tokio::runtime::Handle::current(),
-        // Placeholder replaced below (the forward needs the cookie).
         forward: DispatchTarget::Native(NativeForward {
             dispatch_fn,
-            cookie: 0,
+            cookie: cookie_id,
         }),
         tool_updates: crate::wasm::PendingToolUpdates::default(),
         tool_aborts: crate::wasm::PendingToolAborts::default(),
         subscriptions: crate::wasm::HostCallSubscriptions::default(),
     });
-    let cookie_ptr = &*cookie_box as *const NativeCallContext as PluginCookie;
-    let cookie = cookie_ptr as usize;
-    let mut context = cookie_box;
-    context.forward = DispatchTarget::Native(NativeForward {
-        dispatch_fn,
-        cookie,
-    });
+    contexts()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(cookie_id, context.clone());
 
     let receipt_bytes = init_fn(
         RpiHostCalls {
@@ -195,18 +257,83 @@ pub async fn load_native_plugin(
         },
         cookie_ptr,
     );
-    let receipt: Value = serde_json::from_slice(&receipt_bytes[..])
-        .map_err(|e| format!("plugin init returned invalid JSON: {e}"))?;
+    let receipt: Value = match serde_json::from_slice(&receipt_bytes[..]) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            // A failed load must not leave a registered context behind.
+            remove_context(cookie_id);
+            return Err(format!("plugin init returned invalid JSON: {error}"));
+        }
+    };
     if let Some(error) = receipt.get("error") {
         let kind = error.get("kind").and_then(Value::as_str).unwrap_or("call");
         let message = error
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("plugin init failed");
+        remove_context(cookie_id);
         return Err(format!("{kind}: {message}"));
     }
 
-    api.extension()
-        .set_native_plugin(NativePlugin { module, context });
+    api.extension().set_native_plugin(NativePlugin {
+        module,
+        cookie: cookie_id,
+    });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{ExtensionApi, ExtensionRuntime, LoadedExtension};
+
+    extern "C" fn stub_dispatch(_cookie: PluginCookie, _message: RVec<u8>) -> RVec<u8> {
+        RVec::from(b"null".to_vec())
+    }
+
+    fn test_context(runtime: &tokio::runtime::Runtime) -> Arc<NativeCallContext> {
+        Arc::new(NativeCallContext {
+            api: ExtensionApi::for_extension(
+                Arc::new(LoadedExtension::new(
+                    "<inline:native-registry>",
+                    "<inline:native-registry>",
+                )),
+                ExtensionRuntime::new(),
+                "/test-cwd",
+            ),
+            capabilities: HashSet::new(),
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Native(NativeForward {
+                dispatch_fn: stub_dispatch,
+                cookie: 0,
+            }),
+            tool_updates: crate::wasm::PendingToolUpdates::default(),
+            tool_aborts: crate::wasm::PendingToolAborts::default(),
+            subscriptions: crate::wasm::HostCallSubscriptions::default(),
+        })
+    }
+
+    /// v0.1.6 review P2-12: the trampoline resolves the context through the
+    /// registry, so a plugin thread that calls back after unload gets a
+    /// stale-context envelope instead of dereferencing freed memory.
+    #[test]
+    fn removed_context_answers_stale_instead_of_dangling() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let id = next_cookie_id();
+        contexts()
+            .lock()
+            .unwrap()
+            .insert(id, test_context(&runtime));
+        assert!(lookup_context(id as PluginCookie).is_some());
+        remove_context(id);
+        assert!(lookup_context(id as PluginCookie).is_none());
+
+        let response = host_call_trampoline(
+            id as PluginCookie,
+            RVec::from(br#"{"call":"getFlag","args":{}}"#.to_vec()),
+        );
+        let response: Value = serde_json::from_slice(&response[..]).expect("stale JSON envelope");
+        assert_eq!(response["error"]["kind"], "stale");
+        assert!(lookup_context(std::ptr::null()).is_none());
+    }
 }

@@ -627,11 +627,34 @@ impl OpenAiChatGptOAuth {
         });
 
         let manual_cancel = CancellationToken::new();
+        // Upstream signals the manual prompt with
+        // `AbortSignal.any([manualAbort.signal, interaction.signal])`
+        // (openai-chatgpt.ts:278): an interaction abort must cancel the
+        // prompt too, not only the later token exchange (v0.1.6 review
+        // P2-2).
+        let prompt_signal = CancellationToken::new();
+        let prompt_watcher = {
+            let prompt_signal = prompt_signal.clone();
+            let manual_cancel = manual_cancel.clone();
+            let interaction_signal = interaction.signal();
+            tokio::spawn(async move {
+                match interaction_signal {
+                    Some(signal) => {
+                        tokio::select! {
+                            _ = signal.cancelled() => {}
+                            _ = manual_cancel.cancelled() => {}
+                        }
+                    }
+                    None => manual_cancel.cancelled().await,
+                }
+                prompt_signal.cancel();
+            })
+        };
         let prompt = interaction.prompt(AuthPrompt::ManualCode {
             message: "Complete login in your browser, or paste the final redirect URL here:"
                 .to_owned(),
             placeholder: Some(REDIRECT_URI.to_owned()),
-            signal: Some(manual_cancel.clone()),
+            signal: Some(prompt_signal),
         });
         tokio::pin!(prompt);
 
@@ -658,6 +681,7 @@ impl OpenAiChatGptOAuth {
         if let Some(callback) = callback {
             callback.close().await;
         }
+        prompt_watcher.abort();
 
         // `catch (error) { if (interaction.signal.aborted) throw ... }` —
         // an aborted login reports cancellation, not the prompt error.
@@ -1217,6 +1241,47 @@ mod tests {
         let credential = task.await.expect("join").expect("login");
         assert_eq!(credential.access, "access-token");
         assert_eq!(credential.extra["clientId"], json!("oaiapp_issued"));
+    }
+
+    /// v0.1.6 review P2-2: aborting the interaction must cancel the manual
+    /// prompt too (upstream signals it with
+    /// `AbortSignal.any([manualAbort.signal, interaction.signal])`), not
+    /// only the later token exchange.
+    #[tokio::test]
+    async fn interaction_abort_cancels_the_manual_prompt() {
+        let mock = MockTokenEndpoint::start(token_response(REQUIRED_SCOPE)).await;
+        let callback_port = free_port();
+        let oauth = OpenAiChatGptOAuth::with_endpoints(
+            format!("{}/api/accounts/oauth/token", mock.url),
+            callback_port,
+        );
+        let interaction = Arc::new(PendingInteraction::new());
+        let interaction_for_task = interaction.clone();
+        let task = tokio::spawn(async move {
+            let options = device_options();
+            oauth
+                .login(interaction_for_task.as_ref(), Some(&options))
+                .await
+        });
+        // Wait until the login emitted the authorization URL; by then the
+        // pending manual prompt owns the prompt signal.
+        for _ in 0..1000 {
+            if interaction
+                .events()
+                .iter()
+                .any(|event| matches!(event, AuthEvent::AuthUrl { .. }))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        interaction.signal.cancel();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("an interaction abort must settle the login")
+            .expect("join")
+            .expect_err("login cancelled");
+        assert!(error.message.contains("Login cancelled"), "{error:?}");
     }
 
     /// A bind failure degrades to the pasted redirect URL.

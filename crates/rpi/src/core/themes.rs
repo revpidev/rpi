@@ -906,9 +906,13 @@ pub struct Theme {
 // ===========================================================================
 
 /// Parse `"#RRGGBB"` into [`Rgb`] (theme.ts:171-183).
+///
+/// The ASCII check before slicing matters: a 6-byte non-ASCII value such
+/// as `"#€abc"` byte-slices through a char boundary and panicked
+/// (v0.1.6 review P2-6).
 fn hex_to_rgb(hex: &str) -> Result<Rgb, RpiError> {
     let cleaned = hex.strip_prefix('#').unwrap_or(hex);
-    if cleaned.len() != 6 {
+    if cleaned.len() != 6 || !cleaned.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(RpiError::Resource(format!("Invalid hex color: {}", hex)));
     }
     let r = u32::from_str_radix(&cleaned[0..2], 16)
@@ -1064,6 +1068,11 @@ fn bg_ansi(color: &ResolvedColor, mode: ColorMode) -> Result<String, RpiError> {
 
 /// Resolve a colour value, following variable references recursively with
 /// cycle detection (theme.ts:293-309).
+/// Maximum variable-reference chain length. A non-cyclic chain otherwise
+/// recurses once per link and can overflow the stack with a ~10k-link
+/// theme (v0.1.6 review P3); the bound also keeps cycle detection cheap.
+const MAX_VAR_REF_DEPTH: usize = 256;
+
 fn resolve_var_refs(
     value: &ColorValue,
     vars: &HashMap<String, ColorValue>,
@@ -1083,6 +1092,11 @@ fn resolve_var_refs(
                 return Err(RpiError::Resource(format!(
                     "Circular variable reference detected: {}",
                     s
+                )));
+            }
+            if visited.len() >= MAX_VAR_REF_DEPTH {
+                return Err(RpiError::Resource(format!(
+                    "Variable reference chain too deep (limit {MAX_VAR_REF_DEPTH}): {s}"
                 )));
             }
             let referenced = vars.get(s).ok_or_else(|| {
@@ -1242,21 +1256,26 @@ pub fn validate_theme_json(label: &str, value: &serde_json::Value) -> Result<The
     let mut missing_colors: Vec<String> = Vec::new();
     let mut other_errors: Vec<String> = Vec::new();
 
-    // Check top-level allowed keys (additionalProperties: false)
-    const ALLOWED_TOP_KEYS: &[&str] = &["$schema", "name", "vars", "colors", "export"];
-    if let Some(obj) = value.as_object() {
-        for key in obj.keys() {
-            if !ALLOWED_TOP_KEYS.contains(&key.as_str()) {
-                other_errors.push(format!("  - /{}: additional property not allowed", key));
-            }
-        }
-    }
+    // Upstream validates with typebox (`theme-json.ts:14-38`), whose
+    // `Type.Object` ignores additional properties: unknown keys are
+    // additive and must not fail a user theme (v0.1.6 review P1-7 — the
+    // `additionalProperties: false` in `theme-schema.json` is editor
+    // tooling only, and the previous check rejected the documented
+    // `appearance` field).
 
     // Check name
     match value.get("name") {
         Some(serde_json::Value::String(_)) => {}
         Some(_) => other_errors.push("  - /name: expected string".to_string()),
         None => other_errors.push("  - : missing required property: name".to_string()),
+    }
+
+    // Check appearance (optional; enum dark|light)
+    match value.get("appearance") {
+        None => {}
+        Some(serde_json::Value::String(appearance))
+            if appearance == "dark" || appearance == "light" => {}
+        Some(_) => other_errors.push("  - /appearance: expected \"dark\" or \"light\"".to_string()),
     }
 
     // Check colors
@@ -1283,18 +1302,11 @@ pub fn validate_theme_json(label: &str, value: &serde_json::Value) -> Result<The
                     missing_colors.push((*key).to_string());
                 }
             }
-            // Check allowed keys (additionalProperties: false)
-            for key in obj.keys() {
-                if !ALLOWED_COLOR_KEYS.contains(&key.as_str()) {
-                    other_errors.push(format!(
-                        "  - /colors/{}: additional property not allowed",
-                        key
-                    ));
-                }
-            }
-            // Check value types
+            // Value types for known color tokens; unknown tokens are
+            // ignored entirely, like upstream typebox additional properties
+            // (v0.1.6 review follow-up).
             for (key, val) in obj {
-                if !is_valid_color_value(val) {
+                if ALLOWED_COLOR_KEYS.contains(&key.as_str()) && !is_valid_color_value(val) {
                     other_errors.push(format!(
                         "  - /colors/{}: expected string or integer 0-255",
                         key
@@ -1321,17 +1333,10 @@ pub fn validate_theme_json(label: &str, value: &serde_json::Value) -> Result<The
         if !export.is_object() {
             other_errors.push("  - /export: expected object".to_string());
         } else if let Some(obj) = export.as_object() {
-            const ALLOWED_EXPORT_KEYS: &[&str] = &["pageBg", "cardBg", "infoBg"];
-            for key in obj.keys() {
-                if !ALLOWED_EXPORT_KEYS.contains(&key.as_str()) {
-                    other_errors.push(format!(
-                        "  - /export/{}: additional property not allowed",
-                        key
-                    ));
-                }
-            }
             for (key, val) in obj {
-                if !is_valid_color_value(val) {
+                if matches!(key.as_str(), "pageBg" | "cardBg" | "infoBg")
+                    && !is_valid_color_value(val)
+                {
                     other_errors.push(format!(
                         "  - /export/{}: expected string or integer 0-255",
                         key
@@ -1566,7 +1571,20 @@ pub fn theme_json_value(name: &str) -> Option<serde_json::Value> {
 
 /// Resolve theme colours as CSS-compatible hex strings
 /// (theme.ts:1022-1043).
+///
+/// The generated `system` theme has no JSON file, so it is constructed
+/// directly like upstream `loadTheme(SYSTEM_THEME_NAME)`; resolving it
+/// through the custom-theme loader returned an empty map and `/export`
+/// produced unstyled HTML (v0.1.6 review P2-5).
 pub fn get_resolved_theme_colors(theme_name: &str) -> Result<HashMap<String, String>, RpiError> {
+    if theme_name == SYSTEM_THEME_NAME {
+        let theme = create_system_theme(None);
+        return Ok(theme
+            .colors()
+            .iter()
+            .map(|(key, color)| (key.clone(), tui_colors::color_to_hex(color)))
+            .collect());
+    }
     let is_light = theme_name == "light";
     let theme_json = load_theme_json(theme_name)?;
     let colors = with_color_fallbacks(theme_json.colors.clone());
@@ -1977,7 +1995,10 @@ impl Theme {
                 if self.dim_tokens.contains(token) {
                     attributes.dim = true;
                 }
-                Some(self.get_fg_ansi(token))
+                // The plain stored ANSI: the dim SGR comes from the
+                // attribute above, and `get_fg_ansi` would add a second
+                // `SGR 2` (v0.1.6 review P3).
+                Some(self.fg_colors.get(token).cloned().unwrap_or_default())
             }
             Some(ThemeStyleColor::Color(color)) => Some(tui_colors::foreground_ansi(
                 color,
@@ -2073,6 +2094,10 @@ mod tests {
         assert!(hex_to_rgb("#ff").is_err());
         assert!(hex_to_rgb("#gggggg").is_err());
         assert!(hex_to_rgb("").is_err());
+        // v0.1.6 review P2-6: 6 bytes with a multi-byte character used to
+        // slice through a char boundary and panic.
+        assert!(hex_to_rgb("#€abc").is_err());
+        assert!(hex_to_rgb("éabcd").is_err());
     }
 
     #[test]
@@ -2251,6 +2276,47 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Circular"));
+    }
+
+    /// v0.1.6 review P3: a long non-cyclic chain must error instead of
+    /// recursing to a stack overflow.
+    #[test]
+    fn test_resolve_var_refs_depth_is_bounded() {
+        let mut vars = HashMap::new();
+        for index in 0..(MAX_VAR_REF_DEPTH + 10) {
+            vars.insert(
+                format!("v{index}"),
+                ColorValue::Str(format!("v{}", index + 1)),
+            );
+        }
+        vars.insert(
+            format!("v{}", MAX_VAR_REF_DEPTH + 10),
+            ColorValue::Str("#010203".to_string()),
+        );
+        let error = resolve_var_refs(
+            &ColorValue::Str("v0".to_string()),
+            &vars,
+            &mut HashSet::new(),
+        )
+        .expect_err("deep chain must be rejected")
+        .to_string();
+        assert!(error.contains("too deep"), "{error}");
+        // A chain within the bound still resolves.
+        let mut shallow = HashMap::new();
+        for index in 0..10 {
+            shallow.insert(
+                format!("s{index}"),
+                ColorValue::Str(format!("s{}", index + 1)),
+            );
+        }
+        shallow.insert("s10".to_string(), ColorValue::Str("#010203".to_string()));
+        let resolved = resolve_var_refs(
+            &ColorValue::Str("s0".to_string()),
+            &shallow,
+            &mut HashSet::new(),
+        )
+        .expect("shallow chain");
+        assert_eq!(resolved, ResolvedColor::Hex("#010203".to_string()));
     }
 
     #[test]
@@ -2493,6 +2559,69 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&content).expect("valid json");
         assert!(validate_theme_json("test", &value).is_err());
         assert!(parse_theme_json("test", &value).is_ok());
+    }
+
+    /// v0.1.6 review P1-7: the built-in themes (which carry the documented
+    /// `appearance` field) must pass the installed validator verbatim; a
+    /// user theme copied from `dark.json` must load.
+    #[test]
+    fn test_validate_accepts_the_builtin_themes() {
+        for (label, content) in [("dark", DARK_THEME_JSON), ("light", LIGHT_THEME_JSON)] {
+            let value: serde_json::Value =
+                serde_json::from_str(content).expect("built-in theme JSON");
+            let parsed = validate_theme_json(label, &value)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(parsed.appearance.as_deref(), Some(label));
+        }
+    }
+
+    /// v0.1.6 review P1-7: unknown keys are additive (upstream typebox
+    /// ignores additional properties), at the top level and inside
+    /// `colors`/`export`.
+    #[test]
+    fn test_validate_ignores_unknown_keys() {
+        let mut colors = serde_json::Map::new();
+        for key in REQUIRED_COLOR_KEYS {
+            colors.insert(
+                (*key).to_string(),
+                serde_json::Value::String("#000000".to_string()),
+            );
+        }
+        colors.insert(
+            "futureToken".to_string(),
+            // Even a malformed unknown token is ignored, like typebox.
+            serde_json::json!({"nested": true}),
+        );
+        let json = serde_json::json!({
+            "name": "future",
+            "appearance": "dark",
+            "myExtension": { "anything": true },
+            "colors": serde_json::Value::Object(colors),
+            "export": { "pageBg": "#000000", "futureExport": {"bad": 1} },
+        });
+        let parsed = validate_theme_json("future", &json).expect("unknown keys are additive");
+        assert_eq!(parsed.appearance.as_deref(), Some("dark"));
+    }
+
+    /// v0.1.6 review P1-7: `appearance` is typed, not just allowed.
+    #[test]
+    fn test_validate_rejects_an_invalid_appearance() {
+        let mut colors = serde_json::Map::new();
+        for key in REQUIRED_COLOR_KEYS {
+            colors.insert(
+                (*key).to_string(),
+                serde_json::Value::String("#000000".to_string()),
+            );
+        }
+        let json = serde_json::json!({
+            "name": "bad-appearance",
+            "appearance": "blue",
+            "colors": serde_json::Value::Object(colors),
+        });
+        let error = validate_theme_json("test", &json)
+            .expect_err("invalid appearance must be rejected")
+            .to_string();
+        assert!(error.contains("/appearance"), "{error}");
     }
 
     // --- eb3e9feed split: the lenient fallback (no validator installed) ---
@@ -2980,6 +3109,26 @@ mod tests {
             attributes: tui_colors::TextAttributes::default(),
         };
         assert_eq!(theme.style("y", &concrete), "\x1b[38;2;10;11;12my\x1b[39m");
+        // A dim token emits SGR 2 exactly once: the stored fg ANSI is plain
+        // and the attribute adds the only SGR 2 (v0.1.6 review P3).
+        let mut resolved = HashMap::new();
+        resolved.insert("dim".to_string(), ResolvedColor::Hex("#010203".to_string()));
+        let dim_theme = Theme::from_resolved(
+            resolved,
+            ColorMode::TrueColor,
+            Some("dim-test".to_string()),
+            None,
+            None,
+            vec!["dim".to_string()],
+        )
+        .expect("dim theme");
+        let dim = ThemeStyle {
+            fg: Some(ThemeStyleColor::Token("dim".to_string())),
+            bg: None,
+            attributes: tui_colors::TextAttributes::default(),
+        };
+        let rendered = dim_theme.style("z", &dim);
+        assert_eq!(rendered.matches("\x1b[2m").count(), 1, "{rendered:?}");
     }
 
     // --- System theme + terminal state (V16-10 FR-C, OSC mock) ------------

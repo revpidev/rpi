@@ -919,6 +919,10 @@ pub(crate) async fn exec_script(request: ScriptExecRequest<'_>) -> ScriptExecOut
     command
         .args(request.args)
         .current_dir(request.cwd)
+        // Belt-and-braces process cleanup: the timeout/overflow paths kill
+        // by pid, but a dropped child (runtime shutdown, cancelled future)
+        // must not outlive the run either (v0.1.6 review P1-8).
+        .kill_on_drop(true)
         .stdin(if request.stdin.is_some() {
             std::process::Stdio::piped()
         } else {
@@ -1038,8 +1042,42 @@ fn kill_process(pid: Option<u32>) {
         // still owns; SIGKILL is always safe to send.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    if let Some(pid) = pid {
+        // `taskkill /F /T /PID` from the trusted System32 path (the bash
+        // tool's `kill_process_tree`, shell.ts:216-240). Without this the
+        // timeout and stdout-cap paths reported `killed: true` while the
+        // child kept running on Windows (v0.1.6 review P1-8).
+        use std::process::{Command, Stdio};
+        let (taskkill, args) = windows_taskkill_invocation(pid);
+        let _ = Command::new(taskkill)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = pid;
+}
+
+/// Windows kill invocation builder, split out so it compiles and is unit
+/// tested on every platform (mirrors the bash tool's helper).
+#[cfg(any(windows, test))]
+fn windows_taskkill_invocation(pid: u32) -> (std::path::PathBuf, [String; 4]) {
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let taskkill = std::path::Path::new(&system_root)
+        .join("System32")
+        .join("taskkill.exe");
+    (
+        taskkill,
+        [
+            "/F".to_owned(),
+            "/T".to_owned(),
+            "/PID".to_owned(),
+            pid.to_string(),
+        ],
+    )
 }
 
 fn thinking_level_str(level: rpi_agent::types::ThinkingLevel) -> &'static str {
@@ -1051,5 +1089,20 @@ fn thinking_level_str(level: rpi_agent::types::ThinkingLevel) -> &'static str {
         rpi_agent::types::ThinkingLevel::High => "high",
         rpi_agent::types::ThinkingLevel::Xhigh => "xhigh",
         rpi_agent::types::ThinkingLevel::Max => "max",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0.1.6 review P1-8: the Windows kill invocation uses the trusted
+    /// System32 path and the same force/tree flags as the bash tool.
+    #[test]
+    fn windows_taskkill_uses_system32_and_force_tree_flags() {
+        let (taskkill, args) = windows_taskkill_invocation(42);
+        let rendered = taskkill.to_string_lossy().replace('\\', "/");
+        assert!(rendered.ends_with("System32/taskkill.exe"), "{rendered}");
+        assert_eq!(args, ["/F", "/T", "/PID", "42"]);
     }
 }

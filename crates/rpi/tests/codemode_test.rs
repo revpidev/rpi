@@ -513,6 +513,36 @@ async fn keeps_store_values_across_calls() {
     );
 }
 
+/// v0.1.6 review P1-3: a successful script without a return value (a body
+/// with no `return`, or an `exit()` call) must persist store writes and
+/// must not append a bogus "Script error:" block to a completed result.
+#[tokio::test]
+async fn store_writes_survive_a_value_less_completion() {
+    let fixture = session_fixture(CodemodeMode::On).await;
+    let no_return = run(&fixture, "store(\"count\", 1);").await;
+    assert_eq!(no_return.is_error, None);
+    let text = result_text(&no_return);
+    assert!(text.starts_with("Script completed\n"), "{text}");
+    assert!(!text.contains("Script error:"), "{text}");
+
+    let exited = run(&fixture, "store(\"count\", 2); exit();").await;
+    assert_eq!(exited.is_error, None, "{}", result_text(&exited));
+    assert!(
+        !result_text(&exited).contains("Script error:"),
+        "{}",
+        result_text(&exited)
+    );
+
+    // Both writes landed as codemode-store entries and are visible to the
+    // next run.
+    let next = run(&fixture, "return load(\"count\");").await;
+    assert!(
+        result_text(&next).trim_end().ends_with('2'),
+        "{}",
+        result_text(&next)
+    );
+}
+
 #[tokio::test]
 async fn applies_the_timeout_option_and_rejects_invalid_options() {
     let fixture = session_fixture(CodemodeMode::On).await;

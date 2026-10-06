@@ -179,7 +179,15 @@ async fn handle_callback<T: Clone + Send + Sync + 'static>(
             oauth_error_html("Missing authorization code.", None),
         );
     };
-    state.claimed.store(true, Ordering::SeqCst);
+    // Claim the callback atomically (v0.1.6 review P2-1): a load-then-store
+    // check let two concurrent callbacks with the same code both proceed to
+    // the token exchange.
+    if state.claimed.swap(true, Ordering::SeqCst) {
+        return callback_response(
+            StatusCode::CONFLICT,
+            oauth_error_html("This sign-in has already been handled.", None),
+        );
+    }
     let complete = state.complete.clone();
     match complete(code.clone()).await {
         Ok(value) => {
@@ -529,6 +537,51 @@ mod tests {
                 .expect("body")
                 .contains("State mismatch.")
         );
+        server.close().await;
+    }
+
+    /// v0.1.6 review P2-1: two concurrent callbacks carrying the same code
+    /// must not both run the token exchange.
+    #[tokio::test]
+    async fn concurrent_callbacks_exchange_the_code_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let complete_calls = calls.clone();
+        let complete: CompleteFn<String> = Arc::new(move |code| {
+            let calls = complete_calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok(code)
+            })
+        });
+        let server = OAuthCallbackServer::start(OAuthCallbackServerOptions {
+            provider_name: "Test".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            path: "/callback".to_owned(),
+            redirect_host: None,
+            state: Some("expected".to_owned()),
+            complete,
+            signal: None,
+            timeout: None,
+        })
+        .await
+        .expect("bind");
+        let base = format!("http://{}", server.local_addr());
+        let url = format!("{base}/callback?code=the-code&state=expected");
+        let (first, second) = tokio::join!(reqwest::get(&url), reqwest::get(&url));
+        let first = first.expect("first response");
+        let second = second.expect("second response");
+        let statuses = [first.status(), second.status()];
+        assert!(statuses.contains(&StatusCode::OK), "{statuses:?}");
+        assert!(statuses.contains(&StatusCode::CONFLICT), "{statuses:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the token exchange must run exactly once"
+        );
+        server.wait().await.expect("wait").expect("completed");
         server.close().await;
     }
 

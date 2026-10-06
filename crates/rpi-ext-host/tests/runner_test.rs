@@ -530,6 +530,84 @@ async fn runner_emit_dispatches_serially_in_load_then_registration_order() {
     );
 }
 
+/// v0.1.6 review follow-up (P1-2): an awaited event dispatch into an
+/// extension blocked in a synchronous host call (`executeTool`) is
+/// skipped: the extension's thread cannot answer, and a nested-call event
+/// emitted to the caller must not deadlock. Other extensions still run,
+/// and delivery resumes once the host call returns.
+#[tokio::test]
+async fn emit_skips_an_extension_blocked_in_a_host_call() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let blocked_hits = Arc::new(AtomicUsize::new(0));
+    let other_hits = Arc::new(AtomicUsize::new(0));
+    let guard_slot: Arc<Mutex<Option<Arc<rpi_ext_host::api::RouteGuard>>>> =
+        Arc::new(Mutex::new(None));
+    let blocked_hits_for_ext = blocked_hits.clone();
+    let guard_slot_for_ext = guard_slot.clone();
+    let blocked = inline_ext("blocked", move |api| {
+        *guard_slot_for_ext
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(api.extension().host_call_guard().clone());
+        let hits = blocked_hits_for_ext.clone();
+        api.on(
+            EVENT_SESSION_START,
+            json_handler(move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Null)
+            }),
+        )
+        .unwrap();
+    });
+    let other_hits_for_ext = other_hits.clone();
+    let other = inline_ext("other", move |api| {
+        let hits = other_hits_for_ext.clone();
+        api.on(
+            EVENT_SESSION_START,
+            json_handler(move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Null)
+            }),
+        )
+        .unwrap();
+    });
+    let host = host_with(vec![blocked, other]).await;
+
+    host.emit(EVENT_SESSION_START, json!({ "type": EVENT_SESSION_START }))
+        .await;
+    assert_eq!(blocked_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(other_hits.load(Ordering::SeqCst), 1);
+
+    let guard = guard_slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+        .expect("guard captured at load");
+    let scope = guard.enter();
+    host.emit(EVENT_SESSION_START, json!({ "type": EVENT_SESSION_START }))
+        .await;
+    assert_eq!(
+        blocked_hits.load(Ordering::SeqCst),
+        1,
+        "the blocked extension's handler must be skipped"
+    );
+    assert_eq!(
+        other_hits.load(Ordering::SeqCst),
+        2,
+        "other extensions still receive the event"
+    );
+
+    drop(scope);
+    host.emit(EVENT_SESSION_START, json!({ "type": EVENT_SESSION_START }))
+        .await;
+    assert_eq!(
+        blocked_hits.load(Ordering::SeqCst),
+        2,
+        "delivery resumes after the host call returns"
+    );
+}
+
 #[tokio::test]
 async fn runner_emit_isolates_handler_errors_and_continues() {
     // runner.ts:806-815 — a throwing handler is reported via emitError and

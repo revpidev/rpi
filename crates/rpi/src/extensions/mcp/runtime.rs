@@ -454,14 +454,10 @@ impl McpServerConnection {
                     if matches!(error, McpError::SessionExpired) && attempt == 1 {
                         // The server no longer knows the session, so it did
                         // not run the request; retry once on a new session.
-                        let mut slot = self.client.lock().await;
-                        if slot
-                            .as_ref()
-                            .is_some_and(|current| Arc::ptr_eq(current, &client))
-                        {
-                            *slot = None;
-                        }
-                        drop(slot);
+                        // Closing the old client releases its GET stream task
+                        // (v0.1.6 review P2-4; the slot reset alone leaked
+                        // it).
+                        self.drop_client(&client).await;
                         attempt += 1;
                         continue;
                     }

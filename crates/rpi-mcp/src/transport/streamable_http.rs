@@ -186,6 +186,7 @@ where
 
     let mut stream = stream;
     let mut buffered: Vec<u8> = Vec::new();
+    let mut at_stream_start = true;
     let mut event_name: Option<String> = None;
     let mut event_id: Option<String> = None;
     let mut data_lines: Vec<String> = Vec::new();
@@ -194,6 +195,16 @@ where
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         buffered.extend_from_slice(&chunk);
+        if at_stream_start && buffered.len() >= 3 {
+            // A leading UTF-8 BOM would otherwise turn the first `data`
+            // field into `\u{FEFF}data` and drop the event (v0.1.6 review
+            // P3). The check waits for three bytes so a split BOM still
+            // matches.
+            if buffered.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                buffered.drain(..3);
+            }
+            at_stream_start = false;
+        }
         while let Some(newline) = buffered.iter().position(|byte| *byte == b'\n') {
             let line: Vec<u8> = buffered.drain(..=newline).collect();
             process_line(
@@ -882,18 +893,23 @@ impl McpTransport for StreamableHttpTransport {
             return Ok(());
         }
         self.shared.controller.cancel();
-        if self.started.load(Ordering::SeqCst)
-            && self.session_id().is_some()
-            && let Ok((headers, _token)) = self.shared.headers(&[]).await
-        {
-            // Best-effort session termination with a 1s bound.
-            let request = self
-                .shared
-                .http
-                .request(reqwest::Method::DELETE, self.shared.url.clone())
-                .headers(headers)
-                .timeout(Duration::from_millis(1_000));
-            let _ = request.send().await;
+        // Best-effort session termination, bounded to 1s: header resolution
+        // may run an OAuth refresh (up to 15s), and shutdown must not stall
+        // on the token endpoint (v0.1.6 review P2-4). A cached token still
+        // gets the DELETE; a mid-refresh cancel just skips it.
+        if self.started.load(Ordering::SeqCst) && self.session_id().is_some() {
+            let shared = self.shared.clone();
+            let _ = tokio::time::timeout(Duration::from_millis(1_000), async move {
+                if let Ok((headers, _token)) = shared.headers(&[]).await {
+                    let request = shared
+                        .http
+                        .request(reqwest::Method::DELETE, shared.url.clone())
+                        .headers(headers)
+                        .timeout(Duration::from_millis(1_000));
+                    let _ = request.send().await;
+                }
+            })
+            .await;
         }
         self.shared.events.emit_close();
         Ok(())
@@ -948,6 +964,35 @@ mod tests {
         assert_eq!(events[0].id.as_deref(), Some("7"));
         assert_eq!(ids, vec!["7".to_owned()]);
         assert_eq!(retries, vec![250]);
+    }
+
+    /// v0.1.6 review P3: a leading UTF-8 BOM must not eat the first event.
+    #[test]
+    fn strips_a_leading_utf8_bom() {
+        let (events, _, _) = collect_events(b"\xef\xbb\xbfdata: hello\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "hello");
+        // A split BOM across chunks matches too.
+        let stream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"\xef\xbb")),
+            Ok(Bytes::from_static(b"\xbfdata: hi\n\n")),
+        ]);
+        let mut events = Vec::new();
+        let mut options = ConsumeSseOptions {
+            max_event_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            on_event: &mut |event| events.push(event),
+            on_id: &mut |_| {},
+            on_retry: &mut |_| {},
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(consume_sse_stream(Box::pin(stream), &mut options))
+            .expect("sse parses");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "hi");
     }
 
     #[test]

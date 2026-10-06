@@ -537,6 +537,29 @@ mod tests {
         );
     }
 
+    /// v0.1.6 review P3: `execute` re-checks the mode, so a nested or
+    /// manual dispatch cannot write a plan outside Plan mode.
+    #[test]
+    fn write_plan_outside_plan_mode_is_rejected() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        __reset_state();
+        let host = install_host();
+        host.set("getMode", fake_reply(json!("default")));
+        let value = dispatch_with_host(
+            &host,
+            &json!({
+                "kind": "toolExecute",
+                "toolName": "write_plan",
+                "params": {"content": "# plan"},
+            }),
+        );
+        assert_eq!(value["isError"], true, "{value}");
+        assert!(
+            value.to_string().contains("only available in plan mode"),
+            "{value}"
+        );
+    }
+
     #[test]
     fn dispatch_routes_write_plan_tool_execution() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());

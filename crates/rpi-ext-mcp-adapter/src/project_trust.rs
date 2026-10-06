@@ -299,27 +299,32 @@ fn save_approval(path: &Path, record: ApprovalRecord) {
         }
     }
     let temp = path.with_extension(format!("{}-{}.tmp", std::process::id(), random_suffix()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-        {
-            use std::io::Write;
-            let _ = file.write_all(payload.as_bytes());
-            let _ = file.sync_all();
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::write(&temp, payload.as_bytes());
+    // Write-then-rename is only crash-safe when the write succeeded
+    // (v0.1.6 review P2-11): a failed or partial write must leave the
+    // previous approval store in place, not rename a torn file over it.
+    if write_temp_file(&temp, &payload).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return;
     }
     if std::fs::rename(&temp, path).is_err() {
         let _ = std::fs::remove_file(&temp);
     }
+}
+
+/// Create `temp` exclusively and write the full payload before the caller
+/// renames it over the store; `sync_all` flushes it to disk first.
+fn write_temp_file(temp: &Path, payload: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(temp)?;
+    use std::io::Write;
+    file.write_all(payload.as_bytes())?;
+    file.sync_all()
 }
 
 fn random_suffix() -> String {
@@ -514,6 +519,44 @@ mod tests {
 
     fn server(value: Value) -> ServerEntry {
         ServerEntry(value.as_object().cloned().unwrap_or_default())
+    }
+
+    /// v0.1.6 review P2-11: a failed write or rename must leave the target
+    /// untouched and clean up the temp file.
+    #[test]
+    fn failed_approval_write_cleans_up_and_leaves_the_target() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "rpi-mcp-trust-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&sandbox).expect("sandbox");
+        // The store path is a directory: the temp write succeeds but the
+        // final rename fails, exercising the failure branch.
+        let path = sandbox.join("approvals.json");
+        std::fs::create_dir_all(&path).expect("target dir");
+        approve_project_server(&path, "/repo", "srv", &server(json!({ "command": "x" })));
+        assert!(path.is_dir(), "the target must survive a failed rename");
+        let temp_files: Vec<String> = std::fs::read_dir(&sandbox)
+            .expect("read sandbox")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(temp_files.is_empty(), "stale temp files: {temp_files:?}");
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    /// The rename step only runs after a fully written temp file.
+    #[test]
+    fn write_temp_file_fails_when_the_parent_is_missing() {
+        let path = std::env::temp_dir()
+            .join("rpi-mcp-missing-parent-dir")
+            .join("x.tmp");
+        assert!(write_temp_file(&path, "{}").is_err());
     }
 
     #[test]

@@ -301,6 +301,16 @@ pub fn get_mcp_tool_exposure(config: &McpServerConfig, tool_name: &str) -> McpEx
 /// `LOOPBACK_HOSTS` (mcp-servers.ts:90).
 const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
 
+/// `isLoopbackHost`: `url::Url::host_str()` keeps the brackets on IPv6
+/// literals, so both sides are normalized. The previous comparison trimmed
+/// only the constant and could never match `[::1]` (v0.1.6 review P3).
+fn is_loopback_host(host: &str) -> bool {
+    let normalized = host.trim_matches(['[', ']']);
+    LOOPBACK_HOSTS
+        .iter()
+        .any(|candidate| candidate.trim_matches(['[', ']']) == normalized)
+}
+
 /// `isLoopbackRedirectUri` (mcp-servers.ts:93): an http URI on a loopback
 /// host without query or fragment.
 pub fn is_loopback_redirect_uri(value: &str) -> bool {
@@ -308,9 +318,7 @@ pub fn is_loopback_redirect_uri(value: &str) -> bool {
         return false;
     };
     url.scheme() == "http"
-        && LOOPBACK_HOSTS
-            .iter()
-            .any(|host| host.trim_matches(['[', ']']) == url.host_str().unwrap_or_default())
+        && is_loopback_host(url.host_str().unwrap_or_default())
         && url.query().is_none()
         && url.fragment().is_none()
 }
@@ -414,10 +422,7 @@ fn validate_oauth(value: Option<&Value>) -> Result<(), String> {
             .and_then(|value| url::Url::parse(value).ok());
         let valid = url.as_ref().is_some_and(|url| {
             url.scheme() == "https"
-                || (url.scheme() == "http"
-                    && LOOPBACK_HOSTS.iter().any(|host| {
-                        host.trim_matches(['[', ']']) == url.host_str().unwrap_or_default()
-                    }))
+                || (url.scheme() == "http" && is_loopback_host(url.host_str().unwrap_or_default()))
         });
         if !valid {
             return Err(
@@ -523,9 +528,7 @@ pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<McpServerCo
                 ));
             }
             let url = url::Url::parse(url).expect("validated above");
-            let loopback = LOOPBACK_HOSTS
-                .iter()
-                .any(|host| host.trim_matches(['[', ']']) == url.host_str().unwrap_or_default());
+            let loopback = is_loopback_host(url.host_str().unwrap_or_default());
             if url.scheme() != "https" && !loopback {
                 return Err(format!(
                     "server \"{name}\": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
@@ -804,6 +807,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// v0.1.6 review P3: `Url::host_str()` keeps IPv6 brackets, so the
+    /// `[::1]` loopback form must match too.
+    #[test]
+    fn ipv6_loopback_redirects_and_auth_urls_are_accepted() {
+        assert!(is_loopback_redirect_uri("http://[::1]:8080/callback"));
+        assert!(is_loopback_redirect_uri("http://localhost:8080/callback"));
+        assert!(is_loopback_redirect_uri("http://127.0.0.1:8080/callback"));
+        assert!(!is_loopback_redirect_uri(
+            "http://[::1]:8080/callback?code=x"
+        ));
+        let http = validate_mcp_server_config(
+            "docs",
+            &json!({"url": "http://[::1]:9000/mcp", "auth": {"provider": "radius"}}),
+        );
+        assert!(http.is_ok(), "{http:?}");
+        let metadata = validate_mcp_server_config(
+            "docs",
+            &json!({
+                "url": "https://example.com/mcp",
+                "oauth": {"authServerMetadataUrl": "http://[::1]:9000/metadata"},
+            }),
+        );
+        assert!(metadata.is_ok(), "{metadata:?}");
+    }
 
     #[test]
     fn validates_http_and_stdio_shapes() {

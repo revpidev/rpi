@@ -417,19 +417,44 @@ fn value_text(value: &Value) -> String {
 }
 
 /// Write the full text output to a temp file, like bash does for truncated
-/// output.
+/// output. The file is created exclusively and 0600 (v0.1.6 review P3): a
+/// predictable name with default permissions in a shared temp dir invites
+/// symlink pre-creation and world-readable spill of script output.
 fn spill_output(text: &str) -> Result<std::path::PathBuf, String> {
-    let unique = format!(
-        "rpi-codemode-{:016x}.txt",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-            ^ (std::process::id() as u128)
-    );
-    let path = std::env::temp_dir().join(unique);
-    std::fs::write(&path, text).map_err(|error| error.to_string())?;
-    Ok(path)
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let dir = std::env::temp_dir();
+    for _ in 0..8 {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+        );
+        hasher.write_u32(std::process::id());
+        let path = dir.join(format!("rpi-codemode-{:016x}.txt", hasher.finish()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(error) = file.write_all(text.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error.to_string());
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("could not create a unique codemode output spill file".to_owned())
 }
 
 /// `truncateOutput` (execute.ts:272-300).
@@ -1271,27 +1296,37 @@ pub async fn execute_codemode(
             }
         })
         .collect();
-    if let CodemodeResult::Ok {
-        value: Some(value),
-        store_writes,
-        ..
-    } = &result
-    {
-        if !store_writes.set.is_empty() || !store_writes.delete.is_empty() {
-            let _ = options.api.append_entry(
-                CODEMODE_STORE_ENTRY_TYPE,
-                Some(json!({ "set": store_writes.set, "delete": store_writes.delete })),
-            );
+    match &result {
+        CodemodeResult::Ok {
+            value,
+            store_writes,
+            ..
+        } => {
+            // Store writes are persisted for every successful script — a
+            // script that reports success without returning a value (a bare
+            // `exit()` or a body with no `return`, both `value: None`) must
+            // still commit them (v0.1.6 review P1-3; upstream execute.ts:404
+            // persists them for `result.ok` regardless of `result.value`).
+            if !store_writes.set.is_empty() || !store_writes.delete.is_empty() {
+                let _ = options.api.append_entry(
+                    CODEMODE_STORE_ENTRY_TYPE,
+                    Some(json!({ "set": store_writes.set, "delete": store_writes.delete })),
+                );
+            }
+            // A returned value is appended like text(); `None` adds nothing.
+            if let Some(value) = value {
+                items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
+                    text: value_text(value),
+                    text_signature: None,
+                }));
+            }
         }
-        items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
-            text: value_text(value),
-            text_signature: None,
-        }));
-    } else {
-        items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
-            text: format!("Script error:\n{}", format_error(&result, &nested)),
-            text_signature: None,
-        }));
+        CodemodeResult::Err { .. } => {
+            items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
+                text: format!("Script error:\n{}", format_error(&result, &nested)),
+                text_signature: None,
+            }));
+        }
     }
     let generated = generated_images.load(std::sync::atomic::Ordering::SeqCst);
     if generated > 0

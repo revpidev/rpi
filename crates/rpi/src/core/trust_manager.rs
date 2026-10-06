@@ -14,8 +14,9 @@ use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 /// `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` (trust-manager.ts:29-37).
-const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: [&str; 7] = [
+const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: [&str; 8] = [
     "settings.json",
+    "mcp.json",
     "extensions",
     "skills",
     "prompts",
@@ -749,6 +750,57 @@ mod tests {
                 "{entry} should require trust"
             );
         }
+    }
+
+    /// Regression (v0.1.6 review P0-1): the constant-driven test above
+    /// cannot catch a missing entry — pin the literal names upstream
+    /// requires, in upstream order (trust-manager.ts:30-39).
+    #[test]
+    fn trust_requiring_resource_names_match_upstream() {
+        assert_eq!(
+            TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES,
+            [
+                "settings.json",
+                "mcp.json",
+                "extensions",
+                "skills",
+                "prompts",
+                "themes",
+                "SYSTEM.md",
+                "APPEND_SYSTEM.md",
+            ]
+        );
+    }
+
+    /// A repo that only ships `.rpi/mcp.json` must not be auto-trusted:
+    /// project MCP servers spawn a `command`, so the trust prompt is the
+    /// gate against clone-and-execute (v0.1.6 review P0-1).
+    #[test]
+    fn mcp_json_alone_requires_trust_and_is_not_auto_trusted() {
+        let dirs = test_dirs();
+        std::fs::create_dir_all(dirs.cwd.join(CONFIG_DIR_NAME)).unwrap();
+        std::fs::write(
+            dirs.cwd.join(CONFIG_DIR_NAME).join("mcp.json"),
+            r#"{"mcpServers":{"evil":{"command":"sh"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            has_trust_requiring_project_resources(&dirs.cwd),
+            "a project .rpi/mcp.json must require trust"
+        );
+        // Headless + never-default resolves to untrusted, not to the
+        // "no resources -> trusted" shortcut.
+        let store = ProjectTrustStore::new(&dirs.agent_dir);
+        let trusted = resolve_project_trusted(
+            &dirs.cwd,
+            &store,
+            None,
+            DefaultProjectTrust::Never,
+            None,
+            &mut ProjectTrustContext::headless(),
+        )
+        .unwrap();
+        assert!(!trusted);
     }
 
     #[test]

@@ -813,13 +813,25 @@ impl McpClient {
         }
     }
 
+    /// Remove the pending entry for `id`, matching `1` and `1.0` as the
+    /// same JavaScript number (v0.1.6 review P3): the exact-key miss used
+    /// to leave a response unclaimed until its timeout fired.
+    fn take_pending(&self, id: &JsonRpcId) -> Option<PendingRequest> {
+        let mut pending = lock(&self.pending);
+        if let Some(entry) = pending.remove(id) {
+            return Some(entry);
+        }
+        let key = pending.keys().find(|key| key.numerically_eq(id)).cloned()?;
+        pending.remove(&key)
+    }
+
     fn handle_response(
         &self,
         id: &JsonRpcId,
         result: &Option<Value>,
         error: &Option<JsonRpcErrorObject>,
     ) {
-        let Some(entry) = lock(&self.pending).remove(id) else {
+        let Some(entry) = self.take_pending(id) else {
             self.emit_error(McpError::Invalid(format!(
                 "Received response for unknown MCP request {id}"
             )));

@@ -261,11 +261,25 @@ fn dispatch_with_host(host: &dyn HostCall, jobs: Option<&Sender<Job>>, message: 
     }
 }
 
+/// Whether an event begins a new session and therefore needs a live
+/// refresh worker (v0.1.6 review P1-6).
+fn event_starts_session(message: &Value) -> bool {
+    message.get("kind").and_then(Value::as_str) == Some("event")
+        && message.get("event").and_then(Value::as_str) == Some("session_start")
+}
+
 /// Dispatch one host → plugin message (resolved through the cookie's
 /// channel and worker).
 fn dispatch_message(cookie: PluginCookie, message: &Value) -> Value {
     match channel_for(cookie) {
         Some(host) => {
+            // `/new` and `/resume` reuse the loaded plugin but emit
+            // `session_shutdown` first, which stops the previous worker;
+            // start a fresh one so the new session's refresh stays async
+            // and throttled (P1-6).
+            if event_starts_session(message) {
+                footer::start_worker(cookie, host);
+            }
             let jobs = footer::worker_for(cookie);
             dispatch_with_host(&host, jobs.as_ref(), message)
         }
@@ -540,5 +554,20 @@ mod tests {
         assert!(footer::worker_for(cookie).is_some());
         footer::send_job(cookie, Job::Shutdown);
         assert_eq!(rx.recv().expect("shutdown"), Job::Shutdown);
+    }
+    #[test]
+    fn session_start_is_the_worker_restart_trigger() {
+        assert!(event_starts_session(
+            &json!({"kind": "event", "event": "session_start"})
+        ));
+        assert!(!event_starts_session(
+            &json!({"kind": "event", "event": "session_shutdown"})
+        ));
+        assert!(!event_starts_session(
+            &json!({"kind": "event", "event": "message_end"})
+        ));
+        assert!(!event_starts_session(
+            &json!({"kind": "command", "name": "usage"})
+        ));
     }
 }

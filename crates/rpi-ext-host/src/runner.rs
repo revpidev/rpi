@@ -397,9 +397,31 @@ impl ExtensionRunnerCore {
     /// Snapshot of `(extension_path, handler)` pairs in dispatch order:
     /// extensions in load order, handlers in registration order within each
     /// extension (runner.ts:792-796).
+    ///
+    /// Extensions currently blocked in a synchronous host call
+    /// (`executeTool`) are skipped: their thread cannot answer an awaited
+    /// dispatch, so queueing behind it would deadlock the nested call that
+    /// is emitting the event (v0.1.6 review follow-up P1-2). Upstream's
+    /// single JS loop delivers such events after the await; rpi's
+    /// blocking ABI cannot, and skipping is the fail-safe substitute.
+    ///
+    /// `route_guard` (model-registry host calls) is deliberately not checked
+    /// here: the current `model_registry_complete` path passes no
+    /// `on_payload` hook and the provider request/context events are wired
+    /// onto the Agent's own stream options, so no extension event can be
+    /// emitted during that window. If a future registry path starts emitting
+    /// extension events, it needs the same skip (see the P1-2 review note).
     fn handlers_for(&self, event_type: &str) -> Vec<(String, EventHandler)> {
         let mut out = Vec::new();
         for ext in &self.extensions {
+            if ext.host_call_guard().is_active() {
+                tracing::debug!(
+                    path = %ext.path,
+                    event_type,
+                    "extension blocked in a host call; event dispatch skipped"
+                );
+                continue;
+            }
             for handler in ext.handlers_for(event_type) {
                 out.push((ext.path.clone(), handler));
             }

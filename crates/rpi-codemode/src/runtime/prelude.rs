@@ -372,3 +372,18 @@ pub const PRELUDE_SOURCE: &str = r####"(function (bridge, toolsJson, globalsJson
 		},
 	};
 })"####;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pinned digest must track the embedded prelude: any edit has to
+    /// update `PRELUDE_SOURCE_SHA256` deliberately (v0.1.6 review P3 — the
+    /// constant was previously unasserted "fake insurance").
+    #[test]
+    fn prelude_source_matches_the_pinned_sha256() {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(PRELUDE_SOURCE.as_bytes());
+        assert_eq!(format!("{digest:x}"), PRELUDE_SOURCE_SHA256);
+    }
+}

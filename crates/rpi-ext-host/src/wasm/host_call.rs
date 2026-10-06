@@ -14,7 +14,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::{Capability, HostState};
-use crate::api::{DeliverAs, SendMessageOptions, SendUserMessageOptions};
+use crate::api::{DeliverAs, ExecuteToolOptions, SendMessageOptions, SendUserMessageOptions};
 use crate::types as ext;
 use crate::types::{FlagType, FlagValue};
 
@@ -272,6 +272,10 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             let tool_name = name.clone();
             let execute_updates = state.tool_updates.clone();
             let execute_aborts = state.tool_aborts.clone();
+            // v0.1.6 review P1-2: while this extension is blocked in a
+            // synchronous host call (executeTool) its thread cannot answer a
+            // tool dispatch; re-entry must fail closed instead of deadlocking.
+            let execute_guard = state.api.extension().host_call_guard().clone();
             // The component owner identity the wire calls stamp
             // (`NamespacedUiBridge`), precomputed for the tool-abort watcher
             // below (V14-23 C3).
@@ -286,6 +290,17 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .get("renderResult")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // A misspelled exposure must not silently become `direct`
+            // (v0.1.6 review P2-8): validate like `setToolExposures` does.
+            let exposure = match definition.get("exposure") {
+                None | Some(Value::Null) => ext::ToolExposure::Direct,
+                Some(value) => serde_json::from_value(value.clone()).map_err(|_| {
+                    (
+                        "invalidRequest",
+                        format!("registerTool: invalid exposure for tool \"{name}\""),
+                    )
+                })?,
+            };
             state
                 .api
                 .register_tool(ext::ToolDefinition {
@@ -309,11 +324,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     constrained_sampling: definition.get("constrainedSampling").cloned(),
                     render_shell: str_arg(&definition, "renderShell").map(str::to_owned),
                     prepare_arguments: None,
-                    exposure: definition
-                        .get("exposure")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .unwrap_or_default(),
+                    exposure,
                     namespace: definition
                         .get("namespace")
                         .cloned()
@@ -330,7 +341,13 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         let tool_updates = execute_updates.clone();
                         let tool_aborts = execute_aborts.clone();
                         let watcher_owner = owner_namespace.clone();
+                        let execute_guard = execute_guard.clone();
                         Box::pin(async move {
+                            if execute_guard.is_active() {
+                                return Err(format!(
+                                    "tool \"{tool_name}\" cannot run while its extension is blocked in a host call"
+                                ));
+                            }
                             let tool_call_id = request.tool_call_id.clone();
                             // ADR-0015: stash the agent's on_update sink so
                             // `toolUpdate` host calls made by the guest/plugin
@@ -558,9 +575,25 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .require_actions()
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             let handle = state.async_handle.clone();
+            // Mark the synchronous wait so a nested dispatch back into this
+            // extension fails closed (v0.1.6 review P1-2).
+            let _guard = state.api.extension().host_call_guard().clone().enter();
+            // The caller's cancellation token flows into the nested call so
+            // an abort reaches it too (v0.1.6 review P2-7). `on_update`
+            // cannot cross this synchronous host-call boundary.
+            let nested_options = state
+                .tool_aborts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&caller_id)
+                .cloned()
+                .map(|signal| ExecuteToolOptions {
+                    signal: Some(signal),
+                    on_update: None,
+                });
             let outcome = block_on(&handle, async move {
                 actions
-                    .execute_tool(&caller_id, &name, call_args, None)
+                    .execute_tool(&caller_id, &name, call_args, nested_options)
                     .await
             })?
             .map_err(|e| (error_kind(&e), e.to_string()))?;
@@ -2658,6 +2691,84 @@ mod execute_tool_tests {
             subscriptions: Default::default(),
             memory_limiter: crate::wasm::MemoryLimiter,
         }
+    }
+
+    /// v0.1.6 review P1-2: a tool dispatch into an extension that is
+    /// blocked in a synchronous host call (`executeTool`) must fail closed
+    /// instead of deadlocking on the blocked guest/plugin thread.
+    #[test]
+    fn reentrant_tool_dispatch_fails_closed_while_blocked_in_a_host_call() {
+        let mut state = host_state(HashSet::from([Capability::Tools]));
+        dispatch(
+            &mut state,
+            "registerTool",
+            json!({
+                "definition": {
+                    "name": "echo",
+                    "description": "echo",
+                    "parameters": {"type": "object"},
+                }
+            }),
+        )
+        .expect("registerTool");
+        let extension = state.api.extension();
+        let tool = extension
+            .tools()
+            .get("echo")
+            .expect("registered tool")
+            .definition
+            .clone();
+        let execute = tool.execute.clone();
+        let _guard = extension.host_call_guard().clone().enter();
+        let request = crate::types::ToolExecuteRequest {
+            tool_call_id: "call-1".to_owned(),
+            params: json!({}),
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let result = runtime.block_on((execute)(request, state.api.context()));
+        let error = result.expect_err("reentrant dispatch must fail closed");
+        assert!(error.contains("blocked in a host call"), "{error}");
+        drop(_guard);
+        // After the host call returns, calls are allowed again.
+        let ok_request = crate::types::ToolExecuteRequest {
+            tool_call_id: "call-2".to_owned(),
+            params: json!({}),
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+        };
+        let outcome = runtime.block_on((execute)(ok_request, state.api.context()));
+        assert!(
+            outcome.is_err(),
+            "no guest harness: dispatch fails differently"
+        );
+        assert!(
+            !outcome.unwrap_err().contains("blocked in a host call"),
+            "the guard must be released"
+        );
+    }
+
+    /// v0.1.6 review P2-8: a misspelled exposure must be rejected, not
+    /// silently downgraded to `direct`.
+    #[test]
+    fn register_tool_rejects_an_invalid_exposure() {
+        let mut state = host_state(HashSet::from([Capability::Tools]));
+        let error = dispatch(
+            &mut state,
+            "registerTool",
+            json!({
+                "definition": {
+                    "name": "typo",
+                    "description": "typo",
+                    "parameters": {"type": "object"},
+                    "exposure": "hiddden",
+                }
+            }),
+        )
+        .expect_err("invalid exposure must fail closed");
+        assert_eq!(error.0, "invalidRequest");
+        assert!(error.1.contains("invalid exposure"), "{error:?}");
     }
 
     #[test]
