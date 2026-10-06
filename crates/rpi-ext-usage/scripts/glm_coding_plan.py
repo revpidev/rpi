@@ -85,7 +85,10 @@ def _auth_store_key():
             continue
         key = key.strip()
         if key.startswith("$"):
-            value = os.environ.get(key[1:].strip())
+            env_name = key[1:].strip()
+            if env_name.startswith("{") and env_name.endswith("}"):
+                env_name = env_name[1:-1].strip()
+            value = os.environ.get(env_name)
             if value:
                 return value
             continue

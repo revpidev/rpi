@@ -30,6 +30,13 @@ pub struct UsageScriptContext {
 /// Credential environment additions for one script run.
 pub type UsageScriptEnv = Vec<(String, String)>;
 
+/// Environment variable the provider scripts read for their in-script
+/// request timeouts. The host injects the same budget it enforces, so a
+/// script's degradation path can finish before the process is killed
+/// (v0.1.6 review round 2: the built-in scripts default to 8s while the
+/// host kills at the 3s default, making their fallbacks unreachable).
+pub const USAGE_TIMEOUT_ENV: &str = "RPI_USAGE_TIMEOUT_MS";
+
 /// Best-effort API-key env var name for `provider`: the model catalog's
 /// conventional variable when the usage provider id matches a provider id
 /// (`deepseek` → `DEEPSEEK_API_KEY`). Custom ids rely on the explicit
@@ -53,13 +60,21 @@ pub async fn execute_usage_script(
 ) -> Result<UsageEnvelope, String> {
     let stdin = serde_json::to_string(context).map_err(|error| error.to_string())?;
     let command = script_path.to_string_lossy().into_owned();
+    // The script's own timeout budget mirrors the enforced one; a caller
+    // cannot override it (the value is authoritative for the process kill).
+    let mut env: UsageScriptEnv = env
+        .iter()
+        .filter(|(name, _)| name != USAGE_TIMEOUT_ENV)
+        .cloned()
+        .collect();
+    env.push((USAGE_TIMEOUT_ENV.to_owned(), timeout_ms.to_string()));
     let outcome = exec_script(ScriptExecRequest {
         command: &command,
         args: &[],
         cwd,
         timeout_ms: Some(timeout_ms),
         stdin: Some(&stdin),
-        env,
+        env: &env,
         max_stdout_bytes: Some(super::MAX_USAGE_STDOUT_BYTES),
     })
     .await;

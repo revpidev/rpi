@@ -70,6 +70,8 @@ def _auth_store_key():
         key = key.strip()
         if key.startswith("$"):
             env_name = key[1:].strip()
+            if env_name.startswith("{") and env_name.endswith("}"):
+                env_name = env_name[1:-1].strip()
             value = os.environ.get(env_name)
             if value:
                 return value, "auth.json:" + provider_id

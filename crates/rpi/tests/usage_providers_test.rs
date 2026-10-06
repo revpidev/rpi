@@ -281,6 +281,37 @@ async fn explicit_settings_and_user_dir_resolve() {
     assert_eq!(envelope.get("displayText"), Some(&json!("user-p: ok")));
 }
 
+/// Round-2: the host injects the enforced `usage.timeoutMs` into the
+/// script environment so a script's own degradation path can finish
+/// before the process is killed (the built-in scripts default to 8s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scripts_receive_the_enforced_timeout_budget() {
+    let tmp = TempDir::new();
+    let script = tmp.path().join("timeout.sh");
+    write_script(
+        &script,
+        r#"#!/bin/sh
+printf '%s' "{\"schemaVersion\":1,\"provider\":\"timeout-p\",\"displayText\":\"$RPI_USAGE_TIMEOUT_MS\"}"
+"#,
+    );
+    let fixture = fixture(
+        vec![("timeout-p".to_owned(), script.display().to_string())],
+        Some(r#"{"usage":{"timeoutMs":1234}}"#),
+    )
+    .await;
+    let envelope = fixture
+        .api
+        .usage_fetch("timeout-p", true)
+        .await
+        .unwrap()
+        .expect("envelope");
+    assert_eq!(
+        envelope.get("displayText"),
+        Some(&json!("1234")),
+        "the script must see the same budget the host enforces"
+    );
+}
+
 /// Unknown providers answer `null` (the wire arm maps `None`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_provider_answers_none() {

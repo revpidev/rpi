@@ -202,6 +202,27 @@ fn run_script(
     agent_dir: &AgentDir,
     timeout_ms: u64,
 ) -> Run {
+    run_script_with_env(
+        script,
+        provider,
+        base_url,
+        agent_dir,
+        &[(key_env, "test-key")],
+        timeout_ms,
+    )
+}
+
+/// Run a script with an exact environment overlay (all conventional key
+/// variables removed) — the auth-store and failure-matrix tests need full
+/// control over which credentials are visible.
+fn run_script_with_env(
+    script: &str,
+    provider: &str,
+    base_url: &str,
+    agent_dir: &AgentDir,
+    env: &[(&str, &str)],
+    timeout_ms: u64,
+) -> Run {
     let mut command = Command::new("python3");
     command
         .arg(script_path(script))
@@ -209,12 +230,12 @@ fn run_script(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("RPI_CODING_AGENT_DIR", &agent_dir.0)
-        .env("RPI_USAGE_TIMEOUT_MS", timeout_ms.to_string())
-        .env(key_env, "test-key");
+        .env("RPI_USAGE_TIMEOUT_MS", timeout_ms.to_string());
     for name in KEY_ENVS {
-        if name != key_env {
-            command.env_remove(name);
-        }
+        command.env_remove(name);
+    }
+    for (name, value) in env {
+        command.env(name, value);
     }
     let mut child = command.spawn().expect("spawn python3");
     let context = serde_json::json!({ "provider": provider, "baseUrl": base_url }).to_string();
@@ -560,4 +581,49 @@ fn timeout_is_a_failure() {
         run.stderr
     );
     assert_no_key_leak(&run);
+}
+
+/// Round-2: an `auth.json` api_key stored as the braced form
+/// `${VAR}` resolves through the environment exactly like `$VAR`.
+#[test]
+fn auth_store_braced_env_references_resolve() {
+    if !python3_available() {
+        eprintln!("skipping: python3 unavailable");
+        return;
+    }
+    for (script, provider, auth_id) in [
+        ("deepseek.py", "deepseek", "deepseek"),
+        ("glm_coding_plan.py", "glm-coding-plan", "zai"),
+        ("kimi_code.py", "kimi-code", "kimi-coding"),
+        ("minimax_token_plan.py", "minimax-token-plan", "minimax"),
+    ] {
+        let stub = stub(vec![StubReply::Status(401, "{}".to_owned())]);
+        let agent = AgentDir::new(&format!("auth-{auth_id}"));
+        std::fs::write(
+            agent.0.join("auth.json"),
+            format!(r#"{{"{auth_id}": {{"type": "api_key", "key": "${{CONTRACT_AUTH_KEY}}"}}}}"#),
+        )
+        .expect("auth.json");
+        let run = run_script_with_env(
+            script,
+            provider,
+            &stub.base("/probe"),
+            &agent,
+            &[("CONTRACT_AUTH_KEY", "resolved-secret")],
+            5_000,
+        );
+        let requests = stub.requests();
+        assert!(
+            !requests.is_empty(),
+            "{script}: the script must attempt a request"
+        );
+        assert!(
+            requests.iter().any(|request| request
+                .header("authorization")
+                .is_some_and(|value| value == "Bearer resolved-secret")),
+            "{script}: the braced env reference must resolve (status {:?})",
+            run.status
+        );
+        assert_no_key_leak(&run);
+    }
 }

@@ -84,7 +84,7 @@ pub fn materialize(agent_dir: &Path) -> Result<Vec<(&'static str, PathBuf)>, Str
     for script in BUILTIN_SCRIPTS {
         let path = dir.join(script.file);
         write_if_changed(&path, script.source)?;
-        let register_path = register_path(&dir, &script);
+        let register_path = register_path(&dir, &script)?;
         written.push((script.provider, register_path));
     }
     Ok(written)
@@ -111,9 +111,10 @@ pub fn register_builtin(host: &dyn HostCall, agent_dir: &Path) -> Result<usize, 
 
 /// The path handed to `ctx.usage.register`: the script itself on Unix
 /// (shebang), a `cmd` shim on Windows (CreateProcess cannot start a `.py`
-/// directly).
-fn register_path(dir: &Path, script: &BuiltinScript) -> PathBuf {
-    let script_path = dir.join(script.file);
+/// directly). A shim write failure is a hard error (round-2): silently
+/// falling back to the `.py` path produced a registration that could never
+/// start on Windows.
+fn register_path(dir: &Path, script: &BuiltinScript) -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
         let shim = dir.join(script.file.replace(".py", ".cmd"));
@@ -121,11 +122,16 @@ fn register_path(dir: &Path, script: &BuiltinScript) -> PathBuf {
             "@echo off\r\nwhere python >nul 2>nul\r\nif %errorlevel%==0 (python \"%~dp0{}\" %*) else (py \"%~dp0{}\" %*)\r\n",
             script.file, script.file
         );
-        if std::fs::write(&shim, body).is_ok() {
-            return shim;
-        }
+        std::fs::write(&shim, body).map_err(|error| {
+            format!(
+                "could not write the Windows launcher {}: {error}",
+                shim.display()
+            )
+        })?;
+        return Ok(shim);
     }
-    script_path
+    #[cfg(not(windows))]
+    Ok(dir.join(script.file))
 }
 
 /// Write `body` to `path` when missing or different; chmod 0755 on Unix.
