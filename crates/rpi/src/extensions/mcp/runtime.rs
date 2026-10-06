@@ -475,7 +475,11 @@ impl McpServerConnection {
     /// `reconnect` (runtime.ts:296): connect again with fresh credentials.
     pub async fn reconnect(self: &Arc<Self>) -> Result<(), McpError> {
         let _guard = self.opening.lock().await;
-        if let Some(client) = self.client.lock().await.clone() {
+        // Clone the client OUT of its lock first: the `if let`
+        // temporary-guard lifetime would keep `self.client` locked across
+        // `drop_client`, which locks `self.client` again (self-deadlock).
+        let client = self.client.lock().await.clone();
+        if let Some(client) = client {
             self.drop_client(&client).await;
         }
         self.open().await.map(|_| ())
@@ -485,7 +489,9 @@ impl McpServerConnection {
     /// were removed.
     pub async fn sign_out(self: &Arc<Self>) {
         let _guard = self.opening.lock().await;
-        if let Some(client) = self.client.lock().await.clone() {
+        // See `reconnect` for the guard-lifetime rationale.
+        let client = self.client.lock().await.clone();
+        if let Some(client) = client {
             self.drop_client(&client).await;
         }
         if !self.closed.load(Ordering::SeqCst) {

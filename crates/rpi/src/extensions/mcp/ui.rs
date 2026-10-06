@@ -440,7 +440,8 @@ impl McpBuiltinState {
                 }
             }
         }
-        for server in lock(&self.servers).clone() {
+        let servers = lock(&self.servers).clone();
+        for server in servers {
             let entry = lock(&server.entry).clone();
             if entry.config.enabled() {
                 exposures.insert(entry.config.exposure());
@@ -680,7 +681,11 @@ impl McpBuiltinState {
             .cloned()
             .unwrap_or_default();
         for name in names {
-            if let Some(definition) = lock(&self.tools).definitions.get(&name).cloned() {
+            // Clone the definition out of the lock before the host call:
+            // the `if let` temporary-guard lifetime would otherwise run
+            // `api.register_tool` (a synchronous host call) under `tools`.
+            let definition = lock(&self.tools).definitions.get(&name).cloned();
+            if let Some(definition) = definition {
                 let hidden = ToolDefinition {
                     exposure: ToolExposure::Hidden,
                     ..definition
@@ -696,7 +701,9 @@ impl McpBuiltinState {
 
     /// `serversWithResources` (index.ts:346).
     fn servers_with_resources(&self) -> Vec<Arc<McpServerConnection>> {
-        lock(&self.servers)
+        // Snapshot first — see `pending_servers` for the lock-order rationale.
+        let servers = lock(&self.servers).clone();
+        servers
             .iter()
             .filter(|server| {
                 let entry = lock(&server.entry);
@@ -867,28 +874,39 @@ impl McpBuiltinState {
                 // The callback receives `&McpServerConnection`; the
                 // registration needs the owning `Arc`, which the server slot
                 // holds.
-                if let Some(server) = state.find_server(connection.name())
-                    && let Some(connection) = server
+                if let Some(server) = state.find_server(connection.name()) {
+                    // Clone the connection OUT of its lock first: the
+                    // `if let` temporary-guard lifetime would otherwise keep
+                    // `server.connection` locked across `register_tools`,
+                    // which locks `self.servers` / `self.tools` and makes
+                    // synchronous host calls. `pending_servers` takes those
+                    // locks in the opposite order (`servers` → `connection`),
+                    // so holding the connection lock here ABBA-deadlocks the
+                    // first prompt while a server is still connecting.
+                    let connection = server
                         .connection
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
-                        .clone()
-                {
-                    state.register_tools(&connection);
+                        .clone();
+                    if let Some(connection) = connection {
+                        state.register_tools(&connection);
+                    }
                 }
             })
         };
         let on_change = {
             let state = state.clone();
             Some(Arc::new(move |connection: &McpServerConnection| {
-                if let Some(server) = state.find_server(connection.name())
-                    && let Some(connection) = server
+                if let Some(server) = state.find_server(connection.name()) {
+                    // Same guard-lifetime rule as `on_tools` above.
+                    let connection = server
                         .connection
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
-                        .clone()
-                {
-                    state.on_connection_change(&connection);
+                        .clone();
+                    if let Some(connection) = connection {
+                        state.on_connection_change(&connection);
+                    }
                 }
             })
                 as Arc<dyn Fn(&McpServerConnection) + Send + Sync>)
@@ -982,7 +1000,14 @@ impl McpBuiltinState {
     }
 
     fn pending_servers(&self) -> Vec<(Arc<McpServer>, watch::Receiver<bool>, bool)> {
-        lock(&self.servers)
+        // Snapshot the server list first: iterating under the `servers`
+        // guard while locking each `server.entry` / `connection` / `ready`
+        // establishes a `servers` → per-server order. A connection callback
+        // that runs `register_tools` while holding `server.connection`
+        // (fixed above) or any other per-server → `servers` path would
+        // ABBA-deadlock against it.
+        let servers = lock(&self.servers).clone();
+        servers
             .iter()
             .filter(|server| {
                 let entry = lock(&server.entry);
@@ -1035,7 +1060,8 @@ impl McpBuiltinState {
                 }
             }
             None => {
-                for server in lock(&self.servers).clone() {
+                let servers = lock(&self.servers).clone();
+                for server in servers {
                     let entry = lock(&server.entry);
                     if entry.config.enabled()
                         && let Some(message) = describe_state(&server)
@@ -1624,7 +1650,9 @@ impl McpBuiltinState {
             *lock(&self.servers) = servers;
         }
         self.ensure_discovery_active(&ctx);
-        let enabled: Vec<Arc<McpServer>> = lock(&self.servers)
+        // Snapshot first — see `pending_servers` for the lock-order rationale.
+        let servers = lock(&self.servers).clone();
+        let enabled: Vec<Arc<McpServer>> = servers
             .iter()
             .filter(|server| lock(&server.entry).config.enabled())
             .cloned()
@@ -1734,7 +1762,9 @@ impl McpBuiltinState {
         ctx: &ExtensionContext,
     ) -> Result<Value, String> {
         self.wait_for_direct_servers(ctx).await;
-        let listings: Vec<McpServerListing> = lock(&self.servers)
+        // Snapshot first — see `pending_servers` for the lock-order rationale.
+        let servers = lock(&self.servers).clone();
+        let listings: Vec<McpServerListing> = servers
             .iter()
             .map(|server| McpServerListing {
                 entry: lock(&server.entry).clone(),
@@ -1857,7 +1887,9 @@ impl McpBuiltinState {
                 connection.close().await;
             }
         }
-        let added: Vec<Arc<McpServer>> = lock(&self.servers)
+        // Snapshot first — see `pending_servers` for the lock-order rationale.
+        let servers = lock(&self.servers).clone();
+        let added: Vec<Arc<McpServer>> = servers
             .iter()
             .filter(|server| {
                 let entry = lock(&server.entry);
