@@ -443,17 +443,8 @@ fn run_worktree_setup_hook(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut attempt = 0u32;
-    let child = loop {
-        match command.spawn() {
-            Ok(child) => break child,
-            Err(error) if is_text_file_busy(&error) && attempt < 5 => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
-            }
-            Err(error) => return Err(format!("worktree setup hook failed to start: {error}")),
-        }
-    };
+    let child = retry_text_file_busy(|| command.spawn())
+        .map_err(|error| format!("worktree setup hook failed to start: {error}"))?;
     // Timeout via a watchdog thread (spawnSync-equivalent): the waiter runs
     // on its own thread, the watchdog polls it. On timeout the hook process
     // is killed (Node spawnSync {timeout} sends its killSignal) — a runaway
@@ -526,7 +517,7 @@ fn run_worktree_setup_hook(
 
 /// Unix `ETXTBSY` (os error 26): a just-written executable is still held
 /// open for writing by an inherited FD in another threaded fork. Hardened
-/// by the retry loop in [`run_worktree_setup_hook`].
+/// by [`retry_text_file_busy`].
 fn is_text_file_busy(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -536,6 +527,29 @@ fn is_text_file_busy(error: &std::io::Error) -> bool {
     {
         let _ = error;
         false
+    }
+}
+
+/// Number of ETXTBSY retries after the first attempt.
+const TEXT_FILE_BUSY_RETRIES: u32 = 5;
+
+/// Run `operation`, retrying with linear backoff while the kernel reports
+/// ETXTBSY; any other error (or an exhausted budget) is returned. Split out
+/// from the hook spawn so the retry policy is unit-testable without
+/// reproducing the inherited-FD race.
+fn retry_text_file_busy<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempt = 0u32;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_text_file_busy(&error) && attempt < TEXT_FILE_BUSY_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -2083,5 +2097,53 @@ mod synthetic_path_tests {
              distinct paths kept"
         );
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// TE45 (bc95264) retry policy: ETXTBSY is retried within the budget,
+    /// other errors are not, and exhaustion returns the last ETXTBSY.
+    #[cfg(unix)]
+    #[test]
+    fn text_file_busy_spawns_retry_then_succeed() {
+        let attempts = std::cell::Cell::new(0u32);
+        let result = retry_text_file_busy(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() <= 3 {
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                Ok(7u8)
+            }
+        });
+        assert_eq!(result.expect("retry recovers"), 7);
+        assert_eq!(attempts.get(), 4, "one initial attempt + three retries");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_file_busy_exhaustion_returns_the_last_error() {
+        let attempts = std::cell::Cell::new(0u32);
+        let result = retry_text_file_busy(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<u8, _>(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+        });
+        assert_eq!(
+            result.expect_err("exhausted budget").raw_os_error(),
+            Some(libc::ETXTBSY)
+        );
+        assert_eq!(attempts.get(), 6, "one initial + five retries");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_etxtbsy_errors_are_not_retried() {
+        let attempts = std::cell::Cell::new(0u32);
+        let result = retry_text_file_busy(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<u8, _>(std::io::Error::from_raw_os_error(libc::ENOENT))
+        });
+        assert_eq!(
+            result.expect_err("quiet failure").raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(attempts.get(), 1, "unrelated errors fail immediately");
     }
 }

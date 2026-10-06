@@ -75,7 +75,12 @@ fn main() {
             let _ = std::fs::write(indexed.join("argv.txt"), args.join("\n"));
         }
         let mut env_pairs: Vec<(String, String)> = std::env::vars()
-            .filter(|(key, _)| key.starts_with("RPI_") || key.starts_with("MCP") || key == "PATH")
+            .filter(|(key, _)| {
+                key.starts_with("RPI_")
+                    || key.starts_with("MCP")
+                    || key.starts_with("GIT_")
+                    || key == "PATH"
+            })
             .collect();
         env_pairs.sort();
         let env_text = env_pairs

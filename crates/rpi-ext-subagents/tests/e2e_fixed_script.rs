@@ -22,6 +22,9 @@ struct FakeHost {
     /// `{"path", "id"}`, `None` = host call error (fallback path). Scenario
     /// 3 and the FR-D dual-instance scenario set it before forking.
     session_file: std::sync::Mutex<Option<Value>>,
+    /// `ctx.isProjectTrusted` (#2570): the parent project-trust decision the
+    /// launch contract forwards as `--no-approve` when untrusted.
+    project_trusted: std::sync::atomic::AtomicBool,
 }
 
 fn builtin_host_tools() -> Vec<String> {
@@ -108,6 +111,11 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
             None => json!({ "error": { "message": "no authoritative session" } }),
         },
         "ctx.model" => json!({ "ok": host.model }),
+        "ctx.isProjectTrusted" => json!({
+            "ok": host
+                .project_trusted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }),
         "toolUpdate" => {
             TOOL_UPDATES
                 .lock()
@@ -275,6 +283,7 @@ fn e2e_fixed_child_full_pipeline() {
         model: json!({ "provider": "faux", "id": "faux-1" }),
         tools: builtin_host_tools(),
         session_file: std::sync::Mutex::new(None),
+        project_trusted: std::sync::atomic::AtomicBool::new(true),
     });
     let response = rpi_ext_subagents::install_for_test(
         RpiHostCalls {
@@ -438,6 +447,53 @@ fn e2e_fixed_child_full_pipeline() {
     assert_eq!(meta["usage"]["input"], 100);
     assert_eq!(meta["usage"]["cost"], 0.42);
     assert_eq!(meta["model"], "faux/fixed-1");
+
+    // ---- Scenario 1b: Git routing env is stripped, trust flows to argv ---
+    // #2440: GIT_DIR/GIT_WORK_TREE/GIT_CONFIG_KEY_0 set in the parent must
+    // not reach the child (the fixed-child dump now includes GIT_*).
+    rpi_test_env::set_var("GIT_DIR", "/tmp/parent-git-dir");
+    rpi_test_env::set_var("GIT_WORK_TREE", "/tmp/parent-work-tree");
+    rpi_test_env::set_var("GIT_CONFIG_KEY_0", "core.hooksPath");
+    let dump = sandbox.dump("git-env");
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+    rpi_test_env::set_var("RPI_E2E_MODE", "ok");
+    let result = execute(json!({ "agent": "scout", "task": "git env probe", "timeoutMs": 30000 }));
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    let env_text = std::fs::read_to_string(dump.join("env.txt")).unwrap();
+    for leaked in ["GIT_DIR=", "GIT_WORK_TREE=", "GIT_CONFIG_KEY_0="] {
+        assert!(
+            !env_text.contains(leaked),
+            "{leaked} leaked into the child:\n{env_text}"
+        );
+    }
+    rpi_test_env::remove_var("GIT_DIR");
+    rpi_test_env::remove_var("GIT_WORK_TREE");
+    rpi_test_env::remove_var("GIT_CONFIG_KEY_0");
+
+    // #2570: an untrusted parent project passes --no-approve to the child;
+    // a trusted parent does not.
+    host.project_trusted
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let dump = sandbox.dump("untrusted");
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+    let result = execute(json!({ "agent": "scout", "task": "trust probe", "timeoutMs": 30000 }));
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    let argv = std::fs::read_to_string(dump.join("argv.txt")).unwrap();
+    assert!(
+        argv.lines().any(|line| line == "--no-approve"),
+        "an untrusted parent must pass --no-approve:\n{argv}"
+    );
+    host.project_trusted
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let dump = sandbox.dump("trusted");
+    rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+    let result = execute(json!({ "agent": "scout", "task": "trust probe", "timeoutMs": 30000 }));
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    let argv = std::fs::read_to_string(dump.join("argv.txt")).unwrap();
+    assert!(
+        argv.lines().all(|line| line != "--no-approve"),
+        "a trusted parent must not pass --no-approve:\n{argv}"
+    );
 
     // ---- Scenario 2: fork unavailable degrades to fresh (ADR-0026) ------
     // G2 (TE18 FR-G): previously fail-fast asserting "Forked subagent
