@@ -30,7 +30,7 @@
 
 ### Internal
 
-- workspace version bumped through 0.1.6-rc.1 → 0.1.6-rc.2 with Cargo.lock synced each time (eight lockstep extensions propagate via `version.workspace`).
+- workspace version bumped through 0.1.6-rc.1 → 0.1.6-rc.3 with Cargo.lock synced each time (eight lockstep extensions propagate via `version.workspace`).
 - deviations TE-D44 (MCP config layout [VARIANT], TE46), TE-D45 (plan-mode XDG config path) and TE-D46 (plan-mode exposure-hidden boundary) promoted; D-105 (events skipped while an extension is blocked in a synchronous host call) promoted; TE-D47+ reserved and unused.
 
 ## [0.1.5] - 2026-09-29
