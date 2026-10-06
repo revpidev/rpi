@@ -333,6 +333,94 @@ async fn fails_only_the_request_whose_sse_stream_breaks() {
     client.close().await.unwrap();
 }
 
+/// v0.1.6 review round 2 (O2): a server that echoes the numeric request id
+/// as a JSON float (`1` → `1.0`) still counts as answering the request. The
+/// old exact-id comparison left the stream "unanswered", issued a GET
+/// resume with `Last-Event-ID`, and then emitted a spurious failure/unknown
+/// request for an id the client had already consumed.
+#[tokio::test]
+async fn float_response_ids_count_as_answered_without_resume() {
+    // The resume path sleeps before its GET; pin it to ~1ms so an
+    // unanswered stream would visibly retry inside the assertion window,
+    // and record the attempt instead of racing the retry delay.
+    let get_seen = Arc::new(tokio::sync::Notify::new());
+    let handler_get = get_seen.clone();
+    let (url, requests) =
+        start_server(Arc::new(move |request: RecordedRequest| -> HandlerResult {
+            let handler_get = handler_get.clone();
+            Box::pin(async move {
+                if request.method == "GET" {
+                    handler_get.notify_one();
+                    return protocol_response(&request);
+                }
+                let is_tool_call =
+                    request.method == "POST" && request.body_method() == Some("tools/call");
+                if is_tool_call
+                    && let Some(id) = request.body.as_ref().and_then(|body| body.get("id"))
+                {
+                    let float_id = id.as_f64().unwrap_or_default();
+                    let payload = json!({
+                        "jsonrpc": "2.0",
+                        "id": float_id,
+                        "result": {"content": [{"type": "text", "text": "hello"}]},
+                    });
+                    return TestResponse::sse(
+                        200,
+                        format!("id: tool-result\ndata: {payload}\n\n"),
+                        &[],
+                    );
+                }
+                protocol_response(&request)
+            })
+        }))
+        .await;
+    let mut options = StreamableHttpTransportOptions::new(&url);
+    options.open_get_stream = false;
+    options.reconnect.initial_delay_ms = 1;
+    options.reconnect.max_delay_ms = 5;
+    let transport = Arc::new(StreamableHttpTransport::new(options).unwrap());
+    let client = McpClient::new(McpClientOptions::new("http-test", "1.0.0"));
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let errors = errors.clone();
+        client.on_error(Arc::new(move |error| {
+            errors.lock().unwrap().push(error.to_string());
+        }));
+    }
+    client.connect(transport).await.unwrap();
+
+    let result = client
+        .call_tool("echo", None, McpRequestOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.content[0]["text"], "hello");
+    // An unanswered stream would issue its GET resume within the retry
+    // window (1ms delay + local round-trip); the stored permit makes the
+    // check immediate when it happens.
+    let resumed =
+        tokio::time::timeout(std::time::Duration::from_millis(250), get_seen.notified()).await;
+    assert!(
+        resumed.is_err(),
+        "an answered response must not trigger a GET resume"
+    );
+    assert!(
+        errors.lock().unwrap().is_empty(),
+        "an answered float-id response must not emit errors: {:?}",
+        errors.lock().unwrap()
+    );
+    let gets = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.method == "GET")
+        .count();
+    assert_eq!(
+        gets, 0,
+        "an answered response must not trigger a GET resume"
+    );
+    client.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn opens_the_get_stream_after_initialization() {
     let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

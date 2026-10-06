@@ -615,7 +615,13 @@ impl HttpShared {
                 let answered_flag = &mut answered;
                 let mut on_message = |message: &JsonRpcMessage| {
                     if let JsonRpcMessage::Response { id, .. } = message
-                        && *id == request_id
+                        // Numeric identity (v0.1.6 review round 2, O2): the
+                        // client id `1` and a server echo `1.0` are the same
+                        // JavaScript number; exact `==` left the stream
+                        // "unanswered", triggering a spurious GET resume and
+                        // an "unknown request" error after the response had
+                        // already been consumed.
+                        && id.numerically_eq(&request_id)
                     {
                         *answered_flag = true;
                     }
