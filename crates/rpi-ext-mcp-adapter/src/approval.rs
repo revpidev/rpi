@@ -154,9 +154,17 @@ impl ApprovalCache {
     }
 
     /// `restoreSessionApprovalState` (session-approvals.ts:178-199 @ 928c30c):
-    /// clear, then replay the branch entries (idempotent rebuild).
+    /// clear, then replay the branch entries (idempotent rebuild). The
+    /// server-wide grants are cleared too: upstream replaces the map
+    /// (session-approvals.ts:180-182) so an approval dialog opened on the
+    /// old branch cannot grant server authority after navigation, resume,
+    /// or session replacement (v0.1.6 review round 2, O7).
     pub fn restore(&self, entries: &[SessionApprovalEntry]) {
         let keys = restored_approval_keys(entries);
+        self.approved_servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let mut approved = self.approved.lock().unwrap_or_else(|e| e.into_inner());
         approved.clear();
         approved.extend(keys);
@@ -359,11 +367,19 @@ pub fn is_tool_call_approval_required(
     let Some(approval) = approval else {
         return false;
     };
+    if approval == Value::Bool(false) {
+        return false;
+    }
     if approval == Value::Bool(true) {
         return true;
     }
+    // Values from unvalidated sources (imports, runtime registration) fail
+    // closed, mirroring `tool-approval.ts:43` (`!Array.isArray(approval)`).
+    // `"destructive"` is not implemented yet (annotations are deferred), so
+    // it also requires approval for every call on the server (v0.1.6 review
+    // round 2, O8; changelog notes the fail-closed interim).
     let Value::Array(patterns) = &approval else {
-        return false;
+        return true;
     };
     if patterns.is_empty() {
         return false;
@@ -429,19 +445,12 @@ where
 {
     let identity = get_tool_approval_identity(server_name, tool, args);
 
-    // #628 (4becf97, tool-approval.ts:104-165 @ 5884ac4e): a runtime-wide
-    // server approval permits every tool and argument on that server,
-    // including tools discovered later. It is checked before the per-tool
-    // identity gate; broker denials still win (a broker that answers first
-    // is consulted below and may deny).
-    if cache.is_server_approved(server_name) {
-        return ToolCallApprovalResult::Ok;
-    }
-
     // #536 (45757f5, tool-approval.ts ensureToolCallApproved @ 97435aab):
-    // approval BROKERS are consulted BEFORE the session-grant cache — a
-    // broker's allow/deny must win over an earlier session grant (the
-    // cached fast path only applies when the broker abstains).
+    // approval BROKERS are consulted BEFORE the session-grant cache and
+    // before the #628 server-wide grant — a broker's allow/deny must win
+    // over an earlier grant. The server grant is evaluated right after the
+    // broker abstains, matching upstream's order (v0.1.6 review round 2,
+    // O7/O-small: the old fast path returned before the broker was asked).
     if let Some(broker) = broker {
         match broker.decide(server_name, tool, args, origin) {
             ApprovalDecision::AllowOnce => return ToolCallApprovalResult::Ok,
@@ -456,6 +465,14 @@ where
             ApprovalDecision::Deny => return ToolCallApprovalResult::Denied,
             ApprovalDecision::Abstain => {}
         }
+    }
+
+    // #628 (4becf97, tool-approval.ts:104-165 @ 5884ac4e): a runtime-wide
+    // server approval permits every tool and argument on that server,
+    // including tools discovered later. It sits after the broker (a broker
+    // deny wins) and before the per-tool identity gate.
+    if cache.is_server_approved(server_name) {
+        return ToolCallApprovalResult::Ok;
     }
 
     // Session-scoped fast path.
@@ -536,6 +553,22 @@ pub fn dialog_preview(args: &Value) -> String {
     } else {
         sanitized
     }
+}
+
+/// Upstream `serverScope` note (tool-approval.ts:150-165 @ 4becf97): explains
+/// what the fourth dialog choice grants.
+pub const SERVER_SCOPE_NOTE: &str = "Allow server for this session permits all tools and arguments on this server until reload or session/branch change. Other security and UI consent checks still apply.";
+
+/// The full approval dialog title: sanitized server/tool, the bounded
+/// argument preview, and the server-scope note (v0.1.6 review round 2).
+pub fn dialog_title(server_name: &str, tool: &ToolMetadata, args: &Value) -> String {
+    format!(
+        "MCP: {} wants to run {}\n\nArguments:\n{}\n\n{}",
+        crate::utils::sanitize_terminal_text(server_name),
+        crate::utils::sanitize_terminal_text(&tool.original_name),
+        dialog_preview(args),
+        SERVER_SCOPE_NOTE
+    )
 }
 
 fn ordered_details(
@@ -1188,6 +1221,88 @@ mod tests {
         );
     }
 
+    /// Round-2 O7: a broker deny must win over the #628 server-wide grant,
+    /// not only over the per-tool session cache. Reverting the order (server
+    /// grant fast path first) turns this test red: the grant would return
+    /// `Ok` before the broker is ever asked.
+    #[test]
+    fn broker_deny_wins_over_an_existing_server_grant() {
+        let config = config_with_approval(Some(json!(true)));
+        let cache = ApprovalCache::new();
+        let granting_ui = FixedHandler(ApprovalDecision::AllowServerForSession);
+        assert_eq!(
+            ensure_tool_call_approved(
+                &config,
+                &cache,
+                "demo",
+                &tool(),
+                &json!({"query": "x"}),
+                ApprovalOrigin::Proxy,
+                None,
+                Some(&granting_ui),
+                no_context,
+            ),
+            ToolCallApprovalResult::Ok
+        );
+        assert!(cache.is_server_approved("demo"));
+
+        let denying_broker = FixedHandler(ApprovalDecision::Deny);
+        assert_eq!(
+            ensure_tool_call_approved(
+                &config,
+                &cache,
+                "demo",
+                &tool(),
+                &json!({"query": "x"}),
+                ApprovalOrigin::Proxy,
+                Some(&denying_broker),
+                None,
+                no_context,
+            ),
+            ToolCallApprovalResult::Denied,
+            "the broker's deny must win over the server-wide grant"
+        );
+
+        // An abstaining broker still falls through to the server grant.
+        let abstaining_broker = FixedHandler(ApprovalDecision::Abstain);
+        assert_eq!(
+            ensure_tool_call_approved(
+                &config,
+                &cache,
+                "demo",
+                &tool(),
+                &json!({"query": "x"}),
+                ApprovalOrigin::Proxy,
+                Some(&abstaining_broker),
+                None,
+                no_context,
+            ),
+            ToolCallApprovalResult::Ok
+        );
+    }
+
+    /// Round-2 O8: `approveTools` values from unvalidated sources fail
+    /// closed (upstream `!Array.isArray(approval)` → true). `"destructive"`
+    /// is not implemented yet, so it also requires approval for every call.
+    #[test]
+    fn non_array_approve_tools_values_fail_closed() {
+        for value in [json!("destructive"), json!(42), json!({"scope": "all"})] {
+            let config = config_with_approval(Some(value.clone()));
+            assert!(
+                is_tool_call_approval_required(&config, "demo", "search", None),
+                "{value} must require approval (fail closed)"
+            );
+        }
+        // `false` and the empty array keep the upstream no-approval branch.
+        for value in [json!(false), json!([])] {
+            let config = config_with_approval(Some(value.clone()));
+            assert!(
+                !is_tool_call_approval_required(&config, "demo", "search", None),
+                "{value} must not require approval"
+            );
+        }
+    }
+
     /// A8: rejection details carry names/hashes only, with the proxy `mode`
     /// key first (upstream ordered object).
     #[test]
@@ -1237,7 +1352,25 @@ mod tests {
         assert!(!dialog_preview(&json!({"q": "a\u{1b}[31mb\u{7}c"})).contains('\u{1b}'));
     }
 
-    /// Restore clears stale grants before replaying the target branch (A6/A7).
+    /// Round-2: the dialog title carries the upstream server-scope note so
+    /// "Allow server for this session" is explained before the choice.
+    #[test]
+    fn dialog_title_includes_the_server_scope_note() {
+        let title = dialog_title("demo", &tool(), &json!({"query": "x"}));
+        assert!(
+            title.starts_with("MCP: demo wants to run search"),
+            "{title}"
+        );
+        assert!(title.contains("Arguments:\n{"), "{title}");
+        assert!(title.contains(SERVER_SCOPE_NOTE), "{title}");
+        assert!(
+            title.contains("until reload or session/branch change"),
+            "{title}"
+        );
+    }
+
+    /// Restore clears stale grants before replaying the target branch (A6/A7);
+    /// server-wide grants reset too (v0.1.6 review round 2, O7).
     #[test]
     fn restore_replaces_the_previous_set() {
         let config = config_with_approval(Some(json!(true)));
@@ -1257,10 +1390,16 @@ mod tests {
             no_context,
         );
         assert!(cache.is_approved(&identity.cache_key));
+        cache.grant_server("demo");
+        assert!(cache.is_server_approved("demo"));
 
         cache.restore(&[]);
         assert!(cache.is_empty());
         assert!(!cache.is_approved(&identity.cache_key));
+        assert!(
+            !cache.is_server_approved("demo"),
+            "branch navigation, resume, or session replacement must drop server-wide grants"
+        );
 
         let entry = SessionApprovalEntry::allow_for_session(
             "demo",

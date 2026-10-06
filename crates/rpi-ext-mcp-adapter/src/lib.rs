@@ -1462,14 +1462,10 @@ impl approval::ApprovalHandler for TuiApprovalHandler {
             return approval::ApprovalDecision::Deny;
         };
         let channel = state.channel();
-        let preview = approval::dialog_preview(args);
-        let title = format!(
-            "MCP: {} wants to run {}",
-            utils::sanitize_terminal_text(server_name),
-            utils::sanitize_terminal_text(&tool.original_name)
-        );
+        let title = approval::dialog_title(server_name, tool, args);
         // #628 (4becf97): the fourth choice grants every tool/argument on
-        // this server for the current runtime (memory-only).
+        // this server for the current runtime (memory-only). The title
+        // carries upstream's `serverScope` note.
         let options = vec![
             "Allow once".to_string(),
             "Allow for session".to_string(),
@@ -1480,7 +1476,7 @@ impl approval::ApprovalHandler for TuiApprovalHandler {
             &channel.calls(),
             channel.cookie,
             "ui.select",
-            json!({"title": format!("{title}\n\nArguments:\n{preview}"), "options": options}),
+            json!({"title": title, "options": options}),
         );
         match selected
             .and_then(|value| value.as_str().map(str::to_string))

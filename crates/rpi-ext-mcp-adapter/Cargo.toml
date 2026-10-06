@@ -57,6 +57,10 @@ aes-gcm = { workspace = true, features = ["getrandom"] }
 # and authentication fails closed (no plaintext fallback) — matching the
 # upstream behavior (design risk R4).
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
+# Approval-store timestamps use the same `new Date().toISOString()` shape as
+# upstream (millisecond-precision UTC); chrono is the workspace's clock-only
+# baseline (rpi core's mcp log uses it the same way).
+chrono.workspace = true
 
 
 [dev-dependencies]

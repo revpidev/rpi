@@ -291,9 +291,12 @@ fn save_approval(path: &Path, record: ApprovalRecord) {
     }))
     .unwrap_or_else(|_| "{}".to_string());
     if let Some(parent) = path.parent() {
+        let existed = parent.exists();
         let _ = std::fs::create_dir_all(parent);
+        // Only tighten a directory this code created: forcing 0700 on every
+        // write overrides an operator's deliberate mode (round-2).
         #[cfg(unix)]
-        {
+        if !existed {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
@@ -308,6 +311,20 @@ fn save_approval(path: &Path, record: ApprovalRecord) {
     }
     if std::fs::rename(&temp, path).is_err() {
         let _ = std::fs::remove_file(&temp);
+    } else {
+        sync_parent_dir(path);
+    }
+}
+
+/// Best-effort parent-directory sync after the rename (the file data was
+/// already flushed); unix-only because Windows cannot open a directory as a
+/// file. A failure here cannot corrupt the store.
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
 }
 
@@ -355,13 +372,11 @@ pub fn approve_project_server(
 }
 
 fn now_iso8601() -> String {
-    // Seconds-precision UTC like `new Date().toISOString()`; the store only
-    // carries it for display/diagnostics.
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{seconds}")
+    // Millisecond-precision UTC like `new Date().toISOString()`
+    // (v0.1.6 review round 2: the field used to hold epoch seconds under an
+    // ISO-8601 name; the reader accepts any string, so existing stores stay
+    // readable).
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// `describeServer` (project-server-trust.ts:184-192): the confirmation
@@ -557,6 +572,16 @@ mod tests {
             .join("rpi-mcp-missing-parent-dir")
             .join("x.tmp");
         assert!(write_temp_file(&path, "{}").is_err());
+    }
+
+    /// Round-2: `approvedAt` is a real ISO-8601 UTC timestamp, not epoch
+    /// seconds under an ISO-8601 name.
+    #[test]
+    fn approval_timestamps_are_iso8601() {
+        let stamp = now_iso8601();
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        assert_eq!(stamp.len(), 24, "millisecond precision: {stamp}");
+        chrono::DateTime::parse_from_rfc3339(&stamp).expect("RFC 3339 timestamp");
     }
 
     #[test]
