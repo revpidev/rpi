@@ -292,8 +292,19 @@ fn execute_subagent_tool_inner(
         .get("agent")
         .and_then(Value::as_str)
         .is_some_and(|s| !s.is_empty());
+    // The requested composition mode travels with every pre-dispatch error
+    // so the card renders as the composite the caller asked for (round-2
+    // review note).
+    let requested_mode = if has_tasks {
+        "parallel"
+    } else if has_steps {
+        "chain"
+    } else {
+        "single"
+    };
     if (has_tasks as u8) + (has_steps as u8) + (has_single as u8) > 1 {
-        return ToolOutcome::error(
+        return ToolOutcome::mode_error(
+            requested_mode,
             "Use one of { tasks }, { steps }, or a single { agent, task } — they cannot be combined.".to_string(),
         );
     }
@@ -323,7 +334,7 @@ fn execute_subagent_tool_inner(
     // Timeout aliases must agree before any execution path
     // (resolveForegroundTimeout, executor 2272-2289).
     if let Err(error) = check_timeout_aliases(&object) {
-        return ToolOutcome::error(error);
+        return ToolOutcome::mode_error(requested_mode, error);
     }
 
     // R7.1.5.3 (#1934/#1937): baseRef is validated up front for every shape
@@ -333,15 +344,21 @@ fn execute_subagent_tool_inner(
         match value.as_str() {
             Some(reference) => {
                 if let Err(error) = crate::p1::worktree::validate_base_ref(reference) {
-                    return ToolOutcome::error(error);
+                    return ToolOutcome::mode_error(requested_mode, error);
                 }
             }
-            None => return ToolOutcome::error("baseRef must be a string Git ref.".to_string()),
+            None => {
+                return ToolOutcome::mode_error(
+                    requested_mode,
+                    "baseRef must be a string Git ref.".to_string(),
+                );
+            }
         }
     }
 
     if !has_tasks && !has_steps && !has_single {
-        return ToolOutcome::error(
+        return ToolOutcome::mode_error(
+            requested_mode,
             "Provide { agent, task } for delegation, { tasks } or { steps } for composition (see ADR-0018), or { action } for management (list, get, status, doctor).".to_string(),
         );
     }
@@ -350,7 +367,7 @@ fn execute_subagent_tool_inner(
     let config_max_depth = config.max_subagent_depth.as_ref().and_then(Value::as_u64);
     let depth = budget::check_depth(config_max_depth);
     if depth.blocked {
-        return ToolOutcome::error(budget::depth_blocked_message(&depth));
+        return ToolOutcome::mode_error(requested_mode, budget::depth_blocked_message(&depth));
     }
 
     let scope = object
@@ -383,7 +400,7 @@ fn execute_subagent_tool_inner(
     }
     let agents = match ctx.discover(scope) {
         Ok(agents) => agents,
-        Err(error) => return ToolOutcome::error(error),
+        Err(error) => return ToolOutcome::mode_error(requested_mode, error),
     };
 
     if wants_async {

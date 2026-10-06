@@ -158,6 +158,9 @@ pub fn render_subagent_tool_result(result: &Value, options: &Value, call_args: &
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // A failed preflight carries no result rows but is not a success; the
+    // card must not read "all steps done" (round-2 review note).
+    let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
 
     let mut lines: Vec<(String, &'static str)> = Vec::new();
 
@@ -191,7 +194,7 @@ pub fn render_subagent_tool_result(result: &Value, options: &Value, call_args: &
             } else {
                 format!("chain · {} steps", results.len().max(1))
             };
-            let (glyph, status, tone) = composite_status(&results, &progress, is_partial);
+            let (glyph, status, tone) = composite_status(&results, &progress, is_partial, is_error);
             lines.push((format!("{glyph} {label} · {status}"), tone));
             lines.push((composite_stats(&results, &progress), "muted"));
             for (index, child) in results.iter().enumerate() {
@@ -402,6 +405,7 @@ fn composite_status(
     results: &[Value],
     progress: &[Value],
     is_partial: bool,
+    is_error: bool,
 ) -> (&'static str, String, &'static str) {
     if is_partial {
         let max_duration = progress
@@ -410,6 +414,9 @@ fn composite_status(
             .max()
             .unwrap_or(0);
         return (spinner_frame(max_duration), "running".to_string(), "accent");
+    }
+    if results.is_empty() && is_error {
+        return ("✗", "not started".to_string(), "error");
     }
     let any_aborted = results.iter().any(|entry| {
         entry
@@ -958,6 +965,27 @@ mod tests {
         assert!(
             lines.iter().any(|(text, _)| text.starts_with("43 token")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn failed_composite_preflight_renders_an_error_card() {
+        // A dispatch preflight error carries no rows; the card must not
+        // claim success (round-2 review note).
+        let details = json!({"mode": "parallel", "results": []});
+        let tree = render_subagent_tool_result(
+            &json!({"details": details, "isError": true}),
+            &json!({}),
+            &json!({}),
+        );
+        let lines = card_lines(&tree);
+        assert!(
+            lines[0].0.starts_with("✗ 1 tasks · not started"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines[0].0.contains("all steps done"),
+            "an error card must not claim completion: {lines:?}"
         );
     }
 

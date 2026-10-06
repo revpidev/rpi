@@ -596,8 +596,18 @@ pub async fn run_child_async(
         .as_deref()
         .or_else(|| parent_ref.map(|(provider, _)| provider));
     let scope = ctx.settings.model_scope.as_ref();
+    // resolve_effective_subagent_model and build_model_candidates can both
+    // enforce the same resolved rules (the Configured origin); dedupe the
+    // log lines so one model does not warn twice (round-2 review note).
+    let warned = std::sync::Mutex::new(std::collections::HashSet::new());
     let mut warn_sink = |violation: &model::ModelScopeViolation| {
-        tracing::warn!(violation = %violation.message, "model scope violation");
+        let fresh = warned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(violation.message.clone());
+        if fresh {
+            tracing::warn!(violation = %violation.message, "model scope violation");
+        }
     };
     let resolved = model::resolve_effective_subagent_model(
         explicit_model,
