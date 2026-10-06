@@ -93,8 +93,6 @@ fn strip_trailing_date_stamp(segment: &str) -> String {
 
 /// Match `^(.*)-(\d{4})-(\d{2})-(\d{2})$` with plausible date parts.
 fn strip_date_suffix_dashed(segment: &str) -> Option<String> {
-    let first = segment.char_indices().rev().collect::<Vec<_>>();
-    let _ = first;
     // Parse from the end: DD-MM-YYYY.
     let bytes = segment.as_bytes();
     if bytes.len() < 10 {
@@ -753,19 +751,21 @@ pub fn parse_model_scope_config(value: Option<&Value>) -> Result<Option<ModelSco
 
 /// `throwForUnresolvedEnforcedReservedScope` (model-resolution.ts:287-295
 /// @ b6bda32f): enforced rules whose allow list still contains an unexpanded
-/// reserved token need a parent session model (or a scoped snapshot).
+/// reserved token need a parent session model (or a scoped snapshot). The
+/// caller passes the per-agent-resolved scopes
+/// ([`resolveModelScopesForAgent`](ModelScopeConfig::resolved_scopes_for_agent),
+/// model-scope.ts:151-193), so `modelScope.agents.<name>` rules are checked
+/// with their agent (v0.1.6 review round 2, O11 — the old `""` lookup
+/// skipped them).
 fn throw_for_unresolved_enforced_reserved_scope(
-    scope: Option<&ModelScopeConfig>,
-    parent_model: Option<(&str, &str)>,
-    scoped_model_ids: &[String],
+    resolved: &[(ModelScopeConfig, String)],
     include_mixed: bool,
 ) -> Result<(), String> {
-    let Some(scope) = scope else {
-        return Ok(());
-    };
-    let resolved = scope.resolved_scopes_for_agent("", parent_model, scoped_model_ids);
-    for (rule, origin) in &resolved {
-        if origin != "modelScope" || rule.enforce != Some(true) {
+    for (rule, origin) in resolved {
+        if origin != "modelScope" && !origin.starts_with("modelScope.agents.") {
+            continue;
+        }
+        if rule.enforce != Some(true) {
             continue;
         }
         let Some(allow) = rule.allow.as_ref() else {
@@ -808,6 +808,7 @@ pub fn resolve_subagent_model_override(
     parent_model: Option<(&str, &str)>,
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
+    agent_name: Option<&str>,
     scope: Option<&ModelScopeConfig>,
     scoped_model_ids: &[String],
     source: ModelSource,
@@ -819,11 +820,22 @@ pub fn resolve_subagent_model_override(
     } else {
         Some(trimmed)
     };
+    // Upstream receives the per-agent scopes from the caller
+    // (`resolveModelScopesForAgent`, model-scope.ts:151-193); resolve them
+    // here with the agent name so `modelScope.agents.<name>` participates in
+    // the fail-closed reserved-token check (v0.1.6 review round 2, O11).
+    let resolved_scopes: Vec<(ModelScopeConfig, String)> = scope
+        .map(|scope| {
+            scope.resolved_scopes_for_agent(
+                agent_name.unwrap_or(""),
+                parent_model,
+                scoped_model_ids,
+            )
+        })
+        .unwrap_or_default();
     if parent_model.is_none() {
         throw_for_unresolved_enforced_reserved_scope(
-            scope,
-            parent_model,
-            scoped_model_ids,
+            &resolved_scopes,
             explicit.is_none() || source == ModelSource::Inherited,
         )?;
     }
@@ -855,13 +867,6 @@ pub fn resolve_subagent_model_override(
     if let Some(resolved) = resolved.as_deref()
         && scope.is_some_and(|s| s.enforced())
     {
-        // Upstream receives already-resolved scopes from the caller
-        // (`resolveModelScopesForAgent`); expand the global rule here so
-        // reserved patterns (`inherit`/`scoped`) compare as their concrete
-        // ids instead of literal tokens (model-scope.ts @ b6bda32f).
-        let resolved_scopes = scope
-            .map(|scope| scope.resolved_scopes_for_agent("", parent_model, scoped_model_ids))
-            .unwrap_or_default();
         for (rule, origin) in &resolved_scopes {
             if let Some(mut violation) = check_model_scope(Some(resolved), Some(rule), source) {
                 // The upstream violation message carries the rule origin
@@ -894,6 +899,7 @@ pub fn resolve_effective_subagent_model(
     parent_model: Option<(&str, &str)>,
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
+    agent_name: Option<&str>,
     scope: Option<&ModelScopeConfig>,
     scoped_model_ids: &[String],
     on_warn: &mut dyn FnMut(&ModelScopeViolation),
@@ -903,6 +909,7 @@ pub fn resolve_effective_subagent_model(
         parent_model,
         available_models,
         preferred_provider,
+        agent_name,
         scope,
         scoped_model_ids,
         if explicit_model.is_some() {
@@ -920,6 +927,7 @@ pub fn resolve_effective_subagent_model(
         parent_model,
         available_models,
         preferred_provider,
+        agent_name,
         scope,
         scoped_model_ids,
         ModelSource::Inherited,
@@ -1288,6 +1296,7 @@ mod tests {
                 Some(&registry),
                 None,
                 None,
+                None,
                 &[],
                 &mut sink
             )
@@ -1303,6 +1312,7 @@ mod tests {
                 Some(&registry),
                 None,
                 None,
+                None,
                 &[],
                 &mut sink
             )
@@ -1316,6 +1326,7 @@ mod tests {
                 Some("claude-5"),
                 Some(parent_ref),
                 Some(&registry),
+                None,
                 None,
                 None,
                 &[],
@@ -1457,6 +1468,7 @@ mod te18_model_tests {
             Some(&registry),
             None,
             None,
+            None,
             &[],
             ModelSource::Explicit,
             &mut sink,
@@ -1472,6 +1484,7 @@ mod te18_model_tests {
                 Some(&registry),
                 None,
                 None,
+                None,
                 &[],
                 ModelSource::Inherited,
                 &mut sink,
@@ -1485,6 +1498,7 @@ mod te18_model_tests {
                 Some("claude-5"),
                 None,
                 Some(&registry),
+                None,
                 None,
                 None,
                 &[],
@@ -1695,6 +1709,7 @@ mod te18_model_tests {
                 Some(("openai", "gpt-5.5")),
                 None,
                 None,
+                None,
                 Some(&scope),
                 &scoped,
                 ModelSource::Inherited,
@@ -1707,6 +1722,7 @@ mod te18_model_tests {
         // expanded snapshot patterns.
         let error = resolve_subagent_model_override(
             Some("google/gemini-3-pro"),
+            None,
             None,
             None,
             None,
@@ -1725,6 +1741,7 @@ mod te18_model_tests {
                 Some(("anthropic", "claude-5")),
                 None,
                 None,
+                None,
                 Some(&scope),
                 &[],
                 ModelSource::Inherited,
@@ -1740,6 +1757,7 @@ mod te18_model_tests {
             None,
             None,
             None,
+            None,
             Some(&scope),
             &[],
             ModelSource::Inherited,
@@ -1749,6 +1767,80 @@ mod te18_model_tests {
         assert!(
             error.contains("'scoped' requires a current parent session model"),
             "{error}"
+        );
+    }
+
+    /// Round-2 O11: a per-agent `modelScope.agents.<name>` rule with an
+    /// enforced reserved token must fail closed when there is no parent
+    /// model, naming the per-agent origin. The old empty-agent lookup made
+    /// `agents.get("")` miss and the rule fell through silently.
+    #[test]
+    fn per_agent_reserved_scope_without_parent_fails_closed() {
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert(
+            "worker".to_string(),
+            ModelScopeConfig {
+                enforce: Some(true),
+                strict: None,
+                allow: Some(vec![SCOPED_PATTERN.to_string()]),
+                agents: Default::default(),
+            },
+        );
+        let scope = ModelScopeConfig {
+            enforce: None,
+            strict: None,
+            allow: None,
+            agents,
+        };
+        let mut sink = |_violation: &ModelScopeViolation| {};
+        let error = resolve_subagent_model_override(
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            Some(&scope),
+            &[],
+            ModelSource::Inherited,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(error.contains("modelScope.agents.worker"), "{error}");
+        assert!(
+            error.contains("'scoped' requires a current parent session model"),
+            "{error}"
+        );
+        // Another agent does not match the rule and resolves normally.
+        assert_eq!(
+            resolve_subagent_model_override(
+                None,
+                None,
+                None,
+                None,
+                Some("researcher"),
+                Some(&scope),
+                &[],
+                ModelSource::Inherited,
+                &mut sink,
+            )
+            .unwrap(),
+            None
+        );
+        // A parent model expands the token and the rule is satisfied.
+        assert_eq!(
+            resolve_subagent_model_override(
+                None,
+                Some(("anthropic", "claude-5")),
+                None,
+                None,
+                Some("worker"),
+                Some(&scope),
+                &[],
+                ModelSource::Inherited,
+                &mut sink,
+            )
+            .unwrap(),
+            Some("anthropic/claude-5".to_string())
         );
     }
 

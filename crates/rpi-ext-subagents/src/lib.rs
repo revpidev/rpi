@@ -1736,6 +1736,9 @@ pub mod parity {
             parent_ref,
             registry_ref,
             preferred_provider,
+            // The public parity seam has no agent identity; global scopes
+            // keep their previous behavior.
+            None,
             parsed_scope.as_ref(),
             &scoped_ids,
             source,

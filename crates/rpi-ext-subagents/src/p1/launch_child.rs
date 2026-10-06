@@ -605,6 +605,7 @@ pub async fn run_child_async(
         parent_ref,
         registry_ref,
         preferred_provider,
+        Some(&agent.name),
         scope,
         &scoped_model_ids,
         &mut warn_sink,
