@@ -199,8 +199,8 @@ fn run_job_sync(host: &dyn HostCall, job: Job) {
     let mut state = FooterState::default();
     let now = Instant::now();
     match job {
-        Job::Refresh { force, throttled } => {
-            footer::refresh(host, &config, &mut state, force, throttled, now);
+        Job::Refresh { throttled } => {
+            footer::refresh(host, &config, &mut state, false, throttled, now);
         }
         Job::Command { args } => command::handle_now(host, &config, &mut state, &args, now),
         Job::Shutdown => {}
@@ -223,14 +223,8 @@ fn queue_job(host: &dyn HostCall, jobs: Option<&Sender<Job>>, job: Job) {
 /// `session_shutdown` stops the worker.
 fn handle_event(host: &dyn HostCall, jobs: Option<&Sender<Job>>, event: &str) {
     let job = match event {
-        "session_start" | "model_select" => Job::Refresh {
-            force: false,
-            throttled: false,
-        },
-        "message_end" => Job::Refresh {
-            force: false,
-            throttled: true,
-        },
+        "session_start" | "model_select" => Job::Refresh { throttled: false },
+        "message_end" => Job::Refresh { throttled: true },
         "session_shutdown" => Job::Shutdown,
         _ => return,
     };
@@ -477,27 +471,9 @@ mod tests {
             }
         );
         for (event, expected) in [
-            (
-                "session_start",
-                Job::Refresh {
-                    force: false,
-                    throttled: false,
-                },
-            ),
-            (
-                "model_select",
-                Job::Refresh {
-                    force: false,
-                    throttled: false,
-                },
-            ),
-            (
-                "message_end",
-                Job::Refresh {
-                    force: false,
-                    throttled: true,
-                },
-            ),
+            ("session_start", Job::Refresh { throttled: false }),
+            ("model_select", Job::Refresh { throttled: false }),
+            ("message_end", Job::Refresh { throttled: true }),
             ("session_shutdown", Job::Shutdown),
         ] {
             dispatch_for_test(&host, Some(&tx), &json!({"kind": "event", "event": event}));
@@ -552,7 +528,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         footer::install_worker_for_test(cookie as usize, tx);
         assert!(footer::worker_for(cookie).is_some());
-        footer::send_job(cookie, Job::Shutdown);
+        footer::worker_for(cookie)
+            .expect("worker registered")
+            .send(Job::Shutdown)
+            .expect("send shutdown");
         assert_eq!(rx.recv().expect("shutdown"), Job::Shutdown);
     }
     #[test]

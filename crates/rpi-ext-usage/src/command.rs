@@ -40,6 +40,9 @@ pub fn handle_now(
             host,
             "rpi-usage is disabled (settings usage.enabled=false).",
         );
+        // Running the refresh pipeline while disabled clears the status
+        // entry instead of leaving a stale line (round-2).
+        footer::refresh(host, config, state, false, false, now);
         return;
     }
     let known = host::usage_list_providers(host);
@@ -258,7 +261,11 @@ mod tests {
         };
         let host = UsageFakeHost::new();
         host.set_providers(vec!["deepseek".to_owned()]);
-        let mut state = FooterState::default();
+        let mut state = FooterState {
+            provider: Some("deepseek".to_owned()),
+            text: Some("deepseek: CNY 1".to_owned()),
+            last_fetch: None,
+        };
         handle_now(&host, &disabled, &mut state, "", Instant::now());
         assert!(
             host.notifications()
@@ -268,5 +275,10 @@ mod tests {
             host.notifications()
         );
         assert!(host.fetch_calls().is_empty());
+        assert_eq!(
+            host.statuses().last(),
+            Some(&("rpi-usage".to_owned(), None)),
+            "the disabled command clears the stale footer"
+        );
     }
 }

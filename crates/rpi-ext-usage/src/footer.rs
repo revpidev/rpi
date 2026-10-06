@@ -31,11 +31,8 @@ pub const STATUS_KEY: &str = "rpi-usage";
 /// One unit of work for the refresh worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
-    /// Refresh the footer; `force` bypasses the framework cache, `throttled`
-    /// applies the `usage.refreshMs` window.
+    /// Refresh the footer; `throttled` applies the `usage.refreshMs` window.
     Refresh {
-        /// Bypass the framework's 60s cache (and the plugin throttle).
-        force: bool,
         /// Respect the `usage.refreshMs` window.
         throttled: bool,
     },
@@ -129,21 +126,6 @@ pub fn start_worker(cookie: PluginCookie, host: NativeHostCall) -> Sender<Job> {
     tx
 }
 
-/// Enqueue a job for the cookie's worker (best effort; pre-install
-/// dispatches, or a stopped worker, are dropped).
-pub fn send_job(cookie: PluginCookie, job: Job) {
-    let sender = workers()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&(cookie as usize))
-        .map(|entry| entry.sender.clone());
-    if let Some(sender) = sender
-        && sender.send(job).is_err()
-    {
-        tracing::debug!("rpi-usage: refresh worker is gone; job dropped");
-    }
-}
-
 /// The worker sender for a cookie (dispatch routing seam).
 pub fn worker_for(cookie: PluginCookie) -> Option<Sender<Job>> {
     workers()
@@ -181,12 +163,12 @@ fn worker_loop(
     let mut state = FooterState::default();
     while let Ok(first) = rx.recv() {
         let mut command: Option<String> = None;
-        let mut refresh_job: Option<(bool, bool)> = None;
+        let mut refresh_job: Option<bool> = None;
         let mut shutdown = false;
         let mut consume = |job: Job| match job {
-            Job::Refresh { force, throttled } => match refresh_job {
-                None => refresh_job = Some((force, throttled)),
-                Some((f, t)) => refresh_job = Some((f | force, t && throttled)),
+            Job::Refresh { throttled } => match refresh_job {
+                None => refresh_job = Some(throttled),
+                Some(t) => refresh_job = Some(t && throttled),
             },
             Job::Command { args } => command = Some(args),
             Job::Shutdown => shutdown = true,
@@ -203,8 +185,8 @@ fn worker_loop(
             let now = Instant::now();
             if let Some(args) = command {
                 crate::command::handle_now(&host, &config, &mut state, &args, now);
-            } else if let Some((force, throttled)) = refresh_job {
-                refresh(&host, &config, &mut state, force, throttled, now);
+            } else if let Some(throttled) = refresh_job {
+                refresh(&host, &config, &mut state, false, throttled, now);
             }
         }));
         if let Err(_panic) = result {
@@ -472,9 +454,14 @@ mod tests {
         assert_eq!(host.statuses().len(), 0);
     }
     /// v0.1.6 review P1-6: a stale worker's exit must not unregister the
-    /// worker a new session started.
+    /// worker a new session started. Round-2 review O3: this test touches
+    /// the process-global WORKERS map, so it must hold TEST_LOCK (the
+    /// lib.rs dispatch tests install/stop workers under the same lock).
     #[test]
     fn stale_worker_stop_does_not_remove_the_new_worker() {
+        let _guard = crate::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         clear_workers_for_test();
         let cookie = 7usize;
         let (old_tx, _old_rx) = std::sync::mpsc::channel();
