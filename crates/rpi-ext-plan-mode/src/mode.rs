@@ -60,10 +60,14 @@ pub struct SessionPlanState {
     /// can report the last plan.
     pub plan_path: Option<PathBuf>,
     /// Whether the user was already warned that leaving Plan mode could not
-    /// restore the boundary (or the active snapshot was unavailable); the
-    /// warning fires once per entry so a persistent host outage does not
-    /// re-notify on every event (round-2 review note).
+    /// release the boundary; the warning fires once per entry so a
+    /// persistent host outage does not re-notify on every event (round-2
+    /// review note).
     pub exit_cleanup_notified: bool,
+    /// Whether the user was already warned that the pre-plan active set
+    /// could not be restored on a clean exit; fires once per entry so a
+    /// retry loop cannot repeat it (round-2 review note).
+    pub degraded_exit_notified: bool,
 }
 
 static STATES: OnceLock<Mutex<HashMap<String, SessionPlanState>>> = OnceLock::new();
@@ -138,6 +142,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
             state.plan_path = None;
             state.hint_shown = false;
             state.exit_cleanup_notified = false;
+            state.degraded_exit_notified = false;
         }
         let newly = whitelist::newly_hidden(&tools, &config);
         if !entering {
@@ -202,6 +207,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
 
     if state.in_plan {
         let mut cleanup_failed = false;
+        let mut degraded_snapshot = false;
         if !state.hidden_targets.is_empty()
             && let Err(error) = host.call(
                 "clearToolExposures",
@@ -239,21 +245,16 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
             tracing::warn!(
                 "rpi-plan-mode: no active-set snapshot was captured on entry; keeping the active set"
             );
-            state.exit_cleanup_notified = true;
-            let _ = host.call(
-                "ui.notify",
-                json!({
-                    "message": i18n::ACTIVE_SET_NOT_RESTORED,
-                    "notifyType": "warning",
-                }),
-            );
+            degraded_snapshot = true;
         }
         if cleanup_failed {
             // Keep the mirror state so the next event retries the release
             // instead of leaking the hidden overrides for the rest of the
             // session (v0.1.6 review round 2, O6), and tell the user once
             // per Plan entry (a persistent outage would otherwise re-notify
-            // on every before_agent_start; round-2 review note).
+            // on every before_agent_start; round-2 review note). The
+            // degraded-snapshot note waits for a clean exit so the message
+            // matches what actually happened.
             if !state.exit_cleanup_notified {
                 let _ = host.call(
                     "ui.notify",
@@ -268,6 +269,16 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
             // state untouched for the retry.
             commit(&session, state);
             return false;
+        }
+        if degraded_snapshot && !state.degraded_exit_notified {
+            state.degraded_exit_notified = true;
+            let _ = host.call(
+                "ui.notify",
+                json!({
+                    "message": i18n::ACTIVE_SET_NOT_RESTORED,
+                    "notifyType": "warning",
+                }),
+            );
         }
         if state.hint_shown && crate::host::has_ui(host) {
             let _ = host.call(
@@ -285,6 +296,7 @@ pub fn reconcile(host: &dyn HostCall) -> bool {
         state.entry_known.clear();
         state.hint_shown = false;
         state.exit_cleanup_notified = false;
+        state.degraded_exit_notified = false;
         // `plan_path` deliberately survives: `/plan file` reports the last
         // plan after exit, and a new Plan entry resets it.
         commit(&session, state);
@@ -821,6 +833,56 @@ mod tests {
             ]
         );
         assert_eq!(host.view().active, vec!["read", "edit", "bash"]);
+        assert!(!state_for_test("s-1").in_plan);
+    }
+
+    /// Round-2 follow-up: when the entry snapshot is unavailable AND the
+    /// cleanup keeps failing, the user gets the accurate cleanup note (once)
+    /// and the degraded-snapshot note only after a clean exit — never a
+    /// re-notify on every event, and never an "off" message while the
+    /// boundary is still applied.
+    #[test]
+    fn combined_snapshot_and_cleanup_failures_notify_once() {
+        let _guard = serialized();
+        crate::__reset_state();
+        let host = base_host();
+        host.set_mode("plan");
+        host.fail_method("getActiveTools");
+        assert!(reconcile(&host), "entry without a snapshot still hides");
+        assert_eq!(host.view().active, vec!["read", "write_plan"]);
+        host.clear_failed_methods();
+        host.set_mode("default");
+        host.fail_method("clearToolExposures");
+        assert!(!reconcile(&host));
+        let first: Vec<String> = host.view().notifications;
+        assert!(
+            first
+                .iter()
+                .any(|message| message.contains("cleanup will be retried")),
+            "the failing cleanup must be named: {first:?}"
+        );
+        assert!(
+            !first
+                .iter()
+                .any(|message| message.contains("pre-plan active tool set")),
+            "the degraded note must wait for a clean exit: {first:?}"
+        );
+        assert!(!reconcile(&host));
+        assert_eq!(
+            host.view().notifications,
+            first,
+            "a persistent outage must not re-notify"
+        );
+        host.clear_failed_methods();
+        assert!(!reconcile(&host));
+        assert!(
+            host.view()
+                .notifications
+                .iter()
+                .any(|message| message.contains("pre-plan active tool set")),
+            "the recovered exit reports the unrestored active set: {:?}",
+            host.view().notifications
+        );
         assert!(!state_for_test("s-1").in_plan);
     }
 
