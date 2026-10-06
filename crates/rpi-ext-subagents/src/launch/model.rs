@@ -864,9 +864,11 @@ pub fn resolve_subagent_model_override(
             }
         }
     };
-    if let Some(resolved) = resolved.as_deref()
-        && scope.is_some_and(|s| s.enforced())
-    {
+    if let Some(resolved) = resolved.as_deref() {
+        // Apply every resolved rule by its own `enforce` (upstream
+        // `enforceModelScopes`); the old top-level `enforce` gate skipped
+        // per-agent rules when the global rule was unenforced (round-2
+        // review note). `check_model_scope` no-ops on unenforced rules.
         for (rule, origin) in &resolved_scopes {
             if let Some(mut violation) = check_model_scope(Some(resolved), Some(rule), source) {
                 // The upstream violation message carries the rule origin
@@ -1842,6 +1844,81 @@ mod te18_model_tests {
             .unwrap(),
             Some("anthropic/claude-5".to_string())
         );
+    }
+
+    /// Round-2 note: a per-agent rule is enforced by its own `enforce`, even
+    /// when the global rule carries none (upstream `enforceModelScopes`
+    /// checks every resolved rule). The old top-level gate skipped it.
+    #[test]
+    fn per_agent_enforce_applies_without_a_global_enforce() {
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert(
+            "worker".to_string(),
+            ModelScopeConfig {
+                enforce: Some(true),
+                strict: Some(true),
+                allow: Some(vec!["anthropic/*".to_string()]),
+                agents: Default::default(),
+            },
+        );
+        let scope = ModelScopeConfig {
+            enforce: None,
+            strict: None,
+            allow: None,
+            agents,
+        };
+        let mut sink = |_violation: &ModelScopeViolation| {};
+        let error = resolve_subagent_model_override(
+            None,
+            Some(("openai", "gpt-5")),
+            None,
+            None,
+            Some("worker"),
+            Some(&scope),
+            &[],
+            ModelSource::Inherited,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(error.contains("modelScope.agents.worker"), "{error}");
+        // A non-strict per-agent rule warns instead of failing.
+        let mut warnings = Vec::new();
+        let scope_warn = ModelScopeConfig {
+            enforce: None,
+            strict: None,
+            allow: None,
+            agents: {
+                let mut agents = std::collections::BTreeMap::new();
+                agents.insert(
+                    "worker".to_string(),
+                    ModelScopeConfig {
+                        enforce: Some(true),
+                        strict: None,
+                        allow: Some(vec!["anthropic/*".to_string()]),
+                        agents: Default::default(),
+                    },
+                );
+                agents
+            },
+        };
+        let mut sink = |violation: &ModelScopeViolation| warnings.push(violation.message.clone());
+        assert_eq!(
+            resolve_subagent_model_override(
+                None,
+                Some(("openai", "gpt-5")),
+                None,
+                None,
+                Some("worker"),
+                Some(&scope_warn),
+                &[],
+                ModelSource::Inherited,
+                &mut sink,
+            )
+            .unwrap(),
+            Some("openai/gpt-5".to_string())
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("modelScope.agents.worker"));
     }
 
     #[test]

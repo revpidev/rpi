@@ -243,6 +243,17 @@ fn tool_surface_integration() {
             result["details"]["statusFile"].is_null(),
             "{params}: a failed preflight must not return a run receipt: {result}"
         );
+        // The error keeps the requested composition mode so the card renders
+        // as the composite the caller asked for (round-2 review note).
+        let expected_mode = if params.get("tasks").is_some() {
+            "parallel"
+        } else {
+            "chain"
+        };
+        assert_eq!(
+            result["details"]["mode"], expected_mode,
+            "{params}: {result}"
+        );
     }
     let chain_dirs_after = std::fs::read_dir(&chain_root)
         .map(|entries| entries.count())

@@ -58,6 +58,18 @@ impl ToolOutcome {
         }
     }
 
+    /// Error outcome that keeps the requested composition mode in `details`
+    /// (round-2 review note): upstream canonicalize errors answer
+    /// `mode: "parallel"|"chain"`, so the error card renders as the
+    /// composite the caller asked for instead of a single-subagent card.
+    pub fn mode_error(mode: &str, text: String) -> Self {
+        Self {
+            text,
+            details: json!({ "mode": mode, "results": [] }),
+            is_error: true,
+        }
+    }
+
     pub fn to_tool_result(&self) -> Value {
         json!({
             "content": [{ "type": "text", "text": self.text }],
@@ -715,19 +727,19 @@ fn dispatch_tasks(
         max_tasks,
     ) {
         Ok(entries) => entries,
-        Err(error) => return ToolOutcome::error(error),
+        Err(error) => return ToolOutcome::mode_error("parallel", error),
     };
     // Upstream canonicalizes every task agent before any execution
     // (`canonicalizeExecutionParams`): a typo in a later task must not let
     // the earlier tasks start (v0.1.6 review round 2, B1).
     if let Err(error) = crate::p1::parallel::validate_task_agents(&entries, agents) {
-        return ToolOutcome::error(error);
+        return ToolOutcome::mode_error("parallel", error);
     }
     // R7.1.6.3: reject explicit output collisions before any spawn.
     if let Err(error) =
         crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries, agents))
     {
-        return ToolOutcome::error(error);
+        return ToolOutcome::mode_error("parallel", error);
     }
     let concurrency = ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
     // Worktree isolation (FR-P1-06): top-level `worktree: true` defaults
@@ -736,7 +748,7 @@ fn dispatch_tasks(
     // None when no task ends up enabled.
     let worktree_plan = match build_worktree_plan(&entries, object, ctx) {
         Ok(plan) => plan,
-        Err(error) => return ToolOutcome::error(error),
+        Err(error) => return ToolOutcome::mode_error("parallel", error),
     };
     let outcomes = match crate::p1::parallel::run_parallel(
         &entries,
@@ -747,7 +759,7 @@ fn dispatch_tasks(
         worktree_plan.clone(),
     ) {
         Ok(outcomes) => outcomes,
-        Err(error) => return ToolOutcome::error(error),
+        Err(error) => return ToolOutcome::mode_error("parallel", error),
     };
     if let Some(plan) = &worktree_plan {
         crate::p1::parallel::finalize_worktree_handoff(plan, &ctx.run_id, &ctx.base_cwd);
@@ -786,19 +798,19 @@ fn dispatch_steps(
 ) -> ToolOutcome {
     let steps = match crate::p1::chain::parse_steps(object.get("steps").unwrap_or(&Value::Null)) {
         Ok(steps) => steps,
-        Err(error) => return ToolOutcome::error(error),
+        Err(error) => return ToolOutcome::mode_error("chain", error),
     };
     // Upstream canonicalizes every step agent before any execution: a typo
     // in a later step must not run the earlier steps first (v0.1.6 review
     // round 2, B2).
     if let Err(error) = crate::p1::chain::validate_step_agents(&steps, agents) {
-        return ToolOutcome::error(error);
+        return ToolOutcome::mode_error("chain", error);
     }
     // R7.1.6.3: reject explicit output collisions before any spawn.
     if let Err(error) =
         crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps, agents))
     {
-        return ToolOutcome::error(error);
+        return ToolOutcome::mode_error("chain", error);
     }
     let original_task = object
         .get("task")
@@ -808,7 +820,7 @@ fn dispatch_steps(
     let (completed, failed) =
         match crate::p1::chain::run_chain(&steps, agents, ctx, runtime, &original_task) {
             Ok(result) => result,
-            Err(error) => return ToolOutcome::error(error),
+            Err(error) => return ToolOutcome::mode_error("chain", error),
         };
     record_runs(
         &completed
@@ -877,27 +889,27 @@ fn dispatch_async(
             ctx.config.parallel_max_tasks(),
         ) {
             Ok(entries) => entries,
-            Err(error) => return ToolOutcome::error(error),
+            Err(error) => return ToolOutcome::mode_error("parallel", error),
         };
         // Upstream canonicalizes every task agent before the receipt is
         // returned (v0.1.6 review round 2, B1/B2): the async path must not
         // consume the spawn budget, create a run directory, or answer
         // "started" for a batch that cannot launch.
         if let Err(error) = crate::p1::parallel::validate_task_agents(&entries, agents) {
-            return ToolOutcome::error(error);
+            return ToolOutcome::mode_error("parallel", error);
         }
         // R7.1.6.3: fail closed before the receipt is returned.
         if let Err(error) =
             crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries, agents))
         {
-            return ToolOutcome::error(error);
+            return ToolOutcome::mode_error("parallel", error);
         }
         let concurrency = ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
         // Same worktree opt-in as the foreground path (FR-P1-06): top-level
         // or per-task `worktree: true`.
         let worktree_plan = match build_worktree_plan(&entries, object, ctx) {
             Ok(plan) => plan,
-            Err(error) => return ToolOutcome::error(error),
+            Err(error) => return ToolOutcome::mode_error("parallel", error),
         };
         crate::runner::background::AsyncBody::Tasks {
             entries,
@@ -908,18 +920,18 @@ fn dispatch_async(
         let steps = match crate::p1::chain::parse_steps(object.get("steps").unwrap_or(&Value::Null))
         {
             Ok(steps) => steps,
-            Err(error) => return ToolOutcome::error(error),
+            Err(error) => return ToolOutcome::mode_error("chain", error),
         };
         // Upstream canonicalizes every step agent before the receipt is
         // returned (v0.1.6 review round 2, B1/B2).
         if let Err(error) = crate::p1::chain::validate_step_agents(&steps, agents) {
-            return ToolOutcome::error(error);
+            return ToolOutcome::mode_error("chain", error);
         }
         // R7.1.6.3: fail closed before the receipt is returned.
         if let Err(error) =
             crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps, agents))
         {
-            return ToolOutcome::error(error);
+            return ToolOutcome::mode_error("chain", error);
         }
         let original_task = object
             .get("task")
@@ -942,6 +954,11 @@ fn dispatch_async(
         }
     };
 
+    let body_mode = match &body {
+        crate::runner::background::AsyncBody::Single { .. } => "single",
+        crate::runner::background::AsyncBody::Tasks { .. } => "parallel",
+        crate::runner::background::AsyncBody::Steps { .. } => "chain",
+    };
     let session_id = ctx.parent_session_id.clone();
     let planned = match &body {
         crate::runner::background::AsyncBody::Single { .. } => 1,
@@ -968,7 +985,7 @@ fn dispatch_async(
         agents,
         crate::launch::binary::resolve_self_extension_path().as_deref(),
     ) {
-        return ToolOutcome::error(error);
+        return ToolOutcome::mode_error(body_mode, error);
     }
 
     // Budget preflight (ADR-0019 §4): session spawn ledger first (releases on
@@ -978,7 +995,7 @@ fn dispatch_async(
     );
     if let Err(error) = spawn_ledger.reserve(planned, ctx.config.max_subagent_spawns_per_session())
     {
-        return ToolOutcome::error(error);
+        return ToolOutcome::mode_error(body_mode, error);
     }
     let capacity = crate::runner::background::ActiveAsyncCapacity::open(
         session_id.as_deref().unwrap_or("no-session"),
@@ -989,7 +1006,7 @@ fn dispatch_async(
         .unwrap_or(u64::MAX);
     let slot = match capacity.acquire(&ctx.run_id, limit) {
         Ok(slot) => slot,
-        Err(error) => return ToolOutcome::error(error),
+        Err(error) => return ToolOutcome::mode_error(body_mode, error),
     };
 
     let handle = crate::runner::background::start_run(&ctx.run_id, session_id.as_deref(), &body);
