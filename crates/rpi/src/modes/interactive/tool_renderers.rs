@@ -1,6 +1,9 @@
 //! Built-in tool renderers (T17) — port of the `renderCall`/`renderResult`
 //! hooks carried by the upstream tool definitions in
-//! `packages/coding-agent/src/core/tools/*.ts` @ pi 0.82.1 (2efa728).
+//! `packages/coding-agent/src/core/tools/*.ts` @ pi 0.82.1 (2efa728), plus
+//! the `codemode` definition from
+//! `packages/coding-agent/src/extensions/codemode/renderer.ts` @ a13d35a74
+//! (the built-in extension registers no hooks itself).
 //!
 //! [`builtin_tool_definition`] is the render-only port of
 //! `createAllToolDefinitions(cwd)[toolName]` (tool-execution.ts:57): one
@@ -9,6 +12,7 @@
 //! the registered definitions are shared, stateless singletons.
 
 pub mod bash;
+pub mod codemode;
 pub mod edit;
 pub mod find;
 pub mod grep;
@@ -30,6 +34,7 @@ pub fn builtin_tool_definition(tool_name: &str) -> Option<Arc<dyn ToolDefinition
     let registry = REGISTRY.get_or_init(|| {
         let mut map: HashMap<&'static str, Arc<dyn ToolDefinition>> = HashMap::new();
         map.insert("bash", Arc::new(bash::BashToolRenderer));
+        map.insert("codemode", Arc::new(codemode::CodemodeToolRenderer));
         map.insert("edit", Arc::new(edit::EditToolRenderer));
         map.insert("find", Arc::new(find::FindToolRenderer));
         map.insert("grep", Arc::new(grep::GrepToolRenderer));

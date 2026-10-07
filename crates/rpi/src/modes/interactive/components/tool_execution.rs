@@ -1049,6 +1049,59 @@ mod tests {
         assert!(expanded.contains("count: 2"), "{expanded:?}");
     }
 
+    /// Regression: the built-in codemode extension registers no
+    /// `renderCall`/`renderResult` hooks, so without the T17 `codemode`
+    /// renderer the tool resolved no definition at all and the generic
+    /// `formatToolExecution` fallback printed the entire script (pretty
+    /// JSON) and output unfolded. With the built-in renderer registered
+    /// the script folds to its preview and the result renders the nested
+    /// call rows with the script header hidden.
+    #[test]
+    fn codemode_calls_fold_through_the_builtin_renderer() {
+        let script: String = (1..=40)
+            .map(|index| format!("const v{index} = {index};\n"))
+            .collect();
+        let mut component = ToolExecutionComponent::new(
+            "codemode",
+            "call_1",
+            serde_json::json!({"code": script}),
+            ToolExecutionOptions::default(),
+            None,
+            theme(),
+            RenderHandle::new(|| {}),
+            "/cwd",
+        );
+        component.update_result(
+            ToolResultState {
+                content: vec![
+                    ToolResultContentLoose::text(
+                        "Script completed\nWall time 0.1 seconds\nOutput:\n",
+                    ),
+                    ToolResultContentLoose::text("done"),
+                ],
+                is_error: false,
+                details: Some(serde_json::json!({
+                    "calls": [
+                        {"id": "call_1/1", "name": "read", "args": "{\"path\":\"a\"}",
+                         "status": "ok", "durationMs": 5}
+                    ]
+                })),
+            },
+            false,
+        );
+        let stripped = strip_ansi(&component.render(80).join("\n"));
+        // The script is folded, not printed in full.
+        assert!(!stripped.contains("const v40"), "{stripped}");
+        assert!(stripped.contains("more lines,"), "{stripped}");
+        // The nested call renders; the script header is dropped.
+        assert!(
+            stripped.contains("✓ read {\"path\":\"a\"} 5ms"),
+            "{stripped}"
+        );
+        assert!(!stripped.contains("Wall time"), "{stripped}");
+        assert!(stripped.contains("done"), "{stripped}");
+    }
+
     #[test]
     fn result_updates_background_by_state() {
         let mut component = make_component();
