@@ -1,9 +1,10 @@
 //! build.rs — built-in model catalog pipeline (T13 W4).
 //!
-//! Reads the vendored provider catalog data in `src/providers/data/` (copied
-//! verbatim from `external/pi/packages/ai/src/providers/data/`, first vendored
-//! at pin 0.82.1 @ 2efa728 and verified byte-identical at 4181f66 / 0.84.1+
-//! on the v0.11 bump — generatedAt 2026-07-30 predates both pins; read-only
+//! Reads the vendored provider catalog data in `src/providers/data/` — a
+//! byte-for-byte copy of the output of the pinned upstream generator
+//! (`external/pi/packages/ai/scripts/generate-models.ts`; the initial
+//! vendoring at pin 0.82.1 @ 2efa728 has been refreshed repeatedly, most
+//! recently the 2026-10-08 run — see the manifest `generatedAt`; read-only
 //! generated data — never edit by hand, coding-standards
 //! §3.2) and emits `models_generated.rs` into `OUT_DIR` with:
 //!
@@ -19,9 +20,11 @@
 //! the data as-is and applies nothing further.
 //!
 //! Refresh flow (manual, never at build time — builds stay offline):
-//! `scripts/refresh-model-catalog.sh` re-vendors the JSONs from the pinned
-//! upstream checkout after running its `generate-models.ts`; an upstream pin
-//! bump requires an ADR (coding-standards §15.2).
+//! `scripts/refresh-model-catalog.sh` re-vendors the JSONs produced by
+//! running the generator in a **throwaway upstream worktree** (the vendored
+//! data deliberately diverges from whatever `external/pi` currently holds;
+//! that checkout stays a read-only reference); an upstream pin bump requires
+//! an ADR (coding-standards §15.2).
 
 use std::path::{Path, PathBuf};
 

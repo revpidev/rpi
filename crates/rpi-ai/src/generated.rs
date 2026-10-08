@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_v6_type_faces() {
-        // OpenRouter carries the `openrouter-images` api group (57 image
+        // OpenRouter carries the `openrouter-images` api group (61 image
         // models) and `typesafe-system-one` classifiers.
         let openrouter = builtin_catalog().expect("catalog");
         assert!(
