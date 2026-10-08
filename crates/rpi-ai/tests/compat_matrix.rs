@@ -454,7 +454,10 @@ fn test_catalog_github_copilot_eager_streaming_baked() {
 #[test]
 fn test_catalog_together_reasoning_variants_baked() {
     // Reasoning-effort models: effort on, openai thinking format.
-    let gpt_oss = get_builtin_model("together", "openai/gpt-oss-20b").expect("gpt-oss-20b");
+    // G2 (2026-10-08 catalog refresh): the previous `openai/gpt-oss-20b` /
+    // `deepseek-ai/DeepSeek-V4-Pro` ids were retired by the snapshot; the
+    // same baked rules moved to their current siblings.
+    let gpt_oss = get_builtin_model("together", "openai/gpt-oss-120b").expect("gpt-oss-120b");
     let compat = gpt_oss.compat.as_ref().expect("compat");
     assert_eq!(compat.supports_reasoning_effort, Some(true));
     assert_eq!(compat.thinking_format, Some(ThinkingFormat::Openai));
@@ -463,7 +466,8 @@ fn test_catalog_together_reasoning_variants_baked() {
     assert_eq!(map.get(&ModelThinkingLevel::Off), Some(&None));
 
     // Default reasoning models keep the together toggle format with effort off.
-    let r1 = get_builtin_model("together", "deepseek-ai/DeepSeek-V4-Pro").expect("ds-v4-pro");
+    let r1 =
+        get_builtin_model("together", "deepseek-ai/DeepSeek-V4-Pro-0813").expect("ds-v4-pro-0813");
     let compat = r1.compat.as_ref().expect("compat");
     assert_eq!(compat.thinking_format, Some(ThinkingFormat::Together));
     assert_eq!(compat.supports_long_cache_retention, Some(false));

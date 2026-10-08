@@ -120,7 +120,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://integrate.api.nvidia.com/v1",
         "NVIDIA API key",
         "NVIDIA_API_KEY",
-        19, // 19451accd rules regen (models.dev snapshot 2026-09-23)
+        21, // 2026-10-08 catalog refresh (deepseek-v4.1-flash + diffusiongemma-26b)
     ),
     spec(
         together_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        20, // 2026-10-01 v6 regen (Kimi K2.6 → K3; models.dev snapshot)
+        17, // 2026-10-08 catalog refresh (DeepSeek-V4-Pro → -0813; models.dev snapshot)
     ),
     spec(
         xai_provider,
@@ -398,19 +398,21 @@ fn together_reasoning_controls_match_api_surface() {
     assert_eq!(compat.supports_reasoning_effort, Some(true));
     assert_eq!(compat.thinking_format, Some(ThinkingFormat::Openai));
 
-    let deepseek_v4 = get_model(&provider, "deepseek-ai/DeepSeek-V4-Pro");
+    let deepseek_v4 = get_model(&provider, "deepseek-ai/DeepSeek-V4-Pro-0813");
+    // 2026-10-08 catalog refresh: models.dev retired DeepSeek-V4-Pro (the
+    // generator's `TOGETHER_TOGGLE_REASONING_EFFORT_MODELS` set still names
+    // the old id, so the correction no longer applies to the -0813 sibling)
+    // and the replacement carries the plain toggle map with effort off.
     assert_eq!(
         deepseek_v4.thinking_level_map,
         Some(ThinkingLevelMap::from([
             (ModelThinkingLevel::Minimal, None),
             (ModelThinkingLevel::Low, None),
             (ModelThinkingLevel::Medium, None),
-            (ModelThinkingLevel::High, Some("high".to_owned())),
-            (ModelThinkingLevel::Xhigh, None),
         ]))
     );
     let compat = deepseek_v4.compat.as_ref().expect("deepseek compat");
-    assert_eq!(compat.supports_reasoning_effort, Some(true));
+    assert_eq!(compat.supports_reasoning_effort, Some(false));
     assert_eq!(compat.thinking_format, Some(ThinkingFormat::Together));
 
     let minimax = get_model(&provider, "MiniMaxAI/MiniMax-M2.7");

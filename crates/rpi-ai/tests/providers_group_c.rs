@@ -256,7 +256,11 @@ fn moonshotai_kimi_k3_pricing_and_mid_convo_compat() {
         assert_eq!(model.cost.rates.input, 3.0);
         assert_eq!(model.cost.rates.output, 15.0);
         assert_eq!(model.cost.rates.cache_read, 0.3);
-        assert_eq!(model.cost.rates.cache_write, 0.0);
+        // 2026-10-08 catalog refresh: models.dev now reports Kimi K3 cache
+        // write as 3/MTok (was 0 when upstream pinned the assertion); the
+        // generator passes the source value through unchanged (no correction
+        // rule for Moonshot chat models).
+        assert_eq!(model.cost.rates.cache_write, 3.0);
         // Post-#9548 catalog shape: `deferredToolsMode` was replaced by the
         // mid-conversation compat faces (9e05370b2; wire convergence V15-06,
         // T-V15-02-1).
