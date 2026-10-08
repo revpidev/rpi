@@ -99,6 +99,25 @@ pub enum IdleStreamError<E> {
     IdleTimeout { idle_ms: u64 },
 }
 
+impl IdleStreamError<reqwest::Error> {
+    /// The provider-facing message for a body-stream failure. The transport
+    /// arm uses the upstream-parity wording via
+    /// [`crate::utils::transport_error::format_reqwest_error`] (reqwest's
+    /// `Display` drops the source chain, which the retry classifier needs);
+    /// the idle arm matches the historical wording, which already carries
+    /// `timed out`.
+    pub fn message(&self) -> String {
+        match self {
+            IdleStreamError::Transport(error) => {
+                crate::utils::transport_error::format_reqwest_error(error)
+            }
+            IdleStreamError::IdleTimeout { idle_ms } => {
+                format!("stream idle timeout: no data for {idle_ms}ms (connection timed out)")
+            }
+        }
+    }
+}
+
 impl<E: std::fmt::Display> std::fmt::Display for IdleStreamError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

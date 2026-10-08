@@ -909,7 +909,7 @@ async fn run(
             }
         };
         let Some(chunk) = chunk else { break };
-        let bytes = chunk.map_err(|error| StreamFailure::plain(error.to_string()))?;
+        let bytes = chunk.map_err(|error| StreamFailure::plain(error.message()))?;
         let parsed = reader.feed(&bytes).map_err(StreamFailure::plain)?;
         if push_converted(&mut converter, events, parsed) {
             // Terminal event pushed: upstream `return`s out of the async IIFE.

@@ -664,7 +664,7 @@ async fn run(
                 StreamNext::Cancelled => return Err("Request was aborted".to_owned()),
             };
         let Some(chunk) = chunk else { break };
-        let bytes = chunk.map_err(|error| error.to_string())?;
+        let bytes = chunk.map_err(|error| error.message())?;
         for sse in decoder.feed(&bytes)? {
             // No `[DONE]` sentinel on the Responses API: a terminal
             // `response.completed`/`response.failed` event ends the stream.

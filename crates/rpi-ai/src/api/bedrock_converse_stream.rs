@@ -1879,7 +1879,12 @@ async fn run(
                         Err(ProviderErrorInfo {
                             status: error.status().map(|status| status.as_u16()),
                             headers: None,
-                            message: format_bedrock_error(None, None, None, &error.to_string()),
+                            message: format_bedrock_error(
+                                None,
+                                None,
+                                None,
+                                &crate::utils::transport_error::format_reqwest_error(&error),
+                            ),
                         })
                     }
                     crate::api::stream_timeouts::SendOutcome::HeadersTimeout(message) => {
@@ -1965,7 +1970,7 @@ async fn run(
         let bytes = match chunk {
             Ok(bytes) => bytes,
             Err(error) => {
-                outcome = Err(error.to_string());
+                outcome = Err(error.message());
                 break 'stream;
             }
         };

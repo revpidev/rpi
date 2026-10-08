@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::types::{FetchFn, FetchRequest, FetchResponse};
 use crate::utils::provider_retry::ProviderErrorInfo;
+use crate::utils::transport_error::format_reqwest_error;
 
 /// Outcome of a failed [`send_provider_request`] attempt. The variants keep
 /// the reqwest error intact so adapters with special reqwest mappings (e.g.
@@ -59,19 +60,20 @@ impl SendFailure {
             SendFailure::Reqwest(error) => ProviderErrorInfo {
                 status: error.status().map(|status| status.as_u16()),
                 headers: None,
-                message: error.to_string(),
+                message: format_reqwest_error(&error),
             },
             SendFailure::Custom(info) => info,
         }
     }
 
     /// Display message matching the pre-channel `error.to_string()` mapping
-    /// (pi_messages / codex style).
+    /// (pi_messages / codex style), with the upstream-parity transport
+    /// wording for reqwest failures (see `utils::transport_error`).
     pub fn message(&self) -> String {
         match self {
             SendFailure::Aborted => "Request was aborted".to_owned(),
             SendFailure::HeadersTimedOut(message) => message.clone(),
-            SendFailure::Reqwest(error) => error.to_string(),
+            SendFailure::Reqwest(error) => format_reqwest_error(error),
             SendFailure::Custom(info) => info.message.clone(),
         }
     }

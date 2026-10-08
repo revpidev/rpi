@@ -23,5 +23,6 @@ pub mod sanitize_unicode;
 pub mod text;
 pub mod transcript;
 pub mod transform_messages;
+pub mod transport_error;
 pub mod uuid;
 pub mod validation;

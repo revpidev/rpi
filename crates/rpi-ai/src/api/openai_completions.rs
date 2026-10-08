@@ -2738,7 +2738,7 @@ async fn run(
                 }
             };
         let Some(chunk) = chunk else { break };
-        let bytes = match chunk.map_err(|error| error.to_string()) {
+        let bytes = match chunk.map_err(|error| error.message()) {
             Ok(bytes) => bytes,
             Err(error) => {
                 result = Err(error);

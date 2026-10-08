@@ -259,7 +259,7 @@ async fn generate_images_inner(
         }
         None => body_fut.await,
     }
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| crate::utils::transport_error::format_reqwest_error(&error))?;
     let parsed: OpenRouterImageGenerationResponse =
         serde_json::from_str(&body).map_err(|error| error.to_string())?;
 

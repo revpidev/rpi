@@ -341,7 +341,9 @@ async fn classify_inner(
                                 response.text().await.map_err(|error| ProviderErrorInfo {
                                     status: None,
                                     headers: None,
-                                    message: error.to_string(),
+                                    message: crate::utils::transport_error::format_reqwest_error(
+                                        &error,
+                                    ),
                                 })?;
                             let parsed = serde_json::from_str::<Value>(&body).map_err(|error| {
                                 ProviderErrorInfo {

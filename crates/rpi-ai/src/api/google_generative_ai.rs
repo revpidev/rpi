@@ -779,7 +779,7 @@ async fn run(
                         Err(ProviderErrorInfo {
                             status: error.status().map(|status| status.as_u16()),
                             headers: None,
-                            message: error.to_string(),
+                            message: crate::utils::transport_error::format_reqwest_error(&error),
                         })
                     }
                     crate::api::stream_timeouts::SendOutcome::HeadersTimeout(message) => {
@@ -832,7 +832,7 @@ async fn run(
                 StreamNext::Cancelled => return Err("Request was aborted".to_owned()),
             };
         let Some(chunk) = chunk else { break };
-        let bytes = chunk.map_err(|error| error.to_string())?;
+        let bytes = chunk.map_err(|error| error.message())?;
         check_raw_chunk_error(&bytes)?;
         for sse in decoder.feed(&bytes)? {
             processor.handle_sse(&sse, events)?;

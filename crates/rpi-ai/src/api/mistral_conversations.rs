@@ -1319,7 +1319,7 @@ async fn run(
                                 format_mistral_error(
                                     error.status().map(|status| status.as_u16()),
                                     None,
-                                    &error.to_string(),
+                                    &crate::utils::transport_error::format_reqwest_error(&error),
                                 )
                             },
                         },
@@ -1401,7 +1401,7 @@ async fn run(
                 if error.is_timeout() {
                     MISTRAL_TIMEOUT_MESSAGE.to_owned()
                 } else {
-                    error.to_string()
+                    crate::utils::transport_error::format_reqwest_error(&error)
                 }
             }
         })?;
