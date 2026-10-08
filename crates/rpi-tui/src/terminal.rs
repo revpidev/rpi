@@ -41,6 +41,13 @@
 //!   the upstream catch-and-skip semantics (V14-18 FR-D).
 //! - Raw mode: the previous state is captured with crossterm's
 //!   `is_raw_mode_enabled()` (upstream `process.stdin.isRaw || false`).
+//!   Only [`ProcessTerminal::new`] manages the process terminal's raw mode;
+//!   the injected-writer constructor ([`ProcessTerminal::with_writer`],
+//!   tests/harnesses) never calls `enable_raw_mode`/`disable_raw_mode` —
+//!   those resolve the tty through `/dev/tty` (crossterm `tty_fd`) when
+//!   stdin is not a tty and could block forever in a non-TTY session with an
+//!   accessible controlling tty (observed: the `recovery.rs` panic-hook
+//!   tests hung without a pty; `setsid` runs passed instantly).
 //!   `process.stdin.pause()` in `stop()` (terminal.ts:446) has no Rust
 //!   equivalent: the stdin reader thread is spawned once per process and
 //!   lives for the process; `stop()` clears the process-global live sender
@@ -449,6 +456,15 @@ fn default_query_size() -> io::Result<(u16, u16)> {
 pub struct ProcessTerminal<W: Write = io::Stdout> {
     out: W,
     write_log_path: Option<PathBuf>,
+    /// Whether this instance owns the process terminal's raw-mode state:
+    /// `true` for [`ProcessTerminal::new`] (real stdin/stdout), `false` for
+    /// [`ProcessTerminal::with_writer`] (test/harness injection). Injected
+    /// writers must never call `enable_raw_mode`/`disable_raw_mode`:
+    /// crossterm resolves the tty through `/dev/tty` when stdin is not a
+    /// tty, which blocks forever in a non-TTY session with an accessible
+    /// controlling tty (the `recovery.rs` panic-hook test hang, v0.1.6-rc.5
+    /// fix).
+    owns_raw_mode: bool,
     was_raw: bool,
     /// Raw mode was toggled by `start()`; guards raw restore in `stop()`
     /// (upstream calls `setRawMode` unconditionally, which is a no-op there
@@ -478,7 +494,9 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
 impl ProcessTerminal<io::Stdout> {
     /// Terminal on process stdin/stdout (upstream `new ProcessTerminal()`).
     pub fn new() -> Self {
-        Self::with_writer(io::stdout())
+        let mut terminal = Self::with_writer(io::stdout());
+        terminal.owns_raw_mode = true;
+        terminal
     }
 }
 
@@ -489,11 +507,14 @@ impl Default for ProcessTerminal<io::Stdout> {
 }
 
 impl<W: Write> ProcessTerminal<W> {
-    /// Terminal writing to a custom sink (test injection point).
+    /// Terminal writing to a custom sink (test injection point). The
+    /// returned terminal does not manage the process terminal's raw mode
+    /// (see `owns_raw_mode`).
     pub fn with_writer(out: W) -> Self {
         Self {
             out,
             write_log_path: resolve_write_log_path(),
+            owns_raw_mode: false,
             was_raw: false,
             started: false,
             input_handler: None,
@@ -854,9 +875,13 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         self.input_handler = Some(on_input);
         self.resize_handler = Some(on_resize);
 
-        // Save previous state and enable raw mode.
-        self.was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-        let _ = crossterm::terminal::enable_raw_mode();
+        // Save previous state and enable raw mode — process terminals only:
+        // an injected writer never mutates the real terminal's mode (see
+        // `owns_raw_mode`).
+        if self.owns_raw_mode {
+            self.was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+            let _ = crossterm::terminal::enable_raw_mode();
+        }
         self.started = true;
 
         // Enable bracketed paste mode - terminal will wrap pastes in
@@ -930,13 +955,16 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         // The persistent reader's cleared slot approximates this: bytes read
         // while stopped are discarded instead of buffered.
 
-        // Restore raw mode state.
+        // Restore raw mode state (process terminals only; an injected writer
+        // never changed it, see `owns_raw_mode`).
         if self.started {
-            let _ = if self.was_raw {
-                crossterm::terminal::enable_raw_mode()
-            } else {
-                crossterm::terminal::disable_raw_mode()
-            };
+            if self.owns_raw_mode {
+                let _ = if self.was_raw {
+                    crossterm::terminal::enable_raw_mode()
+                } else {
+                    crossterm::terminal::disable_raw_mode()
+                };
+            }
             self.started = false;
         }
     }
@@ -1667,6 +1695,33 @@ mod tests {
             (terminal.query_size)().is_err(),
             "off-tty size query must fail fast into the COLUMNS/LINES/default chain"
         );
+    }
+
+    /// Regression (v0.1.6-rc.5): an injected-writer terminal must not manage
+    /// the process terminal's raw mode. `start()` used to call
+    /// `crossterm::terminal::enable_raw_mode()` unconditionally; crossterm
+    /// resolves the tty through `/dev/tty` when stdin is not a tty, and in a
+    /// non-TTY session with an accessible controlling tty that call blocked
+    /// forever — the `recovery.rs` panic-hook tests wedged the whole suite
+    /// off-pty (but passed under `setsid`, where `/dev/tty` cannot be
+    /// opened). Red/green: reverting the `owns_raw_mode` gate re-introduces
+    /// the hang in exactly that environment, so this test is the
+    /// fast-failing canary; the field guard keeps the wiring explicit in
+    /// every environment.
+    #[test]
+    fn injected_writer_terminal_does_not_manage_process_raw_mode() {
+        assert!(
+            !ProcessTerminal::with_writer(SharedWriter::default()).owns_raw_mode,
+            "injected writers must not touch /dev/tty raw-mode state"
+        );
+        assert!(
+            ProcessTerminal::new().owns_raw_mode,
+            "the real process terminal keeps managing raw mode"
+        );
+        let mut terminal = ProcessTerminal::with_writer(SharedWriter::default());
+        terminal.set_query_size(|| Ok((80, 24)));
+        terminal.start(Box::new(|_| {}), Box::new(|| {}));
+        terminal.stop();
     }
 
     /// Regression: all started terminals share ONE process-global stdin

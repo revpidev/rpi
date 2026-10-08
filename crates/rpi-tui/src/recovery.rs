@@ -286,7 +286,8 @@ mod tests {
         let mut terminal = ProcessTerminal::with_writer(writer.clone());
         // Pin the size query: the default reads the real terminal, whose
         // no-tty fallback (crossterm 0.29 spawns `tput`) can block forever —
-        // see `terminal.rs::default_query_size`.
+        // see `terminal.rs::default_query_size`. Raw mode needs no pin: the
+        // injected writer never manages the process terminal (v0.1.6-rc.5).
         terminal.set_query_size(|| Ok((80, 24)));
         let tui = TuiMainScreen::new(Box::new(terminal));
         tui.start();
@@ -362,7 +363,8 @@ mod tests {
         let mut terminal = ProcessTerminal::with_writer(writer.clone());
         // Pin the size query: the default reads the real terminal, whose
         // no-tty fallback (crossterm 0.29 spawns `tput`) can block forever —
-        // see `terminal.rs::default_query_size`.
+        // see `terminal.rs::default_query_size`. Raw mode needs no pin: the
+        // injected writer never manages the process terminal (v0.1.6-rc.5).
         terminal.set_query_size(|| Ok((80, 24)));
         let tui = TuiMainScreen::new(Box::new(terminal));
         let handle = crate::tui_handle::TuiHandle::from_main(tui);
@@ -396,7 +398,8 @@ mod tests {
         let mut terminal = ProcessTerminal::with_writer(writer.clone());
         // Pin the size query: the default reads the real terminal, whose
         // no-tty fallback (crossterm 0.29 spawns `tput`) can block forever —
-        // see `terminal.rs::default_query_size`.
+        // see `terminal.rs::default_query_size`. Raw mode needs no pin: the
+        // injected writer never manages the process terminal (v0.1.6-rc.5).
         terminal.set_query_size(|| Ok((80, 24)));
         let alt = crate::tui_alt_screen::TuiAltScreen::new(Box::new(terminal));
         let handle = crate::tui_handle::TuiHandle::from_alt(alt);
