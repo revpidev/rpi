@@ -52,6 +52,7 @@ use serde_json::{Map, Value, json};
 
 use crate::types::ProviderEnv;
 use crate::utils::provider_env::get_provider_env_value;
+use crate::utils::transport_error::format_reqwest_error;
 
 /// `REQUIRED_VERTEX_AI_SCOPE` (`NodeAuth`): the only scope pi ever requests.
 pub const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -276,7 +277,7 @@ async fn post_token_grant(
         .form(form)
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format_reqwest_error(&error))?;
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {
@@ -348,7 +349,12 @@ async fn fetch_metadata_access_token(endpoints: &AdcEndpoints) -> Result<String,
         .header("Metadata-Flavor", "Google")
         .send()
         .await
-        .map_err(|error| format!("Could not refresh access token: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Could not refresh access token: {}",
+                format_reqwest_error(&error)
+            )
+        })?;
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {

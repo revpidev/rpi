@@ -268,6 +268,29 @@ mod tests {
         assert!(message.contains("1234"), "message: {message}");
     }
 
+    /// `IdleStreamError<reqwest::Error>::message()` must route transport
+    /// failures through the upstream-parity normalizer (the retry classifier
+    /// reads this string); reverting to `error.to_string()` fails this test.
+    #[tokio::test]
+    async fn transport_error_message_uses_upstream_wording() {
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/v1/x")
+            .send()
+            .await
+            .expect_err("closed port");
+        let wrapped = IdleStreamError::Transport(error);
+        let message = wrapped.message();
+        assert!(
+            message.starts_with("Connection error."),
+            "message: {message}"
+        );
+        let idle = IdleStreamError::<reqwest::Error>::IdleTimeout { idle_ms: 1234 };
+        assert_eq!(
+            idle.message(),
+            "stream idle timeout: no data for 1234ms (connection timed out)"
+        );
+    }
+
     #[tokio::test]
     async fn headers_timeout_returns_value_without_budget() {
         assert_eq!(

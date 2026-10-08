@@ -18,7 +18,11 @@
 //! `node_modules/@anthropic-ai/sdk/core/error.mjs:73-82`):
 //! - `is_timeout()` → `Request timed out.` (`APIConnectionTimeoutError`)
 //! - `is_connect() | is_request() | is_body() | is_decode()` →
-//!   `Connection error.` (`APIConnectionError`)
+//!   `Connection error.` (`APIConnectionError`). `is_decode()` is included
+//!   because a truncated mid-stream body surfaces as a decode error
+//!   ("unexpected EOF during chunk size line"); a plain JSON-decode failure
+//!   would also read as a connection error, which is the safe direction for
+//!   the retry classifier.
 //! - everything else keeps `reqwest`'s own display text.
 
 use crate::utils::error_body::truncate_error_text;

@@ -237,7 +237,24 @@ mod tests {
             .json(&serde_json::json!({}));
         let result = send_provider_request(request, None, None, None).await;
         match result {
-            Err(SendFailure::Reqwest(error)) => assert!(error.is_connect()),
+            Err(failure @ SendFailure::Reqwest(_)) => {
+                if let SendFailure::Reqwest(error) = &failure {
+                    assert!(error.is_connect());
+                }
+                // Wiring guard: reverting the formatter call in
+                // `into_provider_error_info`/`message` fails here.
+                assert!(
+                    failure.message().starts_with("Connection error."),
+                    "message: {}",
+                    failure.message()
+                );
+                assert!(
+                    failure
+                        .into_provider_error_info()
+                        .message
+                        .starts_with("Connection error.")
+                );
+            }
             other => panic!("expected reqwest connect error, got {other:?}"),
         }
     }

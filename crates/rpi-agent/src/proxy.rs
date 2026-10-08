@@ -60,6 +60,7 @@ use rpi_ai::types::{
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use rpi_ai::utils::json_parse::parse_streaming_json;
+use rpi_ai::utils::transport_error::format_reqwest_error;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -378,7 +379,7 @@ async fn run(
         },
         None => request.send().await,
     }
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| format_reqwest_error(&error))?;
 
     // :166-177
     let status = response.status();
@@ -404,7 +405,7 @@ async fn run(
             None => byte_stream.next().await,
         };
         let Some(chunk) = chunk else { break };
-        let bytes = chunk.map_err(|error| error.to_string())?;
+        let bytes = chunk.map_err(|error| format_reqwest_error(&error))?;
         // :187-189
         if signal.is_some_and(|token| token.is_cancelled()) {
             return Err("Request aborted by user".to_owned());
