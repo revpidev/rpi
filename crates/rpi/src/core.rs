@@ -8,6 +8,7 @@ pub mod cache_warming;
 pub mod changelog;
 pub mod compaction_runner;
 pub mod crash_attribution;
+pub mod deprecated_extensions;
 pub mod environment;
 pub mod export_html;
 pub mod extension_actions;

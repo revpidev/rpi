@@ -1198,6 +1198,25 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         ),
                     });
                 }
+                // Deprecated-extension startup notice (rpi-own, v0.1.6):
+                // MCP moved into the host, so an installed rpi-mcp-adapter
+                // is recommended for removal even when it is disabled or
+                // not loaded this session. `rpi update` skips it; this is
+                // the persistent nudge.
+                if !parsed.no_extensions {
+                    for installed in
+                        crate::core::deprecated_extensions::installed_deprecated_extensions(
+                            &options.agent_dir,
+                            &cwd,
+                            project_trusted,
+                        )
+                    {
+                        diagnostics.push(AgentSessionRuntimeDiagnostic {
+                            level: DiagnosticLevel::Warning,
+                            message: installed.startup_message(),
+                        });
+                    }
+                }
                 {
                     let mut loader = services
                         .resource_loader
