@@ -31,7 +31,11 @@ jobs:
       # §9.2). Crate dir names under crates/ — the only place to extend; the
       # package name and native carrier filename are read from each crate's
       # rpi-extension.json at pack time.
-      EXT_CRATES: rpi-ext-subagents rpi-ext-mcp-adapter rpi-ext-smart-fetch rpi-ext-statusline rpi-ext-ask-user-question rpi-ext-todo rpi-ext-plan-mode rpi-ext-usage
+      # rpi-ext-mcp-adapter is intentionally absent (v0.1.6): MCP moved into
+      # the host, so the extension is deprecated and no further .rpix
+      # artifacts are published for it
+      # (crates/rpi/src/core/deprecated_extensions.rs).
+      EXT_CRATES: rpi-ext-subagents rpi-ext-smart-fetch rpi-ext-statusline rpi-ext-ask-user-question rpi-ext-todo rpi-ext-plan-mode rpi-ext-usage
     strategy:
       fail-fast: false
       matrix:
