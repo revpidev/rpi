@@ -2497,7 +2497,9 @@ impl ModelRuntime {
     }
 
     /// V17-01 R2.2.2: startup diagnostics for legacy Azure provider keys in
-    /// auth.json (the same strings [`Self::get_error`] carries).
+    /// auth.json. These deliberately stay out of [`Self::get_error`] (review
+    /// O1 choice 2); the caller surfaces them on the startup diagnostics
+    /// channel.
     pub fn legacy_auth_key_diagnostics(&self) -> &[String] {
         &self.legacy_auth_diagnostics
     }
