@@ -1,7 +1,7 @@
 //! Worker-thread entry: one worker runs one script inside a fresh QuickJS VM
 //! (a separate wasm instance), relays tool calls and output to the host, and
 //! reports the result (port of `packages/codemode/src/runtime/worker.ts` and
-//! the host-side `Execution` lifecycle @ a13d35a74).
+//! the host-side `Execution` lifecycle @ abe508e1b).
 //!
 //! The host side terminates the worker when the script settles, times out,
 //! or is aborted; the worker exists so that a spinning script never blocks

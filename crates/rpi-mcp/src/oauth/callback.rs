@@ -1,5 +1,5 @@
 //! Loopback OAuth callback server (port of
-//! `packages/mcp/src/oauth/callback.ts` @ a13d35a74). RFC 8252: the server
+//! `packages/mcp/src/oauth/callback.ts` @ abe508e1b). RFC 8252: the server
 //! listens on `127.0.0.1` and serves one path with a state-matched
 //! one-shot callback.
 

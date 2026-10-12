@@ -1,5 +1,5 @@
 //! streamable HTTP transport (port of
-//! `packages/mcp/src/transports/streamable-http.ts` @ a13d35a74).
+//! `packages/mcp/src/transports/streamable-http.ts` @ abe508e1b).
 //!
 //! POST carries requests/notifications; responses arrive as JSON or as an
 //! SSE stream on the POST response, and the server may additionally expose a

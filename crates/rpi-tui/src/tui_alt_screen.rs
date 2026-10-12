@@ -3768,7 +3768,7 @@ impl TuiAltScreenInner {
     }
 
     /// `compositeScrollToEndIndicator` (tui-alt-screen.ts:1611-1648 @
-    /// a13d35a74; 79680533c, #9842 8c7279378): center the jump-to-end label
+    /// abe508e1b; 79680533c, #9842 8c7279378): center the jump-to-end label
     /// on the last row of a follow-end primary scroll view scrolled away
     /// from its end, independently of scrollbar visibility, and record its
     /// hit rectangle.
@@ -3809,7 +3809,7 @@ impl TuiAltScreenInner {
         let scrollbar_column = crate::layout::get_scrollbar_geometry(box_, false)
             .map(|geometry| geometry.column)
             .unwrap_or(clip.x + clip.width as isize);
-        // #9842 (8c7279378, tui-alt-screen.ts:1630-1641 @ a13d35a74): center
+        // #9842 (8c7279378, tui-alt-screen.ts:1630-1641 @ abe508e1b): center
         // the label on the clip independently of scrollbar visibility, then
         // clip drawing/click bounds before the scrollbar column.
         let label = truncate_to_width(&indicator(), clip.width, "", false);

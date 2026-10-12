@@ -1,5 +1,5 @@
 //! MCP tool adaptation (port of
-//! `packages/coding-agent/src/extensions/mcp/tools.ts` @ a13d35a74).
+//! `packages/coding-agent/src/extensions/mcp/tools.ts` @ abe508e1b).
 //!
 //! Results map onto the model-facing content (text and images). Text over
 //! 20 KB keeps its start and end with the middle cut out, and the full text

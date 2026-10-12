@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/providers/typesafe.ts` @ a13d35a74 — TypeSafe,
+//! Port of `packages/ai/src/providers/typesafe.ts` @ abe508e1b — TypeSafe,
 //! classifier-only provider (schema v6). The provider registers the
 //! `typesafe-system-one` classifier implementation; it has no chat models and
 //! no dynamic catalog.

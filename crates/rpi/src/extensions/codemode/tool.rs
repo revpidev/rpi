@@ -1,5 +1,5 @@
 //! The `codemode` tool definition and its `prepareLoadout` hook. Port of
-//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ a13d35a74.
+//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ abe508e1b.
 //!
 //! The tool is registered inactive (`exposure: model-only`,
 //! `defaultActive: false`); enabling it is the `defaultTools`/`--tools`
@@ -48,7 +48,7 @@ pub fn settings_from_manager(
     manager.get_codemode_settings()
 }
 
-/// `ToolInfo` view of one registered tool (`agent-session.ts:1465-1476`).
+/// `ToolInfo` view of one registered tool (`agent-session.ts:1495-1506`).
 #[derive(Debug, Clone)]
 pub struct ToolInfo {
     pub name: String,
@@ -110,7 +110,7 @@ pub fn to_codemode_declaration(tool: &ToolInfo) -> rpi_codemode::CodemodeToolInf
 }
 
 /// Tools a script may call: every given tool except the codemode tool
-/// itself (tool.ts:169-171).
+/// itself (tool.ts:177-180).
 pub fn get_codemode_callable_tools(tools: &[ToolInfo]) -> Vec<ToolInfo> {
     tools
         .iter()
@@ -275,10 +275,10 @@ pub fn create_codemode_tool_definition(
         ]),
         parameters: codemode_schema(),
         // Capable models write the script as raw text instead of a JSON-escaped
-        // string (tool.ts:380).
+        // string (tool.ts:395).
         constrained_sampling: Some(codemode_constrained_sampling()),
         output_schema: None,
-        // Scripts must not start other scripts (tool.ts:377).
+        // Scripts must not start other scripts (tool.ts:392).
         exposure: ToolExposure::ModelOnly,
         namespace: None,
         annotations: None,
@@ -298,7 +298,7 @@ pub fn create_codemode_tool_definition(
     }
 }
 
-/// `constrainedSampling` (tool.ts:380): the Lark grammar that fixes the
+/// `constrainedSampling` (tool.ts:395): the Lark grammar that fixes the
 /// optional `// @options:` line; the OpenAI adapters consume the grammar
 /// variants when the model supports grammar tools.
 pub fn codemode_constrained_sampling() -> Value {

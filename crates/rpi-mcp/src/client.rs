@@ -1,5 +1,5 @@
 //! The MCP client session (port of `packages/mcp/src/client.ts` @
-//! a13d35a74): initialize handshake, request/notification dispatching,
+//! abe508e1b): initialize handshake, request/notification dispatching,
 //! paginated listings, tool calls, progress and cancellation handling.
 //!
 //! The client is always used through an `Arc` (like the upstream runtime

@@ -1,5 +1,5 @@
 //! Nested tool calls (`ctx.executeTool()`), ported from
-//! `packages/coding-agent/test/nested-tool-calls.test.ts` @ a13d35a74
+//! `packages/coding-agent/test/nested-tool-calls.test.ts` @ abe508e1b
 //! (V16-06 FR-E): id assignment, parent-carrying events, bounded record,
 //! usage summation, exclusive serialization.
 

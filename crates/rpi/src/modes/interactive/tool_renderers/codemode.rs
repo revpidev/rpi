@@ -1,6 +1,6 @@
 //! codemode tool renderer — port of `renderCall`/`renderResult` in
-//! `packages/coding-agent/src/extensions/codemode/renderer.ts` @ a13d35a74
-//! (v1.0.0).
+//! `packages/coding-agent/src/extensions/codemode/renderer.ts` @ abe508e1b
+//! (v1.1.0).
 //!
 //! The call shows the script folded to the first [`CODE_PREVIEW_LINES`]
 //! visual lines; the result lists the nested tool calls (the last

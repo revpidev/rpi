@@ -510,7 +510,7 @@ pub struct TurnStartEvent {
 }
 
 /// `turn_end` payload (`message`/`toolResults` as JSON) plus the boundary
-/// state added at dispatch time (V16-03; types.ts:1015-1022 @ a13d35a74).
+/// state added at dispatch time (V16-03; types.ts:1015-1022 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnEndEvent {
@@ -526,7 +526,7 @@ pub struct TurnEndEvent {
     pub context: Value,
 }
 
-/// `agent_before_settle` payload (V16-03; types.ts:980-983 @ a13d35a74).
+/// `agent_before_settle` payload (V16-03; types.ts:980-983 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentBeforeSettleEvent {
@@ -537,7 +537,7 @@ pub struct AgentBeforeSettleEvent {
     pub context: Value,
 }
 
-/// `AgentActivityOutcome` (types.ts:922 @ a13d35a74).
+/// `AgentActivityOutcome` (types.ts:922 @ abe508e1b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentActivityOutcome {
@@ -546,7 +546,7 @@ pub enum AgentActivityOutcome {
     Error,
 }
 
-/// `BoundaryResult` (types.ts:975-978 @ a13d35a74): what a boundary handler
+/// `BoundaryResult` (types.ts:975-978 @ abe508e1b): what a boundary handler
 /// may return. Entries stay raw JSON until the host applies them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -92,7 +92,7 @@ pub struct AgentToolResult {
     #[serde(default)]
     pub details: Value,
     /// Machine-readable result matching the tool's `outputSchema`, for
-    /// programmatic callers (types.ts:424-440 @ a13d35a74). Not sent to the
+    /// programmatic callers (types.ts:424-440 @ abe508e1b). Not sent to the
     /// model; `content` remains the model-facing result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
@@ -132,7 +132,7 @@ pub trait AgentTool: Send + Sync {
     /// JSON Schema of the tool parameters (TypeBox upstream).
     fn parameters(&self) -> &Value;
     /// JSON Schema of `structuredContent` in successful results
-    /// (types.ts:590 @ a13d35a74). Default: no structured output.
+    /// (types.ts:590 @ abe508e1b). Default: no structured output.
     fn output_schema(&self) -> Option<&Value> {
         None
     }
@@ -217,7 +217,7 @@ pub enum AgentEvent {
         tool_name: String,
         args: Value,
         /// Set when another tool (for example a codemode script) made this
-        /// call (types.ts:1044-1051 @ a13d35a74; `parentToolCallId` at :1050).
+        /// call (types.ts:1044-1051 @ abe508e1b; `parentToolCallId` at :1050).
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_tool_call_id: Option<String>,
     },

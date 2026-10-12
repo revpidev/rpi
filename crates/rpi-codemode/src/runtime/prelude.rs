@@ -1,6 +1,6 @@
 //! JavaScript evaluated inside the QuickJS VM before the script runs
 //! (verbatim port of `packages/codemode/src/runtime/prelude-source.ts` @
-//! a13d35a74, v1.0.0 description-slimming / `guard()` revision).
+//! abe508e1b, v1.0.0 description-slimming / `guard()` revision).
 //!
 //! The VM is its own wasm instance, so nothing here guards a realm boundary.
 //! The prelude keeps the host bridge in a closure so the script cannot call

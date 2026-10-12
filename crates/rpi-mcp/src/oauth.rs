@@ -1,4 +1,4 @@
-//! OAuth 2.1 for MCP (port of `packages/mcp/src/oauth/` @ a13d35a74),
+//! OAuth 2.1 for MCP (port of `packages/mcp/src/oauth/` @ abe508e1b),
 //! including the v1.0.0 hardening: `authServerMetadataUrl`, RFC 9207 `iss`,
 //! step-up scope merging, credential-key migration support and null/empty
 //! optional-field tolerance.

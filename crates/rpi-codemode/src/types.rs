@@ -1,5 +1,5 @@
 //! Public types of the codemode sandbox (port of
-//! `packages/codemode/src/types.ts` @ a13d35a74).
+//! `packages/codemode/src/types.ts` @ abe508e1b).
 
 use std::sync::Arc;
 
@@ -95,7 +95,7 @@ pub enum CodemodeOutputItem {
     Image { data: String, mime_type: String },
 }
 
-/// `CodemodeCallStatus` (types.ts:49).
+/// `CodemodeCallStatus` (types.ts:51).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CodemodeCallStatus {
@@ -224,7 +224,7 @@ pub struct CodemodeExecuteOptions {
 /// Default overall deadline (`DEFAULT_TIMEOUT_MS`, host.ts:22).
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 
-/// Store limits (prelude-source.ts:28-29).
+/// Store limits (prelude-source.ts:32-33).
 pub const MAX_STORE_VALUE_CHARS: usize = 256 * 1024;
 pub const MAX_STORE_TOTAL_CHARS: usize = 1024 * 1024;
 

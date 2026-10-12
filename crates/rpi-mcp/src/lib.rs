@@ -1,5 +1,5 @@
 //! Standalone MCP client: port of `@earendil-works/pi-mcp`
-//! (`packages/mcp` @ a13d35a74).
+//! (`packages/mcp` @ abe508e1b).
 //!
 //! The crate has no dependency on the rpi host: it carries the two
 //! transports (stdio child processes and streamable HTTP), a hand-written

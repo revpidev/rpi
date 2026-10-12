@@ -137,7 +137,7 @@ const APP_TITLE: &str = "rpi";
 /// the event loop is always awake; here the driver polls with this cap).
 const DRIVER_PUMP_CAP: Duration = Duration::from_millis(50);
 
-/// `TERMINAL_QUERY_TIMEOUT_MS` (theme-controller.ts:25 @ a13d35a74): how long
+/// `TERMINAL_QUERY_TIMEOUT_MS` (theme-controller.ts:25 @ abe508e1b): how long
 /// the system theme stays grayscale before falling back to palette indices.
 const TERMINAL_QUERY_TIMEOUT_MS: u64 = 100;
 /// Tokio backstop for the first color result; the Tui's own deadline is the

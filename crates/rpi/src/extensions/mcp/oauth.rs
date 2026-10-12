@@ -1,5 +1,5 @@
 //! OAuth sign-in and credential storage for remote MCP servers (port of
-//! `packages/coding-agent/src/extensions/mcp/oauth.ts` @ a13d35a74).
+//! `packages/coding-agent/src/extensions/mcp/oauth.ts` @ abe508e1b).
 //!
 //! Credentials live in `<agent-dir>/mcp-auth.json`, keyed by server name and
 //! URL as `mcp__<name>|<url>` (v1.0.0 `5806068c2`); a legacy URL-only key is

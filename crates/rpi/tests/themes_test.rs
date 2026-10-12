@@ -338,7 +338,7 @@ fn test_colorfggb_light_background() {
 
 #[test]
 fn test_colorfgbg_index_eight_is_dark_and_seven_is_light() {
-    // Vim-style classification (theme.ts:697-705 @ a13d35a74).
+    // Vim-style classification (theme.ts:697-705 @ abe508e1b).
     let det = detect_terminal_background_from_env_str("15;8");
     assert_eq!(det.theme, TerminalTheme::Dark);
     let det = detect_terminal_background_from_env_str("0;7");

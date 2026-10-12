@@ -1,5 +1,5 @@
 //! Messages between the async host and the per-execution VM worker thread
-//! (port of `packages/codemode/src/runtime/protocol.ts` @ a13d35a74).
+//! (port of `packages/codemode/src/runtime/protocol.ts` @ abe508e1b).
 //!
 //! Tool arguments, results, and values cross as JSON strings: the worker
 //! passes them into and out of the QuickJS VM as strings and never builds

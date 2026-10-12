@@ -3,7 +3,9 @@
 # comments (V16-07 review O-E).
 #
 # The v0.99.2 -> v1.0.0 pin bump moved most of these lines; a partial refresh
-# left ~50 stale references behind. This check binds each comment to the
+# left ~50 stale references behind. The v1.0.0 -> v1.1.0 pin bump (V17-00,
+# ADR-0036) moved them again; the table below was relocated by symbol against
+# the abe508e1b checkout. This check binds each comment to the
 # pinned checkout in both directions:
 #   1. the rpi source still cites the expected `(<basename>:<range>)`, and
 #   2. the cited range in external/pi still contains the expected symbol.
@@ -58,12 +60,12 @@ crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensio
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:91-96@function toModelInfo
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:122-157@function checkClassifierContext
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:159-183@function checkImagesContext
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:272-300@function truncateOutput
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:219-230@function readCodemodeStore
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:436-445@function isNamespaceName
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:447-517@function createDiscoveryGlobals
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:368-396@function truncateOutput
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:232-243@function readCodemodeStore
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:539-548@function isNamespaceName
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:550-620@function createDiscoveryGlobals
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:316-434@export async function executeCodemode
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:302-313@function toScriptValue
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:398-410@function toScriptValue
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:519-630@function createModelGlobals
 crates/rpi-codemode/src/source.rs@packages/codemode/src/source.ts@source.ts:11@CODEMODE_OPTIONS_PREFIX
 crates/rpi-codemode/src/source.rs@packages/codemode/src/source.ts@source.ts:18-30@CODEMODE_SOURCE_GRAMMAR
@@ -81,7 +83,7 @@ crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@de
 crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:221-308@export function schemaToType
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:14-41@export interface CodemodeTool \{
 crates/rpi-codemode/src/types.rs@packages/codemode/src/declarations.ts@declarations.ts:132-147@export function renderToolSignature
-crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:49@export type CodemodeCallStatus
+crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:51@export type CodemodeCallStatus
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:51-55@export interface CodemodeCall \{
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:57-65@export type CodemodeErrorKind
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:67-73@export interface CodemodeError \{
@@ -89,12 +91,12 @@ crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:82-90@e
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:92-125@export interface CodemodeSandboxOptions
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:127-136@export interface CodemodeExecuteOptions
 crates/rpi-codemode/src/types.rs@packages/codemode/src/runtime/host.ts@host.ts:22@const DEFAULT_TIMEOUT_MS
-crates/rpi-codemode/src/types.rs@packages/codemode/src/runtime/prelude-source.ts@prelude-source.ts:28-29@MAX_STORE_VALUE_CHARS = 256 \* 1024
+crates/rpi-codemode/src/types.rs@packages/codemode/src/runtime/prelude-source.ts@prelude-source.ts:32-33@MAX_STORE_VALUE_CHARS = 256 \* 1024
 crates/rpi-codemode/src/types.rs@packages/codemode/src/runtime/host.ts@host.ts:24-35@const RESERVED_GLOBALS
-crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:63-67@interface PendingCall
-crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:242-253@private finish
-crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:49-56@function parseStoreWrites
-crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:201-208@private handleDone
+crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:102-106@interface PendingCall
+crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:297-308@private finish
+crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:64-81@function parseStoreWrites
+crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:255-263@private handleDone
 crates/rpi-codemode/src/runtime/worker.rs@packages/codemode/src/runtime/worker.ts@worker.ts:118-122@const drain = 
 crates/rpi-codemode/src/runtime/worker.rs@packages/codemode/src/runtime/worker.ts@worker.ts:32-44@function discardOutput
 crates/rpi-codemode/src/runtime/worker.rs@packages/codemode/src/runtime/worker.ts@worker.ts:65-100@const bridge = vm.newFunction
@@ -112,24 +114,24 @@ crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/to
 crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:220@export const TOOL_SEARCH_DESCRIPTION
 crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:222-247@export function createToolSearchToolDefinition
 crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:233@async execute\(_toolCallId
-crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:156@const CHARS_PER_TOKEN = 4
-crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:133@export const CODEMODE_DOCS_PATH
+crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:158@const CHARS_PER_TOKEN = 4
+crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:135@export const CODEMODE_DOCS_PATH
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:140-151@function describeGlobals
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:173-185@export interface CodemodeDescriptionOptions
-crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:188-192@function renderToolSection
+crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:198-203@function renderToolSection
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:211-235@function selectCatalog
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:237-291@export function createCodemodeDescription
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:293-313@function describeOutput
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:315-327@function describeScriptCall
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/settings-manager.ts@settings-manager.ts:103-108@export interface CodemodeSettings
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/index.ts@index.ts:20-30@function readMode
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/agent-session.ts@agent-session.ts:1465-1476@getAllTools
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/agent-session.ts@agent-session.ts:1495-1506@getAllTools
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:87-91@export const codemodeSchema
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:169-171@export function getCodemodeCallableTools
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:177-180@export function getCodemodeCallableTools
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:329-363@function prepareCodemodeLoadout
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:365-404@export function createCodemodeToolDefinition
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:377@exposure: "model-only"
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:380@constrainedSampling: \{ type: "grammar"
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:392@exposure: "model-only"
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:395@constrainedSampling: \{ type: "grammar"
 ANCHORS
 
 if ((failures > 0)); then

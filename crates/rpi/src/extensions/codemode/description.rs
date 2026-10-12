@@ -1,5 +1,5 @@
 //! Model-facing codemode description (port of the description helpers in
-//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ a13d35a74,
+//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ abe508e1b,
 //! v1.0.0 slimmed form). The rendered text is a byte-parity surface.
 
 use std::collections::{HashMap, HashSet};
@@ -14,12 +14,12 @@ use crate::config::get_docs_path;
 use crate::extensions::codemode::tool::{ToolInfo, to_codemode_declaration};
 
 /// Characters per token when estimating the cost of a tool section
-/// (tool.ts:156).
+/// (tool.ts:158).
 const CHARS_PER_TOKEN: usize = 4;
 
 const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. Calls still running when the script ends are cancelled.\n- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`";
 
-/// `CODEMODE_DOCS_PATH` (tool.ts:133): the reference model-facing doc.
+/// `CODEMODE_DOCS_PATH` (tool.ts:135): the reference model-facing doc.
 pub fn codemode_docs_path() -> String {
     get_docs_path()
         .join("codemode.md")
@@ -58,7 +58,7 @@ pub struct CodemodeDescriptionOptions {
 }
 
 /// `### \`id\` (\`raw name\`)` followed by the tool's description and
-/// declaration (tool.ts:188-192).
+/// declaration (tool.ts:198-203).
 fn render_tool_section(declaration: &rpi_codemode::CodemodeToolInfo) -> String {
     let id = to_codemode_identifier(&declaration.name);
     let heading = if id == declaration.name {

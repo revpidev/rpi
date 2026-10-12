@@ -1,5 +1,5 @@
 //! Test-only stdio MCP server used by `tests/stdio.rs` (counterpart of
-//! `packages/mcp/test/fixtures/stdio-server.mjs` @ a13d35a74).
+//! `packages/mcp/test/fixtures/stdio-server.mjs` @ abe508e1b).
 //!
 //! Modes:
 //! - default: LF-delimited JSON-RPC echo server; exits on stdin EOF.

@@ -3,7 +3,7 @@
 //! request error) and the in-stream `response.failed` path append the
 //! ChatGPT usage link to the final error message, and only for the shared
 //! usage-limit code. Mirrors `test/openai-responses-usage-limit.test.ts` @
-//! pi a13d35a74 (v1.0.0) at the adapter level: the upstream test stubs
+//! pi abe508e1b (v1.1.0) at the adapter level: the upstream test stubs
 //! `fetch`, here a scripted loopback server records the request and serves
 //! the recorded payloads.
 

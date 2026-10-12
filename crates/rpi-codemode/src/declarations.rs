@@ -1,5 +1,5 @@
 //! TypeScript declaration rendering for the script-visible API (port of
-//! `packages/codemode/src/declarations.ts` @ a13d35a74).
+//! `packages/codemode/src/declarations.ts` @ abe508e1b).
 //!
 //! Tools become members of `declare const tools`, globals become
 //! `declare function` statements, and `ns.member` globals members of
@@ -603,7 +603,7 @@ pub fn is_plain_object(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! Ports `packages/codemode/test/declarations.test.ts` @ a13d35a74.
+    //! Ports `packages/codemode/test/declarations.test.ts` @ abe508e1b.
 
     use super::*;
     use serde_json::json;

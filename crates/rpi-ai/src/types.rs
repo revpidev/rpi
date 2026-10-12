@@ -793,7 +793,7 @@ pub struct UsageCost {
 }
 
 impl Usage {
-    /// `combineUsage` (usage-totals.ts:31 @ a13d35a74): field-wise sum;
+    /// `combineUsage` (usage-totals.ts:31 @ abe508e1b): field-wise sum;
     /// optional splits stay `None` when both sides are `None`.
     pub fn combined(&self, other: &Usage) -> Usage {
         Usage {
@@ -1019,7 +1019,7 @@ impl fmt::Debug for ImagesOptions {
 // `api/system-one-shared.ts`; V16-07 FR-F)
 // ---------------------------------------------------------------------------
 
-/// `ClassifierChoiceQuestion` (types.ts:633-637 @ a13d35a74).
+/// `ClassifierChoiceQuestion` (types.ts:633-637 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassifierChoiceQuestion {
@@ -1202,7 +1202,7 @@ pub trait ProviderClassifier: Send + Sync {
 }
 
 /// `Provider.generateImages` for the unified schema-v6 `ImageModel`
-/// (models.ts:221-226 @ a13d35a74). The older image subsystem's
+/// (models.ts:221-226 @ abe508e1b). The older image subsystem's
 /// `images_models::ProviderImages` stays as is; this trait is the unified
 /// runtime's contract.
 pub trait ProviderImageGenerator: Send + Sync {
@@ -1382,7 +1382,7 @@ pub struct AssistantMessage {
     pub provider_thinking_level: Option<String>,
     /// Pi thinking level the agent loop requested for this response. Absent
     /// outside the agent loop and for legacy responses (R2.7.1,
-    /// types.ts:553-554 @ a13d35a74). The agent loop records it on every
+    /// types.ts:553-554 @ abe508e1b). The agent loop records it on every
     /// finalized assistant message (agent-loop.ts:409).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ModelThinkingLevel>,
@@ -1415,7 +1415,7 @@ pub struct AssistantMessage {
 }
 
 /// A tool call that another tool made while it ran, for example from a
-/// codemode script (types.ts:570-581 @ a13d35a74).
+/// codemode script (types.ts:570-581 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedToolCallRecord {
@@ -1437,7 +1437,7 @@ pub struct NestedToolCallRecord {
 }
 
 /// Bounded record of the nested calls a tool made. Results are not recorded
-/// (types.ts:583-588 @ a13d35a74).
+/// (types.ts:583-588 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedToolCalls {
@@ -1930,7 +1930,7 @@ pub struct Model {
     pub compat: Option<ModelCompat>,
 }
 
-/// `ModelType` (types.ts:1158-1165 @ a13d35a74, schema v6): what a catalog
+/// `ModelType` (types.ts:1158-1165 @ abe508e1b, schema v6): what a catalog
 /// entry is for. Chat is the default and omits `type` in catalog data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1954,7 +1954,7 @@ impl ModelType {
     }
 }
 
-/// `ImageModel` (types.ts:1143-1156 @ a13d35a74): image-generation catalog
+/// `ImageModel` (types.ts:1143-1156 @ abe508e1b): image-generation catalog
 /// entry. Parsed through [`AnyModel`]; `AnyModel` dispatch tries this shape
 /// before the classifier and chat shapes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1979,7 +1979,7 @@ pub struct ImageModel {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
-/// `ClassifierModel` (types.ts:1150-1155 @ a13d35a74): structured classifier
+/// `ClassifierModel` (types.ts:1150-1155 @ abe508e1b): structured classifier
 /// catalog entry. Parsed through [`AnyModel`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2000,7 +2000,7 @@ pub struct ClassifierModel {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
-/// `AnyModel` (types.ts:1167-1168 @ a13d35a74): anything a provider can
+/// `AnyModel` (types.ts:1167-1168 @ abe508e1b): anything a provider can
 /// list. Deserialization dispatches on the raw `type` field (missing =
 /// chat), so each variant is unambiguous; unknown types are rejected and
 /// skipped by callers (catalog/remote parse).
@@ -2050,7 +2050,7 @@ impl<'de> Deserialize<'de> for AnyModel {
 }
 
 impl AnyModel {
-    /// `getModelType` (utils/model-operations.ts @ a13d35a74).
+    /// `getModelType` (utils/model-operations.ts @ abe508e1b).
     pub fn model_type(&self) -> ModelType {
         match self {
             AnyModel::Image(_) => ModelType::Image,
@@ -2091,7 +2091,7 @@ impl AnyModel {
         }
     }
 
-    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ a13d35a74):
+    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ abe508e1b):
     /// the same upstream id may appear once per type.
     pub fn merge_key(&self) -> String {
         format!("{}\0{}", self.model_type().as_str(), self.id())
@@ -2127,7 +2127,7 @@ impl From<Model> for AnyModel {
     }
 }
 
-/// `isModelType` (utils/model-operations.ts @ a13d35a74).
+/// `isModelType` (utils/model-operations.ts @ abe508e1b).
 pub fn is_model_type(model: &AnyModel, model_type: ModelType) -> bool {
     model.model_type() == model_type
 }
@@ -2538,7 +2538,7 @@ pub struct VercelGatewayRouting {
 
 // ---------------------------------------------------------------------------
 // Model type guards and error results (`utils/model-operations.ts` @
-// a13d35a74; V16-06/V16-07 R2.5.2/R2.5.3)
+// abe508e1b; V16-06/V16-07 R2.5.2/R2.5.3)
 // ---------------------------------------------------------------------------
 fn assert_model_type(
     model: &AnyModel,

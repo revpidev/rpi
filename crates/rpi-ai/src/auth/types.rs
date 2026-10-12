@@ -346,7 +346,7 @@ pub trait ApiKeyAuth: Send + Sync {
     ) -> Result<Option<AuthResult>, ModelsError>;
 }
 
-/// `LoginOptions` (auth/types.ts:202-208 @ a13d35a74) — app-supplied
+/// `LoginOptions` (auth/types.ts:202-208 @ abe508e1b) — app-supplied
 /// context for login flows.
 #[derive(Clone, Default)]
 pub struct LoginOptions {

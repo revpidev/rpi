@@ -1,5 +1,5 @@
 //! Behavior tests ported from `packages/codemode/test/sandbox.test.ts`
-//! @ a13d35a74 (FR-A/FR-B surfaces not covered by `sandbox_test.rs`).
+//! @ abe508e1b (FR-A/FR-B surfaces not covered by `sandbox_test.rs`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

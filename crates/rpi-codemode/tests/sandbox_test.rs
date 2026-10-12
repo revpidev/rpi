@@ -1,5 +1,5 @@
 //! Smoke tests for the wasmtime/quickjs ABI (port of the upstream
-//! `sandbox.test.ts` "script execution" cases @ a13d35a74).
+//! `sandbox.test.ts` "script execution" cases @ abe508e1b).
 
 use rpi_codemode::{CodemodeExecuteOptions, CodemodeSandbox, CodemodeSandboxOptions};
 

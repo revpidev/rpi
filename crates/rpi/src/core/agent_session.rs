@@ -440,7 +440,7 @@ fn builtin_tool_guidelines(name: &str) -> &'static [&'static str] {
 // AgentSession
 // ============================================================================
 
-/// `_deferredSettledActions` entries (agent-session.ts:418 @ a13d35a74):
+/// `_deferredSettledActions` entries (agent-session.ts:418 @ abe508e1b):
 /// work requested from `agent_settled` handlers, run after every settled
 /// handler finished.
 type DeferredSettledAction = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
@@ -491,7 +491,7 @@ struct AgentSessionInner {
     /// turn's tool results are in state and session (240eb29c4, #8537).
     pending_custom_messages: Mutex<Vec<AgentMessage>>,
     last_assistant_message: Mutex<Option<AssistantMessage>>,
-    /// `_failedResponse` (agent-session.ts:401 @ a13d35a74): the failed
+    /// `_failedResponse` (agent-session.ts:401 @ abe508e1b): the failed
     /// response handed to the next request preparation as the route
     /// `failed` payload (`retry` reason). Set by the auto-retry and overflow
     /// recovery paths; consumed/cleared by `prepareRequest` and the agent
@@ -504,7 +504,7 @@ struct AgentSessionInner {
     /// rpi-statusline 03-realtime-token-count §1.3).
     turn_index: AtomicU32,
 
-    /// `_boundaryDispatchedMessages` (agent-session.ts:413 @ a13d35a74):
+    /// `_boundaryDispatchedMessages` (agent-session.ts:413 @ abe508e1b):
     /// assistant messages whose `turn_end` boundary already ran inside
     /// `finishTurn`; the event-time fallback skips them.
     boundary_dispatched_messages: Mutex<Vec<AssistantMessage>>,
@@ -534,7 +534,7 @@ struct AgentSessionInner {
     tool_registry: Mutex<OrderedMap<Arc<dyn AgentTool>>>,
     /// `ToolDefinitionEntry` registry (agent-session.ts:2460 `_toolDefinitions`).
     tool_definitions: Mutex<OrderedMap<ToolDefinitionEntry>>,
-    /// `_hiddenDeclarations` (agent-session.ts:452-453 @ a13d35a74): declared
+    /// `_hiddenDeclarations` (agent-session.ts:452-453 @ abe508e1b): declared
     /// tools whose declarations requests leave out, from `prepareLoadout`
     /// hooks. They stay active and callable, and the transcript still
     /// declares them, so the active set survives `/tree` and resume.
@@ -543,7 +543,7 @@ struct AgentSessionInner {
     /// re-applied after every registry rebuild so `setToolExposures`
     /// survives register/unregister/reload. Cleared with the session.
     tool_exposure_overrides: Mutex<HashMap<String, ext::ToolExposure>>,
-    /// `_nestedToolCalls` (agent-session.ts:450-451 @ a13d35a74): created on
+    /// `_nestedToolCalls` (agent-session.ts:450-451 @ abe508e1b): created on
     /// the first `ctx.executeTool()` call (V16-06 FR-E).
     nested_tool_calls: Mutex<Option<Arc<NestedCallRunner>>>,
     /// `_customTools` (agent-session.ts:345) — SDK-provided tools.
@@ -572,7 +572,7 @@ struct AgentSessionInner {
     extension_error_unsubscriber: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-/// `routedModel` (agent-session.ts:1422-1427 @ a13d35a74): the physical
+/// `routedModel` (agent-session.ts:1422-1427 @ abe508e1b): the physical
 /// model (and requested thinking level) of the latest successful response,
 /// returned only while the current selection is a virtual model.
 #[derive(Debug, Clone)]
@@ -730,7 +730,7 @@ impl NestedToolCallHost for SessionNestedHost {
             return;
         };
         // `await this._extensionRunner.emit(event); this._emit(event)`
-        // (agent-session.ts:729-732 @ a13d35a74).
+        // (agent-session.ts:729-732 @ abe508e1b).
         let (event_name, payload, agent_event) = match event {
             NestedToolExecutionEvent::Start {
                 tool_call_id,
@@ -1035,7 +1035,7 @@ impl AgentSession {
         }
         // V16-03 FR-A R5: the compaction runner persists restorative context
         // omissions for discarded recovery attempts
-        // (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ a13d35a74).
+        // (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ abe508e1b).
         {
             let weak = Arc::downgrade(&session.inner);
             if let Ok(mut runner) = session.inner.compaction.try_lock() {
@@ -1085,18 +1085,18 @@ impl AgentSession {
         // compaction + state refresh (V14-01 FR-D).
         session.install_agent_next_turn_refresh();
         // `_installAgentRequestProjection()` (agent-session.ts:398,
-        // 760-786 @ a13d35a74): a SessionManager projection becomes the
+        // 760-786 @ abe508e1b): a SessionManager projection becomes the
         // provider-context authority before every conversational request.
         session.install_agent_request_projection();
         // `_installAgentBoundaryHooks()` (agent-session.ts:398, 858-868):
         // `turn_end` boundary dispatch runs inside `finishTurn`.
         session.install_agent_boundary_hooks();
         // `_installHiddenDeclarationsProjection()` (agent-session.ts:490,
-        // 1720-1738 @ a13d35a74): `prepareLoadout` hidden declarations are
+        // 1720-1738 @ abe508e1b): `prepareLoadout` hidden declarations are
         // removed from the declarations every request carries.
         session.install_hidden_declarations_projection();
         // `_nestedToolCalls` lookup (agent-session.ts:1074-1086 @
-        // a13d35a74): finished model-issued calls take their bounded
+        // abe508e1b): finished model-issued calls take their bounded
         // nested-call record onto the result message (V16-06 FR-E).
         session.install_nested_call_summary();
         // `_installAgentForcedPromptProjection()` (agent-session.ts:417 @
@@ -1255,13 +1255,13 @@ impl AgentSession {
     }
 
     /// `_installAgentRequestProjection` (agent-session.ts:760-853 @
-    /// a13d35a74; virtual-model routing slice deferred to V16-12): installs
+    /// abe508e1b; virtual-model routing slice deferred to V16-12): installs
     /// the canonical session projection as the provider context for every
     /// conversational request. Direct `agent.state.messages` assignments are
     /// superseded here (R3.1.2); recovery goes through the session append
     /// APIs + [`Self::refresh_context`].
     /// `_consumeFailedResponse` slice of `prepareRequest`
-    /// (agent-session.ts:762-763 @ a13d35a74): the auto-retry/overflow path
+    /// (agent-session.ts:762-763 @ abe508e1b): the auto-retry/overflow path
     /// stores the failed response; request preparation takes and clears it.
     fn take_failed_response(&self) -> Option<AssistantMessage> {
         lock(&self.inner.failed_response).take()
@@ -1377,7 +1377,7 @@ impl AgentSession {
         Ok((Some(route.model), route.thinking_level))
     }
 
-    /// `_recordSelection` (agent-session.ts:594-603 @ a13d35a74): record the
+    /// `_recordSelection` (agent-session.ts:594-603 @ abe508e1b): record the
     /// selection on the current branch when the branch implies another one,
     /// so a resume restores it. Tree navigation can leave the latest
     /// `model_change` on another branch; responses cannot record a virtual
@@ -1433,7 +1433,7 @@ impl AgentSession {
                     let session = AgentSession { inner };
 
                     // `const failed = this._failedResponse; this._failedResponse = undefined;`
-                    // (agent-session.ts:762-763 @ a13d35a74).
+                    // (agent-session.ts:762-763 @ abe508e1b).
                     let failed = session.take_failed_response();
 
                     // `prepare()` (agent-session.ts:764-776): canonical
@@ -1589,7 +1589,7 @@ impl AgentSession {
         )));
     }
 
-    /// `refreshContext` (agent-session.ts:1391-1393 @ a13d35a74): rebuild the
+    /// `refreshContext` (agent-session.ts:1391-1393 @ abe508e1b): rebuild the
     /// finalized agent transcript from the canonical session projection.
     pub fn refresh_context(&self) {
         let projection = lock(&self.inner.session_manager).build_session_projection();
@@ -1597,7 +1597,7 @@ impl AgentSession {
     }
 
     /// `_findPersistedMessageEntryId` (agent-session.ts:1189-1207 @
-    /// a13d35a74): value-equality scan over the branch, then the
+    /// abe508e1b): value-equality scan over the branch, then the
     /// projected-index fallback.
     fn find_persisted_message_entry_id(&self, message: &AgentMessage) -> Option<String> {
         let session = lock(&self.inner.session_manager);
@@ -1625,7 +1625,7 @@ impl AgentSession {
         None
     }
 
-    /// `_omitRecoveryAttempt` (agent-session.ts:1208-1222 @ a13d35a74):
+    /// `_omitRecoveryAttempt` (agent-session.ts:1208-1222 @ abe508e1b):
     /// durably omit a discarded retry/recovery attempt (and the immediate
     /// tool results of its turn) from the model projection while keeping the
     /// raw transcript intact. Fail-soft: append failures are logged and do
@@ -1676,7 +1676,7 @@ impl AgentSession {
     }
 
     // ==================================================================
-    // Boundary cluster (agent-session.ts:858-1016 @ a13d35a74)
+    // Boundary cluster (agent-session.ts:858-1016 @ abe508e1b)
     // ==================================================================
 
     /// `_installAgentBoundaryHooks` (agent-session.ts:852-862):
@@ -1793,7 +1793,7 @@ impl AgentSession {
         boundary.continue_
     }
 
-    /// `_runBeforeSettleBoundary` (agent-session.ts:1846-1869 @ a13d35a74).
+    /// `_runBeforeSettleBoundary` (agent-session.ts:1846-1869 @ abe508e1b).
     async fn run_before_settle_boundary(&self) -> bool {
         let runner = self.runner();
         if !runner.has_handlers("agent_before_settle") {
@@ -2087,7 +2087,7 @@ impl AgentSession {
             cache_warmer.on_agent_settled();
         }
         // `_isEmittingAgentSettled = true` before the dispatch
-        // (agent-session.ts:1053 @ a13d35a74); `finally` clears it. Work
+        // (agent-session.ts:1053 @ abe508e1b); `finally` clears it. Work
         // requested from settled handlers is queued and drained after every
         // handler finished.
         self.inner
@@ -2098,7 +2098,7 @@ impl AgentSession {
         self.inner
             .is_emitting_agent_settled
             .store(false, Ordering::SeqCst);
-        // `_deferredSettledActions` (agent-session.ts:1052-1068 @ a13d35a74):
+        // `_deferredSettledActions` (agent-session.ts:1052-1068 @ abe508e1b):
         // runs requested from settled handlers execute after every handler
         // finished, then the idle wait resolves.
         let deferred: Vec<_> = std::mem::take(&mut *lock(&self.inner.deferred_settled_actions));
@@ -2308,7 +2308,7 @@ impl AgentSession {
                 // The boundary normally already ran inside `finishTurn`
                 // (`_boundaryDispatchedMessages`); the event-time fallback
                 // covers messages that bypassed the hook
-                // (agent-session.ts:1267-1271 @ a13d35a74).
+                // (agent-session.ts:1267-1271 @ abe508e1b).
                 if let AgentMessage::Assistant(assistant) = message {
                     let already_dispatched = {
                         let mut dispatched = lock(&self.inner.boundary_dispatched_messages);
@@ -2948,7 +2948,7 @@ impl AgentSession {
             )
     }
 
-    /// `_getCallableTools` (agent-session.ts:1515-1524 @ a13d35a74): the
+    /// `_getCallableTools` (agent-session.ts:1515-1524 @ abe508e1b): the
     /// active `direct` tools plus every registered `codemode`/`deferred`
     /// tool. `hidden` and `model-only` tools are not callable through
     /// `ctx.executeTool()`.
@@ -2982,7 +2982,7 @@ impl AgentSession {
 
     /// Install the nested-call summary lookup on the shared agent
     /// (`_handleAgentEvent`'s `takeRecord`, agent-session.ts:1074-1086 @
-    /// a13d35a74; V16-06 FR-E). The loop calls it for each finished
+    /// abe508e1b; V16-06 FR-E). The loop calls it for each finished
     /// model-issued tool call.
     fn install_nested_call_summary(&self) {
         let weak = Arc::downgrade(&self.inner);
@@ -3010,7 +3010,7 @@ impl AgentSession {
         runner
     }
 
-    /// `_executeNestedToolCall` (agent-session.ts:702-735 @ a13d35a74): run
+    /// `_executeNestedToolCall` (agent-session.ts:702-735 @ abe508e1b): run
     /// a call a tool made through `ctx.executeTool()` against the callable
     /// tools, through the same pipeline and hooks as model-issued calls.
     pub async fn execute_nested_tool_call(
@@ -3120,7 +3120,7 @@ impl AgentSession {
             .collect()
     }
 
-    /// `getToolDefinition` (agent-session.ts:1478 @ a13d35a74): the
+    /// `getToolDefinition` (agent-session.ts:1478 @ abe508e1b): the
     /// `ToolInfo` JSON for one registered tool, or `None`.
     pub fn get_tool_definition(&self, name: &str) -> Option<serde_json::Value> {
         let definitions = lock(&self.inner.tool_definitions);
@@ -3129,7 +3129,7 @@ impl AgentSession {
             .map(|entry| Self::tool_info_json(name, entry))
     }
 
-    /// `ToolInfo` shape (agent-session.ts:1465-1476 @ a13d35a74; `ToolInfo` =
+    /// `ToolInfo` shape (agent-session.ts:1465-1476 @ abe508e1b; `ToolInfo` =
     /// core/extensions/types.ts:2067): name,
     /// description, parameters, promptGuidelines, exposure, namespace,
     /// annotations, sourceInfo.
@@ -3190,7 +3190,7 @@ impl AgentSession {
         commands
     }
 
-    /// `setActiveToolsByName` (agent-session.ts:1488-1496 @ a13d35a74).
+    /// `setActiveToolsByName` (agent-session.ts:1488-1496 @ abe508e1b).
     pub fn set_active_tools_by_name(&self, tool_names: Vec<String>) {
         let tools = self.apply_tool_loadout(tool_names);
         let valid_names: Vec<String> = tools.iter().map(|tool| tool.name().to_owned()).collect();
@@ -3201,7 +3201,7 @@ impl AgentSession {
         self.rebuild_system_prompt(&valid_names);
     }
 
-    /// `_applyToolLoadout` (agent-session.ts:1528-1569 @ a13d35a74): the
+    /// `_applyToolLoadout` (agent-session.ts:1528-1569 @ abe508e1b): the
     /// active tools are the registered, non-hidden ones; active tools with a
     /// `prepareLoadout` hook can replace declared descriptions and hide
     /// declarations from requests (the hidden projection lives on the agent
@@ -3453,7 +3453,7 @@ impl AgentSession {
         messages: Option<&[AgentMessage]>,
     ) -> Option<rpi_ai::types::SystemMessage> {
         // `options.selectedTools = this._applyToolLoadout(options.selectedTools)
-        // .map(t => t.name)` (agent-session.ts:1693 @ a13d35a74): the
+        // .map(t => t.name)` (agent-session.ts:1693 @ abe508e1b): the
         // prompt's selected tools are executable through the loadout hooks
         // (description replacements + hidden declarations), and the agent
         // tools are set from the same declared list.
@@ -3507,7 +3507,7 @@ impl AgentSession {
     }
 
     /// `_installHiddenDeclarationsProjection` (agent-session.ts:1720-1738 @
-    /// a13d35a74): remove the declarations that `prepareLoadout` hooks hide
+    /// abe508e1b): remove the declarations that `prepareLoadout` hooks hide
     /// from every request. The whole transcript is filtered with the
     /// current set, so the projected declarations stay consistent across
     /// requests and only change when the loadout does. Chained after the
@@ -3692,7 +3692,7 @@ impl AgentSession {
     async fn run_agent_prompt_inner(&self, messages: Vec<AgentMessage>) -> Result<(), RpiError> {
         // Requests made from `agent_settled` handlers wait until every
         // settled handler finished (agent-session.ts:1922 / :2268 @
-        // a13d35a74; rpi adapts the two upstream deferral points to the
+        // abe508e1b; rpi adapts the two upstream deferral points to the
         // single run entry point).
         if self.inner.is_emitting_agent_settled.load(Ordering::SeqCst) {
             let weak = Arc::downgrade(&self.inner);
@@ -3715,7 +3715,7 @@ impl AgentSession {
             .store(false, Ordering::SeqCst);
         self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
         // `this._failedResponse = undefined; this._recordSelection();`
-        // (agent-session.ts:1778-1779 @ a13d35a74).
+        // (agent-session.ts:1778-1779 @ abe508e1b).
         *lock(&self.inner.failed_response) = None;
         self.record_selection();
         let result = async {
@@ -4498,7 +4498,7 @@ impl AgentSession {
                 .store(true, Ordering::SeqCst);
         }
         // `if (this._isBeforeSettle) this._abortDuringBeforeSettle = true`
-        // (agent-session.ts:2394 @ a13d35a74).
+        // (agent-session.ts:2394 @ abe508e1b).
         if self.inner.is_before_settle.load(Ordering::SeqCst) {
             self.inner
                 .abort_during_before_settle
@@ -5252,7 +5252,7 @@ impl AgentSession {
 
         // Keep the failed attempt in raw history while durably omitting it
         // from model projection (`_omitRecoveryAttempt`, agent-session.ts:3738
-        // @ a13d35a74).
+        // @ abe508e1b).
         self.omit_recovery_attempt(message);
 
         let token = CancellationToken::new();

@@ -138,7 +138,7 @@ fn lock_abort(cell: &AbortTokenCell) -> std::sync::MutexGuard<'_, Option<Cancell
     cell.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `_omitRecoveryAttempt` callback (agent-session.ts:1208-1222 @ a13d35a74):
+/// `_omitRecoveryAttempt` callback (agent-session.ts:1208-1222 @ abe508e1b):
 /// persists a restorative `context_edit` omission for a discarded recovery
 /// attempt before the post-run compaction.
 pub type OmitRecoveryFn = Arc<dyn Fn(&AssistantMessage) + Send + Sync>;
@@ -158,7 +158,7 @@ pub type SummarizationModelResolver = Arc<
         + Sync,
 >;
 
-/// `_findPersistedMessageEntryId` (agent-session.ts:1189-1207 @ a13d35a74):
+/// `_findPersistedMessageEntryId` (agent-session.ts:1189-1207 @ abe508e1b):
 /// value-equality scan over the branch, then the projected-index fallback.
 fn find_persisted_message_entry_id(
     path: &[SessionEntry],
@@ -267,7 +267,7 @@ impl CompactionRunner {
     }
 
     /// V16-03 FR-A R5: install the recovery-omission callback
-    /// (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ a13d35a74).
+    /// (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ abe508e1b).
     pub fn set_omit_recovery(&mut self, omit: OmitRecoveryFn) {
         self.omit_recovery = Some(omit);
     }
@@ -742,7 +742,7 @@ impl CompactionRunner {
             .map(|m| u64::from(m.max_tokens))
             .unwrap_or(0);
         // Canonical projection checks (agent-session.ts:2006-2021 @
-        // a13d35a74): an assistant entry that a later context edit omitted, or
+        // abe508e1b): an assistant entry that a later context edit omitted, or
         // whose usage a later edit/compaction invalidated, must not be
         // trusted to trigger recovery.
         let typed_projection = rpi_agent::session::build_session_projection(&path);
@@ -844,7 +844,7 @@ impl CompactionRunner {
             self.overflow_recovery_attempted = true;
             // Keep the failed attempt in raw history while durably omitting
             // it from the model projection (agent-session.ts:2992-2997 @
-            // a13d35a74 `_omitRecoveryAttempt`). Direct state truncation no
+            // abe508e1b `_omitRecoveryAttempt`). Direct state truncation no
             // longer reaches the provider context under the canonical
             // projection.
             if let Some(omit) = &self.omit_recovery {
@@ -859,7 +859,7 @@ impl CompactionRunner {
             return retry;
         }
 
-        // Case 3: threshold (agent-session.ts:3016-3051 @ a13d35a74). For
+        // Case 3: threshold (agent-session.ts:3016-3051 @ abe508e1b). For
         // error messages or all-zero usage, estimate from the last valid
         // response. Edited context must not trust pre-edit usage.
         let has_context_edits = typed_projection

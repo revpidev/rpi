@@ -47,7 +47,7 @@ use crate::types::{
     RegisteredTool, ResolvedCommand, is_session_before_event,
 };
 
-/// `restoreSystemMessages` (runner.ts:284-293 @ a13d35a74): re-attach the
+/// `restoreSystemMessages` (runner.ts:284-293 @ abe508e1b): re-attach the
 /// prompt and tool state after a `context` handler changed the conversation.
 /// The replayed prompt/tool checkpoint becomes one leading system message so
 /// pruning, windowing, or slicing from a compaction summary cannot drop it.
@@ -265,7 +265,7 @@ impl ExtensionRunnerCore {
         ExtensionContext::new(self.runtime.clone(), self.cwd.clone())
     }
 
-    /// `createToolContext` (runner.ts:952-980 @ a13d35a74): the context a
+    /// `createToolContext` (runner.ts:952-980 @ abe508e1b): the context a
     /// tool's `execute` receives; carries the calling id and signal so
     /// `ctx.executeTool()` can run nested calls under it (V16-06 FR-E).
     pub fn create_tool_context(
@@ -691,7 +691,7 @@ impl ExtensionRunnerCore {
         // `ExtensionRunner.emit()` refuses the boundary events; they are
         // dispatched through `emit_boundary` with the chained
         // `{entries, continue, context}` state (runner.ts:172-189 @
-        // a13d35a74).
+        // abe508e1b).
         if matches!(event_type, EVENT_TURN_END | EVENT_AGENT_BEFORE_SETTLE) {
             self.emit_error(ExtensionError::new(
                 "<boundary>",
@@ -729,7 +729,7 @@ impl ExtensionRunnerCore {
         result
     }
 
-    /// `emitBoundary` (runner.ts:1020-1078 @ a13d35a74): chained
+    /// `emitBoundary` (runner.ts:1020-1078 @ abe508e1b): chained
     /// `{entries, continue}` state over the boundary handlers. After every
     /// handler the caller rebuilds the boundary context preview; a failed
     /// rebuild invalidates the dispatch (drafts and continuation are
@@ -905,7 +905,7 @@ impl ExtensionRunnerCore {
     /// non-undefined result field replaces the corresponding event field and
     /// later handlers observe earlier patches. A handler that replaces
     /// `content` without restating `structuredContent` drops it
-    /// (runner.ts:1185-1196 @ a13d35a74; V16-06 FR-C).
+    /// (runner.ts:1185-1196 @ abe508e1b; V16-06 FR-C).
     pub async fn emit_tool_result(&self, payload: Value) -> Option<Value> {
         let mut current_event = payload.clone();
         let mut modified = false;
@@ -1068,7 +1068,7 @@ impl ExtensionRunnerCore {
         Ok(None)
     }
 
-    /// `emitContext` (runner.ts:1247-1355 @ a13d35a74): the two-phase
+    /// `emitContext` (runner.ts:1247-1355 @ abe508e1b): the two-phase
     /// request-time transform. `context` handlers see the conversation only
     /// and pi restores the prompt/tool state after each; then
     /// `context_with_system` handlers see the full transcript and their

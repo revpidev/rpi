@@ -1,5 +1,5 @@
 //! Codemode source format (port of `packages/codemode/src/source.ts` @
-//! a13d35a74): JavaScript, optionally preceded by one options line.
+//! abe508e1b): JavaScript, optionally preceded by one options line.
 //!
 //! ```js
 //! // @options: {"max_output_tokens": 2000, "timeout_ms": 30000}
@@ -162,7 +162,7 @@ pub fn parse_codemode_source(input: &str) -> Result<ParsedCodemodeSource, Codemo
 
 #[cfg(test)]
 mod tests {
-    //! Ports `packages/codemode/test/source.test.ts` @ a13d35a74.
+    //! Ports `packages/codemode/test/source.test.ts` @ abe508e1b.
 
     use super::*;
 

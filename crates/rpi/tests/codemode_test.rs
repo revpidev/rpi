@@ -1,6 +1,6 @@
 //! End-to-end codemode tests (V16-07 FR-C/E/H), ported from
 //! `packages/coding-agent/test/suite/agent-session-codemode.test.ts`
-//! @ a13d35a74.
+//! @ abe508e1b.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

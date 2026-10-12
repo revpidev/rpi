@@ -1,5 +1,5 @@
-//! Port of `packages/ai/src/auth/oauth/callback-server.ts` @ pi a13d35a74
-//! (v1.0.0) — the loopback OAuth redirect handler shared by the Anthropic,
+//! Port of `packages/ai/src/auth/oauth/callback-server.ts` @ pi abe508e1b
+//! (v1.1.0) — the loopback OAuth redirect handler shared by the Anthropic,
 //! OpenAI Codex, OpenRouter and Radius browser sign-in flows.
 //!
 //! Intentional differences: the upstream `node:http` server becomes an axum
@@ -484,7 +484,7 @@ pub async fn wait_for_callback_or_manual_input<T: Clone + Send + Sync + 'static>
 #[cfg(test)]
 mod tests {
     //! Test intents ported from `packages/ai/test/oauth-callback-server.test.ts`
-    //! @ pi a13d35a74 (v1.0.0), same names in snake_case. The upstream mocked
+    //! @ pi abe508e1b (v1.1.0), same names in snake_case. The upstream mocked
     //! fetch becomes a `reqwest` request against the loopback server; fake
     //! timers for the timeout case become a short real timeout.
 

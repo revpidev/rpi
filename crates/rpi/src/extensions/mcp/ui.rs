@@ -1,6 +1,6 @@
 //! The built-in `mcp` extension (port of
 //! `packages/coding-agent/src/extensions/mcp/index.ts` and `ui.ts` @
-//! a13d35a74): connects `mcp.json` and extension-registered servers when a
+//! abe508e1b): connects `mcp.json` and extension-registered servers when a
 //! session starts, registers their tools, renders the `mcp_servers` system
 //! prompt section and drives `/mcp`.
 //!
@@ -247,7 +247,7 @@ fn find_replacer(own_path: &str, tools: &[Value], commands: &[Value]) -> Option<
 
 /// The active `mcp__*` names a resumed/reloaded loadout references that no
 /// server has registered yet (`_restoreToolsFromTranscript` pending set,
-/// agent-session.ts:1763-1768 @ a13d35a74, v1.0.0 `c662ec7e3`).
+/// agent-session.ts:1763-1768 @ abe508e1b, v1.0.0 `c662ec7e3`).
 pub fn pending_mcp_tools(active_tools: &[String], registered: &HashSet<String>) -> HashSet<String> {
     active_tools
         .iter()

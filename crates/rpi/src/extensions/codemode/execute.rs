@@ -1,5 +1,5 @@
 //! Runs one codemode script (port of
-//! `packages/coding-agent/src/extensions/codemode/execute.ts` @ a13d35a74).
+//! `packages/coding-agent/src/extensions/codemode/execute.ts` @ abe508e1b).
 //! Split from `tool.rs` so the sandbox runtime only loads when a script runs.
 
 use std::collections::HashMap;
@@ -457,7 +457,7 @@ fn spill_output(text: &str) -> Result<std::path::PathBuf, String> {
     Err("could not create a unique codemode output spill file".to_owned())
 }
 
-/// `truncateOutput` (execute.ts:272-300).
+/// `truncateOutput` (execute.ts:368-396).
 fn truncate_output(
     items: Vec<ToolResultContent>,
     max_tokens: usize,
@@ -520,7 +520,7 @@ fn truncate_output(
 }
 
 /// Values of `load()`: the `codemode-store` entries on the branch, applied
-/// from the root (execute.ts:219-230).
+/// from the root (execute.ts:232-243).
 fn read_codemode_store(entries: &[SessionEntryInfo]) -> Value {
     let mut store: serde_json::Map<String, Value> = serde_json::Map::new();
     for entry in entries {
@@ -544,7 +544,7 @@ fn read_codemode_store(entries: &[SessionEntryInfo]) -> Value {
     Value::Object(store)
 }
 
-/// `isNamespaceName` (execute.ts:436-445).
+/// `isNamespaceName` (execute.ts:539-548).
 fn namespace_suffix(name: &str) -> Option<&str> {
     name.rfind("__")
         .map(|index| &name[index + 2..])
@@ -573,7 +573,7 @@ fn sample_map(tools: &[ToolInfo]) -> HashMap<String, String> {
 }
 
 /// `searchTools()`, `describeTool()`, and `describeNamespace()`
-/// (execute.ts:447-517).
+/// (execute.ts:550-620).
 fn create_discovery_globals(
     tools: &[ToolInfo],
     samples: &HashMap<String, String>,
@@ -1385,7 +1385,7 @@ pub async fn execute_codemode(
     })
 }
 
-/// The value a script receives for a nested call (execute.ts:302-313).
+/// The value a script receives for a nested call (execute.ts:398-410).
 fn to_script_value(
     output_schema: Option<&Value>,
     name: &str,

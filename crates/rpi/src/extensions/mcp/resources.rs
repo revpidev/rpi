@@ -1,5 +1,5 @@
 //! MCP resource tools (port of
-//! `packages/coding-agent/src/extensions/mcp/resources.ts` @ a13d35a74):
+//! `packages/coding-agent/src/extensions/mcp/resources.ts` @ abe508e1b):
 //! `list_mcp_resources`, `list_mcp_resource_templates` and
 //! `read_mcp_resource`, covering every connected server with resources.
 //! MCP App resources (`ui://` or `profile=mcp-app`) and icons are left out.

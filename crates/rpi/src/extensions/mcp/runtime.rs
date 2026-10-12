@@ -1,6 +1,6 @@
 //! The part of the MCP integration that talks to servers: connections,
 //! transports and OAuth (port of
-//! `packages/coding-agent/src/extensions/mcp/runtime.ts` @ a13d35a74).
+//! `packages/coding-agent/src/extensions/mcp/runtime.ts` @ abe508e1b).
 //!
 //! Connections run in the background; calls reconnect lazily when the
 //! connection went away. Read-only requests retry once after a transient

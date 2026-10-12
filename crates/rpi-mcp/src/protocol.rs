@@ -1,5 +1,5 @@
 //! JSON-RPC 2.0 message model and errors (port of
-//! `packages/mcp/src/protocol/jsonrpc.ts` @ a13d35a74).
+//! `packages/mcp/src/protocol/jsonrpc.ts` @ abe508e1b).
 
 use std::fmt;
 

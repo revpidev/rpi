@@ -53,7 +53,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub type AgentListener =
     Arc<dyn Fn(AgentEvent, CancellationToken) -> BoxFuture<'static, ()> + Send + Sync>;
 
-/// `finishTurn` (agent.ts:125 @ a13d35a74, agent-side variant). Receives the
+/// `finishTurn` (agent.ts:125 @ abe508e1b, agent-side variant). Receives the
 /// active run's abort signal as the second argument (upstream
 /// `this.signal`).
 pub type FinishTurnAgentFn = Arc<
@@ -245,7 +245,7 @@ impl PendingMessageQueue {
         !self.messages.is_empty()
     }
 
-    /// `peek()` (agent.ts:159-162 @ a13d35a74): the next batch a drain would
+    /// `peek()` (agent.ts:159-162 @ abe508e1b): the next batch a drain would
     /// deliver, without consuming it.
     fn peek(&self) -> Vec<AgentMessage> {
         if self.mode == QueueMode::All {
@@ -401,7 +401,7 @@ pub struct Agent {
     /// `finishTurn` — interior-mutable because the session installs the
     /// boundary-dispatch chain after building the shared agent (upstream
     /// assigns `this.agent.finishTurn` post-construction,
-    /// agent-session.ts:858-868 @ a13d35a74).
+    /// agent-session.ts:858-868 @ abe508e1b).
     finish_turn: RwLock<Option<FinishTurnAgentFn>>,
     /// `prepareRequest` — interior-mutable because the session layer installs
     /// the canonical-context projection after building the shared agent
@@ -543,7 +543,7 @@ impl Agent {
 
     /// Post-construction install/clear of the `finishTurn` hook
     /// (`this.agent.finishTurn = ...`, agent-session.ts:858-868 @
-    /// a13d35a74).
+    /// abe508e1b).
     pub fn set_finish_turn(&self, hook: Option<FinishTurnAgentFn>) {
         *self.finish_turn.write().unwrap_or_else(|e| e.into_inner()) = hook;
     }
@@ -559,7 +559,7 @@ impl Agent {
 
     /// Post-construction install/clear of the `prepareRequest` hook
     /// (`this.agent.prepareRequest = ...`, agent-session.ts:760-761 @
-    /// a13d35a74).
+    /// abe508e1b).
     pub fn set_prepare_request(&self, hook: Option<PrepareRequestAgentFn>) {
         *self
             .prepare_request
@@ -691,7 +691,7 @@ impl Agent {
         lock(&self.steering_queue).has_items() || lock(&self.follow_up_queue).has_items()
     }
 
-    /// `peekQueuedMessages` (agent.ts:330-334 @ a13d35a74): preview the next
+    /// `peekQueuedMessages` (agent.ts:330-334 @ abe508e1b): preview the next
     /// queued batch without consuming it. Steering first, then follow-up.
     pub fn peek_queued_messages(&self) -> Vec<AgentMessage> {
         let steering = lock(&self.steering_queue).peek();

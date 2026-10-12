@@ -220,7 +220,7 @@ pub struct ToolResultPatch {
     /// Machine-readable result for tools that declare an `outputSchema`
     /// (V16-06 FR-C). `None` with `content: Some(..)` means the handler
     /// replaced the content without restating it, so the structured content
-    /// is dropped (runner.ts:1185-1193 @ a13d35a74).
+    /// is dropped (runner.ts:1185-1193 @ abe508e1b).
     pub structured_content: Option<serde_json::Value>,
     pub is_error: Option<bool>,
     pub usage: Option<rpi_ai::types::Usage>,
@@ -498,7 +498,7 @@ pub trait ExtensionRunner: Send + Sync {
         messages
     }
 
-    /// `emitBoundary` (runner.ts:1020-1078 @ a13d35a74): the chained
+    /// `emitBoundary` (runner.ts:1020-1078 @ abe508e1b): the chained
     /// `{entries, continue, context}` dispatch used for `turn_end` and
     /// `agent_before_settle`. Default = no handlers, no dispatch.
     fn emit_boundary(

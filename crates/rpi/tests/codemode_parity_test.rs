@@ -1,6 +1,6 @@
 //! Byte-parity tests for the model-visible codemode description
 //! (V16-07 FR-H R1 hard-parity surface). The expected strings are generated
-//! from the pinned upstream (`external/pi` @ a13d35a74) — see
+//! from the pinned upstream (`external/pi` @ abe508e1b) — see
 //! `tests/fixtures/README.md`.
 
 use std::collections::{HashMap, HashSet};

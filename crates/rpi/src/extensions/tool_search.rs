@@ -1,6 +1,6 @@
 //! `tool_search`: BM25 tool discovery over the tools that are not declared to
 //! the model (`codemode`/`deferred` exposure). Port of
-//! `packages/coding-agent/src/extensions/tool-search/tool.ts` @ a13d35a74.
+//! `packages/coding-agent/src/extensions/tool-search/tool.ts` @ abe508e1b.
 //!
 //! The same ranker backs `searchTools()` in codemode scripts.
 
@@ -440,7 +440,7 @@ pub fn inline_extension() -> InlineExtension {
 
 #[cfg(test)]
 mod tests {
-    //! Ports `test/tool-search.test.ts` @ a13d35a74 (ranker cases).
+    //! Ports `test/tool-search.test.ts` @ abe508e1b (ranker cases).
 
     use super::*;
 

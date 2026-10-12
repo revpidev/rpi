@@ -1,5 +1,5 @@
 //! OAuth flow tests, ported from `packages/mcp/test/oauth.test.ts` intents
-//! @ a13d35a74, including the v1.0.0 hardening (`authServerMetadataUrl`,
+//! @ abe508e1b, including the v1.0.0 hardening (`authServerMetadataUrl`,
 //! RFC 9207 `iss`, step-up scope, refresh scope retention).
 
 use std::collections::HashMap;

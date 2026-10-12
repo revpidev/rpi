@@ -3,7 +3,7 @@
 //! `McpClient` + `StdioTransport` and prints one normalized JSON result
 //! document to stdout.
 //!
-//! The upstream reference is `external/pi/packages/mcp` @ a13d35a74, driven
+//! The upstream reference is `external/pi/packages/mcp` @ abe508e1b, driven
 //! by `scripts/mcp-parity/builtin-upstream-runner.mjs` with the exact same
 //! step sequence; the orchestrator
 //! `scripts/mcp-parity/run-builtin-mcp-parity.mjs` diffs the two documents.
