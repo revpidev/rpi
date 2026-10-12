@@ -794,6 +794,7 @@ async fn foundry_completions_leg_resolves_endpoint_and_deployment_name() {
 /// Without any endpoint source the completions leg terminates the stream with
 /// the shared Azure base-URL error instead of throwing out of `stream()`.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // test env-guard held across awaits (startup_ui.rs precedent)
 async fn foundry_completions_leg_errors_without_endpoint() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _guard = EnvGuard::clear(&["AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME"]);

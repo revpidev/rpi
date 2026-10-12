@@ -2478,8 +2478,11 @@ impl ModelRuntime {
             // V17-01 R2.2.2: non-fatal legacy-key diagnostics (models.json).
             errors.extend(config.diagnostics().iter().cloned());
         }
-        // V17-01 R2.2.2: auth.json legacy-key diagnostics.
-        errors.extend(self.legacy_auth_diagnostics.iter().cloned());
+        // auth.json legacy-key diagnostics deliberately stay OUT of
+        // `get_error()` (V17-01 review O1 choice 2): they ride the startup
+        // diagnostics channel (`legacy_auth_key_diagnostics`), so a stale
+        // credential key does not mask the model selector's config error or
+        // flip `auth check` for unrelated providers.
         for (provider_id, error) in lock(&self.composition_errors).iter() {
             errors.push(format!("Provider \"{provider_id}\": {error}"));
         }
@@ -3630,12 +3633,15 @@ mod tests {
             error.contains("providers.azure-openai-responses"),
             "models.json diagnostic present: {error}"
         );
+        // O1 choice 2: auth.json diagnostics stay on the startup channel,
+        // not `get_error()`.
         assert!(
-            error.contains("azure-openai-responses (credential key)"),
-            "auth.json diagnostic present: {error}"
+            !error.contains("credential key"),
+            "auth diagnostic must not leak into get_error(): {error}"
         );
         let auth_diagnostics = runtime.legacy_auth_key_diagnostics();
         assert_eq!(auth_diagnostics.len(), 1);
+        assert!(auth_diagnostics[0].contains("azure-openai-responses (credential key)"));
         assert!(auth_diagnostics[0].contains(&auth_path.display().to_string()));
         // No rewrite: both files are untouched (no migration, no alias).
         assert!(

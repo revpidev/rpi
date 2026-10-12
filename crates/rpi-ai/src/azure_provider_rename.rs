@@ -25,7 +25,11 @@ pub const LEGACY_AZURE_PROVIDER_ID: &str = "azure-openai-responses";
 pub const AZURE_PROVIDER_ID: &str = "azure";
 
 /// Shared migration guidance appended to every diagnostic.
-pub const AZURE_MIGRATION_GUIDANCE: &str = "The Azure provider was renamed from \"azure-openai-responses\" to \"azure\" in Pi v1.1.0. Update the key to \"azure\", or run `/login` again; the azure-openai-responses api id and the AZURE_OPENAI_* environment variables are unchanged.";
+pub fn migration_guidance() -> String {
+    format!(
+        "The Azure provider was renamed from \"{LEGACY_AZURE_PROVIDER_ID}\" to \"{AZURE_PROVIDER_ID}\" in Pi v1.1.0. Update the key to \"{AZURE_PROVIDER_ID}\", or run `/login` again; the azure-openai-responses api id and the AZURE_OPENAI_* environment variables are unchanged."
+    )
+}
 
 /// Whether a model id / pattern uses the legacy provider:
 /// `azure-openai-responses`, `azure-openai-responses/<model>`,
@@ -40,7 +44,8 @@ pub fn is_legacy_provider_pattern(value: &str) -> bool {
 /// migration guidance.
 pub fn legacy_key_diagnostic(file: &str, key_path: &str) -> String {
     format!(
-        "Unsupported provider id \"{LEGACY_AZURE_PROVIDER_ID}\" in {file} at {key_path}. {AZURE_MIGRATION_GUIDANCE}"
+        "Unsupported provider id \"{LEGACY_AZURE_PROVIDER_ID}\" in {file} at {key_path}. {}",
+        migration_guidance()
     )
 }
 
@@ -139,7 +144,7 @@ mod tests {
         assert!(diagnostics[3].contains("modelThinkingLevels.azure-openai-responses/gpt-5.4"));
         for diagnostic in &diagnostics {
             assert!(diagnostic.contains("settings.json"));
-            assert!(diagnostic.contains(AZURE_MIGRATION_GUIDANCE));
+            assert!(diagnostic.contains(&migration_guidance()));
         }
     }
 
