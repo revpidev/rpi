@@ -303,9 +303,9 @@ mod tests {
             .map(|provider| catalog.models(provider).len())
             .sum();
         // Schema v6 regen @ abe508e1b rules (models.dev + OpenRouter +
-        // NVIDIA + Vercel AI Gateway snapshot 2026-10-08; +typesafe.json vs
+        // NVIDIA + Vercel AI Gateway snapshot 2026-10-12; +typesafe.json vs
         // the 2026-09-23 schemaVersion 3 snapshot).
-        assert_eq!(total, 1562);
+        assert_eq!(total, 1551);
         let images: usize = catalog
             .providers()
             .iter()
@@ -317,7 +317,7 @@ mod tests {
             .map(|provider| catalog.classifier_models(provider).len())
             .sum();
         assert_eq!(images, 61);
-        assert_eq!(classifiers, 24);
+        assert_eq!(classifiers, 32);
         // Radius ships its static public catalog since 4d38031fb; the
         // gateway overlay lives in `providers::radius`.
         assert!(catalog.providers().contains(&"radius"));

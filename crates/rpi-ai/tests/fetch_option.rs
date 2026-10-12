@@ -183,12 +183,7 @@ async fn passes_fetch_through_stream_simple_to_openai_sdk_adapters() {
     .await;
     assert!(terminal_error_message(&events).contains("upstream rejected request"));
 
-    let azure = model(
-        "azure-openai-responses",
-        "azure-openai-responses",
-        UNROUTABLE,
-        json!({}),
-    );
+    let azure = model("azure", "azure", UNROUTABLE, json!({}));
     let events = collect(
         rpi_ai::api::azure_openai_responses::stream_simple(
             &azure,

@@ -23,7 +23,7 @@ use rpi_ai::generated::get_builtin_model;
 use rpi_ai::models::{CreateModelsOptions, Models};
 use rpi_ai::providers::amazon_bedrock::amazon_bedrock_provider;
 use rpi_ai::providers::anthropic::anthropic_provider;
-use rpi_ai::providers::azure_openai_responses::azure_openai_responses_provider;
+use rpi_ai::providers::azure::azure_provider;
 use rpi_ai::providers::google::google_provider;
 use rpi_ai::providers::google_vertex::google_vertex_provider;
 use rpi_ai::providers::mistral::mistral_provider;
@@ -238,19 +238,41 @@ fn test_openai_codex_factory_config() {
 }
 
 // ---------------------------------------------------------------------------
-// azure-openai-responses
+// azure
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_azure_openai_responses_factory_config_and_auth() {
-    let provider = azure_openai_responses_provider();
-    assert_factory_basics(
-        &provider,
-        "azure-openai-responses",
-        "Azure OpenAI",
-        None,
-        "azure-openai-responses",
-    );
+async fn test_azure_factory_config_and_auth() {
+    let provider = azure_provider();
+    assert_eq!(provider.id(), "azure");
+    assert_eq!(provider.name(), "Azure");
+    assert_eq!(provider.base_url(), None);
+    let models = provider.get_models();
+    assert!(!models.is_empty(), "azure: catalog models expected");
+    for model in &models {
+        assert_eq!(model.provider, "azure");
+        assert!(
+            matches!(
+                model.api.as_str(),
+                "azure-openai-responses" | "openai-completions"
+            ),
+            "azure: unexpected api for {}: {}",
+            model.id,
+            model.api
+        );
+    }
+    // Foundry Chat Completions entry rides the shared openai-completions
+    // transport; the Responses line keeps the unchanged api id (#9714).
+    let foundry = models
+        .iter()
+        .find(|model| model.id == "deepseek-v4-pro")
+        .expect("foundry deepseek-v4-pro");
+    assert_eq!(foundry.api.as_str(), "openai-completions");
+    let responses = models
+        .iter()
+        .find(|model| model.id == "gpt-5.4")
+        .expect("gpt-5.4");
+    assert_eq!(responses.api.as_str(), "azure-openai-responses");
 
     let auth = provider.auth();
     assert!(auth.oauth.is_none());

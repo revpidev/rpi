@@ -168,6 +168,15 @@ pub async fn create_agent_session_services(
     loader.reload();
 
     let mut diagnostics = Vec::new();
+    // R2.2.2 (V17-01, rpi-own [VARIANT]): legacy Azure provider keys in
+    // auth.json are reported at startup. Warning level — the diagnostic must
+    // not abort startup (no rewrite, no alias; the user decides).
+    for message in model_runtime.legacy_auth_key_diagnostics() {
+        diagnostics.push(AgentSessionRuntimeDiagnostic {
+            level: DiagnosticLevel::Warning,
+            message: message.clone(),
+        });
+    }
     // Built-in (hidden) extension provider registrations drain into the
     // model runtime (agent-session-services.ts:166-178
     // `pendingNativeProviderRegistrations`): the llama.cpp extension is the

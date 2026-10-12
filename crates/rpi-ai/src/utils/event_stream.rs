@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures::Stream;
 use futures::future::{BoxFuture, Shared};
@@ -34,6 +35,18 @@ struct Inner {
     result_tx: Mutex<Option<oneshot::Sender<AssistantMessage>>>,
     result_rx: Shared<oneshot::Receiver<AssistantMessage>>,
     done: AtomicBool,
+    /// Wall-clock start of this stream (`#startedAt`, event-stream.ts:98).
+    started_at_wall_ms: i64,
+    /// Monotonic start of this stream (`#startedAtMonotonic`).
+    started_at_monotonic: Instant,
+}
+
+/// `Date.now()` at stream creation.
+fn now_wall_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Producer/consumer event stream for assistant message events.
@@ -65,8 +78,25 @@ impl AssistantMessageEventStream {
                 result_tx: Mutex::new(Some(result_tx)),
                 result_rx: result_rx.shared(),
                 done: AtomicBool::new(false),
+                started_at_wall_ms: now_wall_ms(),
+                started_at_monotonic: Instant::now(),
             }),
         }
+    }
+
+    /// `#time` (event-stream.ts:120-123 @ abe508e1b): set `durationMs` with a
+    /// monotonic clock unless the stream already completed, the message
+    /// already carries a duration (a forwarding stream keeps the inner
+    /// measurement), or its `timestamp` predates the stream (a fetched
+    /// deferred result stays untimed).
+    fn time_response(&self, message: &mut AssistantMessage) {
+        if self.inner.done.load(Ordering::SeqCst)
+            || message.duration_ms.is_some()
+            || message.timestamp < self.inner.started_at_wall_ms
+        {
+            return;
+        }
+        message.duration_ms = Some(self.inner.started_at_monotonic.elapsed().as_millis() as u64);
     }
 
     fn resolve_result(&self, message: AssistantMessage) {
@@ -94,11 +124,26 @@ impl AssistantMessageEventStream {
         }
     }
 
-    /// Push an event to the stream.
+    /// Push an event to the stream. Terminal events time the final message
+    /// before the completion guard (event-stream.ts:106-110).
     pub fn push(&self, event: StreamEvent) {
         if self.inner.done.load(Ordering::SeqCst) {
             return;
         }
+        let event = match event {
+            StreamEvent::Done {
+                reason,
+                mut message,
+            } => {
+                self.time_response(&mut message);
+                StreamEvent::Done { reason, message }
+            }
+            StreamEvent::Error { reason, mut error } => {
+                self.time_response(&mut error);
+                StreamEvent::Error { reason, error }
+            }
+            other => other,
+        };
         if Self::is_complete(&event) {
             self.inner.done.store(true, Ordering::SeqCst);
             if let Some(result) = Self::extract_result(&event) {
@@ -117,12 +162,16 @@ impl AssistantMessageEventStream {
         }
     }
 
-    /// End the stream. A provided result resolves pending `result()` calls
-    /// (unless already resolved by a terminal event).
+    /// End the stream. A provided result is timed before the completion
+    /// guard (`end`, event-stream.ts:112-115) and resolves pending
+    /// `result()` calls (unless already resolved by a terminal event).
     pub fn end(&self, result: Option<AssistantMessage>) {
-        self.inner.done.store(true, Ordering::SeqCst);
-        if let Some(result) = result {
+        if let Some(mut result) = result {
+            self.time_response(&mut result);
+            self.inner.done.store(true, Ordering::SeqCst);
             self.resolve_result(result);
+        } else {
+            self.inner.done.store(true, Ordering::SeqCst);
         }
         // Dropping the sender closes the channel: iterators terminate after
         // draining buffered events, and pending `poll_recv` wakers fire.
@@ -177,6 +226,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         }
     }
 
@@ -414,6 +464,139 @@ mod tests {
         assert!(
             ratio < 50.0,
             "drain time ratio 100k/10k = {ratio:.1}x (linear ≈ 10x, quadratic ≈ 100x)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R2.7 `durationMs` timing (upstream event-stream.test.ts @ 36a686ee8 /
+    // f284a2460): monotonic from stream creation, saw-start only.
+    // -----------------------------------------------------------------------
+
+    fn timed_message(stop_reason: StopReason) -> AssistantMessage {
+        let mut value = message(stop_reason);
+        value.timestamp = now_wall_ms();
+        value
+    }
+
+    /// "sets durationMs on the final done or error message of a response it
+    /// saw start".
+    #[tokio::test]
+    async fn test_duration_ms_set_on_terminal_message() {
+        let done = AssistantMessageEventStream::new();
+        let answer = timed_message(StopReason::Stop);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        done.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: answer,
+        });
+        let resolved = done.result().await.expect("resolved");
+        let measured = resolved.duration_ms.expect("timed");
+        assert!(measured >= 15, "duration {measured}ms below sleep window");
+
+        let failed = AssistantMessageEventStream::new();
+        failed.push(StreamEvent::Error {
+            reason: ErrorReason::Error,
+            error: timed_message(StopReason::Error),
+        });
+        assert!(
+            failed
+                .result()
+                .await
+                .expect("resolved")
+                .duration_ms
+                .is_some()
+        );
+
+        let ended = AssistantMessageEventStream::new();
+        ended.end(Some(timed_message(StopReason::Aborted)));
+        assert!(
+            ended
+                .result()
+                .await
+                .expect("resolved")
+                .duration_ms
+                .is_some()
+        );
+    }
+
+    /// "keeps an existing duration, so a forwarding stream keeps the inner
+    /// measurement".
+    #[tokio::test]
+    async fn test_duration_ms_keeps_existing_measurement() {
+        let outer = AssistantMessageEventStream::new();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let inner = AssistantMessageEventStream::new();
+        inner.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: timed_message(StopReason::Stop),
+        });
+        let measured_message = inner.result().await.expect("resolved");
+        let measured = measured_message.duration_ms.expect("inner measurement");
+        assert!(measured < 20, "inner measurement {measured}ms too slow");
+        outer.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: measured_message,
+        });
+        assert_eq!(
+            outer.result().await.expect("resolved").duration_ms,
+            Some(measured)
+        );
+
+        let preset = {
+            let mut value = timed_message(StopReason::Stop);
+            value.duration_ms = Some(1234);
+            value
+        };
+        let stream = AssistantMessageEventStream::new();
+        stream.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: preset,
+        });
+        assert_eq!(
+            stream.result().await.expect("resolved").duration_ms,
+            Some(1234)
+        );
+    }
+
+    /// "leaves a message untimed when it started before the stream, such as
+    /// a fetched deferred result".
+    #[tokio::test]
+    async fn test_duration_ms_leaves_stale_timestamp_untimed() {
+        let mut fetched = message(StopReason::Stop);
+        fetched.timestamp = now_wall_ms() - 60_000;
+        let stream = AssistantMessageEventStream::new();
+        stream.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: fetched,
+        });
+        let resolved = stream.result().await.expect("resolved");
+        assert_eq!(resolved.duration_ms, None);
+    }
+
+    /// "does not time a message pushed after the stream completed" — the
+    /// late event is dropped by the completion guard (Rust owns the event,
+    /// so the observable face is the single buffered terminal event).
+    #[tokio::test]
+    async fn test_duration_ms_late_push_untimed() {
+        let stream = AssistantMessageEventStream::new();
+        stream.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: timed_message(StopReason::Stop),
+        });
+        stream.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: timed_message(StopReason::Stop),
+        });
+        stream.end(None);
+        let events: Vec<StreamEvent> = stream.clone().collect().await;
+        assert_eq!(events.len(), 1, "late push must be dropped");
+        assert!(
+            stream
+                .result()
+                .await
+                .expect("resolved")
+                .duration_ms
+                .is_some()
         );
     }
 }

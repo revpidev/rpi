@@ -211,6 +211,9 @@ pub struct ProviderConfigModel {
     pub max_tokens: u32,
     /// 25a2c8dcf (#7568): rides the `...definition` spread upstream.
     pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// v1.0.2 (#9776, R2.3.1): per-thinking-level sampling overrides ride the
+    /// same `...definition` spread (`extensionModelFromDefinition`).
+    pub sampling_params_by_thinking_level: Option<rpi_ai::types::SamplingParamsByThinkingLevel>,
     pub headers: Option<BTreeMap<String, String>>,
     pub compat: Option<rpi_ai::types::ModelCompat>,
 }
@@ -410,6 +413,9 @@ pub struct ModelRuntime {
     /// Whether network model-catalog refreshes are allowed at all
     /// (`PI_OFFLINE` unset, model-runtime.ts:157).
     model_network_enabled: bool,
+    /// V17-01 R2.2.2: legacy Azure provider keys found in auth.json at
+    /// runtime creation (rpi-own [VARIANT]; read-only, never rewritten).
+    legacy_auth_diagnostics: Vec<String>,
     /// Resolved refresh timeout (`modelRefreshTimeoutMs ?? 15s`,
     /// model-runtime.ts:163-165): bounds the create-time refresh and the
     /// post-login/logout refresh ([`bounded_refresh_signal`]) alike.
@@ -1451,6 +1457,18 @@ fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -
             None => override_sampling.clone(),
         });
     }
+    // v1.0.2 (#9776, R2.3.1) `mergeSamplingParamsByThinkingLevel`: a present
+    // level overrides per key; absent levels keep the model value.
+    if let Some(override_levels) = &override_.sampling_params_by_thinking_level {
+        let mut merged = model
+            .sampling_params_by_thinking_level
+            .take()
+            .unwrap_or_default();
+        for (level, params) in override_levels {
+            merged.entry(*level).or_default().extend(params.clone());
+        }
+        model.sampling_params_by_thinking_level = Some(merged);
+    }
     if let Some(compat) = &override_.compat {
         model.compat = Some(merge_compat(model.compat.as_ref(), compat));
     }
@@ -1763,6 +1781,11 @@ impl ModelRuntime {
         let auth_path = options
             .auth_path
             .unwrap_or_else(|| get_agent_dir().join("auth.json"));
+        // R2.2.2 (V17-01): auth.json legacy Azure provider keys are
+        // reported (never rewritten); captured before the path moves into
+        // the credential store.
+        let legacy_auth_diagnostics =
+            rpi_ai::auth::file_store::legacy_azure_provider_diagnostics(&auth_path);
         let store: Arc<dyn CredentialStore> = options
             .credentials
             .unwrap_or_else(|| Arc::new(FileCredentialStore::new(auth_path)));
@@ -1818,6 +1841,7 @@ impl ModelRuntime {
             models_path,
             config: Mutex::new(config),
             model_network_enabled,
+            legacy_auth_diagnostics,
             model_refresh_timeout_ms,
             native_providers: Mutex::new(OrderedMap::default()),
             extension_providers: Mutex::new(OrderedMap::default()),
@@ -2446,9 +2470,16 @@ impl ModelRuntime {
     /// `getError` (model-runtime.ts:334-343).
     pub fn get_error(&self) -> Option<String> {
         let mut errors: Vec<String> = Vec::new();
-        if let Some(config_error) = lock(&self.config).error() {
-            errors.push(config_error.to_owned());
+        {
+            let config = lock(&self.config);
+            if let Some(config_error) = config.error() {
+                errors.push(config_error.to_owned());
+            }
+            // V17-01 R2.2.2: non-fatal legacy-key diagnostics (models.json).
+            errors.extend(config.diagnostics().iter().cloned());
         }
+        // V17-01 R2.2.2: auth.json legacy-key diagnostics.
+        errors.extend(self.legacy_auth_diagnostics.iter().cloned());
         for (provider_id, error) in lock(&self.composition_errors).iter() {
             errors.push(format!("Provider \"{provider_id}\": {error}"));
         }
@@ -2460,6 +2491,12 @@ impl ModelRuntime {
         } else {
             Some(errors.join("\n\n"))
         }
+    }
+
+    /// V17-01 R2.2.2: startup diagnostics for legacy Azure provider keys in
+    /// auth.json (the same strings [`Self::get_error`] carries).
+    pub fn legacy_auth_key_diagnostics(&self) -> &[String] {
+        &self.legacy_auth_diagnostics
     }
 
     pub fn get_registered_provider_config(&self, provider_id: &str) -> Option<ProviderConfigInput> {
@@ -3389,6 +3426,7 @@ fn json_model_to_model(
         context_window: model.context_window.unwrap_or(128000.0) as u32,
         max_tokens: model.max_tokens.unwrap_or(16384.0) as u32,
         sampling_params: model.sampling_params.clone(),
+        sampling_params_by_thinking_level: model.sampling_params_by_thinking_level.clone(),
         headers: model
             .headers
             .as_ref()
@@ -3453,6 +3491,7 @@ fn config_model_to_model(
         context_window: model.context_window,
         max_tokens: model.max_tokens,
         sampling_params: model.sampling_params.clone(),
+        sampling_params_by_thinking_level: model.sampling_params_by_thinking_level.clone(),
         headers: model.headers.clone(),
         id: model.id,
         compat: model.compat.clone(),
@@ -3556,6 +3595,59 @@ mod tests {
         })
         .await;
         (tmp, runtime)
+    }
+
+    /// V17-01 R2.2.2: legacy Azure provider keys in models.json and auth.json
+    /// surface through `get_error()` (and auth keys through the startup
+    /// diagnostics accessor) without failing the load or rewriting files.
+    #[tokio::test]
+    async fn legacy_azure_provider_keys_surface_as_diagnostics() {
+        let tmp = TempDir::new();
+        let agent_dir = tmp.0.join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let models_path = agent_dir.join("models.json");
+        let auth_path = agent_dir.join("auth.json");
+        std::fs::write(
+            &models_path,
+            r#"{"providers": {"azure-openai-responses": {"baseUrl": "https://x"}}}"#,
+        )
+        .expect("write models.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"azure-openai-responses": {"type": "api_key", "key": "legacy"}}"#,
+        )
+        .expect("write auth.json");
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: Some(auth_path.clone()),
+            models_path: ModelsPathInput::Path(models_path.clone()),
+            ..Default::default()
+        })
+        .await;
+
+        let error = runtime.get_error().expect("diagnostics");
+        assert!(
+            error.contains("providers.azure-openai-responses"),
+            "models.json diagnostic present: {error}"
+        );
+        assert!(
+            error.contains("azure-openai-responses (credential key)"),
+            "auth.json diagnostic present: {error}"
+        );
+        let auth_diagnostics = runtime.legacy_auth_key_diagnostics();
+        assert_eq!(auth_diagnostics.len(), 1);
+        assert!(auth_diagnostics[0].contains(&auth_path.display().to_string()));
+        // No rewrite: both files are untouched (no migration, no alias).
+        assert!(
+            std::fs::read_to_string(&models_path)
+                .expect("models.json")
+                .contains("azure-openai-responses")
+        );
+        assert!(
+            std::fs::read_to_string(&auth_path)
+                .expect("auth.json")
+                .contains("azure-openai-responses")
+        );
     }
 
     /// `ModelRuntime.create` seeds every built-in provider
@@ -4444,10 +4536,12 @@ mod tests {
                 "apiKey": "RPI_TEST_COMPOSE_SAMPLING_KEY",
                 "models": [
                     {"id": "sampling-model", "samplingParams": {"temperature": 1, "top_p": 0.95, "top_k": 0}},
+                    {"id": "level-model", "samplingParamsByThinkingLevel": {"low": {"temperature": 0.6, "top_p": 0.95}, "high": {"top_k": 64}}},
                     {"id": "plain-model"}
                 ],
                 "modelOverrides": {
-                    "plain-model": {"samplingParams": {"top_p": 0.9}}
+                    "plain-model": {"samplingParams": {"top_p": 0.9}},
+                    "level-model": {"samplingParamsByThinkingLevel": {"low": {"top_p": 0.5}}}
                 }
             }}}"#,
         )
@@ -4472,6 +4566,23 @@ mod tests {
         assert_eq!(
             plain.sampling_params.as_ref().expect("samplingParams")["top_p"],
             serde_json::json!(0.9)
+        );
+
+        // v1.0.2 (#9776, R2.3.1): per-level sampling params parse from
+        // models.json and merge per level / per key over the definition.
+        let level = runtime.get_model("custom", "level-model").expect("model");
+        let by_level = level
+            .sampling_params_by_thinking_level
+            .as_ref()
+            .expect("samplingParamsByThinkingLevel");
+        let low = &by_level[&rpi_ai::types::ModelThinkingLevel::Low];
+        assert_eq!(low["temperature"], serde_json::json!(0.6));
+        assert_eq!(low["top_p"], serde_json::json!(0.5));
+        let high = &by_level[&rpi_ai::types::ModelThinkingLevel::High];
+        assert_eq!(high["top_k"], serde_json::json!(64));
+        assert!(
+            !by_level.contains_key(&rpi_ai::types::ModelThinkingLevel::Off),
+            "unconfigured levels stay absent"
         );
 
         // An override merges key-wise over the model-level params.
@@ -4960,6 +5071,7 @@ mod tests {
                 headers: None,
                 compat: None,
                 sampling_params: None,
+                sampling_params_by_thinking_level: None,
             }],
             api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
             ..Default::default()
@@ -5183,6 +5295,7 @@ mod tests {
             headers: None,
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         };
         let compat = runtime.get_compatibility_request_config(&model);
         assert!(
@@ -5271,6 +5384,7 @@ mod tests {
             headers: Some(headers),
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         };
         let compat = runtime.get_compatibility_request_config(&model);
         assert_eq!(
@@ -5286,7 +5400,10 @@ mod tests {
     /// upstream assertion: `{ ok: true, headers }` with no apiKey key.
     #[tokio::test]
     async fn get_auth_returns_none_for_missing_provider() {
-        let (_tmp, runtime) = runtime_with_models_json(r#"{"providers": {}}"#).await;
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {} sampling_params_by_thinking_level: None,}"#,
+        )
+        .await;
         let model = Model {
             id: "test-model".to_owned(),
             name: "Test".to_owned(),
@@ -5304,6 +5421,7 @@ mod tests {
             headers: None,
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         };
         let auth = runtime.get_auth(&model, None).await.unwrap();
         assert!(auth.is_none(), "missing provider → Ok(None)");
@@ -5339,6 +5457,7 @@ mod tests {
             headers: None,
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         }
     }
 
@@ -5586,6 +5705,7 @@ mod tests {
             headers: None,
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         }
     }
 
@@ -5922,6 +6042,7 @@ mod virtual_model_tests {
             sampling_params: None,
             headers: None,
             compat: None,
+            sampling_params_by_thinking_level: None,
         }
     }
 

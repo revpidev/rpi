@@ -157,6 +157,7 @@ fn create_assistant_message(text: &str) -> AgentMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     })
 }
 

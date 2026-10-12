@@ -45,6 +45,7 @@ fn test_model() -> Model {
         headers: None,
         compat: None,
         sampling_params: None,
+        sampling_params_by_thinking_level: None,
     }
 }
 
@@ -126,6 +127,7 @@ fn assistant_message(content: Vec<AssistantContent>, stop: StopReason) -> Assist
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 

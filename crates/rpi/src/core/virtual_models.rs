@@ -201,6 +201,7 @@ pub fn create_virtual_model(definition: &VirtualModelDefinition) -> Model {
         sampling_params: None,
         headers: None,
         compat: None,
+        sampling_params_by_thinking_level: None,
     }
 }
 
@@ -409,6 +410,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         })
     }
 

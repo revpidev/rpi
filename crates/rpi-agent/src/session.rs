@@ -875,6 +875,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         })
     }
 

@@ -44,7 +44,7 @@ use crate::api::constrained_sampling::{
 };
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
-use crate::api::simple_options::{MIN_ANSWER_TOKENS, build_base_options};
+use crate::api::simple_options::{MIN_ANSWER_TOKENS, build_base_options, resolve_sampling_params};
 use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
 use crate::models::{ProviderStreams, clamp_thinking_level};
@@ -1448,16 +1448,17 @@ pub fn build_params(
 
     // 25a2c8dcf (#7568): merged last so custom keys override the named
     // request fields.
-    // Last so custom keys override the named request fields. Per-request
-    // keys override model defaults (#9506 `c01f687e5`).
-    let mut sampling = model.sampling_params.clone().unwrap_or_default();
-    if let Some(option_params) = &options.stream.sampling_params {
-        for (key, value) in option_params {
-            sampling.insert(key.clone(), value.clone());
+    // Last so custom keys override the named request fields. The effective
+    // thinking level's `samplingParamsByThinkingLevel` sits between the model
+    // defaults and the per-request keys (#9506 `c01f687e5`, #9776).
+    if let Some(sampling) = resolve_sampling_params(
+        model,
+        options.reasoning_effort.unwrap_or(ModelThinkingLevel::Off),
+        options.stream.sampling_params.as_ref(),
+    ) {
+        for (key, value) in &sampling {
+            params.insert(key.clone(), value.clone());
         }
-    }
-    for (key, value) in &sampling {
-        params.insert(key.clone(), value.clone());
     }
 
     Ok(Value::Object(params))
@@ -2557,6 +2558,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -4276,6 +4278,7 @@ mod build_and_stream_tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         })
     }
 
@@ -4848,6 +4851,26 @@ mod build_and_stream_tests {
         );
         assert_eq!(merged["top_p"], json!(0.5));
         assert_eq!(merged["min_p"], json!(0.05));
+
+        // v1.0.2 (#9776, R2.3.1): the effective (clamped) thinking level's
+        // params sit between the model defaults and the request keys.
+        let level_model = make_model(json!({
+            "reasoning": true,
+            "thinkingLevelMap": {"low": null, "medium": null},
+            "samplingParams": {"temperature": 1.0, "min_p": 0.05},
+            "samplingParamsByThinkingLevel": {"high": {"temperature": 0.8, "top_k": 64}}
+        }));
+        let mut level_opts = options(StreamOptions {
+            sampling_params: Some([("top_p".to_owned(), json!(0.5))].into_iter().collect()),
+            ..StreamOptions::default()
+        });
+        level_opts.reasoning_effort = Some(ModelThinkingLevel::Low);
+        level_opts.tool_choice = None;
+        let level_params = params_for(&level_model, &ctx, &level_opts, CacheRetention::Short);
+        assert_eq!(level_params["temperature"], json!(0.8));
+        assert_eq!(level_params["top_p"], json!(0.5));
+        assert_eq!(level_params["top_k"], json!(64));
+        assert_eq!(level_params["min_p"], json!(0.05));
     }
 
     /// Upstream openai-completions-thinking-token-budget.test.ts (d07889da0

@@ -233,6 +233,9 @@ pub struct ModelsJsonModelOverride {
     pub max_tokens: Option<f64>,
     /// 25a2c8dcf (#7568): default sampling parameters for this model.
     pub sampling_params: Option<serde_json::Map<String, Value>>,
+    /// `ModelOverrideSchema.samplingParamsByThinkingLevel` (v1.0.2, #9776;
+    /// R2.3.1): merged per level and per key over the catalog value.
+    pub sampling_params_by_thinking_level: Option<crate::types::SamplingParamsByThinkingLevel>,
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<ModelCompat>,
 }
@@ -259,6 +262,9 @@ pub struct ModelsJsonModel {
     pub max_tokens: Option<f64>,
     /// 25a2c8dcf (#7568): default sampling parameters for this model.
     pub sampling_params: Option<serde_json::Map<String, Value>>,
+    /// `ModelDefinitionSchema.samplingParamsByThinkingLevel` (v1.0.2,
+    /// #9776; R2.3.1): carried verbatim onto the runtime model.
+    pub sampling_params_by_thinking_level: Option<crate::types::SamplingParamsByThinkingLevel>,
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<ModelCompat>,
 }
@@ -347,10 +353,15 @@ fn validate(config: &ModelsJson) -> Vec<String> {
 /// `ModelConfig` — one immutable load of models.json. Loading never fails
 /// hard: a missing path or missing file yields an empty config; load/parse/
 /// schema problems yield an empty config plus [`ModelConfig::error`].
+///
+/// `diagnostics` carries non-fatal rpi-own findings (Azure rename legacy
+/// keys, R2.2.2): the config still loads and the finding is surfaced through
+/// `ModelRuntime::get_error()`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelConfig {
     providers: OrderedMap<ModelsJsonProvider>,
     error: Option<String>,
+    diagnostics: Vec<String>,
 }
 
 impl ModelConfig {
@@ -362,6 +373,7 @@ impl ModelConfig {
         Self {
             providers: OrderedMap::default(),
             error: Some(error),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -390,6 +402,13 @@ impl ModelConfig {
                 ));
             }
         };
+        // R2.2.2 (V17-01): legacy Azure provider keys are reported with the
+        // file and key position; the document still loads (no rewrite, no
+        // alias).
+        let diagnostics = crate::azure_provider_rename::models_json_diagnostics(
+            &path.display().to_string(),
+            &parsed,
+        );
         let config: ModelsJson = match serde_json::from_value(parsed) {
             Ok(config) => config,
             Err(error) => {
@@ -410,6 +429,7 @@ impl ModelConfig {
         Self {
             providers: config.providers,
             error: None,
+            diagnostics,
         }
     }
 
@@ -426,6 +446,11 @@ impl ModelConfig {
     /// `getError`.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// V17-01 R2.2.2: non-fatal diagnostics collected at load time.
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
     }
 }
 
@@ -477,6 +502,25 @@ mod tests {
         let config = ModelConfig::load(Some(&temp_path("enoent"))).await;
         assert_eq!(config.error(), None);
         assert_eq!(config.provider_ids(), Vec::<&str>::new());
+    }
+
+    /// V17-01 R2.2.2: a legacy Azure provider key is diagnosed with file and
+    /// key position without failing the load; the new key stays silent.
+    #[tokio::test]
+    async fn test_load_legacy_azure_provider_diagnostic() {
+        let path = temp_path("azure-legacy");
+        std::fs::write(
+            &path,
+            r#"{"providers": {"azure-openai-responses": {"baseUrl": "https://x"}, "azure": {"baseUrl": "https://y"}}}"#,
+        )
+        .expect("write");
+        let config = ModelConfig::load(Some(&path)).await;
+        assert_eq!(config.error(), None, "legacy key must not fail the load");
+        let diagnostics = config.diagnostics();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("providers.azure-openai-responses"));
+        assert!(diagnostics[0].contains(&path.display().to_string()));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

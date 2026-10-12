@@ -754,6 +754,21 @@ pub fn read_stored_credential(
     parse_credential(data.get(provider_id)?).ok()
 }
 
+/// V17-01 R2.2.2 (rpi-own [VARIANT]): diagnostics for credential entries
+/// still keyed by the renamed Azure provider id. Read-only — the file is
+/// never rewritten and the old key is never aliased. Missing or malformed
+/// files yield no diagnostics (the store's own error path reports those).
+pub fn legacy_azure_provider_diagnostics(auth_path: impl AsRef<Path>) -> Vec<String> {
+    let file = auth_path.as_ref().display().to_string();
+    let Ok(content) = std::fs::read_to_string(auth_path.as_ref()) else {
+        return Vec::new();
+    };
+    let Ok(data) = parse_storage_data(Some(&content)) else {
+        return Vec::new();
+    };
+    crate::azure_provider_rename::auth_json_diagnostics(&file, &data)
+}
+
 #[cfg(test)]
 mod tests {
     //! Test intents ported from

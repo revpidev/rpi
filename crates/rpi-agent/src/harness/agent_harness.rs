@@ -147,6 +147,7 @@ fn create_failure_message(model: &Model, error_message: &str, aborted: bool) -> 
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 

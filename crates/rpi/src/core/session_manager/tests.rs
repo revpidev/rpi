@@ -75,6 +75,7 @@ fn assistant_msg(text: &str) -> AgentMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     })
 }
 
@@ -585,6 +586,7 @@ fn tool_result_msg(text: &str) -> AgentMessage {
         nested_calls: None,
         is_error: false,
         timestamp: 1,
+        duration_ms: None,
     })
 }
 
@@ -2399,6 +2401,7 @@ fn preserves_tool_and_summary_usage_across_a_file_backed_reload() {
             nested_calls: None,
             is_error: false,
             timestamp: 1,
+            duration_ms: None,
         }))
         .expect("append");
     session

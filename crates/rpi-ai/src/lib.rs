@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod azure_provider_rename;
 pub mod error;
 pub mod generated;
 pub mod images;

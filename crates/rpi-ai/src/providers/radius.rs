@@ -588,9 +588,9 @@ mod tests {
             .await
             .expect("refresh");
         let models = provider.get_models();
-        // Baseline (28, catalog snapshot 2026-10-01) + organization-only;
-        // `balanced` is replaced, not duplicated.
-        assert_eq!(models.len(), 28 + 1);
+        // Baseline (29, catalog snapshot 2026-10-12; +claude-haiku-5-5) +
+        // organization-only; `balanced` is replaced, not duplicated.
+        assert_eq!(models.len(), 29 + 1);
         assert_eq!(
             models.iter().filter(|model| model.id == "balanced").count(),
             1

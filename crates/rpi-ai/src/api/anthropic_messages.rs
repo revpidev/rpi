@@ -77,7 +77,10 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
-const MID_CONVERSATION_TOOL_CHANGES_BETA: &str = "mid-conversation-tool-changes-2026-07-01";
+/// `INLINE_TOOLS_BETA` (b271b0a52, #9548): later tools are defined by value
+/// in `tool_addition` blocks; the top-level list stays fixed across tool
+/// changes (prompt cache preservation).
+const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
 
 /// Stable deferred tool declared whenever native tool changes are in use
 /// (anthropic-messages.ts:190-200 @ #9548). Anthropic adds hidden prompt
@@ -201,7 +204,7 @@ fn get_beta_features(
         features.push(THINKING_BINDING_CONTROLS_BETA.to_owned());
     }
     if native_tool_changes {
-        features.push(MID_CONVERSATION_TOOL_CHANGES_BETA.to_owned());
+        features.push(INLINE_TOOLS_BETA.to_owned());
     }
     // :1017 — `[...new Set(features)]` (already unique by construction;
     // kept for parity with the upstream dedup step).
@@ -736,14 +739,21 @@ fn insert_thinking_level_messages(
     messages
 }
 
+/// `convertToolDefinitions` callback (b271b0a52): converts tool declarations
+/// into wire definitions for inline `tool_addition` blocks.
+type ConvertToolDefinitions<'a> = &'a dyn Fn(&[Tool]) -> Result<Vec<Value>, String>;
+
+/// `convertMessages` (transcript.ts). `convert_tool_definitions` converts
+/// tool definitions for native `tool_addition` blocks; `None` keeps
+/// mid-conversation tool changes non-native (b271b0a52).
 fn convert_messages(
     transformed_messages: &[Message],
     is_oauth_token: bool,
     cache_control: Option<&Value>,
     allow_empty_signature: bool,
-    native_tool_changes: bool,
+    convert_tool_definitions: Option<ConvertToolDefinitions<'_>>,
     managed_provider: Option<&str>,
-) -> ConvertedAnthropicMessages {
+) -> Result<ConvertedAnthropicMessages, String> {
     let mut params: Vec<Value> = Vec::new();
     let mut assistant_levels: HashMap<usize, String> = HashMap::new();
     // Later system messages are held back and emitted directly before the
@@ -771,9 +781,17 @@ fn convert_messages(
                         "text": sanitize_surrogates(&text),
                     }));
                 }
-                if native_tool_changes {
+                if let Some(convert_tool_definitions) = convert_tool_definitions {
+                    let added = system.tools_added.as_deref().unwrap_or(&[]);
+                    // A new definition under the same name replaces the old
+                    // one, so no removal is needed (b271b0a52).
+                    let redefined: std::collections::HashSet<&str> =
+                        added.iter().map(|tool| tool.name.as_str()).collect();
                     if let Some(removed) = &system.tools_removed {
                         for tool in removed {
+                            if redefined.contains(tool.name.as_str()) {
+                                continue;
+                            }
                             blocks.push(json!({
                                 "type": "tool_removal",
                                 "tool": {
@@ -783,16 +801,11 @@ fn convert_messages(
                             }));
                         }
                     }
-                    if let Some(added) = &system.tools_added {
-                        for tool in added {
-                            blocks.push(json!({
-                                "type": "tool_addition",
-                                "tool": {
-                                    "type": "tool_reference",
-                                    "name": if is_oauth_token { to_claude_code_name(&tool.name) } else { tool.name.clone() },
-                                },
-                            }));
-                        }
+                    for definition in convert_tool_definitions(added)? {
+                        blocks.push(json!({
+                            "type": "tool_addition",
+                            "tool": {"type": "tool_definition", "definition": definition},
+                        }));
                     }
                 }
                 if !blocks.is_empty() {
@@ -979,10 +992,10 @@ fn convert_messages(
         }
     }
 
-    ConvertedAnthropicMessages {
+    Ok(ConvertedAnthropicMessages {
         messages: params,
         assistant_levels,
-    }
+    })
 }
 
 fn should_use_fine_grained_tool_streaming_beta(model: &Model, context: &TranscriptContext) -> bool {
@@ -1137,10 +1150,12 @@ fn build_params(
         Some(Message::System(_)) => &transformed_messages[1..],
         _ => transformed_messages.as_slice(),
     };
-    // Native tool changes reference tools by name, so a redefined name
-    // cannot be expressed, and Anthropic rejects a tool list where every
-    // tool is deferred, so there must be an initial active tool to anchor
-    // the deferred ones. Otherwise the current tool list is sent.
+    // Native tool changes keep the request-level tool list fixed and define
+    // every later tool by value in a `tool_addition` block, which also
+    // expresses same-name redefinitions. Anthropic rejects a tool list where
+    // every tool is deferred, so there must be an initial active tool to
+    // anchor the placeholder. Otherwise the current tool list is sent
+    // (b271b0a52, #9548).
     let initial_tools: Vec<Tool> = initial_system_message
         .and_then(|message| message.tools_added.clone())
         .unwrap_or_default();
@@ -1152,14 +1167,26 @@ fn build_params(
         .as_ref()
         .and_then(|compat| compat.supports_mid_convo_effort)
         == Some(true);
+    // Inline tool definitions for `tool_addition` blocks: the same converter
+    // the request-level list uses, without cache control or deferral.
+    let convert_tool_definitions = |tools: &[Tool]| -> Result<Vec<Value>, String> {
+        convert_tools(
+            tools,
+            is_oauth_token,
+            compat.supports_eager_tool_input_streaming,
+            compat.supports_strict_tools,
+            None,
+            false,
+        )
+    };
     let converted = convert_messages(
         conversation_messages,
         is_oauth_token,
         cache_control.as_ref(),
         compat.allow_empty_signature,
-        native_tool_changes,
+        native_tool_changes.then_some(&convert_tool_definitions as _),
         managed.then_some(model.provider.as_str()),
-    );
+    )?;
     let messages = if managed {
         insert_thinking_level_messages(converted, options.effort.as_deref().unwrap_or("high"))
     } else {
@@ -1215,20 +1242,10 @@ fn build_params(
     };
     if native_tool_changes {
         // Initial tools stay active with the cache breakpoint on the last
-        // one. Every later declaration is deferred and only surfaced by its
-        // `tool_addition` block; removed tools stay declared and are
-        // withdrawn by `tool_removal`. The request-level list therefore only
-        // grows, keeping the cached prefix intact across tool changes
-        // (#9548, anthropic-messages.ts:1120-1137).
-        let initial_names: HashSet<&str> = initial_tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
-        let later_tools: Vec<Tool> =
-            crate::utils::transcript::get_declared_tools(&context.messages)
-                .into_iter()
-                .filter(|tool| !initial_names.contains(tool.name.as_str()))
-                .collect();
+        // one, followed by the placeholder. The list never changes
+        // afterwards: later tools are defined by value in `tool_addition`
+        // blocks and withdrawn by `tool_removal`, so the cached prefix
+        // survives every tool change (b271b0a52, #9548).
         let mut tools = convert_tools(
             &initial_tools,
             is_oauth_token,
@@ -1243,15 +1260,6 @@ fn build_params(
             "input_schema": {"type": "object", "properties": {}, "required": []},
             "defer_loading": true,
         }));
-        let mut later = convert_tools(
-            &later_tools,
-            is_oauth_token,
-            compat.supports_eager_tool_input_streaming,
-            compat.supports_strict_tools,
-            None,
-            true,
-        )?;
-        tools.append(&mut later);
         params["tools"] = Value::Array(tools);
     } else {
         let tools = crate::utils::transcript::get_current_tools(&context.messages);
@@ -1951,6 +1959,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -1988,16 +1997,15 @@ async fn run(
 
     let compat = get_anthropic_compat(model);
     let current_tools = crate::utils::transcript::get_current_tools(&context.messages);
-    // Native tool changes: the transport accepts tool_addition/tool_removal
-    // blocks, the transcript carries an initial active tool to anchor the
-    // deferred ones, and no name was redefined with a different definition
-    // (#9548, anthropic-messages.ts:1047-1051).
+    // Native tool changes: the transport accepts inline `tool_addition`
+    // blocks (b271b0a52), the transcript carries an initial active tool to
+    // anchor the placeholder, and same-name redefinitions are expressed by
+    // value. Otherwise the current tool list is sent (#9548).
     let native_tool_changes = compat.supports_mid_convo_system_messages
         && compat.supports_mid_convo_tool_changes
         && crate::utils::transcript::get_initial_system_message(&context.messages)
             .and_then(|message| message.tools_added.as_ref())
-            .is_some_and(|tools| !tools.is_empty())
-        && !crate::utils::transcript::has_tool_redefinitions(&context.messages);
+            .is_some_and(|tools| !tools.is_empty());
 
     let dynamic_headers = if model.provider == "github-copilot" {
         let has_images = has_copilot_vision_input(&context.messages);
@@ -2480,6 +2488,7 @@ pub(crate) mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         })
     }
 
@@ -2849,7 +2858,8 @@ pub(crate) mod tests {
             user_text("again"),
         ];
         let cc = json!({"type": "ephemeral"});
-        let converted = convert_messages(&messages, false, Some(&cc), false, false, None);
+        let converted =
+            convert_messages(&messages, false, Some(&cc), false, None, None).expect("convert");
         let params = converted.messages;
         assert_eq!(params.len(), 3);
         assert_eq!(params[0], json!({"role": "user", "content": "hello"}));
@@ -2871,7 +2881,8 @@ pub(crate) mod tests {
             assistant_message(vec![], "anthropic", "claude-sonnet-4-5"),
             user_text("real"),
         ];
-        let converted = convert_messages(&messages, false, None, false, false, None);
+        let converted =
+            convert_messages(&messages, false, None, false, None, None).expect("convert");
         let params = converted.messages;
         assert_eq!(params.len(), 1);
         assert_eq!(params[0]["content"], json!("real"));
@@ -2896,7 +2907,8 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let converted = convert_messages(&messages, false, None, false, false, None);
+        let converted =
+            convert_messages(&messages, false, None, false, None, None).expect("convert");
         let params = converted.messages;
         let blocks = params[0]["content"].as_array().expect("blocks");
         assert_eq!(
@@ -2912,7 +2924,8 @@ pub(crate) mod tests {
         assert_eq!(blocks.len(), 2);
 
         // allowEmptySignature keeps the block as thinking with "".
-        let converted = convert_messages(&messages, false, None, true, false, None);
+        let converted =
+            convert_messages(&messages, false, None, true, None, None).expect("convert");
         let params = converted.messages;
         let blocks = params[0]["content"].as_array().expect("blocks");
         assert_eq!(
@@ -2932,7 +2945,8 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let converted = convert_messages(&messages, false, None, false, false, None);
+        let converted =
+            convert_messages(&messages, false, None, false, None, None).expect("convert");
         let params = converted.messages;
         assert_eq!(
             params[0]["content"][0],
@@ -2947,7 +2961,8 @@ pub(crate) mod tests {
             tool_result("call_2", "two"),
             user_text("next"),
         ];
-        let converted = convert_messages(&messages, false, None, false, false, None);
+        let converted =
+            convert_messages(&messages, false, None, false, None, None).expect("convert");
         let params = converted.messages;
         assert_eq!(params.len(), 2);
         let content = params[0]["content"].as_array().expect("content");
@@ -2973,10 +2988,12 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let converted = convert_messages(&messages, true, None, false, false, None);
+        let converted =
+            convert_messages(&messages, true, None, false, None, None).expect("convert");
         let params = converted.messages;
         assert_eq!(params[0]["content"][0]["name"], json!("Bash"));
-        let converted = convert_messages(&messages, false, None, false, false, None);
+        let converted =
+            convert_messages(&messages, false, None, false, None, None).expect("convert");
         let params = converted.messages;
         assert_eq!(params[0]["content"][0]["name"], json!("bash"));
     }
@@ -4648,6 +4665,7 @@ mod fireworks_mid_convo_tools_tests {
             nested_calls: None,
             is_error: false,
             timestamp: 0,
+            duration_ms: None,
         });
         let context = crate::utils::transcript::normalize_context(&Context {
             system_prompt: None,
@@ -4905,17 +4923,23 @@ mod transcript_tool_changes_tests {
         assert!(
             betas
                 .split(',')
+                .any(|beta| beta == "inline-tools-2026-09-15"),
+            "inline tool definitions beta present in the header: {betas:?}"
+        );
+        assert!(
+            !betas
+                .split(',')
                 .any(|beta| beta == "mid-conversation-tool-changes-2026-07-01"),
-            "native tool changes beta present in the header: {betas:?}"
+            "the replaced beta must be gone: {betas:?}"
         );
         assert_eq!(
             payload["system"][0]["text"],
             "base prompt\n\n<rules>\nold rules\n</rules>\n\n<docs>\nread docs\n</docs>"
         );
 
-        // Initial tools stay active and carry the cache breakpoint; the
-        // placeholder and every later declaration are deferred; the removed
-        // tool stays declared.
+        // The top-level list holds only the initial tools (with the cache
+        // breakpoint) and the deferred placeholder; later tools never appear
+        // there — the list is fixed so the cached prefix survives.
         let tools = payload["tools"].as_array().expect("tools");
         assert_eq!(
             tools
@@ -4924,16 +4948,13 @@ mod transcript_tool_changes_tests {
                 .collect::<Vec<_>>(),
             vec![
                 Some("base_tool"),
-                Some(super::DEFERRED_TOOL_PLACEHOLDER_NAME),
-                Some("late_tool")
+                Some(super::DEFERRED_TOOL_PLACEHOLDER_NAME)
             ]
         );
         assert_eq!(tools[0]["cache_control"], json!({"type": "ephemeral"}));
         assert!(tools[0].get("defer_loading").is_none());
         assert_eq!(tools[1]["defer_loading"], json!(true));
         assert!(tools[1].get("cache_control").is_none());
-        assert_eq!(tools[2]["defer_loading"], json!(true));
-        assert!(tools[2].get("cache_control").is_none());
 
         let messages = payload["messages"].as_array().expect("messages");
         let update = messages.last().expect("trailing system update");
@@ -4945,8 +4966,33 @@ mod transcript_tool_changes_tests {
             .map(|block| block["type"].as_str().expect("type"))
             .collect();
         assert_eq!(block_types, vec!["text", "tool_removal", "tool_addition"]);
+        assert_eq!(update["content"][1]["tool"]["type"], "tool_reference");
         assert_eq!(update["content"][1]["tool"]["name"], "base_tool");
-        assert_eq!(update["content"][2]["tool"]["name"], "late_tool");
+        // Later tools are defined by value; the block (not the definition)
+        // carries the cache breakpoint.
+        assert_eq!(update["content"][2]["tool"]["type"], "tool_definition");
+        assert_eq!(
+            update["content"][2]["tool"]["definition"]["name"],
+            "late_tool"
+        );
+        assert_eq!(
+            update["content"][2]["tool"]["definition"]["description"],
+            "late_tool tool"
+        );
+        assert!(
+            update["content"][2]["tool"]["definition"]
+                .get("defer_loading")
+                .is_none()
+        );
+        assert!(
+            update["content"][2]["tool"]["definition"]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            update["content"][2]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         let text = update["content"][0]["text"].as_str().expect("text");
         assert!(text.contains("updated guidance"), "{text}");
         assert!(text.contains("<rules>\nnew rules\n</rules>"), "{text}");
@@ -4982,87 +5028,152 @@ mod transcript_tool_changes_tests {
         );
     }
 
-    /// "sends the current Anthropic tool list when native tool changes cannot
-    /// express the history" (transcript-tool-changes.test.ts:119): a same-name
-    /// redefinition, and a transcript with no initial tool to anchor deferred
-    /// ones, both fall back to the current tool list.
+    /// "redefines an Anthropic tool by value under the same name"
+    /// (transcript-tool-changes.test.ts @ b271b0a52): the top-level list keeps
+    /// the original definition (cached prefix survives) and the new definition
+    /// replaces the old one in place; no removal block is sent for it.
     #[tokio::test]
-    async fn sends_current_tool_list_when_native_cannot_express_history() {
+    async fn redefines_a_tool_by_value_under_the_same_name() {
         let redefined = serde_json::from_value::<Tool>(json!({
             "name": "base_tool",
             "description": "changed",
             "parameters": {"type": "object", "properties": {}}
         }))
         .expect("tool");
-        let redefined_b = serde_json::from_value::<Tool>(json!({
-            "name": "base_tool",
-            "description": "changed",
-            "parameters": {"type": "object", "properties": {}}
-        }))
-        .expect("tool");
-        let fallback_contexts = vec![
-            // Same-name redefinition: blocks reference tools by name only.
-            context(
-                vec![
-                    system_message(json!({
-                        "role": "system",
-                        "content": "base prompt",
-                        "toolsAdded": [tool_declaration("base_tool")],
-                        "timestamp": 0
-                    })),
-                    system_message(json!({
-                        "role": "system",
-                        "content": "updated guidance",
-                        "toolsRemoved": [{"name": "base_tool"}],
-                        "toolsAdded": [redefined],
-                        "timestamp": 2
-                    })),
-                ],
-                None,
-            ),
-            // No initial tool: Anthropic rejects an all-deferred tool list.
-            context(
-                vec![
-                    system_message(json!({
-                        "role": "system",
-                        "content": "base prompt",
-                        "timestamp": 0
-                    })),
-                    system_message(json!({
-                        "role": "system",
-                        "content": "updated guidance",
-                        "toolsAdded": [redefined_b],
-                        "timestamp": 2
-                    })),
-                ],
-                None,
-            ),
-        ];
-        for fallback in fallback_contexts {
-            let payload = capture(&native_model(), &fallback).await;
-            assert!(
-                payload.get("betas").is_none(),
-                "the body never carries a betas array (header-only transport)"
-            );
-            let tools = payload["tools"].as_array().expect("tools");
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0]["name"], "base_tool");
-            assert_eq!(tools[0]["description"], "changed");
-            assert_eq!(tools[0]["cache_control"], json!({"type": "ephemeral"}));
-            assert!(tools[0].get("defer_loading").is_none());
-            // The update still rides an in-place system message (the model
-            // accepts mid-conversation system messages) — text only.
-            let messages = payload["messages"].as_array().expect("messages");
-            let update = messages.last().expect("trailing system update");
-            assert_eq!(update["role"], "system");
-            let block_types: Vec<&str> = update["content"]
-                .as_array()
-                .expect("content blocks")
+        let context = context(
+            vec![
+                system_message(json!({
+                    "role": "system",
+                    "content": "base prompt",
+                    "toolsAdded": [tool_declaration("base_tool")],
+                    "timestamp": 0
+                })),
+                user_text("before"),
+                system_message(json!({
+                    "role": "system",
+                    "content": "",
+                    "toolsRemoved": [{"name": "base_tool"}],
+                    "toolsAdded": [redefined],
+                    "timestamp": 2
+                })),
+            ],
+            None,
+        );
+        let payload = capture(&native_model(), &context).await;
+        assert!(
+            payload.get("betas").is_none(),
+            "the body never carries a betas array (header-only transport)"
+        );
+        let (headers, _) = build_request_headers(
+            &native_model(),
+            &context,
+            true,
+            Some("sk-key"),
+            &AnthropicOptions::default(),
+            None,
+            None,
+            None,
+        );
+        let betas = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.as_deref())
+            .unwrap_or_default();
+        assert!(
+            betas
+                .split(',')
+                .any(|beta| beta == "inline-tools-2026-09-15"),
+            "inline tool definitions beta present in the header: {betas:?}"
+        );
+        // The top-level declaration keeps the original definition.
+        let tools = payload["tools"].as_array().expect("tools");
+        assert_eq!(
+            tools
                 .iter()
-                .map(|block| block["type"].as_str().expect("type"))
-                .collect();
-            assert_eq!(block_types, vec!["text"]);
-        }
+                .map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("base_tool"),
+                Some(super::DEFERRED_TOOL_PLACEHOLDER_NAME)
+            ]
+        );
+        assert_eq!(tools[0]["description"], "base_tool tool");
+        // The new definition replaces the old one in place; only the addition
+        // block is sent (no `tool_removal` for a redefined name).
+        let messages = payload["messages"].as_array().expect("messages");
+        let update = messages.last().expect("trailing system update");
+        let blocks = update["content"].as_array().expect("content blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_addition");
+        assert_eq!(blocks[0]["tool"]["type"], "tool_definition");
+        assert_eq!(blocks[0]["tool"]["definition"]["name"], "base_tool");
+        assert_eq!(blocks[0]["tool"]["definition"]["description"], "changed");
+    }
+
+    /// "sends the current Anthropic tool list without an initial tool"
+    /// (transcript-tool-changes.test.ts @ b271b0a52): Anthropic rejects a
+    /// tool list where every tool (here: the placeholder) is deferred, so a
+    /// transcript with no initial tool falls back to the current list.
+    #[tokio::test]
+    async fn sends_current_tool_list_without_an_initial_tool() {
+        let context = context(
+            vec![
+                system_message(json!({
+                    "role": "system",
+                    "content": "base prompt",
+                    "timestamp": 0
+                })),
+                user_text("before"),
+                system_message(json!({
+                    "role": "system",
+                    "content": "updated guidance",
+                    "toolsAdded": [tool_declaration("late_tool")],
+                    "timestamp": 2
+                })),
+            ],
+            None,
+        );
+        let payload = capture(&native_model(), &context).await;
+        assert!(
+            payload.get("betas").is_none(),
+            "the body never carries a betas array (header-only transport)"
+        );
+        let (headers, _) = build_request_headers(
+            &native_model(),
+            &context,
+            false,
+            Some("sk-key"),
+            &AnthropicOptions::default(),
+            None,
+            None,
+            None,
+        );
+        let betas = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.as_deref())
+            .unwrap_or_default();
+        assert!(
+            !betas
+                .split(',')
+                .any(|beta| beta == "inline-tools-2026-09-15"),
+            "native tool changes must not engage without an initial tool: {betas:?}"
+        );
+        let tools = payload["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "late_tool");
+        assert_eq!(tools[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(tools[0].get("defer_loading").is_none());
+        // The update still rides an in-place system message (the model
+        // accepts mid-conversation system messages) — text only.
+        let messages = payload["messages"].as_array().expect("messages");
+        let update = messages.last().expect("trailing system update");
+        assert_eq!(update["role"], "system");
+        let block_types: Vec<&str> = update["content"]
+            .as_array()
+            .expect("content blocks")
+            .iter()
+            .map(|block| block["type"].as_str().expect("type"))
+            .collect();
+        assert_eq!(block_types, vec!["text"]);
     }
 
     /// "folds Anthropic updates into the system prompt without native

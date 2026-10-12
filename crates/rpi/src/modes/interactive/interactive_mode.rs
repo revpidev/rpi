@@ -6169,6 +6169,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         }
     }
 
@@ -6203,6 +6204,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         })
     }
 
@@ -7850,6 +7852,7 @@ mod tests {
                         usage: None,
                         nested_calls: None,
                         timestamp: 1_700_000_000_000,
+                        duration_ms: None,
                     },
                 ))
                 .expect("append tool result");
@@ -11030,6 +11033,7 @@ mod tests {
             nested_calls: None,
             is_error,
             timestamp: 0,
+            duration_ms: None,
         };
         assert!(!tool_result_state_from_message(&message(false)).is_error);
         let failed = tool_result_state_from_message(&message(true));

@@ -491,6 +491,7 @@ fn capture_stream_fn(texts: &[&str]) -> Capture {
                     deferred: None,
                     end_turn: None,
                     raw_stop_reason: None,
+                    duration_ms: None,
                 };
                 let stream = futures::stream::iter(vec![StreamEvent::Done {
                     reason: DoneReason::Stop,
@@ -695,6 +696,7 @@ fn stop_reason_text(text: &str, stop_reason: rpi_ai::types::StopReason) -> Assis
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -813,6 +815,7 @@ async fn summarization_tool_call_response_is_rejected() {
                     deferred: None,
                     end_turn: None,
                     raw_stop_reason: None,
+                    duration_ms: None,
                 };
                 Box::pin(futures::stream::iter(vec![StreamEvent::Done {
                     reason: rpi_ai::types::DoneReason::Stop,

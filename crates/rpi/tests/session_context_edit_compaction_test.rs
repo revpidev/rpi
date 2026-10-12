@@ -60,6 +60,7 @@ fn assistant_with_usage(text: &str, input: u64, output: u64, total: u64) -> Agen
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     })
 }
 

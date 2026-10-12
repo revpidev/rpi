@@ -56,7 +56,7 @@ use crate::api::openai_responses_shared::{
     ConvertResponsesMessagesOptions, ConvertResponsesToolsOptions, ResponsesStreamOptions,
     ResponsesStreamProcessor, convert_responses_messages, convert_responses_tools,
 };
-use crate::api::simple_options::build_base_options;
+use crate::api::simple_options::{build_base_options, resolve_sampling_params};
 use crate::api::sse::SseDecoder;
 use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
 use crate::models::{ProviderStreams, clamp_thinking_level};
@@ -87,14 +87,8 @@ pub const DEFAULT_AZURE_API_VERSION: &str = "v1";
 /// `AZURE_TOOL_CALL_PROVIDERS`: providers whose tool-call ids keep the
 /// Responses `{call_id}|{item_id}` composite form (the OpenAI family plus
 /// this API itself).
-pub static AZURE_TOOL_CALL_PROVIDERS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    HashSet::from([
-        "openai",
-        "openai-codex",
-        "opencode",
-        "azure-openai-responses",
-    ])
-});
+pub static AZURE_TOOL_CALL_PROVIDERS: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| HashSet::from(["openai", "openai-codex", "opencode", "azure"]));
 
 // ---------------------------------------------------------------------------
 // Options
@@ -428,17 +422,23 @@ pub fn build_params(
     }
 
     // 25a2c8dcf (#7568): merged last so custom keys override the named
-    // request fields.
-    // Last so custom keys override the named request fields. Per-request
-    // keys override model defaults (#9506 `c01f687e5`).
-    let mut sampling = model.sampling_params.clone().unwrap_or_default();
-    if let Some(option_params) = &options.stream.sampling_params {
-        for (key, value) in option_params {
-            sampling.insert(key.clone(), value.clone());
+    // request fields. #9776: `reasoningEffort ?? (reasoningSummary ?
+    // "medium" : undefined)` selects the thinking-level layer.
+    let sampling_reasoning_effort = options.reasoning_effort.or_else(|| {
+        options
+            .reasoning_summary
+            .as_deref()
+            .filter(|summary| !summary.is_empty())
+            .map(|_| ModelThinkingLevel::Medium)
+    });
+    if let Some(sampling) = resolve_sampling_params(
+        model,
+        sampling_reasoning_effort.unwrap_or(ModelThinkingLevel::Off),
+        options.stream.sampling_params.as_ref(),
+    ) {
+        for (key, value) in &sampling {
+            params[key.clone()] = value.clone();
         }
-    }
-    for (key, value) in &sampling {
-        params[key.clone()] = value.clone();
     }
 
     Ok(params)
@@ -474,6 +474,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -834,8 +835,7 @@ mod tests {
     use crate::types::ProviderEnv;
 
     fn model(extra: Value) -> Model {
-        let mut overrides =
-            json!({"api": "azure-openai-responses", "provider": "azure-openai-responses"});
+        let mut overrides = json!({"api": "azure-openai-responses", "provider": "azure"});
         overrides
             .as_object_mut()
             .expect("object")
@@ -1184,6 +1184,43 @@ mod tests {
         let merged = params_for(&model_with_defaults, &ctx, &override_options);
         assert_eq!(merged["top_p"], json!(0.5));
         assert_eq!(merged["min_p"], json!(0.05));
+
+        // v1.0.2 (#9776, R2.3.1): the effective (clamped) thinking level's
+        // params sit between the model defaults and the request keys.
+        let level_model = model(json!({
+            "reasoning": true,
+            "thinkingLevelMap": {"low": null, "medium": null},
+            "samplingParams": {"temperature": 1.0, "min_p": 0.05},
+            "samplingParamsByThinkingLevel": {"high": {"temperature": 0.8, "top_k": 64}}
+        }));
+        let level_options = AzureOpenAIResponsesOptions {
+            reasoning_effort: Some(ModelThinkingLevel::Low),
+            stream: StreamOptions {
+                sampling_params: Some([("top_p".to_owned(), json!(0.5))].into_iter().collect()),
+                ..StreamOptions::default()
+            },
+            ..AzureOpenAIResponsesOptions::default()
+        };
+        let level_params = params_for(&level_model, &ctx, &level_options);
+        assert_eq!(level_params["temperature"], json!(0.8));
+        assert_eq!(level_params["top_p"], json!(0.5));
+        assert_eq!(level_params["top_k"], json!(64));
+        assert_eq!(level_params["min_p"], json!(0.05));
+
+        // "uses medium sampling params for summary-only requests".
+        let summary_model = model(json!({
+            "reasoning": true,
+            "samplingParamsByThinkingLevel": {
+                "off": {"temperature": 0.7},
+                "medium": {"temperature": 0.8}
+            }
+        }));
+        let summary_options = AzureOpenAIResponsesOptions {
+            reasoning_summary: Some("auto".to_owned()),
+            ..AzureOpenAIResponsesOptions::default()
+        };
+        let summary_params = params_for(&summary_model, &ctx, &summary_options);
+        assert_eq!(summary_params["temperature"], json!(0.8));
     }
 
     #[test]
@@ -1326,7 +1363,7 @@ mod tests {
                 None
             )
             .err(),
-            Some("No API key for provider: azure-openai-responses".to_owned())
+            Some("No API key for provider: azure".to_owned())
         );
     }
 }

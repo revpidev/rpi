@@ -3,8 +3,10 @@
 //! Shared `stream_simple` helpers: max-tokens clamping to context, base
 //! option construction, reasoning clamps and thinking budget defaults.
 
+use crate::models::clamp_thinking_level;
 use crate::types::{
-    Model, SimpleStreamOptions, StreamOptions, ThinkingBudgets, ThinkingLevel, TranscriptContext,
+    Model, ModelThinkingLevel, SamplingParams, SimpleStreamOptions, StreamOptions, ThinkingBudgets,
+    ThinkingLevel, TranscriptContext,
 };
 use crate::utils::estimate::estimate_context_tokens;
 
@@ -51,6 +53,39 @@ pub fn build_base_options(
     // request (#9506 `c01f687e5`), so the request's own map passes through
     // unchanged here.
     stream
+}
+
+/// `resolveSamplingParams` (simple-options.ts:26-34 @ abe508e1b, #9776):
+/// merge `Model.samplingParams` → the effective (clamped) thinking level's
+/// `samplingParamsByThinkingLevel` entry → the request's own map, last key
+/// wins. `None` when all three are unset (request body unchanged).
+pub fn resolve_sampling_params(
+    model: &Model,
+    thinking_level: ModelThinkingLevel,
+    request_params: Option<&SamplingParams>,
+) -> Option<SamplingParams> {
+    let effective_thinking_level = clamp_thinking_level(model, thinking_level);
+    let thinking_level_params = model
+        .sampling_params_by_thinking_level
+        .as_ref()
+        .and_then(|by_level| by_level.get(&effective_thinking_level));
+    if model.sampling_params.is_none()
+        && thinking_level_params.is_none()
+        && request_params.is_none()
+    {
+        return None;
+    }
+    let mut merged = SamplingParams::new();
+    if let Some(base) = &model.sampling_params {
+        merged.extend(base.clone());
+    }
+    if let Some(level) = thinking_level_params {
+        merged.extend(level.clone());
+    }
+    if let Some(request) = request_params {
+        merged.extend(request.clone());
+    }
+    Some(merged)
 }
 
 /// `clampReasoning`: xhigh/max map down to high on budget paths.
@@ -293,6 +328,83 @@ mod tests {
                 ("top_k", json!(0)),
                 ("min_p", json!(0))
             ])
+        );
+    }
+
+    // -- samplingParamsByThinkingLevel (v1.0.2 #9776, R2.3.1) -----------------
+
+    fn sampling_model(extra: serde_json::Value) -> Model {
+        let mut value = json!({
+            "id": "m", "name": "m", "api": "openai-completions", "provider": "p",
+            "baseUrl": "https://example.com", "reasoning": true, "input": ["text"],
+            "cost": {"input": 1.0, "output": 1.0, "cacheRead": 0.1, "cacheWrite": 1.0},
+            "contextWindow": 128000, "maxTokens": 8192
+        });
+        value
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        serde_json::from_value(value).expect("model")
+    }
+
+    /// Upstream sampling-options.test.ts: "applies sampling params for the
+    /// effective thinking level over model defaults" — the requested level is
+    /// clamped first (low/medium unsupported → high).
+    #[test]
+    fn test_resolve_sampling_params_effective_thinking_level_over_defaults() {
+        let model = sampling_model(json!({
+            "reasoning": true,
+            "thinkingLevelMap": {"low": null, "medium": null},
+            "samplingParams": {"temperature": 1, "top_p": 0.95},
+            "samplingParamsByThinkingLevel": {"high": {"temperature": 0.8, "top_k": 64}}
+        }));
+        let resolved = resolve_sampling_params(&model, ModelThinkingLevel::Low, None)
+            .expect("thinking-level layer applies");
+        assert_eq!(resolved["temperature"], json!(0.8));
+        assert_eq!(resolved["top_p"], json!(0.95));
+        assert_eq!(resolved["top_k"], json!(64));
+    }
+
+    /// "applies off sampling params when reasoning is disabled".
+    #[test]
+    fn test_resolve_sampling_params_off_level() {
+        let model = sampling_model(json!({
+            "samplingParamsByThinkingLevel": {"off": {"temperature": 0.7}}
+        }));
+        let resolved = resolve_sampling_params(&model, ModelThinkingLevel::Off, None)
+            .expect("off layer applies");
+        assert_eq!(resolved["temperature"], json!(0.7));
+    }
+
+    /// "merges stream-option keys over thinking-level keys".
+    #[test]
+    fn test_resolve_sampling_params_request_over_thinking_level() {
+        let model = sampling_model(json!({
+            "samplingParamsByThinkingLevel": {"low": {"temperature": 0.6, "top_p": 0.95}}
+        }));
+        let request: SamplingParams = [("top_p".to_owned(), json!(0.5))].into_iter().collect();
+        let resolved = resolve_sampling_params(&model, ModelThinkingLevel::Low, Some(&request))
+            .expect("merged");
+        assert_eq!(resolved["temperature"], json!(0.6));
+        assert_eq!(resolved["top_p"], json!(0.5));
+    }
+
+    /// "omits sampling params when neither options nor model set them" — the
+    /// unconfigured request shape must stay byte-identical (缺省零回归).
+    #[test]
+    fn test_resolve_sampling_params_none_when_all_unset() {
+        let model = sampling_model(json!({}));
+        assert_eq!(
+            resolve_sampling_params(&model, ModelThinkingLevel::Low, None),
+            None
+        );
+        // A configured level map does not leak into other levels.
+        let model = sampling_model(json!({
+            "samplingParamsByThinkingLevel": {"high": {"temperature": 0.8}}
+        }));
+        assert_eq!(
+            resolve_sampling_params(&model, ModelThinkingLevel::Medium, None),
+            None
         );
     }
 }

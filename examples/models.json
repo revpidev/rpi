@@ -133,6 +133,15 @@
           "id": "claude-haiku-5-5",
           "name": "Claude Haiku 5.5",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
           "input": [
             "text",
             "image"
@@ -141,11 +150,25 @@
             "input": 0.1,
             "output": 0.5,
             "cacheRead": 0.01,
-            "cacheWrite": 0.125
+            "cacheWrite": 0.125,
+            "tiers": [
+              {
+                "inputTokensAbove": 100000,
+                "input": 0.5,
+                "output": 2.5,
+                "cacheRead": 0.05,
+                "cacheWrite": 0.625
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 128000,
           "compat": {
+            "supportsMidConvoEffort": true,
+            "supportsMidConvoSystemMessages": true,
+            "supportsMidConvoToolChanges": true,
+            "forceAdaptiveThinking": true,
+            "supportsTemperature": false,
             "supportsStrictTools": true
           }
         },
@@ -1560,7 +1583,16 @@
             "input": 4,
             "output": 20,
             "cacheRead": 0.4,
-            "cacheWrite": 5
+            "cacheWrite": 5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 8,
+                "output": 30,
+                "cacheRead": 0.8,
+                "cacheWrite": 10
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -2400,7 +2432,16 @@
             "input": 0.05,
             "output": 0.25,
             "cacheRead": 0.005,
-            "cacheWrite": 0.0625
+            "cacheWrite": 0.0625,
+            "tiers": [
+              {
+                "inputTokensAbove": 100000,
+                "input": 0.25,
+                "output": 1.25,
+                "cacheRead": 0.025,
+                "cacheWrite": 0.3125
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 128000,
@@ -2629,7 +2670,16 @@
             "input": 1.5,
             "output": 7.5,
             "cacheRead": 0.15,
-            "cacheWrite": 1.875
+            "cacheWrite": 1.875,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 3,
+                "output": 11.25,
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 64000,
@@ -2818,7 +2868,16 @@
             "input": 0.25,
             "output": 2,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 128000,
+                "input": 0.5,
+                "output": 4,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 262144,
           "maxTokens": 32768,
@@ -2841,7 +2900,16 @@
             "input": 0.075,
             "output": 0.3,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 128000,
+                "input": 0.1,
+                "output": 0.8,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 262144,
           "maxTokens": 32768,
@@ -2896,7 +2964,16 @@
             "input": 0.5,
             "output": 3,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 128000,
+                "input": 1,
+                "output": 6,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 262144,
           "maxTokens": 131072,
@@ -2928,7 +3005,16 @@
             "input": 0.25,
             "output": 2,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 128000,
+                "input": 0.5,
+                "output": 4,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 262144,
           "maxTokens": 131072,
@@ -2960,7 +3046,16 @@
             "input": 0.1,
             "output": 0.4,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 128000,
+                "input": 0.2,
+                "output": 0.8,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 262144,
           "maxTokens": 131072,
@@ -3068,13 +3163,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.2574,
-            "output": 1.0287,
+            "input": 0.32,
+            "output": 0.89,
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "contextWindow": 128000,
-          "maxTokens": 16000,
+          "contextWindow": 163840,
+          "maxTokens": 16384,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -3207,8 +3302,8 @@
           ],
           "cost": {
             "input": 0.259,
-            "output": 0.42,
-            "cacheRead": 0.135,
+            "output": 0.8,
+            "cacheRead": 0.14,
             "cacheWrite": 0
           },
           "contextWindow": 163840,
@@ -3291,9 +3386,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.018,
-            "output": 1.28,
-            "cacheRead": 0.018,
+            "input": 0.016,
+            "output": 0.64,
+            "cacheRead": 0.016,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -3356,9 +3451,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.2088,
-            "output": 0.4176,
-            "cacheRead": 0.0174,
+            "input": 0.95526,
+            "output": 1.91052,
+            "cacheRead": 0.079605,
             "cacheWrite": 0
           },
           "contextWindow": 1024000,
@@ -3388,9 +3483,9 @@
             "text"
           ],
           "cost": {
-            "input": 1.32,
-            "output": 3.96,
-            "cacheRead": 0.044,
+            "input": 0.66,
+            "output": 1.98,
+            "cacheRead": 0.022,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -3421,13 +3516,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.3,
-            "output": 1.2,
-            "cacheRead": 0.006,
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
-          "maxTokens": 943718,
+          "maxTokens": 393216,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -3631,7 +3726,16 @@
             "input": 1.25,
             "output": 10,
             "cacheRead": 0.125,
-            "cacheWrite": 0.375
+            "cacheWrite": 0.375,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 2.5,
+                "output": 15,
+                "cacheRead": 0.25,
+                "cacheWrite": 0.375
+              }
+            ]
           },
           "contextWindow": 1048576,
           "maxTokens": 65536,
@@ -3657,7 +3761,16 @@
             "input": 1.25,
             "output": 10,
             "cacheRead": 0.125,
-            "cacheWrite": 0.375
+            "cacheWrite": 0.375,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 2.5,
+                "output": 15,
+                "cacheRead": 0.25,
+                "cacheWrite": 0.375
+              }
+            ]
           },
           "contextWindow": 1048576,
           "maxTokens": 65536,
@@ -3683,7 +3796,16 @@
             "input": 0.625,
             "output": 5,
             "cacheRead": 0.125,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 1.25,
+                "output": 7.5,
+                "cacheRead": 0.25,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1048576,
           "maxTokens": 65536,
@@ -3901,7 +4023,16 @@
             "input": 2,
             "output": 12,
             "cacheRead": 0.2,
-            "cacheWrite": 0.375
+            "cacheWrite": 0.375,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 4,
+                "output": 18,
+                "cacheRead": 0.4,
+                "cacheWrite": 0.375
+              }
+            ]
           },
           "contextWindow": 1048576,
           "maxTokens": 65536,
@@ -3933,7 +4064,16 @@
             "input": 2,
             "output": 12,
             "cacheRead": 0.2,
-            "cacheWrite": 0.375
+            "cacheWrite": 0.375,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 4,
+                "output": 18,
+                "cacheRead": 0.4,
+                "cacheWrite": 0.375
+              }
+            ]
           },
           "contextWindow": 1048576,
           "maxTokens": 65536,
@@ -3965,7 +4105,16 @@
             "input": 1,
             "output": 6,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 2,
+                "output": 9,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1048576,
           "maxTokens": 65536,
@@ -4383,9 +4532,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.0765,
-            "output": 0.255,
-            "cacheRead": 0.0425,
+            "input": 0.09,
+            "output": 0.3,
+            "cacheRead": 0.05,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -4604,16 +4753,16 @@
           }
         },
         {
-          "id": "inclusionai/ling-3.0-flash-sante:free",
-          "name": "inclusionAI: Ling 3.0 Flash Sante (free)",
+          "id": "inclusionai/ling-3.0-flash-sante",
+          "name": "inclusionAI: Ling 3.0 Flash Sante",
           "reasoning": true,
           "input": [
             "text"
           ],
           "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
+            "input": 0.042,
+            "output": 0.1232,
+            "cacheRead": 0.0084,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -4662,7 +4811,7 @@
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 32768,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -4769,9 +4918,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.1,
-            "output": 0.32,
-            "cacheRead": 0,
+            "input": 0.22,
+            "output": 0.5,
+            "cacheRead": 0.11,
             "cacheWrite": 0
           },
           "contextWindow": 131072,
@@ -5437,7 +5586,7 @@
             "cacheRead": 0.07,
             "cacheWrite": 0
           },
-          "contextWindow": 524288,
+          "contextWindow": 1048576,
           "maxTokens": 262144,
           "compat": {
             "supportsDeveloperRole": false,
@@ -5587,7 +5736,7 @@
             "text"
           ],
           "cost": {
-            "input": 0.019,
+            "input": 0.029,
             "output": 0.03,
             "cacheRead": 0,
             "cacheWrite": 0
@@ -5834,11 +5983,11 @@
           "cost": {
             "input": 0.6,
             "output": 2.5,
-            "cacheRead": 0,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 235929,
+          "maxTokens": 98304,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -5878,9 +6027,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.465,
-            "output": 2.45,
-            "cacheRead": 0.0975,
+            "input": 0.65,
+            "output": 3.41,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -5937,9 +6086,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.65,
-            "output": 15,
-            "cacheRead": 0.43,
+            "input": 0.73,
+            "output": 10,
+            "cacheRead": 0.55,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -6077,13 +6226,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.085,
-            "output": 0.4,
+            "input": 0.08,
+            "output": 0.45,
             "cacheRead": 0,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 16384,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -6139,13 +6288,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.5,
-            "output": 2.2,
-            "cacheRead": 0.1,
+            "input": 0.6,
+            "output": 2.4,
+            "cacheRead": 0.12,
             "cacheWrite": 0
           },
-          "contextWindow": 262144,
-          "maxTokens": 16384,
+          "contextWindow": 202800,
+          "maxTokens": 182520,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -6192,13 +6341,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.049,
-            "output": 0.14,
-            "cacheRead": 0.0245,
+            "input": 0.07,
+            "output": 0.2,
+            "cacheRead": 0.04,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 131072,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -7289,7 +7438,16 @@
             "input": 2.5,
             "output": 15,
             "cacheRead": 0.25,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 5,
+                "output": 22.5,
+                "cacheRead": 0.5,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7446,7 +7604,16 @@
             "input": 30,
             "output": 180,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 60,
+                "output": 270,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7478,7 +7645,16 @@
             "input": 15,
             "output": 90,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 30,
+                "output": 135,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7509,7 +7685,16 @@
             "input": 1.25,
             "output": 7.5,
             "cacheRead": 0.125,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2.5,
+                "output": 11.25,
+                "cacheRead": 0.25,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7540,7 +7725,16 @@
             "input": 5,
             "output": 30,
             "cacheRead": 0.5,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 10,
+                "output": 45,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7572,7 +7766,16 @@
             "input": 30,
             "output": 180,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 60,
+                "output": 270,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7603,7 +7806,16 @@
             "input": 15,
             "output": 90,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 30,
+                "output": 135,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7634,7 +7846,16 @@
             "input": 2.5,
             "output": 15,
             "cacheRead": 0.25,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 5,
+                "output": 22.5,
+                "cacheRead": 0.5,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7665,7 +7886,16 @@
             "input": 0.2,
             "output": 1.2,
             "cacheRead": 0.02,
-            "cacheWrite": 0.25
+            "cacheWrite": 0.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.4,
+                "output": 1.8,
+                "cacheRead": 0.04,
+                "cacheWrite": 0.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7697,7 +7927,16 @@
             "input": 0.2,
             "output": 1.2,
             "cacheRead": 0.02,
-            "cacheWrite": 0.25
+            "cacheWrite": 0.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.4,
+                "output": 1.8,
+                "cacheRead": 0.04,
+                "cacheWrite": 0.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7728,7 +7967,16 @@
             "input": 0.1,
             "output": 0.6,
             "cacheRead": 0.01,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.2,
+                "output": 0.9,
+                "cacheRead": 0.02,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7759,7 +8007,16 @@
             "input": 0.1,
             "output": 0.6,
             "cacheRead": 0.01,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.2,
+                "output": 0.9,
+                "cacheRead": 0.02,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7790,7 +8047,16 @@
             "input": 2,
             "output": 10,
             "cacheRead": 0.2,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7822,7 +8088,16 @@
             "input": 2,
             "output": 10,
             "cacheRead": 0.2,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7853,7 +8128,16 @@
             "input": 1,
             "output": 5,
             "cacheRead": 0.1,
-            "cacheWrite": 1.25
+            "cacheWrite": 1.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2,
+                "output": 7.5,
+                "cacheRead": 0.2,
+                "cacheWrite": 2.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7884,7 +8168,16 @@
             "input": 1,
             "output": 5,
             "cacheRead": 0.1,
-            "cacheWrite": 1.25
+            "cacheWrite": 1.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2,
+                "output": 7.5,
+                "cacheRead": 0.2,
+                "cacheWrite": 2.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7915,7 +8208,16 @@
             "input": 2,
             "output": 12,
             "cacheRead": 0.2,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 18,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7947,7 +8249,16 @@
             "input": 2,
             "output": 12,
             "cacheRead": 0.2,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 18,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -7978,7 +8289,16 @@
             "input": 1,
             "output": 6,
             "cacheRead": 0.1,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2,
+                "output": 9,
+                "cacheRead": 0.2,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8009,7 +8329,16 @@
             "input": 1,
             "output": 6,
             "cacheRead": 0.1,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2,
+                "output": 9,
+                "cacheRead": 0.2,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8071,7 +8400,16 @@
             "input": 10,
             "output": 50,
             "cacheRead": 1,
-            "cacheWrite": 12.5
+            "cacheWrite": 12.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 20,
+                "output": 75,
+                "cacheRead": 2,
+                "cacheWrite": 25
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8103,7 +8441,16 @@
             "input": 10,
             "output": 50,
             "cacheRead": 1,
-            "cacheWrite": 12.5
+            "cacheWrite": 12.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 20,
+                "output": 75,
+                "cacheRead": 2,
+                "cacheWrite": 25
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8134,7 +8481,16 @@
             "input": 5,
             "output": 25,
             "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "cacheWrite": 6.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 10,
+                "output": 37.5,
+                "cacheRead": 1,
+                "cacheWrite": 12.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8165,7 +8521,16 @@
             "input": 5,
             "output": 25,
             "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "cacheWrite": 6.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 10,
+                "output": 37.5,
+                "cacheRead": 1,
+                "cacheWrite": 12.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8196,7 +8561,16 @@
             "input": 0.1,
             "output": 0.5,
             "cacheRead": 0.01,
-            "cacheWrite": 0.125
+            "cacheWrite": 0.125,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.2,
+                "output": 0.75,
+                "cacheRead": 0.02,
+                "cacheWrite": 0.25
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8228,7 +8602,16 @@
             "input": 0.1,
             "output": 0.5,
             "cacheRead": 0.01,
-            "cacheWrite": 0.125
+            "cacheWrite": 0.125,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.2,
+                "output": 0.75,
+                "cacheRead": 0.02,
+                "cacheWrite": 0.25
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8259,7 +8642,16 @@
             "input": 0.05,
             "output": 0.25,
             "cacheRead": 0.005,
-            "cacheWrite": 0.0625
+            "cacheWrite": 0.0625,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.1,
+                "output": 0.375,
+                "cacheRead": 0.01,
+                "cacheWrite": 0.125
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8290,7 +8682,16 @@
             "input": 0.05,
             "output": 0.25,
             "cacheRead": 0.005,
-            "cacheWrite": 0.0625
+            "cacheWrite": 0.0625,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.1,
+                "output": 0.375,
+                "cacheRead": 0.01,
+                "cacheWrite": 0.125
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8321,7 +8722,16 @@
             "input": 2,
             "output": 10,
             "cacheRead": 0.2,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8353,7 +8763,16 @@
             "input": 2,
             "output": 10,
             "cacheRead": 0.2,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8384,7 +8803,16 @@
             "input": 1,
             "output": 5,
             "cacheRead": 0.1,
-            "cacheWrite": 1.25
+            "cacheWrite": 1.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2,
+                "output": 7.5,
+                "cacheRead": 0.2,
+                "cacheWrite": 2.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8415,7 +8843,16 @@
             "input": 1,
             "output": 5,
             "cacheRead": 0.1,
-            "cacheWrite": 1.25
+            "cacheWrite": 1.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2,
+                "output": 7.5,
+                "cacheRead": 0.2,
+                "cacheWrite": 2.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8446,7 +8883,16 @@
             "input": 2,
             "output": 10,
             "cacheRead": 0.1,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -8478,7 +8924,96 @@
             "input": 2,
             "output": 10,
             "cacheRead": 0.1,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
+              }
+            ]
+          },
+          "contextWindow": 1050000,
+          "maxTokens": 128000,
+          "compat": {
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "openai/gpt-6.1-sol-pro:batch",
+          "name": "OpenAI: GPT-6.1 Sol Pro (batch)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 1,
+            "output": 5,
+            "cacheRead": 0.05,
+            "cacheWrite": 1.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2,
+                "output": 7.5,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5
+              }
+            ]
+          },
+          "contextWindow": 1050000,
+          "maxTokens": 128000,
+          "compat": {
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "openai/gpt-6.1-sol:batch",
+          "name": "OpenAI: GPT-6.1 Sol (batch)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 1,
+            "output": 5,
+            "cacheRead": 0.05,
+            "cacheWrite": 1.25,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 2,
+                "output": 7.5,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -9229,29 +9764,16 @@
             "input": 0.26,
             "output": 0.78,
             "cacheRead": 0.052,
-            "cacheWrite": 0.325
-          },
-          "contextWindow": 1000000,
-          "maxTokens": 32768,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen-plus-2025-07-28",
-          "name": "Qwen: Qwen Plus 0728",
-          "reasoning": false,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.26,
-            "output": 0.78,
-            "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0.325,
+            "tiers": [
+              {
+                "inputTokensAbove": 256000,
+                "input": 0.78,
+                "output": 2.34,
+                "cacheRead": 0.156,
+                "cacheWrite": 0.975
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 32768,
@@ -9277,28 +9799,6 @@
           },
           "contextWindow": 40960,
           "maxTokens": 16384,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3-235b-a22b",
-          "name": "Qwen: Qwen3 235B A22B",
-          "reasoning": true,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.455,
-            "output": 1.82,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "contextWindow": 131072,
-          "maxTokens": 8192,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9339,13 +9839,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.23,
-            "output": 2.3,
+            "input": 0.45,
+            "output": 3.5,
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "contextWindow": 131072,
-          "maxTokens": 117964,
+          "contextWindow": 128000,
+          "maxTokens": 16384,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9383,38 +9883,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.04815,
-            "output": 0.19305,
+            "input": 0.1,
+            "output": 0.3,
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "contextWindow": 128000,
-          "maxTokens": 32000,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3-30b-a3b-thinking-2507",
-          "name": "Qwen: Qwen3 30B A3B Thinking 2507",
-          "reasoning": true,
-          "thinkingLevelMap": {
-            "off": null
-          },
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.2,
-            "output": 2.4,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "contextWindow": 81920,
-          "maxTokens": 32768,
+          "contextWindow": 262144,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9437,28 +9912,6 @@
           },
           "contextWindow": 40960,
           "maxTokens": 16384,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3-8b",
-          "name": "Qwen: Qwen3 8B",
-          "reasoning": true,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.117,
-            "output": 0.455,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "contextWindow": 131072,
-          "maxTokens": 8192,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9521,7 +9974,23 @@
             "input": 0.195,
             "output": 0.975,
             "cacheRead": 0.039,
-            "cacheWrite": 0.24375
+            "cacheWrite": 0.24375,
+            "tiers": [
+              {
+                "inputTokensAbove": 32000,
+                "input": 0.325,
+                "output": 1.625,
+                "cacheRead": 0.065,
+                "cacheWrite": 0.40625
+              },
+              {
+                "inputTokensAbove": 128000,
+                "input": 0.52,
+                "output": 2.6,
+                "cacheRead": 0.104,
+                "cacheWrite": 0.65
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 65536,
@@ -9555,72 +10024,6 @@
           }
         },
         {
-          "id": "qwen/qwen3-coder-plus",
-          "name": "Qwen: Qwen3 Coder Plus",
-          "reasoning": false,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.65,
-            "output": 3.25,
-            "cacheRead": 0.13,
-            "cacheWrite": 0.8125
-          },
-          "contextWindow": 1000000,
-          "maxTokens": 65536,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3-max",
-          "name": "Qwen: Qwen3 Max",
-          "reasoning": false,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.78,
-            "output": 3.9,
-            "cacheRead": 0.156,
-            "cacheWrite": 0.975
-          },
-          "contextWindow": 262144,
-          "maxTokens": 65536,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3-max-thinking",
-          "name": "Qwen: Qwen3 Max Thinking",
-          "reasoning": true,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.78,
-            "output": 3.9,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "contextWindow": 262144,
-          "maxTokens": 65536,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
           "id": "qwen/qwen3-next-80b-a3b-instruct",
           "name": "Qwen: Qwen3 Next 80B A3B Instruct",
           "reasoning": false,
@@ -9628,13 +10031,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.15,
-            "output": 1.5,
-            "cacheRead": 0,
+            "input": 0.1,
+            "output": 1.1,
+            "cacheRead": 0.07,
             "cacheWrite": 0
           },
-          "contextWindow": 131072,
-          "maxTokens": 32768,
+          "contextWindow": 262144,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9658,8 +10061,8 @@
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "contextWindow": 131072,
-          "maxTokens": 32768,
+          "contextWindow": 262144,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9679,32 +10082,6 @@
             "input": 0.21,
             "output": 1.9,
             "cacheRead": 0.1,
-            "cacheWrite": 0
-          },
-          "contextWindow": 131072,
-          "maxTokens": 32768,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3-vl-235b-a22b-thinking",
-          "name": "Qwen: Qwen3 VL 235B A22B Thinking",
-          "reasoning": true,
-          "thinkingLevelMap": {
-            "off": null
-          },
-          "input": [
-            "text",
-            "image"
-          ],
-          "cost": {
-            "input": 0.4,
-            "output": 4,
-            "cacheRead": 0,
             "cacheWrite": 0
           },
           "contextWindow": 131072,
@@ -9751,36 +10128,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.2,
-            "output": 2.4,
+            "input": 0.29,
+            "output": 1,
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "contextWindow": 131072,
-          "maxTokens": 32768,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3-vl-32b-instruct",
-          "name": "Qwen: Qwen3 VL 32B Instruct",
-          "reasoning": false,
-          "input": [
-            "text",
-            "image"
-          ],
-          "cost": {
-            "input": 0.104,
-            "output": 0.416,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "contextWindow": 131072,
-          "maxTokens": 32768,
+          "contextWindow": 262144,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9797,39 +10151,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.117,
-            "output": 0.455,
-            "cacheRead": 0,
+            "input": 0.25,
+            "output": 0.75,
+            "cacheRead": 0.12,
             "cacheWrite": 0
           },
-          "contextWindow": 131072,
-          "maxTokens": 32768,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3-vl-8b-thinking",
-          "name": "Qwen: Qwen3 VL 8B Thinking",
-          "reasoning": true,
-          "thinkingLevelMap": {
-            "off": null
-          },
-          "input": [
-            "text",
-            "image"
-          ],
-          "cost": {
-            "input": 0.18,
-            "output": 2.1,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "contextWindow": 131072,
-          "maxTokens": 32768,
+          "contextWindow": 262144,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9892,13 +10220,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.15,
-            "output": 1,
-            "cacheRead": 0.05,
+            "input": 0.08,
+            "output": 0.75,
+            "cacheRead": 0.04,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 235929,
+          "maxTokens": 32768,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9915,13 +10243,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.45,
-            "output": 3,
-            "cacheRead": 0.22,
+            "input": 0.55,
+            "output": 3.5,
+            "cacheRead": 0.225,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 81920,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9987,7 +10315,16 @@
             "input": 0.26,
             "output": 1.56,
             "cacheRead": 0,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 256000,
+                "input": 0.325,
+                "output": 1.95,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 65536,
@@ -10010,7 +10347,16 @@
             "input": 0.3,
             "output": 1.8,
             "cacheRead": 0,
-            "cacheWrite": 0.375
+            "cacheWrite": 0.375,
+            "tiers": [
+              {
+                "inputTokensAbove": 256000,
+                "input": 0.375,
+                "output": 2.25,
+                "cacheRead": 0,
+                "cacheWrite": 0.46875
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 65536,
@@ -10030,13 +10376,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.3,
-            "output": 2,
-            "cacheRead": 0.03,
+            "input": 0.32,
+            "output": 3.2,
+            "cacheRead": 0,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 65536,
+          "maxTokens": 81920,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10053,13 +10399,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.15,
-            "output": 1,
-            "cacheRead": 0.05,
+            "input": 0.1,
+            "output": 0.95,
+            "cacheRead": 0.1,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 235929,
+          "maxTokens": 65536,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10079,31 +10425,18 @@
             "input": 0.1875,
             "output": 1.125,
             "cacheRead": 0,
-            "cacheWrite": 0.234375
+            "cacheWrite": 0.234375,
+            "tiers": [
+              {
+                "inputTokensAbove": 256000,
+                "input": 0.75,
+                "output": 3,
+                "cacheRead": 0,
+                "cacheWrite": 0.9375
+              }
+            ]
           },
           "contextWindow": 1000000,
-          "maxTokens": 65536,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "qwen/qwen3.6-max-preview",
-          "name": "Qwen: Qwen3.6 Max Preview",
-          "reasoning": true,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 1.027,
-            "output": 6.162,
-            "cacheRead": 0,
-            "cacheWrite": 1.28375
-          },
-          "contextWindow": 262144,
           "maxTokens": 65536,
           "compat": {
             "supportsDeveloperRole": false,
@@ -10124,7 +10457,16 @@
             "input": 0.325,
             "output": 1.95,
             "cacheRead": 0,
-            "cacheWrite": 0.40625
+            "cacheWrite": 0.40625,
+            "tiers": [
+              {
+                "inputTokensAbove": 256000,
+                "input": 1.3,
+                "output": 3.9,
+                "cacheRead": 0,
+                "cacheWrite": 1.625
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 65536,
@@ -10147,7 +10489,23 @@
             "input": 0.03,
             "output": 0.13,
             "cacheRead": 0.006,
-            "cacheWrite": 0.038
+            "cacheWrite": 0.038,
+            "tiers": [
+              {
+                "inputTokensAbove": 32000,
+                "input": 0.1,
+                "output": 0.4,
+                "cacheRead": 0.02,
+                "cacheWrite": 0.125
+              },
+              {
+                "inputTokensAbove": 256000,
+                "input": 0.2,
+                "output": 0.8,
+                "cacheRead": 0.04,
+                "cacheWrite": 0.25
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 65536,
@@ -10192,7 +10550,16 @@
             "input": 0.32,
             "output": 1.28,
             "cacheRead": 0.064,
-            "cacheWrite": 0.4
+            "cacheWrite": 0.4,
+            "tiers": [
+              {
+                "inputTokensAbove": 256000,
+                "input": 0.96,
+                "output": 3.84,
+                "cacheRead": 0.192,
+                "cacheWrite": 1.2
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 131072,
@@ -10252,13 +10619,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.425,
-            "output": 2.55,
-            "cacheRead": 0.085,
-            "cacheWrite": 0.53125
+            "input": 0.04,
+            "output": 2.3,
+            "cacheRead": 0.0198,
+            "cacheWrite": 0
           },
-          "contextWindow": 1000000,
-          "maxTokens": 131072,
+          "contextWindow": 262144,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10278,7 +10645,7 @@
             "input": 0.15,
             "output": 0.47,
             "cacheRead": 0.016,
-            "cacheWrite": 0.2
+            "cacheWrite": 0
           },
           "contextWindow": 1000000,
           "maxTokens": 131072,
@@ -10310,7 +10677,7 @@
             "input": 2,
             "output": 6,
             "cacheRead": 0.25,
-            "cacheWrite": 2.5
+            "cacheWrite": 0
           },
           "contextWindow": 1000000,
           "maxTokens": 131072,
@@ -10474,7 +10841,16 @@
             "input": 5,
             "output": 30,
             "cacheRead": 0.5,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 10,
+                "output": 45,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 128000,
@@ -10506,7 +10882,16 @@
             "input": 5,
             "output": 30,
             "cacheRead": 0.5,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 10,
+                "output": 45,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 128000,
@@ -10542,28 +10927,6 @@
           },
           "contextWindow": 262144,
           "maxTokens": 65536,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "sao10k/l3.1-euryale-70b",
-          "name": "Sao10K: Llama 3.1 Euryale 70B v2.2",
-          "reasoning": false,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.85,
-            "output": 0.85,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "contextWindow": 131072,
-          "maxTokens": 16384,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10621,6 +10984,38 @@
           },
           "contextWindow": 256000,
           "maxTokens": 230400,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "stepfun/step-5-preview",
+          "name": "StepFun: Step 5 Preview",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 1,
+            "output": 2.7,
+            "cacheRead": 0.05,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 64000,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -11023,7 +11418,16 @@
             "input": 1.25,
             "output": 2.5,
             "cacheRead": 0.2,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 2.5,
+                "output": 5,
+                "cacheRead": 0.4,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 2000000,
           "maxTokens": 1800000,
@@ -11055,7 +11459,16 @@
             "input": 1.25,
             "output": 2.5,
             "cacheRead": 0.2,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 2.5,
+                "output": 5,
+                "cacheRead": 0.4,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 900000,
@@ -11087,7 +11500,16 @@
             "input": 1,
             "output": 2,
             "cacheRead": 0.16,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 2,
+                "output": 4,
+                "cacheRead": 0.32,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 900000,
@@ -11119,7 +11541,16 @@
             "input": 2,
             "output": 6,
             "cacheRead": 0.3,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 4,
+                "output": 12,
+                "cacheRead": 0.6,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 500000,
           "maxTokens": 450000,
@@ -11151,7 +11582,16 @@
             "input": 2,
             "output": 6,
             "cacheRead": 0.5,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 4,
+                "output": 12,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 500000,
           "maxTokens": 450000,
@@ -11183,7 +11623,16 @@
             "input": 2,
             "output": 6,
             "cacheRead": 0.5,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 4,
+                "output": 12,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 500000,
           "maxTokens": 450000,
@@ -11209,7 +11658,16 @@
             "input": 1,
             "output": 2,
             "cacheRead": 0.2,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 2,
+                "output": 4,
+                "cacheRead": 0.4,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 256000,
           "maxTokens": 230400,
@@ -11409,13 +11867,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.43,
-            "output": 1.75,
-            "cacheRead": 0.08,
+            "input": 0.5,
+            "output": 2,
+            "cacheRead": 0.1,
             "cacheWrite": 0
           },
-          "contextWindow": 198000,
-          "maxTokens": 16384,
+          "contextWindow": 202752,
+          "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -11434,7 +11892,7 @@
           "cost": {
             "input": 0.3,
             "output": 0.9,
-            "cacheRead": 0.055,
+            "cacheRead": 0.05,
             "cacheWrite": 0
           },
           "contextWindow": 131072,
@@ -11573,13 +12031,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.171,
-            "output": 12,
-            "cacheRead": 0.15,
+            "input": 0.06,
+            "output": 7,
+            "cacheRead": 0.059,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
-          "maxTokens": 131072,
+          "maxTokens": 943718,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -11604,9 +12062,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.049,
-            "output": 3.39,
-            "cacheRead": 0.048,
+            "input": 0.079,
+            "output": 4.8,
+            "cacheRead": 0.059,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -11636,13 +12094,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.15,
-            "output": 0.5,
-            "cacheRead": 0.03,
+            "input": 0.0232,
+            "output": 1.2,
+            "cacheRead": 0.0232,
             "cacheWrite": 0
           },
-          "contextWindow": 1048575,
-          "maxTokens": 943717,
+          "contextWindow": 1048576,
+          "maxTokens": 943718,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -11853,7 +12311,16 @@
             "input": 0.1,
             "output": 0.5,
             "cacheRead": 0.01,
-            "cacheWrite": 0.125
+            "cacheWrite": 0.125,
+            "tiers": [
+              {
+                "inputTokensAbove": 100000,
+                "input": 0.5,
+                "output": 2.5,
+                "cacheRead": 0.05,
+                "cacheWrite": 0.625
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 128000,
@@ -11949,9 +12416,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.0116,
-            "output": 1.2,
-            "cacheRead": 0.01,
+            "input": 0.0336,
+            "output": 1.188,
+            "cacheRead": 0.0336,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -11981,7 +12448,7 @@
           ],
           "cost": {
             "input": 0.25,
-            "output": 3.4,
+            "output": 5,
             "cacheRead": 0.2,
             "cacheWrite": 0
           },
@@ -12011,9 +12478,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.018,
-            "output": 1.28,
-            "cacheRead": 0.018,
+            "input": 0.0128,
+            "output": 0.768,
+            "cacheRead": 0.0128,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12079,7 +12546,16 @@
             "input": 2,
             "output": 12,
             "cacheRead": 0.2,
-            "cacheWrite": 0.375
+            "cacheWrite": 0.375,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 4,
+                "output": 18,
+                "cacheRead": 0.4,
+                "cacheWrite": 0.375
+              }
+            ]
           },
           "contextWindow": 1048576,
           "maxTokens": 65536,
@@ -12108,9 +12584,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.64,
-            "output": 13,
-            "cacheRead": 0.45,
+            "input": 0.72,
+            "output": 24,
+            "cacheRead": 0.3,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12143,7 +12619,16 @@
             "input": 10,
             "output": 50,
             "cacheRead": 1,
-            "cacheWrite": 12.5
+            "cacheWrite": 12.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 20,
+                "output": 75,
+                "cacheRead": 2,
+                "cacheWrite": 25
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -12175,7 +12660,16 @@
             "input": 0.1,
             "output": 0.5,
             "cacheRead": 0.01,
-            "cacheWrite": 0.125
+            "cacheWrite": 0.125,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 0.2,
+                "output": 0.75,
+                "cacheRead": 0.02,
+                "cacheWrite": 0.25
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -12239,7 +12733,16 @@
             "input": 2,
             "output": 10,
             "cacheRead": 0.1,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -12271,7 +12774,16 @@
             "input": 2,
             "output": 12,
             "cacheRead": 0.2,
-            "cacheWrite": 2.5
+            "cacheWrite": 2.5,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 4,
+                "output": 18,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
+              }
+            ]
           },
           "contextWindow": 1050000,
           "maxTokens": 128000,
@@ -12303,7 +12815,16 @@
             "input": 2,
             "output": 6,
             "cacheRead": 0.5,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 200000,
+                "input": 4,
+                "output": 12,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 500000,
           "maxTokens": 450000,
@@ -12332,13 +12853,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.04,
-            "output": 0.5,
-            "cacheRead": 0.025,
+            "input": 0.0232,
+            "output": 1.2,
+            "cacheRead": 0.0232,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
-          "maxTokens": 131072,
+          "maxTokens": 943718,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -12363,13 +12884,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.0392,
-            "output": 12,
-            "cacheRead": 0.0365,
+            "input": 0.055,
+            "output": 5,
+            "cacheRead": 0.06,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
-          "maxTokens": 131072,
+          "maxTokens": 943718,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -12745,7 +13266,7 @@
             "input": 3,
             "output": 15,
             "cacheRead": 0.3,
-            "cacheWrite": 3
+            "cacheWrite": 0
           },
           "contextWindow": 1048576,
           "maxTokens": 1048576,
@@ -12874,7 +13395,7 @@
             "input": 3,
             "output": 15,
             "cacheRead": 0.3,
-            "cacheWrite": 3
+            "cacheWrite": 0
           },
           "contextWindow": 1048576,
           "maxTokens": 1048576,
@@ -12942,7 +13463,16 @@
             "input": 0.3,
             "output": 1.2,
             "cacheRead": 0.06,
-            "cacheWrite": 0
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 512000,
+                "input": 0.6,
+                "output": 2.4,
+                "cacheRead": 0.12,
+                "cacheWrite": 0
+              }
+            ]
           },
           "contextWindow": 1000000,
           "maxTokens": 512000

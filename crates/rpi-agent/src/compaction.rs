@@ -679,6 +679,7 @@ async fn stream_final_message(
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -707,6 +708,7 @@ fn aborted_summary_message(model: &Model) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 

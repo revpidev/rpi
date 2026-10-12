@@ -282,6 +282,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         })
     }
 
@@ -299,6 +300,7 @@ mod tests {
             nested_calls: None,
             is_error: false,
             timestamp: 3,
+            duration_ms: None,
         }
     }
 

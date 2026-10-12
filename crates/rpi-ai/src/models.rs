@@ -2317,6 +2317,7 @@ mod tests {
                 deferred: None,
                 end_turn: None,
                 raw_stop_reason: None,
+                duration_ms: None,
             };
             stream.push(StreamEvent::Start {
                 partial: Arc::new(partial.clone()),
@@ -3588,6 +3589,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         };
         stream.push(StreamEvent::Start {
             partial: Arc::new(partial.clone()),
@@ -5592,6 +5594,7 @@ mod tests {
                 deferred: None,
                 end_turn: None,
                 raw_stop_reason: None,
+                duration_ms: None,
             };
             partial.stop_reason = StopReason::Stop;
             stream.push(StreamEvent::Done {

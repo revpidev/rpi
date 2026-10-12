@@ -270,6 +270,7 @@ pub fn transform_messages(
                             nested_calls: None,
                             is_error: true,
                             timestamp: now_ms(),
+                            duration_ms: None,
                         }));
                     }
                 }
@@ -386,6 +387,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         })
     }
 
@@ -413,6 +415,7 @@ mod tests {
             nested_calls: None,
             is_error: false,
             timestamp: 2,
+            duration_ms: None,
         })
     }
 

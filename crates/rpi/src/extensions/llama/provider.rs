@@ -133,6 +133,32 @@ pub(crate) async fn router_autoload_enabled(
     }
 }
 
+/// Whether llama.cpp reports a native decision model. Since llama.cpp 0.6.0,
+/// `GET /models` lists `decisions` in `architecture.output_modalities` for
+/// these models, including unloaded and sleeping ones. Older servers report
+/// `["text"]` or omit `architecture`, so their models are treated as chat
+/// models (R2.4.3 ①, provider.ts:78-88 @ f6127a1bf).
+fn is_decision_model(model: &LlamaModelInfo) -> bool {
+    model.architecture.as_ref().is_some_and(|architecture| {
+        architecture
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "decisions")
+    })
+}
+
+/// Decision-only models cannot generate text and are not listed for chat
+/// (provider.ts:91-94).
+fn is_chat_model(model: &LlamaModelInfo) -> bool {
+    !is_decision_model(model)
+        || model.architecture.as_ref().is_some_and(|architecture| {
+            architecture
+                .output_modalities
+                .iter()
+                .any(|modality| modality == "text")
+        })
+}
+
 fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaError> {
     let reported_context_window = model
         .meta
@@ -180,6 +206,7 @@ fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaE
             ..Default::default()
         }),
         sampling_params: None,
+        sampling_params_by_thinking_level: None,
     })
 }
 
@@ -220,7 +247,9 @@ impl LlamaProvider {
 
     /// `setCatalog` (provider.ts:61-63 @ dcd461925): entries selectable via
     /// [`model_is_selectable`] are published as pi models — loaded and
-    /// sleeping always; unloaded presets when the router autoloads.
+    /// sleeping always; unloaded presets when the router autoloads. Decision
+    /// models are not listed for chat (provider.ts:176-178 @ f6127a1bf);
+    /// their classifier registration is the R2.4.3 ②③ evaluation (V17-06).
     pub fn set_catalog(
         &self,
         catalog: &[LlamaModelInfo],
@@ -229,7 +258,7 @@ impl LlamaProvider {
     ) -> Result<(), LlamaError> {
         let mut models = Vec::new();
         for model in catalog {
-            if model_is_selectable(model, options.router_autoload) {
+            if model_is_selectable(model, options.router_autoload) && is_chat_model(model) {
                 models.push(to_pi_model(model, server_url)?);
             }
         }
@@ -631,6 +660,47 @@ mod tests {
         let models = controller.provider().get_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
         assert_eq!(ids, vec!["sleeping", "preset-a"]);
+    }
+
+    /// R2.4.3 ① (f6127a1bf #10382): llama.cpp reports native decision models
+    /// via `architecture.output_modalities` containing `decisions`; they
+    /// cannot generate text and are not listed for chat. A decision model
+    /// that also outputs text stays chat; servers without the metadata keep
+    /// every model listed as chat.
+    #[test]
+    fn decision_models_are_not_listed_for_chat() {
+        let controller = create_llama_provider();
+        let mut decision_only = model_info("lev", LlamaModelStatusValue::LOADED);
+        decision_only.architecture = Some(LlamaArchitecture {
+            input_modalities: vec!["text".to_owned()],
+            output_modalities: vec!["decisions".to_owned()],
+        });
+        let mut decision_text = model_info("kev", LlamaModelStatusValue::LOADED);
+        decision_text.architecture = Some(LlamaArchitecture {
+            input_modalities: vec!["text".to_owned()],
+            output_modalities: vec!["decisions".to_owned(), "text".to_owned()],
+        });
+        let mut legacy = model_info("legacy", LlamaModelStatusValue::LOADED);
+        legacy.architecture = Some(LlamaArchitecture {
+            input_modalities: vec!["text".to_owned()],
+            output_modalities: vec!["text".to_owned()],
+        });
+        let no_architecture = model_info("bare", LlamaModelStatusValue::LOADED);
+
+        controller
+            .set_catalog(
+                &[decision_only, decision_text, legacy, no_architecture],
+                "http://localhost:8080",
+                LlamaSetCatalogOptions::default(),
+            )
+            .expect("set catalog");
+        let models = controller.provider().get_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["kev", "legacy", "bare"],
+            "decision-only models must not be listed for chat"
+        );
     }
 
     /// `toPiModel` context fallback (provider.ts:29-30): missing/zero

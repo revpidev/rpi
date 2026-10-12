@@ -1801,7 +1801,7 @@ mod tests {
     fn test_convert_tool_call_id_sanitize_for_disallowed_provider() {
         // Target provider outside OPENAI_TOOL_CALL_PROVIDERS: the whole id is
         // sanitized to safe chars, capped at 64, trailing underscores trimmed.
-        let m = model(json!({"provider": "azure-openai-responses"}));
+        let m = model(json!({"provider": "mistral"}));
         let long = format!("{}!!!___", "a".repeat(70));
         let ctx = common::context(
             vec![
@@ -2160,7 +2160,7 @@ mod tests {
             // Same provider/api, different model id.
             model(json!({"id": "gpt-5.2"})),
             // Different provider.
-            model(json!({"provider": "azure-openai-responses"})),
+            model(json!({"provider": "azure"})),
             // Codex target.
             model(json!({
                 "api": "openai-codex-responses", "provider": "openai-codex",
@@ -2281,6 +2281,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         }
     }
 

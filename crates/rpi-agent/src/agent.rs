@@ -144,6 +144,7 @@ fn default_model() -> Model {
         headers: None,
         compat: None,
         sampling_params: None,
+        sampling_params_by_thinking_level: None,
     }
 }
 
@@ -1134,6 +1135,7 @@ impl Agent {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         };
         let message = AgentMessage::Assistant(failure_message);
         let state = self.state.clone();

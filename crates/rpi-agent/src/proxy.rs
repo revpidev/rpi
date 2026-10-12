@@ -859,6 +859,7 @@ fn initial_partial(model: &Model) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -1118,6 +1119,7 @@ mod tests {
             headers: None,
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         }
     }
 }

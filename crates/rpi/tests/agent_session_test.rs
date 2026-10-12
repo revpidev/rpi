@@ -2440,6 +2440,7 @@ async fn prepare_request_projection_overrides_direct_state_messages() {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         },
     )]);
 

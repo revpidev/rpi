@@ -47,6 +47,7 @@ fn assistant_message(text: &str) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 

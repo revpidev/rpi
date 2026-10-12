@@ -320,6 +320,7 @@ mod tests {
             sampling_params: None,
             headers: None,
             compat: None,
+            sampling_params_by_thinking_level: None,
         }
     }
 

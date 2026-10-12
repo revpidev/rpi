@@ -1210,6 +1210,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -1651,6 +1652,7 @@ mod tests {
             nested_calls: None,
             is_error,
             timestamp: 0,
+            duration_ms: None,
         })
     }
 
@@ -2258,6 +2260,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         });
         let converted = to_chat_messages(&[assistant], false);
         assert_eq!(converted.len(), 1);
@@ -2299,6 +2302,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         });
         assert!(to_chat_messages(&[empty], false).is_empty());
     }

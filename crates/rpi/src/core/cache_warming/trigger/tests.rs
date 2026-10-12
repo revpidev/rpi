@@ -57,6 +57,7 @@ fn test_model(id: &str) -> Model {
         sampling_params: None,
         headers: None,
         compat: None,
+        sampling_params_by_thinking_level: None,
     }
 }
 
@@ -127,6 +128,7 @@ fn assistant_response(model: &Model, stop_reason: StopReason) -> AssistantMessag
         error_message: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 

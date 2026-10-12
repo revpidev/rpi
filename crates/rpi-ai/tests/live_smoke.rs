@@ -116,11 +116,7 @@ fn gate_azure() -> Option<(Model, StreamOptions)> {
     let model_id =
         std::env::var("RPI_LIVE_AZURE_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_owned());
     Some(model_and_options(
-        &model_id,
-        &base_url,
-        "azure-openai-responses",
-        "azure-openai-responses",
-        api_key,
+        &model_id, &base_url, "azure", "azure", api_key,
     ))
 }
 
@@ -309,7 +305,7 @@ async fn test_live_azure_openai_responses() {
         .stream(&model, &context(), Some(options))
         .collect()
         .await;
-    smoke(events, "azure-openai-responses").await;
+    smoke(events, "azure").await;
 }
 
 #[tokio::test]

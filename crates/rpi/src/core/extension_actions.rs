@@ -107,6 +107,7 @@ fn setup_error_stream(message: &str) -> rpi_ai::utils::event_stream::AssistantMe
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         },
     });
     stream.end(None);

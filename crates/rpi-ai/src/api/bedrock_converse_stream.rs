@@ -398,6 +398,7 @@ pub fn supports_adaptive_thinking(model_id: &str, model_name: &str) -> bool {
                 || s.contains("opus-5")
                 || s.contains("sonnet-4-6")
                 || s.contains("sonnet-5")
+                || s.contains("haiku-5")
                 || s.contains("fable-5")
         })
 }
@@ -412,6 +413,7 @@ pub fn supports_native_xhigh_effort(model: &Model) -> bool {
                 || s.contains("opus-4-8")
                 || s.contains("opus-5")
                 || s.contains("sonnet-5")
+                || s.contains("haiku-5")
                 || s.contains("fable-5")
         })
 }
@@ -436,11 +438,13 @@ pub fn supports_prompt_caching(model: &Model, env: Option<&ProviderEnv>) -> bool
     if !candidates.iter().any(|s| s.contains("claude")) {
         return get_provider_env_value("AWS_BEDROCK_FORCE_CACHE", env).as_deref() == Some("1");
     }
-    // Claude 5 (fable-5, opus-5, sonnet-5).
-    if candidates
-        .iter()
-        .any(|s| s.contains("fable-5") || s.contains("opus-5") || s.contains("sonnet-5"))
-    {
+    // Claude 5 (fable-5, opus-5, sonnet-5, haiku-5).
+    if candidates.iter().any(|s| {
+        s.contains("fable-5")
+            || s.contains("opus-5")
+            || s.contains("sonnet-5")
+            || s.contains("haiku-5")
+    }) {
         return true;
     }
     // Claude 4.x (opus-4, sonnet-4, haiku-4).
@@ -1690,6 +1694,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 

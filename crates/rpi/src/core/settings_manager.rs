@@ -1121,6 +1121,26 @@ impl SettingsManager {
                 settings_paths.get(&SettingsScope::Project).cloned(),
             ));
         }
+        // R2.2.2 (V17-01, rpi-own [VARIANT]): legacy Azure provider keys are
+        // reported per scope with file and key position; the settings still
+        // load (no rewrite, no alias) and the diagnostic rides the existing
+        // startup diagnostics channel.
+        for (scope, settings) in [
+            (SettingsScope::Global, &global_settings),
+            (SettingsScope::Project, &project_settings),
+        ] {
+            let path = settings_paths.get(&scope).cloned();
+            let file = path.clone().unwrap_or_else(|| scope.as_str().to_owned());
+            for diagnostic in
+                rpi_ai::azure_provider_rename::settings_json_diagnostics(&file, settings.as_map())
+            {
+                initial_errors.push(to_settings_error(
+                    scope,
+                    RpiError::Settings(diagnostic),
+                    path.clone(),
+                ));
+            }
+        }
         SettingsManager::new(
             Box::new(storage),
             global_settings,
@@ -3593,6 +3613,50 @@ mod tests {
         scopes.sort();
         assert_eq!(scopes, vec!["global", "project"]);
         assert!(manager.drain_errors().is_empty());
+    }
+
+    /// V17-01 R2.2.2 (rpi-own [VARIANT]): legacy Azure provider keys in
+    /// settings.json are diagnosed per scope with file + key position; the
+    /// settings still load and are never rewritten.
+    #[test]
+    fn legacy_azure_provider_keys_are_diagnosed_without_rewriting() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({
+                "defaultProvider": "azure-openai-responses",
+                "enabledModels": ["azure-openai-responses/gpt-5.4", "azure/*"],
+                "modelThinkingLevels": {"azure-openai-responses/gpt-5.4": "high"}
+            }),
+        );
+        let mut manager = create(&dirs);
+        let errors = manager.drain_errors();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        let messages: Vec<String> = errors
+            .iter()
+            .map(|error| error.error.raw_message())
+            .collect();
+        assert!(messages.iter().any(|m| m.contains("defaultProvider")));
+        assert!(messages.iter().any(|m| m.contains("enabledModels[0]")));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("modelThinkingLevels.azure-openai-responses/gpt-5.4"))
+        );
+        for message in &messages {
+            assert!(message.contains(&global_path(&dirs).display().to_string()));
+            assert!(message.contains("renamed"));
+        }
+        // The settings still load (no rewrite, no alias): the old value
+        // remains visible so the user can see exactly what must change.
+        assert_eq!(
+            manager.get_default_provider().as_deref(),
+            Some("azure-openai-responses")
+        );
+        let stored = read_json(&global_path(&dirs));
+        assert_eq!(stored["defaultProvider"], "azure-openai-responses");
+        // The `azure/*` entry is legitimate and never triggers.
+        assert_eq!(manager.get_enabled_models().unwrap().len(), 2);
     }
 
     // =======================================================================

@@ -75,8 +75,16 @@ def main() -> None:
         if chosen_api is not None:
             groups = {k: v for k, v in raw.items() if k == chosen_api}
         else:
-            groups = raw
-        assert len(groups) == 1, f"{data_file}: expected one api group, got {list(groups)}"
+            # Schema v6 files may carry classifier/image groups alongside the
+            # chat group (e.g. openai.json gained `openai-decisions` with
+            # #9776's GPT-6 Luna classifier); the template is chat-only, so
+            # keep the groups that carry at least one chat entry.
+            groups = {
+                k: v
+                for k, v in raw.items()
+                if any(m.get("type", "chat") == "chat" for m in v.values())
+            }
+        assert len(groups) == 1, f"{data_file}: expected one chat api group, got {list(groups)}"
         api, models = next(iter(groups.items()))
         providers[provider_id] = {
             "name": name,

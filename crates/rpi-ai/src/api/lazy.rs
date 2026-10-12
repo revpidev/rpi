@@ -14,12 +14,26 @@ use crate::types::{
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 
-/// `createSetupErrorMessage` (lazy.ts): zero-usage error assistant message.
+/// `createSetupErrorMessage` (lazy.ts): zero-usage error assistant message
+/// stamped at the current wall clock.
 pub fn create_setup_error_message(
     api: &ApiKind,
     provider: &str,
     model: &str,
     error_message: &str,
+) -> AssistantMessage {
+    create_setup_error_message_at(api, provider, model, error_message, now_ms())
+}
+
+/// `createSetupErrorMessage` with the caller's captured stream start
+/// (`lazy.ts:39`: the error message carries the `startedAt` of the outer
+/// stream, so it stays timed).
+pub fn create_setup_error_message_at(
+    api: &ApiKind,
+    provider: &str,
+    model: &str,
+    error_message: &str,
+    timestamp: i64,
 ) -> AssistantMessage {
     AssistantMessage {
         role: AssistantRole::Assistant,
@@ -35,10 +49,11 @@ pub fn create_setup_error_message(
         usage: Usage::default(),
         stop_reason: StopReason::Error,
         error_message: Some(error_message.to_owned()),
-        timestamp: now_ms(),
+        timestamp,
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -75,6 +90,7 @@ pub fn lazy_stream<F>(model: &crate::types::Model, setup: F) -> AssistantMessage
 where
     F: Future<Output = Result<AssistantMessageEventStream, ModelsError>> + Send + 'static,
 {
+    let started_at = now_ms();
     let outer = AssistantMessageEventStream::new();
     let task_outer = outer.clone();
     let err_model = model.clone();
@@ -83,7 +99,13 @@ where
         match setup.await {
             Ok(inner) => forward_stream(&task_outer, inner).await,
             Err(error) => {
-                let message = create_setup_error_message_for_model(&err_model, &error.message);
+                let message = create_setup_error_message_at(
+                    &err_model.api,
+                    &err_model.provider,
+                    &err_model.id,
+                    &error.message,
+                    started_at,
+                );
                 task_outer.push(StreamEvent::Error {
                     reason: ErrorReason::Error,
                     error: message.clone(),

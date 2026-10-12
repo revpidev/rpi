@@ -132,6 +132,7 @@ pub fn get_radius_models_from_config(
             headers: None,
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         })
         .collect()
 }

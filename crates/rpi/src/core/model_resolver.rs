@@ -23,13 +23,13 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("ant-ling", "Ring-2.6-1T"),
     ("anthropic", "claude-opus-4-8"),
     ("openai", "gpt-5.5"),
-    ("azure-openai-responses", "gpt-5.4"),
+    ("azure", "gpt-5.4"),
     ("openai-codex", "gpt-6.1-sol"),
     // `balanced` since 9767ba275 (select Radius models after catalog
     // discovery); post-login selection falls back to catalog order when the
     // account catalog lacks it (complete_provider_authentication).
     ("radius", "balanced"),
-    ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
+    ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
     ("deepseek", "deepseek-v4-pro"),
     ("google", "gemini-3.1-pro-preview"),
     ("google-vertex", "gemini-3.1-pro-preview"),
@@ -1037,6 +1037,7 @@ mod tests {
             headers: None,
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         }
     }
 
@@ -1713,6 +1714,27 @@ mod tests {
                 "Could not restore model test-provider/gone (model no longer exists). Using test-provider/alpha-1."
             )
         );
+    }
+
+    /// V17-01 R2.2.3 (upstream #9714): a session saved under the renamed
+    /// provider id (`azure-openai-responses`) restores by fallback instead of
+    /// hard-failing — the old id no longer has a catalog entry, so the model
+    /// is reported as gone and another available model is used.
+    #[tokio::test]
+    async fn test_restore_falls_back_for_the_renamed_azure_provider() {
+        let runtime = runtime_with_models(vec![test_model("alpha-1")]).await;
+        let result =
+            restore_model_from_session("azure-openai-responses", "gpt-5.4", None, &runtime).await;
+        let model = result.model.expect("fallback model");
+        assert_eq!(model.provider, "test-provider");
+        assert_eq!(model.id, "alpha-1");
+        let message = result.fallback_message.expect("fallback message");
+        assert!(
+            message.contains("azure-openai-responses/gpt-5.4")
+                && message.contains("model no longer exists"),
+            "{message}"
+        );
+        assert!(result.restored_notice.is_none());
     }
 
     // ------------------------------------------------------------------

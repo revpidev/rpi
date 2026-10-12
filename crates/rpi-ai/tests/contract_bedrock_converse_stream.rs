@@ -24,7 +24,7 @@ use rpi_ai::api::bedrock_converse_stream::{
     BedrockOptions, BedrockToolChoice, EMPTY_TEXT_PLACEHOLDER, filtered_custom_headers,
     format_bedrock_error, get_standard_bedrock_endpoint_region, is_reserved_header,
     map_thinking_level_to_effort, resolve_bedrock_config, stream, supports_adaptive_thinking,
-    supports_native_xhigh_effort,
+    supports_native_xhigh_effort, supports_prompt_caching,
 };
 use rpi_ai::types::{
     ApiKind, AssistantMessage, AssistantMessageDiagnostic, Context, DoneReason, Message, Model,
@@ -1436,6 +1436,7 @@ async fn test_convert_messages_empty_text_placeholder() {
         nested_calls: None,
         is_error: false,
         timestamp: 0,
+        duration_ms: None,
     });
     let assistant = Message::Assistant(AssistantMessage {
         role: rpi_ai::types::AssistantRole::Assistant,
@@ -1463,6 +1464,7 @@ async fn test_convert_messages_empty_text_placeholder() {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     });
     let (payload, _) = capture_payload(
         &model,
@@ -1514,6 +1516,7 @@ async fn test_convert_messages_assistant_blank_and_thinking() {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     });
     let (payload, _) =
         capture_payload(&model, &context(vec![assistant]), sigv4_options(test_env())).await;
@@ -1654,6 +1657,7 @@ async fn test_convert_messages_replays_redacted_reasoning_as_redacted_content() 
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     });
     let (payload, _) =
         capture_payload(&model, &context(vec![assistant]), sigv4_options(test_env())).await;
@@ -1697,6 +1701,7 @@ async fn test_convert_messages_sanitizes_empty_tool_argument_keys() {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     });
     let (payload, _) =
         capture_payload(&model, &context(vec![assistant]), sigv4_options(test_env())).await;
@@ -1885,6 +1890,7 @@ fn test_supports_adaptive_thinking_family_matrix() {
         ("global.anthropic.claude-opus-5", "Claude Opus 5"),
         ("global.anthropic.claude-sonnet-4-6", "Claude Sonnet 4.6"),
         ("global.anthropic.claude-sonnet-5", "Claude Sonnet 5"),
+        ("global.anthropic.claude-haiku-5-5", "Claude Haiku 5.5"),
         ("global.anthropic.claude-fable-5", "Claude Fable 5"),
     ] {
         assert!(supports_adaptive_thinking(id, name), "{id}");
@@ -1924,9 +1930,39 @@ fn test_supports_native_xhigh_effort_subset() {
     assert!(xhigh("global.anthropic.claude-opus-4-8-v1", "Opus 4.8"));
     assert!(xhigh("global.anthropic.claude-opus-5", "Opus 5"));
     assert!(xhigh("global.anthropic.claude-sonnet-5", "Sonnet 5"));
+    assert!(xhigh("global.anthropic.claude-haiku-5-5", "Haiku 5.5"));
     assert!(xhigh("global.anthropic.claude-fable-5", "Fable 5"));
     assert!(!xhigh("global.anthropic.claude-opus-4-6-v1", "Opus 4.6"));
     assert!(!xhigh("global.anthropic.claude-sonnet-4-6", "Sonnet 4.6"));
+}
+
+/// f76c1db66 (#10549 family, v1.1.0): Bedrock requests for Haiku 5.5 use
+/// prompt caching alongside adaptive thinking and native xhigh.
+#[test]
+fn test_supports_prompt_caching_haiku_55() {
+    let haiku = make_model(
+        "global.anthropic.claude-haiku-5-5",
+        "Claude Haiku 5.5",
+        "http://unused",
+        json!({}),
+    );
+    assert!(supports_prompt_caching(&haiku, None));
+    // The Claude 4.x path is unchanged.
+    let haiku_45 = make_model(
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "Claude Haiku 4.5",
+        "http://unused",
+        json!({}),
+    );
+    assert!(supports_prompt_caching(&haiku_45, None));
+    // Non-Claude targets stay off without AWS_BEDROCK_FORCE_CACHE.
+    let nova = make_model(
+        "amazon.nova-lite-v1:0",
+        "Nova Lite",
+        "http://unused",
+        json!({}),
+    );
+    assert!(!supports_prompt_caching(&nova, None));
 }
 
 #[test]

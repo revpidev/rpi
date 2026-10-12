@@ -188,6 +188,7 @@ fn append_tool_result(
             nested_calls: None,
             is_error,
             timestamp: 0,
+            duration_ms: None,
         }))
         .expect("append toolResult message")
 }

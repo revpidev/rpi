@@ -305,9 +305,13 @@ pub fn get_declared_tools(messages: &[Message]) -> Vec<Tool> {
 }
 
 /// `hasToolRedefinitions` (transcript.ts:173-188): whether a tool name was
-/// declared twice with different definitions. Transports that reference
-/// tools by name (Anthropic `tool_addition`/`tool_removal`) cannot express
-/// that.
+/// declared twice with different definitions. A transport that can only
+/// reference previously declared tools by name cannot replay such a history.
+///
+/// Deprecated (b271b0a52): no built-in transport needs this anymore —
+/// Anthropic expresses redefinitions with inline `tool_definition` blocks.
+/// Kept for API compatibility; will be removed in a future release.
+#[deprecated(note = "no built-in transport needs this anymore (b271b0a52)")]
 pub fn has_tool_redefinitions(messages: &[Message]) -> bool {
     let mut declared: std::collections::HashMap<String, Tool> = std::collections::HashMap::new();
     for message in messages {
@@ -541,6 +545,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // `has_tool_redefinitions` kept for API compatibility (b271b0a52)
     fn non_additive_detection() {
         let with_removed = vec![Message::System(SystemMessage {
             role: Default::default(),

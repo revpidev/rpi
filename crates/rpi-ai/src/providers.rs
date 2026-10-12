@@ -19,7 +19,7 @@ use crate::models::{CreateModelsOptions, Models, Provider, create_models};
 pub mod amazon_bedrock;
 pub mod ant_ling;
 pub mod anthropic;
-pub mod azure_openai_responses;
+pub mod azure;
 pub mod baseten;
 pub mod cerebras;
 pub mod cloudflare_ai_gateway;
@@ -97,9 +97,9 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
         factory: Some(anthropic::anthropic_provider),
     },
     BuiltinProviderSpec {
-        id: "azure-openai-responses",
+        id: "azure",
         in_catalog: true,
-        factory: Some(azure_openai_responses::azure_openai_responses_provider),
+        factory: Some(azure::azure_provider),
     },
     BuiltinProviderSpec {
         id: "baseten",
@@ -336,7 +336,7 @@ mod tests {
         "amazon-bedrock",
         "ant-ling",
         "anthropic",
-        "azure-openai-responses",
+        "azure",
         "baseten",
         "cerebras",
         "cloudflare-ai-gateway",
@@ -425,7 +425,7 @@ mod tests {
             "amazon-bedrock",
             "ant-ling",
             "anthropic",
-            "azure-openai-responses",
+            "azure",
             "baseten",
             "cerebras",
             "cloudflare-ai-gateway",

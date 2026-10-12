@@ -164,6 +164,16 @@ pub enum ModelThinkingLevel {
 /// level unsupported, `Some(value)` = provider/model-specific mapped value.
 pub type ThinkingLevelMap = std::collections::BTreeMap<ModelThinkingLevel, Option<String>>;
 
+/// `SamplingParams` (types.ts:92 @ abe508e1b): arbitrary sampling parameters
+/// merged into the request body as-is.
+pub type SamplingParams = serde_json::Map<String, Value>;
+
+/// `SamplingParamsByThinkingLevel` (types.ts:93 @ abe508e1b; R2.3.1):
+/// per-thinking-level sampling parameter overrides. Applies to the
+/// `openai-completions` / `openai-responses` / `azure-openai-responses` APIs.
+pub type SamplingParamsByThinkingLevel =
+    std::collections::BTreeMap<ModelThinkingLevel, SamplingParams>;
+
 impl ThinkingLevel {
     /// The corresponding [`ModelThinkingLevel`] variant.
     pub fn to_model_level(self) -> ModelThinkingLevel {
@@ -1412,6 +1422,13 @@ pub struct AssistantMessage {
     pub end_turn: Option<bool>,
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
+    /// Milliseconds from `timestamp` until the response ended, measured with
+    /// a monotonic clock. Set by the assistant message event stream on the
+    /// final message of a response it saw start; absent for legacy messages
+    /// and for deferred results fetched later (R2.7.1, types.ts:571-575
+    /// @ abe508e1b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// A tool call that another tool made while it ran, for example from a
@@ -1470,6 +1487,10 @@ pub struct ToolResultMessage {
     pub is_error: bool,
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
+    /// Milliseconds the tool's execution took, measured with a monotonic
+    /// clock. Absent for legacy results (R2.7.1, types.ts:595 @ abe508e1b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// `Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage`
@@ -1922,6 +1943,12 @@ pub struct Model {
     /// [`StreamOptions::sampling_params`]; per-request keys override these.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_params: Option<serde_json::Map<String, Value>>,
+    /// Per-thinking-level sampling parameter overrides (v1.0.2, R2.3.1):
+    /// merged over `sampling_params` for the effective (clamped) thinking
+    /// level, below the request's own keys. Unset keeps the request shape
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_params_by_thinking_level: Option<SamplingParamsByThinkingLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Compatibility overrides; which fields apply is governed by `api`
@@ -2667,6 +2694,7 @@ mod tests {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         }
     }
 
@@ -3234,6 +3262,7 @@ mod tests {
             nested_calls: None,
             is_error: false,
             timestamp: 3,
+            duration_ms: None,
         };
         let v: Value = serde_json::from_str(&to_json(&msg)).expect("parse");
         assert_eq!(v["role"], json!("toolResult"));

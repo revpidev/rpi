@@ -1232,6 +1232,7 @@ async fn stream_assistant_response(
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     };
     finalize_streamed_message(context, final_message, added_partial, emit).await
 }
@@ -2043,6 +2044,7 @@ fn create_tool_result_message(
         nested_calls,
         is_error: finalized.is_error,
         timestamp: now_millis(),
+        duration_ms: None,
     }
 }
 

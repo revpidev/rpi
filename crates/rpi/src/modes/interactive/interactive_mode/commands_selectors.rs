@@ -3460,6 +3460,7 @@ mod tests {
             headers: None,
             compat: None,
             sampling_params: None,
+            sampling_params_by_thinking_level: None,
         };
         // Unknown placeholder + empty snapshot → defer (the account-catalog
         // case: "Refreshing model catalog…" until discovery completes).
@@ -4259,6 +4260,7 @@ mod tests {
                 headers: None,
                 compat: None,
                 sampling_params: None,
+                sampling_params_by_thinking_level: None,
             },
             Model {
                 id: "m1".into(),
@@ -4277,6 +4279,7 @@ mod tests {
                 headers: None,
                 compat: None,
                 sampling_params: None,
+                sampling_params_by_thinking_level: None,
             },
             Model {
                 id: "m1".into(),
@@ -4295,6 +4298,7 @@ mod tests {
                 headers: None,
                 compat: None,
                 sampling_params: None,
+                sampling_params_by_thinking_level: None,
             },
         ];
         // Canonical provider/id.
@@ -4567,6 +4571,7 @@ mod tests {
             deferred: None,
             end_turn: None,
             raw_stop_reason: None,
+            duration_ms: None,
         })
     }
 

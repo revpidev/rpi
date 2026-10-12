@@ -52,6 +52,7 @@ fn assistant_msg(text: &str) -> AssistantMessage {
         deferred: None,
         end_turn: None,
         raw_stop_reason: None,
+        duration_ms: None,
     }
 }
 
@@ -328,6 +329,7 @@ fn convert_to_llm_passes_through_base_message_kinds() {
         nested_calls: None,
         is_error: false,
         timestamp: 3,
+        duration_ms: None,
     });
 
     let out = convert_to_llm(&[user.clone(), assistant.clone(), tool_result.clone()]);

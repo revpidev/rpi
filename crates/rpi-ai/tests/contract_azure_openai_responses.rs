@@ -158,7 +158,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn model(base_url: &str, extra: Value) -> Model {
     let mut value = json!({
         "id": "gpt-4o-mini", "name": "GPT-4o mini",
-        "api": ApiKind::AZURE_OPENAI_RESPONSES, "provider": "azure-openai-responses",
+        "api": ApiKind::AZURE_OPENAI_RESPONSES, "provider": "azure",
         "baseUrl": base_url, "reasoning": false, "input": ["text"],
         "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.5, "cacheWrite": 1.0},
         "contextWindow": 128000, "maxTokens": 8192
@@ -694,4 +694,141 @@ fn test_azure_config_resolution_defaults() {
     // Nothing set anywhere → the upstream error message.
     let error = resolve_azure_config(&m, None).expect_err("missing");
     assert!(error.starts_with("Azure OpenAI base URL is required."));
+}
+
+// ---------------------------------------------------------------------------
+// Foundry Chat Completions leg (V17-01 FR-B R3, #9714/#9645)
+// ---------------------------------------------------------------------------
+
+/// Serializes tests that mutate process env (the missing-endpoint test reads
+/// the process env fallback in `get_provider_env_value`).
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvGuard {
+    fn clear(names: &[&'static str]) -> Self {
+        let saved = names
+            .iter()
+            .map(|name| {
+                let value = std::env::var(name).ok();
+                rpi_test_env::remove_var(name);
+                (*name, value)
+            })
+            .collect();
+        Self { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(value) => rpi_test_env::set_var(name, value),
+                None => rpi_test_env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// The Azure provider's `openai-completions` leg (Foundry deployments)
+/// resolves the endpoint onto the model before dispatch and swaps the
+/// deployment name into the request body; `AZURE_OPENAI_*` env vars are the
+/// only endpoint source for this leg (the Responses-only option bag does not
+/// exist on the shared completions options).
+#[tokio::test]
+async fn foundry_completions_leg_resolves_endpoint_and_deployment_name() {
+    let (base_url, mut captured) = serve(vec![(
+        200,
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    )])
+    .await;
+    let model: Model = serde_json::from_value(json!({
+        "id": "deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "api": ApiKind::OPENAI_COMPLETIONS,
+        "provider": "azure",
+        "baseUrl": "",
+        "reasoning": true,
+        "input": ["text"],
+        "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.1, "cacheWrite": 0.0},
+        "contextWindow": 1000000,
+        "maxTokens": 128000
+    }))
+    .expect("model");
+    let env: ProviderEnv = [
+        ("AZURE_OPENAI_BASE_URL".to_owned(), base_url.clone()),
+        (
+            "AZURE_OPENAI_DEPLOYMENT_NAME_MAP".to_owned(),
+            "deepseek-v4-pro=foundry-deepseek".to_owned(),
+        ),
+    ]
+    .into();
+    let events = collect(rpi_ai::providers::azure::AzureCompletions.stream(
+        &model,
+        &context(vec![user_text("hi")]),
+        Some(StreamOptions {
+            request: rpi_ai::ProviderRequestOptions {
+                api_key: Some("test-key".to_owned()),
+                env: Some(env),
+                ..Default::default()
+            },
+            ..StreamOptions::default()
+        }),
+    ))
+    .await;
+    assert_eq!(
+        event_kinds(&events).last(),
+        Some(&"done"),
+        "events: {:?}",
+        event_kinds(&events)
+    );
+    let request = captured.recv().await.expect("captured request");
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/chat/completions");
+    assert_eq!(request.body_json()["model"], "foundry-deepseek");
+}
+
+/// Without any endpoint source the completions leg terminates the stream with
+/// the shared Azure base-URL error instead of throwing out of `stream()`.
+#[tokio::test]
+async fn foundry_completions_leg_errors_without_endpoint() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = EnvGuard::clear(&["AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME"]);
+    let model: Model = serde_json::from_value(json!({
+        "id": "deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "api": ApiKind::OPENAI_COMPLETIONS,
+        "provider": "azure",
+        "baseUrl": "",
+        "reasoning": true,
+        "input": ["text"],
+        "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.1, "cacheWrite": 0.0},
+        "contextWindow": 1000000,
+        "maxTokens": 128000
+    }))
+    .expect("model");
+    let events = collect(rpi_ai::providers::azure::AzureCompletions.stream(
+        &model,
+        &context(vec![user_text("hi")]),
+        Some(options()),
+    ))
+    .await;
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::Error { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("error event");
+    assert!(
+        error
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("Azure OpenAI base URL is required.")),
+        "{:?}",
+        error.error_message
+    );
 }
