@@ -843,19 +843,91 @@ pub fn convert_tool_config(
     Ok(Some(Value::Object(tool_config)))
 }
 
+/// `THINKING_BINDING_CONTROLS_BETA` (bedrock-converse-stream.ts:121
+/// @ 69f0be6f0): dropped stale thinking blocks on replays.
+const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// `supportsThinkingBlockBinding` (#10324 `69f0be6f0`): the model accepts
+/// `thinking.block_binding`. Opus 4.6 and Sonnet 4.6 reject it with
+/// "thinking.adaptive.block_binding: Extra inputs are not permitted".
+fn supports_thinking_block_binding(model: &Model) -> bool {
+    get_model_match_candidates(&model.id, &model.name)
+        .iter()
+        .any(|s| {
+            s.contains("opus-4-7")
+                || s.contains("opus-4-8")
+                || s.contains("opus-5")
+                || s.contains("sonnet-5")
+                || s.contains("fable-5")
+        })
+}
+
+/// OpenAI GPT effort on Bedrock (#9331/#10142 `2989eb581`): GPT-5.x and
+/// GPT-6 take a nested `reasoning.effort` and reject `minimal`.
+const OPENAI_GPT_EFFORT: [(ThinkingLevel, &str); 6] = [
+    (ThinkingLevel::Minimal, "low"),
+    (ThinkingLevel::Low, "low"),
+    (ThinkingLevel::Medium, "medium"),
+    (ThinkingLevel::High, "high"),
+    (ThinkingLevel::Xhigh, "xhigh"),
+    (ThinkingLevel::Max, "max"),
+];
+
+/// gpt-oss takes a flat `reasoning_effort` and only accepts low, medium and
+/// high.
+const OPENAI_GPT_OSS_EFFORT: [(ThinkingLevel, &str); 6] = [
+    (ThinkingLevel::Minimal, "low"),
+    (ThinkingLevel::Low, "low"),
+    (ThinkingLevel::Medium, "medium"),
+    (ThinkingLevel::High, "high"),
+    (ThinkingLevel::Xhigh, "high"),
+    (ThinkingLevel::Max, "high"),
+];
+
+fn table_effort(table: &[(ThinkingLevel, &'static str)], level: ThinkingLevel) -> &'static str {
+    table
+        .iter()
+        .find(|(candidate, _)| *candidate == level)
+        .map(|(_, effort)| *effort)
+        .unwrap_or("medium")
+}
+
 /// `buildAdditionalModelRequestFields`: adaptive thinking (effort) for the
 /// newer Claude families, budget-based thinking with the interleaved-thinking
-/// beta flag otherwise; `display` is omitted on GovCloud.
+/// beta flag otherwise; `display` and `block_binding` are omitted on GovCloud.
+/// Non-Claude reasoning models on Converse get their OpenAI reasoning effort
+/// form (#9331/#10142).
 pub fn build_additional_model_request_fields(
     model: &Model,
     options: &BedrockOptions,
 ) -> Option<Value> {
     let reasoning = options.reasoning?;
-    if !model.reasoning || !is_anthropic_claude_model(model) {
+    if !model.reasoning {
         return None;
     }
 
-    let display = if is_gov_cloud_bedrock_target(model, options) {
+    if !is_anthropic_claude_model(model) {
+        let candidates = get_model_match_candidates(&model.id, &model.name);
+        if candidates.iter().any(|s| s.contains("gpt-oss")) {
+            return Some(json!({
+                "reasoning_effort": table_effort(&OPENAI_GPT_OSS_EFFORT, reasoning),
+            }));
+        }
+        if candidates.iter().any(|s| s.contains("gpt-")) {
+            let mapped = model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(&reasoning.to_model_level()))
+                .and_then(|value| value.clone());
+            let effort =
+                mapped.unwrap_or_else(|| table_effort(&OPENAI_GPT_EFFORT, reasoning).to_owned());
+            return Some(json!({"reasoning": {"effort": effort}}));
+        }
+        return None;
+    }
+
+    let is_gov_cloud = is_gov_cloud_bedrock_target(model, options);
+    let display = if is_gov_cloud {
         None
     } else {
         Some(
@@ -865,6 +937,11 @@ pub fn build_additional_model_request_fields(
                 .as_str(),
         )
     };
+    // Replayed signed thinking blocks are bound to the system prompt and
+    // tools they were created with. Bedrock 400s on replay after either
+    // changes unless stale blocks are dropped, matching the Anthropic
+    // provider. Skipped on GovCloud like display (#10324).
+    let use_block_binding = !is_gov_cloud && supports_thinking_block_binding(model);
 
     let adaptive = supports_adaptive_thinking(&model.id, &model.name);
     let mut fields = Map::new();
@@ -874,11 +951,23 @@ pub fn build_additional_model_request_fields(
         if let Some(display) = display {
             thinking.insert("display".to_owned(), json!(display));
         }
+        if use_block_binding {
+            thinking.insert(
+                "block_binding".to_owned(),
+                json!({"prefix_mismatch_behavior": "drop_block"}),
+            );
+        }
         fields.insert("thinking".to_owned(), Value::Object(thinking));
         fields.insert(
             "output_config".to_owned(),
             json!({"effort": map_thinking_level_to_effort(model, options.reasoning)}),
         );
+        if use_block_binding {
+            fields.insert(
+                "anthropic_beta".to_owned(),
+                json!([THINKING_BINDING_CONTROLS_BETA]),
+            );
+        }
     } else {
         let default_budget = match reasoning {
             ThinkingLevel::Minimal => 1024,
@@ -1908,6 +1997,7 @@ async fn run(
             // to the same 2 when the caller leaves it unset (D-026).
             max_retries: Some(options.stream.max_retries.unwrap_or(2)),
             max_retry_delay_ms: options.stream.max_retry_delay_ms,
+            ..Default::default()
         },
         options.stream.signal.as_ref(),
     )

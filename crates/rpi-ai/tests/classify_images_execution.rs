@@ -228,6 +228,7 @@ fn models_with_classifier(base_url: &str) -> Models {
         api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
         fetch_models: None,
         filter_models_fn: None,
+        filter_all_models_fn: None,
     });
     models.set_provider(provider);
     models
@@ -365,6 +366,7 @@ async fn classify_without_a_key_or_provider_is_an_error_result() {
         api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
         fetch_models: None,
         filter_models_fn: None,
+        filter_all_models_fn: None,
     });
     models.set_provider(provider);
     let result = models
@@ -402,6 +404,7 @@ async fn classify_without_a_key_or_provider_is_an_error_result() {
         api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
         fetch_models: None,
         filter_models_fn: None,
+        filter_all_models_fn: None,
     });
     models.set_provider(provider);
     let result = models
@@ -476,6 +479,7 @@ async fn cloudflare_transport_unwraps_the_rest_envelope() {
         api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
         fetch_models: None,
         filter_models_fn: None,
+        filter_all_models_fn: None,
     });
     models.set_provider(provider);
     let mut model = classifier_model(&base_url, "cloudflare-workers-ai-system-one");
@@ -552,6 +556,7 @@ async fn generate_images_resolves_auth_and_never_rejects() {
         api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
         fetch_models: None,
         filter_models_fn: None,
+        filter_all_models_fn: None,
     });
     models.set_provider(provider);
     let mut model = ImageModel {
@@ -702,6 +707,7 @@ fn models_with_capture_classifier(
         api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
         fetch_models: None,
         filter_models_fn: None,
+        filter_all_models_fn: None,
     });
     models.set_provider(provider);
     models

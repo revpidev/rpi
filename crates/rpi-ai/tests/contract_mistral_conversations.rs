@@ -601,7 +601,8 @@ async fn preserves_raw_mistral_finish_reasons_for_provider_error_stops() {
     assert_eq!(error.raw_stop_reason.as_deref(), Some("error"));
     assert_eq!(
         error.error_message.as_deref(),
-        Some("Provider stopped with: error")
+        // #10487 (7fb59f995): "server error" makes the message retryable.
+        Some("Provider stopped with: error (server error)")
     );
 }
 

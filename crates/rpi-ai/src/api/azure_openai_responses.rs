@@ -583,6 +583,7 @@ async fn run(
         ProviderRetryOptions {
             max_retries: options.stream.max_retries,
             max_retry_delay_ms: options.stream.max_retry_delay_ms,
+            ..Default::default()
         },
         options.stream.signal.as_ref(),
     )

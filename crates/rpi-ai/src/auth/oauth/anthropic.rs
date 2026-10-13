@@ -304,24 +304,44 @@ impl AnthropicOAuth {
         let verifier = pkce.verifier;
         let challenge = pkce.challenge;
 
-        // `startOAuthCallbackServer({...}).catch(() => undefined)`: a bind
-        // failure falls back to the pasted redirect URL (R2.6.2).
+        // `startOAuthCallbackServer`. #10571 (`8d8ae2fc2`): try the
+        // preferred port first so forwarded setups keep working, then let
+        // the OS pick a free loopback port when it cannot be bound (e.g.
+        // Hyper-V/WSL port exclusions on Windows). Without a callback
+        // server, login continues with the pasted redirect URL.
         let complete: CompleteFn<String> = Arc::new(|code| Box::pin(async move { Ok(code) }));
-        let callback = OAuthCallbackServer::start(OAuthCallbackServerOptions {
-            provider_name: "Anthropic".to_owned(),
-            host: default_callback_host(),
-            port: self.callback_port,
-            path: CALLBACK_PATH.to_owned(),
-            // The advertised redirect uses `localhost` while the bind host is
-            // `RPI_OAUTH_CALLBACK_HOST` (upstream `redirectHost` seam).
-            redirect_host: Some("localhost".to_owned()),
-            state: Some(verifier.clone()),
-            complete,
-            signal: interaction.signal(),
-            timeout: None,
-        })
-        .await
-        .ok();
+        let start_callback_server = |port: u16| {
+            let verifier = verifier.clone();
+            let complete = complete.clone();
+            let signal = interaction.signal();
+            async move {
+                OAuthCallbackServer::start(OAuthCallbackServerOptions {
+                    provider_name: "Anthropic".to_owned(),
+                    host: default_callback_host(),
+                    port,
+                    path: CALLBACK_PATH.to_owned(),
+                    // The advertised redirect uses `localhost` while the bind
+                    // host is `RPI_OAUTH_CALLBACK_HOST` (upstream
+                    // `redirectHost` seam).
+                    redirect_host: Some("localhost".to_owned()),
+                    state: Some(verifier),
+                    complete,
+                    signal,
+                    timeout: None,
+                })
+                .await
+            }
+        };
+        let callback = match start_callback_server(self.callback_port).await {
+            Ok(server) => Some(server),
+            Err(_) => start_callback_server(0).await.ok(),
+        };
+        // The authorize URL, paste prompt and token exchange use the bound
+        // redirect URI.
+        let redirect_uri = callback
+            .as_ref()
+            .map(OAuthCallbackServer::redirect_uri)
+            .unwrap_or_else(|| REDIRECT_URI.to_owned());
 
         let result = async {
             // `authParams` in upstream key order; `URLSearchParams.toString()`
@@ -331,7 +351,7 @@ impl AnthropicOAuth {
                     ("code", "true"),
                     ("client_id", CLIENT_ID),
                     ("response_type", "code"),
-                    ("redirect_uri", REDIRECT_URI),
+                    ("redirect_uri", redirect_uri.as_str()),
                     ("scope", SCOPES),
                     ("code_challenge", challenge.as_str()),
                     ("code_challenge_method", "S256"),
@@ -352,7 +372,7 @@ impl AnthropicOAuth {
                 ManualPrompt {
                     message: "Complete login in your browser, or paste the authorization code / redirect URL here:"
                         .to_owned(),
-                    placeholder: REDIRECT_URI.to_owned(),
+                    placeholder: redirect_uri.clone(),
                 },
             )
             .await?;
@@ -369,7 +389,7 @@ impl AnthropicOAuth {
             interaction.notify(AuthEvent::Progress {
                 message: "Exchanging authorization code for tokens...".to_owned(),
             });
-            self.exchange_authorization_code(&code, &state, &verifier, REDIRECT_URI)
+            self.exchange_authorization_code(&code, &state, &verifier, &redirect_uri)
                 .await
         }
         .await;
@@ -811,7 +831,18 @@ mod tests {
         assert_eq!(body["grant_type"], "authorization_code");
         assert_eq!(body["client_id"], CLIENT_ID);
         assert_eq!(body["code"], "manual-code");
-        assert_eq!(body["redirect_uri"], "http://localhost:53692/callback");
+        // #10571: the exchange uses the callback server's bound redirect URI,
+        // which the auth URL announced (localhost host + bound port).
+        assert_eq!(
+            body["redirect_uri"].as_str(),
+            handle.auth_url_param("redirect_uri").as_deref()
+        );
+        assert!(
+            body["redirect_uri"]
+                .as_str()
+                .is_some_and(|uri| uri.starts_with("http://localhost:")),
+            "localhost redirect: {body}"
+        );
         assert_eq!(
             body["state"].as_str(),
             handle.auth_url_param("state").as_deref()
@@ -821,6 +852,56 @@ mod tests {
                 .as_str()
                 .is_some_and(|v| !v.is_empty())
         );
+    }
+
+    /// #10571 (`8d8ae2fc2`): when the preferred port cannot be bound, login
+    /// falls back to an OS-chosen loopback port and uses that redirect URI.
+    #[tokio::test]
+    async fn falls_back_to_a_free_port_when_the_preferred_port_is_taken() {
+        let endpoint = MockTokenEndpoint::start(
+            StatusCode::OK,
+            token_response("access-token", "refresh-token"),
+        )
+        .await;
+        // Hold the preferred port for the duration of the test.
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let occupied_port = occupied.local_addr().expect("addr").port();
+        let oauth = oauth_with(&endpoint, occupied_port);
+        let handle = InteractionHandle::default();
+        let interaction = FakeInteraction::new(
+            handle.clone(),
+            Box::new(|handle, prompt| {
+                Box::pin(async move {
+                    expect_manual_code(&prompt);
+                    let state = handle.auth_url_param("state").ok_or_else(|| {
+                        ModelsError::new(ModelsErrorCode::Auth, "Missing OAuth state in auth URL")
+                    })?;
+                    let redirect_uri = handle.auth_url_param("redirect_uri").ok_or_else(|| {
+                        ModelsError::new(
+                            ModelsErrorCode::Auth,
+                            "Missing OAuth redirect_uri in auth URL",
+                        )
+                    })?;
+                    Ok(format!("{redirect_uri}?code=manual-code&state={state}"))
+                })
+            }),
+        );
+
+        oauth.login(&interaction, None).await.expect("login");
+        let redirect = handle
+            .auth_url_param("redirect_uri")
+            .expect("redirect_uri in the auth URL");
+        assert!(
+            redirect.starts_with("http://localhost:"),
+            "localhost redirect: {redirect}"
+        );
+        assert!(
+            !redirect.contains(&format!(":{occupied_port}/")),
+            "must not reuse the taken port: {redirect}"
+        );
+        let bodies = endpoint.bodies();
+        assert_eq!(bodies.len(), 1, "exactly one token request");
+        assert_eq!(bodies[0]["redirect_uri"].as_str(), Some(redirect.as_str()));
     }
 
     /// `omits scope from refresh token requests`.

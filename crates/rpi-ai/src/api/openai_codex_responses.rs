@@ -294,8 +294,11 @@ use crate::utils::rpi_user_agent::get_rpi_user_agent;
 /// Case-insensitive header record (JS `Headers` lowercases all names).
 type HeaderRecord = BTreeMap<String, String>;
 
-/// `buildBaseCodexHeaders`: model headers, then option headers (`None`
-/// deletes), then the auth/account/originator/UA headers always win.
+/// `buildBaseCodexHeaders` (#10429 `0cf65d2bf`): provider defaults first
+/// so model and model/caller headers can override them, matching the other
+/// providers; model headers, then option headers (`None` deletes), then the
+/// fixed Authorization/account-id headers. `StreamOptions.headers`
+/// documents that caller values override provider defaults.
 fn build_base_codex_headers(
     model: &Model,
     additional_headers: Option<&ProviderHeaders>,
@@ -303,6 +306,10 @@ fn build_base_codex_headers(
     token: &str,
 ) -> HeaderRecord {
     let mut headers = HeaderRecord::new();
+    // Literal "rpi" (upstream openai-codex-responses.ts:1593 uses "pi";
+    // ADR-0001 brand rename).
+    headers.insert("originator".to_owned(), "rpi".to_owned());
+    headers.insert("user-agent".to_owned(), get_rpi_user_agent());
     if let Some(model_headers) = &model.headers {
         for (key, value) in model_headers {
             headers.insert(key.to_lowercase(), value.clone());
@@ -316,9 +323,6 @@ fn build_base_codex_headers(
     }
     headers.insert("authorization".to_owned(), format!("Bearer {token}"));
     headers.insert("chatgpt-account-id".to_owned(), account_id.to_owned());
-    // Literal "pi" (upstream openai-codex-responses.ts:1593); do not rename.
-    headers.insert("originator".to_owned(), "rpi".to_owned());
-    headers.insert("user-agent".to_owned(), get_rpi_user_agent());
     headers
 }
 
@@ -2492,8 +2496,33 @@ mod tests {
         // Option `None` deletes the model header (case-insensitively).
         assert!(!headers.contains_key("x-custom"));
         assert_eq!(headers.get("x-extra"), Some(&"1".to_owned()));
-        // Auth/originator headers always win over model headers.
-        assert_eq!(headers.get("originator"), Some(&"rpi".to_owned()));
+        // #10429: model headers override the originator default; Authorization
+        // and the account id stay fixed.
+        assert_eq!(headers.get("originator"), Some(&"model".to_owned()));
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&"Bearer token".to_owned())
+        );
+        assert_eq!(headers.get("chatgpt-account-id"), Some(&"acc".to_owned()));
+    }
+
+    /// #10429 (`0cf65d2bf`): "lets model and caller headers override originator
+    /// and User-Agent".
+    #[test]
+    fn test_caller_headers_override_originator_and_user_agent() {
+        let m = model(json!({"headers": {"originator": "my-app"}}));
+        let options_headers: ProviderHeaders = [
+            ("user-agent".to_owned(), Some("my-app/1.0".to_owned())),
+            (
+                "Authorization".to_owned(),
+                Some("Bearer ignored".to_owned()),
+            ),
+        ]
+        .into();
+        let headers = build_base_codex_headers(&m, Some(&options_headers), "acc", "token");
+        assert_eq!(headers.get("originator"), Some(&"my-app".to_owned()));
+        assert_eq!(headers.get("user-agent"), Some(&"my-app/1.0".to_owned()));
+        // The auth header stays the resolved token.
         assert_eq!(
             headers.get("authorization"),
             Some(&"Bearer token".to_owned())

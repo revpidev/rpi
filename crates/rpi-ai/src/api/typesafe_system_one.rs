@@ -7,9 +7,8 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::api::system_one_shared::{
-    SystemOneTransport, classify_system_one, is_record, typesafe_payload,
-};
+use crate::api::classifier_shared::is_record;
+use crate::api::system_one_shared::{SystemOneTransport, classify_system_one, typesafe_payload};
 use crate::types::{
     ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ProviderClassifier,
 };

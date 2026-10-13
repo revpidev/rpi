@@ -355,6 +355,10 @@ pub struct LoginOptions {
     /// can create the ID on first use and must return the same ID on every
     /// later call.
     pub get_device_id: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// Name this app introduces itself with during login, e.g. OpenAI's agent
+    /// name hint and the Codex originator (auth/types.ts:206-211 @ `9ad083102`).
+    /// Defaults to rpi's own name.
+    pub agent_name: Option<String>,
 }
 
 // Manual Debug: the callback is not a secret, but it has no Debug impl.
@@ -362,6 +366,7 @@ impl fmt::Debug for LoginOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoginOptions")
             .field("get_device_id", &self.get_device_id.is_some())
+            .field("agent_name", &self.agent_name)
             .finish()
     }
 }

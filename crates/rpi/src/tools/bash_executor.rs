@@ -20,9 +20,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::bash::{BashExecError, BashExecOptions, BashOperations};
-use crate::tools::sanitize::{
-    sanitize_binary_output, split_incomplete_ansi_suffix, strip_ansi,
-};
+use crate::tools::sanitize::{sanitize_binary_output, split_incomplete_ansi_suffix, strip_ansi};
 use crate::tools::truncate::{self, DEFAULT_MAX_BYTES, TruncateOptions};
 
 /// Result of a user bash execution (bash-executor.ts:29-40).

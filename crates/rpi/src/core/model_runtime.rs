@@ -824,6 +824,16 @@ impl Provider for ModelOverridingProvider {
         self.base.filter_models(models, credential)
     }
 
+    /// `filterAllModels` forwards to the base when it defines one
+    /// (provider-composer.ts:639-641).
+    fn filter_all_models(
+        &self,
+        models: Vec<AnyModel>,
+        credential: Option<&Credential>,
+    ) -> Vec<AnyModel> {
+        self.base.filter_all_models(models, credential)
+    }
+
     /// Overlays keep the base's dynamic catalog refresh
     /// (provider-composer.ts:475-478).
     fn refresh_models(
@@ -917,6 +927,16 @@ impl Provider for RefreshDelegatingProvider {
     /// (provider-composer.ts:492-494).
     fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
         self.base.filter_models(models, credential)
+    }
+
+    /// `filterAllModels` comes from the native base provider only
+    /// (provider-composer.ts:639-641).
+    fn filter_all_models(
+        &self,
+        models: Vec<AnyModel>,
+        credential: Option<&Credential>,
+    ) -> Vec<AnyModel> {
+        self.base.filter_all_models(models, credential)
     }
 
     fn refresh_models(
@@ -1195,6 +1215,22 @@ impl Provider for VirtualModelProvider {
             None => physical,
         };
         result.extend(self.virtuals.iter().cloned());
+        result
+    }
+
+    /// `filterAllModels` filters the physical models and appends the virtual
+    /// ones (virtual-models.ts:230-232).
+    fn filter_all_models(
+        &self,
+        models: Vec<AnyModel>,
+        credential: Option<&Credential>,
+    ) -> Vec<AnyModel> {
+        let physical = self.physical_any(models);
+        let mut result = match &self.base {
+            Some(base) => base.filter_all_models(physical, credential),
+            None => physical,
+        };
+        result.extend(self.virtuals.iter().cloned().map(AnyModel::Chat));
         result
     }
 
@@ -2607,6 +2643,7 @@ impl ModelRuntime {
                     api_key: overrides.api_key.clone(),
                     env: overrides.env.clone(),
                     min_oauth_validity_ms: overrides.min_oauth_validity_ms,
+                    signal: None,
                 }),
             )
             .await

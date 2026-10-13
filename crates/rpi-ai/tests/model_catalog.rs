@@ -615,3 +615,46 @@ fn test_correction_copilot_individual_endpoint() {
         Some("https://api.individual.githubcopilot.com")
     );
 }
+
+/// #10326 (`4665fafb4`): Bedrock OpenAI models keep their models.dev pricing
+/// tiers, so long-context requests cost the long-context rate.
+#[test]
+fn test_correction_bedrock_openai_cost_tiers() {
+    for id in ["global.openai.gpt-6-sol", "us.openai.gpt-5.6-luna"] {
+        let model = get_model("amazon-bedrock", id);
+        let tiers = model
+            .cost
+            .tiers
+            .as_ref()
+            .unwrap_or_else(|| panic!("{id} must carry pricing tiers"));
+        assert!(
+            tiers.iter().any(|tier| tier.input_tokens_above == 272_000),
+            "{id}: {tiers:?}"
+        );
+        assert!(
+            tiers
+                .iter()
+                .any(|tier| tier.rates.input > model.cost.rates.input),
+            "{id}: the long-context tier must be more expensive"
+        );
+    }
+}
+
+/// `c10bfb0d7`: the Cloudflare AI Gateway `/anthropic` passthrough forwards
+/// the model id unchanged, so the catalog uses dashed Claude ids.
+#[test]
+fn test_correction_cloudflare_gateway_dashed_claude_ids() {
+    for id in ["claude-opus-5-5", "claude-haiku-4-5", "claude-sonnet-5-5"] {
+        let model = get_model("cloudflare-ai-gateway", id);
+        assert_eq!(model.id, id);
+        assert_eq!(model.api.as_str(), "anthropic-messages");
+    }
+    // No dotted ids survive (Anthropic rejects them with a 404).
+    assert!(
+        get_builtin_models("cloudflare-ai-gateway")
+            .iter()
+            .filter(|model| model.api.as_str() == "anthropic-messages")
+            .all(|model| !model.id.contains('.')),
+        "dotted Claude ids must not ship"
+    );
+}

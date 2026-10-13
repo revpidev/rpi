@@ -407,4 +407,63 @@ mod tests {
             None
         );
     }
+
+    /// #10497 (27075fe07, context-estimate.test.ts:45-58): new text
+    /// reserves 3.5 characters per token when limiting output.
+    #[test]
+    fn test_estimates_new_text_at_35_chars_per_token_for_output_limits() {
+        use crate::types::{AssistantMessage, AssistantRole, StopReason, Usage};
+
+        let assistant = crate::types::Message::Assistant(AssistantMessage {
+            role: AssistantRole::Assistant,
+            content: vec![crate::types::AssistantContent::Text(
+                crate::types::TextContent {
+                    text: "kept".to_owned(),
+                    text_signature: None,
+                },
+            )],
+            api: crate::types::ApiKind::from("openai-responses"),
+            provider: "openai".to_owned(),
+            model: "test-model".to_owned(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: None,
+            thinking_level: None,
+            diagnostics: None,
+            usage: Usage {
+                total_tokens: 2_000,
+                input: 2_000,
+                ..Default::default()
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 100,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
+            duration_ms: None,
+        });
+        let user = crate::types::Message::User(crate::types::UserMessage {
+            role: crate::types::UserRole::User,
+            content: UserContent::Text("x".repeat(3_500)),
+            timestamp: 200,
+        });
+        let context = crate::utils::transcript::normalize_context(&crate::types::Context {
+            system_prompt: None,
+            messages: vec![assistant, user],
+            tools: None,
+        });
+        let estimate = estimate_context_tokens(&context);
+        assert_eq!(estimate.tokens, 3_000);
+        assert_eq!(estimate.usage_tokens, 2_000);
+        assert_eq!(estimate.trailing_tokens, 1_000);
+        assert_eq!(estimate.last_usage_index, Some(0));
+
+        // contextWindow 10_000, maxTokens 8_000 → 8_000 vs 10_000 - 3_000 - 4_096.
+        let model = make_model(10_000, 8_000);
+        assert_eq!(
+            build_base_options(&model, &context, None, None).max_tokens,
+            Some(2_904)
+        );
+    }
 }

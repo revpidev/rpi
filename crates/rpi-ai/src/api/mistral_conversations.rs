@@ -694,7 +694,9 @@ fn map_chat_stop_reason(reason: &str) -> (StopReason, Option<String>) {
         "tool_calls" => (StopReason::ToolUse, None),
         "error" => (
             StopReason::Error,
-            Some("Provider stopped with: error".to_owned()),
+            // #10487 (7fb59f995): Mistral reports transient server failures
+            // this way; "server error" makes the message retryable.
+            Some("Provider stopped with: error (server error)".to_owned()),
         ),
         other => (
             StopReason::Error,
@@ -1337,6 +1339,7 @@ async fn run(
         ProviderRetryOptions {
             max_retries: options.stream.max_retries,
             max_retry_delay_ms: options.stream.max_retry_delay_ms,
+            ..Default::default()
         },
         options.stream.signal.as_ref(),
     )
@@ -2155,7 +2158,7 @@ mod tests {
             map_chat_stop_reason("error"),
             (
                 StopReason::Error,
-                Some("Provider stopped with: error".to_owned())
+                Some("Provider stopped with: error (server error)".to_owned())
             )
         );
         // 5a53f086e: unmapped reasons are provider errors, not stops.

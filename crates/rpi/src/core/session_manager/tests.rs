@@ -3042,10 +3042,7 @@ fn tool_result_duration_ms_roundtrips_through_jsonl() {
     let file = tmp.path().join("durations.jsonl");
     let with_duration = "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"out\"}],\"isError\":false,\"timestamp\":1,\"durationMs\":1234}}";
     let legacy = "{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2025-01-01T00:00:02.000Z\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"c2\",\"toolName\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"old\"}],\"isError\":false,\"timestamp\":2}}";
-    let content = format!(
-        "{}\n{with_duration}\n{legacy}\n",
-        header_line("s1", "/tmp")
-    );
+    let content = format!("{}\n{with_duration}\n{legacy}\n", header_line("s1", "/tmp"));
     std::fs::write(&file, content).expect("write");
 
     let sm = SessionManager::open(&file, Some(tmp.path()), None).expect("open");

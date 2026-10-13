@@ -85,7 +85,9 @@ const LOGIN_METHOD_BROWSER: &str = "browser";
 /// `OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD`.
 const LOGIN_METHOD_DEVICE_CODE: &str = "device_code";
 /// Default `originator` (`createAuthorizationFlow(originator = "pi")`).
-const ORIGINATOR: &str = "pi";
+/// Default `originator` (upstream "pi"; ADR-0001 brand rename). Overridable
+/// through `LoginOptions.agentName`.
+const ORIGINATOR: &str = "rpi";
 
 fn error(message: impl Into<String>) -> ModelsError {
     ModelsError::new(ModelsErrorCode::Oauth, message.into())
@@ -625,8 +627,12 @@ impl OpenAiCodexOAuth {
     async fn login_browser(
         &self,
         interaction: &dyn AuthInteraction,
+        options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
-        let flow = create_authorization_flow(ORIGINATOR)?;
+        let originator = options
+            .and_then(|options| options.agent_name.as_deref())
+            .unwrap_or(ORIGINATOR);
+        let flow = create_authorization_flow(originator)?;
         // `startOAuthCallbackServer({...}).catch(() => undefined)`: port 1455
         // is shared with the Codex CLI, so a bind failure falls back to the
         // pasted redirect URL (R2.6.2).
@@ -764,7 +770,7 @@ impl OAuthAuth for OpenAiCodexOAuth {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
-        _options: Option<&LoginOptions>,
+        options: Option<&LoginOptions>,
     ) -> Result<OAuthCredential, ModelsError> {
         let method = interaction
             .prompt(AuthPrompt::Select {
@@ -786,7 +792,7 @@ impl OAuthAuth for OpenAiCodexOAuth {
             .await?;
         match method.as_str() {
             LOGIN_METHOD_DEVICE_CODE => self.login_device_code(interaction).await,
-            LOGIN_METHOD_BROWSER => self.login_browser(interaction).await,
+            LOGIN_METHOD_BROWSER => self.login_browser(interaction, options).await,
             other => Err(error(format!("Unknown OpenAI Codex login method: {other}"))),
         }
     }
@@ -1740,7 +1746,8 @@ mod tests {
                 .as_deref(),
             Some("true")
         );
-        assert_eq!(handle.auth_url_param("originator").as_deref(), Some("pi"));
+        // ADR-0001 brand rename + #10433 default (upstream "pi").
+        assert_eq!(handle.auth_url_param("originator").as_deref(), Some("rpi"));
 
         let response = reqwest::get(format!(
             "http://127.0.0.1:{callback_port}{CALLBACK_PATH}?code=callback-code&state={state}"

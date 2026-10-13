@@ -32,8 +32,10 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("rpi-tool-selection-test-{}-{id}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-tool-selection-test-{}-{id}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         TempDir(dir)
     }
@@ -206,11 +208,7 @@ async fn session_fixture(options: FixtureOptions) -> Fixture {
             vec!["builtin:tool-search".to_owned()],
             vec![
                 rpi::extensions::tool_search::inline_extension(),
-                tools_extension(
-                    options
-                        .fail_exposure
-                        .unwrap_or(ext::ToolExposure::Deferred),
-                ),
+                tools_extension(options.fail_exposure.unwrap_or(ext::ToolExposure::Deferred)),
             ],
             false,
             false,

@@ -62,7 +62,11 @@ impl ToolNameMatcher {
     }
 
     pub fn matches(&self, name: &str) -> bool {
-        self.names.contains(name) || self.patterns.iter().any(|pattern| tool_pattern_matches(pattern, name))
+        self.names.contains(name)
+            || self
+                .patterns
+                .iter()
+                .any(|pattern| tool_pattern_matches(pattern, name))
     }
 }
 
@@ -149,7 +153,10 @@ mod tests {
     fn pattern_matches_literal_and_star_forms() {
         assert!(tool_pattern_matches("read", "read"));
         assert!(!tool_pattern_matches("read", "readx"));
-        assert!(tool_pattern_matches("mcp__radius__*", "mcp__radius__search"));
+        assert!(tool_pattern_matches(
+            "mcp__radius__*",
+            "mcp__radius__search"
+        ));
         assert!(tool_pattern_matches("*_tool", "dynamic_tool"));
         assert!(tool_pattern_matches("ask_*", "ask_question"));
         assert!(tool_pattern_matches("*", "anything"));

@@ -2013,7 +2013,8 @@ fn test_map_thinking_level_to_effort() {
 async fn test_thinking_payload_adaptive_and_budget() {
     let ctx = context(vec![user_text("Hello")]);
 
-    // Adaptive: Opus 4.8 -> effort output_config, no anthropic_beta.
+    // Adaptive: Opus 4.8 -> effort output_config, block_binding + binding beta
+    // (#10324 69f0be6f0).
     let opus48 = make_model(
         "global.anthropic.claude-opus-4-8-v1",
         "Claude Opus 4.8 (Global)",
@@ -2025,16 +2026,19 @@ async fn test_thinking_payload_adaptive_and_budget() {
     let (payload, _) = capture_payload(&opus48, &ctx, options).await;
     assert_eq!(
         payload["additionalModelRequestFields"]["thinking"],
-        json!({"type": "adaptive", "display": "summarized"})
+        json!({
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+        })
     );
     assert_eq!(
         payload["additionalModelRequestFields"]["output_config"],
         json!({"effort": "high"})
     );
-    assert!(
-        payload["additionalModelRequestFields"]
-            .get("anthropic_beta")
-            .is_none()
+    assert_eq!(
+        payload["additionalModelRequestFields"]["anthropic_beta"],
+        json!(["thinking-binding-controls-2026-08-01"])
     );
 
     // Adaptive + xhigh on Fable 5.
@@ -2050,6 +2054,27 @@ async fn test_thinking_payload_adaptive_and_budget() {
     assert_eq!(
         payload["additionalModelRequestFields"]["output_config"],
         json!({"effort": "xhigh"})
+    );
+
+    // Opus 4.6 advertises adaptive thinking but rejects block_binding: no
+    // block_binding, no beta (the 400 case the fix avoids).
+    let opus46 = make_model(
+        "global.anthropic.claude-opus-4-6-v1",
+        "Claude Opus 4.6",
+        "http://unused",
+        json!({}),
+    );
+    let mut options = sigv4_options(test_env());
+    options.reasoning = Some(ThinkingLevel::High);
+    let (payload, _) = capture_payload(&opus46, &ctx, options).await;
+    assert_eq!(
+        payload["additionalModelRequestFields"]["thinking"],
+        json!({"type": "adaptive", "display": "summarized"})
+    );
+    assert!(
+        payload["additionalModelRequestFields"]
+            .get("anthropic_beta")
+            .is_none()
     );
 
     // Budget-based: Sonnet 4.5 -> enabled + budget_tokens + interleaved beta.
@@ -2077,7 +2102,7 @@ async fn test_thinking_payload_adaptive_and_budget() {
             .is_none()
     );
 
-    // Non-Claude model: no additionalModelRequestFields at all.
+    // Non-Claude model without reasoning: no additionalModelRequestFields at all.
     let nova = make_model(
         "amazon.nova-lite-v1:0",
         "Nova Lite",
@@ -2087,6 +2112,88 @@ async fn test_thinking_payload_adaptive_and_budget() {
     let mut options = sigv4_options(test_env());
     options.reasoning = Some(ThinkingLevel::High);
     let (payload, _) = capture_payload(&nova, &ctx, options).await;
+    assert!(payload.get("additionalModelRequestFields").is_none());
+}
+
+/// #9331/#10142 (2989eb581): the configured thinking level reaches OpenAI
+/// models on Bedrock Converse; gpt-oss clamps to low/medium/high.
+#[tokio::test]
+async fn test_thinking_payload_openai_reasoning_effort() {
+    let ctx = context(vec![user_text("Hello")]);
+
+    // GPT-5.x / GPT-6: nested reasoning.effort; minimal maps to low.
+    for (level, effort) in [
+        (ThinkingLevel::Minimal, "low"),
+        (ThinkingLevel::Low, "low"),
+        (ThinkingLevel::Medium, "medium"),
+        (ThinkingLevel::High, "high"),
+        (ThinkingLevel::Xhigh, "xhigh"),
+        (ThinkingLevel::Max, "max"),
+    ] {
+        let gpt = make_model(
+            "global.openai.gpt-6-sol",
+            "GPT-6 Sol",
+            "http://unused",
+            json!({}),
+        );
+        let mut options = sigv4_options(test_env());
+        options.reasoning = Some(level);
+        let (payload, _) = capture_payload(&gpt, &ctx, options).await;
+        assert_eq!(
+            payload["additionalModelRequestFields"],
+            json!({"reasoning": {"effort": effort}}),
+            "gpt-6 {level:?}"
+        );
+    }
+
+    // gpt-oss: flat reasoning_effort capped at high.
+    let gpt_oss = make_model(
+        "openai.gpt-oss-120b-1:0",
+        "gpt-oss-120b",
+        "http://unused",
+        json!({}),
+    );
+    for (level, effort) in [
+        (ThinkingLevel::Minimal, "low"),
+        (ThinkingLevel::Medium, "medium"),
+        (ThinkingLevel::Xhigh, "high"),
+        (ThinkingLevel::Max, "high"),
+    ] {
+        let mut options = sigv4_options(test_env());
+        options.reasoning = Some(level);
+        let (payload, _) = capture_payload(&gpt_oss, &ctx, options).await;
+        assert_eq!(
+            payload["additionalModelRequestFields"],
+            json!({"reasoning_effort": effort}),
+            "gpt-oss {level:?}"
+        );
+    }
+
+    // An inference-profile ARN only identified by model.name still matches.
+    let profile = make_model(
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/my-profile",
+        "GPT-6 Sol",
+        "http://unused",
+        json!({}),
+    );
+    let mut options = sigv4_options(test_env());
+    options.reasoning = Some(ThinkingLevel::Medium);
+    let (payload, _) = capture_payload(&profile, &ctx, options).await;
+    assert_eq!(
+        payload["additionalModelRequestFields"],
+        json!({"reasoning": {"effort": "medium"}})
+    );
+
+    // No reasoning level (off) leaves the request untouched.
+    let mut options = sigv4_options(test_env());
+    options.reasoning = None;
+    let gpt = make_model(
+        "global.openai.gpt-6-sol",
+        "GPT-6 Sol",
+        "http://unused",
+        json!({}),
+    );
+    let (payload, _) = capture_payload(&gpt, &ctx, options).await;
     assert!(payload.get("additionalModelRequestFields").is_none());
 }
 
@@ -2220,7 +2327,11 @@ async fn test_stream_simple_budget_path_payload() {
     let payload = captured2.lock().expect("payload slot").clone();
     assert_eq!(
         payload["additionalModelRequestFields"]["thinking"],
-        json!({"type": "adaptive", "display": "summarized"})
+        json!({
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+        })
     );
     assert_eq!(
         payload["additionalModelRequestFields"]["output_config"],

@@ -11,8 +11,9 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use url::Url;
 
+use crate::api::classifier_shared::is_record;
 use crate::api::system_one_shared::{
-    SystemOneTransport, SystemOneWireRequest, classify_system_one, is_record,
+    SystemOneTransport, SystemOneWireRequest, classify_system_one,
 };
 use crate::types::{
     ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ProviderClassifier,

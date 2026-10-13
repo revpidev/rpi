@@ -1,15 +1,19 @@
-//! Port of `packages/ai/src/auth/resolve.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/auth/resolve.ts` @ `abe508e1b` (v1.1.0,
+//! `bde882c74`).
 //!
 //! Shared auth resolution: a stored credential owns the provider (hit stops),
 //! ambient/env is consulted only when nothing is stored. No silent env
 //! fallback after a failed refresh. OAuth refresh runs under the store lock
-//! with double-checked expiry.
+//! with double-checked expiry; the caller's signal cancels only the lock
+//! wait, so a rotated refresh token is always persisted.
 
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use super::types::{
-    ApiKeyCredential, AuthContext, AuthResult, Credential, CredentialStore, OAuthCredential,
-    ProviderAuth,
+    ApiKeyCredential, AuthContext, AuthOperationOptions, AuthResult, Credential, CredentialStore,
+    OAuthCredential, ProviderAuth,
 };
 use crate::types::ProviderEnv;
 
@@ -90,6 +94,9 @@ pub struct AuthResolutionOverrides {
     /// Require this much remaining OAuth-token validity; defaults to five
     /// minutes (upstream: callers can only *raise* the floor).
     pub min_oauth_validity_ms: Option<u64>,
+    /// Cancels the wait for the credential-store lock; a refresh that has
+    /// started completes and persists (auth/resolve.ts:24 @ `bde882c74`).
+    pub signal: Option<CancellationToken>,
 }
 
 /// `DEFAULT_OAUTH_MINIMUM_VALIDITY_MS` (auth/resolve.ts:119 @ 4181f66).
@@ -98,6 +105,156 @@ const DEFAULT_OAUTH_MINIMUM_VALIDITY_MS: i64 = 5 * 60 * 1000;
 /// `DEFAULT_OAUTH_REFRESH_TIMEOUT_MS` (auth/resolve.ts:120 @ 4181f66).
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS: std::time::Duration =
     std::time::Duration::from_millis(15_000);
+
+/// `refreshStoredOAuthCredential` (auth/resolve.ts:105-155 @ `bde882c74`):
+/// refresh a stored OAuth credential under the credential-store lock and
+/// persist the result before the lock is released. `needs_refresh` is
+/// re-checked under the lock, so concurrent callers and processes refresh
+/// once.
+///
+/// `signal` cancels only the wait for the lock. Once a refresh starts, the
+/// provider may already have rotated the refresh token, so the refresh and
+/// its persistence ignore `signal` and are bounded only by
+/// [`DEFAULT_OAUTH_REFRESH_TIMEOUT_MS`]. Otherwise a cancelled caller could
+/// discard the only valid refresh token. Callers that must return promptly
+/// on cancellation race this future with their signal.
+pub async fn refresh_stored_oauth_credential(
+    credentials: &Arc<dyn CredentialStore>,
+    provider_id: &str,
+    oauth: Arc<dyn super::types::OAuthAuth>,
+    needs_refresh: Arc<dyn Fn(&OAuthCredential) -> bool + Send + Sync>,
+    signal: &CancellationToken,
+) -> Result<Option<OAuthCredential>, ModelsError> {
+    refresh_stored_oauth_credential_with_timeout(
+        credentials,
+        provider_id,
+        oauth,
+        needs_refresh,
+        signal,
+        DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
+    )
+    .await
+}
+
+/// [`refresh_stored_oauth_credential`] with an injectable refresh timeout
+/// (test seam; public callers use [`DEFAULT_OAUTH_REFRESH_TIMEOUT_MS`]).
+async fn refresh_stored_oauth_credential_with_timeout(
+    credentials: &Arc<dyn CredentialStore>,
+    provider_id: &str,
+    oauth: Arc<dyn super::types::OAuthAuth>,
+    needs_refresh: Arc<dyn Fn(&OAuthCredential) -> bool + Send + Sync>,
+    signal: &CancellationToken,
+    refresh_timeout: std::time::Duration,
+) -> Result<Option<OAuthCredential>, ModelsError> {
+    // The store's modify is queue-cancellable through this token, but the
+    // token is detached once the callback starts (upstream
+    // `removeEventListener("abort", cancelLockWait)`), so a caller abort
+    // during the refresh cannot stop the write.
+    let lock_wait = CancellationToken::new();
+    let detached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let caller = signal.clone();
+        let lock_wait = lock_wait.clone();
+        let detached = detached.clone();
+        tokio::spawn(async move {
+            caller.cancelled().await;
+            if !detached.load(std::sync::atomic::Ordering::SeqCst) {
+                lock_wait.cancel();
+            }
+        })
+    };
+    let options = AuthOperationOptions::with_signal(lock_wait);
+    let provider_id_owned = provider_id.to_owned();
+    let caller_signal = signal.clone();
+    let modify = {
+        let credentials = credentials.clone();
+        let provider_id = provider_id_owned.clone();
+        async move {
+            credentials
+                .modify(
+                    &provider_id,
+                    Arc::new(move |current| {
+                        let oauth = oauth.clone();
+                        let needs_refresh = needs_refresh.clone();
+                        let caller_signal = caller_signal.clone();
+                        let detached = detached.clone();
+                        let provider_id = provider_id_owned.clone();
+                        Box::pin(async move {
+                            detached.store(true, std::sync::atomic::Ordering::SeqCst);
+                            // `signal.throwIfAborted()` after the detach
+                            // (resolve.ts:136).
+                            if caller_signal.is_cancelled() {
+                                return Err(ModelsError::aborted());
+                            }
+                            let Some(Credential::OAuth(current)) = current else {
+                                return Ok(None); // logged out meanwhile
+                            };
+                            if !needs_refresh(&current) {
+                                return Ok(None); // another process/request refreshed
+                            }
+                            // The refresh ignores the caller signal: a rotated
+                            // refresh token must be persisted.
+                            match tokio::time::timeout(
+                                refresh_timeout,
+                                oauth.refresh(&current, None),
+                            )
+                            .await
+                            {
+                                Ok(Ok(refreshed)) => Ok(Some(Credential::OAuth(refreshed))),
+                                Ok(Err(error)) => Err(ModelsError::with_cause(
+                                    ModelsErrorCode::Oauth,
+                                    format!("OAuth refresh failed for {provider_id}"),
+                                    &error.message,
+                                )),
+                                Err(_elapsed) => Err(ModelsError::with_cause(
+                                    ModelsErrorCode::Oauth,
+                                    format!("OAuth refresh failed for {provider_id}"),
+                                    "refresh timed out",
+                                )),
+                            }
+                        })
+                    }),
+                    Some(&options),
+                )
+                .await
+        }
+    };
+    // Spawn so a started refresh survives the caller returning/aborting; the
+    // caller's signal only cancels the wait (upstream's outer promise race
+    // leaves the in-flight refresh running, `bde882c74`).
+    let join = tokio::spawn(modify);
+    let result = tokio::select! {
+        biased;
+        _ = signal.cancelled() => {
+            watcher.abort();
+            // The detached task keeps running and persists the rotated
+            // credential.
+            return Err(ModelsError::aborted());
+        }
+        joined = join => match joined {
+            Ok(inner) => inner,
+            Err(error) => Err(ModelsError::with_cause(
+                ModelsErrorCode::Auth,
+                format!("Credential store modify failed for {provider_id}"),
+                &error.to_string(),
+            )),
+        },
+    };
+    watcher.abort();
+    match result {
+        Ok(post) => Ok(post.and_then(|credential| match credential {
+            Credential::OAuth(credential) => Some(credential),
+            Credential::ApiKey(_) => None,
+        })),
+        Err(error) if error.code == ModelsErrorCode::Oauth => Err(error),
+        Err(error) if error.code == ModelsErrorCode::Aborted => Err(error),
+        Err(error) => Err(ModelsError::with_cause(
+            ModelsErrorCode::Auth,
+            format!("Credential store modify failed for {provider_id}"),
+            &error.message,
+        )),
+    }
+}
 
 /// `overlayEnvAuthContext`: request-scoped env overrides win over the base.
 struct OverlayEnvAuthContext<'a> {
@@ -119,7 +276,10 @@ impl AuthContext for OverlayEnvAuthContext<'_> {
     }
 }
 
-/// `resolveProviderAuth` — see module docs.
+/// `resolveProviderAuth` (auth/resolve.ts:31-93 @ `bde882c74`) — a stored
+/// credential owns the provider (hit stops); ambient/env is consulted only
+/// when nothing is stored. `overrides.signal` cancels the wait but a
+/// started OAuth refresh completes and persists.
 pub async fn resolve_provider_auth(
     provider_id: &str,
     auth: &ProviderAuth,
@@ -155,7 +315,11 @@ pub async fn resolve_provider_auth(
         .await;
     }
 
-    let stored = read_credential(credentials, provider_id).await?;
+    // `operationSignal(overrides?.signal)` (resolve.ts:39): the caller can
+    // cancel the lock wait; a started refresh still persists.
+    let signal = overrides.and_then(|o| o.signal.clone()).unwrap_or_default();
+
+    let stored = read_credential(credentials, provider_id, &signal).await?;
     if let Some(stored) = stored {
         match (&stored, &auth.oauth, &auth.api_key) {
             (Credential::OAuth(oauth_credential), Some(oauth), _) => {
@@ -164,6 +328,7 @@ pub async fn resolve_provider_auth(
                     provider_id,
                     oauth.clone(),
                     oauth_credential,
+                    &signal,
                     overrides.and_then(|o| o.min_oauth_validity_ms),
                     DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
                 )
@@ -219,6 +384,7 @@ async fn resolve_stored_oauth(
     provider_id: &str,
     oauth: Arc<dyn super::types::OAuthAuth>,
     stored: &OAuthCredential,
+    signal: &CancellationToken,
     min_oauth_validity_ms: Option<u64>,
     refresh_timeout: std::time::Duration,
 ) -> Result<Option<AuthResult>, ModelsError> {
@@ -232,76 +398,40 @@ async fn resolve_stored_oauth(
         now_ms() + minimum_validity_ms >= credential.expires
     }
 
-    let credential = stored.clone();
+    let mut credential = stored.clone();
 
     // Valid token → straight to `to_auth`, zero modify/locks
     // (auth/resolve.ts:139 "not expiresSoon" fast path).
-    if !expires_soon(&credential, minimum_validity_ms) {
-        return to_auth_result(&oauth, &credential, provider_id)
-            .await
-            .map(Some);
-    }
-
-    // Optimistic check said expiring; the authoritative check runs under the
-    // lock (auth/resolve.ts:142-163).
-    let provider_id_owned = provider_id.to_owned();
-    let oauth_for_refresh = oauth.clone();
-    let post = credentials
-        .modify(
+    if expires_soon(&credential, minimum_validity_ms) {
+        // Optimistic check said expiring; the authoritative check runs under
+        // the lock (auth/resolve.ts:142-163). The caller's signal cancels
+        // only the lock wait; a started refresh persists (`bde882c74`).
+        let minimum = minimum_validity_ms;
+        let needs_refresh =
+            Arc::new(move |current: &OAuthCredential| expires_soon(current, minimum));
+        let Some(post) = refresh_stored_oauth_credential_with_timeout(
+            credentials,
             provider_id,
-            Arc::new(move |current| {
-                let provider_id = provider_id_owned.clone();
-                let oauth = oauth_for_refresh.clone();
-                let minimum = minimum_validity_ms;
-                let timeout_dur = refresh_timeout;
-                Box::pin(async move {
-                    let Some(Credential::OAuth(current)) = current else {
-                        return Ok(None); // logged out meanwhile
-                    };
-                    if !expires_soon(&current, minimum) {
-                        return Ok(None); // another process/request refreshed
-                    }
-                    // Refresh under a hard timeout (auth/resolve.ts:149-153).
-                    // Upstream: `AbortSignal.any([signal, AbortSignal.timeout(15000)])`.
-                    match tokio::time::timeout(timeout_dur, oauth.refresh(&current, None)).await {
-                        Ok(Ok(refreshed)) => Ok(Some(Credential::OAuth(refreshed))),
-                        Ok(Err(error)) => Err(ModelsError::with_cause(
-                            ModelsErrorCode::Oauth,
-                            format!("OAuth refresh failed for {provider_id}"),
-                            &error.message,
-                        )),
-                        Err(_elapsed) => Err(ModelsError::with_cause(
-                            ModelsErrorCode::Oauth,
-                            format!("OAuth refresh failed for {provider_id}"),
-                            "refresh timed out",
-                        )),
-                    }
-                })
-            }),
-            None,
+            oauth.clone(),
+            needs_refresh,
+            signal,
+            refresh_timeout,
         )
-        .await
-        .map_err(|error| match error.code {
-            ModelsErrorCode::Oauth => error,
-            _ => ModelsError::with_cause(
-                ModelsErrorCode::Auth,
-                format!("Credential store modify failed for {provider_id}"),
-                &error.message,
-            ),
-        })?;
-    let Some(Credential::OAuth(post)) = post else {
-        return Ok(None); // logged out meanwhile
-    };
-    let credential = post;
+        .await?
+        else {
+            return Ok(None); // logged out meanwhile
+        };
+        credential = post;
 
-    // Explicit callers (e.g. bearer-token export) require the requested
-    // minimum after the refresh; the default five-minute path does not
-    // impose a contract (auth/resolve.ts:169-171).
-    if min_oauth_validity_ms.is_some() && expires_soon(&credential, minimum_validity_ms) {
-        return Err(ModelsError::new(
-            ModelsErrorCode::Oauth,
-            format!("OAuth refresh returned a token that expires too soon for {provider_id}"),
-        ));
+        // Explicit callers (e.g. bearer-token export) require the requested
+        // minimum after the refresh; the default five-minute path does not
+        // impose a contract (auth/resolve.ts:169-171).
+        if min_oauth_validity_ms.is_some() && expires_soon(&credential, minimum_validity_ms) {
+            return Err(ModelsError::new(
+                ModelsErrorCode::Oauth,
+                format!("OAuth refresh returned a token that expires too soon for {provider_id}"),
+            ));
+        }
     }
 
     to_auth_result(&oauth, &credential, provider_id)
@@ -353,14 +483,19 @@ async fn resolve_api_key(
 async fn read_credential(
     credentials: &Arc<dyn CredentialStore>,
     provider_id: &str,
+    signal: &CancellationToken,
 ) -> Result<Option<Credential>, ModelsError> {
-    credentials.read(provider_id, None).await.map_err(|error| {
-        ModelsError::with_cause(
-            ModelsErrorCode::Auth,
-            format!("Credential store read failed for {provider_id}"),
-            &error.message,
-        )
-    })
+    let options = AuthOperationOptions::with_signal(signal.clone());
+    credentials
+        .read(provider_id, Some(&options))
+        .await
+        .map_err(|error| {
+            ModelsError::with_cause(
+                ModelsErrorCode::Auth,
+                format!("Credential store read failed for {provider_id}"),
+                &error.message,
+            )
+        })
 }
 
 fn now_ms() -> i64 {
@@ -520,6 +655,9 @@ mod tests {
         block_on_refresh: AtomicBool,
         refresh_started: tokio::sync::Notify,
         refresh_release: tokio::sync::Notify,
+        /// Cancelled from inside `refresh` to simulate the caller aborting
+        /// while the refresh is in flight (`bde882c74`).
+        cancel_on_refresh: Option<CancellationToken>,
     }
 
     impl FakeOAuthAuth {
@@ -531,6 +669,7 @@ mod tests {
                 block_on_refresh: AtomicBool::new(false),
                 refresh_started: tokio::sync::Notify::new(),
                 refresh_release: tokio::sync::Notify::new(),
+                cancel_on_refresh: None,
             }
         }
 
@@ -542,7 +681,15 @@ mod tests {
                 block_on_refresh: AtomicBool::new(false),
                 refresh_started: tokio::sync::Notify::new(),
                 refresh_release: tokio::sync::Notify::new(),
+                cancel_on_refresh: None,
             }
+        }
+
+        /// Cancels `token` from inside `refresh`, as if the caller aborted
+        /// while the refresh was in flight.
+        fn cancelling(mut self, token: CancellationToken) -> Self {
+            self.cancel_on_refresh = Some(token);
+            self
         }
 
         /// Refreshed token expires in `delta_ms` from now.
@@ -577,6 +724,9 @@ mod tests {
             self.refresh_started.notify_one();
             if self.block_on_refresh.load(Ordering::SeqCst) {
                 self.refresh_release.notified().await;
+            }
+            if let Some(token) = &self.cancel_on_refresh {
+                token.cancel();
             }
             match &self.refresh_error {
                 Some(message) => Err(ModelsError::new(ModelsErrorCode::Oauth, message.clone())),
@@ -1240,6 +1390,42 @@ mod tests {
         assert_eq!(error.code, ModelsErrorCode::Auth);
     }
 
+    /// `persists an OAuth refresh that started before the request was
+    /// cancelled` (models-runtime.test.ts @ `bde882c74`): the caller rejects
+    /// with the abort, but the rotated credential is still written.
+    #[tokio::test]
+    async fn persists_an_oauth_refresh_that_started_before_cancellation() {
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("p1", oauth_credential("old-access", 0)).await);
+        let token = CancellationToken::new();
+        let oauth = Arc::new(FakeOAuthAuth::succeeding().cancelling(token.clone()));
+        let auth = provider_auth(None, Some(oauth.clone()));
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let overrides = AuthResolutionOverrides {
+            signal: Some(token.clone()),
+            ..Default::default()
+        };
+
+        let error =
+            resolve_provider_auth("p1", &auth, &credentials, &auth_context, Some(&overrides))
+                .await
+                .expect_err("a cancelled caller rejects");
+        assert_eq!(error.code, ModelsErrorCode::Aborted);
+        assert_eq!(oauth.refresh_calls(), 1);
+
+        // The detached refresh persists the rotated credential.
+        for _ in 0..200 {
+            if let Some(Credential::OAuth(stored)) =
+                credentials.read("p1", None).await.expect("read")
+                && stored.access == "refreshed-access"
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("rotated credential was not persisted");
+    }
+
     /// `bounds_oauth_refreshes_and_releases_the_credential_store_lock_after_timeout`:
     /// inject 50ms timeout, refresh hangs → reject code=oauth; a subsequent
     /// modify completes immediately (lock released).
@@ -1261,6 +1447,7 @@ mod tests {
             "p1",
             oauth.clone(),
             &stored_oauth,
+            &CancellationToken::new(),
             None,
             std::time::Duration::from_millis(50),
         )

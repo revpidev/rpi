@@ -2751,10 +2751,7 @@ async fn tools_cli_modifiers_adjust_default_tools_selection() {
         None,
     )
     .await;
-    assert_eq!(
-        sorted_active(&fixture.session),
-        vec!["bash".to_string()]
-    );
+    assert_eq!(sorted_active(&fixture.session), vec!["bash".to_string()]);
 
     // A plain list replaces the setting (and cannot be overridden by a later
     // reload of the setting).

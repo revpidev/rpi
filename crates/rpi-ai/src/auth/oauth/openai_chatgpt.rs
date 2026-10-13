@@ -35,8 +35,9 @@ use super::pkce::generate_pkce;
 /// `DYNAMIC_CLIENT_ID` — every login registers a new client with this ID;
 /// OpenAI returns the issued client ID in the callback.
 const DYNAMIC_CLIENT_ID: &str = "dynamic_agent_client";
-/// `AGENT_NAME_HINT`.
-const AGENT_NAME_HINT: &str = "Pi";
+/// `AGENT_NAME_HINT` — the app's name in OpenAI's consent screen (upstream
+/// "Pi"; ADR-0001 brand rename). Overridable through `LoginOptions.agentName`.
+const AGENT_NAME_HINT: &str = "rpi";
 /// `AUTHORIZE_URL`.
 const AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/authorize";
 /// `TOKEN_URL`.
@@ -287,15 +288,39 @@ struct ChatGptCallbackServer {
     serve: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Why [`ChatGptCallbackServer::start`] failed.
+enum ChatGptCallbackStartError {
+    /// `EADDRINUSE`: another pending login (another rpi session or the Codex
+    /// CLI) holds the port. The browser callback would reach that listener and
+    /// be rejected with a state mismatch, so login fails before opening the
+    /// browser (#10265 `eeac84ca9`).
+    PortInUse(std::io::Error),
+    /// Any other bind failure; login falls back to the pasted redirect URL.
+    Bind(ModelsError),
+}
+
+impl std::fmt::Display for ChatGptCallbackStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChatGptCallbackStartError::PortInUse(bind_error) => write!(f, "{bind_error}"),
+            ChatGptCallbackStartError::Bind(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 impl ChatGptCallbackServer {
-    async fn start(expected_state: &str, port: u16) -> Result<Self, ModelsError> {
+    async fn start(expected_state: &str, port: u16) -> Result<Self, ChatGptCallbackStartError> {
         let host = default_callback_host();
         let listener = tokio::net::TcpListener::bind((host.as_str(), port))
             .await
             .map_err(|bind_error| {
-                error(format!(
-                    "OAuth callback server failed to bind {host}:{port}: {bind_error}"
-                ))
+                if bind_error.kind() == std::io::ErrorKind::AddrInUse {
+                    ChatGptCallbackStartError::PortInUse(bind_error)
+                } else {
+                    ChatGptCallbackStartError::Bind(error(format!(
+                        "OAuth callback server failed to bind {host}:{port}: {bind_error}"
+                    )))
+                }
             })?;
         let (settle, _) = watch::channel(None);
         let state = Arc::new(CallbackState {
@@ -588,11 +613,19 @@ impl OpenAiChatGptOAuth {
 
         let callback = match ChatGptCallbackServer::start(&state, self.callback_port).await {
             Ok(callback) => Some(callback),
-            Err(start_error) => {
+            // #10265 (`eeac84ca9`): without the server, the browser callback
+            // would reach whatever else holds the port, which rejects it as a
+            // state mismatch. Fail with a clear error instead.
+            Err(ChatGptCallbackStartError::PortInUse(bind_error)) => {
+                return Err(error(format!(
+                    "Port {} is in use, probably by an unfinished login in another rpi session or by the Codex CLI. Cancel that login and try again. ({bind_error})",
+                    self.callback_port
+                )));
+            }
+            Err(ChatGptCallbackStartError::Bind(start_error)) => {
                 interaction.notify(AuthEvent::Info {
                     message: format!(
-                        "Could not listen on {REDIRECT_URI}; paste the final redirect URL to continue. {}",
-                        start_error.message
+                        "Could not listen on {REDIRECT_URI}; paste the final redirect URL to continue. {start_error}"
                     ),
                     links: None,
                 });
@@ -604,7 +637,12 @@ impl OpenAiChatGptOAuth {
             let query = url::form_urlencoded::Serializer::new(String::new())
                 .extend_pairs([
                     ("client_id", DYNAMIC_CLIENT_ID),
-                    ("agent_name_hint", AGENT_NAME_HINT),
+                    (
+                        "agent_name_hint",
+                        options
+                            .and_then(|options| options.agent_name.as_deref())
+                            .unwrap_or(AGENT_NAME_HINT),
+                    ),
                     ("ext_agent_host_id", host_id.as_str()),
                     ("response_type", "code"),
                     ("redirect_uri", REDIRECT_URI),
@@ -980,6 +1018,7 @@ mod tests {
     fn device_options() -> LoginOptions {
         LoginOptions {
             get_device_id: Some(Arc::new(|| DEVICE_ID.to_owned())),
+            agent_name: None,
         }
     }
 
@@ -1029,7 +1068,8 @@ mod tests {
                 .map(|(_, value)| value.into_owned())
         };
         assert_eq!(param("client_id").as_deref(), Some("dynamic_agent_client"));
-        assert_eq!(param("agent_name_hint").as_deref(), Some("Pi"));
+        // ADR-0001 brand rename + #10433 default (upstream "Pi").
+        assert_eq!(param("agent_name_hint").as_deref(), Some("rpi"));
         assert_eq!(
             param("ext_agent_host_id").as_deref(),
             Some(&format!("urn:uuid:{DEVICE_ID}")[..])
@@ -1117,6 +1157,7 @@ mod tests {
             .expect_err("no device id");
         assert!(error.message.contains("requires a device ID"));
         let non_uuid = LoginOptions {
+            agent_name: None,
             get_device_id: Some(Arc::new(|| "not-a-uuid".to_owned())),
         };
         let error = oauth
@@ -1284,9 +1325,11 @@ mod tests {
         assert!(error.message.contains("Login cancelled"), "{error:?}");
     }
 
-    /// A bind failure degrades to the pasted redirect URL.
+    /// #10265 (`eeac84ca9`): a taken callback port fails before opening the
+    /// browser — the callback would otherwise reach the other listener and be
+    /// rejected with a state mismatch.
     #[tokio::test]
-    async fn bind_failure_falls_back_to_the_pasted_redirect_url() {
+    async fn occupied_callback_port_fails_before_opening_the_browser() {
         let mock = MockTokenEndpoint::start(token_response(REQUIRED_SCOPE)).await;
         let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1296,19 +1339,67 @@ mod tests {
             format!("{}/api/accounts/oauth/token", mock.url),
             callback_port,
         );
+        // Callback-first interaction: the flow must not reach the prompt.
         let interaction = TestInteraction::new(Box::new(|_, events| {
             Ok(interactive_callback_url(events, Some("oaiapp_issued")))
         }));
 
-        let credential = oauth
+        let error = oauth
             .login(&interaction, Some(&device_options()))
             .await
-            .expect("manual fallback");
-        assert_eq!(credential.access, "access-token");
-        let notified = interaction.events().iter().any(|event| {
-            matches!(event, AuthEvent::Info { message, .. } if message.contains("Could not listen on"))
-        });
-        assert!(notified, "bind failure must be reported before the prompt");
+            .expect_err("the taken port must fail the login");
+        assert!(
+            error.message.contains("is in use"),
+            "port-in-use message: {}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("another rpi session or by the Codex CLI"),
+            "upstream wording: {}",
+            error.message
+        );
+        assert!(
+            !interaction
+                .events()
+                .iter()
+                .any(|event| matches!(event, AuthEvent::AuthUrl { .. })),
+            "the browser must not be opened"
+        );
+    }
+
+    /// #10433 (`9ad083102`): `LoginOptions.agentName` replaces the agent name.
+    #[tokio::test]
+    async fn login_options_agent_name_overrides_the_hint() {
+        let mock = MockTokenEndpoint::start(token_response(REQUIRED_SCOPE)).await;
+        let oauth = mock.oauth();
+        let interaction = TestInteraction::new(Box::new(|_, events| {
+            Ok(interactive_callback_url(events, Some("oaiapp_issued")))
+        }));
+        let options = LoginOptions {
+            get_device_id: Some(Arc::new(|| DEVICE_ID.to_owned())),
+            agent_name: Some("my-app".to_owned()),
+        };
+
+        oauth
+            .login(&interaction, Some(&options))
+            .await
+            .expect("login");
+        let authorize_url = interaction
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                AuthEvent::AuthUrl { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("auth url");
+        let authorize = url::Url::parse(&authorize_url).expect("authorize");
+        let hint = authorize
+            .query_pairs()
+            .find(|(key, _)| key == "agent_name_hint")
+            .map(|(_, value)| value.into_owned());
+        assert_eq!(hint.as_deref(), Some("my-app"));
     }
 
     /// Manual state mismatches are rejected before any token request.

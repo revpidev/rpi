@@ -677,6 +677,8 @@ fn show_oauth_login_dialog(
                     .session()
                     .settings_manager(|settings| settings.get_or_create_device_id())
             })),
+            // Defaults to rpi's own brand name (`AGENT_NAME_HINT`).
+            agent_name: None,
         };
         let result = runtime
             .login(&provider_id, AuthType::Oauth, &interaction, Some(&options))

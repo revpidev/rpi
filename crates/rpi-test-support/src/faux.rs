@@ -231,7 +231,7 @@ pub struct FauxProviderOptions {
 struct FauxInner {
     pending: std::collections::VecDeque<FauxResponseStep>,
     call_count: u64,
-    prompt_cache: HashMap<String, String>,
+    prompt_cache: HashMap<String, Vec<String>>,
 }
 
 /// Faux provider handle. Clone via `Arc`; the `stream_fn` closure shares the
@@ -446,8 +446,11 @@ impl FauxProvider {
         context: &rpi_ai::types::TranscriptContext,
         options: &StreamOptions,
     ) -> Usage {
-        let prompt_text = serialize_context(context);
-        let prompt_tokens = estimate_tokens(&prompt_text);
+        // One text per message; the whole prompt joins them with blank
+        // lines (`fe11328b0`, usage numbers unchanged).
+        let prompt = prompt_messages(context);
+        let prompt_length = joined_length(&prompt, prompt.len());
+        let prompt_tokens = estimate_len_tokens(prompt_length);
         let output_tokens = estimate_tokens(&assistant_content_to_text(&message.content));
         let mut input = prompt_tokens;
         let mut cache_read = 0u64;
@@ -459,16 +462,16 @@ impl FauxProvider {
             let mut inner = self.lock();
             match inner.prompt_cache.get(session_id) {
                 Some(previous) => {
-                    let cached_chars = common_prefix_len(previous, &prompt_text);
-                    cache_read = estimate_tokens(&previous[..cached_chars]);
-                    cache_write = estimate_tokens(&prompt_text[cached_chars..]);
+                    let cached_chars = common_prompt_prefix_length(previous, &prompt);
+                    cache_read = estimate_len_tokens(cached_chars);
+                    cache_write = estimate_len_tokens(prompt_length - cached_chars);
                     input = prompt_tokens.saturating_sub(cache_read);
                 }
                 None => {
                     cache_write = prompt_tokens;
                 }
             }
-            inner.prompt_cache.insert(session_id.clone(), prompt_text);
+            inner.prompt_cache.insert(session_id.clone(), prompt);
         }
 
         Usage {
@@ -490,7 +493,12 @@ impl FauxProvider {
 
 /// `estimateTokens`: 4 chars per token, rounded up.
 pub fn estimate_tokens(text: &str) -> u64 {
-    text.chars().count().div_ceil(4) as u64
+    estimate_len_tokens(text.chars().count())
+}
+
+/// `Math.ceil(chars / 4)` for an already-counted char length.
+fn estimate_len_tokens(chars: usize) -> u64 {
+    chars.div_ceil(4) as u64
 }
 
 fn content_to_text(content: &[UserContentBlock]) -> String {
@@ -535,11 +543,12 @@ fn tool_result_to_text(message: &ToolResultMessage) -> String {
     parts.join("\n")
 }
 
-/// Port of upstream `serializeContext` (parity-sensitive: cache usage
-/// estimates in session JSONL derive from this exact string shape).
+/// One `role:text` entry per message; the whole prompt joins them with
+/// blank lines (upstream `withUsageEstimate` @ `fe11328b0`). Parity-sensitive:
+/// cache usage estimates in session JSONL derive from this exact shape.
 /// #9548: the system prompt and tools ride the transcript's system messages
 /// (`system:<text>` + `tool±:<json>` markers, faux.ts:197-217).
-fn serialize_context(context: &rpi_ai::types::TranscriptContext) -> String {
+fn prompt_messages(context: &rpi_ai::types::TranscriptContext) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for message in &context.messages {
         let (role, text) = match message {
@@ -582,20 +591,52 @@ fn serialize_context(context: &rpi_ai::types::TranscriptContext) -> String {
         };
         parts.push(format!("{role}:{text}"));
     }
-    parts.join("\n\n")
+    parts
 }
 
-fn common_prefix_len(a: &str, b: &str) -> usize {
-    let mut len = 0;
-    for ((ia, ca), (ib, cb)) in a.char_indices().zip(b.char_indices()) {
+/// `joinedLength` (faux.ts:217-221): length of `messages` joined with blank
+/// lines, in `char`s (the rpi char-count convention).
+fn joined_length(messages: &[String], count: usize) -> usize {
+    let mut length = if count > 0 { (count - 1) * 2 } else { 0 };
+    for message in messages.iter().take(count) {
+        length += message.chars().count();
+    }
+    length
+}
+
+/// `commonPrefixLength` for two strings, in `char`s.
+fn common_prefix_chars(a: &str, b: &str) -> usize {
+    let mut chars = 0;
+    for (ca, cb) in a.chars().zip(b.chars()) {
         if ca != cb {
             break;
         }
-        debug_assert_eq!(ia, ib, "same prefix implies same byte offsets");
-        let _ = ib;
-        len = ia + ca.len_utf8();
+        chars += 1;
     }
-    len
+    chars
+}
+
+/// `commonPromptPrefixLength` (faux.ts:223-233 @ `fe11328b0`): equal
+/// messages are compared whole; characters are compared only from the first
+/// message that differs. The two joined prompts include the `\n\n`
+/// separators around the differing message.
+fn common_prompt_prefix_length(previous: &[String], current: &[String]) -> usize {
+    let mut index = 0;
+    while index < previous.len() && index < current.len() && previous[index] == current[index] {
+        index += 1;
+    }
+    let rest = |messages: &[String]| -> String {
+        if index == messages.len() {
+            return String::new();
+        }
+        let mut rest = String::new();
+        if index > 0 {
+            rest.push_str("\n\n");
+        }
+        rest.push_str(&messages[index..].join("\n\n"));
+        rest
+    };
+    joined_length(previous, index) + common_prefix_chars(&rest(previous), &rest(current))
 }
 
 fn create_error_message(
@@ -1146,6 +1187,65 @@ mod tests {
         assert_eq!(m2.usage.input, 0);
     }
 
+    /// `counts cached characters up to the first difference in the joined
+    /// prompt` (faux-provider.test.ts @ `fe11328b0`): equal messages compare
+    /// whole; characters are compared only from the first differing message.
+    #[tokio::test]
+    async fn test_faux_usage_cache_counts_to_the_first_differing_message() {
+        let provider = FauxProvider::new(FauxProviderOptions::default());
+        provider.set_responses(vec![
+            faux_assistant_message("a", Default::default()).into(),
+            faux_assistant_message("b", Default::default()).into(),
+        ]);
+        let model = provider.get_model(None).unwrap();
+        let options = StreamOptions {
+            session_id: Some("session-1".to_owned()),
+            ..Default::default()
+        };
+        let user = |text: &str| {
+            Message::User(rpi_ai::types::UserMessage {
+                role: rpi_ai::types::UserRole::User,
+                content: rpi_ai::types::UserContent::Text(text.to_owned()),
+                timestamp: 1,
+            })
+        };
+        let context = |messages: Vec<Message>| {
+            rpi_ai::utils::transcript::normalize_context(&rpi_ai::types::Context {
+                system_prompt: None,
+                messages,
+                tools: None,
+            })
+        };
+
+        // "user:hello world" = 16 chars → 4 tokens.
+        let first = collect(provider.stream_fn()(
+            model.clone(),
+            context(vec![user("hello world")]),
+            options.clone(),
+        ))
+        .await;
+        let StreamEvent::Done { message: m1, .. } = first.last().unwrap() else {
+            panic!("expected done");
+        };
+        assert_eq!(m1.usage.cache_write, 4);
+        assert_eq!(m1.usage.cache_read, 0);
+
+        // Joined: 16 + 2 + "user:next" (9) = 27 chars. The first message is
+        // equal, so 16 cached chars → 4 read, ceil(11/4) = 3 write.
+        let second = collect(provider.stream_fn()(
+            model,
+            context(vec![user("hello world"), user("next")]),
+            options,
+        ))
+        .await;
+        let StreamEvent::Done { message: m2, .. } = second.last().unwrap() else {
+            panic!("expected done");
+        };
+        assert_eq!(m2.usage.cache_read, 4);
+        assert_eq!(m2.usage.cache_write, 3);
+        assert_eq!(m2.usage.input, 3); // ceil(27/4) - 4
+    }
+
     #[tokio::test]
     async fn test_faux_cache_disabled_with_retention_none() {
         let provider = FauxProvider::new(FauxProviderOptions::default());
@@ -1314,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_common_prefix_len_multibyte() {
-        assert_eq!(common_prefix_len("héllo", "hélà"), 4); // 'h','é','l' = 1+2+1 bytes
+    fn test_common_prefix_chars_multibyte() {
+        assert_eq!(common_prefix_chars("héllo", "hélà"), 3); // 'h','é','l'
     }
 }

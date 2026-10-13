@@ -697,6 +697,7 @@ where
         ProviderRetryOptions {
             max_retries: options.max_retries,
             max_retry_delay_ms: options.max_retry_delay_ms,
+            ..Default::default()
         },
         options.signal.as_ref(),
     )

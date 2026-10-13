@@ -388,7 +388,11 @@ pub async fn create_agent_session(
     let tool_modifiers: Option<Vec<String>> = options
         .tools
         .as_ref()
-        .filter(|tools| tools.iter().any(|entry| crate::core::tool_names::is_tool_modifier(entry)))
+        .filter(|tools| {
+            tools
+                .iter()
+                .any(|entry| crate::core::tool_names::is_tool_modifier(entry))
+        })
         .cloned();
     let selected_tool_names: Option<Vec<String>> = match &tool_modifiers {
         Some(modifiers) => Some(crate::core::tool_names::apply_tool_modifiers(
@@ -405,13 +409,10 @@ pub async fn create_agent_session(
                 None
             }
         }
-        None => options
-            .tools
-            .clone()
-            .or(match options.no_tools {
-                Some(NoTools::All) => Some(Vec::new()),
-                _ => None,
-            }),
+        None => options.tools.clone().or(match options.no_tools {
+            Some(NoTools::All) => Some(Vec::new()),
+            _ => None,
+        }),
     };
     let excluded_matcher = options
         .exclude_tools
@@ -427,8 +428,8 @@ pub async fn create_agent_session(
                 .is_some_and(|matcher| matcher.matches(name))
         })
         .collect();
-    let uses_default_tools = (options.tools.is_none() || tool_modifiers.is_some())
-        && options.no_tools.is_none();
+    let uses_default_tools =
+        (options.tools.is_none() || tool_modifiers.is_some()) && options.no_tools.is_none();
 
     // convertToLlm with the blockImages filter (sdk.ts:256-290).
     let convert_to_llm = {

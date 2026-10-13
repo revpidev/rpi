@@ -67,10 +67,13 @@ impl RetryError {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProviderRetryOptions {
     pub max_retries: Option<u32>,
     pub max_retry_delay_ms: Option<u64>,
+    /// HTTP statuses that fail at once although the default policy would
+    /// retry them (provider-retry.ts:7, `0cf65d2bf` for the Decisions 504).
+    pub no_retry_statuses: Option<Vec<u16>>,
 }
 
 /// Mirrors the pinned OpenAI/Anthropic SDK retry policy; review when the
@@ -208,6 +211,14 @@ where
                     return Err(RetryError::Aborted);
                 }
                 if retries_remaining == 0 || !is_retryable_provider_error(&error) {
+                    return Err(RetryError::Provider(error));
+                }
+                if error.status.is_some_and(|status| {
+                    options
+                        .no_retry_statuses
+                        .as_ref()
+                        .is_some_and(|statuses| statuses.contains(&status))
+                }) {
                     return Err(RetryError::Provider(error));
                 }
 
@@ -384,6 +395,7 @@ mod tests {
             ProviderRetryOptions {
                 max_retries: Some(1),
                 max_retry_delay_ms: None,
+                ..Default::default()
             },
             None,
         )
@@ -398,6 +410,7 @@ mod tests {
             ProviderRetryOptions {
                 max_retries: Some(3),
                 max_retry_delay_ms: None,
+                ..Default::default()
             },
             None,
         )
@@ -408,6 +421,61 @@ mod tests {
         }
     }
 
+    /// `noRetryStatuses` (provider-retry.ts:7 @ 0cf65d2bf): a normally
+    /// retryable status fails at once when listed (the Decisions 504).
+    #[tokio::test]
+    async fn test_retry_provider_request_no_retry_statuses_fail_fast() {
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let calls2 = calls.clone();
+        let result: Result<(), RetryError> = retry_provider_request(
+            move || {
+                let calls = calls2.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(error(Some(504), &[], "gateway timeout"))
+                }
+            },
+            ProviderRetryOptions {
+                max_retries: Some(3),
+                max_retry_delay_ms: None,
+                no_retry_statuses: Some(vec![504]),
+            },
+            None,
+        )
+        .await;
+        match result {
+            Err(RetryError::Provider(info)) => assert_eq!(info.status, Some(504)),
+            other => panic!("expected provider error, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "504 must not be retried");
+
+        // Without the opt-out the same status retries.
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let calls2 = calls.clone();
+        let result: Result<(), RetryError> = retry_provider_request(
+            move || {
+                let calls = calls2.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(error(Some(504), &[], "gateway timeout"))
+                }
+            },
+            ProviderRetryOptions {
+                max_retries: Some(1),
+                max_retry_delay_ms: None,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "default policy retries 504"
+        );
+    }
+
     #[tokio::test]
     async fn test_retry_provider_request_delay_cap_is_terminal() {
         let result: Result<(), RetryError> = retry_provider_request(
@@ -415,6 +483,7 @@ mod tests {
             ProviderRetryOptions {
                 max_retries: Some(3),
                 max_retry_delay_ms: None,
+                ..Default::default()
             },
             None,
         )

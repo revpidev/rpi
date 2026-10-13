@@ -156,6 +156,31 @@ pub trait Provider: Send + Sync {
         models
     }
 
+    /// `filterAllModels` (models.ts:757 @ `ce8972a0e`): availability filter
+    /// over every model type. The default applies [`Provider::filter_models`]
+    /// to the chat models and passes the other types through (the upstream
+    /// fallback).
+    fn filter_all_models(
+        &self,
+        models: Vec<AnyModel>,
+        credential: Option<&Credential>,
+    ) -> Vec<AnyModel> {
+        let chat: Vec<Model> = models
+            .iter()
+            .filter_map(|model| model.as_chat().cloned())
+            .collect();
+        let filtered = self.filter_models(chat, credential);
+        let available: std::collections::HashSet<&str> =
+            filtered.iter().map(|model| model.id.as_str()).collect();
+        models
+            .into_iter()
+            .filter(|model| match model {
+                AnyModel::Chat(chat) => available.contains(chat.id.as_str()),
+                _ => true,
+            })
+            .collect()
+    }
+
     /// `refreshModels?` (models.ts:104): restore the provider-scoped stored
     /// catalog and optionally fetch a newer list using the effective
     /// credential. Implementations must retain their previous list on failure
@@ -547,6 +572,11 @@ pub type FetchModelsFn = Arc<
 /// (models.ts:751 @ 4181f66).
 pub type FilterModelsFn = Arc<dyn Fn(Vec<Model>, Option<&Credential>) -> Vec<Model> + Send + Sync>;
 
+/// `FilterAllModelsFn` — the `createProvider.filterAllModels` callback over
+/// every model type (models.ts:758 @ `ce8972a0e`).
+pub type FilterAllModelsFn =
+    Arc<dyn Fn(Vec<AnyModel>, Option<&Credential>) -> Vec<AnyModel> + Send + Sync>;
+
 /// `CreateProviderOptions` (models.ts:739-754 @ 4181f66).
 #[derive(Default)]
 pub struct CreateProviderOptions {
@@ -576,6 +606,9 @@ pub struct CreateProviderOptions {
     pub fetch_models: Option<FetchModelsFn>,
     /// Optional model availability filter (models.ts:751).
     pub filter_models_fn: Option<FilterModelsFn>,
+    /// Optional all-type availability filter (models.ts:758). When present it
+    /// wins over [`Provider::filter_all_models`]'s chat fallback.
+    pub filter_all_models_fn: Option<FilterAllModelsFn>,
 }
 
 struct CreatedProvider {
@@ -600,6 +633,8 @@ struct CreatedProvider {
     fetch_models: Option<FetchModelsFn>,
     /// Optional `filterModels`.
     filter_models_fn: Option<FilterModelsFn>,
+    /// Optional `filterAllModels`.
+    filter_all_models_fn: Option<FilterAllModelsFn>,
 }
 
 impl CreatedProvider {
@@ -719,6 +754,31 @@ impl Provider for CreatedProvider {
 
     fn classifier(&self, api: &str) -> Option<Arc<dyn ProviderClassifier>> {
         self.classifiers.get(api).cloned()
+    }
+
+    fn filter_all_models(
+        &self,
+        models: Vec<AnyModel>,
+        credential: Option<&Credential>,
+    ) -> Vec<AnyModel> {
+        if let Some(filter) = &self.filter_all_models_fn {
+            filter(models, credential)
+        } else {
+            let chat: Vec<Model> = models
+                .iter()
+                .filter_map(|model| model.as_chat().cloned())
+                .collect();
+            let filtered = self.filter_models(chat, credential);
+            let available: std::collections::HashSet<&str> =
+                filtered.iter().map(|model| model.id.as_str()).collect();
+            models
+                .into_iter()
+                .filter(|model| match model {
+                    AnyModel::Chat(chat) => available.contains(chat.id.as_str()),
+                    _ => true,
+                })
+                .collect()
+        }
     }
 
     fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
@@ -853,6 +913,7 @@ pub fn create_provider(input: CreateProviderOptions) -> Arc<dyn Provider> {
         dynamic_models: Arc::new(Mutex::new(Vec::new())),
         fetch_models: input.fetch_models,
         filter_models_fn: input.filter_models_fn,
+        filter_all_models_fn: input.filter_all_models_fn,
     })
 }
 
@@ -1193,16 +1254,7 @@ impl Models {
         let mut available = Vec::new();
         for (provider, credential) in providers {
             let models = provider.get_all_models();
-            let available_chat = provider.get_models();
-            let filtered_chat = provider.filter_models(available_chat, credential.as_ref());
-            let available_ids: std::collections::HashSet<&str> = filtered_chat
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect();
-            available.extend(models.into_iter().filter(|model| match model {
-                AnyModel::Chat(chat) => available_ids.contains(chat.id.as_str()),
-                _ => true,
-            }));
+            available.extend(provider.filter_all_models(models, credential.as_ref()));
         }
         Ok(available)
     }
@@ -1644,33 +1696,20 @@ impl Models {
             if signal.is_cancelled() {
                 return Ok(None);
             }
-            let now = now_millis();
-            let signal_clone = signal.clone();
-            let store_options = AuthOperationOptions::with_signal(signal.clone());
-            let post = self
-                .credentials
-                .modify(
-                    provider.id(),
-                    Arc::new(move |current| {
-                        let oauth_auth = oauth_auth.clone();
-                        let signal = signal_clone.clone();
-                        Box::pin(async move {
-                            match current {
-                                Some(Credential::OAuth(current)) if now < current.expires => {
-                                    Ok(None)
-                                }
-                                Some(Credential::OAuth(current)) => oauth_auth
-                                    .refresh(&current, Some(&signal))
-                                    .await
-                                    .map(|credential| Some(Credential::OAuth(credential))),
-                                _ => Ok(None),
-                            }
-                        })
-                    }),
-                    Some(&store_options),
-                )
-                .await?;
-            return Ok(post.filter(|credential| matches!(credential, Credential::OAuth(_))));
+            // A refresh that has started survives cancellation or a
+            // superseding model refresh, so a rotated refresh token is always
+            // persisted (models.ts:620-636 @ `bde882c74`).
+            let needs_refresh =
+                Arc::new(|current: &crate::auth::OAuthCredential| now_millis() >= current.expires);
+            let post = crate::auth::resolve::refresh_stored_oauth_credential(
+                &self.credentials,
+                provider.id(),
+                oauth_auth,
+                needs_refresh,
+                signal,
+            )
+            .await?;
+            return Ok(post.map(Credential::OAuth));
         }
 
         let Some(api_key) = provider.auth().api_key.clone() else {

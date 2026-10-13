@@ -43,9 +43,14 @@ fn retryable_provider_error_pattern() -> &'static Regex {
     static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         build_provider_error_pattern(&[
             "overloaded",
+            // #10543 (8b5708dbb): transient server-busy errors.
+            "server_busy",
+            "servers are currently busy",
             // #9669 (e98f287ee): Azure peak-load capacity errors are
             // transient — retry instead of surfacing a hard failure.
             "currently experiencing high demand",
+            // #10278 (3874b3e98): transient provider capacity errors.
+            "model is at capacity",
             "rate.?limit",
             "too many requests",
             "429",
@@ -86,6 +91,10 @@ fn retryable_provider_error_pattern() -> &'static Regex {
             "stream ended before message_stop",
             "stream ended before a terminal response event",
             "http2 request did not get a response",
+            // #10379 (5b6c792b4): Node ERR_HTTP2_STREAM_CANCEL — the HTTP/2
+            // session died before the request was sent, e.g. after the
+            // Bedrock SDK's 5-minute session timeout.
+            "pending stream has been canceled",
             "retry delay",
             "you can retry your request",
             "try your request again",
@@ -298,6 +307,38 @@ mod tests {
         assert!(is_retryable_assistant_error(&assistant(
             StopReason::Error,
             Some(AZURE_PEAK_LOAD_ERROR)
+        )));
+    }
+
+    /// #10278 (3874b3e98) / #10543 (8b5708dbb) / #10379 (5b6c792b4):
+    /// capacity, server-busy, and HTTP/2 pending-stream errors retry.
+    #[test]
+    fn test_retryable_capacity_busy_and_http2_errors() {
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("Selected model is at capacity. Please try again later.")
+        )));
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("server_busy")
+        )));
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("Servers are currently busy. Please retry.")
+        )));
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("The pending stream has been canceled (caused by: connect ETIMEDOUT)")
+        )));
+        // #10487 (7fb59f995): Mistral's finish_reason "error" message.
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("Provider stopped with: error (server error)")
+        )));
+        // The non-retryable limit pattern still wins where it matches.
+        assert!(!is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("quota exceeded; model is at capacity")
         )));
     }
 

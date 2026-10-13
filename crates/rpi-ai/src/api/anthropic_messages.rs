@@ -2064,6 +2064,7 @@ async fn run(
     let retry_options = ProviderRetryOptions {
         max_retries: options.stream.max_retries,
         max_retry_delay_ms: options.stream.max_retry_delay_ms,
+        ..Default::default()
     };
     let initial_federation_token = federation_token.clone();
     let response = retry_provider_request(

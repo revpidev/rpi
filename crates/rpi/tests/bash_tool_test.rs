@@ -833,11 +833,8 @@ mod bash_executor_tests {
 
     #[tokio::test]
     async fn test_split_color_code_right_after_esc() {
-        let (output, streamed) = run_chunks(vec![
-            b"before\x1b".to_vec(),
-            b"[32mafter\n".to_vec(),
-        ])
-        .await;
+        let (output, streamed) =
+            run_chunks(vec![b"before\x1b".to_vec(), b"[32mafter\n".to_vec()]).await;
         assert_eq!(output, "beforeafter\n");
         assert_eq!(streamed, "beforeafter\n");
     }

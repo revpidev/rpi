@@ -226,6 +226,7 @@ async fn generate_images_inner(
         ProviderRetryOptions {
             max_retries: options.and_then(|options| options.max_retries),
             max_retry_delay_ms: options.and_then(|options| options.max_retry_delay_ms),
+            ..Default::default()
         },
         options.and_then(|options| options.signal.as_ref()),
     )

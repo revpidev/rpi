@@ -1,7 +1,9 @@
-//! Port of `packages/ai/src/utils/estimate.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/utils/estimate.ts` @ `abe508e1b` (v1.1.0,
+//! `27075fe07`).
 //!
-//! chars/4 heuristic token estimation with usage-anchor trailing estimation.
-//! Do not "improve" — the constants are pinned behavior (ADR-0002 §4).
+//! chars/3.5 heuristic token estimation with usage-anchor trailing
+//! estimation. Do not "improve" — the constants are pinned behavior
+//! (ADR-0002 §4).
 //!
 //! Intentional differences: JS `String.length` counts UTF-16 code units;
 //! `chars` here counts `char`s. For BMP text they are identical; for astral
@@ -13,8 +15,17 @@ use crate::types::{
     TranscriptContext, Usage, UserContent, UserContentBlock,
 };
 
-const CHARS_PER_TOKEN: usize = 4;
+/// #10497 (27075fe07): 3.5 characters per token, leaving more room when
+/// calculating output limits. `ceil(chars * 2 / 7)`, exact integer
+/// arithmetic.
+const CHARS_NUMERATOR: u64 = 2;
+const CHARS_DENOMINATOR: u64 = 7;
 const ESTIMATED_IMAGE_CHARS: usize = 4800;
+
+/// `Math.ceil(chars / 3.5)` for a non-negative integer count.
+fn chars_to_tokens(chars: usize) -> u64 {
+    (chars as u64 * CHARS_NUMERATOR).div_ceil(CHARS_DENOMINATOR)
+}
 
 /// `calculateContextTokens`: `totalTokens` when set, else the component sum.
 pub fn calculate_context_tokens(usage: &Usage) -> u64 {
@@ -59,7 +70,7 @@ fn image_chars(_image: &ImageContent) -> usize {
 }
 
 pub fn estimate_text_tokens(text: &str) -> u64 {
-    (char_len(text) as u64).div_ceil(CHARS_PER_TOKEN as u64)
+    chars_to_tokens(char_len(text))
 }
 
 pub fn estimate_message_tokens(message: &Message) -> u64 {
@@ -104,7 +115,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
             })
             .sum(),
     };
-    (chars as u64).div_ceil(CHARS_PER_TOKEN as u64)
+    chars_to_tokens(chars)
 }
 
 fn last_assistant_usage_info(messages: &[Message]) -> Option<(&Usage, usize)> {
