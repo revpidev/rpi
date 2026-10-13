@@ -317,7 +317,7 @@ pub fn parse_args(args: &[String]) -> Args {
         } else if arg == "--no-extensions" || arg == "-ne" {
             result.no_extensions = true;
         } else if arg == "--no-mcp" {
-            // `--no-mcp` (args.ts:184-185 @ 04b97ef00): disable the built-in
+            // `--no-mcp` (cli/args.ts:191-192 @ 04b97ef00): disable the built-in
             // MCP support for one run (consumed by
             // `crate::extensions::without_disabled_builtins`).
             result.no_mcp = true;
