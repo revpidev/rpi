@@ -39,6 +39,7 @@ pub mod mermaid;
 pub mod mouse;
 pub mod native_modifiers;
 pub mod oklab;
+pub mod program_status;
 pub mod recovery;
 pub mod stdin_buffer;
 pub mod terminal;

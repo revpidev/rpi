@@ -125,6 +125,7 @@ use crate::modes::interactive::components::{
 use crate::modes::interactive::custom_editor::{CustomEditor, CustomEditorRegion, EscapeHandler};
 use crate::modes::interactive::footer::{FooterComponent, FooterDataProvider};
 use crate::modes::interactive::header::{ExpandableText, build_builtin_header};
+use crate::modes::interactive::program_status::{BlockedStatus, ProgramStatusReporter};
 use crate::modes::interactive::theme::markdown_theme;
 use crate::tools::truncate::TruncationResult;
 
@@ -403,7 +404,13 @@ pub(crate) enum UiCommand {
         event: String,
         error: String,
     },
-    AgentSettled,
+    AgentSettled {
+        /// Captured at emission time from `AgentSession::is_abort_requested`
+        /// (`_agentRunAbortRequested`, agent-session.ts:1079): the internal
+        /// precursor of the V17-06 `agent_settled.aborted` event field.
+        /// Aborted runs report `idle` instead of `done`.
+        aborted: bool,
+    },
     CompactionStart(CompactionReason),
     CompactionEnd {
         reason: CompactionReason,
@@ -577,7 +584,11 @@ impl From<AgentSessionEvent> for UiCommand {
                 }
             },
             AgentSessionEvent::Session(event) => match event {
-                crate::core::agent_session::SessionEvent::AgentSettled => UiCommand::AgentSettled,
+                crate::core::agent_session::SessionEvent::AgentSettled => {
+                    // Filled in by `subscribe_to_agent` at emission time; the
+                    // plain conversion cannot see the session.
+                    UiCommand::AgentSettled { aborted: false }
+                }
                 crate::core::agent_session::SessionEvent::QueueUpdate {
                     steering,
                     follow_up,
@@ -1404,6 +1415,10 @@ pub(crate) struct InteractiveUi {
     /// `apply_runtime_settings` refreshes it on session rebind
     /// (interactive-mode.ts:1715).
     output_pad: AtomicUsize,
+    /// `programStatus` (interactive-mode.ts:550-554): reports working,
+    /// blocked, done, and error states to terminals that support OSC 7501.
+    /// Single status authority for the interactive layer (02 §1.3 裁决 3).
+    pub(crate) program_status: Mutex<ProgramStatusReporter>,
     /// `hiddenThinkingLabel` (interactive-mode.ts:351-352). Mutex: the T15
     /// extension UI bridge updates it (`setHiddenThinkingLabel`).
     hidden_thinking_label: Mutex<String>,
@@ -1982,9 +1997,22 @@ impl InteractiveUi {
     pub(crate) fn subscribe_to_agent(&self) -> Box<dyn FnOnce() + Send> {
         let queue = Arc::clone(&self.event_queue);
         let render_handle = self.render_handle.clone();
+        // `agent_settled` carries the run's abort request: read it at
+        // emission time inside the synchronous subscriber (the event gains
+        // the field only with V17-06's ABI payload).
+        let session = self.session().downgrade();
         self.session()
             .subscribe(Arc::new(move |event: AgentSessionEvent| {
-                let command = UiCommand::from(event);
+                let command = match &event {
+                    AgentSessionEvent::Session(
+                        crate::core::agent_session::SessionEvent::AgentSettled,
+                    ) => UiCommand::AgentSettled {
+                        aborted: session
+                            .upgrade()
+                            .is_some_and(|session| session.is_abort_requested()),
+                    },
+                    _ => UiCommand::from(event),
+                };
                 lock(&queue).push_back(command);
                 render_handle.request_render();
             }))
@@ -2027,6 +2055,10 @@ impl InteractiveUi {
                     self.ui
                         .with_terminal(|terminal| terminal.set_progress(true));
                 }
+                // `programStatus.handleEvent` (program-status-reporter.ts:
+                // 36-39): run result defaults to done.
+                lock(&self.program_status).handle_agent_start();
+                self.report_program_status();
                 // Restore the main escape handler if the retry handler is
                 // still active (the retry success event fires later, but the
                 // main handler is needed now).
@@ -2076,6 +2108,9 @@ impl InteractiveUi {
                 let _ = name;
                 self.update_terminal_title();
                 Component::invalidate(&mut *lock(&self.footer));
+                // The session name is part of working/done reports
+                // (program-status-reporter.ts:70-72).
+                self.report_program_status();
                 self.render_handle.request_render();
             }
             UiCommand::ThinkingLevelChanged(level) => {
@@ -2174,6 +2209,10 @@ impl InteractiveUi {
                     return;
                 }
                 if let AgentMessage::Assistant(assistant) = &message {
+                    // `programStatus.handleEvent` (program-status-reporter.ts:
+                    // 40-46): the latest response decides the outcome.
+                    lock(&self.program_status).handle_message_end(assistant);
+                    self.report_program_status();
                     let streamed = lock(&self.streaming).take();
                     if let Some(track) = streamed {
                         let mut component = lock(&track.handle);
@@ -2301,9 +2340,12 @@ impl InteractiveUi {
                 lock(&self.pending_tools).clear();
                 self.render_handle.request_render();
             }
-            UiCommand::AgentSettled => {
+            UiCommand::AgentSettled { aborted } => {
                 // agent_settled (interactive-mode.ts:3065-3067): extension
-                // shutdown requests complete here.
+                // shutdown requests complete here; the program status reports
+                // idle for aborted runs (program-status-reporter.ts:66-69).
+                lock(&self.program_status).handle_agent_settled(aborted);
+                self.report_program_status();
                 if self.shutdown_requested.load(Ordering::Relaxed) {
                     let _ = self.shutdown_tx.send(true);
                 }
@@ -2314,6 +2356,10 @@ impl InteractiveUi {
                     self.ui
                         .with_terminal(|terminal| terminal.set_progress(true));
                 }
+                // `programStatus.handleEvent` (program-status-reporter.ts:
+                // 47-49): compaction reports working.
+                lock(&self.program_status).handle_compaction_start();
+                self.report_program_status();
                 // Keep the editor active; submissions are queued during
                 // compaction.
                 let mut editor = lock(&self.editor);
@@ -2345,6 +2391,16 @@ impl InteractiveUi {
                 // (interactive-mode.ts:3117); currently unwired — see the
                 // known gap in `flush_compaction_queue` (D-019).
                 let _ = will_retry;
+                // `programStatus.handleEvent` (program-status-reporter.ts:
+                // 50-65): a failed recovery compaction ends the run unless a
+                // later response succeeds; a manual compaction reports its
+                // own result.
+                lock(&self.program_status).handle_compaction_end(
+                    reason,
+                    aborted,
+                    error_message.as_deref(),
+                );
+                self.report_program_status();
                 // compaction_end (interactive-mode.ts:3083-3120).
                 if self.show_terminal_progress {
                     self.ui
@@ -4284,6 +4340,42 @@ impl InteractiveUi {
         self.ui.with_terminal(|terminal| terminal.set_title(&title));
     }
 
+    /// Send the current program status to the terminal (OSC 7501). Called
+    /// after every status-relevant event; [`ProgramStatusReporter::report`]
+    /// dedups so repeated calls are silent (interactive-mode.ts:550-554,
+    /// 1000, 2729, 3412, 6321).
+    pub(crate) fn report_program_status(&self) {
+        let session_name = {
+            let session_manager = self.session().session_manager();
+            let manager = lock(&session_manager);
+            manager.get_session_name()
+        };
+        let status = lock(&self.program_status).report(session_name.as_deref());
+        if let Some(status) = status {
+            self.ui
+                .with_terminal(|terminal| terminal.set_program_status(&status));
+        }
+    }
+
+    /// `programStatus.setBlocked(source, status)` + report: report `blocked`
+    /// while a dialog waits for the user; `None` clears the source
+    /// (interactive-mode.ts:2729/2742/2810/2823/2854/2866/6321/6334).
+    pub(crate) fn set_program_status_blocked(
+        &self,
+        source: &str,
+        status: Option<BlockedStatus>,
+    ) {
+        lock(&self.program_status).set_blocked(source, status);
+        self.report_program_status();
+    }
+
+    /// `programStatus.reset()` (interactive-mode.ts:2095): forget the previous
+    /// session's run on rebind.
+    pub(crate) fn reset_program_status(&self) {
+        lock(&self.program_status).reset();
+        self.report_program_status();
+    }
+
     /// `updateAvailableProviderCount` (interactive-mode.ts:4364-4371).
     fn update_available_provider_count(&self) {
         let models = if !self.session().scoped_models().is_empty() {
@@ -4901,6 +4993,7 @@ impl InteractiveMode {
             output_pad: AtomicUsize::new(
                 session.settings_manager(|settings| settings.get_output_pad()) as usize,
             ),
+            program_status: Mutex::new(ProgramStatusReporter::new()),
             hidden_thinking_label: Mutex::new("Thinking...".to_string()),
             working_visible: AtomicBool::new(true),
             working_message: Mutex::new(None),
@@ -5276,6 +5369,9 @@ impl InteractiveMode {
 
         // Start the UI (interactive-mode.ts:726).
         self.ui.start();
+        // `this.programStatus.report()` (interactive-mode.ts:1000): the
+        // resting `idle` status reaches the terminal from startup on.
+        self.ui_state.report_program_status();
 
         // Theme file watcher (theme.ts:886-957): a polling thread detects
         // custom-theme file changes and queues `UiCommand::ThemeChanged`;
@@ -6482,7 +6578,7 @@ mod tests {
             UiCommand::ThinkingLevelChanged(_) => "thinking_level_changed",
             UiCommand::BashExecutionUpdate { .. } => "bash_execution_update",
             UiCommand::ExtensionError { .. } => "extension_error",
-            UiCommand::AgentSettled => "agent_settled",
+            UiCommand::AgentSettled { .. } => "agent_settled",
             UiCommand::CompactionStart(_) => "compaction_start",
             UiCommand::CompactionEnd { .. } => "compaction_end",
             UiCommand::AutoRetryStart { .. } => "auto_retry_start",

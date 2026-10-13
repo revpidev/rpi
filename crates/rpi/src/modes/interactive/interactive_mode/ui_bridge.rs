@@ -45,6 +45,8 @@ use crate::modes::interactive::components::extension_input::ExtensionInputCompon
 use crate::modes::interactive::components::extension_selector::{
     ExtensionSelectorComponent, ExtensionSelectorOptions,
 };
+use crate::modes::interactive::program_status::BlockedStatus;
+use rpi_tui::program_status::ProgramStatusKind;
 
 /// TUI entry wrapper forwarding component calls and focus (the
 /// startup_ui.rs `SelectorRegion` pattern).
@@ -132,6 +134,7 @@ impl InteractiveUiBridge {
         entry: super::SharedComponent,
         opts: Option<UiDialogOptions>,
         rx: oneshot::Receiver<Option<String>>,
+        blocked: BlockedStatus,
     ) -> Option<String> {
         let ui = self.ui()?;
         // ADR-0024 C1 (R-U2.2): the four bridge dialogs blur the active
@@ -139,6 +142,10 @@ impl InteractiveUiBridge {
         // focus afterwards (unless it was hidden meanwhile, R-U10.2).
         ui.component_registry.dialog_opened();
         ui.show_selector(entry.clone());
+        // `programStatus.setBlocked("extension-dialog", blocked)`
+        // (interactive-mode.ts:2729): the OSC 7501 report says what the
+        // dialog waits for while it is open.
+        ui.set_program_status_blocked("extension-dialog", Some(blocked));
         let result = match opts.and_then(|o| o.timeout) {
             Some(ms) if ms > 0 => {
                 match tokio::time::timeout(std::time::Duration::from_millis(ms), rx).await {
@@ -154,14 +161,59 @@ impl InteractiveUiBridge {
         // selector (built-in, or another extension's dialog) may own the
         // editor region; an unconditional hide would close the replacement.
         // The component focus restore shares that guard: a superseded dialog
-        // must not remount/refocus the component over the replacement.
+        // must not remount/refocus the component over the replacement. The
+        // blocked status clears under the same guard so a superseded dialog
+        // cannot clear its replacement's `blocked` report.
         if let Some(ui) = self.ui()
             && ui.selector_is_current(&entry)
         {
             ui.hide_selector_if_current(&entry);
+            ui.set_program_status_blocked("extension-dialog", None);
             ui.component_registry.dialog_closed();
         }
         result
+    }
+
+    /// Shared `showExtensionSelector` body with the blocked report
+    /// (interactive-mode.ts:2690-2745).
+    async fn show_extension_selector(
+        &self,
+        title: &str,
+        options: &[String],
+        opts: Option<UiDialogOptions>,
+        blocked: BlockedStatus,
+    ) -> Option<String> {
+        let ui = self.ui()?;
+        let (tx, rx) = oneshot::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let selector = Arc::new(Mutex::new(ExtensionSelectorComponent::new(
+            Arc::clone(&lock(&ui.theme)),
+            Some(title.to_owned()),
+            options.to_vec(),
+            {
+                let tx = tx.clone();
+                Box::new(move |selected: Option<String>| {
+                    if let Some(tx) = lock(&tx).take() {
+                        let _ = tx.send(selected);
+                    }
+                })
+            },
+            {
+                let tx = tx.clone();
+                Box::new(move || {
+                    if let Some(tx) = lock(&tx).take() {
+                        let _ = tx.send(None);
+                    }
+                })
+            },
+            Some(ExtensionSelectorOptions {
+                render_handle: Some(ui.render_handle.clone()),
+                timeout_ms: opts.and_then(|o| o.timeout),
+                on_toggle_tools_expanded: None,
+            }),
+        )));
+        let entry = super::shared_component_from_boxed(Box::new(DialogRegion(selector)));
+        self.mount_dialog(entry, opts, rx, blocked).await
     }
 
     /// Build the component for a widget content against the CURRENT theme
@@ -371,46 +423,34 @@ impl UiBridge for InteractiveUiBridge {
         options: &[String],
         opts: Option<UiDialogOptions>,
     ) -> Option<String> {
-        let ui = self.ui()?;
-        let (tx, rx) = oneshot::channel();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-        let selector = Arc::new(Mutex::new(ExtensionSelectorComponent::new(
-            Arc::clone(&lock(&ui.theme)),
-            Some(title.to_owned()),
-            options.to_vec(),
-            {
-                let tx = tx.clone();
-                Box::new(move |selected: Option<String>| {
-                    if let Some(tx) = lock(&tx).take() {
-                        let _ = tx.send(selected);
-                    }
-                })
+        self.show_extension_selector(
+            title,
+            options,
+            opts,
+            BlockedStatus {
+                kind: ProgramStatusKind::Question,
+                message: title.to_owned(),
             },
-            {
-                let tx = tx.clone();
-                Box::new(move || {
-                    if let Some(tx) = lock(&tx).take() {
-                        let _ = tx.send(None);
-                    }
-                })
-            },
-            Some(ExtensionSelectorOptions {
-                render_handle: Some(ui.render_handle.clone()),
-                timeout_ms: opts.and_then(|o| o.timeout),
-                on_toggle_tools_expanded: None,
-            }),
-        )));
-        let entry = super::shared_component_from_boxed(Box::new(DialogRegion(selector)));
-        self.mount_dialog(entry, opts, rx).await
+        )
+        .await
     }
 
     /// `showExtensionConfirm` (interactive-mode.ts:2262-2269): a Yes/No
-    /// selector over `"{title}\n{message}"`.
+    /// selector over `"{title}\n{message}"`; the blocked report is
+    /// `permission` with just the title.
     async fn confirm(&self, title: &str, message: &str, opts: Option<UiDialogOptions>) -> bool {
         let combined = format!("{title}\n{message}");
-        self.select(&combined, &["Yes".to_owned(), "No".to_owned()], opts)
-            .await
-            .as_deref()
+        self.show_extension_selector(
+            &combined,
+            &["Yes".to_owned(), "No".to_owned()],
+            opts,
+            BlockedStatus {
+                kind: ProgramStatusKind::Permission,
+                message: title.to_owned(),
+            },
+        )
+        .await
+        .as_deref()
             == Some("Yes")
     }
 
@@ -447,7 +487,16 @@ impl UiBridge for InteractiveUiBridge {
             None,
         )));
         let entry = super::shared_component_from_boxed(Box::new(DialogRegion(input)));
-        self.mount_dialog(entry, opts, rx).await
+        self.mount_dialog(
+            entry,
+            opts,
+            rx,
+            BlockedStatus {
+                kind: ProgramStatusKind::Question,
+                message: title.to_owned(),
+            },
+        )
+        .await
     }
 
     /// `showExtensionEditor` (interactive-mode.ts:2332-2400).
@@ -479,7 +528,16 @@ impl UiBridge for InteractiveUiBridge {
             None,
         )));
         let entry = super::shared_component_from_boxed(Box::new(DialogRegion(editor)));
-        self.mount_dialog(entry, None, rx).await
+        self.mount_dialog(
+            entry,
+            None,
+            rx,
+            BlockedStatus {
+                kind: ProgramStatusKind::Question,
+                message: title.to_owned(),
+            },
+        )
+        .await
     }
 
     /// `notify` (interactive-mode.ts:2177-2185 area): non-blocking status

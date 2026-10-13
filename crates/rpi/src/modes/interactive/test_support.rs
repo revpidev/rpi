@@ -68,6 +68,7 @@ pub(crate) struct TestTerminal {
     resize_handler: Arc<Mutex<Option<ResizeHandler>>>,
     title: Arc<Mutex<String>>,
     progress: Arc<Mutex<bool>>,
+    program_status: Arc<Mutex<Vec<rpi_tui::program_status::ProgramStatus>>>,
 }
 
 impl TestTerminal {
@@ -78,6 +79,7 @@ impl TestTerminal {
             resize_handler: Arc::new(Mutex::new(None)),
             title: Arc::new(Mutex::new(String::new())),
             progress: Arc::new(Mutex::new(false)),
+            program_status: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -108,6 +110,14 @@ impl TestTerminal {
     #[allow(dead_code)]
     pub(crate) fn progress(&self) -> bool {
         *self.progress.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Program statuses reported through OSC 7501 so far (V17-05).
+    pub(crate) fn program_statuses(&self) -> Vec<rpi_tui::program_status::ProgramStatus> {
+        self.program_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Whether `start` was called (input handler installed).
@@ -177,6 +187,13 @@ impl Terminal for TestTerminal {
 
     fn set_progress(&mut self, active: bool) {
         *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = active;
+    }
+
+    fn set_program_status(&mut self, status: &rpi_tui::program_status::ProgramStatus) {
+        self.program_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(status.clone());
     }
 
     fn pump(&mut self, _timeout: Option<Duration>) -> bool {

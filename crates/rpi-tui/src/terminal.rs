@@ -4,7 +4,8 @@
 //! (upstream `ProcessTerminal`): raw mode, stdin reading, Kitty keyboard
 //! protocol negotiation with modifyOtherKeys fallback (DA response without a
 //! Kitty answer falls back immediately, no startup timeout), bracketed paste,
-//! OSC 9;4 taskbar progress, and terminal state restore on `stop()`.
+//! OSC 9;4 taskbar progress, OSC 7501 program status (V17-05, `@ abe508e1b`),
+//! and terminal state restore on `stop()`.
 //!
 //! Intentional differences:
 //! - Timers become explicit deadlines, matching `StdinBuffer`
@@ -108,6 +109,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::keys::set_kitty_protocol_active;
 use crate::native_modifiers::{ModifierKey, is_native_modifier_pressed};
+use crate::program_status::{
+    PROGRAM_STATUS_QUERY, ProgramStatus, format_program_status, is_program_status_reply,
+};
 use crate::stdin_buffer::{StdinBuffer, StdinBufferEvent, StdinBufferOptions};
 
 /// `TERMINAL_PROGRESS_KEEPALIVE_MS` (terminal.ts:11).
@@ -133,6 +137,9 @@ const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT: Duration = Duration::from_mil
 /// from `rpi::core::environment::ENV_TUI_WRITE_LOG` (rpi-tui cannot depend
 /// on rpi, coding-standards §2.2).
 const ENV_TUI_WRITE_LOG: &str = "RPI_TUI_WRITE_LOG";
+/// `PI_PROGRAM_STATUS` (terminal.ts:294) — Rpi rename (ADR-0001): `1` forces
+/// OSC 7501 support, `0` disables it, unset probes the terminal.
+const ENV_PROGRAM_STATUS: &str = "RPI_PROGRAM_STATUS";
 
 /// `KeyboardProtocolNegotiationSequence` (terminal.ts:19-21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,6 +324,17 @@ pub trait Terminal {
     /// Progress indicator (OSC 9;4) (upstream `setProgress(active)`).
     fn set_progress(&mut self, active: bool);
 
+    /// Report what the program is doing (OSC 7501). Sent only to terminals
+    /// that support it; the latest status is re-sent when support is
+    /// confirmed or the terminal restarts (upstream `setProgramStatus(status)`,
+    /// terminal.ts:122-125).
+    ///
+    /// Additive default no-op: the upstream `Terminal` interface makes the
+    /// member mandatory ([BREAKING] for TS implementors), Rust trait objects
+    /// keep existing implementations source-compatible; terminals without
+    /// OSC 7501 support stay silent exactly like the upstream contract.
+    fn set_program_status(&mut self, _status: &ProgramStatus) {}
+
     /// Rust addition (explicit-deadline replacement for the upstream timers,
     /// see header note): the next instant at which [`Terminal::tick`] has
     /// work to do — StdinBuffer tail flush, keyboard-protocol fragment flush
@@ -415,10 +433,15 @@ impl TerminalEventSource {
 
 /// Result of [`ProcessTerminal::read_keyboard_protocol_negotiation_sequence`];
 /// the upstream `KeyboardProtocolNegotiationSequence | "pending" | undefined`
-/// union (terminal.ts:254).
+/// union (terminal.ts:254). `Sequence` carries the full (possibly
+/// reassembled) sequence so a not-consumed DA reply can be forwarded whole
+/// (terminal.ts:190 `negotiation?.sequence ?? sequence`).
 enum NegotiationRead {
     Pending,
-    Sequence(KeyboardProtocolNegotiationSequence),
+    Sequence {
+        parsed: KeyboardProtocolNegotiationSequence,
+        sequence: String,
+    },
     NotNegotiation,
 }
 
@@ -481,6 +504,22 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
     stdin_buffer: Option<StdinBuffer>,
     /// Explicit-deadline form of `progressInterval`.
     progress_keepalive_deadline: Option<Instant>,
+    /// Latest program status, kept across `stop()` so `start()` can report it
+    /// again (terminal.ts:165).
+    program_status: Option<ProgramStatus>,
+    /// Whether the terminal confirmed OSC 7501 support since the last
+    /// `start()`, or `RPI_PROGRAM_STATUS=1` (terminal.ts:166-167).
+    program_status_supported: bool,
+    /// The support query was sent and its DA1 sentinel has not arrived yet
+    /// (terminal.ts:169).
+    program_status_query_pending: bool,
+    /// `RPI_PROGRAM_STATUS` captured at construction (upstream reads
+    /// `process.env.PI_PROGRAM_STATUS` at query time; the value cannot change
+    /// between construction and `start()` in practice). `None` = probe.
+    program_status_env: Option<String>,
+    /// DA1 replies owed to keyboard-protocol queries; later DA1 replies
+    /// answer other queries and are forwarded (terminal.ts:160-161).
+    pending_keyboard_protocol_device_attributes: u32,
     event_tx: Option<mpsc::Sender<TerminalEvent>>,
     event_rx: Option<TerminalEventSource>,
     resize_task: Option<tokio::task::JoinHandle<()>>,
@@ -526,6 +565,11 @@ impl<W: Write> ProcessTerminal<W> {
             keyboard_protocol_negotiation_flush_deadline: None,
             stdin_buffer: None,
             progress_keepalive_deadline: None,
+            program_status: None,
+            program_status_supported: false,
+            program_status_query_pending: false,
+            program_status_env: std::env::var(ENV_PROGRAM_STATUS).ok(),
+            pending_keyboard_protocol_device_attributes: 0,
             event_tx: None,
             event_rx: None,
             resize_task: None,
@@ -557,6 +601,10 @@ impl<W: Write> ProcessTerminal<W> {
     /// protocol; receiving DA before a Kitty response enables the
     /// modifyOtherKeys fallback without a startup timeout.
     ///
+    /// The OSC 7501 program status query shares the DA sentinel: a terminal
+    /// that supports it replies before DA. `RPI_PROGRAM_STATUS=1` or `0`
+    /// skips the query (terminal.ts:285-299).
+    ///
     /// The upstream `process.stdin.on("data", ...)` wiring corresponds to the
     /// reader thread + channel set up in `start()`.
     fn query_and_enable_kitty_protocol(&mut self) {
@@ -571,12 +619,34 @@ impl<W: Write> ProcessTerminal<W> {
             ..StdinBufferOptions::default()
         }));
         self.keyboard_protocol_pushed = true;
+        self.pending_keyboard_protocol_device_attributes += 1;
         self.clear_keyboard_protocol_negotiation_buffer();
-        // `KITTY_KEYBOARD_PROTOCOL_QUERY` (terminal.ts:17).
+        let program_status_override = self.program_status_env.as_deref();
+        self.program_status_supported = program_status_override == Some("1");
+        self.program_status_query_pending =
+            program_status_override != Some("1") && program_status_override != Some("0");
+        let program_status_query = if self.program_status_query_pending {
+            PROGRAM_STATUS_QUERY
+        } else {
+            ""
+        };
+        // `KITTY_KEYBOARD_PROTOCOL_QUERY` + query + `DEVICE_ATTRIBUTES_QUERY`
+        // (terminal.ts:17-18).
         self.write_direct(&format!(
-            "\x1b[>{}u\x1b[?u\x1b[c",
+            "\x1b[>{}u\x1b[?u{program_status_query}\x1b[c",
             DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS
         ));
+        self.write_program_status();
+    }
+
+    /// `writeProgramStatus` (terminal.ts:580-584): re-send the latest status
+    /// once support is confirmed or the terminal restarts.
+    fn write_program_status(&mut self) {
+        if self.program_status_supported
+            && let Some(status) = self.program_status.clone()
+        {
+            self.write_direct(&format_program_status(&status));
+        }
     }
 
     /// Blocking stdin reader thread: raw bytes → incremental UTF-8 decode →
@@ -711,13 +781,26 @@ impl<W: Write> ProcessTerminal<W> {
     }
 
     /// Upstream StdinBuffer `data` handler (terminal.ts:181-192): watch for
-    /// the Kitty protocol response and forward everything else as input.
+    /// the OSC 7501 reply and the Kitty protocol response, and forward
+    /// everything else as input.
     fn route_data_sequence(&mut self, sequence: &str) {
+        if is_program_status_reply(sequence) {
+            if self.program_status_query_pending {
+                self.program_status_query_pending = false;
+                self.program_status_supported = true;
+                self.write_program_status();
+            }
+            return;
+        }
         match self.read_keyboard_protocol_negotiation_sequence(sequence) {
             // Wait briefly for the rest of a split Kitty response.
             NegotiationRead::Pending => self.schedule_keyboard_protocol_negotiation_buffer_flush(),
-            NegotiationRead::Sequence(negotiation_sequence) => {
-                self.handle_keyboard_protocol_negotiation_sequence(negotiation_sequence);
+            NegotiationRead::Sequence { parsed, sequence } => {
+                if !self.handle_keyboard_protocol_negotiation_sequence(parsed) {
+                    // `negotiation?.sequence ?? sequence` (terminal.ts:190): a
+                    // DA reply that no pending query owes is forwarded whole.
+                    self.forward_input_sequence(&sequence);
+                }
             }
             NegotiationRead::NotNegotiation => self.forward_input_sequence(sequence),
         }
@@ -725,30 +808,41 @@ impl<W: Write> ProcessTerminal<W> {
 
     /// Upstream `handleKeyboardProtocolNegotiationSequence`
     /// (terminal.ts:228-250); the upstream `undefined → false` case
-    /// corresponds to [`NegotiationRead::NotNegotiation`].
+    /// corresponds to [`NegotiationRead::NotNegotiation`]. Returns whether
+    /// the sequence was consumed.
     fn handle_keyboard_protocol_negotiation_sequence(
         &mut self,
         negotiation_sequence: KeyboardProtocolNegotiationSequence,
-    ) {
+    ) -> bool {
         self.clear_keyboard_protocol_negotiation_buffer();
-        match negotiation_sequence {
-            KeyboardProtocolNegotiationSequence::KittyFlags { flags } => {
-                if flags != 0 {
-                    self.disable_modify_other_keys();
-                    if !self.kitty_protocol_active {
-                        self.kitty_protocol_active = true;
-                        set_kitty_protocol_active(true);
-                    }
-                } else {
-                    self.enable_modify_other_keys();
-                }
+        if negotiation_sequence == KeyboardProtocolNegotiationSequence::DeviceAttributes {
+            if self.pending_keyboard_protocol_device_attributes == 0 {
+                return false;
             }
-            KeyboardProtocolNegotiationSequence::DeviceAttributes => {
-                if !self.kitty_protocol_active {
-                    self.enable_modify_other_keys();
-                }
+            self.pending_keyboard_protocol_device_attributes -= 1;
+            // The last owed DA answers the latest query, which got no program
+            // status reply first. Earlier DA replies belong to queries from
+            // before a restart (terminal.ts:240-243).
+            if self.pending_keyboard_protocol_device_attributes == 0 {
+                self.program_status_query_pending = false;
             }
         }
+        if let KeyboardProtocolNegotiationSequence::KittyFlags { flags } = negotiation_sequence {
+            if flags != 0 {
+                self.disable_modify_other_keys();
+                if !self.kitty_protocol_active {
+                    self.kitty_protocol_active = true;
+                    set_kitty_protocol_active(true);
+                }
+            } else {
+                self.enable_modify_other_keys();
+            }
+            return true;
+        }
+        if !self.kitty_protocol_active {
+            self.enable_modify_other_keys();
+        }
+        true
     }
 
     /// Upstream `readKeyboardProtocolNegotiationSequence`
@@ -757,11 +851,12 @@ impl<W: Write> ProcessTerminal<W> {
         if !self.keyboard_protocol_negotiation_buffer.is_empty() {
             let buffered_sequence =
                 format!("{}{sequence}", self.keyboard_protocol_negotiation_buffer);
-            if let Some(negotiation_sequence) =
-                parse_keyboard_protocol_negotiation_sequence(&buffered_sequence)
-            {
+            if let Some(parsed) = parse_keyboard_protocol_negotiation_sequence(&buffered_sequence) {
                 self.clear_keyboard_protocol_negotiation_buffer();
-                return NegotiationRead::Sequence(negotiation_sequence);
+                return NegotiationRead::Sequence {
+                    parsed,
+                    sequence: buffered_sequence,
+                };
             }
             if is_keyboard_protocol_negotiation_sequence_prefix(&buffered_sequence) {
                 self.set_keyboard_protocol_negotiation_buffer(buffered_sequence);
@@ -770,8 +865,11 @@ impl<W: Write> ProcessTerminal<W> {
             self.flush_keyboard_protocol_negotiation_buffer_as_input();
         }
 
-        if let Some(negotiation_sequence) = parse_keyboard_protocol_negotiation_sequence(sequence) {
-            return NegotiationRead::Sequence(negotiation_sequence);
+        if let Some(parsed) = parse_keyboard_protocol_negotiation_sequence(sequence) {
+            return NegotiationRead::Sequence {
+                parsed,
+                sequence: sequence.to_string(),
+            };
         }
         if is_keyboard_protocol_negotiation_sequence_prefix(sequence) {
             self.set_keyboard_protocol_negotiation_buffer(sequence.to_string());
@@ -915,6 +1013,14 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         if self.clear_progress_keepalive() {
             self.write_direct(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
         }
+
+        // Remove the status while stopped, for example after exit or while
+        // suspended. start() reports it again (terminal.ts:467-475).
+        if self.program_status_supported && self.program_status.is_some() {
+            self.write_direct(&format_program_status(&ProgramStatus::clear()));
+        }
+        self.program_status_supported = false;
+        self.program_status_query_pending = false;
 
         // Disable bracketed paste mode.
         self.write_direct("\x1b[?2004l");
@@ -1108,6 +1214,19 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
             self.clear_progress_keepalive();
             // OSC 9;4;0 - clear progress.
             self.write_direct(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+        }
+    }
+
+    fn set_program_status(&mut self, status: &ProgramStatus) {
+        // `this.programStatus = status.state === "clear" ? undefined : status`
+        // (terminal.ts:576-578).
+        self.program_status = if status.state == crate::program_status::ProgramStatusState::Clear {
+            None
+        } else {
+            Some(status.clone())
+        };
+        if self.program_status_supported {
+            self.write_direct(&format_program_status(status));
         }
     }
 
@@ -1481,12 +1600,18 @@ mod tests {
         input: Arc<Mutex<Option<String>>>,
     }
 
-    /// Upstream `setupNegotiation`: sets the private input handler and calls
-    /// the private `queryAndEnableKittyProtocol` directly (no `start()`, so
-    /// no real tty is touched).
     fn setup_negotiation() -> NegotiationHarness {
+        setup_negotiation_with_program_status(None)
+    }
+
+    /// `setupNegotiation` with an explicit `RPI_PROGRAM_STATUS` value (the
+    /// upstream `withOverride` helper): `None` = probe path.
+    fn setup_negotiation_with_program_status(
+        program_status: Option<&str>,
+    ) -> NegotiationHarness {
         let writer = SharedWriter::default();
         let mut terminal = ProcessTerminal::with_writer(writer.clone());
+        terminal.program_status_env = program_status.map(str::to_owned);
         let input = Arc::new(Mutex::new(None));
         let input_sink = Arc::clone(&input);
         terminal.input_handler = Some(Box::new(move |data: &str| {
@@ -1528,7 +1653,7 @@ mod tests {
     fn queries_kitty_mode_before_enabling_modify_other_keys_fallback() {
         let harness = setup_negotiation();
         let writes = harness.writes();
-        assert_eq!(writes[0], "\x1b[>7u\x1b[?u\x1b[c");
+        assert_eq!(writes[0], "\x1b[>7u\x1b[?u\x1b]7501;?\x1b\\\x1b[c");
         assert!(!writes.contains(&"\x1b[>4;2m".to_string()));
         assert!(!harness.terminal.kitty_protocol_active());
         harness.cleanup();
@@ -1597,6 +1722,138 @@ mod tests {
             1
         );
         harness.cleanup();
+    }
+
+    // terminal.test.ts `program status (OSC 7501)` (#10607)
+    mod program_status {
+        use super::*;
+
+        const WORKING: &str = "\x1b]7501;state=working:app=pi\x1b\\";
+        const CLEAR: &str = "\x1b]7501;state=clear\x1b\\";
+
+        #[test]
+        fn reports_the_latest_status_once_the_terminal_answers_the_query_before_da() {
+            let mut harness = setup_negotiation();
+            harness.terminal.set_program_status(&ProgramStatus {
+                state: crate::program_status::ProgramStatusState::Working,
+                app: Some("pi".into()),
+                kind: None,
+                message: None,
+            });
+            assert!(!harness.writes().contains(&WORKING.to_string()));
+
+            harness.send("\x1b]7501;?\x1b\\");
+            assert_eq!(harness.input(), None);
+            assert_eq!(
+                harness
+                    .writes()
+                    .iter()
+                    .filter(|write| write.as_str() == WORKING)
+                    .count(),
+                1
+            );
+            harness.send("\x1b[?62;4;52c");
+
+            harness.terminal.set_program_status(&ProgramStatus {
+                state: crate::program_status::ProgramStatusState::Done,
+                app: None,
+                kind: None,
+                message: None,
+            });
+            assert_eq!(harness.writes().last().unwrap(), "\x1b]7501;state=done\x1b\\");
+        }
+
+        #[test]
+        fn reports_nothing_when_da_arrives_first_and_swallows_late_replies() {
+            let mut harness = setup_negotiation();
+            harness.send("\x1b[?62;4;52c");
+            harness.send("\x1b]7501;?\x07");
+            harness.terminal.set_program_status(&ProgramStatus {
+                state: crate::program_status::ProgramStatusState::Working,
+                app: Some("pi".into()),
+                kind: None,
+                message: None,
+            });
+
+            assert_eq!(harness.input(), None);
+            assert!(!harness
+                .writes()
+                .iter()
+                .any(|write| write.starts_with("\x1b]7501;state=")));
+        }
+
+        #[test]
+        fn skips_the_query_when_the_override_is_set() {
+            let mut harness = setup_negotiation_with_program_status(Some("1"));
+            assert_eq!(harness.writes()[0], "\x1b[>7u\x1b[?u\x1b[c");
+            harness.terminal.set_program_status(&ProgramStatus {
+                state: crate::program_status::ProgramStatusState::Working,
+                app: Some("pi".into()),
+                kind: None,
+                message: None,
+            });
+            assert_eq!(harness.writes().last().unwrap(), WORKING);
+
+            let mut harness = setup_negotiation_with_program_status(Some("0"));
+            assert_eq!(harness.writes()[0], "\x1b[>7u\x1b[?u\x1b[c");
+            harness.terminal.set_program_status(&ProgramStatus {
+                state: crate::program_status::ProgramStatusState::Working,
+                app: Some("pi".into()),
+                kind: None,
+                message: None,
+            });
+            assert!(!harness.writes().contains(&WORKING.to_string()));
+        }
+
+        #[test]
+        fn does_not_let_a_da_reply_from_before_a_restart_end_the_new_query() {
+            let mut harness = setup_negotiation();
+            harness.terminal.set_program_status(&ProgramStatus {
+                state: crate::program_status::ProgramStatusState::Working,
+                app: Some("pi".into()),
+                kind: None,
+                message: None,
+            });
+            harness.terminal.stop();
+            harness.terminal.query_and_enable_kitty_protocol();
+
+            // The first start's replies arrive late: its DA, then the second
+            // start's reply and DA.
+            harness.send("\x1b[?62;4;52c");
+            harness.send("\x1b]7501;?\x1b\\");
+            harness.send("\x1b[?62;4;52c");
+            assert_eq!(harness.writes().last().unwrap(), WORKING);
+            assert_eq!(harness.input(), None);
+        }
+
+        #[test]
+        fn clears_the_status_on_stop_and_reports_it_again_after_restart() {
+            let mut harness = setup_negotiation();
+            harness.terminal.set_program_status(&ProgramStatus {
+                state: crate::program_status::ProgramStatusState::Working,
+                app: Some("pi".into()),
+                kind: None,
+                message: None,
+            });
+            harness.send("\x1b]7501;?\x1b\\");
+            harness.terminal.stop();
+            assert!(harness.writes().contains(&CLEAR.to_string()));
+
+            // Stopped: nothing is written until the restarted terminal
+            // confirms support again.
+            let writes_before_restart = harness.writes().len();
+            harness.terminal.set_program_status(&ProgramStatus {
+                state: crate::program_status::ProgramStatusState::Working,
+                app: Some("pi".into()),
+                kind: None,
+                message: None,
+            });
+            assert_eq!(harness.writes().len(), writes_before_restart);
+
+            harness.terminal.query_and_enable_kitty_protocol();
+            harness.send("\x1b]7501;?\x1b\\");
+            assert_eq!(harness.writes().last().unwrap(), WORKING);
+        }
     }
 
     #[test]

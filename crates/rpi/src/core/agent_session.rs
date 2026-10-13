@@ -2569,6 +2569,15 @@ impl AgentSession {
         !self.is_streaming() && !self.is_compacting()
     }
 
+    /// Whether the current (or last) run was requested to abort
+    /// (`_agentRunAbortRequested`, agent-session.ts:1078): read at
+    /// `agent_settled` emission time by the interactive program-status
+    /// reporter (V17-05). The ABI payload field `agent_settled.aborted` is
+    /// opened in V17-06.
+    pub fn is_abort_requested(&self) -> bool {
+        self.inner.agent_run_abort_requested.load(Ordering::SeqCst)
+    }
+
     /// `get systemPrompt` (agent-session.ts:980-983 @ #9548): the current
     /// effective system prompt, including changes not yet sent to the model
     /// (`run` options when set, else base).

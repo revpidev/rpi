@@ -22,6 +22,7 @@ pub mod footer;
 pub(crate) mod git_branch_watcher;
 pub mod header;
 pub mod interactive_mode;
+pub(crate) mod program_status;
 pub(crate) mod startup_ui;
 pub mod theme;
 pub(crate) mod theme_watcher;

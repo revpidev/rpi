@@ -79,8 +79,10 @@ use crate::modes::interactive::components::settings_selector::{
 };
 use crate::modes::interactive::components::thinking_selector::ThinkingSelectorComponent;
 use crate::modes::interactive::components::trust_selector::{TrustOption, TrustSelectorComponent};
+use crate::modes::interactive::program_status::BlockedStatus;
 use crate::modes::interactive::theme_watcher::{auto_theme_pair, detect_terminal_theme_for_auto};
 use crate::tools::truncate::TruncationResult;
+use rpi_tui::program_status::ProgramStatusKind;
 
 // =============================================================================
 // Helpers
@@ -680,9 +682,19 @@ fn show_oauth_login_dialog(
             // Defaults to rpi's own brand name (`AGENT_NAME_HINT`).
             agent_name: None,
         };
+        // `programStatus.setBlocked("login", ...)` and its `finally` clear
+        // (interactive-mode.ts:6321-6335).
+        ui.set_program_status_blocked(
+            "login",
+            Some(BlockedStatus {
+                kind: ProgramStatusKind::Auth,
+                message: format!("Log in to {provider_name}"),
+            }),
+        );
         let result = runtime
             .login(&provider_id, AuthType::Oauth, &interaction, Some(&options))
             .await;
+        ui.set_program_status_blocked("login", None);
         ui.hide_selector();
         match result {
             Ok(_credential) => {
@@ -1014,9 +1026,19 @@ fn show_api_key_login_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorPro
     let provider_name = provider.name.clone();
     spawn_async(async move {
         let runtime = ui.session().model_runtime().clone();
+        // `programStatus.setBlocked("login", ...)` and its `finally` clear
+        // (interactive-mode.ts:6321-6335).
+        ui.set_program_status_blocked(
+            "login",
+            Some(BlockedStatus {
+                kind: ProgramStatusKind::Auth,
+                message: format!("Log in to {provider_name}"),
+            }),
+        );
         let result = runtime
             .login(&provider_id, AuthType::ApiKey, &interaction, None)
             .await;
+        ui.set_program_status_blocked("login", None);
         ui.hide_selector();
         match result {
             Ok(_credential) => {
@@ -2756,6 +2778,10 @@ impl InteractiveMode {
         if let Some(unsubscribe) = self.unsubscribe.take() {
             unsubscribe();
         }
+
+        // `this.programStatus.reset()` (interactive-mode.ts:2095): forget
+        // the outgoing session's run, then report the resting idle status.
+        self.ui_state.reset_program_status();
 
         self.ui_state.set_session(session.clone());
         self.ui_state.apply_runtime_settings(&session);
@@ -4808,6 +4834,103 @@ mod tests {
             "no rebuild while streaming (interactive-mode.ts:4273-4288)"
         );
         assert!(lock(&ui.streaming).is_some(), "stream survives the change");
+    }
+
+    // V17-05 FR-A: OSC 7501 statuses reach the terminal through the drain
+    // (program-status-reporter state authority, 02 §1.3 裁决 3).
+    #[tokio::test]
+    async fn program_status_reports_idle_working_done_and_idle_on_abort() {
+        let (mode, terminal, _session, _tmp) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.report_program_status();
+        let statuses = terminal.program_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(
+            statuses[0].state,
+            rpi_tui::program_status::ProgramStatusState::Idle
+        );
+        assert_eq!(statuses[0].app.as_deref(), Some("rpi"));
+
+        ui.push(UiCommand::AgentStart);
+        ui.drain_events();
+        // Dedup: a second report of the same state stays silent.
+        ui.report_program_status();
+        let statuses = terminal.program_statuses();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(
+            statuses[1].state,
+            rpi_tui::program_status::ProgramStatusState::Working
+        );
+
+        ui.push(UiCommand::MessageEnd(assistant_message(
+            vec![text_content("done")],
+            rpi_ai::types::StopReason::Stop,
+        )));
+        ui.push(UiCommand::AgentSettled { aborted: false });
+        ui.drain_events();
+        let statuses = terminal.program_statuses();
+        assert_eq!(
+            statuses.last().unwrap().state,
+            rpi_tui::program_status::ProgramStatusState::Done
+        );
+
+        ui.push(UiCommand::AgentStart);
+        ui.push(UiCommand::AgentSettled { aborted: true });
+        ui.drain_events();
+        let statuses = terminal.program_statuses();
+        assert_eq!(
+            statuses.last().unwrap().state,
+            rpi_tui::program_status::ProgramStatusState::Idle
+        );
+    }
+
+    // V17-05 FR-A: blocked reports come from the extension dialog / login
+    // seams (`programStatus.setBlocked`).
+    #[tokio::test]
+    async fn program_status_reports_blocked_dialogs() {
+        let (mode, terminal, _session, _tmp) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.set_program_status_blocked(
+            "extension-dialog",
+            Some(crate::modes::interactive::program_status::BlockedStatus {
+                kind: rpi_tui::program_status::ProgramStatusKind::Permission,
+                message: "Allow bash?".into(),
+            }),
+        );
+        let statuses = terminal.program_statuses();
+        let last = statuses.last().unwrap();
+        assert_eq!(
+            last.state,
+            rpi_tui::program_status::ProgramStatusState::Blocked
+        );
+        assert_eq!(
+            last.kind,
+            Some(rpi_tui::program_status::ProgramStatusKind::Permission)
+        );
+        assert_eq!(last.message.as_deref(), Some("Allow bash?"));
+
+        // Most recent dialog wins; clearing returns to the underlying idle.
+        ui.set_program_status_blocked(
+            "login",
+            Some(crate::modes::interactive::program_status::BlockedStatus {
+                kind: rpi_tui::program_status::ProgramStatusKind::Auth,
+                message: "Log in to Anthropic".into(),
+            }),
+        );
+        ui.set_program_status_blocked("login", None);
+        let statuses = terminal.program_statuses();
+        assert_eq!(
+            statuses[statuses.len() - 2].kind,
+            Some(rpi_tui::program_status::ProgramStatusKind::Auth)
+        );
+        assert_eq!(
+            statuses.last().unwrap().state,
+            rpi_tui::program_status::ProgramStatusState::Blocked
+        );
+        assert_eq!(
+            statuses.last().unwrap().kind,
+            Some(rpi_tui::program_status::ProgramStatusKind::Permission)
+        );
     }
 
     /// Regression: the tui-mode settings callback fires inside the settings
