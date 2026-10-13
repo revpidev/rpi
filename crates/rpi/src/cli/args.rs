@@ -266,7 +266,7 @@ pub fn parse_args(args: &[String]) -> Args {
                 .map(|s| s.trim().to_owned())
                 .filter(|name| !name.is_empty())
                 .collect();
-            // `getToolListError` (args.ts:143-158 @ 04b97ef00): a list is
+            // `getToolListError` (cli/args.ts:151-161 @ 04b97ef00): a list is
             // either an allowlist of plain names/patterns or only
             // `+name`/`-name` modifiers with exact names. An invalid list
             // reports the diagnostic and leaves `tools` unset.
@@ -1210,7 +1210,7 @@ mod tests {
         assert!(args(&["--no-session"]).no_session);
     }
 
-    // `--no-mcp` (args.ts:184-185 @ 04b97ef00)
+    // `--no-mcp` (cli/args.ts:191-192 @ 04b97ef00)
 
     #[test]
     fn test_parses_no_mcp_flag() {
