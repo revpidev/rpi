@@ -270,7 +270,13 @@ fn fixture_read_tool() -> FixtureTool {
         execute_fn: Arc::new(|_on_update| {
             Box::pin(async {
                 tokio::time::sleep(Duration::from_millis(30)).await;
-                text_tool_result("fixture note content\n")
+                let mut result = text_tool_result("fixture note content\n")?;
+                // v1.0.4 (`021eae60a`): the read tool declares an output
+                // schema and returns the text or an image block as
+                // `structuredContent` (see the V17-02 note in fixtures/README.md).
+                result.structured_content =
+                    Some(Value::String("fixture note content\n".to_owned()));
+                Ok(result)
             })
         }),
     }

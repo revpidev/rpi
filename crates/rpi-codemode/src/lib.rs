@@ -31,6 +31,7 @@ pub use types::{
     CodemodeCall, CodemodeCallStatus, CodemodeError, CodemodeErrorKind, CodemodeExecuteOptions,
     CodemodeJsonSchema, CodemodeOutputItem, CodemodeResult, CodemodeSandboxOptions,
     CodemodeStoreWrites, CodemodeTimeout, CodemodeTool, CodemodeToolContext, CodemodeToolInfo,
-    DEFAULT_TIMEOUT_MS, MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS, RESERVED_GLOBALS,
+    DEFAULT_TIMEOUT_MS, MAX_OUTPUT_CHARS, MAX_OUTPUT_ITEMS, MAX_STORE_TOTAL_CHARS,
+    MAX_STORE_VALUE_CHARS, RESERVED_GLOBALS,
 };
 pub use wasm::{QUICKJS_WASM_SHA256, module_is_compiled, verify_embedded_wasm};

@@ -950,6 +950,7 @@ impl AgentSession {
                 custom_prompt: None,
                 force_system_prompt: None,
                 selected_tools: None,
+                hidden_tools: None,
                 tool_snippets: None,
                 tool_guidelines: None,
                 prompt_guidelines: Vec::new(),
@@ -3273,10 +3274,17 @@ impl AgentSession {
                 registry.keys().filter_map(|name| entry_of(name)).collect();
             let mut exposures = HashMap::new();
             let mut namespaces = HashMap::new();
+            let mut prompt_guidelines = HashMap::new();
             for (name, entry) in definitions.iter() {
                 exposures.insert(name.clone(), entry.exposure);
                 if let Some(namespace) = &entry.namespace {
                     namespaces.insert(name.clone(), namespace.clone());
+                }
+                // `getPromptGuidelines` (#10343): codemode presents the
+                // guidelines of the tools it declares so they survive the
+                // hidden-declaration filter.
+                if !entry.prompt_guidelines.is_empty() {
+                    prompt_guidelines.insert(name.clone(), entry.prompt_guidelines.clone());
                 }
             }
             let mut hooks: Vec<(String, String, ext::PrepareLoadoutFn)> = Vec::new();
@@ -3299,6 +3307,7 @@ impl AgentSession {
                     registered,
                     exposures,
                     namespaces,
+                    prompt_guidelines,
                 },
                 hooks,
             )
@@ -3369,15 +3378,13 @@ impl AgentSession {
             // get its `<tools>` line / `<rules>` bullets rendered from the
             // base options. `selectedTools` stays filtered to the valid set;
             // `build_rules` re-derives lines for the CURRENT selected set on
-            // every build (#9548 `toolGuidelines`).
+            // every build (#9548 `toolGuidelines`). Hidden declarations are
+            // filtered by the builder through `hiddenTools`, not here
+            // (agent-session.ts:1658 @ abe508e1b).
             let mut tool_snippets: HashMap<String, String> = HashMap::new();
             let mut tool_guidelines: HashMap<String, Vec<String>> = HashMap::new();
             for (name, entry) in definitions.iter() {
-                // Hidden tools are only callable through another tool, so
-                // their snippets stay out of the prompt (agent-session.ts:1658).
-                if let Some(snippet) = &entry.prompt_snippet
-                    && !hidden.contains(name)
-                {
+                if let Some(snippet) = &entry.prompt_snippet {
                     tool_snippets.insert(name.clone(), snippet.clone());
                 }
                 if !entry.prompt_guidelines.is_empty() {
@@ -3397,20 +3404,12 @@ impl AgentSession {
         };
         let skills = resources.skills.clone();
         let context_files = resources.context_files.clone();
-        // system-prompt.ts:46 + agent-session.ts call site: the first of
-        // ["read","bash"] among the enabled tools picks both whether the
-        // skills section is injected and which instruction line it carries
-        // (1d6dbf9e3, #8552).
-        let skill_file_read_tool = ["read", "bash"]
-            .iter()
-            .find(|tool| valid.iter().any(|name| name == *tool))
-            .map(|tool| {
-                if *tool == "read" {
-                    crate::core::skills::SkillFileReadTool::Read
-                } else {
-                    crate::core::skills::SkillFileReadTool::Bash
-                }
-            });
+        // system-prompt.ts:46 + agent-session.ts call site: the first
+        // DECLARED of ["read","bash"] picks the instruction line
+        // (1d6dbf9e3, #8552). A reader that is hidden by `prepareLoadout` is
+        // still reachable through another tool, so skills stay and the hint
+        // names no tool (#10343).
+        let skill_file_read_tool = crate::core::skills::skill_file_read_tool(&valid, &hidden);
         let skills_xml = skill_file_read_tool.and_then(|tool| {
             let xml = crate::core::skills::format_skills_for_prompt(&skills, tool);
             if xml.is_empty() { None } else { Some(xml) }
@@ -3421,6 +3420,7 @@ impl AgentSession {
             custom_prompt,
             force_system_prompt: None,
             selected_tools: Some(valid.clone()),
+            hidden_tools: Some(hidden.iter().cloned().collect()),
             tool_snippets: Some(tool_snippets),
             tool_guidelines: Some(tool_guidelines),
             prompt_guidelines: Vec::new(),
@@ -3464,12 +3464,11 @@ impl AgentSession {
         options.selected_tools = Some(valid_tool_names);
         // `options.toolSnippets = Object.fromEntries(Object.entries(...)
         // .filter(([name]) => !this._hiddenDeclarations.has(name)))`
-        // (agent-session.ts:1694-1697): the prompt's tool list matches the
-        // declarations the request carries.
+        // (agent-session.ts:1694-1697 @ abe508e1b) became
+        // `options.hiddenTools = [...this._hiddenDeclarations]` in v1.1.0
+        // (#10343): the builder filters the tool list and rules itself.
         let hidden = lock(&self.inner.hidden_declarations).clone();
-        if let Some(snippets) = options.tool_snippets.as_mut() {
-            snippets.retain(|name, _| !hidden.contains(name));
-        }
+        options.hidden_tools = Some(hidden.into_iter().collect());
 
         let replay_messages: Vec<rpi_ai::types::Message> = messages
             .unwrap_or(&self.inner.agent.state().messages)

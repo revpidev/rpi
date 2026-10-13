@@ -145,6 +145,56 @@ struct ReadTool {
 const NON_VISION_NOTE: &str =
     "[Current model does not support images. The image will be omitted from this request.]";
 
+/// Result for programmatic callers such as codemode scripts: the text for
+/// text files, and an image block for images that codemode's `image()`
+/// accepts (`readOutputSchema`, read.ts:27-34). `note` is the text that goes
+/// with the image, such as resize hints.
+fn read_output_schema() -> &'static Value {
+    static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        json!({
+            "anyOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "required": ["type", "data", "mimeType", "note"],
+                    "properties": {
+                        "type": { "type": "string", "const": "image" },
+                        "data": { "type": "string" },
+                        "mimeType": { "type": "string" },
+                        "note": { "type": "string" }
+                    }
+                }
+            ]
+        })
+    })
+}
+
+/// The image block and its note, or the text for text files and images that
+/// could not be processed (`toReadOutput`, read.ts:72-77).
+fn to_read_output(content: &[ToolResultContent]) -> Value {
+    let text = content
+        .iter()
+        .find_map(|block| match block {
+            ToolResultContent::Text(text) => Some(text.text.clone()),
+            ToolResultContent::Image(_) => None,
+        })
+        .unwrap_or_default();
+    let image = content.iter().find_map(|block| match block {
+        ToolResultContent::Image(image) => Some(image),
+        ToolResultContent::Text(_) => None,
+    });
+    match image {
+        Some(image) => json!({
+            "type": "image",
+            "data": image.data,
+            "mimeType": image.mime_type,
+            "note": text,
+        }),
+        None => Value::String(text),
+    }
+}
+
 /// Tool description with constants expanded (read.ts:212).
 const DESCRIPTION: &str = "Read the contents of a file. Supports text files and \
 images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, \
@@ -210,6 +260,12 @@ impl AgentTool for ReadTool {
     fn constrained_sampling(&self) -> Option<rpi_ai::types::ConstrainedSampling> {
         // read.ts:77 (`fcff255b0`): strict-prefer by default, no gate.
         crate::tools::builtin_strict_prefer_sampling()
+    }
+
+    fn output_schema(&self) -> Option<&Value> {
+        // read.ts:100: programmatic callers (codemode) get the same content
+        // as a string or an image block with its note (#10251).
+        Some(read_output_schema())
     }
 
     async fn execute(
@@ -317,12 +373,12 @@ impl AgentTool for ReadTool {
             }
 
             return Ok(AgentToolResult {
+                structured_content: Some(to_read_output(&content)),
                 content,
                 details: Value::Null,
                 usage: None,
                 terminate: None,
 
-                structured_content: None,
                 is_error: None,
             });
         }
@@ -442,6 +498,7 @@ impl AgentTool for ReadTool {
         }
 
         Ok(AgentToolResult {
+            structured_content: Some(Value::String(output_text.clone())),
             content: vec![ToolResultContent::Text(TextContent {
                 text: output_text,
                 text_signature: None,
@@ -450,7 +507,6 @@ impl AgentTool for ReadTool {
             usage: None,
             terminate: None,
 
-            structured_content: None,
             is_error: None,
         })
     }
@@ -543,6 +599,12 @@ mod tests {
         let result = read_file(&*tool, "small.txt").await;
         assert_eq!(text_of(&result), "line1\nline2\nline3");
         assert_eq!(result.details, Value::Null);
+        // Programmatic callers (codemode) get the text as a string
+        // (read.ts:213 `structuredContent: toReadOutput(result.content)`).
+        assert_eq!(
+            result.structured_content,
+            Some(Value::String("line1\nline2\nline3".to_owned()))
+        );
     }
 
     // ---- should handle non-existent files ----
@@ -770,6 +832,19 @@ mod tests {
             _ => panic!("expected text block"),
         }
         assert!(matches!(result.content[1], ToolResultContent::Image(_)));
+        // Programmatic callers get the same image as a block with its note.
+        let structured = result
+            .structured_content
+            .clone()
+            .expect("structured content");
+        assert_eq!(structured["type"], json!("image"));
+        assert_eq!(structured["mimeType"], json!("image/png"));
+        assert!(
+            structured["data"]
+                .as_str()
+                .is_some_and(|data| !data.is_empty())
+        );
+        assert_eq!(structured["note"].as_str(), Some(text_of(&result)));
     }
 
     // ---- should read BMP files as PNG image attachments ----

@@ -31,6 +31,7 @@ fn tool_info(value: &Value) -> ToolInfo {
             .cloned(),
         exposure: rpi_ext_host::types::ToolExposure::Direct,
         namespace: None,
+        prompt_guidelines: Vec::new(),
     }
 }
 
@@ -65,6 +66,23 @@ fn description_and_script_call_text_match_upstream_byte_for_byte() {
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect::<HashSet<_>>();
+        }
+        if let Some(guidelines) = options_value.get("guidelines").and_then(Value::as_object) {
+            for (name, lines) in guidelines {
+                options.guidelines.insert(
+                    name.clone(),
+                    lines
+                        .as_array()
+                        .map(|lines| {
+                            lines
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
         }
         if let Some(namespaces) = options_value.get("namespaces").and_then(Value::as_array) {
             let mut map: HashMap<String, ToolNamespace> = HashMap::new();

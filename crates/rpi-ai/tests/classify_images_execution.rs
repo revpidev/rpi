@@ -202,6 +202,7 @@ fn classifier_context() -> ClassifierContext {
             .as_object()
             .cloned()
             .unwrap_or_default(),
+        images: None,
         questions,
     }
 }
@@ -635,4 +636,146 @@ fn type_guards_reject_mismatched_models() {
     );
     let error = assert_classifier_model(&chat).expect_err("not a classifier");
     assert!(error.message.contains("is not a classifier model"));
+}
+
+/// `ClassifierContext.images` (ce8972a0e): a context with one image part.
+fn classifier_context_with_image() -> ClassifierContext {
+    let mut context = classifier_context();
+    context.images = Some(vec![rpi_ai::types::ImageContent {
+        data: "aGVsbG8=".to_owned(),
+        mime_type: "image/png".to_owned(),
+    }]);
+    context
+}
+
+/// Records the context it was called with and returns a fixed result.
+#[derive(Default)]
+struct CapturingClassifier {
+    contexts: std::sync::Mutex<Vec<ClassifierContext>>,
+}
+
+impl rpi_ai::types::ProviderClassifier for CapturingClassifier {
+    fn classify(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        _options: Option<&ClassifierOptions>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>>
+    {
+        self.contexts
+            .lock()
+            .expect("contexts")
+            .push(context.clone());
+        let model = model.clone();
+        Box::pin(async move {
+            ClassifierResult {
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                answers: std::collections::BTreeMap::new(),
+                usage: None,
+                stop_reason: ClassifierStopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }
+        })
+    }
+}
+
+fn models_with_capture_classifier(
+    classifier: Arc<dyn rpi_ai::types::ProviderClassifier>,
+) -> Models {
+    let models = Models::new(None);
+    let provider = create_provider(CreateProviderOptions {
+        id: "typesafe".to_owned(),
+        name: Some("TypeSafe".to_owned()),
+        auth: ProviderAuth {
+            api_key: Some(Arc::new(StaticKeyAuth)),
+            oauth: None,
+        },
+        models: Vec::new(),
+        all_models: Vec::new(),
+        classifiers: std::collections::HashMap::from([("capture-classify".to_owned(), classifier)]),
+        images: std::collections::HashMap::new(),
+        base_url: Some("http://127.0.0.1:1".to_owned()),
+        headers: None,
+        api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+        fetch_models: None,
+        filter_models_fn: None,
+    });
+    models.set_provider(provider);
+    models
+}
+
+/// Images reach an image-capable classifier unchanged (the codemode
+/// `models.classify()` consumption face, R3.2.6).
+#[tokio::test]
+async fn classifier_images_reach_an_image_capable_provider() {
+    let classifier = Arc::new(CapturingClassifier::default());
+    let models = models_with_capture_classifier(classifier.clone());
+    let mut model = classifier_model("http://127.0.0.1:1", "capture-classify");
+    model.input = vec![InputModality::Text, InputModality::Image];
+
+    let result = models
+        .classify(&model, &classifier_context_with_image(), None)
+        .await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop, "{result:?}");
+    let contexts = classifier.contexts.lock().expect("contexts");
+    assert_eq!(contexts.len(), 1);
+    let images = contexts[0].images.as_ref().expect("images");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/png");
+    assert_eq!(images[0].data, "aGVsbG8=");
+}
+
+/// A model whose catalog entry does not accept image input returns the
+/// upstream error result before any request (`assertClassifierInputSupported`,
+/// ce8972a0e).
+#[tokio::test]
+async fn classifier_images_require_an_image_capable_model() {
+    let models = models_with_classifier("http://127.0.0.1:1");
+    let result = models
+        .classify(
+            &classifier_model("http://127.0.0.1:1", "typesafe-system-one"),
+            &classifier_context_with_image(),
+            None,
+        )
+        .await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Error);
+    let message = result.error_message.expect("error message");
+    assert!(
+        message.contains("Model typesafe/jev-latest does not accept image input"),
+        "{message}"
+    );
+}
+
+/// APIs that cannot send images fail in the transport with their own
+/// message once the model entry accepts image input (ce8972a0e).
+#[tokio::test]
+async fn system_one_transports_reject_images() {
+    let models = models_with_classifier("http://127.0.0.1:1");
+    let mut model = classifier_model("http://127.0.0.1:1", "typesafe-system-one");
+    model.input = vec![InputModality::Text, InputModality::Image];
+    let result = models
+        .classify(&model, &classifier_context_with_image(), None)
+        .await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Error);
+    let message = result.error_message.expect("error message");
+    assert!(
+        message.contains("System One API does not support image input"),
+        "{message}"
+    );
+}
+
+/// Without images the new field changes nothing (zero regression).
+#[tokio::test]
+async fn classifier_without_images_still_succeeds() {
+    let classifier = Arc::new(CapturingClassifier::default());
+    let models = models_with_capture_classifier(classifier.clone());
+    let mut model = classifier_model("http://127.0.0.1:1", "capture-classify");
+    model.input = vec![InputModality::Text];
+    let result = models.classify(&model, &classifier_context(), None).await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop, "{result:?}");
+    let contexts = classifier.contexts.lock().expect("contexts");
+    assert!(contexts[0].images.is_none());
 }

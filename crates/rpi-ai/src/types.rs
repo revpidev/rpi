@@ -1071,11 +1071,16 @@ pub enum ClassifierQuestion {
     Bool(ClassifierBoolQuestion),
 }
 
-/// `ClassifierContext` (types.ts:651-654).
+/// `ClassifierContext` (types.ts:668-676 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassifierContext {
     pub state: serde_json::Map<String, Value>,
+    /// Images judged together with `state`. Only models whose `input`
+    /// includes `"image"` accept them; other models return an error result
+    /// (ce8972a0e, R2.4.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageContent>>,
     pub questions: std::collections::BTreeMap<String, ClassifierQuestion>,
 }
 
@@ -2610,6 +2615,31 @@ pub fn assert_classifier_model(
             "Model is not a classifier model".to_owned(),
         )),
     }
+}
+
+/// `assertClassifierInputSupported` (utils/model-operations.ts:44-51):
+/// rejects classifier images for models whose catalog entry does not accept
+/// image input. APIs that accept the model but cannot send images fail in
+/// the transport with their own message.
+pub fn assert_classifier_input_supported(
+    model: &ClassifierModel,
+    context: &ClassifierContext,
+) -> Result<(), crate::auth::ModelsError> {
+    if context
+        .images
+        .as_ref()
+        .is_some_and(|images| !images.is_empty())
+        && !model.input.contains(&InputModality::Image)
+    {
+        return Err(crate::auth::ModelsError::new(
+            crate::auth::ModelsErrorCode::Provider,
+            format!(
+                "Model {}/{} does not accept image input",
+                model.provider, model.id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `imageErrorResult` (utils/model-operations.ts:28-39): the never-reject

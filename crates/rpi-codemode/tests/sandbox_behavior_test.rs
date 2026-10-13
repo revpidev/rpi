@@ -680,3 +680,236 @@ async fn date_uses_the_host_timezone_like_upstream() {
         .unwrap_or(0);
     assert_eq!(observed, i64::from(-offset_seconds / 60));
 }
+
+// ---------------------------------------------------------------------------
+// #10444 built-in freeze (b223082bb)
+// ---------------------------------------------------------------------------
+
+/// The prelude shares the built-ins with the script, so patching them could
+/// corrupt what it sends to the host (sandbox.test.ts "ignores patches to
+/// built-ins and built-in globals").
+#[tokio::test]
+async fn ignores_patches_to_builtins_and_builtin_globals() {
+    let sandbox = sandbox_with(vec![echo()], vec![], 10_000);
+    let result = sandbox
+        .execute(
+            r#"
+			Array.prototype.toJSON = () => null;
+			Object.prototype.toJSON = () => 5;
+			Promise.prototype.then = () => {};
+			Map.prototype.get = () => undefined;
+			globalThis.JSON = { stringify: () => "x", parse: () => "x" };
+			store("k", [1]);
+			return [await tools.echo([2]), JSON.stringify({ a: 1 })];
+		"#,
+            timeout(10_000),
+        )
+        .await
+        .expect("execution");
+    match result {
+        CodemodeResult::Ok {
+            value,
+            store_writes,
+            ..
+        } => {
+            assert_eq!(value, Some(serde_json::json!([[2], "{\"a\":1}"])));
+            assert_eq!(
+                store_writes.set.get("k"),
+                Some(&serde_json::json!([1])),
+                "{store_writes:?}"
+            );
+        }
+        other => panic!("expected ok, got {other:?}"),
+    }
+}
+
+/// Intrinsics that are only reachable from instances are frozen too, and
+/// instance overrides still work through the accessors
+/// (sandbox.test.ts "freezes intrinsics that are only reachable from
+/// instances" / "still lets instances override properties of frozen
+/// prototypes").
+#[tokio::test]
+async fn freezes_intrinsics_and_still_allows_instance_overrides() {
+    let sandbox = sandbox_with(vec![], vec![], 10_000);
+    let frozen = sandbox
+        .execute(
+            r#"
+			return [
+				Object.getPrototypeOf(function* () {}).prototype,
+				Object.getPrototypeOf(async function () {}),
+				Object.getPrototypeOf(Int8Array).prototype,
+				Object.getPrototypeOf([][Symbol.iterator]()),
+				Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())),
+				Object.getPrototypeOf(new Map()[Symbol.iterator]()),
+				Object.getPrototypeOf(/a/[Symbol.matchAll]("")),
+			].every((object) => Object.isFrozen(object));
+		"#,
+            timeout(10_000),
+        )
+        .await
+        .expect("execution");
+    assert_eq!(ok_value(frozen), serde_json::json!(true));
+
+    let overrides = sandbox
+        .execute(
+            r#"
+			const object = {};
+			object.toString = () => "custom";
+			function Legacy() {}
+			Legacy.prototype = Object.create(Error.prototype);
+			Legacy.prototype.constructor = Legacy;
+			const bare = new Error();
+			bare.message = "set later";
+			class MyError extends Error {
+				constructor(message) {
+					super(message);
+					this.name = "MyError";
+				}
+			}
+			let patched = "silent";
+			try { Error.prototype.name = "Patched"; } catch (error) { patched = error.constructor.name; }
+			return [String(object), new Legacy().constructor === Legacy, bare.message, new MyError("x").name, Error.prototype.name, patched];
+		"#,
+            timeout(10_000),
+        )
+        .await
+        .expect("execution");
+    assert_eq!(
+        ok_value(overrides),
+        serde_json::json!(["custom", true, "set later", "MyError", "Error", "TypeError"])
+    );
+}
+
+/// A script can set an error's `name` or `message` to anything; the host
+/// requires string fields, so they are coerced (b223082bb).
+#[tokio::test]
+async fn coerces_non_string_error_fields() {
+    let sandbox = sandbox_with(vec![], vec![], 10_000);
+    let result = sandbox
+        .execute(
+            "const error = new Error('x'); error.message = 42; throw error;",
+            timeout(10_000),
+        )
+        .await
+        .expect("execution");
+    match result {
+        CodemodeResult::Err { error, .. } => {
+            assert_eq!(error.kind, CodemodeErrorKind::Script);
+            assert_eq!(error.name.as_deref(), Some("Error"));
+            assert_eq!(error.message, "42");
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #10283 output limits (319fecb89)
+// ---------------------------------------------------------------------------
+
+/// A script whose output passes the limits fails, even if it catches the
+/// error (sandbox.test.ts "fails a script whose output passes the limits,
+/// even if it catches the error").
+#[tokio::test]
+async fn output_past_the_char_limit_fails_the_script() {
+    let sandbox = sandbox_with(vec![], vec![], 60_000);
+    for print in [
+        "text(s)",
+        "console.log(s)",
+        "image(\"data:image/png;base64,\" + p)",
+    ] {
+        let result = sandbox
+            .execute(
+                &format!(
+                    r#"
+					const s = "x".repeat(1 << 20);
+					const p = "iVBORw0KGgoA" + "A".repeat(1 << 20);
+					try {{ {print}; }} catch {{}}
+					for (;;) {{ try {{ {print}; }} catch {{}} }}
+				"#
+                ),
+                timeout(60_000),
+            )
+            .await
+            .expect("execution");
+        match result {
+            CodemodeResult::Err { error, output, .. } => {
+                assert_eq!(error.kind, CodemodeErrorKind::Script, "{error:?}");
+                assert_eq!(error.name.as_deref(), Some("RangeError"), "{error:?}");
+                assert!(
+                    error.message.contains("script output exceeded"),
+                    "{}",
+                    error.message
+                );
+                let chars: usize = output
+                    .iter()
+                    .map(|item| match item {
+                        rpi_codemode::CodemodeOutputItem::Text { text, .. } => text.chars().count(),
+                        rpi_codemode::CodemodeOutputItem::Image { data, .. } => {
+                            data.chars().count()
+                        }
+                    })
+                    .sum();
+                assert!(
+                    chars <= rpi_codemode::MAX_OUTPUT_CHARS,
+                    "output limit not enforced: {chars} chars"
+                );
+                assert!(
+                    chars > rpi_codemode::MAX_OUTPUT_CHARS - (2 << 20),
+                    "output stopped early: {chars} chars"
+                );
+            }
+            other => panic!("expected the output limit to fail the script, got {other:?}"),
+        }
+    }
+}
+
+/// The item limit covers loops that print empty strings
+/// (sandbox.test.ts same case).
+#[tokio::test]
+async fn output_past_the_item_limit_fails_the_script() {
+    let sandbox = sandbox_with(vec![], vec![], 60_000);
+    let result = sandbox
+        .execute("for (;;) text(\"\");", timeout(60_000))
+        .await
+        .expect("execution");
+    match result {
+        CodemodeResult::Err { error, output, .. } => {
+            assert_eq!(error.kind, CodemodeErrorKind::Script);
+            assert_eq!(error.name.as_deref(), Some("RangeError"));
+            assert_eq!(output.len(), rpi_codemode::MAX_OUTPUT_ITEMS);
+        }
+        other => panic!("expected the item limit to fail the script, got {other:?}"),
+    }
+}
+
+/// `console.*` items are marked so the coding agent can group them instead
+/// of mixing them into `text()` output (eb326d265).
+#[tokio::test]
+async fn console_output_is_marked() {
+    let sandbox = sandbox_with(vec![], vec![], 10_000);
+    let result = sandbox
+        .execute(
+            "text(\"plain\");\nconsole.log(\"logged\");\nconsole.error(\"bad\");",
+            timeout(10_000),
+        )
+        .await
+        .expect("execution");
+    let CodemodeResult::Ok { output, .. } = result else {
+        panic!("expected ok");
+    };
+    let items: Vec<(String, bool)> = output
+        .iter()
+        .map(|item| match item {
+            rpi_codemode::CodemodeOutputItem::Text { text, console } => (text.clone(), *console),
+            other => panic!("expected text items, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        items,
+        vec![
+            ("plain".to_owned(), false),
+            ("logged".to_owned(), true),
+            ("bad".to_owned(), true),
+        ]
+    );
+}

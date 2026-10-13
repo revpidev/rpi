@@ -221,3 +221,14 @@ agent-level parity stand-in returns the same value
 re-record at the v0.1.6 pin (`a13d35a74`) is deferred to the next
 fixture-generation pass (the recorder builds upstream, which is out of scope
 for V16-07); the value is pin-stable.
+
+## V17-02 note: `tool-calls` read `structuredContent` (2026-10-12)
+
+The same golden's read `tool_execution_end.result` carries the
+`structuredContent` value upstream v1.0.4 added (`read.ts` `readOutputSchema`
++ `toReadOutput`, commit `021eae60a`): the text for text files, or an image
+block with its note for images. The committed golden was recorded against
+`19451accd` (v0.86.1+1), so that one line was updated by hand to the v1.1.0
+shape (same approach as the V16-07 note above); the value is pin-stable and
+byte-checked during the V17-02 codemode end-to-end test
+(`crates/rpi/tests/codemode_test.rs::codemode_read_resolves_images_to_image_blocks`).

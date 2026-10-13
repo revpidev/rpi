@@ -84,13 +84,21 @@ pub struct CodemodeToolInfo {
     pub signature: Option<String>,
 }
 
-/// One item of the script's output, in the order the script produced it.
-/// Image `data` is base64.
+/// One item of the script's output, in the order the script produced it:
+/// `text()` and `console.*` produce text items (`console` true for
+/// `console.*`), `image()` produces image items. Image `data` is base64
+/// (types.ts:43-50 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum CodemodeOutputItem {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        /// `console.*` items are marked so the caller can group them
+        /// (`console: true`, types.ts:45-50 @ abe508e1b).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        console: bool,
+    },
     #[serde(rename = "image")]
     Image { data: String, mime_type: String },
 }
@@ -224,9 +232,18 @@ pub struct CodemodeExecuteOptions {
 /// Default overall deadline (`DEFAULT_TIMEOUT_MS`, host.ts:22).
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 
-/// Store limits (prelude-source.ts:32-33).
+/// Store limits (prelude-source.ts MAX_STORE_VALUE_CHARS /
+/// MAX_STORE_TOTAL_CHARS).
 pub const MAX_STORE_VALUE_CHARS: usize = 256 * 1024;
 pub const MAX_STORE_TOTAL_CHARS: usize = 1024 * 1024;
+
+/// Output one script may produce with `text()`, `image()`, and `console.*`:
+/// characters of text and base64 image data, and items. The host keeps all
+/// output until the script ends, so without a limit a script that prints in
+/// a loop grows the host's memory until it crashes. The item limit covers
+/// loops that print empty strings (prelude-source.ts:39-42).
+pub const MAX_OUTPUT_CHARS: usize = 16 * 1024 * 1024;
+pub const MAX_OUTPUT_ITEMS: usize = 100_000;
 
 /// Globals a host may not shadow (`RESERVED_GLOBALS`, host.ts:24-35).
 pub const RESERVED_GLOBALS: [&str; 9] = [

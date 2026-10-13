@@ -2,6 +2,7 @@
 //! `packages/coding-agent/test/suite/agent-session-codemode.test.ts`
 //! @ abe508e1b.
 
+use base64::Engine as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -101,7 +102,7 @@ fn extension_tool(
 fn tools_extension() -> InlineExtension {
     let factory: ExtensionFactory = Arc::new(move |api: ExtensionApi| {
         Box::pin(async move {
-            api.register_tool(extension_tool(
+            let mut echo = extension_tool(
                 "echo",
                 "Echo text back.\n\nSecond paragraph.",
                 None,
@@ -115,8 +116,11 @@ fn tools_extension() -> InlineExtension {
                         Ok(text_result(&format!("echo: {text}")))
                     })
                 }),
-            ))
-            .map_err(|error| error.to_string())?;
+            );
+            // #10343: codemode shows each tool's prompt guidelines with its
+            // declaration; the system prompt rules only cover declared tools.
+            echo.prompt_guidelines = Some(vec!["Echo exactly once.".to_owned()]);
+            api.register_tool(echo).map_err(|error| error.to_string())?;
             api.register_tool(extension_tool(
                 "stats",
                 "Return structured stats",
@@ -166,6 +170,12 @@ struct Fixture {
 }
 
 async fn session_fixture(initial_mode: CodemodeMode) -> Fixture {
+    session_fixture_with(initial_mode, false).await
+}
+
+/// Fixture with the built-in `read` tool registered (FR-B: codemode's
+/// `tools.read()` resolves image files to image blocks).
+async fn session_fixture_with(initial_mode: CodemodeMode, include_read: bool) -> Fixture {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
@@ -259,22 +269,26 @@ async fn session_fixture(initial_mode: CodemodeMode) -> Fixture {
         services: Some(services),
         session_manager: Some(session_manager),
         extension_host: Some(host.clone()),
-        exclude_tools: Some(vec![
-            "read".to_owned(),
-            "bash".to_owned(),
-            "edit".to_owned(),
-            "write".to_owned(),
-        ]),
+        exclude_tools: if include_read {
+            None
+        } else {
+            Some(vec![
+                "read".to_owned(),
+                "bash".to_owned(),
+                "edit".to_owned(),
+                "write".to_owned(),
+            ])
+        },
         ..Default::default()
     })
     .await
     .expect("create session");
     bind_session_actions(&host, &created.session).await;
-    created.session.set_active_tools_by_name(vec![
-        "codemode".to_owned(),
-        "echo".to_owned(),
-        "stats".to_owned(),
-    ]);
+    let mut active = vec!["codemode".to_owned(), "echo".to_owned(), "stats".to_owned()];
+    if include_read {
+        active.push("read".to_owned());
+    }
+    created.session.set_active_tools_by_name(active);
 
     Fixture {
         session: created.session,
@@ -365,7 +379,10 @@ async fn runs_nested_calls_in_parallel_and_returns_only_the_script_result() {
     );
     assert_eq!(
         rest.trim_start_matches('\n'),
-        "files 2\necho,stats,mcp__dev__search\n{\"a\":\"echo: one\",\"b\":\"echo: two\",\"names\":[\"a\",\"b\"]}"
+        // Output item separation (`eb326d265`): with several text items
+        // each gets a `==> text N/M <==` header, and `console.*` lines
+        // follow the other output in one `<console_output>` block.
+        "==> text 1/2 <==\necho,stats,mcp__dev__search\n==> text 2/2 <==\n{\"a\":\"echo: one\",\"b\":\"echo: two\",\"names\":[\"a\",\"b\"]}\n<console_output>\nfiles 2\n</console_output>"
     );
     let calls = result.details["calls"].as_array().expect("calls");
     let statuses: Vec<(&str, &str)> = calls
@@ -682,4 +699,246 @@ async fn tool_search_loads_deferred_tools_and_keeps_codemode_description_stable(
         .map(|tool| tool.description().to_owned())
         .expect("codemode tool");
     assert_eq!(codemode_description_before, codemode_description_after);
+}
+
+/// A 1×1 PNG; the sandbox's `image()` requires a complete PNG signature.
+const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// #10310: `image()` output is written to a temp file and the result names
+/// the path with the image's type and size right before the image block
+/// (execute.ts:266-300).
+#[tokio::test]
+async fn image_output_is_saved_to_a_named_private_temp_file() {
+    let fixture = session_fixture(CodemodeMode::On).await;
+    let result = run(
+        &fixture,
+        &format!("image(\"data:image/png;base64,{TINY_PNG_BASE64}\");"),
+    )
+    .await;
+    assert_eq!(result.is_error, None, "{}", result_text(&result));
+
+    let label = result
+        .content
+        .iter()
+        .find_map(|block| match block {
+            rpi_ai::types::ToolResultContent::Text(text)
+                if text.text.starts_with("[Image saved to ") =>
+            {
+                Some(text.text.clone())
+            }
+            _ => None,
+        })
+        .expect("image label");
+    let expected_bytes = base64::engine::general_purpose::STANDARD
+        .decode(TINY_PNG_BASE64)
+        .expect("fixture png decodes");
+    assert!(
+        label.ends_with(&format!("(image/png, {}B)]", expected_bytes.len())),
+        "label: {label}"
+    );
+    let path = PathBuf::from(
+        label
+            .strip_prefix("[Image saved to ")
+            .and_then(|rest| rest.split_once(" ("))
+            .map(|(path, _)| path)
+            .expect("label path"),
+    );
+    // The label item sits right before its image block.
+    let label_index = result
+        .content
+        .iter()
+        .position(|block| {
+            matches!(block, rpi_ai::types::ToolResultContent::Text(text) if text.text == label)
+        })
+        .expect("label position");
+    assert!(matches!(
+        result.content.get(label_index + 1),
+        Some(rpi_ai::types::ToolResultContent::Image(image)) if image.mime_type == "image/png"
+    ));
+
+    // The file holds the image bytes and only the user can read it.
+    assert_eq!(std::fs::read(&path).expect("image file"), expected_bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("image metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "output files are user-only");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Images shown more than once are saved once and share one label
+/// (execute.ts:273-279).
+#[tokio::test]
+async fn duplicate_images_share_one_saved_file() {
+    let fixture = session_fixture(CodemodeMode::On).await;
+    let result = run(
+        &fixture,
+        &format!(
+            "image(\"data:image/png;base64,{TINY_PNG_BASE64}\");\nimage(\"data:image/png;base64,{TINY_PNG_BASE64}\");"
+        ),
+    )
+    .await;
+    assert_eq!(result.is_error, None, "{}", result_text(&result));
+    let labels: Vec<&str> = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            rpi_ai::types::ToolResultContent::Text(text)
+                if text.text.starts_with("[Image saved to ") =>
+            {
+                Some(text.text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels.len(), 2, "one label per image");
+    assert_eq!(labels[0], labels[1], "identical images share one file");
+    let path = PathBuf::from(
+        labels[0]
+            .strip_prefix("[Image saved to ")
+            .and_then(|rest| rest.split_once(" ("))
+            .map(|(path, _)| path)
+            .expect("label path"),
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #10251: `tools.read()` on an image resolves to an image block (with its
+/// note) that `image()` accepts (read.ts `readOutputSchema` + `toReadOutput`).
+#[tokio::test]
+async fn codemode_read_resolves_images_to_image_blocks() {
+    let fixture = session_fixture_with(CodemodeMode::On, true).await;
+    let image_path = fixture._tmp.path().join("cwd").join("tiny.png");
+    std::fs::write(
+        &image_path,
+        base64::engine::general_purpose::STANDARD
+            .decode(TINY_PNG_BASE64)
+            .expect("fixture png decodes"),
+    )
+    .expect("write fixture png");
+
+    let result = run(
+        &fixture,
+        "const block = await tools.read({ path: \"tiny.png\" });\nimage(block);\ntext(block.type + \":\" + block.mimeType);",
+    )
+    .await;
+    assert_eq!(result.is_error, None, "{}", result_text(&result));
+    assert!(
+        result_text(&result).contains("image:image/png"),
+        "the script sees the image block: {}",
+        result_text(&result)
+    );
+    assert!(
+        result
+            .content
+            .iter()
+            .any(|block| matches!(block, rpi_ai::types::ToolResultContent::Image(image) if image.mime_type == "image/png")),
+        "the result carries the image"
+    );
+    // The read tool's note rides the block and becomes the saved-image label.
+    let label = result
+        .content
+        .iter()
+        .find_map(|block| match block {
+            rpi_ai::types::ToolResultContent::Text(text)
+                if text.text.starts_with("[Image saved to ") =>
+            {
+                Some(text.text.clone())
+            }
+            _ => None,
+        })
+        .expect("image label");
+    let path = PathBuf::from(
+        label
+            .strip_prefix("[Image saved to ")
+            .and_then(|rest| rest.split_once(" ("))
+            .map(|(path, _)| path)
+            .expect("label path"),
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #10343: hidden tools' snippets and guidelines leave the system prompt
+/// rules, and the codemode description carries their guidelines with the
+/// declaration instead (`getPromptGuidelines`).
+#[tokio::test]
+async fn hidden_tool_guidelines_move_into_the_codemode_description() {
+    let fixture = session_fixture_with(CodemodeMode::Only, true).await;
+    type Captured = (Vec<(String, String)>, String);
+    let captured: Arc<Mutex<Vec<Captured>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_factory = captured.clone();
+    fixture.provider.set_responses(vec![
+        FauxResponseStep::Factory(Box::new(move |context, _options, _state, _model| {
+            let tools = rpi_ai::utils::transcript::get_current_tools(&context.messages);
+            let prompt = rpi_ai::utils::transcript::get_current_system_prompt(&context.messages);
+            captured_for_factory.lock().unwrap().push((
+                tools
+                    .iter()
+                    .map(|tool| (tool.name.clone(), tool.description.clone()))
+                    .collect(),
+                prompt,
+            ));
+            faux_assistant_message(faux_text("ok"), FauxAssistantOptions::default())
+        })),
+        FauxResponseStep::Message(Box::new(faux_assistant_message(
+            faux_text("done"),
+            FauxAssistantOptions::default(),
+        ))),
+    ]);
+    fixture
+        .session
+        .prompt("go", Default::default())
+        .await
+        .expect("prompt");
+
+    let captured = captured.lock().unwrap();
+    let (tools, prompt) = captured.first().expect("captured request");
+    // `read` stays active and callable, but its declaration is hidden.
+    assert!(
+        fixture
+            .session
+            .get_active_tool_names()
+            .contains(&"read".to_owned()),
+        "{:?}",
+        fixture.session.get_active_tool_names()
+    );
+    assert!(
+        !tools.iter().any(|(name, _)| name == "read"),
+        "hidden declaration left out: {tools:?}"
+    );
+    // The snippet and guideline leave the system prompt.
+    assert!(!prompt.contains("- read: "), "{prompt}");
+    assert!(
+        !prompt.contains("Use read to examine files instead of cat or sed."),
+        "{prompt}"
+    );
+    // The codemode description carries the guideline with the declaration.
+    let codemode = tools
+        .iter()
+        .find(|(name, _)| name == "codemode")
+        .map(|(_, description)| description)
+        .expect("codemode declaration");
+    assert!(codemode.contains("### `read`"), "{codemode}");
+    assert!(
+        codemode.contains("- Use read to examine files instead of cat or sed."),
+        "{codemode}"
+    );
+}
+
+/// #10343: `describeTool()` (and `ALL_TOOLS`) show each tool's prompt
+/// guidelines, which the system prompt only has for declared tools.
+#[tokio::test]
+async fn describe_tool_shows_prompt_guidelines() {
+    let fixture = session_fixture(CodemodeMode::On).await;
+    let result = run(&fixture, "text(await describeTool(\"echo\"));").await;
+    assert_eq!(result.is_error, None, "{}", result_text(&result));
+    assert!(
+        result_text(&result).contains("- Echo exactly once."),
+        "{}",
+        result_text(&result)
+    );
 }

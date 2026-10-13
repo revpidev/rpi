@@ -1,6 +1,6 @@
 //! JavaScript evaluated inside the QuickJS VM before the script runs
 //! (verbatim port of `packages/codemode/src/runtime/prelude-source.ts` @
-//! abe508e1b, v1.0.0 description-slimming / `guard()` revision).
+//! abe508e1b, v1.1.0 lockdown / output-limit / console-kind revision).
 //!
 //! The VM is its own wasm instance, so nothing here guards a realm boundary.
 //! The prelude keeps the host bridge in a closure so the script cannot call
@@ -9,6 +9,16 @@
 //! of it. Tool arguments and results cross as JSON strings and are parsed on
 //! this side.
 //!
+//! Before anything else the prelude freezes the built-ins and makes the
+//! built-in globals read-only; the prelude shares them with the script, so a
+//! script that patched one (for example `Array.prototype.toJSON`) could
+//! otherwise corrupt what the prelude reports to the host (#10444).
+//!
+//! Output helpers count characters and items against `MAX_OUTPUT_CHARS` /
+//! `MAX_OUTPUT_ITEMS` and fail the script past either limit, so a print loop
+//! cannot exhaust host memory (#10283). `console.*` items are marked with
+//! kind `console` so the host can group them separately.
+//!
 //! Evaluates to a function
 //! `(bridge, toolsJson, globalsJson, storeJson) => { settle, run, stalled }`.
 //!
@@ -16,19 +26,110 @@
 //! asserts the embedded string still matches, so any edit must be a
 //! deliberate re-port.
 
-/// sha256 of the upstream `PRELUDE_SOURCE` text (v1.0.0 `prelude-source.ts`).
+/// sha256 of the upstream `PRELUDE_SOURCE` text (v1.1.0 `prelude-source.ts`).
 pub const PRELUDE_SOURCE_SHA256: &str =
-    "1aa3d42c6e8c2fc93a4101dd43e1dc5f51bfff5d3b86e7224b1987631399913d";
+    "224cd74082a03a57105af78e1fe205bda692f096252ff4202121016dd78f6228";
 
 /// The prelude evaluated with the filename `codemode-prelude.js` (the
 /// prelude filters its own frames by that name).
 pub const PRELUDE_SOURCE: &str = r####"(function (bridge, toolsJson, globalsJson, storeJson) {
 	"use strict";
+
+	// Freeze every object reachable from the built-in globals, plus the intrinsics that are only
+	// reachable from instances (iterator and generator prototypes, %TypedArray%).
+	//
+	// Freezing alone breaks ordinary code through the "override mistake": a data property that is
+	// read-only on a prototype cannot be assigned on an instance either, so
+	// this.name = "MyError" in an Error subclass would throw. Commonly overridden properties
+	// become accessors whose setter defines an own property on the instance instead.
+	(function lockdown() {
+		const OVERRIDABLE = new Set(["constructor", "name", "message", "toString", "toLocaleString", "valueOf", "toJSON"]);
+		const seen = new Set([globalThis]);
+		const queue = [];
+		const add = (value) => {
+			if ((typeof value === "object" && value !== null) || typeof value === "function") {
+				if (!seen.has(value)) {
+					seen.add(value);
+					queue.push(value);
+				}
+			}
+		};
+
+		// Accessors from an object literal have no own prototype object, unlike function expressions,
+		// whose prototype.constructor would be converted again without end.
+		function allowOverride(object, key, value, enumerable) {
+			const { get, set } = Object.getOwnPropertyDescriptor(
+				{
+					get accessor() {
+						return value;
+					},
+					set accessor(next) {
+						if (this === object) {
+							throw new TypeError("Cannot assign to read only property '" + String(key) + "' of a built-in");
+						}
+						if ((typeof this !== "object" || this === null) && typeof this !== "function") return;
+						Object.defineProperty(this, key, { value: next, writable: true, enumerable: true, configurable: true });
+					},
+				},
+				"accessor",
+			);
+			Object.defineProperty(object, key, { get, set, enumerable, configurable: false });
+			add(get);
+			add(set);
+		}
+
+		for (const key of Reflect.ownKeys(globalThis)) {
+			const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+			add(descriptor.value);
+			add(descriptor.get);
+			add(descriptor.set);
+			if ("value" in descriptor && descriptor.configurable) {
+				Object.defineProperty(globalThis, key, { writable: false, configurable: false });
+			}
+		}
+		add(Object.getPrototypeOf(function* () {}));
+		add(Object.getPrototypeOf(async function () {}));
+		add(Object.getPrototypeOf(async function* () {}));
+		add(Object.getPrototypeOf(Int8Array));
+		add(Object.getPrototypeOf([][Symbol.iterator]()));
+		add(Object.getPrototypeOf(new Map()[Symbol.iterator]()));
+		add(Object.getPrototypeOf(new Set()[Symbol.iterator]()));
+		add(Object.getPrototypeOf(""[Symbol.iterator]()));
+		add(Object.getPrototypeOf(/a/[Symbol.matchAll]("")));
+		if (typeof Iterator === "function") {
+			if (typeof Iterator.prototype.map === "function") add(Object.getPrototypeOf([].values().map((x) => x)));
+			if (typeof Iterator.from === "function") add(Object.getPrototypeOf(Iterator.from({ next() {} })));
+		}
+
+		while (queue.length > 0) {
+			const object = queue.pop();
+			add(Object.getPrototypeOf(object));
+			const descriptors = Object.getOwnPropertyDescriptors(object);
+			for (const key of Reflect.ownKeys(descriptors)) {
+				const descriptor = descriptors[key];
+				if ("value" in descriptor) {
+					add(descriptor.value);
+					if (
+						descriptor.writable &&
+						descriptor.configurable &&
+						(object === Object.prototype || OVERRIDABLE.has(key))
+					) {
+						allowOverride(object, key, descriptor.value, descriptor.enumerable);
+					}
+				} else {
+					add(descriptor.get);
+					add(descriptor.set);
+				}
+			}
+			Object.freeze(object);
+		}
+	})();
 	const stringify = JSON.stringify;
 	const parse = JSON.parse;
 	const promiseThen = Promise.prototype.then;
 	const ErrorCtor = Error;
 	const TypeErrorCtor = TypeError;
+	const RangeErrorCtor = RangeError;
 	const pending = new Map();
 	let nextId = 1;
 	let finished = false;
@@ -67,11 +168,17 @@ pub const PRELUDE_SOURCE: &str = r####"(function (bridge, toolsJson, globalsJson
 		}
 	}
 
+	// The host requires string fields. A script can set an error's name or message to anything, so
+	// they are coerced, and a value whose coercion throws gets a placeholder.
 	function describeError(error) {
-		if (error instanceof ErrorCtor) {
-			return stringify({ name: error.name, message: error.message, stack: errorText(error) });
+		try {
+			if (error instanceof ErrorCtor) {
+				return stringify({ name: String(error.name), message: String(error.message), stack: errorText(error) });
+			}
+			return stringify({ message: String(format(error)) });
+		} catch {
+			return stringify({ message: "The script threw a value that cannot be described" });
 		}
-		return stringify({ message: format(error) });
 	}
 
 	function caller(kind, name, spread) {
@@ -214,6 +321,26 @@ pub const PRELUDE_SOURCE: &str = r####"(function (bridge, toolsJson, globalsJson
 	Object.defineProperty(globalThis, "store", { value: store, enumerable: true });
 	Object.defineProperty(globalThis, "load", { value: load, enumerable: true });
 
+	let outputChars = 0;
+	let outputItems = 0;
+
+	// Past the output limits the script fails: done() reports the error, so catching it does not
+	// resume output, and the host ends the script.
+	function output(kind, data, mimeType) {
+		if (finished) return;
+		outputChars += data.length;
+		outputItems++;
+		if (outputChars > 16777216 || outputItems > 100000) {
+			const error = new RangeErrorCtor(
+				"script output exceeded the limit of 16777216 characters or 100000 text(), image(), and console calls. " +
+					"Print a summary instead, or write large data to a file with a tool.",
+			);
+			done(false, describeError(error));
+			throw error;
+		}
+		bridge("output", kind, data, mimeType);
+	}
+
 	// Primitives become their string form, everything else JSON.
 	function outputText(value) {
 		if (value === undefined || value === null || typeof value !== "object" && typeof value !== "function") {
@@ -230,7 +357,7 @@ pub const PRELUDE_SOURCE: &str = r####"(function (bridge, toolsJson, globalsJson
 		} catch (error) {
 			throw new TypeErrorCtor(error instanceof ErrorCtor ? error.message : String(error));
 		}
-		if (!finished) bridge("output", "text", rendered);
+		output("text", rendered);
 	}
 
 	function imageUrl(value) {
@@ -285,7 +412,7 @@ pub const PRELUDE_SOURCE: &str = r####"(function (bridge, toolsJson, globalsJson
 		if (!signature) {
 			throw new TypeErrorCtor("invalid image output. The image data is not a PNG, JPEG, GIF, or WebP image");
 		}
-		if (!finished) bridge("output", "image", data, signature[0]);
+		output("image", data, signature[0]);
 	}
 
 	function exit() {
@@ -303,7 +430,7 @@ pub const PRELUDE_SOURCE: &str = r####"(function (bridge, toolsJson, globalsJson
 	const console = {};
 	for (const level of ["log", "info", "warn", "error", "debug"]) {
 		console[level] = (...args) => {
-			if (!finished) bridge("output", "text", args.map(format).join(" "));
+			output("console", args.map(format).join(" "));
 		};
 	}
 	Object.freeze(console);

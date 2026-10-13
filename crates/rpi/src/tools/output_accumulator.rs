@@ -524,14 +524,12 @@ impl OutputAccumulator {
             return;
         }
 
-        let path = std::env::temp_dir().join(format!(
-            "{}-{}.log",
-            self.temp_file_prefix,
-            crate::tools::random_hex_16()
-        ));
-
-        match File::create(&path) {
-            Ok(mut file) => {
+        // Every output file goes through the shared helper so the temp
+        // location and the 0600 mode are defined in one place
+        // (`createOutputFileStream`, output-files.ts:31-34).
+        match crate::utils::output_files::create_output_file_stream(&self.temp_file_prefix, ".log")
+        {
+            Ok((path, mut file)) => {
                 // Write all buffered raw chunks.
                 for chunk in &self.raw_chunks {
                     let _ = file.write_all(chunk);

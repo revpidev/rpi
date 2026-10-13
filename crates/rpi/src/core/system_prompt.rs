@@ -335,6 +335,11 @@ pub struct BuildSystemPromptOptions {
     /// Tools to include in the prompt. Default: `["read", "bash", "edit",
     /// "write"]` (system-prompt.ts:17).
     pub selected_tools: Option<Vec<String>>,
+    /// Selected tools whose declarations requests leave out
+    /// (`prepareLoadout` hidden declarations, #10343). They are reachable
+    /// only through another tool, so the tool list and rules leave them out
+    /// too.
+    pub hidden_tools: Option<Vec<String>>,
     /// Optional one-line tool snippets keyed by tool name.
     pub tool_snippets: Option<HashMap<String, String>>,
     /// Guideline bullets contributed by each tool, keyed by tool name
@@ -464,6 +469,21 @@ pub fn build_system_prompt_sections(options: &BuildSystemPromptOptions) -> Syste
         Some(selected) => selected.iter().map(String::as_str).collect(),
         None => default_tools,
     };
+    // The tool list and rules follow the declared tools: hidden declarations
+    // stay active and callable but are left out of the prompt
+    // (system-prompt.ts:150 `declaredTools`).
+    let hidden: HashSet<&str> = options
+        .hidden_tools
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let declared_tools: Vec<&str> = tools
+        .iter()
+        .copied()
+        .filter(|name| !hidden.contains(name))
+        .collect();
 
     // Upstream throws on an invalid section name inside the handler chain
     // (runner catches per handler); rpi validates at the extension mutation
@@ -513,7 +533,7 @@ pub fn build_system_prompt_sections(options: &BuildSystemPromptOptions) -> Syste
                     .map(String::as_str)
                     .filter(|s| !s.is_empty())
             };
-            let visible_tools: Vec<&str> = tools
+            let visible_tools: Vec<&str> = declared_tools
                 .iter()
                 .copied()
                 .filter(|name| snippet(name).is_some())
@@ -536,7 +556,7 @@ pub fn build_system_prompt_sections(options: &BuildSystemPromptOptions) -> Syste
             prompt_sections.push((
                 "rules".to_owned(),
                 build_rules(
-                    &tools,
+                    &declared_tools,
                     options.tool_guidelines.as_ref(),
                     &options.prompt_guidelines,
                 ),
@@ -569,6 +589,8 @@ pub fn build_system_prompt_sections(options: &BuildSystemPromptOptions) -> Syste
     // Skills section only when a skill-file-read tool is available
     // (system-prompt.ts:160-167, 1d6dbf9e3); the gate checks the TRIMMED
     // text like upstream (`formatSkillsForPrompt(...).trim()` non-empty).
+    // A hidden reader is still reachable through another tool, so skills
+    // stay; the caller formats the hint (`"indirect"` names no tool).
     let skill_file_read_tool = ["read", "bash"].iter().find(|tool| tools.contains(tool));
     if let (Some(_), Some(skills_xml)) = (
         skill_file_read_tool,
@@ -868,6 +890,44 @@ mod tests {
         );
         assert!(prompt.contains("- Main documentation: /pkg/README.md\n"));
         assert!(prompt.contains("- Examples: /pkg/examples (extensions, custom tools, SDK)\n"));
+    }
+
+    /// #10343: hidden declarations leave the tool list and rules; their
+    /// guidelines do not render. Without hidden tools the same inputs list
+    /// everything (zero regression).
+    #[test]
+    fn hidden_tools_leave_the_tool_list_and_rules() {
+        let options = BuildSystemPromptOptions {
+            selected_tools: Some(vec!["read".to_owned(), "bash".to_owned(), "run".to_owned()]),
+            hidden_tools: Some(vec!["read".to_owned(), "bash".to_owned()]),
+            tool_snippets: Some(HashMap::from([
+                ("read".to_owned(), "Read files".to_owned()),
+                ("bash".to_owned(), "Run commands".to_owned()),
+                ("run".to_owned(), "Run a task".to_owned()),
+            ])),
+            tool_guidelines: Some(HashMap::from([
+                ("read".to_owned(), vec!["Use read for files.".to_owned()]),
+                ("run".to_owned(), vec!["Prefer run.".to_owned()]),
+            ])),
+            cwd: PathBuf::from("/repo"),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&options);
+        assert!(prompt.contains("<tools>\n- run: Run a task\n"), "{prompt}");
+        assert!(!prompt.contains("- read: "), "{prompt}");
+        assert!(!prompt.contains("Use read for files."), "{prompt}");
+        assert!(!prompt.contains("Use bash for file operations"), "{prompt}");
+        assert!(prompt.contains("- Prefer run."), "{prompt}");
+
+        // No hidden tools: everything is listed again.
+        let options = BuildSystemPromptOptions {
+            hidden_tools: None,
+            ..options
+        };
+        let prompt = build_system_prompt(&options);
+        assert!(prompt.contains("- read: Read files"), "{prompt}");
+        assert!(prompt.contains("- bash: Run commands"), "{prompt}");
+        assert!(prompt.contains("Use read for files."), "{prompt}");
     }
 
     #[test]

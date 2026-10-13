@@ -159,7 +159,7 @@ async fn collects_text_output_and_console() {
             let texts: Vec<String> = output
                 .into_iter()
                 .map(|item| match item {
-                    rpi_codemode::CodemodeOutputItem::Text { text } => text,
+                    rpi_codemode::CodemodeOutputItem::Text { text, .. } => text,
                     rpi_codemode::CodemodeOutputItem::Image { .. } => panic!("unexpected image"),
                 })
                 .collect();

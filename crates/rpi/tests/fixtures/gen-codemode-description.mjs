@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Regenerates `codemode-description.json` from the pinned upstream checkout
-// (`external/pi` @ a13d35a74, v1.0.0). See the sibling README for the
+// (`external/pi` @ abe508e1b, v1.1.0). See the sibling README for the
 // provenance and the byte-parity test that consumes the fixture.
 //
 // Usage (Node 22.18+/24 with built-in type stripping):
@@ -162,6 +162,16 @@ const cases = [
 	{ name: "budget-rotation", tools: [long, echo, read], options: { models: true, inlineBudget: 40 } },
 	{ name: "budget-zero", tools: [echo], options: { models: true, inlineBudget: 0 } },
 	{ name: "mcp-shared-types", tools: [mcp, echo], options: { models: true, inlineBudget: 2000 } },
+	// #10343: listed tools carry their prompt guidelines.
+	{
+		name: "guidelines",
+		tools: [read, echo],
+		options: {
+			models: true,
+			inlineBudget: 3000,
+			guidelines: { read: ["Use read to examine files instead of cat or sed."], echo: ["   ", "Echo exactly once."] },
+		},
+	},
 ];
 
 const result = { cases: [] };
@@ -171,6 +181,7 @@ for (const entry of cases) {
 	if (Array.isArray(options.namespaces)) {
 		options.namespaces = new Map(options.namespaces.map((item) => [item.tool, item.namespace]));
 	}
+	if (options.guidelines) options.guidelines = new Map(Object.entries(options.guidelines));
 	result.cases.push({
 		name: entry.name,
 		tools: entry.tools,

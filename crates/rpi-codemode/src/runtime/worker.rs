@@ -695,7 +695,10 @@ fn host_call(
                     Ok(text) => text,
                     Err(_) => return 0,
                 };
-                crate::types::CodemodeOutputItem::Text { text }
+                crate::types::CodemodeOutputItem::Text {
+                    text,
+                    console: output_kind == "console",
+                }
             };
             let _ = caller.data().events.send(WorkerToHost::Output(item));
         }

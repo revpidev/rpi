@@ -31,9 +31,9 @@ pub fn codemode_docs_path() -> String {
 fn describe_globals(models: bool) -> String {
     let mut lines = vec![
         "Globals:".to_owned(),
-        "- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script.".to_owned(),
+        "- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script. With several text items, each starts with a `==> text N/M <==` line, and `console` lines follow the other output in one `<console_output>` block. `image()` also saves the image to a temp file and the result names its path.".to_owned(),
         "- `store(key, value)` and `load(key)` keep JSON values across codemode calls.".to_owned(),
-        "- `ALL_TOOLS`, `searchTools(query, { limit?, namespace? })`, `describeTool(name)`, `describeNamespace(name)`: find unlisted tools, such as MCP tools.".to_owned(),
+        "- `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools.".to_owned(),
     ];
     if models {
         lines.push(format!(
@@ -53,6 +53,9 @@ pub struct CodemodeDescriptionOptions {
     /// Tools that are callable but never listed with their declaration
     /// (`deferred` exposure).
     pub deferred: HashSet<String>,
+    /// Prompt guidelines of each tool, by tool name, listed after its
+    /// description (`guidelines`, #10343).
+    pub guidelines: HashMap<String, Vec<String>>,
     /// Estimated tokens (characters / 4) the tool sections may use.
     pub inline_budget: Option<usize>,
 }
@@ -140,7 +143,16 @@ pub fn create_codemode_description(
     let declarations: Vec<rpi_codemode::CodemodeToolInfo> = tools
         .iter()
         .filter(|tool| !options.deferred.contains(&tool.name))
-        .map(to_codemode_declaration)
+        .map(|tool| {
+            to_codemode_declaration(
+                tool,
+                options
+                    .guidelines
+                    .get(&tool.name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )
+        })
         .collect();
     // Insertion-ordered groups: unnamed first, then namespaces by name.
     let mut groups: Vec<CatalogGroup> = vec![CatalogGroup {
@@ -274,7 +286,7 @@ pub fn describe_output(schema: Option<&serde_json::Value>) -> String {
 /// A declared tool's description followed by how scripts call it and what
 /// the call resolves to (tool.ts:293-313).
 pub fn describe_script_call(tool: &ToolInfo) -> String {
-    let declaration = to_codemode_declaration(tool);
+    let declaration = to_codemode_declaration(tool, &[]);
     format!(
         "{}\n\nCodemode: `tools.{}(args)` resolves to {}.",
         tool.description.trim(),

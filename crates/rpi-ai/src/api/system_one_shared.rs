@@ -296,6 +296,15 @@ async fn classify_inner(
     if model.api.as_str() != transport.api {
         return Err(format!("Unsupported classifier API: {}", model.api));
     }
+    // ce8972a0e: System One transports cannot send images; the runtime
+    // rejects them before the request instead of sending a malformed body.
+    if context
+        .images
+        .as_ref()
+        .is_some_and(|images| !images.is_empty())
+    {
+        return Err(format!("{} does not support image input", transport.label));
+    }
     let Some(api_key) = options.and_then(|options| options.api_key.clone()) else {
         return Err(format!("No API key for provider: {}", model.provider));
     };

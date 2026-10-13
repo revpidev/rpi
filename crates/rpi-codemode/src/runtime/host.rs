@@ -28,15 +28,6 @@ use crate::types::{
 #[cfg(test)]
 static LIVE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Hard cap on the output the host accumulates before the script settles
-/// (v0.1.6 review P1-5). Upstream accumulates unbounded and truncates to the
-/// token budget only after the run, so a runaway `text()` loop can exhaust
-/// host memory; this cap drops further items instead of terminating the
-/// script (review decision: drop excess, do not kill). The end-of-run
-/// token-budget truncation and full-output spill still apply to what was
-/// collected.
-pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-
 /// Decrements [`LIVE_WORKERS`] when a worker thread exits (test builds).
 #[cfg(test)]
 struct WorkerThreadGuard;
@@ -285,10 +276,9 @@ impl CodemodeSandbox {
 
         let calls = Arc::new(Mutex::new(CallTable::default()));
         let mut output: Vec<CodemodeOutputItem> = Vec::new();
-        // Cumulative output bytes; items past `MAX_OUTPUT_BYTES` are dropped
-        // with a single warning item (see the constant).
-        let mut output_bytes: usize = 0;
-        let mut output_overflowed = false;
+        // Output is bounded inside the VM instead: the prelude fails the
+        // script past `MAX_OUTPUT_CHARS` / `MAX_OUTPUT_ITEMS` (#10283), which
+        // is also what upstream does.
         let abort_message = |closed: bool| {
             if closed {
                 "Sandbox closed"
@@ -347,24 +337,7 @@ impl CodemodeSandbox {
                 message = events_rx.recv() => {
                     match message {
                         Some(WorkerToHost::Output(item)) => {
-                            let size = match &item {
-                                CodemodeOutputItem::Text { text } => text.len(),
-                                CodemodeOutputItem::Image { data, .. } => data.len(),
-                            };
-                            if output_bytes.saturating_add(size) > MAX_OUTPUT_BYTES {
-                                if !output_overflowed {
-                                    output_overflowed = true;
-                                    output.push(CodemodeOutputItem::Text {
-                                        text: format!(
-                                            "Warning: script output exceeded {} MiB; further output was discarded.",
-                                            MAX_OUTPUT_BYTES / (1024 * 1024)
-                                        ),
-                                    });
-                                }
-                            } else {
-                                output_bytes += size;
-                                output.push(item);
-                            }
+                            output.push(item);
                         }
                         Some(WorkerToHost::Call { id, target, name, args }) => {
                             let source = if target == CallTarget::Tool {
@@ -426,7 +399,7 @@ impl CodemodeSandbox {
                             let (store_writes, store_warning) =
                                 parse_store_writes(writes.as_deref());
                             if let Some(warning) = store_warning {
-                                output.push(CodemodeOutputItem::Text { text: warning });
+                                output.push(CodemodeOutputItem::Text { text: warning, console: false });
                             }
                             // A return value that cannot be decoded (over the
                             // nesting bound) is reported, not silently NULLed
@@ -440,6 +413,7 @@ impl CodemodeSandbox {
                                                 text: format!(
                                                     "Warning: the script return value was discarded (JSON nesting limit {MAX_JSON_DEPTH})."
                                                 ),
+                                                console: false,
                                             });
                                             None
                                         }
@@ -503,6 +477,11 @@ impl CodemodeSandbox {
         if abandoned {
             let _ = replies_tx.send(HostToWorker::Abort);
         }
+        // The interrupt flag is set for every outcome, like upstream
+        // `finish()` (`Atomics.store`, host.ts:332): a script that reported
+        // `done` and kept looping (for example `try { text(x) } catch {}`
+        // after the output limit failed it) must not spin its worker thread.
+        interrupt.store(true, Ordering::SeqCst);
         // Already cancelled by finish(): the record keeps "cancelled" and the
         // worker is gone or going (host.ts:297-308).
         abort.cancel();
@@ -950,7 +929,7 @@ mod tests {
         };
         assert!(value.is_none(), "over-deep return value must be discarded");
         assert!(
-            output.iter().any(|item| matches!(item, CodemodeOutputItem::Text { text } if text.contains("return value was discarded"))),
+            output.iter().any(|item| matches!(item, CodemodeOutputItem::Text { text, .. } if text.contains("return value was discarded"))),
             "expected the return-value warning in {output:?}"
         );
     }
@@ -1040,10 +1019,11 @@ mod tests {
         }
     }
 
-    /// v0.1.6 review P1-5: output past `MAX_OUTPUT_BYTES` is dropped with a
-    /// warning instead of accumulating without bound.
+    /// #10283: a print loop past the prelude's output limits fails the
+    /// script instead of accumulating without bound (the limits themselves
+    /// are asserted in `sandbox_behavior_test.rs`).
     #[tokio::test]
-    async fn output_past_the_cap_is_dropped_with_a_warning() {
+    async fn output_past_the_prelude_limit_fails_the_script() {
         let sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
             timeout_ms: CodemodeTimeout::Milliseconds(60_000),
             ..Default::default()
@@ -1051,28 +1031,31 @@ mod tests {
         .expect("sandbox");
         let result = sandbox
             .execute(
-                "for (let i = 0; i < 64; i++) { text('x'.repeat(1 << 20)); }",
+                "for (;;) { text('x'.repeat(1 << 20)); }",
                 CodemodeExecuteOptions::default(),
             )
             .await
             .expect("execution");
-        let CodemodeResult::Ok { output, .. } = result else {
-            panic!("expected ok, got {result:?}");
+        let CodemodeResult::Err { error, output, .. } = result else {
+            panic!("expected the output limit to fail the script");
         };
-        let bytes: usize = output
+        assert_eq!(error.kind, CodemodeErrorKind::Script);
+        assert_eq!(error.name.as_deref(), Some("RangeError"));
+        assert!(
+            error.message.contains("script output exceeded"),
+            "{}",
+            error.message
+        );
+        let chars: usize = output
             .iter()
             .map(|item| match item {
-                CodemodeOutputItem::Text { text } => text.len(),
+                CodemodeOutputItem::Text { text, .. } => text.len(),
                 CodemodeOutputItem::Image { data, .. } => data.len(),
             })
             .sum();
         assert!(
-            bytes <= MAX_OUTPUT_BYTES + 256,
-            "output cap not enforced: {bytes} bytes"
-        );
-        assert!(
-            output.iter().any(|item| matches!(item, CodemodeOutputItem::Text { text } if text.contains("exceeded"))),
-            "expected the overflow warning in {output:?}"
+            chars <= crate::types::MAX_OUTPUT_CHARS,
+            "output limit not enforced: {chars} chars"
         );
     }
 }

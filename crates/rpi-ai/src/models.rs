@@ -1962,6 +1962,9 @@ impl Models {
         let aborted = options
             .and_then(|options| options.signal.as_ref())
             .is_some_and(CancellationToken::is_cancelled);
+        if let Err(error) = crate::types::assert_classifier_input_supported(model, context) {
+            return classifier_error_result(model, &error.message, aborted);
+        }
         match self.classify_inner(model, context, options).await {
             Ok(result) => result,
             Err(error) => classifier_error_result(model, &error, aborted),

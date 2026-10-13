@@ -1442,6 +1442,11 @@ pub struct ToolLoadout {
     pub exposures: HashMap<String, ToolExposure>,
     /// Namespace by tool name (`getNamespace` upstream).
     pub namespaces: HashMap<String, ToolNamespace>,
+    /// `promptGuidelines` by tool name (`getPromptGuidelines` upstream,
+    /// #10343): hidden declarations leave them out of the system prompt, so
+    /// an orchestrating tool presents them with its declarations.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub prompt_guidelines: HashMap<String, Vec<String>>,
 }
 
 impl ToolLoadout {
@@ -1456,6 +1461,15 @@ impl ToolLoadout {
     /// `loadout.getNamespace(name)`.
     pub fn get_namespace(&self, name: &str) -> Option<&ToolNamespace> {
         self.namespaces.get(name)
+    }
+
+    /// `loadout.getPromptGuidelines(name)`; tools without guidelines give an
+    /// empty slice.
+    pub fn get_prompt_guidelines(&self, name: &str) -> &[String] {
+        self.prompt_guidelines
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 

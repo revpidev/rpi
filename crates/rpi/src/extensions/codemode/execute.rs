@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use base64::Engine as _;
 use futures::future::BoxFuture;
 use rpi_agent::types::AgentToolResult;
 use rpi_ai::types::{AssistantImages, ClassifierResult, ToolResultContent, Usage};
@@ -167,7 +168,7 @@ fn describe_value(value: &Value) -> String {
     }
 }
 
-const CLASSIFIER_CONTEXT_SHAPE: &str = "{ state: { ... }, questions: { <id>: { type: \"choice\", instructions, criteria: { <label>: <meaning> } } | { type: \"score\", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: \"bool\", instructions, criteria: { true: <meaning>, false: <meaning> } } } }";
+const CLASSIFIER_CONTEXT_SHAPE: &str = "{ state: { ... }, images?: [{ type: \"image\", data: <base64>, mimeType }], questions: { <id>: { type: \"choice\", instructions, criteria: { <label>: <meaning> } } | { type: \"score\", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: \"bool\", instructions, criteria: { true: <meaning>, false: <meaning> } } } }";
 
 /// Check a script's classifier context (execute.ts:122-157).
 fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierContext, String> {
@@ -188,6 +189,38 @@ fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierCo
             "context.state must be an object, got {}",
             describe_value(context.get("state").unwrap_or(&Value::Null))
         )));
+    };
+    // Optional images, judged together with the state (ce8972a0e). The
+    // transport (or the model's catalog entry) rejects them when unsupported.
+    let images = match context.get("images") {
+        None => None,
+        Some(value) => {
+            let Some(items) = value.as_array() else {
+                return Err(fail(&format!(
+                    "context.images must be an array, got {}",
+                    describe_value(value)
+                )));
+            };
+            let mut images = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let valid = item.as_object().is_some_and(|object| {
+                    object.get("type").and_then(Value::as_str) == Some("image")
+                        && object.get("data").and_then(Value::as_str).is_some()
+                        && object.get("mimeType").and_then(Value::as_str).is_some()
+                });
+                if !valid {
+                    return Err(fail(&format!(
+                        "context.images[{index}] must be an image block, got {}",
+                        describe_value(item)
+                    )));
+                }
+                images.push(rpi_ai::types::ImageContent {
+                    data: item["data"].as_str().unwrap_or_default().to_owned(),
+                    mime_type: item["mimeType"].as_str().unwrap_or_default().to_owned(),
+                });
+            }
+            Some(images)
+        }
     };
     let Some(questions) = context.get("questions").and_then(Value::as_object) else {
         return Err(fail(&format!(
@@ -294,6 +327,7 @@ fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierCo
     }
     Ok(rpi_ai::types::ClassifierContext {
         state: state.clone(),
+        images,
         questions: parsed,
     })
 }
@@ -417,44 +451,11 @@ fn value_text(value: &Value) -> String {
 }
 
 /// Write the full text output to a temp file, like bash does for truncated
-/// output. The file is created exclusively and 0600 (v0.1.6 review P3): a
-/// predictable name with default permissions in a shared temp dir invites
-/// symlink pre-creation and world-readable spill of script output.
+/// output. Every output file goes through the shared helper, which creates
+/// the file exclusively and mode 0600 (`writeOutputFile`, output-files.ts:23-27).
 fn spill_output(text: &str) -> Result<std::path::PathBuf, String> {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let dir = std::env::temp_dir();
-    for _ in 0..8 {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0),
-        );
-        hasher.write_u32(std::process::id());
-        let path = dir.join(format!("rpi-codemode-{:016x}.txt", hasher.finish()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(mut file) => {
-                use std::io::Write;
-                if let Err(error) = file.write_all(text.as_bytes()) {
-                    let _ = std::fs::remove_file(&path);
-                    return Err(error.to_string());
-                }
-                return Ok(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Err("could not create a unique codemode output spill file".to_owned())
+    crate::utils::output_files::write_output_file("rpi-codemode", ".txt", text.as_bytes())
+        .map_err(|error| error.to_string())
 }
 
 /// `truncateOutput` (execute.ts:368-396).
@@ -519,6 +520,157 @@ fn truncate_output(
     (output, full_output_path)
 }
 
+/// File extensions of the image types the sandbox's `image()` accepts. Must
+/// list every type `IMAGE_SIGNATURES` in the prelude detects
+/// (`IMAGE_EXTENSIONS`, execute.ts:266-271).
+fn image_extension(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "image/png" => Some(".png"),
+        "image/jpeg" => Some(".jpg"),
+        "image/gif" => Some(".gif"),
+        "image/webp" => Some(".webp"),
+        _ => None,
+    }
+}
+
+/// The `[Image saved to …]` label for one image (`label`, execute.ts:274-290).
+fn image_label(image: &rpi_ai::types::ImageContent) -> String {
+    // The prelude validates the base64 and the signature, so this only
+    // guards a hand-built host result.
+    let Some(bytes) = base64::engine::general_purpose::STANDARD
+        .decode(&image.data)
+        .ok()
+    else {
+        return format!(
+            "[Image ({}) could not be saved: invalid base64 image data]",
+            image.mime_type
+        );
+    };
+    let kind = format!(
+        "{}, {}",
+        image.mime_type,
+        crate::tools::truncate::format_size(bytes.len())
+    );
+    let Some(extension) = image_extension(&image.mime_type) else {
+        return format!(
+            "[Image ({kind}) could not be saved: no file extension for image type {}]",
+            image.mime_type
+        );
+    };
+    // A failed write (disk full, unwritable temp dir) must not discard the
+    // result of a script whose tool calls already ran, so it becomes part of
+    // the label.
+    match crate::utils::output_files::write_output_file("rpi-codemode", extension, &bytes) {
+        Ok(path) => format!("[Image saved to {} ({kind})]", path.display()),
+        Err(error) => format!("[Image ({kind}) could not be saved: {error}]"),
+    }
+}
+
+/// Lay out the script's output so the model can tell items apart: providers
+/// join adjacent text blocks with a newline or with nothing. With more than
+/// one text item (`text()` or the returned value), each starts with a
+/// `==> text N/M <==` line; `console.*` lines follow all other output in one
+/// `<console_output>` block (`formatOutput`, execute.ts:242-268).
+fn format_output(output: Vec<CodemodeOutputItem>) -> Vec<ToolResultContent> {
+    let total = output
+        .iter()
+        .filter(|item| matches!(item, CodemodeOutputItem::Text { console: false, .. }))
+        .count();
+    let mut items: Vec<ToolResultContent> = Vec::with_capacity(output.len());
+    let mut console_lines: Vec<String> = Vec::new();
+    let mut index = 0usize;
+    for item in output {
+        match item {
+            CodemodeOutputItem::Image { data, mime_type } => {
+                items.push(ToolResultContent::Image(rpi_ai::types::ImageContent {
+                    data,
+                    mime_type,
+                }));
+            }
+            CodemodeOutputItem::Text {
+                text,
+                console: true,
+            } => console_lines.push(text),
+            CodemodeOutputItem::Text {
+                text,
+                console: false,
+            } => {
+                index += 1;
+                let text = if total > 1 {
+                    format!("==> text {index}/{total} <==\n{text}")
+                } else {
+                    text
+                };
+                items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
+                    text,
+                    text_signature: None,
+                }));
+            }
+        }
+    }
+    if !console_lines.is_empty() {
+        items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
+            text: format!(
+                "<console_output>\n{}\n</console_output>",
+                console_lines.join("\n")
+            ),
+            text_signature: None,
+        }));
+    }
+    items
+}
+
+/// Join adjacent text items into one, each part starting on its own line
+/// (`joinAdjacentText`, execute.ts:271-286).
+fn join_adjacent_text(items: Vec<ToolResultContent>) -> Vec<ToolResultContent> {
+    let mut joined: Vec<ToolResultContent> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            ToolResultContent::Text(text) => {
+                if let Some(ToolResultContent::Text(previous)) = joined.last_mut() {
+                    let separator = if previous.text.is_empty() || previous.text.ends_with('\n') {
+                        ""
+                    } else {
+                        "\n"
+                    };
+                    let prior = std::mem::take(&mut previous.text);
+                    previous.text = format!("{prior}{separator}{}", text.text);
+                } else {
+                    joined.push(ToolResultContent::Text(text));
+                }
+            }
+            other => joined.push(other),
+        }
+    }
+    joined
+}
+
+/// Save each image to a temp file and put a text item with its path before
+/// it (`saveImages`, execute.ts:279-300). The model sees the image but has no
+/// other way to reach its bytes: scripts cannot write files, and `write`
+/// only takes text. Images shown more than once are saved once.
+fn save_images(items: Vec<ToolResultContent>) -> Vec<ToolResultContent> {
+    let mut labels: HashMap<String, String> = HashMap::new();
+    let mut output: Vec<ToolResultContent> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            ToolResultContent::Image(image) => {
+                let label = labels
+                    .entry(image.data.clone())
+                    .or_insert_with(|| image_label(&image))
+                    .clone();
+                output.push(ToolResultContent::Text(rpi_ai::types::TextContent {
+                    text: label,
+                    text_signature: None,
+                }));
+                output.push(ToolResultContent::Image(image));
+            }
+            other => output.push(other),
+        }
+    }
+    output
+}
+
 /// Values of `load()`: the `codemode-store` entries on the branch, applied
 /// from the root (execute.ts:232-243).
 fn read_codemode_store(entries: &[SessionEntryInfo]) -> Value {
@@ -566,7 +718,7 @@ fn sample_map(tools: &[ToolInfo]) -> HashMap<String, String> {
         .map(|tool| {
             (
                 tool.name.clone(),
-                render_tool_sample(&to_codemode_declaration(tool)),
+                render_tool_sample(&to_codemode_declaration(tool, &tool.prompt_guidelines)),
             )
         })
         .collect()
@@ -1276,26 +1428,9 @@ pub async fn execute_codemode(
         }
     }
 
-    let output_items: &[CodemodeOutputItem] = match &result {
-        CodemodeResult::Ok { output, .. } | CodemodeResult::Err { output, .. } => output,
+    let mut script_output: Vec<CodemodeOutputItem> = match &result {
+        CodemodeResult::Ok { output, .. } | CodemodeResult::Err { output, .. } => output.clone(),
     };
-    let mut items: Vec<ToolResultContent> = output_items
-        .iter()
-        .map(|item| match item {
-            CodemodeOutputItem::Text { text } => {
-                ToolResultContent::Text(rpi_ai::types::TextContent {
-                    text: text.clone(),
-                    text_signature: None,
-                })
-            }
-            CodemodeOutputItem::Image { data, mime_type } => {
-                ToolResultContent::Image(rpi_ai::types::ImageContent {
-                    data: data.clone(),
-                    mime_type: mime_type.clone(),
-                })
-            }
-        })
-        .collect();
     match &result {
         CodemodeResult::Ok {
             value,
@@ -1315,18 +1450,20 @@ pub async fn execute_codemode(
             }
             // A returned value is appended like text(); `None` adds nothing.
             if let Some(value) = value {
-                items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
+                script_output.push(CodemodeOutputItem::Text {
                     text: value_text(value),
-                    text_signature: None,
-                }));
+                    console: false,
+                });
             }
         }
-        CodemodeResult::Err { .. } => {
-            items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
-                text: format!("Script error:\n{}", format_error(&result, &nested)),
-                text_signature: None,
-            }));
-        }
+        CodemodeResult::Err { .. } => {}
+    }
+    let mut items = format_output(script_output);
+    if matches!(result, CodemodeResult::Err { .. }) {
+        items.push(ToolResultContent::Text(rpi_ai::types::TextContent {
+            text: format!("Script error:\n{}", format_error(&result, &nested)),
+            text_signature: None,
+        }));
     }
     let generated = generated_images.load(std::sync::atomic::Ordering::SeqCst);
     if generated > 0
@@ -1344,13 +1481,16 @@ pub async fn execute_codemode(
     }
 
     let (items, full_output_path) = truncate_output(
-        items,
+        join_adjacent_text(items),
         parsed
             .options
             .max_output_tokens
             .map(|tokens| tokens as usize)
             .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
     );
+    // After truncation, which joins the text items and moves images after
+    // them, so each path stays next to its image and is never cut.
+    let items = join_adjacent_text(save_images(items));
     let ok = matches!(result, CodemodeResult::Ok { .. });
     let wall_time = started.elapsed().as_secs_f64();
     let header = format!(
@@ -1405,4 +1545,87 @@ fn to_script_value(
         });
     }
     Ok(Value::String(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn questions() -> Value {
+        json!({
+            "q1": {
+                "type": "choice",
+                "instructions": "Pick",
+                "criteria": { "a": "first", "b": "second" }
+            }
+        })
+    }
+
+    #[test]
+    fn classifier_context_accepts_optional_images() {
+        let context = json!({
+            "state": { "files": 2 },
+            "images": [
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }
+            ],
+            "questions": questions(),
+        });
+        let parsed = check_classifier_context(&context).expect("parses");
+        let images = parsed.images.expect("images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "aGVsbG8=");
+        assert_eq!(images[0].mime_type, "image/png");
+
+        // Without images the field stays absent.
+        let without = json!({ "state": { "files": 2 }, "questions": questions() });
+        assert!(
+            check_classifier_context(&without)
+                .expect("parses")
+                .images
+                .is_none()
+        );
+
+        // An empty array is allowed and stays empty.
+        let empty = json!({ "state": {}, "images": [], "questions": questions() });
+        assert_eq!(
+            check_classifier_context(&empty).expect("parses").images,
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn classifier_context_rejects_malformed_images() {
+        let not_an_array = json!({
+            "state": {},
+            "images": { "type": "image" },
+            "questions": questions(),
+        });
+        let error = check_classifier_context(&not_an_array).expect_err("rejects");
+        assert!(
+            error.contains("context.images must be an array, got"),
+            "{error}"
+        );
+
+        let not_an_image = json!({
+            "state": {},
+            "images": [{ "type": "text", "data": "x", "mimeType": "text/plain" }],
+            "questions": questions(),
+        });
+        let error = check_classifier_context(&not_an_image).expect_err("rejects");
+        assert!(
+            error.contains("context.images[0] must be an image block, got"),
+            "{error}"
+        );
+
+        let missing_data = json!({
+            "state": {},
+            "images": [{ "type": "image", "mimeType": "image/png" }],
+            "questions": questions(),
+        });
+        let error = check_classifier_context(&missing_data).expect_err("rejects");
+        assert!(
+            error.contains("context.images[0] must be an image block, got"),
+            "{error}"
+        );
+    }
 }

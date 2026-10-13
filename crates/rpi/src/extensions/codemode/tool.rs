@@ -57,6 +57,11 @@ pub struct ToolInfo {
     pub output_schema: Option<Value>,
     pub exposure: ToolExposure,
     pub namespace: Option<ToolNamespace>,
+    /// `promptGuidelines` (`getPromptGuidelines`, #10343): shown with the
+    /// tool's declarations in the codemode description and by
+    /// `describeTool()`, since the system prompt rules only cover declared
+    /// tools.
+    pub prompt_guidelines: Vec<String>,
 }
 
 /// Parse `pi.getAllTools()` JSON into [`ToolInfo`]s, skipping malformed
@@ -88,17 +93,44 @@ pub fn parse_tool_infos(api: &ExtensionApi) -> Vec<ToolInfo> {
                     .get("namespace")
                     .filter(|value| !value.is_null())
                     .and_then(|value| serde_json::from_value::<ToolNamespace>(value.clone()).ok()),
+                prompt_guidelines: object
+                    .get("promptGuidelines")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect()
 }
 
-/// Convert a registered tool into the declaration-only view scripts see.
-/// Tools without an output schema resolve to their text output.
-pub fn to_codemode_declaration(tool: &ToolInfo) -> rpi_codemode::CodemodeToolInfo {
+/// Convert a registered tool into the declaration-only view scripts see:
+/// its description followed by its prompt guidelines, which the system
+/// prompt only has for declared tools (`toCodemodeDeclaration`). Tools
+/// without an output schema resolve to their text output.
+pub fn to_codemode_declaration(
+    tool: &ToolInfo,
+    guidelines: &[String],
+) -> rpi_codemode::CodemodeToolInfo {
+    let bullets: Vec<String> = guidelines
+        .iter()
+        .map(|guideline| guideline.trim())
+        .filter(|guideline| !guideline.is_empty())
+        .map(|guideline| format!("- {guideline}"))
+        .collect();
+    let description = if bullets.is_empty() {
+        tool.description.clone()
+    } else {
+        format!("{}\n\n{}", tool.description.trim(), bullets.join("\n"))
+    };
     rpi_codemode::CodemodeToolInfo {
         name: tool.name.clone(),
-        description: Some(tool.description.clone()),
+        description: Some(description),
         input_schema: Some(tool.parameters.clone()),
         output_schema: Some(
             tool.output_schema
@@ -147,6 +179,7 @@ fn loadout_tool_info(entry: &rpi_ext_host::types::ToolLoadoutEntry) -> ToolInfo 
         output_schema: entry.output_schema.clone(),
         exposure: ToolExposure::Direct,
         namespace: None,
+        prompt_guidelines: Vec::new(),
     }
 }
 
@@ -194,6 +227,17 @@ fn prepare_codemode_loadout(
         .filter(|tool| loadout.get_exposure(&tool.name) == ToolExposure::Deferred)
         .map(|tool| tool.name.clone())
         .collect();
+    // Prompt guidelines of each listed tool (`getPromptGuidelines`, #10343):
+    // the system prompt only has them for declared tools.
+    let guidelines: HashMap<String, Vec<String>> = listed
+        .iter()
+        .map(|tool| {
+            (
+                tool.name.clone(),
+                loadout.get_prompt_guidelines(&tool.name).to_vec(),
+            )
+        })
+        .collect();
     descriptions.insert(
         CODEMODE_TOOL_NAME.to_owned(),
         create_codemode_description(
@@ -202,6 +246,7 @@ fn prepare_codemode_loadout(
                 models: options.models,
                 namespaces,
                 deferred,
+                guidelines,
                 inline_budget: Some(
                     (options.get_inline_budget)()
                         .map(|budget| budget as usize)

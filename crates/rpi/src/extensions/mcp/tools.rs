@@ -8,7 +8,6 @@
 //! (`isError`) are error results for the model but still resolve for
 //! scripts.
 
-use std::io::Write;
 use std::sync::Arc;
 
 use rpi_agent::types::AgentToolResult;
@@ -65,37 +64,16 @@ pub enum McpOutputData {
 pub type McpOutputSaver = Arc<dyn Fn(&McpOutputData, &str) -> Result<String, String> + Send + Sync>;
 
 /// `saveToTempFile` (tools.ts:75): results can carry private data, so only
-/// the user may read the file.
+/// the user may read the file. Every output file goes through the shared
+/// helper (`writeOutputFile`, output-files.ts:23-27).
 pub fn save_to_temp_file(data: &McpOutputData, extension: &str) -> Result<String, String> {
-    let directory = std::env::temp_dir();
-    for attempt in 0..16u64 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let name = format!("rpi-mcp-{nanos:016x}{attempt:02x}{extension}");
-        let path = directory.join(name);
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(mut file) => {
-                let bytes = match data {
-                    McpOutputData::Text(text) => text.as_bytes(),
-                    McpOutputData::Binary(bytes) => bytes,
-                };
-                file.write_all(bytes).map_err(|error| error.to_string())?;
-                return Ok(path.display().to_string());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Err("could not create a unique temp file".to_owned())
+    let bytes = match data {
+        McpOutputData::Text(text) => text.as_bytes(),
+        McpOutputData::Binary(bytes) => bytes.as_slice(),
+    };
+    crate::utils::output_files::write_output_file("rpi-mcp", extension, bytes)
+        .map(|path| path.display().to_string())
+        .map_err(|error| error.to_string())
 }
 
 /// `createMcpToolName` (tools.ts:86): `mcp__<server>__<tool>`, everything

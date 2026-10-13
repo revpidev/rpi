@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::bash::{BashExecError, BashExecOptions, BashOperations};
-use crate::tools::random_hex_16;
 use crate::tools::sanitize::{sanitize_binary_output, strip_ansi};
 use crate::tools::truncate::{self, DEFAULT_MAX_BYTES, TruncateOptions};
 
@@ -70,10 +69,11 @@ impl OutputState {
         if self.temp_file_path.is_some() {
             return;
         }
-        let id = random_hex_16();
-        let path = std::env::temp_dir().join(format!("rpi-bash-{id}.log"));
-        match File::create(&path) {
-            Ok(mut file) => {
+        // Every output file goes through the shared helper so the temp
+        // location and the 0600 mode are defined in one place
+        // (`createOutputFileStream`, output-files.ts:31-34).
+        match crate::utils::output_files::create_output_file_stream("rpi-bash", ".log") {
+            Ok((path, mut file)) => {
                 for chunk in &self.output_chunks {
                     let _ = file.write_all(chunk.as_bytes());
                 }

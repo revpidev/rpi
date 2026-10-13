@@ -1382,12 +1382,39 @@ pub fn load_skills(options: &LoadSkillsOptions) -> LoadSkillsResult {
 // ---------------------------------------------------------------------------
 
 /// The tool used to load skill files, selected by the system-prompt builder
-/// (`["read","bash"].find(tool => tools.includes(tool))`, system-prompt.ts:46).
-/// `1d6dbf9e3` (#8552): skills stay discoverable when only bash is available.
+/// (`["read","bash"].find(tool => tools.includes(tool))`,
+/// system-prompt.ts:46). `1d6dbf9e3` (#8552): skills stay discoverable when
+/// only bash is available. `Indirect` names no tool for a reader that is
+/// hidden by `prepareLoadout` and reachable only through another tool
+/// (#10343).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillFileReadTool {
     Read,
     Bash,
+    Indirect,
+}
+
+/// The skill-file reader for a selected/hidden tool set
+/// (system-prompt.ts:160-167 @ abe508e1b): the first DECLARED reader wins; a
+/// hidden reader is still reachable through another tool, so skills stay and
+/// the hint names no tool (`"indirect"`, #10343).
+pub fn skill_file_read_tool(
+    selected: &[String],
+    hidden: &std::collections::HashSet<String>,
+) -> Option<SkillFileReadTool> {
+    let declared = |name: &str| {
+        selected.iter().any(|selected_name| selected_name == name) && !hidden.contains(name)
+    };
+    if declared("read") {
+        return Some(SkillFileReadTool::Read);
+    }
+    if declared("bash") {
+        return Some(SkillFileReadTool::Bash);
+    }
+    if selected.iter().any(|name| name == "read" || name == "bash") {
+        return Some(SkillFileReadTool::Indirect);
+    }
+    None
 }
 
 /// `formatSkillsForPrompt` (skills.ts:335-361). The `tool` that will load
@@ -1405,6 +1432,7 @@ pub fn format_skills_for_prompt(skills: &[Skill], tool: SkillFileReadTool) -> St
         SkillFileReadTool::Bash => {
             "Use bash to load a skill's file when the task matches its description."
         }
+        SkillFileReadTool::Indirect => "Load a skill's file when the task matches its description.",
     };
     let visible: Vec<&Skill> = skills
         .iter()
@@ -2249,6 +2277,62 @@ mod tests {
             bash_prompt
         );
         assert_eq!(format_skills_for_prompt(&[], SkillFileReadTool::Read), "");
+    }
+
+    /// #10343: a hidden reader is still reachable through another tool, so
+    /// skills stay and the hint names no tool (`"indirect"`).
+    #[test]
+    fn test_indirect_reader_names_no_tool() {
+        let tmp = TempDir::new();
+        let file = tmp.path().join("s/SKILL.md");
+        let skill = make_skill("s", "d", &file);
+        let indirect =
+            format_skills_for_prompt(std::slice::from_ref(&skill), SkillFileReadTool::Indirect);
+        assert!(
+            indirect.contains("Load a skill's file when the task matches its description."),
+            "{indirect}"
+        );
+        assert!(!indirect.contains("read tool"), "{indirect}");
+        assert!(!indirect.contains("Use bash"), "{indirect}");
+    }
+
+    /// #10343: the declared readers win; a hidden reader falls back to
+    /// `Indirect`; no reader at all drops the skills section.
+    #[test]
+    fn test_skill_file_read_tool_selection() {
+        let selected = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<String>>()
+        };
+        let hidden = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<std::collections::HashSet<String>>()
+        };
+        assert_eq!(
+            skill_file_read_tool(&selected(&["read", "bash"]), &hidden(&[])),
+            Some(SkillFileReadTool::Read)
+        );
+        // A hidden read falls back to bash when bash is declared.
+        assert_eq!(
+            skill_file_read_tool(&selected(&["read", "bash"]), &hidden(&["read"])),
+            Some(SkillFileReadTool::Bash)
+        );
+        // All readers hidden: skills stay, the hint names no tool.
+        assert_eq!(
+            skill_file_read_tool(
+                &selected(&["read", "bash", "edit"]),
+                &hidden(&["read", "bash"])
+            ),
+            Some(SkillFileReadTool::Indirect)
+        );
+        assert_eq!(
+            skill_file_read_tool(&selected(&["edit"]), &hidden(&[])),
+            None
+        );
     }
 
     // ---- /skill expansion ----
