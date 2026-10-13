@@ -137,12 +137,12 @@ impl ProgramStatusReporter {
         };
     }
 
-    /// `session_info_changed` (program-status-reporter.ts:70-72) is handled
-    /// by the caller re-reporting: the session name is part of working and
-    /// done reports and `report()` dedups by content.
-
     /// Report `blocked` for a dialog until it is cleared with `None`.
     /// Reopening a source replaces it (program-status-reporter.ts:88-92).
+    ///
+    /// `session_info_changed` (program-status-reporter.ts:70-72) needs no
+    /// method here: the caller re-reports, since the session name is part of
+    /// working and done reports and `report()` dedups by content.
     pub fn set_blocked(&mut self, source: &str, status: Option<BlockedStatus>) {
         self.blocked.retain(|(key, _)| key != source);
         if let Some(status) = status {

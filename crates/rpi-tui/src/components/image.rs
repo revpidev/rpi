@@ -82,10 +82,10 @@ fn to_png(base64_data: &str, mime_type: &str) -> Option<String> {
         }
     };
     // Touch the entry so it survives the next eviction.
-    if let Some(position) = cache.order.iter().position(|key| key == base64_data) {
-        if let Some(key) = cache.order.remove(position) {
-            cache.order.push_back(key);
-        }
+    if let Some(position) = cache.order.iter().position(|key| key == base64_data)
+        && let Some(key) = cache.order.remove(position)
+    {
+        cache.order.push_back(key);
     }
     png
 }
