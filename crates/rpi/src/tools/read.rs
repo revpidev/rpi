@@ -147,7 +147,7 @@ const NON_VISION_NOTE: &str =
 
 /// Result for programmatic callers such as codemode scripts: the text for
 /// text files, and an image block for images that codemode's `image()`
-/// accepts (`readOutputSchema`, read.ts:27-34). `note` is the text that goes
+/// accepts (`readOutputSchema`, read.ts:33-36). `note` is the text that goes
 /// with the image, such as resize hints.
 fn read_output_schema() -> &'static Value {
     static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
@@ -171,7 +171,7 @@ fn read_output_schema() -> &'static Value {
 }
 
 /// The image block and its note, or the text for text files and images that
-/// could not be processed (`toReadOutput`, read.ts:72-77).
+/// could not be processed (`toReadOutput`, read.ts:73-77).
 fn to_read_output(content: &[ToolResultContent]) -> Value {
     let text = content
         .iter()
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(text_of(&result), "line1\nline2\nline3");
         assert_eq!(result.details, Value::Null);
         // Programmatic callers (codemode) get the text as a string
-        // (read.ts:213 `structuredContent: toReadOutput(result.content)`).
+        // (read.ts:216 `structuredContent: toReadOutput(result.content)`).
         assert_eq!(
             result.structured_content,
             Some(Value::String("line1\nline2\nline3".to_owned()))

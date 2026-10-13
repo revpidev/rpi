@@ -143,11 +143,13 @@ fn with_article(word: &str) -> String {
     format!("{article} {word}")
 }
 
+/// A script value in an error message: `null`, `a string`, `an array`, or
+/// its keys (`{ prompt }`) (`describeValue`, execute.ts:107-116 @ abe508e1b).
 fn describe_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
+        Value::Bool(_) => "a boolean".to_owned(),
+        Value::Number(_) => "a number".to_owned(),
         Value::String(_) => "a string".to_owned(),
         Value::Array(values) => {
             if values.is_empty() {
@@ -168,26 +170,37 @@ fn describe_value(value: &Value) -> String {
     }
 }
 
+/// [`describe_value`] for a possibly missing field: JSON has no `undefined`,
+/// so the option carries the distinction (`undefined` vs `null`).
+fn describe_option(value: Option<&Value>) -> String {
+    match value {
+        Some(value) => describe_value(value),
+        None => "undefined".to_owned(),
+    }
+}
+
 const CLASSIFIER_CONTEXT_SHAPE: &str = "{ state: { ... }, images?: [{ type: \"image\", data: <base64>, mimeType }], questions: { <id>: { type: \"choice\", instructions, criteria: { <label>: <meaning> } } | { type: \"score\", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: \"bool\", instructions, criteria: { true: <meaning>, false: <meaning> } } } }";
 
-/// Check a script's classifier context (execute.ts:122-157).
-fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierContext, String> {
+/// Check a script's classifier context (execute.ts:122-170).
+fn check_classifier_context(
+    value: Option<&Value>,
+) -> Result<rpi_ai::types::ClassifierContext, String> {
     let fail = |problem: &str| {
         format!(
             "models.classify() {problem}. Expected context: {CLASSIFIER_CONTEXT_SHAPE}. See \"Classify\" in {}.",
             crate::extensions::codemode::description::codemode_docs_path()
         )
     };
-    let Some(context) = value.as_object() else {
+    let Some(context) = value.and_then(Value::as_object) else {
         return Err(fail(&format!(
             "expects a context object as its second argument, got {}",
-            describe_value(value)
+            describe_option(value)
         )));
     };
     let Some(state) = context.get("state").and_then(Value::as_object) else {
         return Err(fail(&format!(
             "context.state must be an object, got {}",
-            describe_value(context.get("state").unwrap_or(&Value::Null))
+            describe_option(context.get("state"))
         )));
     };
     // Optional images, judged together with the state (ce8972a0e). The
@@ -225,7 +238,7 @@ fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierCo
     let Some(questions) = context.get("questions").and_then(Value::as_object) else {
         return Err(fail(&format!(
             "context.questions must map question IDs to questions, got {}",
-            describe_value(context.get("questions").unwrap_or(&Value::Null))
+            describe_option(context.get("questions"))
         )));
     };
     if questions.is_empty() {
@@ -318,8 +331,14 @@ fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierCo
                 )));
             }
             None => {
+                // `JSON.stringify(question.type)`: missing renders as
+                // `undefined`, a non-string JSON value as its compact form.
+                let rendered = match question.get("type") {
+                    None => "undefined".to_owned(),
+                    Some(value) => value.to_string(),
+                };
                 return Err(fail(&format!(
-                    "{at}.type must be \"choice\", \"score\", or \"bool\", got null"
+                    "{at}.type must be \"choice\", \"score\", or \"bool\", got {rendered}"
                 )));
             }
         };
@@ -332,30 +351,30 @@ fn check_classifier_context(value: &Value) -> Result<rpi_ai::types::ClassifierCo
     })
 }
 
-/// Check a script's image context (execute.ts:159-183).
-fn check_images_context(value: &Value) -> Result<rpi_ai::types::ImagesContext, String> {
+/// Check a script's image context (execute.ts:173-196).
+fn check_images_context(value: Option<&Value>) -> Result<rpi_ai::types::ImagesContext, String> {
     let docs = crate::extensions::codemode::description::codemode_docs_path();
     let fail = |problem: &str| {
         format!(
             "models.generateImages() {problem}. Expected context: {{ input: [{{ type: \"text\", text: <prompt> }}, ...optional {{ type: \"image\", data: <base64>, mimeType }} references] }}. See \"Generate images\" in {docs}."
         )
     };
-    let Some(context) = value.as_object() else {
+    let Some(context) = value.and_then(Value::as_object) else {
         return Err(fail(&format!(
             "expects a context object as its second argument, got {}",
-            describe_value(value)
+            describe_option(value)
         )));
     };
     let Some(input) = context.get("input").and_then(Value::as_array) else {
         return Err(fail(&format!(
             "context.input must be a non-empty array of blocks, got {}",
-            describe_value(context.get("input").unwrap_or(&Value::Null))
+            describe_option(context.get("input"))
         )));
     };
     if input.is_empty() {
         return Err(fail(&format!(
             "context.input must be a non-empty array of blocks, got {}",
-            describe_value(context.get("input").unwrap_or(&Value::Null))
+            describe_option(context.get("input"))
         )));
     }
     let mut blocks = Vec::new();
@@ -458,7 +477,7 @@ fn spill_output(text: &str) -> Result<std::path::PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
-/// `truncateOutput` (execute.ts:368-396).
+/// `truncateOutput` (execute.ts:373-396).
 fn truncate_output(
     items: Vec<ToolResultContent>,
     max_tokens: usize,
@@ -522,7 +541,7 @@ fn truncate_output(
 
 /// File extensions of the image types the sandbox's `image()` accepts. Must
 /// list every type `IMAGE_SIGNATURES` in the prelude detects
-/// (`IMAGE_EXTENSIONS`, execute.ts:266-271).
+/// (`IMAGE_EXTENSIONS`, execute.ts:326-331).
 fn image_extension(mime_type: &str) -> Option<&'static str> {
     match mime_type {
         "image/png" => Some(".png"),
@@ -533,7 +552,7 @@ fn image_extension(mime_type: &str) -> Option<&'static str> {
     }
 }
 
-/// The `[Image saved to …]` label for one image (`label`, execute.ts:274-290).
+/// The `[Image saved to …]` label for one image (`label`, execute.ts:340-353).
 fn image_label(image: &rpi_ai::types::ImageContent) -> String {
     // The prelude validates the base64 and the signature, so this only
     // guards a hand-built host result.
@@ -570,7 +589,7 @@ fn image_label(image: &rpi_ai::types::ImageContent) -> String {
 /// join adjacent text blocks with a newline or with nothing. With more than
 /// one text item (`text()` or the returned value), each starts with a
 /// `==> text N/M <==` line; `console.*` lines follow all other output in one
-/// `<console_output>` block (`formatOutput`, execute.ts:242-268).
+/// `<console_output>` block (`formatOutput`, execute.ts:262-281).
 fn format_output(output: Vec<CodemodeOutputItem>) -> Vec<ToolResultContent> {
     let total = output
         .iter()
@@ -621,7 +640,7 @@ fn format_output(output: Vec<CodemodeOutputItem>) -> Vec<ToolResultContent> {
 }
 
 /// Join adjacent text items into one, each part starting on its own line
-/// (`joinAdjacentText`, execute.ts:271-286).
+/// (`joinAdjacentText`, execute.ts:284-296).
 fn join_adjacent_text(items: Vec<ToolResultContent>) -> Vec<ToolResultContent> {
     let mut joined: Vec<ToolResultContent> = Vec::with_capacity(items.len());
     for item in items {
@@ -646,7 +665,7 @@ fn join_adjacent_text(items: Vec<ToolResultContent>) -> Vec<ToolResultContent> {
 }
 
 /// Save each image to a temp file and put a text item with its path before
-/// it (`saveImages`, execute.ts:279-300). The model sees the image but has no
+/// it (`saveImages`, execute.ts:338-366). The model sees the image but has no
 /// other way to reach its bytes: scripts cannot write files, and `write`
 /// only takes text. Images shown more than once are saved once.
 fn save_images(items: Vec<ToolResultContent>) -> Vec<ToolResultContent> {
@@ -890,7 +909,7 @@ enum CheckedContext {
     Images(rpi_ai::types::ImagesContext),
 }
 
-type CheckFn = Arc<dyn Fn(&Value) -> Result<CheckedContext, String> + Send + Sync>;
+type CheckFn = Arc<dyn Fn(Option<&Value>) -> Result<CheckedContext, String> + Send + Sync>;
 type RunFn =
     Arc<dyn Fn(rpi_ai::types::AnyModel, CheckedContext) -> BoxFuture<'static, Value> + Send + Sync>;
 type RunModelCallFn = Arc<
@@ -905,7 +924,7 @@ type RunModelCallFn = Arc<
         + Sync,
 >;
 
-/// `models.*` for scripts (execute.ts:519-630).
+/// `models.*` for scripts (execute.ts:627-733).
 fn create_model_globals(
     models: Arc<crate::core::model_runtime::ModelRuntime>,
     tool_call_id: String,
@@ -937,17 +956,22 @@ fn create_model_globals(
                 let list_hint = format!(
                     "List the {model_type} models you can use with models.getAvailableOfType(\"{model_type}\")."
                 );
-                let model = args.first().cloned().unwrap_or(Value::Null);
+                let model = args.first();
                 let fail_first = |detail: &str| {
-                    let undefined_hint =
-                        " models.getModelOfType() returns undefined for an unknown provider or id.";
+                    // The hint only rides the missing/null model error
+                    // (`model === undefined || model === null`, execute.ts:652-655).
+                    let undefined_hint = if model.is_none_or(Value::is_null) {
+                        " models.getModelOfType() returns undefined for an unknown provider or id."
+                    } else {
+                        ""
+                    };
                     format!(
                         "{name}() expects {} model as its first argument, got {detail}.{undefined_hint} {list_hint}",
                         with_article(model_type)
                     )
                 };
                 let (Some(provider), Some(id)) = model
-                    .as_object()
+                    .and_then(Value::as_object)
                     .map(|object| {
                         (
                             object.get("provider").and_then(Value::as_str),
@@ -956,7 +980,7 @@ fn create_model_globals(
                     })
                     .unwrap_or((None, None))
                 else {
-                    return Err(fail_first(&describe_value(&model)));
+                    return Err(fail_first(&describe_option(model)));
                 };
                 let ref_name = format!("{provider}/{id}");
                 let Some(resolved) =
@@ -981,7 +1005,7 @@ fn create_model_globals(
                         }
                     });
                 };
-                let checked = check(args.get(1).unwrap_or(&Value::Null))?;
+                let checked = check(args.get(1))?;
 
                 let index = {
                     let mut calls = calls.lock().unwrap_or_else(|error| error.into_inner());
@@ -1212,7 +1236,7 @@ fn create_model_globals(
     globals
 }
 
-/// Execute one codemode script (execute.ts:316-434).
+/// Execute one codemode script (execute.ts:416-537).
 pub async fn execute_codemode(
     request: ToolExecuteRequest,
     ctx: ExtensionContext,
@@ -1440,7 +1464,7 @@ pub async fn execute_codemode(
             // Store writes are persisted for every successful script — a
             // script that reports success without returning a value (a bare
             // `exit()` or a body with no `return`, both `value: None`) must
-            // still commit them (v0.1.6 review P1-3; upstream execute.ts:404
+            // still commit them (v0.1.6 review P1-3; upstream execute.ts:504-506
             // persists them for `result.ok` regardless of `result.value`).
             if !store_writes.set.is_empty() || !store_writes.delete.is_empty() {
                 let _ = options.api.append_entry(
@@ -1525,7 +1549,7 @@ pub async fn execute_codemode(
     })
 }
 
-/// The value a script receives for a nested call (execute.ts:398-410).
+/// The value a script receives for a nested call (execute.ts:404-410).
 fn to_script_value(
     output_schema: Option<&Value>,
     name: &str,
@@ -1570,7 +1594,7 @@ mod tests {
             ],
             "questions": questions(),
         });
-        let parsed = check_classifier_context(&context).expect("parses");
+        let parsed = check_classifier_context(Some(&context)).expect("parses");
         let images = parsed.images.expect("images");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "aGVsbG8=");
@@ -1579,7 +1603,7 @@ mod tests {
         // Without images the field stays absent.
         let without = json!({ "state": { "files": 2 }, "questions": questions() });
         assert!(
-            check_classifier_context(&without)
+            check_classifier_context(Some(&without))
                 .expect("parses")
                 .images
                 .is_none()
@@ -1588,7 +1612,9 @@ mod tests {
         // An empty array is allowed and stays empty.
         let empty = json!({ "state": {}, "images": [], "questions": questions() });
         assert_eq!(
-            check_classifier_context(&empty).expect("parses").images,
+            check_classifier_context(Some(&empty))
+                .expect("parses")
+                .images,
             Some(Vec::new())
         );
     }
@@ -1600,7 +1626,7 @@ mod tests {
             "images": { "type": "image" },
             "questions": questions(),
         });
-        let error = check_classifier_context(&not_an_array).expect_err("rejects");
+        let error = check_classifier_context(Some(&not_an_array)).expect_err("rejects");
         assert!(
             error.contains("context.images must be an array, got"),
             "{error}"
@@ -1611,7 +1637,7 @@ mod tests {
             "images": [{ "type": "text", "data": "x", "mimeType": "text/plain" }],
             "questions": questions(),
         });
-        let error = check_classifier_context(&not_an_image).expect_err("rejects");
+        let error = check_classifier_context(Some(&not_an_image)).expect_err("rejects");
         assert!(
             error.contains("context.images[0] must be an image block, got"),
             "{error}"
@@ -1622,9 +1648,61 @@ mod tests {
             "images": [{ "type": "image", "mimeType": "image/png" }],
             "questions": questions(),
         });
-        let error = check_classifier_context(&missing_data).expect_err("rejects");
+        let error = check_classifier_context(Some(&missing_data)).expect_err("rejects");
         assert!(
             error.contains("context.images[0] must be an image block, got"),
+            "{error}"
+        );
+    }
+
+    /// Missing fields render as `undefined` like upstream
+    /// (`agent-session-codemode.test.ts:952/958`); explicit `null` stays
+    /// `null`, and other values use the `describeValue` wording.
+    #[test]
+    fn context_errors_match_upstream_wording() {
+        let no_state = json!({ "questions": questions() });
+        let error = check_classifier_context(Some(&no_state)).expect_err("rejects");
+        assert!(
+            error.contains("context.state must be an object, got undefined."),
+            "{error}"
+        );
+
+        let null_state = json!({ "state": null, "questions": questions() });
+        let error = check_classifier_context(Some(&null_state)).expect_err("rejects");
+        assert!(
+            error.contains("context.state must be an object, got null."),
+            "{error}"
+        );
+
+        let no_context = check_classifier_context(None).expect_err("rejects");
+        assert!(
+            no_context.contains("expects a context object as its second argument, got undefined."),
+            "{no_context}"
+        );
+
+        let no_input = json!({ "prompt": "a fox" });
+        let error = check_images_context(Some(&no_input)).expect_err("rejects");
+        assert!(
+            error.contains("context.input must be a non-empty array of blocks, got undefined."),
+            "{error}"
+        );
+
+        let number_state = json!({ "state": 5, "questions": questions() });
+        let error = check_classifier_context(Some(&number_state)).expect_err("rejects");
+        assert!(
+            error.contains("context.state must be an object, got a number."),
+            "{error}"
+        );
+
+        let missing_type = json!({
+            "state": {},
+            "questions": { "q1": { "instructions": "Pick", "criteria": {} } }
+        });
+        let error = check_classifier_context(Some(&missing_type)).expect_err("rejects");
+        assert!(
+            error.contains(
+                "context.questions.q1.type must be \"choice\", \"score\", or \"bool\", got undefined"
+            ),
             "{error}"
         );
     }
