@@ -302,8 +302,7 @@ fn build_edit_call_component(
     theme: &Theme,
     cwd: &str,
 ) -> TuiBox {
-    // `new Box(1, 1, ...)` + `setBgFn(getEditHeaderBg(...))` (edit.ts:157-164,
-    // 262).
+    // `new Box(1, 1, ...)` + `setBgFn(getEditHeaderBg(...))` (edit.ts:256-275).
     let mut component = TuiBox::new(
         1,
         1,

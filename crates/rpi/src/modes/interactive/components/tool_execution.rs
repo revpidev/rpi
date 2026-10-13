@@ -23,7 +23,7 @@
 //! - Kitty image conversion happens inside the `rpi-tui` `Image` component
 //!   through the registered PNG transcoder (`utils/image_convert.rs`,
 //!   upstream `maybeConvertImagesForKitty` + photon,
-//!   tool-execution.ts:178-199 + utils/image-convert.ts): the component keeps
+//!   tool-execution.ts:340-382 + utils/image-convert.ts): the component keeps
 //!   converted PNG data across updates and reuses `Image` instances whose
 //!   source bytes did not change. Upstream's async conversion has a
 //!   synchronous equivalent because the `image` crate is compiled in.
@@ -188,7 +188,7 @@ pub struct ToolRenderContext {
     pub expanded: bool,
     pub show_images: bool,
     pub is_error: bool,
-    /// `durationMs` (tool-execution.ts:119): recorded execution time of the
+    /// `durationMs` (tool-execution.ts:137): recorded execution time of the
     /// finished result; `None` while partial or for legacy results. Internal
     /// field first — the extension ABI field opens in V17-06.
     pub duration_ms: Option<u64>,
@@ -270,7 +270,7 @@ pub struct ToolExecutionComponent {
     has_result: Arc<AtomicBool>,
     show_images: bool,
     image_width_cells: usize,
-    /// `outputPad` (tool-execution.ts:48-50, #10557).
+    /// `outputPad` (tool-execution.ts:50, #10557).
     output_pad: usize,
     is_partial: bool,
     tool_definition: Option<Arc<dyn ToolDefinition>>,
@@ -282,7 +282,7 @@ pub struct ToolExecutionComponent {
     result: Option<ToolResultState>,
     /// Inputs of `image_components`, so `update_display` can reuse images
     /// and keep their converted PNG data (`imageSources`,
-    /// tool-execution.ts:57-58 @ a276dabe5, #10292).
+    /// tool-execution.ts:42 @ a276dabe5, #10292).
     image_sources: Vec<ImageSource>,
     hide_component: bool,
     theme: Arc<Theme>,
@@ -507,7 +507,7 @@ impl ToolExecutionComponent {
         self.update_display();
     }
 
-    /// `setOutputPad` (tool-execution.ts:203-206 @ 18336987a, #10557).
+    /// `setOutputPad` (tool-execution.ts:207-210 @ 18336987a, #10557).
     pub fn set_output_pad(&mut self, output_pad: usize) {
         self.output_pad = output_pad;
         self.update_display();
@@ -670,7 +670,7 @@ impl ToolExecutionComponent {
             ))));
         }
 
-        // Images are appended after the shell (tool-execution.ts:321-354 @
+        // Images are appended after the shell (tool-execution.ts:355-382 @
         // a276dabe5, #10292): reuse `Image` instances whose source bytes did
         // not change so their converted PNG data survives updates; the
         // component itself transcodes non-PNG data on Kitty terminals.
@@ -857,7 +857,7 @@ impl Component for ToolExecutionComponent {
     }
 }
 
-/// `imageSources` entry (tool-execution.ts:57-58 @ a276dabe5, #10292): the
+/// `imageSources` entry (tool-execution.ts:42 @ a276dabe5, #10292): the
 /// inputs of an `Image` component, so an instance is only reused while its
 /// source bytes, mime type, and width are unchanged.
 #[derive(Debug, Clone, PartialEq)]
@@ -1269,9 +1269,14 @@ mod tests {
     }
 
     // tool-execution-component.test.ts: "renders a text fallback for
-    // non-PNG images without a transcoder" (#10292, a276dabe5).
+    // non-PNG images without a transcoder" (#10292, a276dabe5). The
+    // component's `ensure_png_transcoder` registers the real transcoder on
+    // Kitty terminals, so the component-level fallback here comes from that
+    // transcoder rejecting undecodable data; the truly transcoder-less path
+    // is covered by the rpi-tui test
+    // `renders_a_text_fallback_until_a_working_transcoder_is_registered`.
     #[test]
-    fn non_png_kitty_images_render_a_text_fallback_without_a_transcoder() {
+    fn non_png_kitty_images_render_a_text_fallback_when_conversion_fails() {
         let _transcoder_guard = crate::utils::image_convert::TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());

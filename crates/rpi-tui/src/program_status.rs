@@ -13,7 +13,7 @@
 
 use base64::Engine as _;
 
-/// `ProgramStatusState` (program-status.ts:8-9 states plus `clear`).
+/// `ProgramStatusState` (program-status.ts:8-10 states plus `clear`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramStatusState {
     Idle,
@@ -59,7 +59,7 @@ impl ProgramStatusKind {
     }
 }
 
-/// `ProgramStatus` (program-status.ts:7-17). `app` is omitted on the wire
+/// `ProgramStatus` (program-status.ts:8-17). `app` is omitted on the wire
 /// unless [`is_valid_app_name`] accepts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramStatus {
@@ -153,7 +153,7 @@ pub fn is_program_status_reply(sequence: &str) -> bool {
     matches!(middle, Some(middle) if !middle.contains(['\x07', '\x1b']))
 }
 
-/// `APP_PATTERN` (program-status.ts:28).
+/// `APP_PATTERN` (program-status.ts:27).
 fn is_valid_app_name(app: &str) -> bool {
     (1..=32).contains(&app.len())
         && app
@@ -161,7 +161,7 @@ fn is_valid_app_name(app: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
 }
 
-/// `CONTROL_CHARACTERS` (program-status.ts:29): C0 and C1 controls.
+/// `CONTROL_CHARACTERS` (program-status.ts:28): C0 and C1 controls.
 fn is_control_character(c: char) -> bool {
     matches!(c, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}')
 }
@@ -197,7 +197,7 @@ fn js_trim(text: &str) -> &str {
     text.trim_matches(is_js_trim_whitespace)
 }
 
-/// `truncateUtf8` (program-status.ts:33-43): cut at a UTF-8 boundary whose
+/// `truncateUtf8` (program-status.ts:32-41): cut at a UTF-8 boundary whose
 /// byte length stays within `max_bytes`.
 fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
@@ -216,7 +216,7 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
-/// Decoded `msg` limit (program-status.ts:31): its base64 encoding stays
+/// Decoded `msg` limit (program-status.ts:30): its base64 encoding stays
 /// under the 2732-byte encoded limit.
 const MAX_MESSAGE_BYTES: usize = 2048;
 

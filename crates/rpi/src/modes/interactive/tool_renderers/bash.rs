@@ -1,7 +1,9 @@
 //! Bash tool renderer — port of the `renderCall`/`renderResult` hooks in
 //! `packages/coding-agent/src/core/tools/bash.ts` (formatBashCall :231-237,
 //! rebuildBashResultRenderComponent :239-319, hooks :462-496)
-//! @ pi 0.82.1 (2efa728) (T17).
+//! @ pi 0.82.1 (2efa728) (T17); the v1.1.0 pin moved these hooks to
+//! `packages/coding-agent/src/core/tools/renderers/bash.ts` (the V17-05
+//! `Took`/`durationMs` references use that path).
 //!
 //! Intentional differences:
 //! - Upstream keeps per-call render state in a shared mutable `state` object

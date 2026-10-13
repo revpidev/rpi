@@ -320,7 +320,7 @@ fn detect_capabilities_inner(
         };
     }
 
-    // Herdr supports OSC 8 but not images (terminal-image.ts:88-95 @
+    // Herdr supports OSC 8 but not images (terminal-image.ts:89-96 @
     // b2363841a, #10573). Checked BEFORE the Kitty branch so leaked
     // environment variables such as KITTY_WINDOW_ID do not enable images
     // inside Herdr panes.
@@ -756,7 +756,7 @@ fn get_registered_kitty_image_metadata(line: &str) -> Option<RegisteredKittyImag
     get_registered_kitty_image_metadata_from_controls(controls)
 }
 
-/// `getRegisteredKittyImageMetadataFromControls` (terminal-image.ts:353-356
+/// `getRegisteredKittyImageMetadataFromControls` (terminal-image.ts:359-364
 /// @ 672000c80 / #10319): the id lookup without re-extracting the controls.
 fn get_registered_kitty_image_metadata_from_controls(
     controls: &str,
@@ -772,7 +772,7 @@ fn get_registered_kitty_image_metadata_from_controls(
     guard.as_ref()?.map.get(&image_id).copied()
 }
 
-/// `getExplicitKittyImageRows` (terminal-image.ts:362-368 @ 672000c80,
+/// `getExplicitKittyImageRows` (terminal-image.ts:369-374 @ 672000c80,
 /// #10319): the explicit `r=` placement control, when positive.
 fn get_explicit_kitty_image_rows(controls: &str) -> Option<u32> {
     let value = controls
@@ -783,7 +783,7 @@ fn get_explicit_kitty_image_rows(controls: &str) -> Option<u32> {
     value.filter(|rows| *rows > 0)
 }
 
-/// `getKittyImageRowsFromControls` (terminal-image.ts:370-372 @ 672000c80):
+/// `getKittyImageRowsFromControls` (terminal-image.ts:376-378 @ 672000c80):
 /// the explicit `r=` wins over the registered metadata rows.
 fn get_kitty_image_rows_from_controls(controls: &str, fallback_rows: u32) -> u32 {
     get_explicit_kitty_image_rows(controls).unwrap_or(fallback_rows)
@@ -794,7 +794,7 @@ pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
     get_registered_kitty_image_metadata(line).map(|registered| registered.metadata)
 }
 
-/// `KittyImagePlacement` (terminal-image.ts:286-293 @ 4181f66, `rows` since
+/// `KittyImagePlacement` (terminal-image.ts:336-347 @ 4181f66, `rows` since
 /// 672000c80 / #10319).
 #[derive(Debug, Clone, PartialEq)]
 pub struct KittyImagePlacement {
@@ -820,7 +820,7 @@ fn controls_have_m_1(controls: &str) -> bool {
 }
 
 /// Read the number of rows covered by an image placement without scanning
-/// its payload (`getKittyImagePlacementRows`, terminal-image.ts:406-413 @
+/// its payload (`getKittyImagePlacementRows`, terminal-image.ts:413-420 @
 /// 672000c80, #10319).
 pub fn get_kitty_image_placement_rows(line: &str) -> Option<u32> {
     let (_, controls, _) = find_kitty_command(line)?;

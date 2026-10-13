@@ -483,7 +483,7 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
         SettingsChange::OutputPad(padding) => {
             session.settings_manager(|s| s.set_output_pad(padding));
             ui.output_pad.store(padding as usize, Ordering::Relaxed);
-            // `onOutputPadChange` (interactive-mode.ts:5057-5070 @ 18336987a,
+            // `onOutputPadChange` (interactive-mode.ts:5078-5091 @ 18336987a,
             // #10557): walk the chat and pending-message containers and
             // update every child with a `setOutputPad` method in place —
             // no rebuild, so streaming tool components keep their partial

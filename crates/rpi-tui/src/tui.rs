@@ -241,7 +241,7 @@ pub trait Component: Send {
     fn set_hide_thinking_block(&mut self, _hide: bool) {}
 
     /// Output-padding change, mirroring upstream's `"setOutputPad" in child`
-    /// walk (`onOutputPadChange`, interactive-mode.ts:5057-5070 @ 18336987a,
+    /// walk (`onOutputPadChange`, interactive-mode.ts:5078-5091 @ 18336987a,
     /// #10557): the mode updates every transcript block in place. Default:
     /// no output padding — a no-op, exactly like upstream components without
     /// a `setOutputPad` method. (V17-05 extension to the frozen contract;

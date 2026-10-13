@@ -1116,7 +1116,7 @@ impl TuiAltScreen {
         });
     }
 
-    /// `resetTextSelection()` (tui-alt-screen.ts:1325-1329 @ 83c9e2645,
+    /// `resetTextSelection()` (tui-alt-screen.ts:317-320 @ 83c9e2645,
     /// #10567): drop the selection AND the multi-click state before a
     /// transcript rebuild, so stale coordinates cannot highlight unrelated
     /// text after a session switch.
@@ -4062,7 +4062,7 @@ impl TuiAltScreenInner {
         let full_redraw = self.previous_screen.is_empty()
             || self.previous_screen_width != width
             || self.previous_screen_height != height;
-        // `changedRows` (tui-alt-screen.ts:1697 @ 672000c80, #10319): a row is
+        // `changedRows` (tui-alt-screen.ts:1703 @ 672000c80, #10319): a row is
         // changed when its rendered line differs from the previous frame.
         let changed_rows: Vec<bool> = screen
             .iter()
@@ -4076,7 +4076,7 @@ impl TuiAltScreenInner {
         });
         // WezTerm erases intersecting Kitty image cells when a later write
         // touches a covered row; redraw even when no image anchor itself
-        // changed (`imageCellsNeedRedraw`, tui-alt-screen.ts:1699-1712).
+        // changed (`imageCellsNeedRedraw`, tui-alt-screen.ts:1708-1721).
         let is_wezterm = is_wezterm_env();
         let image_cells_need_redraw = !image_anchors_need_redraw
             && is_wezterm
@@ -4125,7 +4125,7 @@ impl TuiAltScreenInner {
         // WezTerm erases intersecting Kitty image cells when a later row
         // write touches a covered row (`803f0e906`, #9169). Draw image
         // placements after every clear and text write so nothing later
-        // intersects them (`drawKittyImagesLast`, tui-alt-screen.ts:1737-1761
+        // intersects them (`drawKittyImagesLast`, tui-alt-screen.ts:1746-1763
         // @ 672000c80, #10319); preserve the existing interleaved output for
         // text-only frames and every other terminal.
         let draw_kitty_images_last = redraw_images

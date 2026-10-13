@@ -3822,7 +3822,7 @@ impl InteractiveUi {
         // renderer closure synchronously.
         let theme = Arc::clone(&lock(&self.theme));
         // Upstream `new CustomEntryComponent(entry, renderer, this.outputPad)`
-        // (interactive-mode.ts:3996 @ 18336987a): the pad is only used by the
+        // (interactive-mode.ts:3851 @ 18336987a): the pad is only used by the
         // renderer-throw fallback box, which the Rust `Option`-returning
         // renderer cannot produce — the trait `set_output_pad` override is
         // the structural no-op (custom_entry.rs).
@@ -4033,7 +4033,7 @@ impl InteractiveUi {
         entries: &[crate::core::session_manager::StoredEntry],
         options: RenderOptions,
     ) {
-        // `renderer.resetTextSelection()` (interactive-mode.ts:4054 @
+        // `renderer.resetTextSelection()` (interactive-mode.ts:4096 @
         // 83c9e2645, #10567): a transcript rebuild discards the fullscreen
         // selection and multi-click state so stale coordinates cannot
         // highlight unrelated text after a session switch.
@@ -9402,7 +9402,7 @@ mod tests {
     }
 
     // V17-05 FR-D (#10567): a transcript rebuild drops the fullscreen
-    // selection and multi-click state (interactive-mode.ts:4054).
+    // selection and multi-click state (interactive-mode.ts:4096).
     #[tokio::test]
     async fn transcript_rebuild_drops_the_fullscreen_selection() {
         let (mut mode, terminal, _session) = mode_harness().await;

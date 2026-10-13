@@ -22,15 +22,15 @@ use crate::tui::Component;
 /// Theme callback (upstream `(str: string) => string`).
 pub type ImageThemeFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 
-/// `ImageTranscoder` (image.ts:26-29 @ a276dabe5, #10292): converts base64
+/// `ImageTranscoder` (image.ts:18 @ a276dabe5, #10292): converts base64
 /// image data to base64 PNG data, or returns `None` if it cannot. Called
 /// synchronously during rendering.
 pub type ImageTranscoder = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
-/// `imageTranscoder` (image.ts:31): the registered converter.
+/// `imageTranscoder` (image.ts:20): the registered converter.
 static IMAGE_TRANSCODER: Mutex<Option<ImageTranscoder>> = Mutex::new(None);
 
-/// `pngCache` (image.ts:33): backstop for callers that recreate `Image`
+/// `pngCache` (image.ts:22): backstop for callers that recreate `Image`
 /// instances. Keyed by source data, least recently used first, capped at 32.
 struct PngCache {
     map: HashMap<String, Option<String>>,
@@ -46,7 +46,7 @@ static PNG_CACHE: std::sync::LazyLock<Mutex<PngCache>> = std::sync::LazyLock::ne
 
 /// Register the converter used for non-PNG images on Kitty-protocol
 /// terminals, which only accept PNG. Without one, such images render as text
-/// fallbacks (`setImageTranscoder`, image.ts:39-42 @ a276dabe5).
+/// fallbacks (`setImageTranscoder`, image.ts:28-31 @ a276dabe5).
 pub fn set_image_transcoder(transcoder: Option<ImageTranscoder>) {
     *IMAGE_TRANSCODER
         .lock()
@@ -58,7 +58,7 @@ pub fn set_image_transcoder(transcoder: Option<ImageTranscoder>) {
     cache.order.clear();
 }
 
-/// `toPng` (image.ts:44-52): consult the LRU cache, then the transcoder.
+/// `toPng` (image.ts:33-41): consult the LRU cache, then the transcoder.
 fn to_png(base64_data: &str, mime_type: &str) -> Option<String> {
     let transcoder = IMAGE_TRANSCODER
         .lock()
@@ -120,7 +120,7 @@ pub struct Image {
     options: ImageOptions,
     image_id: RefCell<Option<u32>>,
     /// Converted PNG data for Kitty. Failures are not stored so a later
-    /// transcoder can retry (`pngData`, image.ts:31).
+    /// transcoder can retry (`pngData`, image.ts:63).
     png_data: RefCell<Option<String>>,
     cache: RefCell<Option<ImageCache>>,
 }
@@ -189,7 +189,7 @@ impl Component for Image {
         let caps = get_capabilities();
         // Kitty-protocol terminals only accept PNG: convert non-PNG images
         // through the registered transcoder and prefer the PNG's own
-        // dimensions (conversion may apply EXIF rotation, image.ts:71-78 @
+        // dimensions (conversion may apply EXIF rotation, image.ts:105-110 @
         // a276dabe5, #10292).
         let mut data = Some(self.base64_data.clone());
         let mut dimensions = self.dimensions;

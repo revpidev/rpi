@@ -110,7 +110,7 @@ pub struct BashExecutionComponent {
     /// `dim` marks `!!` commands, whose output is excluded from the model
     /// context (bash-execution.ts:31-33 @ 18336987a).
     color_key: &'static str,
-    /// `outputPad` (bash-execution.ts:34, #10557).
+    /// `outputPad` (bash-execution.ts:33, #10557).
     output_pad: usize,
     theme: Arc<Theme>,
 }
@@ -154,8 +154,8 @@ impl BashExecutionComponent {
         );
 
         // Add spacer + top/bottom borders around the content container
-        // (bash-execution.ts:40-64); the header and loader rows come from
-        // `update_display` (bash-execution.ts:64 `this.updateDisplay()`).
+        // (bash-execution.ts:39-66); the header and loader rows come from
+        // `update_display` (bash-execution.ts:65 `this.updateDisplay()`).
         let top_border = DynamicBorder::new(border_color.clone());
         let bottom_border = DynamicBorder::new(border_color);
 
@@ -185,7 +185,7 @@ impl BashExecutionComponent {
         self.update_display();
     }
 
-    /// `setOutputPad` (bash-execution.ts:75-78 @ 18336987a, #10557).
+    /// `setOutputPad` (bash-execution.ts:73-76 @ 18336987a, #10557).
     pub fn set_output_pad(&mut self, output_pad: usize) {
         self.output_pad = output_pad;
         self.update_display();
@@ -271,7 +271,7 @@ impl BashExecutionComponent {
         // Rebuild content container (bash-execution.ts:135-136).
         self.content_container.clear();
 
-        // Command header (bash-execution.ts:138-139): `!!` commands keep
+        // Command header (bash-execution.ts:141-142): `!!` commands keep
         // their dim color (18336987a fix — previously hardcoded `bashMode`).
         let header = Text::new(
             self.theme
@@ -389,7 +389,7 @@ impl BashExecutionComponent {
 impl Component for BashExecutionComponent {
     fn render(&self, width: usize) -> Vec<String> {
         // Container children: [Spacer, top border, content, bottom border]
-        // (bash-execution.ts:40-64).
+        // (bash-execution.ts:39-66).
         let mut lines = vec![String::new()];
         lines.extend(self.top_border.render(width));
         lines.extend(self.content_container.render(width));

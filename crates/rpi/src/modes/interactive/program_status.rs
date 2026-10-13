@@ -44,7 +44,7 @@ fn first_line(text: Option<&str>) -> String {
     }
 }
 
-/// `ProgramStatusReporter` (program-status-reporter.ts:19-111).
+/// `ProgramStatusReporter` (program-status-reporter.ts:17-138).
 #[derive(Debug)]
 pub struct ProgramStatusReporter {
     run_active: bool,
@@ -78,13 +78,13 @@ impl ProgramStatusReporter {
         }
     }
 
-    /// `agent_start` (program-status-reporter.ts:36-39).
+    /// `agent_start` (program-status-reporter.ts:37-39).
     pub fn handle_agent_start(&mut self) {
         self.run_active = true;
         self.run_result = ProgramStatus::done();
     }
 
-    /// `message_end` (program-status-reporter.ts:40-46): the latest response
+    /// `message_end` (program-status-reporter.ts:41-45): the latest response
     /// decides the outcome, so a retried error is replaced by its successful
     /// retry.
     pub fn handle_message_end(&mut self, message: &AssistantMessage) {
@@ -95,12 +95,12 @@ impl ProgramStatusReporter {
         };
     }
 
-    /// `compaction_start` (program-status-reporter.ts:47-49).
+    /// `compaction_start` (program-status-reporter.ts:48-49).
     pub fn handle_compaction_start(&mut self) {
         self.compacting = true;
     }
 
-    /// `compaction_end` (program-status-reporter.ts:50-65).
+    /// `compaction_end` (program-status-reporter.ts:51-64).
     pub fn handle_compaction_end(
         &mut self,
         reason: CompactionReason,
@@ -138,7 +138,7 @@ impl ProgramStatusReporter {
     }
 
     /// Report `blocked` for a dialog until it is cleared with `None`.
-    /// Reopening a source replaces it (program-status-reporter.ts:88-92).
+    /// Reopening a source replaces it (program-status-reporter.ts:79-84).
     ///
     /// `session_info_changed` (program-status-reporter.ts:70-72) needs no
     /// method here: the caller re-reports, since the session name is part of
@@ -151,7 +151,7 @@ impl ProgramStatusReporter {
     }
 
     /// Forget the previous session's run, for example after switching
-    /// sessions (program-status-reporter.ts:95-101).
+    /// sessions (program-status-reporter.ts:86-93).
     pub fn reset(&mut self) {
         self.run_active = false;
         self.compacting = false;
@@ -159,7 +159,7 @@ impl ProgramStatusReporter {
         self.resting_status = ProgramStatus::idle();
     }
 
-    /// `report()` (program-status-reporter.ts:103-109): returns the status to
+    /// `report()` (program-status-reporter.ts:95-102): returns the status to
     /// send, or `None` when it equals the last one sent. The caller forwards
     /// a `Some` to [`rpi_tui::terminal::Terminal::set_program_status`].
     pub fn report(&mut self, session_name: Option<&str>) -> Option<ProgramStatus> {
@@ -172,7 +172,7 @@ impl ProgramStatusReporter {
         Some(status)
     }
 
-    /// `currentStatus()` (program-status-reporter.ts:111-138).
+    /// `currentStatus()` (program-status-reporter.ts:103-138).
     fn current_status(&self, session_name: Option<&str>) -> ProgramStatus {
         if let Some((_, blocked)) = self.blocked.last() {
             return ProgramStatus::blocked(blocked.kind, blocked.message.clone());

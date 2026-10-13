@@ -137,7 +137,7 @@ const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT: Duration = Duration::from_mil
 /// from `rpi::core::environment::ENV_TUI_WRITE_LOG` (rpi-tui cannot depend
 /// on rpi, coding-standards §2.2).
 const ENV_TUI_WRITE_LOG: &str = "RPI_TUI_WRITE_LOG";
-/// `PI_PROGRAM_STATUS` (terminal.ts:294) — Rpi rename (ADR-0001): `1` forces
+/// `PI_PROGRAM_STATUS` (terminal.ts:295) — Rpi rename (ADR-0001): `1` forces
 /// OSC 7501 support, `0` disables it, unset probes the terminal.
 const ENV_PROGRAM_STATUS: &str = "RPI_PROGRAM_STATUS";
 
@@ -229,7 +229,7 @@ pub fn resolve_escape_timeout_ms_with(getenv: impl Fn(&str) -> Option<String>) -
     DEFAULT_ESCAPE_TIMEOUT
 }
 
-/// `resolveEscapeTimeoutMs()` with the real environment (terminal.ts:217).
+/// `resolveEscapeTimeoutMs()` with the real environment (terminal.ts:235).
 pub fn resolve_escape_timeout_ms() -> Duration {
     resolve_escape_timeout_ms_with(|key| std::env::var(key).ok())
 }
@@ -433,9 +433,9 @@ impl TerminalEventSource {
 
 /// Result of [`ProcessTerminal::read_keyboard_protocol_negotiation_sequence`];
 /// the upstream `KeyboardProtocolNegotiationSequence | "pending" | undefined`
-/// union (terminal.ts:254). `Sequence` carries the full (possibly
+/// union (terminal.ts:23). `Sequence` carries the full (possibly
 /// reassembled) sequence so a not-consumed DA reply can be forwarded whole
-/// (terminal.ts:190 `negotiation?.sequence ?? sequence`).
+/// (terminal.ts:256 `negotiation?.sequence ?? sequence`).
 enum NegotiationRead {
     Pending,
     Sequence {
@@ -518,7 +518,7 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
     /// between construction and `start()` in practice). `None` = probe.
     program_status_env: Option<String>,
     /// DA1 replies owed to keyboard-protocol queries; later DA1 replies
-    /// answer other queries and are forwarded (terminal.ts:160-161).
+    /// answer other queries and are forwarded (terminal.ts:158).
     pending_keyboard_protocol_device_attributes: u32,
     event_tx: Option<mpsc::Sender<TerminalEvent>>,
     event_rx: Option<TerminalEventSource>,
@@ -593,7 +593,7 @@ impl<W: Write> ProcessTerminal<W> {
 
     /// Query the terminal for Kitty keyboard protocol support and enable it
     /// if available (upstream `queryAndEnableKittyProtocol`,
-    /// terminal.ts:220-226).
+    /// terminal.ts:299).
     ///
     /// Kitty's progressive enhancement detection requires requesting the
     /// desired flags before querying them. The trailing DA query is a
@@ -610,7 +610,7 @@ impl<W: Write> ProcessTerminal<W> {
     fn query_and_enable_kitty_protocol(&mut self) {
         // `setupStdinBuffer` (terminal.ts:177-205 → 209-228 @ 9841914):
         // `new StdinBuffer({ escapeTimeout: resolveEscapeTimeoutMs() })`
-        // (terminal.ts:217) — only the escape timeout is injected; the
+        // (terminal.ts:235) — only the escape timeout is injected; the
         // sequence timeout stays at the 50ms default (stdin-buffer.ts:23).
         // The upstream `data`/`paste` handlers correspond to
         // `handle_stdin_data` / `route_data_sequence`.
@@ -631,7 +631,7 @@ impl<W: Write> ProcessTerminal<W> {
             ""
         };
         // `KITTY_KEYBOARD_PROTOCOL_QUERY` + query + `DEVICE_ATTRIBUTES_QUERY`
-        // (terminal.ts:17-18).
+        // (terminal.ts:20-21).
         self.write_direct(&format!(
             "\x1b[>{}u\x1b[?u{program_status_query}\x1b[c",
             DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS
@@ -639,7 +639,7 @@ impl<W: Write> ProcessTerminal<W> {
         self.write_program_status();
     }
 
-    /// `writeProgramStatus` (terminal.ts:580-584): re-send the latest status
+    /// `writeProgramStatus` (terminal.ts:581-584): re-send the latest status
     /// once support is confirmed or the terminal restarts.
     fn write_program_status(&mut self) {
         if self.program_status_supported
@@ -780,7 +780,7 @@ impl<W: Write> ProcessTerminal<W> {
         }
     }
 
-    /// Upstream StdinBuffer `data` handler (terminal.ts:181-192): watch for
+    /// Upstream StdinBuffer `data` handler (terminal.ts:238-250): watch for
     /// the OSC 7501 reply and the Kitty protocol response, and forward
     /// everything else as input.
     fn route_data_sequence(&mut self, sequence: &str) {
@@ -797,7 +797,7 @@ impl<W: Write> ProcessTerminal<W> {
             NegotiationRead::Pending => self.schedule_keyboard_protocol_negotiation_buffer_flush(),
             NegotiationRead::Sequence { parsed, sequence } => {
                 if !self.handle_keyboard_protocol_negotiation_sequence(parsed) {
-                    // `negotiation?.sequence ?? sequence` (terminal.ts:190): a
+                    // `negotiation?.sequence ?? sequence` (terminal.ts:256): a
                     // DA reply that no pending query owes is forwarded whole.
                     self.forward_input_sequence(&sequence);
                 }
@@ -822,7 +822,7 @@ impl<W: Write> ProcessTerminal<W> {
             self.pending_keyboard_protocol_device_attributes -= 1;
             // The last owed DA answers the latest query, which got no program
             // status reply first. Earlier DA replies belong to queries from
-            // before a restart (terminal.ts:240-243).
+            // before a restart (terminal.ts:307-311).
             if self.pending_keyboard_protocol_device_attributes == 0 {
                 self.program_status_query_pending = false;
             }
@@ -904,7 +904,7 @@ impl<W: Write> ProcessTerminal<W> {
     }
 
     /// Upstream `scheduleKeyboardProtocolNegotiationBufferFlush`
-    /// (terminal.ts:295-301); the 150ms `setTimeout` becomes an explicit
+    /// (terminal.ts:376); the 150ms `setTimeout` becomes an explicit
     /// deadline fired by `tick()`.
     fn schedule_keyboard_protocol_negotiation_buffer_flush(&mut self) {
         if self.keyboard_protocol_negotiation_buffer.is_empty()
@@ -1015,7 +1015,7 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         }
 
         // Remove the status while stopped, for example after exit or while
-        // suspended. start() reports it again (terminal.ts:467-475).
+        // suspended. start() reports it again (terminal.ts:467-477).
         if self.program_status_supported && self.program_status.is_some() {
             self.write_direct(&format_program_status(&ProgramStatus::clear()));
         }
@@ -1246,7 +1246,7 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
     fn tick(&mut self, now: Instant) {
         // StdinBuffer tail flush: the flushed sequences go through the same
         // negotiation + forwarding path as freshly processed data (upstream
-        // stdin-buffer `data` handler, terminal.ts:181-192).
+        // stdin-buffer `data` handler, terminal.ts:238-250).
         let flushed = match self.stdin_buffer.as_mut() {
             Some(buffer) => buffer.flush_expired(now),
             None => Vec::new(),
@@ -1256,7 +1256,7 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         }
 
         // Keyboard-protocol fragment flush (upstream 150ms timer callback,
-        // terminal.ts:295-301).
+        // terminal.ts:376).
         if self
             .keyboard_protocol_negotiation_flush_deadline
             .is_some_and(|deadline| now >= deadline)
