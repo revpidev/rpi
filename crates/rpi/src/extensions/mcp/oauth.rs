@@ -14,12 +14,14 @@ use std::sync::Arc;
 use fs2::FileExt;
 use rpi_mcp::auth_provider::UnauthorizedContext;
 use rpi_mcp::oauth::{
-    McpOAuthProvider, McpOAuthProviderOptions, McpOAuthState, McpOAuthStateStore, OAuthChallenge,
-    OAuthClientInformation, OAuthClientProvider, OAuthFlowOptions, OAuthFlowResult, OAuthTokens,
-    authorize_mcp, parse_www_authenticate, step_up_scope,
+    AuthorizationServerMetadata, ClientMetadataDocumentFn, McpOAuthProvider,
+    McpOAuthProviderOptions, McpOAuthState, McpOAuthStateStore, OAuthChallenge,
+    OAuthClientInformation, OAuthClientMetadataDocument, OAuthClientProvider, OAuthFlowOptions,
+    OAuthFlowResult, OAuthTokens, authorize_mcp, parse_www_authenticate, step_up_scope,
 };
 use rpi_mcp::{AuthProvider, McpError};
 use serde_json::Value;
+use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -27,12 +29,18 @@ use super::config::McpOAuthConfig;
 
 const CALLBACK_HOST: &str = "127.0.0.1";
 const CALLBACK_PATH: &str = "/callback";
+/// Where rpi serves its Client ID Metadata Documents: `client.json` and
+/// `<callback ID>/client.json` (oauth.ts:42; upstream base is
+/// `https://pi.dev/oauth`, mapped to the rpi product domain).
+const CLIENT_METADATA_BASE_URL: &str = "https://revpi.dev/oauth";
 /// Redirect URI for refreshes when none is stored (`FALLBACK_REDIRECT_URL`).
 const FALLBACK_REDIRECT_URL: &str = "http://127.0.0.1/callback";
 /// Access tokens this close to expiry are refreshed before they are sent.
 const REFRESH_SKEW_MS: f64 = 30_000.0;
-/// Bounds each request of a refresh, so it cannot hold the lock long.
-const REFRESH_REQUEST_TIMEOUT_MS: u64 = 15_000;
+/// Bounds each request to the authorization server (`OAUTH_REQUEST_TIMEOUT_MS`,
+/// oauth.ts:51), so an unresponsive one cannot hold the refresh lock, delay
+/// shutdown, or keep a sign-in waiting for long.
+const OAUTH_REQUEST_TIMEOUT_MS: u64 = 15_000;
 /// How long to wait for another process's refresh.
 const REFRESH_LOCK_WAIT_MS: u64 = 25_000;
 /// Retry spacing while waiting for the refresh lock.
@@ -50,6 +58,8 @@ pub struct McpOAuthSettings {
     pub scope: Option<String>,
     /// `client_name` for dynamic client registration.
     pub client_name: Option<String>,
+    /// See `McpOAuthConfig.client_registration`.
+    pub client_registration: Option<String>,
     pub auth_server_metadata_url: Option<Url>,
 }
 
@@ -67,6 +77,7 @@ impl McpOAuthSettings {
             callback_url: oauth.callback_url.clone(),
             scope: oauth.scope.clone(),
             client_name: oauth.client_name.clone(),
+            client_registration: oauth.client_registration.clone(),
             auth_server_metadata_url: oauth
                 .auth_server_metadata_url
                 .as_deref()
@@ -157,6 +168,63 @@ pub fn store_keys(name: &str, server_url: &str) -> (String, String) {
         format!("{}|{legacy_key}", super::config::mcp_namespace(name)),
         legacy_key,
     )
+}
+
+/// `callbackId` (oauth.ts:246): 12 characters identifying an MCP server URL
+/// in callback paths, computed like Codex does (the first 9 bytes of the
+/// SHA-256 of the URL without its fragment, base64url).
+fn callback_id(server_url: &str) -> String {
+    use base64::Engine;
+    let normalized = Url::parse(server_url)
+        .map(|mut url| {
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|_| server_url.to_owned());
+    let digest = sha2::Sha256::digest(normalized.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..9])
+}
+
+/// `clientMetadataDocument` (oauth.ts:255-270): rpi's Client ID Metadata
+/// Document, for `clientRegistration: "cimd"`, chosen like Codex chooses
+/// its own. Without the `iss` parameter in authorization responses
+/// (RFC 9207), the redirect URI and the document are specific to the MCP
+/// server, so a response cannot be mixed up with one from another
+/// authorization server (RFC 9700 section 4.4.2.2).
+fn client_metadata_document(
+    server_url: &str,
+    redirect_url: &str,
+    metadata: Option<&AuthorizationServerMetadata>,
+) -> Result<OAuthClientMetadataDocument, String> {
+    let supports_document = metadata
+        .and_then(|metadata| metadata.client_id_metadata_document_supported)
+        .unwrap_or(false)
+        && metadata
+            .and_then(|metadata| metadata.token_endpoint_auth_methods_supported.as_ref())
+            .is_some_and(|methods| methods.iter().any(|method| method == "none"));
+    if !supports_document {
+        return Err(
+            "The authorization server does not support Client ID Metadata Documents for public clients; remove oauth.clientRegistration \"cimd\""
+                .to_owned(),
+        );
+    }
+    if metadata
+        .and_then(|metadata| metadata.authorization_response_iss_parameter_supported)
+        .unwrap_or(false)
+    {
+        return Ok(OAuthClientMetadataDocument {
+            url: format!("{CLIENT_METADATA_BASE_URL}/client.json"),
+            redirect_url: redirect_url.to_owned(),
+        });
+    }
+    let id = callback_id(server_url);
+    let mut redirect =
+        Url::parse(redirect_url).map_err(|_| "Invalid OAuth redirect URL".to_owned())?;
+    redirect.set_path(&format!("{CALLBACK_PATH}/{id}"));
+    Ok(OAuthClientMetadataDocument {
+        url: format!("{CLIENT_METADATA_BASE_URL}/{id}/client.json"),
+        redirect_url: redirect.to_string(),
+    })
 }
 
 /// Parse the credential store. A missing/empty file is an empty store; a
@@ -616,12 +684,26 @@ impl McpAuthProvider {
         }
     }
 
+    /// `createProvider` (oauth.ts:272): the provider identifies with the
+    /// Client ID Metadata Document when `clientRegistration: "cimd"`.
     fn provider_for(
         &self,
         settings: &McpOAuthSettings,
         redirect_url: String,
         on_redirect: Arc<dyn Fn(Url) + Send + Sync>,
     ) -> McpOAuthProvider {
+        let client_metadata_document: Option<ClientMetadataDocumentFn> =
+            if settings.client_registration.as_deref() == Some("cimd") {
+                let server_url = self.server_url.clone();
+                let document_redirect = redirect_url.clone();
+                Some(Arc::new(move |metadata| {
+                    client_metadata_document(&server_url, &document_redirect, metadata)
+                        .map(Some)
+                        .map_err(rpi_mcp::oauth::OAuthFlowError::Invalid)
+                }))
+            } else {
+                None
+            };
         McpOAuthProvider::new(McpOAuthProviderOptions {
             server_url: self.server_url.clone(),
             redirect_url,
@@ -634,6 +716,7 @@ impl McpAuthProvider {
                 ),
                 ..Default::default()
             },
+            client_metadata_document,
             client_id: settings.client_id.clone(),
             client_secret: settings.client_secret.clone(),
             store: Some(Arc::new(StoreAdapter(
@@ -682,7 +765,7 @@ impl McpAuthProvider {
                     .unwrap_or_else(|| FALLBACK_REDIRECT_URL.to_owned())
                 });
                 let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_millis(REFRESH_REQUEST_TIMEOUT_MS))
+                    .timeout(std::time::Duration::from_millis(OAUTH_REQUEST_TIMEOUT_MS))
                     .build()
                     .ok();
                 let provider = self.provider_for(&settings, redirect_url, Arc::new(|_| {}));
@@ -830,13 +913,19 @@ pub trait McpSignInPrompt: Send + Sync {
 #[error("Sign-in cancelled")]
 pub struct McpSignInCancelledError;
 
-/// `responseFromRedirectUrl` (oauth.ts:379).
+/// `responseFromRedirectUrl` (oauth.ts:379): the pasted URL must be the
+/// full redirect URI of this sign-in. A server-specific redirect URI tells
+/// authorization servers apart, so it must match exactly (oauth.ts:391-393).
 pub fn response_from_redirect_url(
     input: &str,
     state: &str,
+    redirect_url: &Url,
 ) -> Result<(String, Option<String>), String> {
     let url = Url::parse(input.trim())
         .map_err(|_| "Expected the full redirect URL from the browser address bar".to_owned())?;
+    if url.origin() != redirect_url.origin() || url.path() != redirect_url.path() {
+        return Err("The redirect URL does not match this sign-in's redirect URI".to_owned());
+    }
     let params: HashMap<String, String> = url
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -856,21 +945,24 @@ pub fn response_from_redirect_url(
     Ok((code.clone(), params.get("iss").cloned()))
 }
 
-/// `waitForAuthorizationResponse` (oauth.ts:391): the browser callback or a
-/// pasted redirect URL, whichever comes first.
+/// `waitForAuthorizationResponse` (oauth.ts:417): the browser callback or a
+/// pasted redirect URL, whichever comes first. Aborting `signal` aborts the
+/// prompt, which then cancels the sign-in.
 pub async fn wait_for_authorization_response(
     callback: &rpi_mcp::oauth::OAuthCallbackServer,
     state: &str,
+    redirect_url: &Url,
     prompt: &dyn McpSignInPrompt,
+    signal: Option<CancellationToken>,
 ) -> Result<(String, Option<String>), String> {
     let controller = CancellationToken::new();
-    let from_browser = callback.wait_for_callback(state);
+    let from_browser = callback.wait_for_callback(state, Some(redirect_url.path()));
     let from_user = async {
         let input = prompt.prompt_for_redirect_url(controller.clone()).await;
         let Some(input) = input.filter(|input| !input.trim().is_empty()) else {
             return Err(McpSignInCancelledError.to_string());
         };
-        response_from_redirect_url(&input, state)
+        response_from_redirect_url(&input, state, redirect_url)
     };
     tokio::pin!(from_browser);
     tokio::pin!(from_user);
@@ -879,15 +971,22 @@ pub async fn wait_for_authorization_response(
             .map(|callback| (callback.code, callback.iss))
             .map_err(|error| error.to_string()),
         result = &mut from_user => result,
+        () = async {
+            match &signal {
+                Some(signal) => signal.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => Err(McpSignInCancelledError.to_string()),
     };
     controller.cancel();
     result
 }
 
-/// `listenForCallback` (oauth.ts:414): listen on `port`, or on a free port
+/// `listenForCallback` (oauth.ts:446): listen on `port`, or on a free port
 /// when it is taken and not `required`.
 async fn listen_for_callback(
     settings: &CallbackSettings,
+    extra_paths: Vec<String>,
     port: Option<u16>,
     required: bool,
 ) -> Result<rpi_mcp::oauth::OAuthCallbackServer, String> {
@@ -895,6 +994,7 @@ async fn listen_for_callback(
         host: Some(settings.host.clone()),
         redirect_host: Some(settings.redirect_host.clone()),
         path: Some(settings.path.clone()),
+        extra_paths,
         render_page: Some(Arc::new(|page| {
             if page.ok {
                 rpi_ai::auth::oauth::callback_page::oauth_success_html(
@@ -950,7 +1050,11 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
         settings,
         challenge,
         prompt,
+        signal,
     } = options;
+    if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        return Err(McpSignInCancelledError.to_string());
+    }
     let stored = store.load().await;
     let step_up = challenge
         .as_ref()
@@ -970,8 +1074,15 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
             .and_then(|url| Url::parse(url).ok())
             .and_then(|url| url.port())
     });
+    let cimd = settings.client_registration.as_deref() == Some("cimd");
     let callback = listen_for_callback(
         &callback_options,
+        // The redirect URI of a server-specific Client ID Metadata Document.
+        if cimd {
+            vec![format!("{CALLBACK_PATH}/{}", callback_id(&server_url))]
+        } else {
+            Vec::new()
+        },
         preferred_port,
         callback_options.port.is_some(),
     )
@@ -986,11 +1097,17 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
             // Every sign-in gets a fresh `state` parameter.
             next.oauth_state = None;
             // A registered client cannot use another redirect URI, and its
-            // tokens belong to it.
-            if settings.client_id.is_none()
-                && !registered_redirect_urls(stored.client_information.as_ref())
-                    .contains(&redirect_url)
-            {
+            // tokens belong to it. A Client ID Metadata Document is not
+            // stored, so with one, a stored client was registered before
+            // and is replaced (oauth.ts:500-508).
+            let keep_client = settings.client_id.is_some()
+                || if cimd {
+                    stored.client_information.is_none()
+                } else {
+                    registered_redirect_urls(stored.client_information.as_ref())
+                        .contains(&redirect_url)
+                };
+            if !keep_client {
                 next.client_information = None;
                 next.tokens = None;
                 next.tokens_expire_at = None;
@@ -1003,6 +1120,17 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
         let authorization_url: Arc<std::sync::Mutex<Option<Url>>> =
             Arc::new(std::sync::Mutex::new(None));
         let captured = authorization_url.clone();
+        let client_metadata_document: Option<ClientMetadataDocumentFn> = if cimd {
+            let document_server_url = server_url.clone();
+            let document_redirect = redirect_url.clone();
+            Some(Arc::new(move |metadata| {
+                client_metadata_document(&document_server_url, &document_redirect, metadata)
+                    .map(Some)
+                    .map_err(rpi_mcp::oauth::OAuthFlowError::Invalid)
+            }))
+        } else {
+            None
+        };
         let provider = McpOAuthProvider::new(McpOAuthProviderOptions {
             server_url: server_url.clone(),
             redirect_url: redirect_url.clone(),
@@ -1015,6 +1143,7 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
                 ),
                 ..Default::default()
             },
+            client_metadata_document,
             client_id: settings.client_id.clone(),
             client_secret: settings.client_secret.clone(),
             store: Some(Arc::new(StoreAdapter(
@@ -1048,6 +1177,13 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
             authorization_server_metadata_url: settings.auth_server_metadata_url.clone(),
             scope: flow_scope,
             skip_refresh: step_up,
+            // Requests to the authorization server are time-limited
+            // (`timedFetch`, oauth.ts:227-232).
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(OAUTH_REQUEST_TIMEOUT_MS))
+                .build()
+                .ok(),
+            signal: signal.clone(),
             ..Default::default()
         };
         if authorize_mcp(&provider, &flow)
@@ -1066,8 +1202,26 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
             .state()
             .await
             .ok_or_else(|| "OAuth flow did not produce a state parameter".to_owned())?;
+        // The flow picks the redirect URI, which may be specific to the MCP
+        // server (oauth.ts:535-536).
+        let authorization_redirect_url = authorization_url
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.into_owned())
+            .and_then(|value| Url::parse(&value).ok())
+            .unwrap_or_else(|| {
+                Url::parse(&redirect_url)
+                    .unwrap_or_else(|_| Url::parse(FALLBACK_REDIRECT_URL).expect("valid fallback"))
+            });
         prompt.show_authorization_url(authorization_url);
-        let (code, iss) = wait_for_authorization_response(&callback, &state, prompt).await?;
+        let (code, iss) = wait_for_authorization_response(
+            &callback,
+            &state,
+            &authorization_redirect_url,
+            prompt,
+            signal.clone(),
+        )
+        .await?;
         authorize_mcp(
             &provider,
             &OAuthFlowOptions {
@@ -1082,7 +1236,14 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
     }
     .await;
     callback.close().await;
-    result
+    // Aborted requests fail with the signal's reason; report them as the
+    // cancellation they are (oauth.ts:552-553).
+    match result {
+        Err(_) if signal.as_ref().is_some_and(CancellationToken::is_cancelled) => {
+            Err(McpSignInCancelledError.to_string())
+        }
+        result => result,
+    }
 }
 
 /// Options for [`sign_in_mcp_server`].
@@ -1092,6 +1253,8 @@ pub struct SignInOptions<'a> {
     pub settings: McpOAuthSettings,
     pub challenge: Option<OAuthChallenge>,
     pub prompt: &'a dyn McpSignInPrompt,
+    /// Aborts the sign-in at any step (session shutdown or a cancel key).
+    pub signal: Option<CancellationToken>,
 }
 
 #[cfg(test)]
@@ -1202,17 +1365,49 @@ mod tests {
 
     #[test]
     fn redirect_url_errors_match_upstream() {
+        let redirect = Url::parse("http://127.0.0.1:1/callback").unwrap();
         let (code, iss) = response_from_redirect_url(
             "http://127.0.0.1:1/callback?code=x&state=s&iss=https%3A%2F%2Fas.example",
             "s",
+            &redirect,
         )
         .unwrap();
         assert_eq!(code, "x");
         assert_eq!(iss.as_deref(), Some("https://as.example"));
-        assert!(response_from_redirect_url("nonsense", "s").is_err());
-        assert!(response_from_redirect_url("http://x/cb?code=x&state=other", "s").is_err());
-        assert!(response_from_redirect_url("http://x/cb?state=s", "s").is_err());
-        assert!(response_from_redirect_url("http://x/cb?error=denied&state=s", "s").is_err());
+        // A server-specific redirect URI must match exactly (oauth.ts:391).
+        assert!(
+            response_from_redirect_url("http://127.0.0.1:1/other?code=x&state=s", "s", &redirect)
+                .is_err()
+        );
+        assert!(
+            response_from_redirect_url(
+                "http://127.0.0.1:2/callback?code=x&state=s",
+                "s",
+                &redirect
+            )
+            .is_err()
+        );
+        assert!(response_from_redirect_url("nonsense", "s", &redirect).is_err());
+        assert!(
+            response_from_redirect_url(
+                "http://127.0.0.1:1/callback?code=x&state=other",
+                "s",
+                &redirect
+            )
+            .is_err()
+        );
+        assert!(
+            response_from_redirect_url("http://127.0.0.1:1/callback?state=s", "s", &redirect)
+                .is_err()
+        );
+        assert!(
+            response_from_redirect_url(
+                "http://127.0.0.1:1/callback?error=denied&state=s",
+                "s",
+                &redirect
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

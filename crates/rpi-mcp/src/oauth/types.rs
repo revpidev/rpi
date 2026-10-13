@@ -73,6 +73,11 @@ pub struct OAuthClientMetadata {
     pub grant_types: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_types: Option<Vec<String>>,
+    /// OpenID Connect client type, `native` or `web`. Dynamic client
+    /// registration derives it from `redirect_uris` when absent
+    /// (MCP SEP-837, types.ts:50).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -353,14 +353,33 @@ struct HttpShared {
     closed: AtomicBool,
     session_id: Mutex<Option<String>>,
     protocol_version: Mutex<Option<String>>,
+    /// Access token of the latest request, which `close()` reuses instead
+    /// of asking the auth provider (streamable-http.ts:198).
+    last_token: Mutex<Option<String>>,
     events: Arc<TransportEvents>,
 }
 
 impl HttpShared {
+    /// `headers()` (streamable-http.ts:303-307): resolve the token and
+    /// record it for `close()`.
     async fn headers(
         &self,
         extra: &[(String, String)],
     ) -> Result<(reqwest::header::HeaderMap, Option<String>), McpTransportError> {
+        let token = match &self.options.auth_provider {
+            Some(auth) => auth.token().await,
+            None => None,
+        };
+        *lock(&self.last_token) = token.clone();
+        Ok((self.build_headers(extra, token.as_deref()), token))
+    }
+
+    /// `buildHeaders(extra, token)` (streamable-http.ts:310-318).
+    fn build_headers(
+        &self,
+        extra: &[(String, String)],
+        token: Option<&str>,
+    ) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in &self.options.headers {
             if let (Ok(name), Ok(value)) = (
@@ -388,15 +407,12 @@ impl HttpShared {
         {
             headers.insert("MCP-Protocol-Version", value);
         }
-        let mut token = None;
-        if let Some(auth) = &self.options.auth_provider
-            && let Some(value) = auth.token().await
-            && let Ok(header) = reqwest::header::HeaderValue::from_str(&format!("Bearer {value}"))
+        if let Some(token) = token
+            && let Ok(header) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
         {
             headers.insert(reqwest::header::AUTHORIZATION, header);
-            token = Some(value);
         }
-        Ok((headers, token))
+        headers
     }
 
     /// `authorizedFetch` (streamable-http.ts:307): a 401 (or 403 asking for
@@ -763,6 +779,7 @@ impl StreamableHttpTransport {
                 closed: AtomicBool::new(false),
                 session_id: Mutex::new(None),
                 protocol_version: Mutex::new(None),
+                last_token: Mutex::new(None),
                 events: Arc::new(TransportEvents::default()),
             }),
             started: AtomicBool::new(false),
@@ -899,21 +916,21 @@ impl McpTransport for StreamableHttpTransport {
             return Ok(());
         }
         self.shared.controller.cancel();
-        // Best-effort session termination, bounded to 1s: header resolution
-        // may run an OAuth refresh (up to 15s), and shutdown must not stall
-        // on the token endpoint (v0.1.6 review P2-4). A cached token still
-        // gets the DELETE; a mid-refresh cancel just skips it.
+        // Best-effort session termination, bounded to 1s. The auth provider
+        // may refresh tokens over the network, so it is not asked here and
+        // closing never waits for a refresh: the DELETE reuses the token of
+        // the last request (streamable-http.ts:262-273).
         if self.started.load(Ordering::SeqCst) && self.session_id().is_some() {
             let shared = self.shared.clone();
             let _ = tokio::time::timeout(Duration::from_millis(1_000), async move {
-                if let Ok((headers, _token)) = shared.headers(&[]).await {
-                    let request = shared
-                        .http
-                        .request(reqwest::Method::DELETE, shared.url.clone())
-                        .headers(headers)
-                        .timeout(Duration::from_millis(1_000));
-                    let _ = request.send().await;
-                }
+                let token = lock(&shared.last_token).clone();
+                let headers = shared.build_headers(&[], token.as_deref());
+                let request = shared
+                    .http
+                    .request(reqwest::Method::DELETE, shared.url.clone())
+                    .headers(headers)
+                    .timeout(Duration::from_millis(1_000));
+                let _ = request.send().await;
             })
             .await;
         }

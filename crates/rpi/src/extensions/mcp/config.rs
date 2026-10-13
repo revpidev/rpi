@@ -84,6 +84,11 @@ pub struct McpOAuthConfig {
     /// `client_name` for dynamic client registration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
+    /// How the client identifies itself without `clientId`: `dcr` (default)
+    /// registers dynamically; `cimd` uses rpi's Client ID Metadata Document
+    /// (mcp-servers.ts:115-119).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_registration: Option<String>,
     /// Authorization server metadata document used instead of discovery
     /// (v1.0.0 `d850edee9`); https except on loopback.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,6 +242,9 @@ pub struct McpServerEntry {
     /// Config file that defined the entry, or the extension path.
     pub source: String,
     pub scope: Option<McpScope>,
+    /// Project `mcp.json` with an override of this global server's
+    /// `enabled`, `exposure`, or `toolExposure` (config.ts:30).
+    pub override_path: Option<String>,
 }
 
 /// `LoadedMcpConfig` (config.ts:33).
@@ -246,6 +254,9 @@ pub struct LoadedMcpConfig {
     /// Activate codemode when `codemode` servers connect (default true).
     pub auto_enable_codemode: Option<bool>,
     pub errors: Vec<String>,
+    /// The project `mcp.json` when the project is trusted, where `/mcp`
+    /// saves project overrides (config.ts:39).
+    pub project_config: Option<String>,
 }
 
 /// `mcpNamespace` (mcp-servers.ts:133): `mcp__<server>` with `-` → `_`.
@@ -416,6 +427,34 @@ fn validate_oauth(value: Option<&Value>) -> Result<(), String> {
             return Err("oauth.clientName must be a non-empty string".to_owned());
         }
     }
+    // `clientRegistration` (mcp-servers.ts:172-182): values are `dcr` and
+    // `cimd`; `cimd` identifies with the metadata document, so it cannot
+    // combine with a registered client and needs the default callback path
+    // on a loopback host.
+    if let Some(client_registration) = map.get("clientRegistration")
+        && client_registration.as_str() != Some("dcr")
+    {
+        if client_registration.as_str() != Some("cimd") {
+            return Err("oauth.clientRegistration must be \"dcr\" or \"cimd\"".to_owned());
+        }
+        if map.contains_key("clientId") || map.contains_key("clientName") {
+            return Err(
+                "oauth.clientRegistration \"cimd\" cannot be combined with oauth.clientId or oauth.clientName"
+                    .to_owned(),
+            );
+        }
+        if let Some(callback_url) = map.get("callbackUrl").and_then(Value::as_str)
+            && let Ok(url) = url::Url::parse(callback_url)
+        {
+            let hostname = url.host_str().unwrap_or_default();
+            if hostname == "[::1]" || url.path() != "/callback" {
+                return Err(
+                    "oauth.clientRegistration \"cimd\" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback"
+                        .to_owned(),
+                );
+            }
+        }
+    }
     if let Some(metadata_url) = map.get("authServerMetadataUrl") {
         let url = metadata_url
             .as_str()
@@ -432,6 +471,16 @@ fn validate_oauth(value: Option<&Value>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `OVERRIDE_KEYS` (config.ts:41): the only keys a project override may
+/// set.
+const OVERRIDE_KEYS: [&str; 3] = ["enabled", "exposure", "toolExposure"];
+
+/// `isOverride` (config.ts:44): an entry without `command`, `url`, and
+/// `type` overrides a server defined elsewhere instead of defining one.
+fn is_override(value: &Map<String, Value>) -> bool {
+    !value.contains_key("command") && !value.contains_key("url") && !value.contains_key("type")
 }
 
 /// `validateMcpServerConfig` (mcp-servers.ts:246): a validated copy with
@@ -608,6 +657,58 @@ fn read_config_file(path: &Path, scope: McpScope, state: &mut LoadedMcpConfig) {
         return;
     };
     for (name, raw) in servers {
+        // `scope === "project" && isRecord(value) && isOverride(value)`
+        // (config.ts:76): a project entry without `command`, `url`, and
+        // `type` changes only the listed keys of the global server with
+        // the same name and keeps everything else.
+        if scope == McpScope::Project
+            && let Some(entry) = raw.as_object()
+            && is_override(entry)
+        {
+            let base = state
+                .servers
+                .iter()
+                .find(|server| server.name == *name)
+                .cloned();
+            let extra: Vec<&str> = entry
+                .keys()
+                .filter(|key| !OVERRIDE_KEYS.contains(&key.as_str()))
+                .map(String::as_str)
+                .collect();
+            match base {
+                None => state.errors.push(format!(
+                    "{}: server \"{name}\" needs \"command\" or \"url\", or a global server to override",
+                    path.display()
+                )),
+                Some(_) if !extra.is_empty() => state.errors.push(format!(
+                    "{}: server \"{name}\": an override can only set {}",
+                    path.display(),
+                    OVERRIDE_KEYS.join(", ")
+                )),
+                Some(base) => {
+                    let mut merged = base.config.to_json();
+                    if let Some(merged) = merged.as_object_mut() {
+                        for (key, value) in entry {
+                            merged.insert(key.clone(), value.clone());
+                        }
+                    }
+                    match validate_mcp_server_config(name, &merged) {
+                        Ok(config) => {
+                            state.servers.retain(|server| server.name != *name);
+                            state.servers.push(McpServerEntry {
+                                config,
+                                override_path: Some(path.display().to_string()),
+                                ..base
+                            });
+                        }
+                        Err(error) => {
+                            state.errors.push(format!("{}: {error}", path.display()))
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let config = match validate_mcp_server_config(name, raw) {
             Ok(config) => config,
             Err(error) => {
@@ -644,6 +745,7 @@ fn read_config_file(path: &Path, scope: McpScope, state: &mut LoadedMcpConfig) {
             config,
             source: path.display().to_string(),
             scope: Some(scope),
+            override_path: None,
         });
     }
 }
@@ -654,11 +756,9 @@ pub fn load_mcp_config(agent_dir: &Path, cwd: &Path, project_trusted: bool) -> L
     let mut state = LoadedMcpConfig::default();
     read_config_file(&agent_dir.join("mcp.json"), McpScope::Global, &mut state);
     if project_trusted {
-        read_config_file(
-            &cwd.join(CONFIG_DIR_NAME).join("mcp.json"),
-            McpScope::Project,
-            &mut state,
-        );
+        let project_config = cwd.join(CONFIG_DIR_NAME).join("mcp.json");
+        read_config_file(&project_config, McpScope::Project, &mut state);
+        state.project_config = Some(project_config.display().to_string());
     }
     state
 }
@@ -671,28 +771,35 @@ pub struct McpServerConfigPatch {
     pub exposure: Option<McpExposure>,
 }
 
-/// `updateMcpServerConfig` (config.ts:135).
+/// `updateMcpServerConfig` (config.ts:135). With `override_mode`, a
+/// missing entry is added as an override; overrides keep default values,
+/// since they replace the global server's (config.ts:148).
 pub fn update_mcp_server_config(
     path: &Path,
     name: &str,
     patch: McpServerConfigPatch,
+    override_mode: bool,
 ) -> Result<(), String> {
     edit_mcp_servers(path, |servers| {
+        if servers.get(name).is_none() && override_mode {
+            servers.insert(name.to_owned(), Value::Object(Map::new()));
+        }
         let Some(server) = servers.get_mut(name).and_then(Value::as_object_mut) else {
             return Err(format!(
                 "{} does not define MCP server \"{name}\"",
                 path.display()
             ));
         };
+        let keep_defaults = is_override(server);
         if let Some(enabled) = patch.enabled {
-            if enabled {
+            if enabled && !keep_defaults {
                 server.remove("enabled");
             } else {
-                server.insert("enabled".to_owned(), Value::Bool(false));
+                server.insert("enabled".to_owned(), Value::Bool(enabled));
             }
         }
         if let Some(exposure) = patch.exposure {
-            if exposure == McpExposure::Codemode {
+            if exposure == McpExposure::Codemode && !keep_defaults {
                 server.remove("exposure");
             } else {
                 server.insert(
@@ -931,6 +1038,69 @@ mod tests {
         .unwrap();
     }
 
+    /// `oauth.clientRegistration` validation (mcp-servers.ts:172-182).
+    #[test]
+    fn client_registration_validates_cimd_rules() {
+        // `dcr` (the default) and `cimd` pass.
+        validate_mcp_server_config(
+            "s",
+            &json!({"url": "https://x", "oauth": {"clientRegistration": "dcr"}}),
+        )
+        .unwrap();
+        validate_mcp_server_config(
+            "s",
+            &json!({"url": "https://x", "oauth": {"clientRegistration": "cimd"}}),
+        )
+        .unwrap();
+        validate_mcp_server_config(
+            "s",
+            &json!({
+                "url": "https://x",
+                "oauth": {"clientRegistration": "cimd", "callbackUrl": "http://localhost:8080/callback"}
+            }),
+        )
+        .unwrap();
+        validate_mcp_server_config(
+            "s",
+            &json!({
+                "url": "https://x",
+                "oauth": {"clientRegistration": "cimd", "callbackUrl": "http://127.0.0.1/callback"}
+            }),
+        )
+        .unwrap();
+        for (oauth, needle) in [
+            (
+                json!({"clientRegistration": "other"}),
+                "must be \"dcr\" or \"cimd\"",
+            ),
+            (
+                json!({"clientRegistration": 5}),
+                "must be \"dcr\" or \"cimd\"",
+            ),
+            (
+                json!({"clientRegistration": "cimd", "clientId": "id"}),
+                "cannot be combined with oauth.clientId or oauth.clientName",
+            ),
+            (
+                json!({"clientRegistration": "cimd", "clientName": "name"}),
+                "cannot be combined with oauth.clientId or oauth.clientName",
+            ),
+            (
+                json!({"clientRegistration": "cimd", "callbackUrl": "http://[::1]/callback"}),
+                "requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback",
+            ),
+            (
+                json!({"clientRegistration": "cimd", "callbackUrl": "http://localhost/oauth/callback"}),
+                "requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback",
+            ),
+        ] {
+            let error =
+                validate_mcp_server_config("s", &json!({"url": "https://x", "oauth": oauth}))
+                    .unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
     #[test]
     fn namespace_replaces_dashes() {
         assert_eq!(mcp_namespace("dev-radius"), "mcp__dev_radius");
@@ -994,6 +1164,126 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// #10277 (upstream `mcp-extension.test.ts`): project entries without
+    /// `command`/`url` override `enabled`/`exposure`/`toolExposure` of the
+    /// global server with the same name.
+    #[test]
+    fn project_entries_override_global_servers() {
+        let dir = tempdir();
+        let agent = dir.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("mcp.json"),
+            r#"{"mcpServers": {"tools": {"command": "x", "env": {"TOKEN": "secret"}}}}"#,
+        )
+        .unwrap();
+        let cwd = dir.join("project");
+        std::fs::create_dir_all(cwd.join(CONFIG_DIR_NAME)).unwrap();
+        let project = cwd.join(CONFIG_DIR_NAME).join("mcp.json");
+        // An override cannot change the command, which would run with the
+        // global env.
+        std::fs::write(
+            &project,
+            r#"{"mcpServers": {"tools": {"enabled": false, "args": ["y"]}, "missing": {"enabled": false}}}"#,
+        )
+        .unwrap();
+        let loaded = load_mcp_config(&agent, &cwd, true);
+        assert_eq!(
+            loaded.project_config.as_deref(),
+            Some(project.display().to_string().as_str())
+        );
+        assert_eq!(loaded.servers.len(), 1, "{:?}", loaded.servers);
+        let tools = &loaded.servers[0];
+        assert_eq!(tools.name, "tools");
+        assert_eq!(tools.override_path, None);
+        assert!(tools.config.enabled(), "{tools:?}");
+        assert!(
+            loaded.errors.iter().any(|error| error.contains(
+                "server \"tools\": an override can only set enabled, exposure, toolExposure"
+            )),
+            "{:?}",
+            loaded.errors
+        );
+        assert!(
+            loaded.errors.iter().any(|error| error.contains(
+                "server \"missing\" needs \"command\" or \"url\", or a global server to override"
+            )),
+            "{:?}",
+            loaded.errors
+        );
+
+        std::fs::write(&project, r#"{"mcpServers": {"tools": {"enabled": false}}}"#).unwrap();
+        let loaded = load_mcp_config(&agent, &cwd, true);
+        let tools = &loaded.servers[0];
+        assert_eq!(
+            tools.override_path.as_deref(),
+            Some(project.display().to_string().as_str())
+        );
+        assert!(!tools.config.enabled());
+        let McpServerConfig::Stdio(stdio) = &tools.config else {
+            panic!("stdio config expected: {tools:?}");
+        };
+        assert_eq!(
+            stdio
+                .env
+                .as_ref()
+                .and_then(|env| env.get("TOKEN"))
+                .and_then(Value::as_str),
+            Some("secret")
+        );
+
+        // Overrides keep `enabled: true`, since it replaces the global value.
+        update_mcp_server_config(
+            &project,
+            "tools",
+            McpServerConfigPatch {
+                enabled: Some(true),
+                exposure: None,
+            },
+            false,
+        )
+        .unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&project).unwrap()).unwrap();
+        assert_eq!(raw["mcpServers"]["tools"], json!({"enabled": true}));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `updateMcpServerConfig({ override: true })`: a missing entry is
+    /// added as an override and default values stay as keys.
+    #[test]
+    fn override_write_adds_missing_entries_and_keeps_defaults() {
+        let dir = tempdir();
+        let path = dir.join("mcp.json");
+        update_mcp_server_config(
+            &path,
+            "tools",
+            McpServerConfigPatch {
+                enabled: Some(true),
+                exposure: Some(McpExposure::Codemode),
+            },
+            true,
+        )
+        .unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["mcpServers"]["tools"],
+            json!({"enabled": true, "exposure": "codemode"})
+        );
+        // Without override mode a missing entry is an error.
+        let error = update_mcp_server_config(
+            &path,
+            "other",
+            McpServerConfigPatch {
+                enabled: Some(false),
+                exposure: None,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("does not define MCP server"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn edits_preserve_other_content_and_indent() {
         let dir = tempdir();
@@ -1006,6 +1296,7 @@ mod tests {
                 enabled: Some(false),
                 exposure: Some(McpExposure::Deferred),
             },
+            false,
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

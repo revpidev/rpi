@@ -45,6 +45,9 @@ pub struct OAuthCallbackServerOptions {
     pub port: Option<u16>,
     /// Path served. Default: `/callback`.
     pub path: Option<String>,
+    /// More paths that receive the callback, for example a server-specific
+    /// path of a redirect URI (callback.ts:22).
+    pub extra_paths: Vec<String>,
     /// How long a pending callback waits before rejecting. Default: 5 min.
     pub timeout_ms: Option<u64>,
     /// Render the browser page as HTML; the default is plain text.
@@ -54,10 +57,13 @@ pub struct OAuthCallbackServerOptions {
 struct PendingCallback {
     resolve: oneshot::Sender<Result<OAuthCallback, String>>,
     timer: tokio::task::JoinHandle<()>,
+    /// Path this wait accepts, for a server-specific redirect URI
+    /// (callback.ts:44).
+    path: Option<String>,
 }
 
 struct CallbackInner {
-    path: String,
+    paths: Vec<String>,
     render_page: Option<PageRenderer>,
     pending: Mutex<HashMap<String, PendingCallback>>,
 }
@@ -98,7 +104,7 @@ impl CallbackInner {
 }
 
 async fn handle_callback(State(inner): State<Arc<CallbackInner>>, uri: Uri) -> Response {
-    if uri.path() != inner.path {
+    if !inner.paths.iter().any(|path| path == uri.path()) {
         return inner.reply(
             StatusCode::NOT_FOUND,
             OAuthCallbackPage {
@@ -132,6 +138,24 @@ async fn handle_callback(State(inner): State<Arc<CallbackInner>>, uri: Uri) -> R
         );
     };
     pending.timer.abort();
+    // A server-specific redirect URI tells authorization servers apart, so
+    // its wait rejects a response that arrived on another path
+    // (callback.ts:128-135).
+    if let Some(expected) = &pending.path
+        && expected != uri.path()
+    {
+        let _ = pending.resolve.send(Err(
+            "The authorization response arrived on another redirect URI".to_owned(),
+        ));
+        return inner.reply(
+            StatusCode::BAD_REQUEST,
+            OAuthCallbackPage {
+                ok: false,
+                message: "Unexpected redirect URI".to_owned(),
+                details: None,
+            },
+        );
+    }
     if let Some(error) = params.get("error") {
         let description = params
             .get("error_description")
@@ -204,8 +228,10 @@ impl OAuthCallbackServer {
             redirect_host
         };
         let redirect_url = format!("http://{redirect_host}:{}{path}", address.port());
+        let mut paths = vec![path];
+        paths.extend(options.extra_paths);
         let inner = Arc::new(CallbackInner {
-            path,
+            paths,
             render_page: options.render_page,
             pending: Mutex::new(HashMap::new()),
         });
@@ -236,9 +262,16 @@ impl OAuthCallbackServer {
         &self.redirect_url
     }
 
-    /// `waitForCallback` (callback.ts:82): resolves with the state-matched
+    /// `waitForCallback` (callback.ts:95): resolves with the state-matched
     /// callback, or rejects when the timeout elapses or the server closes.
-    pub async fn wait_for_callback(&self, state: &str) -> Result<OAuthCallback, OAuthFlowError> {
+    /// With `path`, a response on another path fails, so a server-specific
+    /// redirect URI can tell authorization servers apart (RFC 9700 section
+    /// 4.4.2.2).
+    pub async fn wait_for_callback(
+        &self,
+        state: &str,
+        path: Option<&str>,
+    ) -> Result<OAuthCallback, OAuthFlowError> {
         if lock(&self.inner.pending).contains_key(state) {
             return Err(OAuthFlowError::Invalid(
                 "OAuth state is already pending".to_owned(),
@@ -256,7 +289,14 @@ impl OAuthCallbackServer {
                     .send(Err("OAuth callback timed out".to_owned()));
             }
         });
-        lock(&self.inner.pending).insert(state.to_owned(), PendingCallback { resolve, timer });
+        lock(&self.inner.pending).insert(
+            state.to_owned(),
+            PendingCallback {
+                resolve,
+                timer,
+                path: path.map(str::to_owned),
+            },
+        );
         match receiver.await {
             Ok(Ok(callback)) => Ok(callback),
             Ok(Err(message)) => Err(OAuthFlowError::Invalid(message)),
@@ -305,7 +345,7 @@ mod tests {
         let redirect = server.redirect_url().to_owned();
         let waiter = {
             let server = &server;
-            async move { server.wait_for_callback("state-1").await }
+            async move { server.wait_for_callback("state-1", None).await }
         };
         let client = reqwest::Client::new();
         let state = tokio::spawn(async move {

@@ -22,6 +22,7 @@ struct AsState {
     token_calls: Mutex<usize>,
     issuer: Mutex<String>,
     token_body: Mutex<Value>,
+    registrations: Mutex<Vec<Value>>,
 }
 
 impl AsState {
@@ -64,6 +65,7 @@ async fn handle(State(state): State<Arc<AsState>>, request: Request<Body>) -> Re
         }
         "/register" => {
             let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            state.registrations.lock().unwrap().push(request.clone());
             let client_name = request
                 .get("client_name")
                 .and_then(Value::as_str)
@@ -116,6 +118,7 @@ fn provider(as_url: &str, store: Arc<dyn McpOAuthStateStore>) -> McpOAuthProvide
             client_name: Some("rpi".to_owned()),
             ..Default::default()
         },
+        client_metadata_document: None,
         client_id: None,
         client_secret: None,
         store: Some(store),
@@ -264,6 +267,7 @@ async fn issuer_mismatch_rejects_before_the_code_exchange() {
         server_url: format!("{as_url}/mcp"),
         redirect_url: "http://127.0.0.1:7777/callback".to_owned(),
         client_metadata: OAuthClientMetadata::default(),
+        client_metadata_document: None,
         client_id: Some("pre-registered".to_owned()),
         client_secret: None,
         store: Some(store),
@@ -324,6 +328,117 @@ async fn step_up_scope_merges_granted_and_challenged() {
     assert_eq!(step_up_scope(None, Some("write")).as_deref(), Some("write"));
 }
 
+/// #10493 (upstream `oauth.test.ts`): `application_type` is derived from
+/// the redirect URIs unless the metadata sets one.
+#[tokio::test]
+async fn registration_derives_application_type_from_redirect_uris() {
+    let (as_url, state) = start_as().await;
+    let register = |redirect_uris: Vec<&str>, application_type: Option<&str>| {
+        let as_url = as_url.clone();
+        let redirect_uris: Vec<String> = redirect_uris.into_iter().map(str::to_owned).collect();
+        let application_type = application_type.map(str::to_owned);
+        async move {
+            let store: Arc<dyn McpOAuthStateStore> = Arc::new(MemoryOAuthStateStore::default());
+            let provider = McpOAuthProvider::new(McpOAuthProviderOptions {
+                server_url: format!("{as_url}/mcp"),
+                redirect_url: "http://127.0.0.1:7777/callback".to_owned(),
+                client_metadata: OAuthClientMetadata {
+                    redirect_uris,
+                    application_type,
+                    ..Default::default()
+                },
+                client_metadata_document: None,
+                client_id: None,
+                client_secret: None,
+                store: Some(store),
+                on_redirect: Arc::new(|_| {}),
+            });
+            authorize_mcp(
+                &provider,
+                &OAuthFlowOptions {
+                    server_url: format!("{as_url}/mcp"),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+    };
+    register(vec!["http://127.0.0.1:1234/callback"], None)
+        .await
+        .unwrap();
+    register(vec!["http://[::1]/callback"], None).await.unwrap();
+    register(vec!["com.example.app:/callback"], None)
+        .await
+        .unwrap();
+    register(vec!["https://app.example/callback"], None)
+        .await
+        .unwrap();
+    register(vec!["http://localhost/callback"], Some("web"))
+        .await
+        .unwrap();
+    let types: Vec<String> = state
+        .registrations
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| {
+            body.get("application_type")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(types, ["native", "native", "native", "web", "web"]);
+    // The explicit value wins over the derived one.
+    assert_eq!(
+        state.registrations.lock().unwrap()[4]
+            .get("redirect_uris")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+}
+
+/// #10565 (upstream `oauth.test.ts`): a flow signal aborts every request,
+/// including one the server never answers.
+#[tokio::test]
+async fn an_aborted_flow_stops_a_hanging_request() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new().fallback(|_request: Request<Body>| async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        Response::builder().body(Body::empty()).unwrap()
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let base = format!("http://{address}");
+    let store: Arc<dyn McpOAuthStateStore> = Arc::new(MemoryOAuthStateStore::default());
+    let provider = provider(&base, store);
+    let token = tokio_util::sync::CancellationToken::new();
+    let cancel = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.cancel();
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        authorize_mcp(
+            &provider,
+            &OAuthFlowOptions {
+                server_url: format!("{base}/mcp"),
+                signal: Some(token.clone()),
+                ..Default::default()
+            },
+        ),
+    )
+    .await;
+    let error = result
+        .expect("the flow returns after the abort")
+        .unwrap_err();
+    assert!(matches!(error, OAuthFlowError::Aborted), "{error}");
+    assert!(token.is_cancelled());
+}
 #[tokio::test]
 async fn invalid_client_registration_is_retried_once_with_dropped_credentials() {
     let (as_url, _state) = start_as().await;

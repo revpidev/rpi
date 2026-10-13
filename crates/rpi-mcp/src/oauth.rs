@@ -21,15 +21,15 @@ pub use discovery::{
 };
 pub use errors::OAuthFlowError;
 pub use flow::{
-    AdaptedOAuthProvider, CredentialKind, ExchangeAuthorizationCodeOptions, OAuthClientProvider,
-    OAuthFlowOptions, OAuthFlowResult, RefreshAuthorizationOptions, RegisterClientOptions,
-    StartAuthorizationOptions, TokenRequestOptions, adapt_oauth_provider, authorize_mcp,
-    exchange_authorization_code, refresh_authorization, register_client, start_authorization,
-    step_up_scope,
+    AdaptedOAuthProvider, CredentialKind, ExchangeAuthorizationCodeOptions,
+    OAuthClientMetadataDocument, OAuthClientProvider, OAuthFlowOptions, OAuthFlowResult,
+    RefreshAuthorizationOptions, RegisterClientOptions, StartAuthorizationOptions,
+    TokenRequestOptions, adapt_oauth_provider, authorize_mcp, exchange_authorization_code,
+    refresh_authorization, register_client, start_authorization, step_up_scope,
 };
 pub use provider::{
-    McpOAuthProvider, McpOAuthProviderOptions, McpOAuthState, McpOAuthStateStore,
-    MemoryOAuthStateStore,
+    ClientMetadataDocumentFn, McpOAuthProvider, McpOAuthProviderOptions, McpOAuthState,
+    McpOAuthStateStore, MemoryOAuthStateStore,
 };
 pub use types::{
     AuthorizationServerMetadata, OAuthChallenge, OAuthClientInformation, OAuthClientMetadata,

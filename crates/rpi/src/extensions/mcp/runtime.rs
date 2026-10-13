@@ -239,7 +239,9 @@ pub struct McpServerConnection {
     challenge: Arc<Mutex<Option<OAuthChallenge>>>,
     client: AsyncMutex<Option<Arc<McpClient>>>,
     opening: AsyncMutex<()>,
-    closed: AtomicBool,
+    /// Aborted by `close()`; cancels a connect in progress, including the
+    /// wait between retries (runtime.ts:174, #10249).
+    shutdown: tokio_util::sync::CancellationToken,
     stderr_tail: Mutex<Option<String>>,
     cwd: String,
     create_transport: McpTransportFactory,
@@ -309,7 +311,7 @@ impl McpServerConnection {
             challenge,
             client: AsyncMutex::new(None),
             opening: AsyncMutex::new(()),
-            closed: AtomicBool::new(false),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             stderr_tail: Mutex::new(None),
             cwd: options.cwd,
             create_transport: options.create_transport,
@@ -336,6 +338,12 @@ impl McpServerConnection {
 
     pub fn state(&self) -> ServerState {
         *lock(&self.state)
+    }
+
+    /// `get closed` (runtime.ts:226): the per-connection shutdown signal
+    /// was aborted.
+    fn is_closed(&self) -> bool {
+        self.shutdown.is_cancelled()
     }
 
     pub fn error(&self) -> Option<String> {
@@ -407,7 +415,7 @@ impl McpServerConnection {
     /// `getClient` (runtime.ts:229): opens on demand, sharing one open with
     /// concurrent callers.
     pub async fn get_client(self: &Arc<Self>) -> Result<Arc<McpClient>, McpError> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.is_closed() {
             return Err(McpError::Transport(format!(
                 "MCP server \"{}\" is shut down",
                 self.entry.name
@@ -494,7 +502,7 @@ impl McpServerConnection {
         if let Some(client) = client {
             self.drop_client(&client).await;
         }
-        if !self.closed.load(Ordering::SeqCst) {
+        if !self.is_closed() {
             self.mark_needs_auth();
         }
     }
@@ -531,6 +539,9 @@ impl McpServerConnection {
 
     /// `open` (runtime.ts:420): connect with transient retries for HTTP.
     async fn open(self: &Arc<Self>) -> Result<Arc<McpClient>, McpError> {
+        if self.is_closed() {
+            return Err(McpError::Transport("shut down while connecting".to_owned()));
+        }
         *lock(&self.state) = ServerState::Connecting;
         self.changed();
         let retries: &[u64] = if self.entry.config.url().is_some() {
@@ -547,12 +558,17 @@ impl McpServerConnection {
                     let Some(delay) = retries.get(attempt) else {
                         return Err(self.connect_failed(error));
                     };
-                    if self.closed.load(Ordering::SeqCst) || !error.is_transient() {
+                    if self.is_closed() || !error.is_transient() {
                         return Err(self.connect_failed(error));
                     }
                     attempt += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
-                    if self.closed.load(Ordering::SeqCst) {
+                    // The wait between retries is cancelled by `close()`
+                    // (runtime.ts:369-373).
+                    tokio::select! {
+                        () = tokio::time::sleep(std::time::Duration::from_millis(*delay)) => {}
+                        () = self.shutdown.cancelled() => {}
+                    }
+                    if self.is_closed() {
                         return Err(self.connect_failed(error));
                     }
                 }
@@ -588,7 +604,27 @@ impl McpServerConnection {
                 Arc::new(move |params| log.write(&name, params)),
             );
         }
-        let connect = client.connect(transport.clone()).await;
+        let (connect, aborted) = {
+            let connect = client.connect(transport.clone());
+            tokio::pin!(connect);
+            let mut aborted = false;
+            let result = tokio::select! {
+                result = &mut connect => result,
+                _ = self.shutdown.cancelled() => {
+                    aborted = true;
+                    Err(McpError::Transport(
+                        "shut down while connecting".to_owned(),
+                    ))
+                }
+            };
+            (result, aborted)
+        };
+        if aborted {
+            // Closing the client fails its pending initialize and closes
+            // the transport.
+            let _ = client.close().await;
+            return Err(McpError::Transport("shut down while connecting".to_owned()));
+        }
         if let Err(error) = connect {
             self.capture_stderr(&transport);
             return Err(match error {
@@ -639,38 +675,58 @@ impl McpServerConnection {
             .as_ref()
             .and_then(|capabilities| capabilities.resources.as_ref())
             .is_some();
-        let tools = if capabilities
-            .as_ref()
-            .and_then(|capabilities| capabilities.tools.as_ref())
-            .is_some()
-        {
-            client.list_tools(McpRequestOptions::default()).await?
-        } else {
-            Vec::new()
+        // The discovery phase is cancelled too: closing the client fails
+        // its pending requests (runtime.ts:384-391).
+        let setup_client = client.clone();
+        let setup = async move {
+            let tools = if capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.tools.as_ref())
+                .is_some()
+            {
+                setup_client
+                    .list_tools(McpRequestOptions::default())
+                    .await?
+            } else {
+                Vec::new()
+            };
+            let (resources, resource_templates) = if has_resources {
+                fetch_resources(&setup_client).await
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            if self.is_closed() {
+                return Err(McpError::Transport("shut down while connecting".to_owned()));
+            }
+            *self.client.lock().await = Some(setup_client.clone());
+            *lock(&self.tools) = tools;
+            self.has_resources.store(has_resources, Ordering::SeqCst);
+            *lock(&self.resources) = resources;
+            *lock(&self.resource_templates) = resource_templates;
+            *lock(&self.instructions) = setup_client
+                .instructions()
+                .map(|instructions| instructions.trim().to_owned())
+                .filter(|instructions| !instructions.is_empty());
+            *lock(&self.state) = ServerState::Connected;
+            *lock(&self.error) = None;
+            (self.on_tools)(self);
+            self.changed();
+            Ok(())
         };
-        let (resources, resource_templates) = if has_resources {
-            fetch_resources(&client).await
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        if self.closed.load(Ordering::SeqCst) {
-            let _ = client.close().await;
-            return Err(McpError::Transport("shut down while connecting".to_owned()));
+        tokio::pin!(setup);
+        let cancelled_client = client.clone();
+        match tokio::select! {
+            result = &mut setup => result,
+            _ = self.shutdown.cancelled() => {
+                let _ = cancelled_client.close().await;
+                Err(McpError::Transport(
+                    "shut down while connecting".to_owned(),
+                ))
+            }
+        } {
+            Ok(()) => Ok(client),
+            Err(error) => Err(error),
         }
-        *self.client.lock().await = Some(client.clone());
-        *lock(&self.tools) = tools;
-        self.has_resources.store(has_resources, Ordering::SeqCst);
-        *lock(&self.resources) = resources;
-        *lock(&self.resource_templates) = resource_templates;
-        *lock(&self.instructions) = client
-            .instructions()
-            .map(|instructions| instructions.trim().to_owned())
-            .filter(|instructions| !instructions.is_empty());
-        *lock(&self.state) = ServerState::Connected;
-        *lock(&self.error) = None;
-        (self.on_tools)(self);
-        self.changed();
-        Ok(client)
     }
 
     /// `refreshTools` (runtime.ts:517).
@@ -682,9 +738,7 @@ impl McpServerConnection {
             .await
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &client));
-        if !same_client
-            || self.closed.load(Ordering::SeqCst)
-            || generation != self.generation.load(Ordering::SeqCst)
+        if !same_client || self.is_closed() || generation != self.generation.load(Ordering::SeqCst)
         {
             return;
         }
@@ -709,9 +763,7 @@ impl McpServerConnection {
             .await
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &client));
-        if !same_client
-            || self.closed.load(Ordering::SeqCst)
-            || generation != self.generation.load(Ordering::SeqCst)
+        if !same_client || self.is_closed() || generation != self.generation.load(Ordering::SeqCst)
         {
             return;
         }
@@ -735,11 +787,11 @@ impl McpServerConnection {
 
     /// `connectFailed` (runtime.ts:490).
     fn connect_failed(&self, error: McpError) -> McpError {
-        if self.needs_sign_in_error(&error) && !self.closed.load(Ordering::SeqCst) {
+        if self.needs_sign_in_error(&error) && !self.is_closed() {
             self.mark_needs_auth();
             return McpError::Transport(sign_in_required_message(&self.entry));
         }
-        let state = if self.closed.load(Ordering::SeqCst) {
+        let state = if self.is_closed() {
             ServerState::Closed
         } else {
             ServerState::Failed
@@ -773,7 +825,7 @@ impl McpServerConnection {
         let connection = self.clone();
         let client = client.clone();
         tokio::spawn(async move {
-            if connection.closed.load(Ordering::SeqCst) {
+            if connection.is_closed() {
                 return;
             }
             let mut guard = connection.client.lock().await;
@@ -795,11 +847,17 @@ impl McpServerConnection {
         });
     }
 
-    /// `close` (runtime.ts:528).
+    /// `close` (runtime.ts:476): aborts a connect in progress, closes the
+    /// in-flight client, and waits for the connect attempt to settle before
+    /// returning (#10249).
     pub async fn close(self: &Arc<Self>) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.shutdown.cancel();
         *lock(&self.state) = ServerState::Closed;
         self.changed();
+        // Wait for any in-flight `open()` to settle first, so it cannot
+        // install a client after the slot was taken; the abort above makes
+        // it return promptly.
+        let _guard = self.opening.lock().await;
         let client = self.client.lock().await.take();
         if let Some(client) = client {
             let _ = client.close().await;

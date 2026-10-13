@@ -615,6 +615,8 @@ struct ServerReport {
     name: String,
     scope: String,
     source: String,
+    /// Project `mcp.json` overriding this global server (cli.ts:95).
+    override_path: Option<String>,
     enabled: bool,
     exposure: String,
     transport: String,
@@ -640,6 +642,7 @@ async fn list(
             name: entry.name.clone(),
             scope: entry.scope.unwrap_or(McpScope::Global).as_str().to_owned(),
             source: entry.source.clone(),
+            override_path: entry.override_path.clone(),
             enabled: entry.config.enabled(),
             exposure: entry.config.exposure().as_str().to_owned(),
             transport: describe_transport(&entry),
@@ -693,6 +696,9 @@ async fn list(
                     "state": report.state,
                     "tools": report.tools,
                 });
+                if let Some(override_path) = &report.override_path {
+                    value["override"] = json!(override_path);
+                }
                 if !report.tool_exposure.is_empty() {
                     value["toolExposure"] = Value::Object(report.tool_exposure.clone());
                 }
@@ -731,6 +737,9 @@ async fn list(
             report.name, report.exposure, report.scope
         ));
         options.log(format!("  {}", report.transport));
+        if let Some(override_path) = &report.override_path {
+            options.log(format!("  project override: {override_path}"));
+        }
         if report.state == "needs-auth" {
             options.log(format!(
                 "  sign in with: {APP_NAME} mcp login {}",
@@ -806,16 +815,26 @@ async fn login(
     let prompt = CliSignInPrompt {
         options: options.clone_for_prompt(),
         name: name.clone(),
-        timeout_ms,
         interactive,
     };
     let store = credentials.for_server(&name, url);
+    // `signal: AbortSignal.timeout(timeoutMs)` (cli.ts:559): the timeout
+    // covers the whole sign-in, not only the redirect prompt.
+    let deadline = tokio_util::sync::CancellationToken::new();
+    {
+        let deadline = deadline.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+            deadline.cancel();
+        });
+    }
     let result = sign_in_mcp_server(crate::extensions::mcp::oauth::SignInOptions {
         server_url: url.to_owned(),
         store: &store,
         settings: connection.oauth_settings(),
         challenge: connection.challenge(),
         prompt: &prompt,
+        signal: Some(deadline),
     })
     .await;
     if let Err(error) = result {
@@ -859,7 +878,6 @@ struct PromptOptions {
 struct CliSignInPrompt {
     options: PromptOptions,
     name: String,
-    timeout_ms: u64,
     interactive: bool,
 }
 
@@ -878,18 +896,16 @@ impl McpSignInPrompt for CliSignInPrompt {
     }
 
     async fn prompt_for_redirect_url(&self, signal: CancellationToken) -> Option<String> {
-        let controller = CancellationToken::new();
+        // The sign-in's signal already carries the `--timeout` deadline
+        // (cli.ts:582-599).
         if self.interactive {
             tokio::select! {
                 () = signal.cancelled() => None,
-                () = tokio::time::sleep(std::time::Duration::from_millis(self.timeout_ms)) => None,
-                line = read_line(controller) => line,
+                line = read_line(signal.clone()) => line,
             }
         } else {
-            tokio::select! {
-                () = signal.cancelled() => None,
-                () = tokio::time::sleep(std::time::Duration::from_millis(self.timeout_ms)) => None,
-            }
+            signal.cancelled().await;
+            None
         }
     }
 }
@@ -1070,7 +1086,6 @@ mod tests {
                 },
             },
             name: "docs".to_owned(),
-            timeout_ms: 10,
             interactive: false,
         };
         let url = url::Url::parse("https://as.example/authorize?client_id=x").unwrap();
@@ -1089,10 +1104,10 @@ mod tests {
             opened.lock().unwrap().as_slice(),
             &[url.as_str().to_owned()]
         );
-        // Non-interactive: no stdin read; the very short timeout returns None.
-        let result = prompt
-            .prompt_for_redirect_url(CancellationToken::new())
-            .await;
+        // Non-interactive: no stdin read; the aborted signal returns None.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let result = prompt.prompt_for_redirect_url(cancelled).await;
         assert!(result.is_none());
     }
 }

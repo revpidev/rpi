@@ -9,7 +9,7 @@
 //! emitted as OSC 8 hyperlinks in TUI mode.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -338,12 +338,22 @@ pub struct McpBuiltinState {
     servers: Mutex<Vec<Arc<McpServer>>>,
     configured_entries: Mutex<Vec<McpServerEntry>>,
     config_errors: Mutex<Vec<String>>,
+    /// The trusted project's `mcp.json`, where `/mcp` saves project
+    /// overrides of global servers (index.ts:292).
+    project_config: Mutex<Option<String>>,
     overridden: Mutex<Vec<String>>,
-    session_active: AtomicBool,
+    /// Lifetime of the current session (index.ts:308-312): cancelled on
+    /// `session_shutdown`, and before the first `session_start`. Work
+    /// captures the token when it starts and drops late results once it is
+    /// cancelled.
+    session: Mutex<CancellationToken>,
+    /// Work registered with [`Self::track`]: manager actions opening or
+    /// closing connections, and sign-ins. Shutdown waits for their cleanup.
+    background_count: std::sync::atomic::AtomicUsize,
+    background_notify: tokio::sync::Notify,
     auto_enable_codemode: AtomicBool,
     warned_unreachable: AtomicBool,
     waited_for_startup: AtomicBool,
-    generation: AtomicU64,
     session_cwd: Mutex<String>,
     credentials: Mutex<Option<Arc<McpOAuthCredentialStore>>>,
     server_log: Mutex<Option<Arc<McpServerLog>>>,
@@ -358,6 +368,41 @@ pub struct McpBuiltinState {
     model_runtime: Arc<crate::core::model_runtime::ModelRuntime>,
 }
 
+/// RAII registration for [`McpBuiltinState::track`].
+struct BackgroundGuard(Arc<McpBuiltinState>);
+
+impl Drop for BackgroundGuard {
+    fn drop(&mut self) {
+        if self.0.background_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.background_notify.notify_waiters();
+        }
+    }
+}
+
+/// `AbortSignal.any([session.signal, cancel])` (index.ts:687): a token that
+/// cancels when either input does.
+fn merge_signals(
+    session: &CancellationToken,
+    cancel: Option<CancellationToken>,
+) -> CancellationToken {
+    let Some(cancel) = cancel else {
+        return session.clone();
+    };
+    let merged = CancellationToken::new();
+    if session.is_cancelled() || cancel.is_cancelled() {
+        merged.cancel();
+        return merged;
+    }
+    for token in [session.clone(), cancel] {
+        let merged = merged.clone();
+        tokio::spawn(async move {
+            token.cancelled().await;
+            merged.cancel();
+        });
+    }
+    merged
+}
+
 impl McpBuiltinState {
     fn new(
         api: ExtensionApi,
@@ -368,12 +413,20 @@ impl McpBuiltinState {
             servers: Mutex::new(Vec::new()),
             configured_entries: Mutex::new(Vec::new()),
             config_errors: Mutex::new(Vec::new()),
+            project_config: Mutex::new(None),
             overridden: Mutex::new(Vec::new()),
-            session_active: AtomicBool::new(false),
+            session: Mutex::new({
+                // Aborted before the first session start, like upstream's
+                // initial `session.abort()` (index.ts:313).
+                let token = CancellationToken::new();
+                token.cancel();
+                token
+            }),
+            background_count: std::sync::atomic::AtomicUsize::new(0),
+            background_notify: tokio::sync::Notify::new(),
             auto_enable_codemode: AtomicBool::new(true),
             warned_unreachable: AtomicBool::new(false),
             waited_for_startup: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
             session_cwd: Mutex::new(String::new()),
             credentials: Mutex::new(None),
             server_log: Mutex::new(None),
@@ -389,6 +442,48 @@ impl McpBuiltinState {
             .iter()
             .find(|server| lock(&server.entry).name == name)
             .cloned()
+    }
+
+    /// The current session's cancellation token (index.ts:312).
+    fn session_signal(&self) -> CancellationToken {
+        lock(&self.session).clone()
+    }
+
+    /// `!signal.aborted` (index.ts:627): whether the current session is
+    /// still alive.
+    fn session_active(&self) -> bool {
+        !lock(&self.session).is_cancelled()
+    }
+
+    /// `session = new AbortController()` (index.ts:1120).
+    fn start_session(&self) -> CancellationToken {
+        let token = CancellationToken::new();
+        *lock(&self.session) = token.clone();
+        token
+    }
+
+    /// `track` (index.ts:315-322): registers work so `session_shutdown`
+    /// waits for its cleanup; the returned guard removes it.
+    fn track(self: &Arc<Self>) -> BackgroundGuard {
+        self.background_count.fetch_add(1, Ordering::SeqCst);
+        BackgroundGuard(self.clone())
+    }
+
+    /// `await Promise.all(backgroundActions)` (index.ts:1246): wait for
+    /// every tracked action to clean up.
+    async fn wait_background(&self) {
+        loop {
+            if self.background_count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            let notified = self.background_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.background_count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn credentials(&self) -> Arc<McpOAuthCredentialStore> {
@@ -942,19 +1037,23 @@ impl McpBuiltinState {
         Ok(connection)
     }
 
-    /// `startConnection` (index.ts:560).
+    /// `startConnection` (index.ts:583): connect the server in the
+    /// background after `after` (a previous ready signal), unless the
+    /// session ended meanwhile. The returned receiver settles when the
+    /// attempt finished (`server.ready`).
     fn start_connection(
         self: &Arc<Self>,
         server: Arc<McpServer>,
-        generation: u64,
+        after: Option<watch::Receiver<bool>>,
     ) -> watch::Receiver<bool> {
         let (sender, receiver) = watch::channel(false);
         let state = self.clone();
+        let session = self.session_signal();
         tokio::spawn(async move {
-            let is_current = {
-                let state = state.clone();
-                move || state.generation.load(Ordering::SeqCst) == generation
-            };
+            if let Some(mut after) = after {
+                let _ = after.wait_for(|ready| *ready).await;
+            }
+            let is_current = move || !session.is_cancelled();
             if !is_current() {
                 let _ = sender.send(true);
                 return;
@@ -1088,12 +1187,14 @@ impl McpBuiltinState {
     }
 
     /// `setEnabled` (index.ts:647): returns an error message when the config
-    /// could not be saved.
+    /// could not be saved. `in_project` writes a project override for a
+    /// global server (index.ts:735-748).
     async fn set_enabled(
         self: &Arc<Self>,
         ctx: &ExtensionContext,
         name: &str,
         enabled: bool,
+        in_project: bool,
     ) -> Option<String> {
         let server = self.find_server(name)?;
         if let Some(failure) = self.save_config(
@@ -1102,6 +1203,7 @@ impl McpBuiltinState {
                 enabled: Some(enabled),
                 exposure: None,
             },
+            in_project,
         ) {
             return Some(failure);
         }
@@ -1117,45 +1219,50 @@ impl McpBuiltinState {
             }
             return None;
         }
-        let generation = self.generation.load(Ordering::SeqCst);
         let server_for_ready = server.clone();
-        let ready = self.start_connection(server, generation);
+        let ready = self.start_connection(server, None);
         *lock_server_ready(&server_for_ready) = Some(ready);
         self.ensure_discovery_active(ctx);
         None
     }
 
     /// `saveConfig` (index.ts:625): changes to registered servers apply to
-    /// the current session only.
-    fn save_config(&self, server: &Arc<McpServer>, patch: McpServerConfigPatch) -> Option<String> {
-        let entry = lock(&server.entry).clone();
-        if entry.scope != Some(McpScope::Extension)
-            && let Some(path) = entry.source.strip_prefix("file:")
-        {
+    /// the current session only. `in_project` adds a project override
+    /// (index.ts:656-665).
+    fn save_config(
+        &self,
+        server: &Arc<McpServer>,
+        patch: McpServerConfigPatch,
+        in_project: bool,
+    ) -> Option<String> {
+        let mut entry = lock(&server.entry).clone();
+        // `const override = inProject ? projectConfig : server.entry.override`
+        // (index.ts:627).
+        if in_project {
+            entry.override_path = lock(&self.project_config).clone();
+        }
+        if entry.scope != Some(McpScope::Extension) {
+            let target = entry
+                .override_path
+                .clone()
+                .unwrap_or_else(|| entry.source.clone());
+            let path = target.strip_prefix("file:").unwrap_or(&target);
             if let Err(error) = super::config::update_mcp_server_config(
                 std::path::Path::new(path),
                 &entry.name,
                 patch,
+                entry.override_path.is_some(),
             ) {
-                return Some(format!("Could not update {}: {error}", entry.source));
+                return Some(format!("Could not update {target}: {error}"));
             }
-        } else if entry.scope != Some(McpScope::Extension)
-            && let Err(error) = super::config::update_mcp_server_config(
-                std::path::Path::new(&entry.source),
-                &entry.name,
-                patch,
-            )
-        {
-            return Some(format!("Could not update {}: {error}", entry.source));
         }
-        let mut updated = entry;
         if let Some(enabled) = patch.enabled {
-            updated.config.common_mut().enabled = Some(enabled);
+            entry.config.common_mut().enabled = Some(enabled);
         }
         if let Some(exposure) = patch.exposure {
-            updated.config.common_mut().exposure = Some(exposure.as_str().to_owned());
+            entry.config.common_mut().exposure = Some(exposure.as_str().to_owned());
         }
-        *lock(&server.entry) = updated;
+        *lock(&server.entry) = entry;
         None
     }
 
@@ -1168,6 +1275,7 @@ impl McpBuiltinState {
                 enabled: None,
                 exposure: Some(exposure),
             },
+            false,
         ) {
             return Some(failure);
         }
@@ -1263,11 +1371,13 @@ impl McpBuiltinState {
         lines.join("\n")
     }
 
-    /// `signIn` (index.ts:636).
+    /// `signIn` (index.ts:677). `cancel` or the session's end stops the
+    /// sign-in (index.ts:686-688).
     async fn sign_in(
-        &self,
+        self: &Arc<Self>,
         server: &Arc<McpServer>,
         prompt: &dyn McpSignInPrompt,
+        cancel: Option<CancellationToken>,
     ) -> Option<String> {
         let connection = server
             .connection
@@ -1287,12 +1397,17 @@ impl McpBuiltinState {
             ));
         };
         let store = self.credentials().for_server(connection.name(), &url);
+        // Shutdown waits for an aborted sign-in to clean up
+        // (index.ts:1246-1249).
+        let _tracked = self.track();
+        let signal = merge_signals(&self.session_signal(), cancel);
         let result = sign_in_mcp_server(super::oauth::SignInOptions {
             server_url: url,
             store: &store,
             settings: connection.oauth_settings(),
             challenge: connection.challenge(),
             prompt,
+            signal: Some(signal),
         })
         .await;
         if let Err(error) = result {
@@ -1588,7 +1703,7 @@ impl McpBuiltinState {
     /// `session_start` handler (index.ts:935).
     fn on_session_start(self: &Arc<Self>, ctx: ExtensionContext) {
         if let Some(replacer) = self.replacer() {
-            self.session_active.store(false, Ordering::SeqCst);
+            lock(&self.session).cancel();
             *lock(&self.servers) = Vec::new();
             if let Ok(ui) = ctx.ui() {
                 ui.notify(
@@ -1608,6 +1723,7 @@ impl McpBuiltinState {
             trusted,
         );
         *lock(&self.config_errors) = loaded.errors.clone();
+        *lock(&self.project_config) = loaded.project_config.clone();
         self.auto_enable_codemode.store(
             loaded.auto_enable_codemode.unwrap_or(true),
             Ordering::SeqCst,
@@ -1615,8 +1731,7 @@ impl McpBuiltinState {
         self.warned_unreachable.store(false, Ordering::SeqCst);
         self.waited_for_startup.store(false, Ordering::SeqCst);
         *lock(&self.session_cwd) = cwd;
-        self.session_active.store(true, Ordering::SeqCst);
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.start_session();
         *lock(&self.configured_entries) = loaded.servers.clone();
         let (registered, overridden) = self.registered_servers();
         *lock(&self.overridden) = overridden;
@@ -1662,7 +1777,7 @@ impl McpBuiltinState {
             return;
         }
         for server in &enabled {
-            let ready = self.start_connection(server.clone(), generation);
+            let ready = self.start_connection(server.clone(), None);
             *lock_server_ready(server) = Some(ready);
         }
     }
@@ -1709,6 +1824,7 @@ impl McpBuiltinState {
                     config: validated,
                     source: extension_path,
                     scope: Some(McpScope::Extension),
+                    override_path: None,
                 }),
                 connection: Mutex::new(None),
                 registered_config: Some(config.to_string()),
@@ -1831,10 +1947,9 @@ impl McpBuiltinState {
         self: &Arc<Self>,
         ctx: &ExtensionContext,
     ) -> Result<Value, String> {
-        if !self.session_active.load(Ordering::SeqCst) {
+        if !self.session_active() {
             return Ok(Value::Null);
         }
-        let generation = self.generation.load(Ordering::SeqCst);
         let (registered, overridden) = self.registered_servers();
         *lock(&self.overridden) = overridden;
         let next: HashMap<String, Option<String>> = registered
@@ -1903,11 +2018,11 @@ impl McpBuiltinState {
             })
             .cloned()
             .collect();
-        if generation != self.generation.load(Ordering::SeqCst) || added.is_empty() {
+        if !self.session_active() || added.is_empty() {
             return Ok(Value::Null);
         }
         for server in &added {
-            let ready = self.start_connection(server.clone(), generation);
+            let ready = self.start_connection(server.clone(), None);
             *lock_server_ready(server) = Some(ready);
         }
         for server in &added {
@@ -1920,10 +2035,12 @@ impl McpBuiltinState {
         Ok(Value::Null)
     }
 
-    /// `session_shutdown` handler (index.ts:1101).
+    /// `session_shutdown` handler (index.ts:1243).
     async fn on_session_shutdown(self: &Arc<Self>) -> Result<Value, String> {
-        self.session_active.store(false, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        lock(&self.session).cancel();
+        // Shutdown waits for aborted sign-ins and manager actions to clean up
+        // (index.ts:1246-1249).
+        self.wait_background().await;
         let servers = lock(&self.servers).clone();
         *lock(&self.servers) = Vec::new();
         for server in servers {
@@ -2113,7 +2230,12 @@ impl McpBuiltinState {
             name: name.clone(),
             tui_mode,
         };
-        let failure = self.sign_in(server, &prompt).await;
+        let failure = self.sign_in(server, &prompt, None).await;
+        // The session ended meanwhile, which cancelled the sign-in and made
+        // `ctx` stale (index.ts:1101-1102).
+        if !self.session_active() {
+            return;
+        }
         if let Some(failure) = failure {
             let kind = if failure == "Sign-in cancelled." {
                 NotifyType::Info
@@ -2215,9 +2337,12 @@ impl McpBuiltinState {
                         }
                     }
                 }
-                "enable" | "disable" => {
-                    let enable = action == "enable";
-                    let failure = self.set_enabled(&base, &name, enable).await;
+                "enable" | "disable" | "enable-project" | "disable-project" => {
+                    // `const enable = action.startsWith("enable")` /
+                    // `action.endsWith("-project")` (index.ts:969-974).
+                    let enable = action.starts_with("enable");
+                    let in_project = action.ends_with("-project");
+                    let failure = self.set_enabled(&base, &name, enable, in_project).await;
                     *lock(&server.message) = failure.clone();
                     if let Some(failure) = failure {
                         ui.notify(&failure, NotifyType::Error);
@@ -2252,9 +2377,17 @@ impl McpBuiltinState {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
+        // Global servers without an override can be turned on or off for the
+        // trusted project alone (index.ts:756-762).
+        let in_project = entry.scope == Some(McpScope::Global)
+            && entry.override_path.is_none()
+            && lock(&self.project_config).is_some();
         let mut options: Vec<String> = Vec::new();
         if !entry.config.enabled() {
             options.push("enable".to_owned());
+            if in_project {
+                options.push("enable-project".to_owned());
+            }
         } else {
             let state = connection.as_ref().map(|connection| connection.state());
             if state == Some(ServerState::NeedsAuth) {
@@ -2283,6 +2416,9 @@ impl McpBuiltinState {
             }
             options.push("exposure".to_owned());
             options.push("disable".to_owned());
+            if in_project {
+                options.push("disable-project".to_owned());
+            }
         }
         if let Some(message) = lock(&server.message).clone() {
             ui.notify(&message, NotifyType::Warning);
@@ -2308,7 +2444,18 @@ async fn pick_from_list(
         .map(|server| {
             let entry = lock(&server.entry);
             let state = describe_state(server).unwrap_or_else(|| "disabled".to_owned());
-            format!("{} ({state})", entry.name)
+            // `override ? "global, project override" : (scope ?? source)`
+            // (index.ts:805).
+            let origin = if entry.override_path.is_some() {
+                "global, project override".to_owned()
+            } else {
+                entry
+                    .scope
+                    .map(McpScope::as_str)
+                    .unwrap_or(entry.source.as_str())
+                    .to_owned()
+            };
+            format!("{} ({state}, {origin})", entry.name)
         })
         .collect();
     let choice = ui.select(title, &labels, None).await?;
@@ -2344,17 +2491,16 @@ impl McpSignInPrompt for NotifySignInPrompt {
     }
 
     async fn prompt_for_redirect_url(&self, signal: CancellationToken) -> Option<String> {
-        let _ = signal;
-        self.ui
-            .input(
-                &format!(
-                    "Waiting for sign-in to \"{}\". If the browser cannot reach this machine, paste the URL it was redirected to.",
-                    self.name
-                ),
-                Some("http://127.0.0.1:.../callback?code=..."),
-                None,
-            )
-            .await
+        // The callback's signal resolves the prompt when the browser reached
+        // the loopback server first; Esc in the dialog resolves `None`.
+        let message = format!(
+            "Waiting for sign-in to \"{}\". If the browser cannot reach this machine, paste the URL it was redirected to.",
+            self.name
+        );
+        tokio::select! {
+            () = signal.cancelled() => None,
+            value = self.ui.input(&message, Some("http://127.0.0.1:.../callback?code=..."), None) => value,
+        }
     }
 }
 
@@ -2389,6 +2535,7 @@ mod tests {
             config: validate_mcp_server_config(name, &config).unwrap(),
             source: "test".to_owned(),
             scope: Some(McpScope::Global),
+            override_path: None,
         }
     }
 

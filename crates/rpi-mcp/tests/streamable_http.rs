@@ -499,3 +499,66 @@ async fn reports_a_session_that_expired() {
         .unwrap_err();
     assert!(matches!(error, McpError::SessionExpired), "{error:?}");
 }
+
+/// An `AuthProvider` that counts its `token()` calls.
+struct CountingAuth {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    token: String,
+}
+
+#[async_trait::async_trait]
+impl rpi_mcp::AuthProvider for CountingAuth {
+    async fn token(&self) -> Option<String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(self.token.clone())
+    }
+}
+
+/// #10565 (upstream `streamable-http.test.ts`): closing the session reuses
+/// the token of the last request instead of asking the auth provider, which
+/// could trigger a refresh.
+#[tokio::test]
+async fn close_reuses_the_last_request_token() {
+    let (url, requests) = start_server(protocol_handler()).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut options = StreamableHttpTransportOptions::new(&url);
+    options.auth_provider = Some(Arc::new(CountingAuth {
+        calls: calls.clone(),
+        token: "token-1".to_owned(),
+    }));
+    let transport = Arc::new(StreamableHttpTransport::new(options).unwrap());
+    let client = McpClient::new(McpClientOptions::new("http-test", "1.0.0"));
+    client.connect(transport.clone()).await.unwrap();
+    client
+        .list_tools(McpRequestOptions::default())
+        .await
+        .unwrap();
+    let calls_before = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(calls_before > 0, "requests resolved the token");
+    client.close().await.unwrap();
+    for _ in 0..100 {
+        let done = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.method == "DELETE");
+        if done {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let recorded = requests.lock().unwrap();
+    let delete = recorded
+        .iter()
+        .find(|request| request.method == "DELETE")
+        .expect("session DELETE");
+    assert_eq!(
+        delete.header("authorization").as_deref(),
+        Some("Bearer token-1")
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        calls_before,
+        "close must not ask the auth provider for a token"
+    );
+}

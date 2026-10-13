@@ -76,6 +76,7 @@ fn stdio_entry(name: &str) -> McpServerEntry {
         config: validate_mcp_server_config(name, &json!({"command": "scripted"})).unwrap(),
         source: "test".to_owned(),
         scope: Some(McpScope::Global),
+        override_path: None,
     }
 }
 
@@ -85,6 +86,7 @@ fn http_entry(name: &str, url: &str) -> McpServerEntry {
         config: validate_mcp_server_config(name, &json!({"url": url})).unwrap(),
         source: "test".to_owned(),
         scope: Some(McpScope::Global),
+        override_path: None,
     }
 }
 
@@ -265,6 +267,76 @@ async fn non_oauth_auth_failure_is_a_connection_failure() {
     assert_eq!(connection.state(), ServerState::Failed);
     assert!(connection.error().is_some());
     connection.close().await;
+}
+
+/// A transport whose `start` never finishes, to model a server that is
+/// still connecting when the session shuts down (#10249).
+struct HangingTransport {
+    events: Arc<rpi_mcp::TransportEvents>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl McpTransport for HangingTransport {
+    async fn start(&self) -> Result<(), McpTransportError> {
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    async fn send(&self, _message: Value) -> Result<(), McpTransportError> {
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), McpTransportError> {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn events(&self) -> Arc<rpi_mcp::TransportEvents> {
+        self.events.clone()
+    }
+}
+
+/// #10249: `close()` aborts a connect that is still in progress, closes its
+/// transport, and waits for the attempt to settle before returning.
+#[tokio::test]
+async fn close_aborts_a_connect_still_in_progress() {
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport_closed = closed.clone();
+    let factory: McpTransportFactory = Arc::new(move |_entry, _cwd, _auth| {
+        Ok(Arc::new(HangingTransport {
+            events: Arc::new(rpi_mcp::TransportEvents::default()),
+            closed: transport_closed.clone(),
+        }) as Arc<dyn McpTransport>)
+    });
+    let connection = Arc::new(McpServerConnection::new(McpServerConnectionOptions {
+        entry: http_entry("slow", "https://mcp.example/mcp"),
+        cwd: "/tmp".to_owned(),
+        create_transport: factory,
+        credentials: Arc::new(McpOAuthCredentialStore::new(std::path::Path::new(
+            "/tmp/rpi-mcp-test",
+        ))),
+        provider_token: None,
+        on_tools: Arc::new(|_| {}),
+        on_change: None,
+        log: None,
+    }));
+    let connecting = {
+        let connection = connection.clone();
+        tokio::spawn(async move { connection.get_client().await })
+    };
+    // Let the connect attempt reach the hanging transport before closing.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), connection.close())
+        .await
+        .expect("close waits for the in-flight connect to settle");
+    assert_eq!(connection.state(), ServerState::Closed);
+    assert!(
+        closed.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-flight transport was closed"
+    );
+    let result = connecting.await.unwrap();
+    assert!(result.is_err(), "the aborted connect reports an error");
 }
 
 /// The `McpServerConfig` shape used by the tests stays the same as the

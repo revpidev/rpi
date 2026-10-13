@@ -3,9 +3,11 @@
 //! `WWW-Authenticate` challenges and resource selection.
 
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::errors::OAuthFlowError;
+use super::flow::cancellable;
 use super::types::{
     AuthorizationServerMetadata, OAuthProtectedResourceMetadata, OAuthServerInfo,
     parse_authorization_server_metadata, parse_protected_resource_metadata,
@@ -18,6 +20,7 @@ pub struct ProtectedResourceMetadataOptions {
     pub resource_metadata_url: Option<String>,
     pub protocol_version: Option<String>,
     pub client: Option<reqwest::Client>,
+    pub signal: Option<CancellationToken>,
 }
 
 /// Options for [`discover_authorization_server_metadata`].
@@ -26,6 +29,7 @@ pub struct AuthorizationServerMetadataOptions {
     pub protocol_version: Option<String>,
     pub skip_issuer_validation: bool,
     pub client: Option<reqwest::Client>,
+    pub signal: Option<CancellationToken>,
 }
 
 /// Options for [`discover_oauth_server_info`].
@@ -36,6 +40,7 @@ pub struct OAuthServerInfoOptions {
     /// configured, so its issuer is not checked.
     pub authorization_server_metadata_url: Option<Url>,
     pub client: Option<reqwest::Client>,
+    pub signal: Option<CancellationToken>,
     pub skip_issuer_validation: bool,
 }
 
@@ -53,14 +58,18 @@ async fn fetch_metadata(
     client: &reqwest::Client,
     url: &Url,
     protocol_version: &str,
+    signal: Option<&CancellationToken>,
 ) -> Result<reqwest::Response, OAuthFlowError> {
-    client
-        .get(url.clone())
-        .header("Accept", "application/json")
-        .header("MCP-Protocol-Version", protocol_version)
-        .send()
-        .await
-        .map_err(|error| OAuthFlowError::Network(error.to_string()))
+    cancellable(signal, async {
+        client
+            .get(url.clone())
+            .header("Accept", "application/json")
+            .header("MCP-Protocol-Version", protocol_version)
+            .send()
+            .await
+            .map_err(|error| OAuthFlowError::Network(error.to_string()))
+    })
+    .await
 }
 
 /// `discoverProtectedResourceMetadata` (discovery.ts:63).
@@ -79,14 +88,14 @@ pub async fn discover_protected_resource_metadata(
     let mut response = if let Some(resource_metadata_url) = &options.resource_metadata_url {
         let url = Url::parse(resource_metadata_url)
             .map_err(|_| OAuthFlowError::Invalid("Invalid resource metadata URL".to_owned()))?;
-        fetch_metadata(&client, &url, &version).await?
+        fetch_metadata(&client, &url, &version, options.signal.as_ref()).await?
     } else {
         let url = Url::parse(&format!(
             "{origin}/.well-known/oauth-protected-resource{}",
             path_suffix(server.path())
         ))
         .map_err(|_| OAuthFlowError::Invalid("Invalid server URL".to_owned()))?;
-        fetch_metadata(&client, &url, &version).await?
+        fetch_metadata(&client, &url, &version, options.signal.as_ref()).await?
     };
     if options.resource_metadata_url.is_none()
         && server.path() != "/"
@@ -94,7 +103,7 @@ pub async fn discover_protected_resource_metadata(
     {
         let url = Url::parse(&format!("{origin}/.well-known/oauth-protected-resource"))
             .map_err(|_| OAuthFlowError::Invalid("Invalid server URL".to_owned()))?;
-        response = fetch_metadata(&client, &url, &version).await?;
+        response = fetch_metadata(&client, &url, &version, options.signal.as_ref()).await?;
     }
     if !response.status().is_success() {
         return Err(OAuthFlowError::Invalid(format!(
@@ -147,7 +156,7 @@ pub async fn discover_authorization_server_metadata(
         .clone()
         .unwrap_or_else(|| LATEST_PROTOCOL_VERSION.to_owned());
     for (url, _kind) in build_authorization_server_discovery_urls(&issuer) {
-        let response = fetch_metadata(&client, &url, &version).await?;
+        let response = fetch_metadata(&client, &url, &version, options.signal.as_ref()).await?;
         if !response.status().is_success() {
             if is_discovery_miss(response.status().as_u16()) {
                 continue;
@@ -188,6 +197,7 @@ pub async fn discover_oauth_server_info(
             resource_metadata_url: options.resource_metadata_url.as_ref().map(Url::to_string),
             client: options.client.clone(),
             protocol_version: None,
+            signal: options.signal.clone(),
         },
     )
     .await
@@ -203,7 +213,13 @@ pub async fn discover_oauth_server_info(
     }
     if let Some(metadata_url) = &options.authorization_server_metadata_url {
         let client = options.client.clone().unwrap_or_default();
-        let response = fetch_metadata(&client, metadata_url, LATEST_PROTOCOL_VERSION).await?;
+        let response = fetch_metadata(
+            &client,
+            metadata_url,
+            LATEST_PROTOCOL_VERSION,
+            options.signal.as_ref(),
+        )
+        .await?;
         if !response.status().is_success() {
             return Err(OAuthFlowError::Invalid(format!(
                 "HTTP {} loading authorization server metadata from {metadata_url}",
@@ -238,6 +254,7 @@ pub async fn discover_oauth_server_info(
             skip_issuer_validation: options.skip_issuer_validation,
             client: options.client.clone(),
             protocol_version: None,
+            signal: options.signal.clone(),
         },
     )
     .await?;

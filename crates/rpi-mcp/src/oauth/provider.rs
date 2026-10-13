@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::errors::OAuthFlowError;
-use super::flow::{CredentialKind, OAuthClientProvider};
-use super::types::{OAuthClientInformation, OAuthClientMetadata, OAuthDiscoveryState, OAuthTokens};
+use super::flow::{CredentialKind, OAuthClientMetadataDocument, OAuthClientProvider};
+use super::types::{
+    AuthorizationServerMetadata, OAuthClientInformation, OAuthClientMetadata, OAuthDiscoveryState,
+    OAuthTokens,
+};
 
 /// `McpOAuthState` (provider.ts:4): everything stored per server URL. The
 /// stored shape is the upstream TypeScript JSON (camelCase container fields,
@@ -57,11 +60,23 @@ impl McpOAuthStateStore for MemoryOAuthStateStore {
     }
 }
 
+/// `clientMetadataDocument?` callback (provider.ts:30-34).
+pub type ClientMetadataDocumentFn = Arc<
+    dyn Fn(
+            Option<&AuthorizationServerMetadata>,
+        ) -> Result<Option<OAuthClientMetadataDocument>, OAuthFlowError>
+        + Send
+        + Sync,
+>;
+
 /// `McpOAuthProviderOptions` (provider.ts:37).
 pub struct McpOAuthProviderOptions {
     pub server_url: String,
     pub redirect_url: String,
     pub client_metadata: OAuthClientMetadata,
+    /// See `OAuthClientProvider.client_metadata_document`
+    /// (provider.ts:30-34).
+    pub client_metadata_document: Option<ClientMetadataDocumentFn>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub store: Option<Arc<dyn McpOAuthStateStore>>,
@@ -74,6 +89,7 @@ pub struct McpOAuthProvider {
     server_url: String,
     redirect_url: String,
     client_metadata: OAuthClientMetadata,
+    client_metadata_document: Option<ClientMetadataDocumentFn>,
     configured_client: Option<OAuthClientInformation>,
     store: Arc<dyn McpOAuthStateStore>,
     on_redirect: Arc<dyn Fn(Url) + Send + Sync>,
@@ -112,6 +128,7 @@ impl McpOAuthProvider {
             server_url: String::new(),
             redirect_url,
             client_metadata,
+            client_metadata_document: options.client_metadata_document,
             configured_client,
             store: options
                 .store
@@ -189,6 +206,16 @@ impl OAuthClientProvider for McpOAuthProvider {
 
     fn client_metadata(&self) -> OAuthClientMetadata {
         self.client_metadata.clone()
+    }
+
+    fn client_metadata_document(
+        &self,
+        metadata: Option<&AuthorizationServerMetadata>,
+    ) -> Result<Option<OAuthClientMetadataDocument>, OAuthFlowError> {
+        match self.client_metadata_document.as_ref() {
+            Some(document) => document(metadata),
+            None => Ok(None),
+        }
     }
 
     async fn state(&self) -> Option<String> {
@@ -290,6 +317,7 @@ mod tests {
             server_url: "https://mcp.example/mcp".to_owned(),
             redirect_url: "http://127.0.0.1:1234/callback".to_owned(),
             client_metadata: OAuthClientMetadata::default(),
+            client_metadata_document: None,
             client_id: None,
             client_secret: None,
             store: Some(store),

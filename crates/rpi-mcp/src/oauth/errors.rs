@@ -29,6 +29,9 @@ pub enum OAuthFlowError {
     /// Generic invalid-data failures (upstream `Error`).
     #[error("{0}")]
     Invalid(String),
+    /// The flow's signal was aborted (upstream `AbortSignal` rejection).
+    #[error("OAuth flow aborted")]
+    Aborted,
     /// Network failures (upstream `TypeError` from fetch).
     #[error("{0}")]
     Network(String),

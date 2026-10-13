@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::discovery::{
@@ -35,6 +36,14 @@ pub enum CredentialKind {
     Discovery,
 }
 
+/// `OAuthClientMetadataDocument` (flow.ts:35): a Client ID Metadata
+/// Document: an https URL used as `client_id`, and a redirect URI it lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthClientMetadataDocument {
+    pub url: String,
+    pub redirect_url: String,
+}
+
 /// `OAuthClientProvider` (flow.ts:37): the stateful seam the flow drives.
 #[async_trait::async_trait]
 pub trait OAuthClientProvider: Send + Sync {
@@ -42,10 +51,18 @@ pub trait OAuthClientProvider: Send + Sync {
     fn redirect_url(&self) -> String;
     /// `clientMetadata` (flow.ts:39).
     fn client_metadata(&self) -> OAuthClientMetadata;
-    /// `clientMetadataUrl` (flow.ts:40): the URL used as `client_id` when
-    /// the authorization server supports metadata documents.
-    fn client_metadata_url(&self) -> Option<String> {
-        None
+    /// `clientMetadataDocument?()` (flow.ts:40-45): the Client ID Metadata
+    /// Document to identify as instead of registering dynamically, or
+    /// `None` to register. Called when no client information is stored; the
+    /// document is not stored. `metadata` is `None` when the authorization
+    /// server has none; check `client_id_metadata_document_supported`. The
+    /// result is an error when the server cannot use the document
+    /// (upstream's callback throws).
+    fn client_metadata_document(
+        &self,
+        _metadata: Option<&AuthorizationServerMetadata>,
+    ) -> Result<Option<OAuthClientMetadataDocument>, OAuthFlowError> {
+        Ok(None)
     }
     /// `state?()` (flow.ts:41).
     async fn state(&self) -> Option<String> {
@@ -88,6 +105,9 @@ pub struct OAuthFlowOptions {
     /// Trusted as configured; must use https, except on loopback.
     pub authorization_server_metadata_url: Option<Url>,
     pub client: Option<reqwest::Client>,
+    /// Aborts every request of the flow (flow.ts:83-84). Requests have no
+    /// time limit of their own; combine with a timeout as needed.
+    pub signal: Option<CancellationToken>,
     pub skip_issuer_validation: bool,
     /// Go straight to the authorization redirect instead of refreshing
     /// stored tokens (a refresh keeps the old scope).
@@ -112,6 +132,20 @@ const NONE: ClientAuthMethod = "none";
 
 fn loopback(hostname: &str) -> bool {
     matches!(hostname, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+/// `applicationType` (flow.ts:106-113): the OpenID Connect
+/// `application_type` for `redirect_uris` (MCP SEP-837). Loopback hosts and
+/// custom schemes are native (RFC 8252); everything else is web.
+fn application_type(redirect_uris: &[String]) -> &'static str {
+    let native = redirect_uris.iter().any(|uri| {
+        let Ok(url) = Url::parse(uri) else {
+            return false;
+        };
+        (url.scheme() != "http" && url.scheme() != "https")
+            || loopback(url.host_str().unwrap_or_default())
+    });
+    if native { "native" } else { "web" }
 }
 
 /// `secureEndpoint` (flow.ts:118).
@@ -295,6 +329,27 @@ pub struct TokenRequestOptions {
     pub client_information: OAuthClientInformation,
     pub resource: Option<String>,
     pub client: Option<reqwest::Client>,
+    pub signal: Option<CancellationToken>,
+}
+
+/// Race one flow request against the flow's cancellation token
+/// (`signal?: AbortSignal`, flow.ts:83-84/`TokenRequestOptions.signal`).
+/// Dropping the request future cancels the underlying HTTP request.
+pub(crate) async fn cancellable<T>(
+    signal: Option<&CancellationToken>,
+    future: impl std::future::Future<Output = Result<T, OAuthFlowError>>,
+) -> Result<T, OAuthFlowError> {
+    let Some(token) = signal else {
+        return future.await;
+    };
+    if token.is_cancelled() {
+        return Err(OAuthFlowError::Aborted);
+    }
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => Err(OAuthFlowError::Aborted),
+        result = future => result,
+    }
 }
 
 /// `tokenRequest` (flow.ts:191).
@@ -347,13 +402,16 @@ async fn token_request(
         .extend_pairs(params)
         .finish();
     let client = options.client.clone().unwrap_or_default();
-    let response = client
-        .post(url.clone())
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-        .map_err(|error| OAuthFlowError::Network(error.to_string()))?;
+    let response = cancellable(options.signal.as_ref(), async {
+        client
+            .post(url.clone())
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| OAuthFlowError::Network(error.to_string()))
+    })
+    .await?;
     let status = response.status().as_u16();
     let text = response
         .text()
@@ -411,20 +469,35 @@ pub async fn register_client(
             .map_err(|_| OAuthFlowError::Invalid("Invalid authorization server URL".to_owned()))?,
     };
     let mut body = serde_json::to_value(&options.client_metadata).unwrap_or_else(|_| json!({}));
-    if let Some(scope) = &options.scope
-        && let Some(map) = body.as_object_mut()
-    {
-        map.insert("scope".to_owned(), Value::String(scope.clone()));
+    if let Some(map) = body.as_object_mut() {
+        // `application_type` (flow.ts:266-267, MCP SEP-837): OpenID Connect
+        // servers assume `web` without one, which rejects http loopback
+        // redirect URIs.
+        let application_type = options
+            .client_metadata
+            .application_type
+            .clone()
+            .unwrap_or_else(|| application_type(&options.client_metadata.redirect_uris).to_owned());
+        map.insert(
+            "application_type".to_owned(),
+            Value::String(application_type),
+        );
+        if let Some(scope) = &options.scope {
+            map.insert("scope".to_owned(), Value::String(scope.clone()));
+        }
     }
     let client = options.client.clone().unwrap_or_default();
-    let response = client
-        .post(endpoint)
-        .header("Accept", "application/json")
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(serde_json::to_string(&body).unwrap_or_default())
-        .send()
-        .await
-        .map_err(|error| OAuthFlowError::Network(error.to_string()))?;
+    let response = cancellable(options.signal.as_ref(), async {
+        client
+            .post(endpoint)
+            .header("Accept", "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_string(&body).unwrap_or_default())
+            .send()
+            .await
+            .map_err(|error| OAuthFlowError::Network(error.to_string()))
+    })
+    .await?;
     let status = response.status().as_u16();
     let text = response
         .text()
@@ -448,6 +521,7 @@ pub struct RegisterClientOptions {
     pub client_metadata: OAuthClientMetadata,
     pub scope: Option<String>,
     pub client: Option<reqwest::Client>,
+    pub signal: Option<CancellationToken>,
 }
 
 /// `exchangeAuthorizationCode` (flow.ts:247).
@@ -541,6 +615,13 @@ async fn run_flow(
     provider: &dyn OAuthClientProvider,
     options: &OAuthFlowOptions,
 ) -> Result<OAuthFlowResult, OAuthFlowError> {
+    if options
+        .signal
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Err(OAuthFlowError::Aborted);
+    }
     let metadata_url = match &options.authorization_server_metadata_url {
         Some(url) => Some(secure_endpoint(url.as_str())?),
         None => None,
@@ -561,6 +642,7 @@ async fn run_flow(
                         &state.authorization_server_url,
                         &AuthorizationServerMetadataOptions {
                             client: options.client.clone(),
+                            signal: options.signal.clone(),
                             skip_issuer_validation: options.skip_issuer_validation,
                             protocol_version: None,
                         },
@@ -581,6 +663,7 @@ async fn run_flow(
                     resource_metadata_url: options.resource_metadata_url.clone(),
                     authorization_server_metadata_url: metadata_url.clone(),
                     client: options.client.clone(),
+                    signal: options.signal.clone(),
                     skip_issuer_validation: options.skip_issuer_validation,
                 },
             )
@@ -618,33 +701,37 @@ async fn run_flow(
                 .clone()
                 .filter(|scope| !scope.is_empty())
         });
-    let mut client = provider.client_information().await;
+    let stored = provider.client_information().await;
+    // `const clientDocument = stored ? undefined : provider.clientMetadataDocument?.(metadata)`
+    // (flow.ts:355-356). The document is not stored.
+    let client_document = if stored.is_none() {
+        provider.client_metadata_document(metadata.as_ref())?
+    } else {
+        None
+    };
+    if let Some(document) = &client_document {
+        let url = Url::parse(&document.url)
+            .map_err(|_| OAuthFlowError::Invalid("Invalid OAuth client metadata URL".to_owned()))?;
+        if url.scheme() != "https" || url.path() == "/" {
+            return Err(OAuthFlowError::Invalid(
+                "Invalid OAuth client metadata URL".to_owned(),
+            ));
+        }
+    }
+    let mut client = stored;
     if client.is_none() {
         if options.authorization_code.is_some() {
             return Err(OAuthFlowError::Invalid(
                 "OAuth client information is missing during code exchange".to_owned(),
             ));
         }
-        if metadata
-            .as_ref()
-            .and_then(|metadata| metadata.client_id_metadata_document_supported)
-            .unwrap_or(false)
-            && let Some(metadata_url) = provider.client_metadata_url()
-        {
-            let url = Url::parse(&metadata_url).map_err(|_| {
-                OAuthFlowError::Invalid("Invalid OAuth client metadata URL".to_owned())
-            })?;
-            if url.scheme() != "https" || url.path() == "/" {
-                return Err(OAuthFlowError::Invalid(
-                    "Invalid OAuth client metadata URL".to_owned(),
-                ));
-            }
-            let information = OAuthClientInformation {
-                client_id: metadata_url,
+        let information = if let Some(document) = &client_document {
+            // `client = clientDocument && { client_id: clientDocument.url }`
+            // (flow.ts:362): identifying as the document skips registration.
+            OAuthClientInformation {
+                client_id: document.url.clone(),
                 ..Default::default()
-            };
-            provider.save_client_information(information.clone()).await;
-            client = Some(information);
+            }
         } else {
             let information = register_client(
                 &discovered.authorization_server_url,
@@ -653,19 +740,29 @@ async fn run_flow(
                     client_metadata: provider.client_metadata(),
                     scope: scope.clone(),
                     client: options.client.clone(),
+                    signal: options.signal.clone(),
                 },
             )
             .await?;
             provider.save_client_information(information.clone()).await;
-            client = Some(information);
-        }
+            information
+        };
+        client = Some(information);
     }
     let client = client.expect("client information is set above");
+    // `const redirectUrl = clientDocument?.redirectUrl ?? provider.redirectUrl`
+    // (flow.ts:373): the document's redirect URI may differ, for example by
+    // a server-specific path.
+    let redirect_url = client_document
+        .as_ref()
+        .map(|document| document.redirect_url.clone())
+        .unwrap_or_else(|| provider.redirect_url());
     let token_options = TokenRequestOptions {
         metadata: metadata.clone(),
         client_information: client.clone(),
         resource: resource.clone(),
         client: options.client.clone(),
+        signal: options.signal.clone(),
     };
     if let Some(code) = &options.authorization_code {
         // RFC 9207: never send a code from another authorization server to
@@ -690,7 +787,7 @@ async fn run_flow(
                 token: token_options,
                 code: code.clone(),
                 code_verifier: provider.code_verifier().await?,
-                redirect_url: provider.redirect_url(),
+                redirect_url,
             },
         )
         .await?;
@@ -726,6 +823,15 @@ async fn run_flow(
                 return Ok(OAuthFlowResult::Authorized);
             }
             Err(error) => match &error {
+                // An aborted refresh is rethrown so it never falls back to
+                // a new authorization (flow.ts:411).
+                _ if options
+                    .signal
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled) =>
+                {
+                    return Err(OAuthFlowError::Aborted);
+                }
                 OAuthFlowError::InsecureEndpoint { .. } => return Err(error),
                 OAuthFlowError::OAuth { code, .. } if code != "server_error" => return Err(error),
                 _ => {}
@@ -738,7 +844,7 @@ async fn run_flow(
         &StartAuthorizationOptions {
             metadata,
             client_information: client,
-            redirect_url: provider.redirect_url(),
+            redirect_url,
             scope,
             state,
             resource,
