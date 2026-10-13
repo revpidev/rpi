@@ -49,6 +49,7 @@ fn bash_lscpu_case_matches_upstream_shape() {
             )],
             is_error: false,
             details: None,
+            duration_ms: None,
         },
         false,
     );
@@ -87,6 +88,7 @@ fn bash_elapsed_ticker_ticks_during_partial_and_settles() {
             content: vec![],
             is_error: false,
             details: None,
+            duration_ms: None,
         },
         true,
     );
@@ -105,6 +107,7 @@ fn bash_elapsed_ticker_ticks_during_partial_and_settles() {
             content: vec![ToolResultContentLoose::text("done")],
             is_error: false,
             details: None,
+            duration_ms: None,
         },
         false,
     );
@@ -164,6 +167,7 @@ fn write_streaming_preview_grows_but_stays_clamped() {
             )],
             is_error: false,
             details: None,
+            duration_ms: None,
         },
         false,
     );

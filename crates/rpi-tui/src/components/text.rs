@@ -60,6 +60,13 @@ impl Text {
         self.invalidate();
     }
 
+    /// `setPaddingX` (text.ts:39-42 @ 18336987a, #10557): runtime padding
+    /// change for the outputPad walk.
+    pub fn set_padding_x(&mut self, padding_x: usize) {
+        self.padding_x = padding_x;
+        self.invalidate();
+    }
+
     fn invalidate_cache(&self) {
         *self.cache.borrow_mut() = None;
     }
@@ -303,5 +310,15 @@ mod tests {
         let text = Text::new("hi", 2, 0, None);
         let lines = text.render(10);
         assert_eq!(strip_ansi(&lines[0]), "  hi      ");
+    }
+
+    // V17-05 FR-C R1 (#10557): runtime padding setter (upstream
+    // `Text.setPaddingX`).
+    #[test]
+    fn set_padding_x_repads_and_invalidates() {
+        let mut text = Text::new("hi", 1, 0, None);
+        assert_eq!(strip_ansi(&text.render(10)[0]), " hi       ");
+        text.set_padding_x(3);
+        assert_eq!(strip_ansi(&text.render(10)[0]), "   hi     ");
     }
 }

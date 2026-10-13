@@ -350,8 +350,6 @@ mod tests {
         assert!(is_program_status_reply("\x1b]7501;?\x07"));
         assert!(is_program_status_reply("\x1b]7501;?version=2\x1b\\"));
         assert!(!is_program_status_reply("\x1b]7501;state=idle\x1b\\"));
-        assert!(!is_program_status_reply(
-            "\x1b]11;rgb:0000/0000/0000\x07"
-        ));
+        assert!(!is_program_status_reply("\x1b]11;rgb:0000/0000/0000\x07"));
     }
 }

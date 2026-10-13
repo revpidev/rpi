@@ -28,6 +28,8 @@ pub struct BranchSummaryMessageComponent {
     markdown_theme: Arc<MarkdownTheme>,
     theme: Arc<Theme>,
     content_box: TuiBox,
+    /// `outputPad` (branch-summary-message.ts:15, #10557).
+    output_pad: usize,
 }
 
 impl BranchSummaryMessageComponent {
@@ -35,6 +37,7 @@ impl BranchSummaryMessageComponent {
         message: BranchSummaryMessage,
         theme: Arc<Theme>,
         markdown_theme: Arc<MarkdownTheme>,
+        output_pad: usize,
     ) -> Self {
         let mut component = Self {
             expanded: false,
@@ -42,6 +45,7 @@ impl BranchSummaryMessageComponent {
             markdown_theme,
             theme,
             content_box: TuiBox::new(0, 0, None),
+            output_pad,
         };
         component.update_display();
         component
@@ -53,13 +57,20 @@ impl BranchSummaryMessageComponent {
         self.update_display();
     }
 
+    /// `setOutputPad` (branch-summary-message.ts:28-30 @ 18336987a,
+    /// #10557).
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        self.output_pad = output_pad;
+        self.update_display();
+    }
+
     /// `updateDisplay` (branch-summary-message.ts:32-56).
     fn update_display(&mut self) {
         let bg = {
             let theme = Arc::clone(&self.theme);
             Box::new(move |t: &str| theme.bg("customMessageBg", t))
         };
-        let mut content_box = TuiBox::new(1, 1, Some(bg));
+        let mut content_box = TuiBox::new(self.output_pad, 1, Some(bg));
 
         let label = self
             .theme
@@ -113,6 +124,11 @@ impl Component for BranchSummaryMessageComponent {
         // inherent methods win on concrete receivers, so no recursion.
         self.set_expanded(expanded);
     }
+
+    fn set_output_pad(&mut self, output_pad: usize) {
+        // `"setOutputPad" in child` walk equivalent (#10557); no recursion.
+        self.set_output_pad(output_pad);
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +171,7 @@ mod tests {
             },
             theme(),
             markdown_theme(&load_theme("dark", None).unwrap()),
+            1,
         );
         let stripped = strip_ansi(&component.render(40).join("\n"));
         assert!(stripped.contains("[branch]"));
@@ -175,10 +192,35 @@ mod tests {
             },
             theme(),
             markdown_theme(&load_theme("dark", None).unwrap()),
+            1,
         );
         component.set_expanded(true);
         let stripped = strip_ansi(&component.render(40).join("\n"));
         assert!(stripped.contains("Branch Summary"));
         assert!(stripped.contains("We refactored the parser."));
+    }
+
+    // V17-05 FR-C R1 (#10557): runtime outputPad setter repads the box.
+    #[test]
+    fn set_output_pad_repads_the_box() {
+        let mut component = BranchSummaryMessageComponent::new(
+            BranchSummaryMessage {
+                role: BranchSummaryRole::BranchSummary,
+                summary: "We refactored the parser.".into(),
+                from_id: "e1".into(),
+                timestamp: 0,
+            },
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            1,
+        );
+        let before = component.render(40);
+        component.set_output_pad(3);
+        let after = component.render(40);
+        assert_ne!(before, after);
+        assert!(
+            strip_ansi(&after.join("\n")).contains("   [branch]"),
+            "after: {after:?}"
+        );
     }
 }

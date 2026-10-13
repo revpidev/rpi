@@ -206,6 +206,10 @@ struct BashResultRenderComponent {
     warnings: Option<String>,
     expanded: bool,
     is_partial: bool,
+    /// `durationMs` (bash.ts:104-105 @ 18336987a, #10557): a final result's
+    /// recorded duration wins over the renderer's own clock — it is
+    /// monotonic and survives session reloads.
+    duration_ms: Option<u64>,
     state: Arc<BashRenderState>,
     theme: Theme,
     cache: RefCell<Option<(usize, Vec<String>)>>,
@@ -269,17 +273,32 @@ impl Component for BashResultRenderComponent {
             }
         }
 
-        let timing = lock_recover(&self.state.timing);
-        if let Some(started_at) = timing.started_at {
-            // bash.ts:314-318: `Elapsed` while partial, `Took` once settled.
-            let label = if self.is_partial { "Elapsed" } else { "Took" };
-            let end = timing.ended_at.unwrap_or_else(Instant::now);
-            let duration = end.saturating_duration_since(started_at);
+        if !self.is_partial
+            && let Some(duration_ms) = self.duration_ms
+        {
+            // bash.ts:103-105: recorded duration wins.
             lines.push(String::new());
-            lines.push(
-                self.theme
-                    .fg("muted", &format!("{label} {}", format_duration(duration))),
-            );
+            lines.push(self.theme.fg(
+                "muted",
+                &format!(
+                    "Took {}",
+                    format_duration(Duration::from_millis(duration_ms))
+                ),
+            ));
+        } else {
+            let timing = lock_recover(&self.state.timing);
+            if let Some(started_at) = timing.started_at {
+                // bash.ts:106-109: `Elapsed` while partial, `Took` once
+                // settled.
+                let label = if self.is_partial { "Elapsed" } else { "Took" };
+                let end = timing.ended_at.unwrap_or_else(Instant::now);
+                let duration = end.saturating_duration_since(started_at);
+                lines.push(String::new());
+                lines.push(
+                    self.theme
+                        .fg("muted", &format!("{label} {}", format_duration(duration))),
+                );
+            }
         }
 
         lines
@@ -411,6 +430,7 @@ impl ToolDefinition for BashToolRenderer {
             warnings,
             expanded: options.expanded,
             is_partial: options.is_partial,
+            duration_ms: context.duration_ms,
             state,
             theme: theme.clone(),
             cache: RefCell::new(None),
@@ -448,6 +468,8 @@ mod tests {
             expanded: false,
             show_images: false,
             is_error: false,
+            duration_ms: None,
+            output_pad: 0,
             terminal_width: 0,
         }
     }
@@ -562,6 +584,7 @@ mod tests {
                 },
                 "fullOutputPath": "/tmp/rpi-bash-abc.log"
             })),
+            duration_ms: None,
         };
         let context = context(&state);
         let component = renderer
@@ -624,6 +647,7 @@ mod tests {
                 },
                 "fullOutputPath": long_path
             })),
+            duration_ms: None,
         };
         let context = context(&state);
         let component = renderer
@@ -673,6 +697,7 @@ mod tests {
             ],
             is_error: false,
             details: None,
+            duration_ms: None,
         };
         let context = context(&state);
         let component = renderer
@@ -706,6 +731,7 @@ mod tests {
             content: vec![],
             is_error: false,
             details: None,
+            duration_ms: None,
         };
         let component = renderer
             .render_result(
@@ -738,5 +764,39 @@ mod tests {
         assert!(lock_recover(&render_state.timer).is_none());
         let stripped = strip_ansi(&component.render(80).join("\n"));
         assert!(stripped.contains("Took 0."), "stripped: {stripped}");
+    }
+
+    // V17-05 FR-C R3 (#10557): a final result's recorded `durationMs` wins
+    // over the renderer's own clock (it survives reloads).
+    #[test]
+    fn recorded_duration_wins_over_the_internal_clock() {
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = BashToolRenderer;
+        let result = ToolResultState {
+            content: vec![],
+            is_error: false,
+            details: None,
+            duration_ms: Some(65_400),
+        };
+        let mut ctx = context(&state);
+        renderer.render_call(&json!({"command": "sleep 65"}), &theme, &ctx);
+        ctx.duration_ms = Some(65_400);
+        let component = renderer
+            .render_result(
+                &result,
+                ResultRenderOptions {
+                    expanded: false,
+                    is_partial: false,
+                },
+                &theme,
+                &ctx,
+            )
+            .expect("final component");
+        let stripped = strip_ansi(&component.render(80).join("\n"));
+        // `formatDuration(65400)` = `1m 5s`; the internal clock (started
+        // during `render_call`) would print `Took 0.`.
+        assert!(stripped.contains("Took 1m 5s"), "stripped: {stripped}");
+        assert!(!stripped.contains("Took 0."), "stripped: {stripped}");
     }
 }

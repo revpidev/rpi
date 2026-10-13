@@ -449,6 +449,8 @@ async fn w4_tool_render_override_and_inheritance() {
         expanded: false,
         show_images: false,
         is_error: false,
+        duration_ms: None,
+        output_pad: 0,
         terminal_width: 0,
     };
     let component = definition
@@ -465,6 +467,7 @@ async fn w4_tool_render_override_and_inheritance() {
                     content: Vec::new(),
                     is_error: false,
                     details: None,
+                    duration_ms: None,
                 },
                 rpi::modes::interactive::components::tool_execution::ResultRenderOptions {
                     expanded: false,
@@ -542,6 +545,7 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
             content: vec![ToolResultContentLoose::text("total output")],
             is_error: false,
             details: None,
+            duration_ms: None,
         },
         false,
     );
@@ -610,6 +614,7 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
             content: vec![ToolResultContentLoose::text("anything")],
             is_error: false,
             details: None,
+            duration_ms: None,
         },
         false,
     );

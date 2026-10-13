@@ -2265,8 +2265,7 @@ impl SettingsSelectorComponent {
                 id: "output-padding".to_string(),
                 label: "Output padding".to_string(),
                 description: Some(
-                    "Horizontal padding for user messages, assistant messages, and thinking"
-                        .to_string(),
+                    "Horizontal padding for messages, tool output, and command output".to_string(),
                 ),
                 current_value: options.output_pad.to_string(),
                 values: Some(vec!["0".to_string(), "1".to_string()]),

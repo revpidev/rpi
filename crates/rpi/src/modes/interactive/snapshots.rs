@@ -198,6 +198,7 @@ fn compaction_summary_collapsed() {
         },
         dark_theme(),
         markdown_theme(&load_theme("dark", None).unwrap()),
+        1,
     );
     assert_snapshot("compaction_summary_collapsed", &component.render(60));
 }
@@ -213,6 +214,7 @@ fn compaction_summary_expanded() {
         },
         dark_theme(),
         markdown_theme(&load_theme("dark", None).unwrap()),
+        1,
     );
     component.set_expanded(true);
     assert_snapshot("compaction_summary_expanded", &component.render(60));
@@ -229,6 +231,7 @@ fn branch_summary_collapsed() {
         },
         dark_theme(),
         markdown_theme(&load_theme("dark", None).unwrap()),
+        1,
     );
     assert_snapshot("branch_summary_collapsed", &component.render(60));
 }
@@ -244,6 +247,7 @@ fn skill_invocation_collapsed() {
         },
         dark_theme(),
         markdown_theme(&load_theme("dark", None).unwrap()),
+        1,
     );
     assert_snapshot("skill_invocation_collapsed", &component.render(60));
 }
@@ -274,7 +278,7 @@ fn custom_message_default() {
 #[test]
 fn bash_execution_complete() {
     let mut component =
-        BashExecutionComponent::new("ls -la", noop_render_handle(), dark_theme(), false);
+        BashExecutionComponent::new("ls -la", noop_render_handle(), dark_theme(), false, 1);
     for i in 0..25 {
         component.append_output(&format!("file_{i}.txt\n"));
     }
@@ -285,7 +289,7 @@ fn bash_execution_complete() {
 #[test]
 fn bash_execution_error() {
     let mut component =
-        BashExecutionComponent::new("false", noop_render_handle(), dark_theme(), false);
+        BashExecutionComponent::new("false", noop_render_handle(), dark_theme(), false, 1);
     component.append_output("some error output\n");
     component.set_complete(Some(2), false, None, None);
     assert_snapshot("bash_execution_error", &component.render(60));
@@ -312,6 +316,7 @@ fn tool_execution_fallback() {
             content: vec![ToolResultContentLoose::text("pub fn main() {}")],
             is_error: false,
             details: None,
+            duration_ms: None,
         },
         false,
     );

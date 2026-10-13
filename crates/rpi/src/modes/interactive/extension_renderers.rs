@@ -195,12 +195,14 @@ mod tests {
             content: Vec::new(),
             is_error: false,
             details: None,
+            duration_ms: None,
         };
         assert_eq!(bridge_tool_result(&ok).is_error, Some(false));
         let failed = ToolResultState {
             content: Vec::new(),
             is_error: true,
             details: None,
+            duration_ms: None,
         };
         assert_eq!(
             bridge_tool_result(&failed).is_error,

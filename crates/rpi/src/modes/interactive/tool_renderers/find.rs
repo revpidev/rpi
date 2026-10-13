@@ -208,6 +208,8 @@ mod tests {
             expanded: false,
             show_images: false,
             is_error: false,
+            duration_ms: None,
+            output_pad: 0,
             terminal_width: 0,
         }
     }
@@ -248,6 +250,7 @@ mod tests {
             content: vec![ToolResultContentLoose::text(text.to_string())],
             is_error: false,
             details,
+            duration_ms: None,
         }
     }
 

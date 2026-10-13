@@ -360,8 +360,13 @@ mod tests {
         harness.reporter.handle_compaction_start();
         harness.report();
         assert_eq!(harness.last().state, ProgramStatusState::Working);
-        assert_eq!(harness.last().message.as_deref(), Some("Compacting context"));
-        harness.reporter.handle_compaction_end(CompactionReason::Threshold, false, None);
+        assert_eq!(
+            harness.last().message.as_deref(),
+            Some("Compacting context")
+        );
+        harness
+            .reporter
+            .handle_compaction_end(CompactionReason::Threshold, false, None);
         harness.report();
         assert_eq!(harness.last().state, ProgramStatusState::Working);
         assert_eq!(harness.last().message.as_deref(), Some("Session"));
@@ -369,23 +374,25 @@ mod tests {
         harness.send_settled(false);
 
         harness.reporter.handle_compaction_start();
-        harness.reporter.handle_compaction_end(CompactionReason::Manual, false, None);
+        harness
+            .reporter
+            .handle_compaction_end(CompactionReason::Manual, false, None);
         harness.report();
         assert_eq!(harness.last().state, ProgramStatusState::Done);
         assert_eq!(harness.last().message.as_deref(), Some("Session"));
 
         harness.reporter.handle_compaction_start();
-        harness.reporter.handle_compaction_end(
-            CompactionReason::Manual,
-            false,
-            Some("No model"),
-        );
+        harness
+            .reporter
+            .handle_compaction_end(CompactionReason::Manual, false, Some("No model"));
         harness.report();
         assert_eq!(harness.last().state, ProgramStatusState::Error);
         assert_eq!(harness.last().message.as_deref(), Some("No model"));
 
         harness.reporter.handle_compaction_start();
-        harness.reporter.handle_compaction_end(CompactionReason::Manual, true, None);
+        harness
+            .reporter
+            .handle_compaction_end(CompactionReason::Manual, true, None);
         harness.report();
         assert_eq!(harness.last().state, ProgramStatusState::Idle);
     }
@@ -413,7 +420,10 @@ mod tests {
         harness.report();
         assert_eq!(harness.last().state, ProgramStatusState::Blocked);
         assert_eq!(harness.last().kind, Some(ProgramStatusKind::Auth));
-        assert_eq!(harness.last().message.as_deref(), Some("Log in to Anthropic"));
+        assert_eq!(
+            harness.last().message.as_deref(),
+            Some("Log in to Anthropic")
+        );
 
         // The run settles while the selector is still open.
         harness.reporter.set_blocked("login", None);

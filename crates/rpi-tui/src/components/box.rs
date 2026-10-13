@@ -86,6 +86,13 @@ impl Box {
         // Don't invalidate here - we'll detect bgFn changes by sampling output
     }
 
+    /// `setPaddingX` (box.ts:53-56 @ 18336987a, #10557): runtime padding
+    /// change for the outputPad walk.
+    pub fn set_padding_x(&mut self, padding_x: usize) {
+        self.padding_x = padding_x;
+        self.invalidate_cache();
+    }
+
     fn invalidate_cache(&self) {
         *self.cache.borrow_mut() = None;
     }
@@ -524,5 +531,16 @@ mod tests {
             );
         }
         assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    // V17-05 FR-C R1 (#10557): runtime padding setter (upstream
+    // `Box.setPaddingX`).
+    #[test]
+    fn set_padding_x_repads_and_invalidates_the_cache() {
+        let mut b = Box::new(1, 0, None);
+        b.add_child(StdBox::new(Text::new("hi", 0, 0, None)));
+        assert_eq!(b.render(10)[0], " hi       ");
+        b.set_padding_x(3);
+        assert_eq!(b.render(10)[0], "   hi     ");
     }
 }

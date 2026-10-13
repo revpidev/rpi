@@ -125,6 +125,11 @@ impl Component for UserMessageComponent {
         Component::invalidate(&mut *self.content);
         self.rebuild();
     }
+
+    fn set_output_pad(&mut self, output_pad: usize) {
+        // `"setOutputPad" in child` walk equivalent (#10557); no recursion.
+        UserMessageComponent::set_output_pad(self, output_pad);
+    }
 }
 
 #[cfg(test)]

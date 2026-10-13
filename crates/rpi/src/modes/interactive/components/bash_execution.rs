@@ -107,6 +107,11 @@ pub struct BashExecutionComponent {
     content_container: Container,
     top_border: DynamicBorder,
     bottom_border: DynamicBorder,
+    /// `dim` marks `!!` commands, whose output is excluded from the model
+    /// context (bash-execution.ts:31-33 @ 18336987a).
+    color_key: &'static str,
+    /// `outputPad` (bash-execution.ts:34, #10557).
+    output_pad: usize,
     theme: Arc<Theme>,
 }
 
@@ -116,6 +121,7 @@ impl BashExecutionComponent {
         render_handle: RenderHandle,
         theme: Arc<Theme>,
         exclude_from_context: bool,
+        output_pad: usize,
     ) -> Self {
         let command = command.into();
 
@@ -147,47 +153,41 @@ impl BashExecutionComponent {
             None,
         );
 
-        let mut content_container = Container::new();
-
-        // Command header (bash-execution.ts:50-52). Note: `updateDisplay`
-        // re-adds the header with the `bashMode` color unconditionally
-        // (bash-execution.ts:138).
-        let header = Text::new(
-            theme.fg(color_key, &Theme::bold(&format!("$ {command}"))),
-            1,
-            0,
-            None,
-        );
-        content_container.add_child(Box::new(header));
-
-        // Loader
-        let loader = Arc::new(Mutex::new(loader));
-        content_container.add_child(Box::new(LoaderRef(Arc::clone(&loader))));
-
         // Add spacer + top/bottom borders around the content container
-        // (bash-execution.ts:40-64).
+        // (bash-execution.ts:40-64); the header and loader rows come from
+        // `update_display` (bash-execution.ts:64 `this.updateDisplay()`).
         let top_border = DynamicBorder::new(border_color.clone());
         let bottom_border = DynamicBorder::new(border_color);
 
-        Self {
+        let mut component = Self {
             command,
             output_lines: Vec::new(),
             status: BashStatus::Running,
             exit_code: None,
-            loader,
+            loader: Arc::new(Mutex::new(loader)),
             truncation_result: None,
             full_output_path: None,
             expanded: false,
-            content_container,
+            content_container: Container::new(),
             top_border,
             bottom_border,
+            color_key,
+            output_pad,
             theme,
-        }
+        };
+        component.update_display();
+        component
     }
 
     /// `setExpanded` (bash-execution.ts:70-73).
     pub fn set_expanded(&mut self, expanded: bool) {
         self.expanded = expanded;
+        self.update_display();
+    }
+
+    /// `setOutputPad` (bash-execution.ts:75-78 @ 18336987a, #10557).
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        self.output_pad = output_pad;
         self.update_display();
     }
 
@@ -271,11 +271,12 @@ impl BashExecutionComponent {
         // Rebuild content container (bash-execution.ts:135-136).
         self.content_container.clear();
 
-        // Command header (bash-execution.ts:138-139).
+        // Command header (bash-execution.ts:138-139): `!!` commands keep
+        // their dim color (18336987a fix — previously hardcoded `bashMode`).
         let header = Text::new(
             self.theme
-                .fg("bashMode", &Theme::bold(&format!("$ {}", self.command))),
-            1,
+                .fg(self.color_key, &Theme::bold(&format!("$ {}", self.command))),
+            self.output_pad,
             0,
             None,
         );
@@ -292,7 +293,7 @@ impl BashExecutionComponent {
                     .join("\n");
                 self.content_container.add_child(Box::new(Text::new(
                     format!("\n{display_text}"),
-                    1,
+                    self.output_pad,
                     0,
                     None,
                 )));
@@ -309,7 +310,7 @@ impl BashExecutionComponent {
                     .add_child(Box::new(CachedVisualTruncation {
                         text: styled_input,
                         max_visual_lines: PREVIEW_LINES,
-                        padding_x: 1,
+                        padding_x: self.output_pad,
                         cache: RefCell::new(None),
                     }));
             }
@@ -366,7 +367,7 @@ impl BashExecutionComponent {
             if !status_parts.is_empty() {
                 self.content_container.add_child(Box::new(Text::new(
                     format!("\n{}", status_parts.join("\n")),
-                    1,
+                    self.output_pad,
                     0,
                     None,
                 )));
@@ -408,6 +409,11 @@ impl Component for BashExecutionComponent {
         // inherent methods win on concrete receivers, so no recursion.
         self.set_expanded(expanded);
     }
+
+    fn set_output_pad(&mut self, output_pad: usize) {
+        // `"setOutputPad" in child` walk equivalent (#10557); no recursion.
+        BashExecutionComponent::set_output_pad(self, output_pad);
+    }
 }
 
 #[cfg(test)]
@@ -421,7 +427,7 @@ mod tests {
     }
 
     fn component(exclude: bool) -> BashExecutionComponent {
-        BashExecutionComponent::new("pwd", RenderHandle::new(|| {}), theme(), exclude)
+        BashExecutionComponent::new("pwd", RenderHandle::new(|| {}), theme(), exclude, 1)
     }
 
     fn strip_ansi(input: &str) -> String {
@@ -594,5 +600,44 @@ mod tests {
         // Both borders are colored; the dim border differs from bashMode.
         assert!(excluded_border.contains("\u{1b}[38;"));
         assert_ne!(excluded_border, normal_border);
+    }
+
+    // V17-05 FR-C R2 (#10557): the `!!` header keeps its dim color after
+    // `updateDisplay` — it used to be re-added with the hardcoded
+    // `bashMode` color.
+    #[test]
+    fn excluded_from_context_header_stays_dim_after_update() {
+        let mut excluded = component(true);
+        excluded.append_output("out\n");
+        excluded.set_complete(Some(0), false, None, None);
+        let mut normal = component(false);
+        normal.append_output("out\n");
+        normal.set_complete(Some(0), false, None, None);
+
+        let excluded_header = excluded
+            .render(40)
+            .into_iter()
+            .find(|line| line.contains("$ pwd"))
+            .expect("excluded header");
+        let normal_header = normal
+            .render(40)
+            .into_iter()
+            .find(|line| line.contains("$ pwd"))
+            .expect("normal header");
+        assert!(excluded_header.contains("\u{1b}[38;"));
+        assert_ne!(excluded_header, normal_header);
+    }
+
+    // V17-05 FR-C R1 (#10557): the runtime outputPad setter repads the
+    // header, output, and status rows.
+    #[test]
+    fn set_output_pad_repads_header_and_output() {
+        let mut component = component(false);
+        component.append_output("hello\n");
+        component.set_complete(Some(0), false, None, None);
+        component.set_output_pad(3);
+        let lines = strip_ansi(&component.render(40).join("\n"));
+        assert!(lines.contains("   $ pwd"), "rendered: {lines}");
+        assert!(lines.contains("   hello"), "rendered: {lines}");
     }
 }

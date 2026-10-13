@@ -671,6 +671,11 @@ impl Component for AssistantMessageComponent {
         AssistantMessageComponent::set_hide_thinking_block(self, hide);
     }
 
+    fn set_output_pad(&mut self, output_pad: usize) {
+        // `"setOutputPad" in child` walk equivalent (#10557); no recursion.
+        AssistantMessageComponent::set_output_pad(self, output_pad);
+    }
+
     fn invalidate(&mut self) {
         self.content_container.invalidate();
         if let Some(message) = self.last_message.clone() {

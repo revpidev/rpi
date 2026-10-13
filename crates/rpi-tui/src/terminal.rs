@@ -1606,9 +1606,7 @@ mod tests {
 
     /// `setupNegotiation` with an explicit `RPI_PROGRAM_STATUS` value (the
     /// upstream `withOverride` helper): `None` = probe path.
-    fn setup_negotiation_with_program_status(
-        program_status: Option<&str>,
-    ) -> NegotiationHarness {
+    fn setup_negotiation_with_program_status(program_status: Option<&str>) -> NegotiationHarness {
         let writer = SharedWriter::default();
         let mut terminal = ProcessTerminal::with_writer(writer.clone());
         terminal.program_status_env = program_status.map(str::to_owned);
@@ -1760,7 +1758,10 @@ mod tests {
                 kind: None,
                 message: None,
             });
-            assert_eq!(harness.writes().last().unwrap(), "\x1b]7501;state=done\x1b\\");
+            assert_eq!(
+                harness.writes().last().unwrap(),
+                "\x1b]7501;state=done\x1b\\"
+            );
         }
 
         #[test]
@@ -1776,10 +1777,12 @@ mod tests {
             });
 
             assert_eq!(harness.input(), None);
-            assert!(!harness
-                .writes()
-                .iter()
-                .any(|write| write.starts_with("\x1b]7501;state=")));
+            assert!(
+                !harness
+                    .writes()
+                    .iter()
+                    .any(|write| write.starts_with("\x1b]7501;state="))
+            );
         }
 
         #[test]

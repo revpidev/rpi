@@ -111,6 +111,14 @@ impl Component for CustomEntryComponent {
         // inherent methods win on concrete receivers, so no recursion.
         self.set_expanded(expanded);
     }
+
+    fn set_output_pad(&mut self, _output_pad: usize) {
+        // Upstream `setOutputPad` (custom-entry.ts:34-37 @ 18336987a,
+        // #10557) stores the pad and rebuilds only for its renderer-catch
+        // fallback box; [`EntryRenderer`] returns `Option` instead of
+        // throwing (module doc), so there is no box to pad — the walk is a
+        // structural no-op.
+    }
 }
 
 #[cfg(test)]

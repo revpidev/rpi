@@ -240,6 +240,15 @@ pub trait Component: Send {
     /// extension to the frozen contract; shared wrappers forward it.)
     fn set_hide_thinking_block(&mut self, _hide: bool) {}
 
+    /// Output-padding change, mirroring upstream's `"setOutputPad" in child`
+    /// walk (`onOutputPadChange`, interactive-mode.ts:5057-5070 @ 18336987a,
+    /// #10557): the mode updates every transcript block in place. Default:
+    /// no output padding — a no-op, exactly like upstream components without
+    /// a `setOutputPad` method. (V17-05 extension to the frozen contract;
+    /// components with padding override this and forward to their inherent
+    /// `set_output_pad`.)
+    fn set_output_pad(&mut self, _output_pad: usize) {}
+
     /// Layout node for the T30 layout engine: replaces upstream's
     /// `LAYOUT_NODE` symbol protocol (`getLayoutNode`, layout-node.ts:48-51).
     /// Stack/scroll containers override this; the returned node borrows the

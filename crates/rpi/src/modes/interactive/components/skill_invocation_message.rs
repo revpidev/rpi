@@ -28,6 +28,8 @@ pub struct SkillInvocationMessageComponent {
     markdown_theme: Arc<MarkdownTheme>,
     theme: Arc<Theme>,
     content_box: TuiBox,
+    /// `outputPad` (skill-invocation-message.ts:16, #10557).
+    output_pad: usize,
 }
 
 impl SkillInvocationMessageComponent {
@@ -35,6 +37,7 @@ impl SkillInvocationMessageComponent {
         skill_block: ParsedSkillBlock,
         theme: Arc<Theme>,
         markdown_theme: Arc<MarkdownTheme>,
+        output_pad: usize,
     ) -> Self {
         let mut component = Self {
             expanded: false,
@@ -42,9 +45,17 @@ impl SkillInvocationMessageComponent {
             markdown_theme,
             theme,
             content_box: TuiBox::new(0, 0, None),
+            output_pad,
         };
         component.update_display();
         component
+    }
+
+    /// `setOutputPad` (skill-invocation-message.ts:28-30 @ 18336987a,
+    /// #10557).
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        self.output_pad = output_pad;
+        self.update_display();
     }
 
     /// `setExpanded` (skill-invocation-message.ts:22-25).
@@ -59,7 +70,7 @@ impl SkillInvocationMessageComponent {
             let theme = Arc::clone(&self.theme);
             Box::new(move |t: &str| theme.bg("customMessageBg", t))
         };
-        let mut content_box = TuiBox::new(1, 1, Some(bg));
+        let mut content_box = TuiBox::new(self.output_pad, 1, Some(bg));
 
         if self.expanded {
             // Expanded: label + skill name header + full content
@@ -120,6 +131,11 @@ impl Component for SkillInvocationMessageComponent {
         // inherent methods win on concrete receivers, so no recursion.
         self.set_expanded(expanded);
     }
+
+    fn set_output_pad(&mut self, output_pad: usize) {
+        // `"setOutputPad" in child` walk equivalent (#10557); no recursion.
+        self.set_output_pad(output_pad);
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +181,7 @@ mod tests {
             block(),
             theme(),
             markdown_theme(&load_theme("dark", None).unwrap()),
+            1,
         );
         let stripped = strip_ansi(&component.render(40).join("\n"));
         assert!(stripped.contains("[skill] plan"));
@@ -178,6 +195,7 @@ mod tests {
             block(),
             theme(),
             markdown_theme(&load_theme("dark", None).unwrap()),
+            1,
         );
         component.set_expanded(true);
         let stripped = strip_ansi(&component.render(40).join("\n"));
@@ -185,5 +203,24 @@ mod tests {
         assert!(stripped.contains("plan"));
         assert!(stripped.contains("1. Investigate"));
         assert!(stripped.contains("2. Write a plan"));
+    }
+
+    // V17-05 FR-C R1 (#10557): runtime outputPad setter repads the box.
+    #[test]
+    fn set_output_pad_repads_the_box() {
+        let mut component = SkillInvocationMessageComponent::new(
+            block(),
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            1,
+        );
+        let before = component.render(40);
+        component.set_output_pad(3);
+        let after = component.render(40);
+        assert_ne!(before, after);
+        assert!(
+            strip_ansi(&after.join("\n")).contains("   [skill]"),
+            "after: {after:?}"
+        );
     }
 }

@@ -497,6 +497,8 @@ mod tests {
             expanded: false,
             show_images: false,
             is_error: false,
+            duration_ms: None,
+            output_pad: 0,
             terminal_width: 0,
         }
     }
@@ -678,6 +680,7 @@ mod tests {
                 "firstChangedLine": 1,
                 "patch": "--- a\n+++ b\n@@ -1 +1 @@\n-Hello, world!\n+Hello, testing!\n"
             })),
+            duration_ms: None,
         };
         let component = renderer
             .render_result(
@@ -733,6 +736,7 @@ mod tests {
                 "diff": "-1 Hello, world!\n+1 Hello, testing!",
                 "firstChangedLine": 1
             })),
+            duration_ms: None,
         };
         let component = renderer
             .render_result(
@@ -784,6 +788,7 @@ mod tests {
             )],
             is_error: true,
             details: None,
+            duration_ms: None,
         };
         let mut err_ctx = ctx.clone();
         err_ctx.is_error = true;
@@ -812,6 +817,7 @@ mod tests {
             content: vec![],
             is_error: false,
             details: None,
+            duration_ms: None,
         };
         let _ = renderer.render_result(
             &ok_result,
@@ -835,6 +841,7 @@ mod tests {
             content: vec![],
             is_error: false,
             details: Some(json!({ "diff": diff })),
+            duration_ms: None,
         };
 
         // Success, no preview → renders the diff.
@@ -862,6 +869,7 @@ mod tests {
             content: vec![],
             is_error: false,
             details: Some(json!({ "diff": "" })),
+            duration_ms: None,
         };
         assert!(format_edit_result(&args, None, &empty, &theme, false).is_none());
 
@@ -871,6 +879,7 @@ mod tests {
             content: vec![ToolResultContentLoose::text(error_text)],
             is_error: true,
             details: None,
+            duration_ms: None,
         };
         let out = format_edit_result(&args, None, &err_result, &theme, true).expect("error");
         assert_eq!(out, theme.fg("error", error_text));
@@ -880,6 +889,7 @@ mod tests {
             content: vec![],
             is_error: true,
             details: None,
+            duration_ms: None,
         };
         assert!(format_edit_result(&args, None, &empty_err, &theme, true).is_none());
 

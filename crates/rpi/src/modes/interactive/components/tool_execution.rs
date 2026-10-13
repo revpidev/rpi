@@ -73,6 +73,9 @@ const FALLBACK_PREVIEW_LINES: usize = 10;
 pub struct ToolExecutionOptions {
     pub show_images: bool,
     pub image_width_cells: usize,
+    /// `outputPad` (tool-execution.ts:28, #10557): horizontal padding for
+    /// the transcript block; defaults to 1 like upstream.
+    pub output_pad: usize,
 }
 
 impl Default for ToolExecutionOptions {
@@ -80,6 +83,7 @@ impl Default for ToolExecutionOptions {
         Self {
             show_images: true,
             image_width_cells: 60,
+            output_pad: 1,
         }
     }
 }
@@ -152,6 +156,11 @@ pub struct ToolResultState {
     pub content: Vec<ToolResultContentLoose>,
     pub is_error: bool,
     pub details: Option<Value>,
+    /// `durationMs` (agent-loop.ts:919-928 / types.ts `ToolResultMessage`):
+    /// recorded execution time, absent for legacy/deferred results. The TUI
+    /// consumes it for the bash `Took` line (V17-05 FR-C R3); the
+    /// `tool_execution_end` event payload field is V17-06.
+    pub duration_ms: Option<u64>,
 }
 
 /// `RenderShell` (extensions/types.ts `renderShell`): whether the tool
@@ -181,6 +190,15 @@ pub struct ToolRenderContext {
     pub expanded: bool,
     pub show_images: bool,
     pub is_error: bool,
+    /// `durationMs` (tool-execution.ts:119): recorded execution time of the
+    /// finished result; `None` while partial or for legacy results. Internal
+    /// field first — the extension ABI field opens in V17-06.
+    pub duration_ms: Option<u64>,
+    /// `outputPad` (extensions/types.ts:489-493, #10557): horizontal padding
+    /// configured by the setting; renderers with `renderShell: "self"`
+    /// apply it themselves. Internal field first — the extension ABI field
+    /// opens in V17-06.
+    pub output_pad: usize,
     /// Viewport width the component last rendered at (0 before the first
     /// render). Forwarded to extension renderers so progress bars size to
     /// the actual terminal instead of a fixed width (rpi extension over
@@ -254,6 +272,8 @@ pub struct ToolExecutionComponent {
     has_result: Arc<AtomicBool>,
     show_images: bool,
     image_width_cells: usize,
+    /// `outputPad` (tool-execution.ts:48-50, #10557).
+    output_pad: usize,
     is_partial: bool,
     tool_definition: Option<Arc<dyn ToolDefinition>>,
     built_in_tool_definition: Option<Arc<dyn ToolDefinition>>,
@@ -302,6 +322,7 @@ impl ToolExecutionComponent {
             has_result: Arc::new(AtomicBool::new(false)),
             show_images: options.show_images,
             image_width_cells: options.image_width_cells,
+            output_pad: options.output_pad,
             is_partial: true,
             tool_definition,
             built_in_tool_definition,
@@ -344,6 +365,12 @@ impl ToolExecutionComponent {
             expanded: self.expanded,
             show_images: self.show_images,
             is_error: self.result.as_ref().is_some_and(|r| r.is_error),
+            duration_ms: if self.is_partial {
+                None
+            } else {
+                self.result.as_ref().and_then(|r| r.duration_ms)
+            },
+            output_pad: self.output_pad,
             terminal_width: self
                 .last_render_width
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -529,6 +556,12 @@ impl ToolExecutionComponent {
         self.update_display();
     }
 
+    /// `setOutputPad` (tool-execution.ts:203-206 @ 18336987a, #10557).
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        self.output_pad = output_pad;
+        self.update_display();
+    }
+
     /// `setImageWidthCells` (tool-execution.ts:211-214).
     pub fn set_image_width_cells(&mut self, width: usize) {
         self.image_width_cells = width.max(1);
@@ -630,6 +663,7 @@ impl ToolExecutionComponent {
                     // child is wrapped in a click-to-expand result region
                     // (tool-execution.ts:315-353 @ 9841914).
                     self.content_box.set_bg_fn(Some(bg_fn));
+                    self.content_box.set_padding_x(self.output_pad);
                     self.content_box.clear();
                     // The result component is BUILT before the call component
                     // (V13-11, rpi#18): a renderer's `renderResult` may
@@ -679,7 +713,7 @@ impl ToolExecutionComponent {
             // (`contentTextRegion`, tool-execution.ts:104).
             self.content_text_region = Some(self.create_result_region(StdBox::new(Text::new(
                 self.format_tool_execution(),
-                1,
+                self.output_pad,
                 1,
                 Some(bg_fn),
             ))));
@@ -849,6 +883,12 @@ impl Component for ToolExecutionComponent {
         // inherent methods win on concrete receivers, so this does not
         // recurse.
         self.set_expanded(expanded);
+    }
+
+    fn set_output_pad(&mut self, output_pad: usize) {
+        // `"setOutputPad" in child` walk equivalent (#10557): route to the
+        // inherent method without recursing.
+        ToolExecutionComponent::set_output_pad(self, output_pad);
     }
 }
 
@@ -1086,6 +1126,7 @@ mod tests {
                          "status": "ok", "durationMs": 5}
                     ]
                 })),
+                duration_ms: None,
             },
             false,
         );
@@ -1110,6 +1151,7 @@ mod tests {
                 content: vec![ToolResultContentLoose::text("file contents")],
                 is_error: false,
                 details: None,
+                duration_ms: None,
             },
             false,
         );
@@ -1123,6 +1165,7 @@ mod tests {
                 content: vec![ToolResultContentLoose::text("permission denied")],
                 is_error: true,
                 details: None,
+                duration_ms: None,
             },
             false,
         );
@@ -1135,6 +1178,7 @@ mod tests {
                 content: vec![ToolResultContentLoose::text("ok")],
                 is_error: false,
                 details: None,
+                duration_ms: None,
             },
             false,
         );
@@ -1178,6 +1222,7 @@ mod tests {
             content: vec![ToolResultContentLoose::text(body.join("\n"))],
             is_error: false,
             details: None,
+            duration_ms: None,
         }
     }
 
@@ -1243,6 +1288,7 @@ mod tests {
                 content: vec![ToolResultContentLoose::image("aGVsbG8=", "image/png")],
                 is_error: false,
                 details: None,
+                duration_ms: None,
             },
             false,
         );
@@ -1273,6 +1319,7 @@ mod tests {
                 )],
                 is_error: false,
                 details: None,
+                duration_ms: None,
             },
             false,
         );
@@ -1346,6 +1393,7 @@ mod tests {
                 content: vec![ToolResultContentLoose::image(&first_bmp, "image/bmp")],
                 is_error: false,
                 details: None,
+                duration_ms: None,
             },
             true,
         );
@@ -1367,6 +1415,7 @@ mod tests {
                 content: vec![ToolResultContentLoose::image(&second_bmp, "image/bmp")],
                 is_error: false,
                 details: None,
+                duration_ms: None,
             },
             true,
         );
@@ -1388,6 +1437,7 @@ mod tests {
                 content: vec![ToolResultContentLoose::image(&final_png, "image/png")],
                 is_error: false,
                 details: None,
+                duration_ms: None,
             },
             false,
         );
@@ -1542,6 +1592,7 @@ mod tests {
                 "diff": "-1 Hello, world!\n+1 Hello, testing!",
                 "firstChangedLine": 1,
             })),
+            duration_ms: None,
         }
     }
 

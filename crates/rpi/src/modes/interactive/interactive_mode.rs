@@ -675,6 +675,12 @@ impl<T: Component> Component for SharedChild<T> {
     fn set_hide_thinking_block(&mut self, hide: bool) {
         lock(&self.0).set_hide_thinking_block(hide);
     }
+
+    /// Forwards the `"setOutputPad" in child` walk (#10557) to the wrapped
+    /// component.
+    fn set_output_pad(&mut self, output_pad: usize) {
+        lock(&self.0).set_output_pad(output_pad);
+    }
 }
 
 /// Tree entry for a shared focusable component (selectors, T12-S5a): the
@@ -766,6 +772,13 @@ impl Component for SharedEntry {
 
     fn set_expanded(&mut self, expanded: bool) {
         lock(&self.0).set_expanded(expanded);
+    }
+
+    fn set_output_pad(&mut self, output_pad: usize) {
+        // `"setOutputPad" in child` walk equivalent (#10557): a selector or
+        // dashed editor mounted in the editor container is not a transcript
+        // block; forwarding keeps the wrapper transparent.
+        lock(&self.0).set_output_pad(output_pad);
     }
 
     fn as_focusable(&self) -> Option<&dyn Focusable> {
@@ -1058,6 +1071,7 @@ fn tool_result_state_from_message(
             .collect(),
         is_error: tool_result.is_error,
         details: tool_result.details.clone(),
+        duration_ms: tool_result.duration_ms,
     }
 }
 
@@ -1099,6 +1113,9 @@ fn tool_result_state_from_value(value: &serde_json::Value, is_error: bool) -> To
         content,
         is_error,
         details,
+        // `result.durationMs` (agent-loop.ts:919-928): present on finalized
+        // tool results, absent for legacy/deferred ones.
+        duration_ms: value.get("durationMs").and_then(serde_json::Value::as_u64),
     }
 }
 
@@ -2263,6 +2280,7 @@ impl InteractiveUi {
                                         )],
                                         is_error: true,
                                         details: None,
+                                        duration_ms: None,
                                     },
                                     false,
                                 );
@@ -2797,6 +2815,7 @@ impl InteractiveUi {
             ToolExecutionOptions {
                 show_images: self.show_images,
                 image_width_cells: self.image_width_cells,
+                output_pad: self.output_pad.load(Ordering::Relaxed),
             },
             // `getRegisteredToolDefinition` (interactive-mode.ts:2944):
             // extension render hooks; overrides without hooks inherit the
@@ -3802,6 +3821,11 @@ impl InteractiveUi {
         // above: `CustomEntryComponent::new` runs `rebuild()` → the entry
         // renderer closure synchronously.
         let theme = Arc::clone(&lock(&self.theme));
+        // Upstream `new CustomEntryComponent(entry, renderer, this.outputPad)`
+        // (interactive-mode.ts:3996 @ 18336987a): the pad is only used by the
+        // renderer-throw fallback box, which the Rust `Option`-returning
+        // renderer cannot produce — the trait `set_output_pad` override is
+        // the structural no-op (custom_entry.rs).
         let mut component = CustomEntryComponent::new(custom_entry.clone(), renderer, theme);
         component.set_expanded(*lock(&self.tool_output_expanded));
         if !component.has_content() {
@@ -3860,6 +3884,7 @@ impl InteractiveUi {
                     self.render_handle.clone(),
                     Arc::clone(&lock(&self.theme)),
                     bash_execution.exclude_from_context.unwrap_or(false),
+                    self.output_pad.load(Ordering::Relaxed),
                 );
                 if !bash_execution.output.is_empty() {
                     component.append_output(&bash_execution.output);
@@ -3914,6 +3939,7 @@ impl InteractiveUi {
                     compaction_summary.clone(),
                     Arc::clone(&lock(&self.theme)),
                     Arc::clone(&lock(&self.markdown_theme)),
+                    self.output_pad.load(Ordering::Relaxed),
                 );
                 component.set_expanded(*lock(&self.tool_output_expanded));
                 self.add_chat_child(Box::new(component));
@@ -3925,6 +3951,7 @@ impl InteractiveUi {
                     branch_summary.clone(),
                     Arc::clone(&lock(&self.theme)),
                     Arc::clone(&lock(&self.markdown_theme)),
+                    self.output_pad.load(Ordering::Relaxed),
                 );
                 component.set_expanded(*lock(&self.tool_output_expanded));
                 self.add_chat_child(Box::new(component));
@@ -3950,6 +3977,7 @@ impl InteractiveUi {
                         skill_block.clone(),
                         Arc::clone(&lock(&self.theme)),
                         Arc::clone(&lock(&self.markdown_theme)),
+                        self.output_pad.load(Ordering::Relaxed),
                     );
                     skill_component.set_expanded(*lock(&self.tool_output_expanded));
                     chat.children.push(Box::new(skill_component));
@@ -4087,6 +4115,7 @@ impl InteractiveUi {
                                         content: vec![ToolResultContentLoose::text(error_message)],
                                         is_error: true,
                                         details: None,
+                                        duration_ms: None,
                                     },
                                     false,
                                 );
@@ -4360,11 +4389,7 @@ impl InteractiveUi {
     /// `programStatus.setBlocked(source, status)` + report: report `blocked`
     /// while a dialog waits for the user; `None` clears the source
     /// (interactive-mode.ts:2729/2742/2810/2823/2854/2866/6321/6334).
-    pub(crate) fn set_program_status_blocked(
-        &self,
-        source: &str,
-        status: Option<BlockedStatus>,
-    ) {
+    pub(crate) fn set_program_status_blocked(&self, source: &str, status: Option<BlockedStatus>) {
         lock(&self.program_status).set_blocked(source, status);
         self.report_program_status();
     }
@@ -6858,6 +6883,7 @@ mod tests {
                 content: vec![ToolResultContentLoose::text("first")],
                 is_error: false,
                 details: None,
+                duration_ms: None,
             },
             true,
         );

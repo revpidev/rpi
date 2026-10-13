@@ -430,6 +430,8 @@ mod tests {
             expanded: false,
             show_images: false,
             is_error: false,
+            duration_ms: None,
+            output_pad: 0,
             terminal_width: 0,
         }
     }
@@ -987,6 +989,7 @@ mod tests {
             )],
             is_error: false,
             details: None,
+            duration_ms: None,
         };
         let component = renderer
             .render_result(
@@ -1013,6 +1016,7 @@ mod tests {
             content: vec![ToolResultContentLoose::text(error_text)],
             is_error: true,
             details: None,
+            duration_ms: None,
         };
         let mut ctx = context(&state);
         ctx.is_error = true;
@@ -1045,6 +1049,7 @@ mod tests {
             content: vec![],
             is_error: true,
             details: None,
+            duration_ms: None,
         };
         assert!(format_write_result(&empty, &theme, true).is_none());
         assert!(format_write_result(&result, &theme, false).is_none());

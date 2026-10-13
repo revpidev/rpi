@@ -472,6 +472,8 @@ mod tests {
             expanded: false,
             show_images: false,
             is_error: false,
+            duration_ms: None,
+            output_pad: 0,
             terminal_width: 0,
         }
     }
@@ -553,6 +555,7 @@ mod tests {
                         {"id": "call/1", "name": "read", "args": "{\"path\":\"a\"}", "status": "ok", "durationMs": 5}
                     ]
                 })),
+                duration_ms: None,
             },
             false,
             true,
@@ -584,6 +587,7 @@ mod tests {
                         call("call/models.classify/3", None),
                     ]
                 })),
+                duration_ms: None,
             },
             false,
             true,
@@ -610,6 +614,7 @@ mod tests {
                 )],
                 is_error: true,
                 details: None,
+                duration_ms: None,
             },
             true,
             true,
@@ -631,6 +636,7 @@ mod tests {
                 ],
                 is_error: false,
                 details: Some(json!({"calls": [], "fullOutputPath": "/tmp/out.txt"})),
+                duration_ms: None,
             },
             false,
             false,
@@ -665,6 +671,7 @@ mod tests {
                 content: vec![script_header()],
                 is_error: false,
                 details: Some(json!({"calls": calls})),
+                duration_ms: None,
             },
             false,
             false,
@@ -688,6 +695,7 @@ mod tests {
                          "durationMs": 5, "error": "line one\nline two"}
                     ]
                 })),
+                duration_ms: None,
             },
             false,
             true,
@@ -709,6 +717,7 @@ mod tests {
                          "status": "ok", "durationMs": 1}
                     ]
                 })),
+                duration_ms: None,
             },
             false,
             false,

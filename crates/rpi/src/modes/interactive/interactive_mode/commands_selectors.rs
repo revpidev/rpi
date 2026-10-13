@@ -483,20 +483,18 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
         SettingsChange::OutputPad(padding) => {
             session.settings_manager(|s| s.set_output_pad(padding));
             ui.output_pad.store(padding as usize, Ordering::Relaxed);
-            // interactive-mode.ts:4270-4290: while streaming, update the
-            // live components in place; otherwise rebuild the chat.
-            let streaming = lock(&ui.streaming);
-            if streaming.is_some() || session.is_streaming() {
-                if let Some(track) = streaming.as_ref() {
-                    lock(&track.handle).set_output_pad(padding as usize);
+            // `onOutputPadChange` (interactive-mode.ts:5057-5070 @ 18336987a,
+            // #10557): walk the chat and pending-message containers and
+            // update every child with a `setOutputPad` method in place —
+            // no rebuild, so streaming tool components keep their partial
+            // output. The defaulted `Component::set_output_pad` reproduces
+            // the upstream `"setOutputPad" in child` duck-typing.
+            for container in [&ui.chat_container, &ui.pending_messages_container] {
+                for child in lock(container).children.iter_mut() {
+                    child.set_output_pad(padding as usize);
                 }
-                // Deviation: historical chat children keep their padding —
-                // the port has no component downcast for the upstream
-                // `chatContainer.children` walk (interactive-mode.ts:4274-4282).
-            } else {
-                drop(streaming);
-                ui.rebuild_chat_from_messages();
             }
+            ui.render_handle.request_render();
         }
         SettingsChange::AutocompleteMaxVisible(max_visible) => {
             session.settings_manager(|s| s.set_autocomplete_max_visible(max_visible));
@@ -2466,6 +2464,7 @@ impl InteractiveUi {
             self.render_handle.clone(),
             Arc::clone(&lock(&self.theme)),
             exclude_from_context,
+            self.output_pad.load(Ordering::Relaxed),
         )));
         if self.session().is_streaming() {
             // Deferred while streaming (interactive-mode.ts:5977-5980).
@@ -4263,6 +4262,7 @@ mod tests {
             ui.render_handle.clone(),
             Arc::clone(&lock(&ui.theme)),
             false,
+            1,
         )));
         let entry = Box::new(SharedChild(Arc::clone(&component)));
         let address = child_address(&*entry);
@@ -4784,7 +4784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_output_pad_rebuilds_chat_when_idle() {
+    async fn settings_output_pad_updates_children_in_place_when_idle() {
         let (mode, _terminal, session, _tmp) = mode_harness().await;
         let ui = &mode.ui_state;
         {
@@ -4797,13 +4797,19 @@ mod tests {
         ui.render_initial_messages();
         ui.show_status("rebuild-sentinel");
 
-        apply_settings_change(ui, SettingsChange::OutputPad(1));
-        assert_eq!(session.settings_manager(|s| s.get_output_pad()), 1);
-        assert_eq!(ui.output_pad.load(Ordering::Relaxed), 1);
+        let before = lock(&ui.chat_container).render(60).join("\n");
+        apply_settings_change(ui, SettingsChange::OutputPad(0));
+        assert_eq!(session.settings_manager(|s| s.get_output_pad()), 0);
+        assert_eq!(ui.output_pad.load(Ordering::Relaxed), 0);
         let rendered = lock(&ui.chat_container).render(60).join("\n");
         assert!(
-            !rendered.contains("rebuild-sentinel"),
-            "chat rebuilt when idle"
+            rendered.contains("rebuild-sentinel"),
+            "no rebuild: the walk updates children in place (#10557)"
+        );
+        assert_ne!(before, rendered, "the walk reached the user message");
+        assert!(
+            !rendered.contains(" hello"),
+            "user message repadded to outputPad 0: {rendered:?}"
         );
     }
 

@@ -413,7 +413,11 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             s("escape"),
             "Close transcript search",
         ),
-        ("tui.altScreen.top", s("ctrl+home"), "Scroll viewport to top"),
+        (
+            "tui.altScreen.top",
+            s("ctrl+home"),
+            "Scroll viewport to top",
+        ),
         (
             "tui.altScreen.bottom",
             s("ctrl+end"),
@@ -757,16 +761,12 @@ fn migrate_keybinding_value(name: &str, value: &serde_json::Value) -> Option<ser
             }
             _ => None,
         },
-        "tui.editor.cursorLineStart" => migrate_exact_key_array(
-            value,
-            &["home", "ctrl+home", "ctrl+a"],
-            &["home", "ctrl+a"],
-        ),
-        "tui.editor.cursorLineEnd" => migrate_exact_key_array(
-            value,
-            &["end", "ctrl+end", "ctrl+e"],
-            &["end", "ctrl+e"],
-        ),
+        "tui.editor.cursorLineStart" => {
+            migrate_exact_key_array(value, &["home", "ctrl+home", "ctrl+a"], &["home", "ctrl+a"])
+        }
+        "tui.editor.cursorLineEnd" => {
+            migrate_exact_key_array(value, &["end", "ctrl+end", "ctrl+e"], &["end", "ctrl+e"])
+        }
         _ => None,
     }
 }
@@ -781,7 +781,12 @@ fn migrate_exact_key_array(
     let serde_json::Value::Array(keys) = value else {
         return None;
     };
-    if keys.len() != old_default.len() || !keys.iter().zip(old_default).all(|(key, old)| key.as_str() == Some(*old)) {
+    if keys.len() != old_default.len()
+        || !keys
+            .iter()
+            .zip(old_default)
+            .all(|(key, old)| key.as_str() == Some(*old))
+    {
         return None;
     }
     Some(serde_json::Value::Array(
@@ -1415,14 +1420,8 @@ mod tests {
             "tui.editor.cursorLineEnd".to_string(),
             serde_json::json!(["ctrl+end", "end"]),
         );
-        raw.insert(
-            "tui.altScreen.top".to_string(),
-            serde_json::json!("home"),
-        );
-        raw.insert(
-            "tui.altScreen.bottom".to_string(),
-            serde_json::json!("end"),
-        );
+        raw.insert("tui.altScreen.top".to_string(), serde_json::json!("home"));
+        raw.insert("tui.altScreen.bottom".to_string(), serde_json::json!("end"));
         let (migrated, was_migrated) = migrate_keybindings_config(&raw);
         assert!(!was_migrated);
         assert_eq!(

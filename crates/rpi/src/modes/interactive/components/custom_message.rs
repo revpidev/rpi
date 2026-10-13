@@ -123,7 +123,7 @@ impl CustomMessageComponent {
             let theme = Arc::clone(&self.theme);
             Box::new(move |t: &str| theme.bg("customMessageBg", t))
         };
-        let mut box_component = TuiBox::new(1, 1, Some(bg));
+        let mut box_component = TuiBox::new(self.output_pad, 1, Some(bg));
 
         // Default rendering: label + content.
         let label = self.theme.fg(
@@ -179,6 +179,11 @@ impl Component for CustomMessageComponent {
         // `setToolsExpanded` chat walk (upstream `isExpandable` duck-typing);
         // inherent methods win on concrete receivers, so no recursion.
         self.set_expanded(expanded);
+    }
+
+    fn set_output_pad(&mut self, output_pad: usize) {
+        // `"setOutputPad" in child` walk equivalent (#10557); no recursion.
+        self.set_output_pad(output_pad);
     }
 }
 
