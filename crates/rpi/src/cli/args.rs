@@ -246,20 +246,36 @@ pub fn parse_args(args: &[String]) -> Args {
             result.session_dir = Some(args[i].clone());
         } else if arg == "--models" && i + 1 < args.len() {
             i += 1;
-            result.models = Some(args[i].split(',').map(|s| s.trim().to_owned()).collect());
+            // #10334 (`9b3c19da5`): empty entries (trailing or repeated
+            // commas) are ignored.
+            result.models = Some(
+                args[i]
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|pattern| !pattern.is_empty())
+                    .collect(),
+            );
         } else if arg == "--no-tools" || arg == "-nt" {
             result.no_tools = true;
         } else if arg == "--no-builtin-tools" || arg == "-nbt" {
             result.no_builtin_tools = true;
         } else if (arg == "--tools" || arg == "-t") && i + 1 < args.len() {
             i += 1;
-            result.tools = Some(
-                args[i]
-                    .split(',')
-                    .map(|s| s.trim().to_owned())
-                    .filter(|name| !name.is_empty())
-                    .collect(),
-            );
+            let tools: Vec<String> = args[i]
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|name| !name.is_empty())
+                .collect();
+            // `getToolListError` (args.ts:143-158 @ 04b97ef00): a list is
+            // either an allowlist of plain names/patterns or only
+            // `+name`/`-name` modifiers with exact names. An invalid list
+            // reports the diagnostic and leaves `tools` unset.
+            match crate::core::tool_names::get_tool_list_error(&tools) {
+                Some(error) => result
+                    .diagnostics
+                    .push(Diagnostic::error(format!("{arg}: {error}"))),
+                None => result.tools = Some(tools),
+            }
         } else if (arg == "--exclude-tools" || arg == "-xt") && i + 1 < args.len() {
             i += 1;
             result.exclude_tools = Some(
@@ -300,6 +316,11 @@ pub fn parse_args(args: &[String]) -> Args {
                 .push(args[i].clone());
         } else if arg == "--no-extensions" || arg == "-ne" {
             result.no_extensions = true;
+        } else if arg == "--no-mcp" {
+            // `--no-mcp` (args.ts:184-185 @ 04b97ef00): disable the built-in
+            // MCP support for one run (consumed by
+            // `crate::extensions::without_disabled_builtins`).
+            result.no_mcp = true;
         } else if arg == "--skill" && i + 1 < args.len() {
             i += 1;
             result
@@ -544,13 +565,14 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
   --no-tools, -nt                Disable all tools by default (built-in and extension)
   --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
-  --tools, -t <tools>            Comma-separated allowlist of tool names to enable
-                                 Applies to built-in, extension, and custom tools
-  --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
-                                 Applies to built-in, extension, and custom tools
+  --tools, -t <tools>            Comma-separated allowlist of tool names or patterns (*) to enable
+                                 Keeps MCP tools unless an entry starts with mcp__
+  --exclude-tools, -xt <tools>   Comma-separated denylist of tool names or patterns (*) to disable
+                                 Applies to all tools, MCP tools included
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
+  --no-mcp                       Disable built-in MCP support: no servers connect and no MCP tools
   --skill <path>                 Load a skill file or directory (can be used multiple times)
   --no-skills, -ns               Disable skills discovery and loading
   --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
@@ -623,6 +645,9 @@ Extensions can register additional flags (e.g., --plan from plan-mode extension)
 
   # Read-only mode (no file modifications possible)
   {APP_NAME} --tools read,grep,find,ls -p "Review the code in src/"
+
+  # Codemode with only the tools of one MCP server
+  {APP_NAME} --tools read,bash,codemode,'mcp__radius__*'
 
   # Disable one tool while keeping the rest available
   {APP_NAME} --exclude-tools ask_question
@@ -1118,6 +1143,19 @@ mod tests {
         );
     }
 
+    /// Issue #10334 (`9b3c19da5`): empty entries are ignored.
+    #[test]
+    fn test_ignores_empty_models_entries() {
+        let result = args(&["--models", "gpt-4o, ,claude-sonnet,"]);
+        assert_eq!(
+            result.models,
+            Some(vec!["gpt-4o".to_owned(), "claude-sonnet".to_owned()])
+        );
+        // Consecutive commas and a whitespace-only payload.
+        let result = args(&["--models", ",,"]);
+        assert_eq!(result.models, Some(Vec::new()));
+    }
+
     // --name flag
 
     #[test]
@@ -1170,6 +1208,91 @@ mod tests {
     #[test]
     fn test_parses_no_session_flag() {
         assert!(args(&["--no-session"]).no_session);
+    }
+
+    // `--no-mcp` (args.ts:184-185 @ 04b97ef00)
+
+    #[test]
+    fn test_parses_no_mcp_flag() {
+        let result = args(&["--no-mcp"]);
+        assert!(result.no_mcp);
+        assert!(result.unknown_flags.is_empty());
+    }
+
+    #[test]
+    fn test_help_contains_no_mcp_and_tool_pattern_lines() {
+        let help = print_help(&[], false);
+        assert!(
+            help.contains(
+                "--no-mcp                       Disable built-in MCP support: no servers connect and no MCP tools"
+            ),
+            "help text must contain the --no-mcp line"
+        );
+        assert!(
+            help.contains(
+                "--tools, -t <tools>            Comma-separated allowlist of tool names or patterns (*) to enable"
+            ),
+            "help text must describe --tools patterns"
+        );
+        assert!(
+            help.contains("Keeps MCP tools unless an entry starts with mcp__"),
+            "help text must describe the MCP retention rule"
+        );
+    }
+
+    // `--tools`/`--exclude-tools` patterns and modifiers
+    // (args.test.ts:458-490 @ 04b97ef00)
+
+    #[test]
+    fn test_parses_tool_modifiers() {
+        let result = args(&["-t", "+codemode,-write"]);
+        assert_eq!(
+            result.tools,
+            Some(vec!["+codemode".to_owned(), "-write".to_owned()])
+        );
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_rejects_tool_names_mixed_with_modifiers() {
+        let result = args(&["--tools", "read,+codemode"]);
+        assert_eq!(result.tools, None);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error(
+                "--tools: tool names cannot be mixed with +name or -name entries"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_rejects_patterns_in_tool_modifiers() {
+        let result = args(&["-t", "+mcp__radius__*"]);
+        assert_eq!(result.tools, None);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error(
+                "-t: +name and -name entries take exact tool names, not patterns: +mcp__radius__*"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_parses_tool_patterns_and_empty_entries() {
+        let result = args(&["--tools", "read, ,mcp__radius__*"]);
+        assert_eq!(
+            result.tools,
+            Some(vec!["read".to_owned(), "mcp__radius__*".to_owned()])
+        );
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_parses_exclude_tool_patterns() {
+        assert_eq!(
+            args(&["--exclude-tools", "mcp__*,"]).exclude_tools,
+            Some(vec!["mcp__*".to_owned()])
+        );
     }
 
     // --extension flag

@@ -708,6 +708,7 @@ async fn constructor_restores_transcript_declared_tools_without_initial_set() {
         model_runtime,
         initial_active_tool_names: None,
         uses_default_tools: false,
+        default_tool_modifiers: Vec::new(),
         allowed_tool_names: None,
         excluded_tool_names: None,
         extension_runner_ref: rpi::core::extensions::new_extension_runner_ref(Arc::new(
@@ -2597,6 +2598,7 @@ async fn agent_settled_handlers_defer_requested_runs() {
         model_runtime,
         initial_active_tool_names: None,
         uses_default_tools: false,
+        default_tool_modifiers: Vec::new(),
         allowed_tool_names: None,
         excluded_tool_names: None,
         extension_runner_ref: runner_ref,
@@ -2719,11 +2721,14 @@ async fn reload_activates_tools_newly_added_to_default_tools() {
     );
 }
 
-/// `--tools` is a strict, literal allowlist: no `+/-` modifier parsing, and
-/// it overrides `defaultTools` including across reload
-/// (args.ts:143-151, sdk.ts:246-252, docs/settings.md:56).
+/// `--tools` `+name`/`-name` entries adjust the `defaultTools` selection
+/// instead of replacing it (v1.1.0 `04b97ef00`; sdk.ts:281-294). A plain
+/// list stays a literal allowlist and overrides `defaultTools` including
+/// across reload; `--no-tools`/`--no-builtin-tools` still win.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tools_cli_flag_is_literal_and_overrides_default_tools() {
+async fn tools_cli_modifiers_adjust_default_tools_selection() {
+    // A list of only modifiers changes the setting's selection. The resolved
+    // `defaultTools` list keeps its order; `+read` appends the new tool.
     let fixture = session_fixture_cli(
         Vec::new(),
         FauxProviderOptions::default(),
@@ -2732,14 +2737,43 @@ async fn tools_cli_flag_is_literal_and_overrides_default_tools() {
         None,
     )
     .await;
-    // `+read` is a literal (unknown) tool name: `read` is not activated.
-    assert!(sorted_active(&fixture.session).is_empty());
-    assert!(!sorted_active(&fixture.session).contains(&"read".to_string()));
+    assert_eq!(
+        sorted_active(&fixture.session),
+        vec!["bash".to_string(), "edit".to_string(), "read".to_string()]
+    );
 
-    // The setting still cannot override the CLI allowlist on reload.
+    // `-name` removes a tool from the setting's selection.
+    let fixture = session_fixture_cli(
+        Vec::new(),
+        FauxProviderOptions::default(),
+        Some(r#"{"defaultTools": ["bash", "edit"]}"#),
+        Some(vec!["-edit".to_string()]),
+        None,
+    )
+    .await;
+    assert_eq!(
+        sorted_active(&fixture.session),
+        vec!["bash".to_string()]
+    );
+
+    // A plain list replaces the setting (and cannot be overridden by a later
+    // reload of the setting).
+    let fixture = session_fixture_cli(
+        Vec::new(),
+        FauxProviderOptions::default(),
+        Some(r#"{"defaultTools": ["bash", "edit"]}"#),
+        Some(vec!["read".to_string()]),
+        None,
+    )
+    .await;
+    assert_eq!(sorted_active(&fixture.session), vec!["read".to_string()]);
     write_default_tools(&fixture, &["read", "bash"]);
     fixture.session.reload().await;
-    assert!(!sorted_active(&fixture.session).contains(&"read".to_string()));
+    assert_eq!(
+        sorted_active(&fixture.session),
+        vec!["read".to_string()],
+        "a plain allowlist stays in charge across reload"
+    );
 
     // `--no-tools` wins over the setting too.
     let fixture = session_fixture_cli(

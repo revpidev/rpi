@@ -39,6 +39,7 @@ pub mod slash_commands;
 pub mod system_prompt;
 pub mod telemetry;
 pub mod themes;
+pub mod tool_names;
 pub mod trust_manager;
 pub mod usage_providers;
 pub mod usage_totals;

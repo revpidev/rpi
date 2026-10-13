@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::core::environment;
+use crate::core::tool_names::is_tool_modifier_value;
 use crate::error::RpiError;
 use crate::tools::path_utils::{normalize_path, resolve_path};
 
@@ -541,9 +542,7 @@ pub const DEFAULT_TOOL_NAMES: [&str; 4] = ["read", "bash", "edit", "write"];
 /// `isToolModifier` (settings-manager.ts:217-219): a `+name`/`-name` entry
 /// that modifies the inherited selection instead of replacing it.
 fn is_tool_modifier(entry: &Value) -> bool {
-    entry
-        .as_str()
-        .is_some_and(|entry| entry.starts_with('+') || entry.starts_with('-'))
+    is_tool_modifier_value(entry)
 }
 
 /// `mergeDefaultTools` (settings-manager.ts:225-231): a list of only

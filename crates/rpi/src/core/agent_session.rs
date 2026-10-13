@@ -211,9 +211,16 @@ pub struct AgentSessionConfig {
     /// removed from it stay active (agent-session.ts:264-268, V16-13
     /// FR-C R3).
     pub uses_default_tools: bool,
-    /// Optional allowlist of tool names.
+    /// `defaultToolModifiers` (agent-session.ts:266-278 @ 04b97ef00): the
+    /// `+name`/`-name` entries of a `--tools` list, re-applied to the
+    /// `defaultTools` setting on reload.
+    pub default_tool_modifiers: Vec<String>,
+    /// Optional allowlist of tool names or patterns (`*` matches any
+    /// characters). A non-empty list without `mcp__` entries also keeps MCP
+    /// tools registered for codemode and tool_search; only `tool_search` can
+    /// declare them (agent-session.ts:266-278 @ 04b97ef00).
     pub allowed_tool_names: Option<Vec<String>>,
-    /// Optional denylist of tool names.
+    /// Optional denylist of tool names or patterns.
     pub excluded_tool_names: Option<Vec<String>>,
     /// Runner slot shared with the Agent's stream hooks.
     pub extension_runner_ref: ExtensionRunnerRef,
@@ -551,8 +558,18 @@ struct AgentSessionInner {
     session_env_cell: Arc<std::sync::RwLock<crate::tools::SessionEnv>>,
     /// `_usesDefaultTools` (agent-session.ts:432, V16-13 FR-C R3).
     uses_default_tools: bool,
-    allowed_tool_names: Option<HashSet<String>>,
-    excluded_tool_names: Option<HashSet<String>>,
+    /// `_defaultToolModifiers` (agent-session.ts:433 @ 04b97ef00).
+    default_tool_modifiers: Vec<String>,
+    /// `_allowedTools` (agent-session.ts:436-441 @ 04b97ef00): matches the
+    /// `--tools` entries — tool names or patterns.
+    allowed_tool_names: Option<crate::core::tool_names::ToolNameMatcher>,
+    /// `_allowlistFiltersMcp` (agent-session.ts:441-445 @ 04b97ef00):
+    /// whether the allowlist filters MCP tools — it is empty (`--no-tools`)
+    /// or names an MCP tool (`mcp__*`). Otherwise it keeps MCP tools
+    /// registered for codemode and tool search.
+    allowlist_filters_mcp: bool,
+    /// `_excludedTools` (agent-session.ts:447 @ 04b97ef00).
+    excluded_tool_names: Option<crate::core::tool_names::ToolNameMatcher>,
     extension_mode: Mutex<ExtensionMode>,
     /// V16-05 FR-B: session-scoped permission mode (`Default`/`Plan`) —
     /// the single authority behind the `app.mode.cycle` keybinding, the
@@ -975,12 +992,16 @@ impl AgentSession {
                 reasoning_level: None,
             })),
             uses_default_tools: config.uses_default_tools,
+            default_tool_modifiers: config.default_tool_modifiers.clone(),
+            allowlist_filters_mcp: config.allowed_tool_names.as_ref().is_some_and(|names| {
+                names.is_empty() || names.iter().any(|entry| entry.starts_with("mcp__"))
+            }),
             allowed_tool_names: config
                 .allowed_tool_names
-                .map(|names| names.into_iter().collect()),
+                .map(|names| crate::core::tool_names::ToolNameMatcher::new(&names)),
             excluded_tool_names: config
                 .excluded_tool_names
-                .map(|names| names.into_iter().collect()),
+                .map(|names| crate::core::tool_names::ToolNameMatcher::new(&names)),
             extension_mode: Mutex::new(ExtensionMode::Print),
             permission_mode: Mutex::new(PermissionMode::Default),
             usage_registry: OnceLock::new(),
@@ -2643,16 +2664,54 @@ impl AgentSession {
     // Tool registry & system prompt
     // ==================================================================
 
+    /// `_isAllowedTool` (agent-session.ts:1517-1526 @ 04b97ef00): whether
+    /// `--tools` and `--exclude-tools` keep the tool registered. MCP tools
+    /// stay registered unless the allowlist filters them (see
+    /// `allowlist_filters_mcp`).
     fn is_allowed_tool(&self, name: &str) -> bool {
-        self.inner
+        if self
+            .inner
+            .excluded_tool_names
+            .as_ref()
+            .is_some_and(|excluded| excluded.matches(name))
+        {
+            return false;
+        }
+        if self
+            .inner
             .allowed_tool_names
             .as_ref()
-            .is_none_or(|allowed| allowed.contains(name))
-            && !self
-                .inner
-                .excluded_tool_names
-                .as_ref()
-                .is_some_and(|excluded| excluded.contains(name))
+            .is_none_or(|allowed| allowed.matches(name))
+        {
+            return true;
+        }
+        !self.inner.allowlist_filters_mcp && crate::core::tool_names::is_mcp_tool_name(name)
+    }
+
+    /// `_isActivatable` (agent-session.ts:1533-1545 @ 04b97ef00): whether
+    /// the tool may be active, which declares it to the model. MCP tools the
+    /// allowlist keeps without matching them are only for codemode and
+    /// tool search: they may be declared only when `tool_search` can load
+    /// them (non-`direct` exposure and `tool_search` registered). This also
+    /// applies to tools restored from the transcript or set by extensions.
+    /// Takes the already-locked definition/registry guards to stay
+    /// re-entrant with `apply_tool_loadout`.
+    fn is_activatable(
+        definitions: &OrderedMap<ToolDefinitionEntry>,
+        registry: &OrderedMap<Arc<dyn AgentTool>>,
+        allowed: Option<&crate::core::tool_names::ToolNameMatcher>,
+        name: &str,
+    ) -> bool {
+        if allowed.is_none_or(|allowed| allowed.matches(name))
+            || !crate::core::tool_names::is_mcp_tool_name(name)
+        {
+            return true;
+        }
+        let exposure = definitions
+            .get(name)
+            .map(|entry| entry.exposure)
+            .unwrap_or(ext::ToolExposure::Direct);
+        exposure != ext::ToolExposure::Direct && registry.contains_key("tool_search")
     }
 
     /// `_buildRuntime` tool half (agent-session.ts:2547-2599 →
@@ -2885,11 +2944,12 @@ impl AgentSession {
             .into_iter()
             .filter(|name| self.is_allowed_tool(name))
             .collect();
-        if self.inner.allowed_tool_names.is_some() {
-            // Naming a tool activates it even when it is not active by
-            // default (agent-session.ts:3525-3529).
+        if let Some(allowed) = self.inner.allowed_tool_names.as_ref() {
+            // Naming or matching a tool activates it even when it is not
+            // active by default. MCP tools kept registered without being
+            // named stay inactive (agent-session.ts:3556-3563).
             for name in &registry_names {
-                if self.is_allowed_tool(name) && Self::is_declarable(&definitions_snapshot, name) {
+                if allowed.matches(name) && Self::is_declarable(&definitions_snapshot, name) {
                     next_active.push(name.clone());
                 }
             }
@@ -3222,6 +3282,17 @@ impl AgentSession {
                 };
                 // `hidden` tools are unreachable even when named.
                 if entry.exposure == ext::ToolExposure::Hidden {
+                    continue;
+                }
+                // `_isActivatable` (agent-session.ts:1533-1545): MCP tools
+                // the allowlist keeps without matching them may be declared
+                // only when tool_search can load them.
+                if !Self::is_activatable(
+                    &definitions,
+                    &registry,
+                    self.inner.allowed_tool_names.as_ref(),
+                    &name,
+                ) {
                     continue;
                 }
                 if let Some(tool) = registry.get(&name) {
@@ -6165,26 +6236,26 @@ impl AgentSession {
                 )
                 .await;
         }
-        // `previousDefaultTools` (agent-session.ts:3616-3618): snapshot the
-        // resolved selection BEFORE the settings reload, so a tool newly
-        // added by the setting can be activated below.
-        let default_tool_names = || -> Vec<String> {
-            crate::core::settings_manager::DEFAULT_TOOL_NAMES
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect()
+        // `getDefaultTools` (agent-session.ts:3614-3619 @ 04b97ef00): the
+        // resolved `defaultTools` value with the `--tools` `+name`/`-name`
+        // modifiers applied; empty when the setting is not in charge.
+        let get_default_tools = || -> Vec<String> {
+            if !self.inner.uses_default_tools {
+                return Vec::new();
+            }
+            let configured = {
+                let loader = lock(&self.inner.resource_loader);
+                loader.settings_manager().get_default_tools()
+            };
+            let base = configured.unwrap_or_else(|| {
+                crate::core::settings_manager::DEFAULT_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            });
+            crate::core::tool_names::apply_tool_modifiers(&base, &self.inner.default_tool_modifiers)
         };
-        let previous_default_tools: HashSet<String> = if self.inner.uses_default_tools {
-            let loader = lock(&self.inner.resource_loader);
-            loader
-                .settings_manager()
-                .get_default_tools()
-                .unwrap_or_else(default_tool_names)
-                .into_iter()
-                .collect()
-        } else {
-            HashSet::new()
-        };
+        let previous_default_tools: HashSet<String> = get_default_tools().into_iter().collect();
         {
             let mut loader = lock(&self.inner.resource_loader);
             loader.settings_manager_mut().reload();
@@ -6210,18 +6281,10 @@ impl AgentSession {
         // added to `defaultTools` are activated; removed ones stay active,
         // and tools disabled during the session stay disabled unless the
         // setting newly adds them.
-        let added_default_tools: Vec<String> = if self.inner.uses_default_tools {
-            let loader = lock(&self.inner.resource_loader);
-            loader
-                .settings_manager()
-                .get_default_tools()
-                .unwrap_or_else(default_tool_names)
-                .into_iter()
-                .filter(|name| !previous_default_tools.contains(name))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let added_default_tools: Vec<String> = get_default_tools()
+            .into_iter()
+            .filter(|name| !previous_default_tools.contains(name))
+            .collect();
         // `_buildRuntime({activeToolNames, includeAllExtensionTools: true})`
         // (agent-session.ts:2610-2615, :3630-3634).
         let mut active_tool_names = self.get_active_tool_names();

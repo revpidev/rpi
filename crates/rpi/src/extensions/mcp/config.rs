@@ -14,6 +14,8 @@ use rpi_ext_host::types::ToolExposure;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::core::tool_names::tool_pattern_matches;
+
 /// `.rpi` project directory name.
 pub const CONFIG_DIR_NAME: &str = crate::config::CONFIG_DIR_NAME;
 
@@ -262,28 +264,6 @@ pub struct LoadedMcpConfig {
 /// `mcpNamespace` (mcp-servers.ts): `mcp__<server>` with `-` → `_`.
 pub fn mcp_namespace(server: &str) -> String {
     format!("mcp__{}", server.replace('-', "_"))
-}
-
-/// `toolPatternRegExp` (mcp-servers.ts): `*` matches any characters,
-/// everything else is literal.
-fn tool_pattern_matches(pattern: &str, value: &str) -> bool {
-    let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return pattern == value;
-    };
-    if !value.starts_with(first) {
-        return false;
-    }
-    let mut rest = &value[first.len()..];
-    let mut last = first;
-    for part in parts {
-        last = part;
-        match rest.find(part) {
-            Some(index) => rest = &rest[index + part.len()..],
-            None => return false,
-        }
-    }
-    value.ends_with(last)
 }
 
 /// `getMcpToolExposure` (mcp-servers.ts): an exact `toolExposure` key

@@ -357,12 +357,17 @@ pub async fn create_agent_session(
         }
     };
 
-    // Tool set (sdk.ts:245-263 @ 4d9aa837c + 541045ae0):
-    // `tools` (strict allowlist) > `noTools` (all/builtin → none) >
-    // `defaultTools` setting (already merged/resolved by the settings
-    // manager, V16-13 FR-C) > built-in defaults; `excludeTools` filters the
-    // result last. Extension tools such as `codemode`/`tool_search` are
-    // nameable here (R3.10.3).
+    // Tool set (sdk.ts:281-294 @ 04b97ef00 + 541045ae0):
+    // `tools` is either a strict allowlist of names/patterns or a list of
+    // only `+name`/`-name` modifiers that adjusts the `defaultTools`
+    // selection; `noTools` (all/builtin → none); `excludeTools` matches
+    // names and patterns and filters the result last. Extension tools such
+    // as `codemode`/`tool_search` are nameable here (R3.10.3).
+    if let Some(tools) = &options.tools
+        && let Some(error) = crate::core::tool_names::get_tool_list_error(tools)
+    {
+        return Err(RpiError::Settings(format!("Invalid tools option: {error}")));
+    }
     let default_active_tool_names: Vec<String> = crate::core::settings_manager::DEFAULT_TOOL_NAMES
         .iter()
         .map(|name| (*name).to_owned())
@@ -371,25 +376,59 @@ pub async fn create_agent_session(
         let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
         loader.settings_manager().get_default_tools()
     };
-    let excluded: Vec<String> = options.exclude_tools.clone().unwrap_or_default();
-    let uses_default_tools = options.tools.is_none() && options.no_tools.is_none();
-    let initial_active_tool_names: Vec<String> = match &options.tools {
-        Some(tools) => tools.clone(),
-        None => match options.no_tools {
-            Some(NoTools::All) | Some(NoTools::Builtin) => Vec::new(),
-            None => {
-                configured_default_tool_names.unwrap_or_else(|| default_active_tool_names.clone())
+    // `defaultToolNames` (sdk.ts:284): `noTools` (all or builtin) means no
+    // default selection.
+    let default_tool_names: Vec<String> = match options.no_tools {
+        Some(_) => Vec::new(),
+        None => configured_default_tool_names.unwrap_or_else(|| default_active_tool_names.clone()),
+    };
+    // `toolModifiers` (sdk.ts:285-288): a `tools` list of only
+    // `+name`/`-name` entries changes the default selection instead of
+    // replacing it.
+    let tool_modifiers: Option<Vec<String>> = options
+        .tools
+        .as_ref()
+        .filter(|tools| tools.iter().any(|entry| crate::core::tool_names::is_tool_modifier(entry)))
+        .cloned();
+    let selected_tool_names: Option<Vec<String>> = match &tool_modifiers {
+        Some(modifiers) => Some(crate::core::tool_names::apply_tool_modifiers(
+            &default_tool_names,
+            modifiers,
+        )),
+        None => options.tools.clone(),
+    };
+    let allowed_tool_names: Option<Vec<String>> = match &tool_modifiers {
+        Some(_) => {
+            if matches!(options.no_tools, Some(NoTools::All)) {
+                selected_tool_names.clone()
+            } else {
+                None
             }
-        },
-    }
-    .into_iter()
-    .filter(|name| !excluded.contains(name))
-    .collect();
-    let allowed_tool_names: Option<Vec<String>> =
-        options.tools.clone().or(match options.no_tools {
-            Some(NoTools::All) => Some(Vec::new()),
-            _ => None,
-        });
+        }
+        None => options
+            .tools
+            .clone()
+            .or(match options.no_tools {
+                Some(NoTools::All) => Some(Vec::new()),
+                _ => None,
+            }),
+    };
+    let excluded_matcher = options
+        .exclude_tools
+        .as_ref()
+        .map(|names| crate::core::tool_names::ToolNameMatcher::new(names));
+    let initial_active_tool_names: Vec<String> = selected_tool_names
+        .clone()
+        .unwrap_or_else(|| default_tool_names.clone())
+        .into_iter()
+        .filter(|name| {
+            !excluded_matcher
+                .as_ref()
+                .is_some_and(|matcher| matcher.matches(name))
+        })
+        .collect();
+    let uses_default_tools = (options.tools.is_none() || tool_modifiers.is_some())
+        && options.no_tools.is_none();
 
     // convertToLlm with the blockImages filter (sdk.ts:256-290).
     let convert_to_llm = {
@@ -822,6 +861,7 @@ pub async fn create_agent_session(
         model_runtime,
         initial_active_tool_names: Some(initial_active_tool_names),
         uses_default_tools,
+        default_tool_modifiers: tool_modifiers.unwrap_or_default(),
         allowed_tool_names,
         excluded_tool_names: options.exclude_tools,
         extension_runner_ref,
