@@ -83,7 +83,7 @@ use crate::terminal::{InputHandler, ResizeHandler, Terminal};
 use crate::terminal_colors::TerminalColors;
 use crate::terminal_image::{
     ImageProtocol, TerminalCapabilities, delete_all_kitty_images, delete_all_kitty_placements,
-    get_capabilities, is_image_line, set_capabilities,
+    get_capabilities, get_kitty_image_placement_rows, is_image_line, set_capabilities,
 };
 use crate::tui::{
     CURSOR_MARKER, Component, OverlayAnchor, OverlayBounds, OverlayHandle, OverlayHandleOps,
@@ -4062,10 +4062,34 @@ impl TuiAltScreenInner {
         let full_redraw = self.previous_screen.is_empty()
             || self.previous_screen_width != width
             || self.previous_screen_height != height;
-        let images_need_redraw = screen.iter().enumerate().any(|(row, line)| {
-            let previous = self.previous_screen.get(row).map_or("", String::as_str);
-            line != previous && (is_image_line(line) || is_image_line(previous))
+        // `changedRows` (tui-alt-screen.ts:1697 @ 672000c80, #10319): a row is
+        // changed when its rendered line differs from the previous frame.
+        let changed_rows: Vec<bool> = screen
+            .iter()
+            .enumerate()
+            .map(|(row, line)| Some(line) != self.previous_screen.get(row))
+            .collect();
+        let image_anchors_need_redraw = screen.iter().enumerate().any(|(row, line)| {
+            changed_rows.get(row).copied().unwrap_or(false)
+                && (is_image_line(line)
+                    || is_image_line(self.previous_screen.get(row).map_or("", String::as_str)))
         });
+        // WezTerm erases intersecting Kitty image cells when a later write
+        // touches a covered row; redraw even when no image anchor itself
+        // changed (`imageCellsNeedRedraw`, tui-alt-screen.ts:1699-1712).
+        let is_wezterm = is_wezterm_env();
+        let image_cells_need_redraw = !image_anchors_need_redraw
+            && is_wezterm
+            && self.image_protocol == Some(ImageProtocol::Kitty)
+            && changed_rows.iter().any(|changed| *changed)
+            && screen.iter().enumerate().any(|(row, line)| {
+                let Some(placement_rows) = get_kitty_image_placement_rows(line) else {
+                    return false;
+                };
+                (row..row + placement_rows as usize)
+                    .any(|covered_row| changed_rows.get(covered_row).copied().unwrap_or(false))
+            });
+        let images_need_redraw = image_anchors_need_redraw || image_cells_need_redraw;
         let redraw_images = full_redraw || images_need_redraw;
         let had_uploaded_kitty_images = kitty_image_cache_has_entries();
         let prepared = if redraw_images && self.image_protocol == Some(ImageProtocol::Kitty) {
@@ -4098,16 +4122,17 @@ impl TuiAltScreenInner {
             buffer.push_str(&prepared.evicted_image_deletion);
         }
 
-        // WezTerm erases intersecting Kitty image cells when a later EL
-        // clears a covered row (`803f0e906`, #9169). Only separate clearing
-        // from drawing for WezTerm frames that place images; preserve the
-        // existing interleaved output for text-only frames and every other
-        // terminal.
-        let clear_rows_before_kitty_images = redraw_images
+        // WezTerm erases intersecting Kitty image cells when a later row
+        // write touches a covered row (`803f0e906`, #9169). Draw image
+        // placements after every clear and text write so nothing later
+        // intersects them (`drawKittyImagesLast`, tui-alt-screen.ts:1737-1761
+        // @ 672000c80, #10319); preserve the existing interleaved output for
+        // text-only frames and every other terminal.
+        let draw_kitty_images_last = redraw_images
             && self.image_protocol == Some(ImageProtocol::Kitty)
             && screen.iter().any(|line| is_image_line(line))
-            && is_wezterm_env();
-        if clear_rows_before_kitty_images {
+            && is_wezterm;
+        if draw_kitty_images_last {
             for row in 0..height {
                 if !full_redraw
                     && !images_need_redraw
@@ -4117,21 +4142,48 @@ impl TuiAltScreenInner {
                 }
                 buffer.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
             }
-        }
-
-        for row in 0..height {
-            if !full_redraw
-                && !images_need_redraw
-                && screen.get(row) == self.previous_screen.get(row)
-            {
-                continue;
+            for row in 0..height {
+                if !full_redraw
+                    && !images_need_redraw
+                    && screen.get(row) == self.previous_screen.get(row)
+                {
+                    continue;
+                }
+                if out_lines.get(row).is_some_and(|line| is_image_line(line)) {
+                    continue;
+                }
+                buffer.push_str(&format!("\x1b[{};1H", row + 1));
+                if let Some(line) = out_lines.get(row) {
+                    buffer.push_str(line);
+                }
             }
-            buffer.push_str(&format!("\x1b[{};1H", row + 1));
-            if !clear_rows_before_kitty_images {
-                buffer.push_str("\x1b[2K");
+            for row in 0..height {
+                if !full_redraw
+                    && !images_need_redraw
+                    && screen.get(row) == self.previous_screen.get(row)
+                {
+                    continue;
+                }
+                if !out_lines.get(row).is_some_and(|line| is_image_line(line)) {
+                    continue;
+                }
+                buffer.push_str(&format!("\x1b[{};1H", row + 1));
+                if let Some(line) = out_lines.get(row) {
+                    buffer.push_str(line);
+                }
             }
-            if let Some(line) = out_lines.get(row) {
-                buffer.push_str(line);
+        } else {
+            for row in 0..height {
+                if !full_redraw
+                    && !images_need_redraw
+                    && screen.get(row) == self.previous_screen.get(row)
+                {
+                    continue;
+                }
+                buffer.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+                if let Some(line) = out_lines.get(row) {
+                    buffer.push_str(line);
+                }
             }
         }
 
@@ -5338,11 +5390,12 @@ mod tests {
         settle(&tui);
         assert_eq!(trimmed_viewport(&terminal), lines_5_to_12);
 
-        send_input(&terminal, &tui, "\x1bOH");
+        // #10314: the transcript top/bottom keys are Ctrl+Home / Ctrl+End.
+        send_input(&terminal, &tui, "\x1b[1;5H");
         settle(&tui);
         assert_eq!(trimmed_viewport(&terminal), lines_1_to_8);
 
-        send_input(&terminal, &tui, "\x1bOF");
+        send_input(&terminal, &tui, "\x1b[1;5F");
         settle(&tui);
         assert_eq!(trimmed_viewport(&terminal), lines_5_to_12);
 
@@ -6750,6 +6803,80 @@ mod tests {
             other_output[first_content..].contains("\x1b[2K"),
             "non-WezTerm frames keep interleaved clears: {other_output:?}"
         );
+    }
+
+    // tui-alt-screen.test.ts: "redraws WezTerm Kitty images after writes to
+    // covered rows" (#10319, 672000c80): a scrollbar update below an
+    // unchanged image anchor must redraw the image.
+    #[test]
+    fn redraws_wezterm_kitty_images_after_writes_to_covered_rows() {
+        let _caps = CapsGuard::kitty();
+        let _wezterm_pane = EnvGuard::set("WEZTERM_PANE", Some("1"));
+        let _term_program = EnvGuard::set("TERM_PROGRAM", None);
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let image_id = 10319u32;
+        let image_line = encode_kitty(
+            "AAAA",
+            &KittyEncodeOptions {
+                columns: Some(2),
+                rows: Some(3),
+                image_id: Some(image_id),
+                move_cursor: Some(false),
+            },
+        );
+        register_kitty_image_metadata(KittyImageMetadata {
+            image_id,
+            columns: 2,
+            rows: 3,
+            width_px: 100.0,
+            height_px: 100.0,
+        });
+        let (root, root_lines) = test_text(&[
+            image_line.clone(),
+            String::new(),
+            String::new(),
+            "after".to_string(),
+        ]);
+        tui.set_layout_root(Some(root));
+        tui.start();
+        settle(&tui);
+        let event_count = terminal.events().len();
+
+        // A write to a row COVERED by the image placement (row 0 covers rows
+        // 0..3) while the anchor line itself is unchanged: only the
+        // covered-row scan can trigger the redraw.
+        set_lines(
+            &root_lines,
+            &[
+                image_line,
+                "changed".to_string(),
+                String::new(),
+                "after".to_string(),
+            ],
+        );
+        tui.request_render(false);
+        settle(&tui);
+        let redraw_writes: String = terminal.events()[event_count..]
+            .iter()
+            .filter_map(|event| match event {
+                VtEvent::Write(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(redraw_writes.contains("\x1b_Ga=d,d=a,q=2\x1b\\"));
+        let placement_index = redraw_writes
+            .find("\x1b_Ga=p,q=2")
+            .unwrap_or_else(|| panic!("placement-only redraw expected: {redraw_writes:?}"));
+        let changed_index = redraw_writes
+            .find("changed")
+            .unwrap_or_else(|| unreachable!("changed row expected"));
+        assert!(
+            placement_index > changed_index,
+            "images are drawn last: {redraw_writes:?}"
+        );
+        assert!(!redraw_writes.contains("\x1b_Ga=T"));
+        stop(&tui);
     }
 
     // ---------------------------------------------------------------------
@@ -8673,7 +8800,7 @@ mod tests {
         settle(&tui);
         let row = terminal.get_viewport()[3].clone();
         assert!(
-            row.contains("↓ Jump to latest message · End"),
+            row.contains("↓ Jump to latest message · Ctrl+End"),
             "label with bottom shortcut: {row:?}"
         );
         stop(&tui);

@@ -320,6 +320,18 @@ fn detect_capabilities_inner(
         };
     }
 
+    // Herdr supports OSC 8 but not images (terminal-image.ts:88-95 @
+    // b2363841a, #10573). Checked BEFORE the Kitty branch so leaked
+    // environment variables such as KITTY_WINDOW_ID do not enable images
+    // inside Herdr panes.
+    if term_program == "herdr" {
+        return TerminalCapabilities {
+            images: None,
+            true_color: has_true_color_hint,
+            hyperlinks: true,
+        };
+    }
+
     if env_flag("KITTY_WINDOW_ID") || term_program == "kitty" {
         return TerminalCapabilities {
             images: Some(ImageProtocol::Kitty),
@@ -741,6 +753,14 @@ fn find_kitty_command(line: &str) -> Option<(usize, &str, usize)> {
 /// `getRegisteredKittyImageMetadata` (terminal-image.ts:308-313 @ 4181f66).
 fn get_registered_kitty_image_metadata(line: &str) -> Option<RegisteredKittyImageMetadata> {
     let (_, controls, _) = find_kitty_command(line)?;
+    get_registered_kitty_image_metadata_from_controls(controls)
+}
+
+/// `getRegisteredKittyImageMetadataFromControls` (terminal-image.ts:353-356
+/// @ 672000c80 / #10319): the id lookup without re-extracting the controls.
+fn get_registered_kitty_image_metadata_from_controls(
+    controls: &str,
+) -> Option<RegisteredKittyImageMetadata> {
     // Upstream `/(?:^|,)i=(\d+)(?:,|$)/`: a whole `,`-separated control of
     // ASCII digits after `i=`.
     let image_id = controls
@@ -752,18 +772,38 @@ fn get_registered_kitty_image_metadata(line: &str) -> Option<RegisteredKittyImag
     guard.as_ref()?.map.get(&image_id).copied()
 }
 
+/// `getExplicitKittyImageRows` (terminal-image.ts:362-368 @ 672000c80,
+/// #10319): the explicit `r=` placement control, when positive.
+fn get_explicit_kitty_image_rows(controls: &str) -> Option<u32> {
+    let value = controls
+        .split(',')
+        .filter_map(|control| control.strip_prefix("r="))
+        .find(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|value| value.parse::<u32>().ok());
+    value.filter(|rows| *rows > 0)
+}
+
+/// `getKittyImageRowsFromControls` (terminal-image.ts:370-372 @ 672000c80):
+/// the explicit `r=` wins over the registered metadata rows.
+fn get_kitty_image_rows_from_controls(controls: &str, fallback_rows: u32) -> u32 {
+    get_explicit_kitty_image_rows(controls).unwrap_or(fallback_rows)
+}
+
 /// `getKittyImageMetadata` (terminal-image.ts:315-325 @ 4181f66).
 pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
     get_registered_kitty_image_metadata(line).map(|registered| registered.metadata)
 }
 
-/// `KittyImagePlacement` (terminal-image.ts:286-293 @ 4181f66).
+/// `KittyImagePlacement` (terminal-image.ts:286-293 @ 4181f66, `rows` since
+/// 672000c80 / #10319).
 #[derive(Debug, Clone, PartialEq)]
 pub struct KittyImagePlacement {
     pub image_id: u32,
     pub transmission_generation: u64,
     pub transmission_bytes: usize,
     pub estimated_decoded_bytes: f64,
+    /// Rows the placement covers (explicit `r=` or the registered metadata).
+    pub rows: u32,
     pub sequence: String,
     pub replacement_line: String,
 }
@@ -779,11 +819,23 @@ fn controls_have_m_1(controls: &str) -> bool {
     controls.split(',').any(|control| control == "m=1")
 }
 
+/// Read the number of rows covered by an image placement without scanning
+/// its payload (`getKittyImagePlacementRows`, terminal-image.ts:406-413 @
+/// 672000c80, #10319).
+pub fn get_kitty_image_placement_rows(line: &str) -> Option<u32> {
+    let (_, controls, _) = find_kitty_command(line)?;
+    if let Some(explicit_rows) = get_explicit_kitty_image_rows(controls) {
+        return Some(explicit_rows);
+    }
+    get_registered_kitty_image_metadata_from_controls(controls)
+        .map(|metadata| metadata.metadata.rows)
+}
+
 /// Build a placement-only command for an image line emitted by `render_image`
 /// (`getKittyImagePlacement`, terminal-image.ts:348-380 @ 4181f66).
 pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
     let (match_index, controls, _) = find_kitty_command(line)?;
-    let metadata = get_registered_kitty_image_metadata(line)?;
+    let metadata = get_registered_kitty_image_metadata_from_controls(controls)?;
 
     // Skip `m=1` continuation chunks up to the final one
     // (terminal-image.ts:353-366). Payload bytes are base64, so the first ST
@@ -828,6 +880,7 @@ pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
         transmission_generation: metadata.transmission_generation,
         transmission_bytes: transmission_end - match_index,
         estimated_decoded_bytes: metadata.metadata.width_px * metadata.metadata.height_px * 4.0,
+        rows: get_kitty_image_rows_from_controls(controls, metadata.metadata.rows),
         sequence,
         replacement_line,
     })
@@ -1592,6 +1645,36 @@ mod tests {
             let caps = detect_capabilities();
             assert!(caps.hyperlinks);
         });
+    }
+
+    // terminal-image.test.ts: "enables hyperlinks without images for Herdr"
+    // (#10573, b2363841a).
+    #[test]
+    fn test_detect_capabilities_enables_hyperlinks_without_images_for_herdr() {
+        with_env(
+            &[
+                ("TERM_PROGRAM", Some("herdr")),
+                // A leaked Kitty variable must not turn images on inside a
+                // Herdr pane (the branch is checked before the Kitty one).
+                ("KITTY_WINDOW_ID", Some("1")),
+            ],
+            || {
+                let caps = detect_capabilities();
+                assert_eq!(caps.images, None);
+                assert!(caps.hyperlinks);
+            },
+        );
+        // RPI_HYPERLINKS=0 still disables hyperlinks (the override layer).
+        with_env(
+            &[
+                ("TERM_PROGRAM", Some("herdr")),
+                ("RPI_HYPERLINKS", Some("0")),
+            ],
+            || {
+                let caps = detect_capabilities();
+                assert!(!caps.hyperlinks);
+            },
+        );
     }
 
     #[test]
@@ -2794,6 +2877,41 @@ mod tests {
         assert_eq!(
             placement.transmission_bytes,
             format!("\x1b_Gi={id};QUJD\x1b\\").len()
+        );
+        // No `r=` control: the registered metadata rows win.
+        assert_eq!(placement.rows, 34);
+    }
+
+    // terminal-image.test.ts: "reads explicit placement rows without
+    // registered metadata" (#10319, 672000c80).
+    #[test]
+    fn test_get_kitty_image_placement_rows_reads_explicit_rows_without_metadata() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let sequence = encode_kitty(
+            "AAAA",
+            &KittyEncodeOptions {
+                columns: Some(2),
+                rows: Some(3),
+                move_cursor: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(get_kitty_image_placement_rows(&sequence), Some(3));
+    }
+
+    #[test]
+    fn test_get_kitty_image_placement_rows_falls_back_to_registered_metadata() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        // No explicit `r=` control.
+        let line = format!("\x1b_Ga=T,f=100,i={id},c=10;QUJD\x1b\\");
+        assert_eq!(get_kitty_image_placement_rows(&line), Some(34));
+        // Unknown line / no metadata / no explicit rows → None.
+        assert_eq!(get_kitty_image_placement_rows("plain text"), None);
+        assert_eq!(
+            get_kitty_image_placement_rows("\x1b_Ga=T,f=100,i=999999;QUJD\x1b\\"),
+            None
         );
     }
 

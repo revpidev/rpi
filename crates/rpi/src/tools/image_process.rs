@@ -220,7 +220,7 @@ fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, image::ImageE
 ///
 /// Returns `None` if the image cannot be decoded or encoded (upstream returns
 /// `null` from Photon failure).
-fn convert_image_bytes_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn convert_image_bytes_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
     let raw_img = image::load_from_memory(bytes).ok()?;
     let img = apply_exif_orientation(raw_img, bytes);
     encode_png(&img).ok()

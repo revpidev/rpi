@@ -10,15 +10,85 @@
 //!   (`RefCell`) because `Component::render` takes `&self`.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use crate::terminal_image::{
     ImageDimensions, ImageProtocol, ImageRenderOptions, allocate_image_id, get_capabilities,
-    get_cell_dimensions, get_image_dimensions, image_fallback, render_image,
+    get_cell_dimensions, get_image_dimensions, get_png_dimensions, image_fallback, render_image,
 };
 use crate::tui::Component;
 
 /// Theme callback (upstream `(str: string) => string`).
 pub type ImageThemeFn = Box<dyn Fn(&str) -> String + Send + Sync>;
+
+/// `ImageTranscoder` (image.ts:26-29 @ a276dabe5, #10292): converts base64
+/// image data to base64 PNG data, or returns `None` if it cannot. Called
+/// synchronously during rendering.
+pub type ImageTranscoder = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
+
+/// `imageTranscoder` (image.ts:31): the registered converter.
+static IMAGE_TRANSCODER: Mutex<Option<ImageTranscoder>> = Mutex::new(None);
+
+/// `pngCache` (image.ts:33): backstop for callers that recreate `Image`
+/// instances. Keyed by source data, least recently used first, capped at 32.
+struct PngCache {
+    map: HashMap<String, Option<String>>,
+    order: VecDeque<String>,
+}
+
+static PNG_CACHE: std::sync::LazyLock<Mutex<PngCache>> = std::sync::LazyLock::new(|| {
+    Mutex::new(PngCache {
+        map: HashMap::new(),
+        order: VecDeque::new(),
+    })
+});
+
+/// Register the converter used for non-PNG images on Kitty-protocol
+/// terminals, which only accept PNG. Without one, such images render as text
+/// fallbacks (`setImageTranscoder`, image.ts:39-42 @ a276dabe5).
+pub fn set_image_transcoder(transcoder: Option<ImageTranscoder>) {
+    *IMAGE_TRANSCODER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = transcoder;
+    let mut cache = PNG_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.map.clear();
+    cache.order.clear();
+}
+
+/// `toPng` (image.ts:44-52): consult the LRU cache, then the transcoder.
+fn to_png(base64_data: &str, mime_type: &str) -> Option<String> {
+    let transcoder = IMAGE_TRANSCODER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()?;
+    let mut cache = PNG_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let png = match cache.map.get(base64_data) {
+        Some(cached) => cached.clone(),
+        None => {
+            let png = transcoder(base64_data, mime_type);
+            cache.map.insert(base64_data.to_owned(), png.clone());
+            cache.order.push_back(base64_data.to_owned());
+            while cache.order.len() > 32 {
+                if let Some(oldest) = cache.order.pop_front() {
+                    cache.map.remove(&oldest);
+                }
+            }
+            png
+        }
+    };
+    // Touch the entry so it survives the next eviction.
+    if let Some(position) = cache.order.iter().position(|key| key == base64_data) {
+        if let Some(key) = cache.order.remove(position) {
+            cache.order.push_back(key);
+        }
+    }
+    png
+}
 
 /// `ImageTheme` (image.ts:12-14).
 pub struct ImageTheme {
@@ -49,6 +119,9 @@ pub struct Image {
     theme: ImageTheme,
     options: ImageOptions,
     image_id: RefCell<Option<u32>>,
+    /// Converted PNG data for Kitty. Failures are not stored so a later
+    /// transcoder can retry (`pngData`, image.ts:31).
+    png_data: RefCell<Option<String>>,
     cache: RefCell<Option<ImageCache>>,
 }
 
@@ -78,6 +151,7 @@ impl Image {
             theme,
             image_id: RefCell::new(options.image_id),
             options,
+            png_data: RefCell::new(None),
             cache: RefCell::new(None),
         }
     }
@@ -113,15 +187,32 @@ impl Component for Image {
         let max_height = self.options.max_height_cells.unwrap_or(default_max_height);
 
         let caps = get_capabilities();
-        let lines: Vec<String> = if let Some(protocol) = caps.images {
+        // Kitty-protocol terminals only accept PNG: convert non-PNG images
+        // through the registered transcoder and prefer the PNG's own
+        // dimensions (conversion may apply EXIF rotation, image.ts:71-78 @
+        // a276dabe5, #10292).
+        let mut data = Some(self.base64_data.clone());
+        let mut dimensions = self.dimensions;
+        if caps.images == Some(ImageProtocol::Kitty) && self.mime_type != "image/png" {
+            if self.png_data.borrow().is_none() {
+                *self.png_data.borrow_mut() = to_png(&self.base64_data, &self.mime_type);
+            }
+            data = self.png_data.borrow().clone();
+            if let Some(png) = &data
+                && let Some(png_dimensions) = get_png_dimensions(png)
+            {
+                dimensions = png_dimensions;
+            }
+        }
+        let lines: Vec<String> = if let (Some(protocol), Some(data)) = (caps.images, data) {
             // `caps.images === "kitty" && this.imageId === undefined` —
             // allocate an id for kitty (image.ts:74-76).
             if protocol == ImageProtocol::Kitty && self.image_id.borrow().is_none() {
                 *self.image_id.borrow_mut() = Some(allocate_image_id());
             }
             let result = render_image(
-                &self.base64_data,
-                self.dimensions,
+                &data,
+                dimensions,
                 &ImageRenderOptions {
                     max_width_cells: Some(max_width as f64),
                     max_height_cells: Some(max_height as f64),
@@ -168,7 +259,7 @@ impl Component for Image {
             } else {
                 let fallback = image_fallback(
                     &self.mime_type,
-                    Some(self.dimensions),
+                    Some(dimensions),
                     self.options.filename.as_deref(),
                 );
                 vec![(self.theme.fallback_color)(&fallback)]
@@ -202,7 +293,10 @@ mod tests {
     //! iTerm2 layout, fallback text, caching).
 
     use super::*;
-    use crate::terminal_image::{TerminalCapabilities, reset_capabilities_cache, set_capabilities};
+    use crate::terminal_image::{
+        CellDimensions, TerminalCapabilities, reset_capabilities_cache, set_capabilities,
+        set_cell_dimensions,
+    };
 
     /// Serializes tests that mutate the global capabilities cache.
     static TEST_CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -395,5 +489,166 @@ mod tests {
         assert!(lines[0].contains("c=10"));
         assert!(lines[0].contains("r=4"));
         assert_eq!(lines.len(), 4);
+    }
+
+    // terminal-image.test.ts `Image transcoding` (#10292, a276dabe5):
+    // Kitty only accepts PNG (f=100); non-PNG images are transcoded.
+    const JPEG: &str = "anBlZw==";
+    /// Minimal PNG header (signature + IHDR) for a 40x10 image.
+    const PNG_40X10: &str = "iVBORw0KGgoAAAANSUhEUgAAACgAAAAK";
+
+    fn counting_transcoder(calls: &Arc<std::sync::Mutex<Vec<String>>>) -> super::ImageTranscoder {
+        let calls = Arc::clone(calls);
+        Arc::new(move |data: &str, _mime_type: &str| {
+            calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(data.to_string());
+            if data == JPEG {
+                Some(PNG_40X10.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn render_with(
+        data: &str,
+        mime_type: &str,
+        dimensions: Option<ImageDimensions>,
+    ) -> Vec<String> {
+        Image::new(
+            data,
+            mime_type,
+            ImageTheme {
+                fallback_color: Box::new(|text: &str| text.to_string()),
+            },
+            None,
+            dimensions,
+        )
+        .render(20)
+    }
+
+    #[test]
+    fn transcodes_non_png_kitty_images_and_sizes_from_the_png() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_capabilities(kitty_caps());
+        set_cell_dimensions(CellDimensions {
+            width_px: 10.0,
+            height_px: 10.0,
+        });
+        set_image_transcoder(Some(counting_transcoder(&Arc::new(std::sync::Mutex::new(
+            Vec::new(),
+        )))));
+        let lines = render_with(
+            JPEG,
+            "image/jpeg",
+            Some(ImageDimensions {
+                width_px: 20.0,
+                height_px: 20.0,
+            }),
+        );
+        set_image_transcoder(None);
+        set_cell_dimensions(CellDimensions::default());
+        reset_capabilities_cache();
+
+        assert!(
+            lines[0].contains("f=100") && lines[0].contains(&format!(";{PNG_40X10}\x1b\\")),
+            "got: {:?}",
+            lines[0]
+        );
+        // 40x10 PNG at 18 columns: 5 rows, not the 18 rows of the 20x20
+        // source dimensions.
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn renders_a_text_fallback_until_a_working_transcoder_is_registered() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_capabilities(kitty_caps());
+        let mut image = Image::new(
+            JPEG,
+            "image/jpeg",
+            ImageTheme {
+                fallback_color: Box::new(|value: &str| value.to_string()),
+            },
+            None,
+            None,
+        );
+        assert!(image.render(80)[0].starts_with("[Image: [image/jpeg]"));
+        set_image_transcoder(Some(Arc::new(|_data: &str, _mime_type: &str| None)));
+        image.invalidate();
+        assert!(image.render(80)[0].starts_with("[Image: [image/jpeg]"));
+        set_image_transcoder(Some(Arc::new(|_data: &str, _mime_type: &str| {
+            Some(PNG_40X10.to_string())
+        })));
+        image.invalidate();
+        let lines = image.render(80);
+        set_image_transcoder(None);
+        reset_capabilities_cache();
+        assert!(lines[0].contains("\x1b_G"), "got: {:?}", lines[0]);
+    }
+
+    #[test]
+    fn converts_each_image_once() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_capabilities(kitty_caps());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        set_image_transcoder(Some(counting_transcoder(&calls)));
+        let mut image = Image::new(
+            JPEG,
+            "image/jpeg",
+            ImageTheme {
+                fallback_color: Box::new(|value: &str| value.to_string()),
+            },
+            None,
+            None,
+        );
+        image.render(80);
+        // New instance hits the shared cache.
+        render_with(JPEG, "image/jpeg", None);
+        for index in 0..40 {
+            render_with(&format!("other-{index}"), "image/jpeg", None);
+        }
+        image.invalidate();
+        image.render(40);
+        set_image_transcoder(None);
+        reset_capabilities_cache();
+        let jpeg_calls = calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|data| data.as_str() == JPEG)
+            .count();
+        assert_eq!(jpeg_calls, 1, "the instance and shared cache convert once");
+    }
+
+    #[test]
+    fn does_not_convert_png_data_or_iterm2_output() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        set_image_transcoder(Some(counting_transcoder(&calls)));
+        set_capabilities(kitty_caps());
+        let png_lines = render_with(PNG_40X10, "image/png", None);
+        assert!(
+            png_lines[0].contains(&format!(";{PNG_40X10}\x1b\\")),
+            "PNG data passes through: {:?}",
+            png_lines[0]
+        );
+        set_capabilities(iterm2_caps());
+        let iterm2_lines = render_with(JPEG, "image/jpeg", None);
+        set_image_transcoder(None);
+        reset_capabilities_cache();
+        assert!(
+            iterm2_lines
+                .last()
+                .is_some_and(|line| line.ends_with(&format!(":{JPEG}\x07"))),
+            "iTerm2 keeps the source data: {:?}",
+            iterm2_lines.last()
+        );
+        assert!(
+            calls.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+            "no conversion for PNG data or iTerm2 output"
+        );
     }
 }

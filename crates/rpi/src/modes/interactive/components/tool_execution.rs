@@ -20,12 +20,13 @@
 //!   `Option<Component>` return instead — `None` falls through to the
 //!   built-in definition, then to the generic fallback (documented T15
 //!   contract).
-//! - `maybeConvertImagesForKitty` converts non-PNG images to PNG
-//!   synchronously (upstream is async via photon/sharp,
-//!   tool-execution.ts:178-199 + utils/image-convert.ts); the rendered
-//!   output is identical, and the EXIF orientation pass of upstream
-//!   `convertImageBytesToPng` is not applied (no EXIF metadata is present in
-//!   typical tool-captured images).
+//! - Kitty image conversion happens inside the `rpi-tui` `Image` component
+//!   through the registered PNG transcoder (`utils/image_convert.rs`,
+//!   upstream `maybeConvertImagesForKitty` + photon,
+//!   tool-execution.ts:178-199 + utils/image-convert.ts): the component keeps
+//!   converted PNG data across updates and reuses `Image` instances whose
+//!   source bytes did not change. Upstream's async conversion has a
+//!   synchronous equivalent because the `image` crate is compiled in.
 //! - `invalidate()` in the render context is replaced by a [`RenderHandle`]:
 //!   upstream `invalidate: () => { this.invalidate(); this.ui.requestRender(); }`
 //!   (tool-execution.ts:118-122) needs `&mut self` access; built-in renderers
@@ -40,7 +41,6 @@
 
 use std::any::Any;
 use std::boxed::Box as StdBox;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -49,9 +49,7 @@ use rpi_tui::components::image::{Image, ImageOptions, ImageTheme};
 use rpi_tui::components::mouse_region::MouseRegion;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
-use rpi_tui::terminal_image::{
-    ImageProtocol, get_capabilities, get_image_dimensions, image_fallback,
-};
+use rpi_tui::terminal_image::{get_capabilities, get_image_dimensions, image_fallback};
 use rpi_tui::tui::{
     Component, Container, RenderHandle, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult,
     TuiMouseEventType, TuiMouseHandlerResult, shared_component_from_boxed,
@@ -282,7 +280,10 @@ pub struct ToolExecutionComponent {
     execution_started: bool,
     args_complete: bool,
     result: Option<ToolResultState>,
-    converted_images: HashMap<usize, ConvertedImage>,
+    /// Inputs of `image_components`, so `update_display` can reuse images
+    /// and keep their converted PNG data (`imageSources`,
+    /// tool-execution.ts:57-58 @ a276dabe5, #10292).
+    image_sources: Vec<ImageSource>,
     hide_component: bool,
     theme: Arc<Theme>,
     /// Last render width (`render` is `&self`; interior mutability keeps the
@@ -331,7 +332,7 @@ impl ToolExecutionComponent {
             execution_started: false,
             args_complete: false,
             result: None,
-            converted_images: HashMap::new(),
+            image_sources: Vec::new(),
             hide_component: false,
             theme,
             last_render_width: std::sync::atomic::AtomicUsize::new(0),
@@ -492,56 +493,6 @@ impl ToolExecutionComponent {
         self.has_result.store(true, Ordering::SeqCst);
         self.is_partial = is_partial;
         self.update_display();
-        self.maybe_convert_images_for_kitty();
-    }
-
-    /// `maybeConvertImagesForKitty` (tool-execution.ts:178-199), converted
-    /// synchronously (see module doc).
-    fn maybe_convert_images_for_kitty(&mut self) {
-        let caps = get_capabilities();
-        if caps.images != Some(ImageProtocol::Kitty) {
-            return;
-        }
-        let Some(result) = &self.result else {
-            return;
-        };
-        let image_blocks: Vec<(usize, &ToolResultContentLoose)> = result
-            .content
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.kind == "image")
-            .collect();
-        for (index, img) in image_blocks {
-            let (Some(data), Some(mime_type)) = (&img.data, &img.mime_type) else {
-                continue;
-            };
-            let source_data = data.clone();
-            let source_mime_type = mime_type.clone();
-            if source_mime_type == "image/png" {
-                continue;
-            }
-            // #8743 (`21b8cc1a4`): a cached conversion is only valid while
-            // the source bytes at this index are unchanged — a newer
-            // partial result must re-convert instead of reusing (and later
-            // rendering) the stale entry.
-            if let Some(cached) = self.converted_images.get(&index)
-                && cached.source_data == source_data
-                && cached.source_mime_type == source_mime_type
-            {
-                continue;
-            }
-            if let Some((data, mime_type)) = convert_to_png(&source_data, &source_mime_type) {
-                self.converted_images.insert(
-                    index,
-                    ConvertedImage {
-                        source_data,
-                        source_mime_type,
-                        data,
-                        mime_type,
-                    },
-                );
-            }
-        }
     }
 
     /// `setExpanded` (tool-execution.ts:201-204).
@@ -719,52 +670,66 @@ impl ToolExecutionComponent {
             ))));
         }
 
-        // Images are appended after the shell (tool-execution.ts:321-354).
-        self.image_components.clear();
+        // Images are appended after the shell (tool-execution.ts:321-354 @
+        // a276dabe5, #10292): reuse `Image` instances whose source bytes did
+        // not change so their converted PNG data survives updates; the
+        // component itself transcodes non-PNG data on Kitty terminals.
+        let mut previous_images: Vec<Option<Image>> =
+            self.image_components.drain(..).map(Some).collect();
+        let previous_sources = std::mem::take(&mut self.image_sources);
         self.image_spacers.clear();
         if let Some(result) = &self.result {
             let caps = get_capabilities();
-            let image_blocks: Vec<(usize, &ToolResultContentLoose)> = result
+            let image_blocks: Vec<&ToolResultContentLoose> = result
                 .content
                 .iter()
-                .enumerate()
-                .filter(|(_, c)| c.kind == "image")
+                .filter(|c| c.kind == "image")
                 .collect();
-            for (i, img) in image_blocks {
+            for img in image_blocks {
                 if caps.images.is_none() || !self.show_images {
                     continue;
                 }
                 let (Some(data), Some(mime_type)) = (&img.data, &img.mime_type) else {
                     continue;
                 };
-                // #8743 (`21b8cc1a4`): only honor a cached conversion whose
-                // source bytes match the image currently at this index.
-                let converted = self.converted_images.get(&i).filter(|cached| {
-                    cached.source_data == *data && cached.source_mime_type == *mime_type
-                });
-                let image_data = converted.map(|c| c.data.as_str()).unwrap_or(data.as_str());
-                let image_mime_type = converted
-                    .map(|c| c.mime_type.as_str())
-                    .unwrap_or(mime_type.as_str());
-                if caps.images == Some(ImageProtocol::Kitty) && image_mime_type != "image/png" {
-                    continue;
-                }
-                self.image_spacers.push(Spacer::new(1));
+                let source = ImageSource {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                    width_cells: self.image_width_cells,
+                };
+                let index = self.image_components.len();
+                let reused = previous_sources
+                    .get(index)
+                    .filter(|previous| **previous == source)
+                    .and_then(|_| previous_images.get_mut(index).and_then(Option::take));
                 let fallback_color = {
                     let theme = Arc::clone(&self.theme);
                     Box::new(move |s: &str| theme.fg("toolOutput", s))
                 };
-                let image_component = Image::new(
-                    image_data.to_string(),
-                    image_mime_type.to_string(),
-                    ImageTheme { fallback_color },
-                    Some(ImageOptions {
-                        max_width_cells: Some(self.image_width_cells),
-                        ..Default::default()
-                    }),
-                    None,
-                );
+                let image_component = reused.unwrap_or_else(|| {
+                    Image::new(
+                        source.data.clone(),
+                        source.mime_type.clone(),
+                        ImageTheme { fallback_color },
+                        Some(ImageOptions {
+                            max_width_cells: Some(source.width_cells),
+                            ..Default::default()
+                        }),
+                        None,
+                    )
+                });
+                if source.mime_type != "image/png" {
+                    // Lets extension-provided images use the transcoder too;
+                    // the UI-level registration in `init` already covers the
+                    // normal flow (interactive-mode.ts:1001, 2062).
+                    let render_handle = self.render_handle.clone();
+                    crate::utils::image_convert::ensure_png_transcoder(move || {
+                        render_handle.request_render();
+                    });
+                }
+                self.image_spacers.push(Spacer::new(1));
                 self.image_components.push(image_component);
+                self.image_sources.push(source);
             }
         }
     }
@@ -892,41 +857,14 @@ impl Component for ToolExecutionComponent {
     }
 }
 
-/// `convertedImages` entry (#8743, `21b8cc1a4`): the converted PNG pair
-/// plus the source data/mime it was produced from, so a cache hit is only
-/// honored while the image block at that index still holds the same bytes
-/// (stale conversions from earlier partial results must not surface).
-struct ConvertedImage {
-    source_data: String,
-    source_mime_type: String,
+/// `imageSources` entry (tool-execution.ts:57-58 @ a276dabe5, #10292): the
+/// inputs of an `Image` component, so an instance is only reused while its
+/// source bytes, mime type, and width are unchanged.
+#[derive(Debug, Clone, PartialEq)]
+struct ImageSource {
     data: String,
     mime_type: String,
-}
-
-/// `convertToPng` (utils/image-convert.ts:31-48): decode any image and
-/// re-encode as PNG for the Kitty protocol. Synchronous in the port (see the
-/// module doc); returns `None` on decode/encode failure (upstream returns
-/// `null` when photon is unavailable).
-fn convert_to_png(base64_data: &str, mime_type: &str) -> Option<(String, String)> {
-    if mime_type == "image/png" {
-        return Some((base64_data.to_string(), "image/png".to_string()));
-    }
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(base64_data)
-        .ok()?;
-    let image = image::load_from_memory(&bytes).ok()?;
-    let mut png_bytes = Vec::new();
-    image
-        .write_to(
-            &mut std::io::Cursor::new(&mut png_bytes),
-            image::ImageFormat::Png,
-        )
-        .ok()?;
-    Some((
-        base64::engine::general_purpose::STANDARD.encode(png_bytes),
-        "image/png".to_string(),
-    ))
+    width_cells: usize,
 }
 
 /// `getTextOutput` (core/tools/render-utils.ts:38-60). `pub(crate)` for the
@@ -989,6 +927,38 @@ mod tests {
 
     /// Serializes tests that mutate the process-global terminal capabilities.
     static CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn kitty_caps() -> rpi_tui::terminal_image::TerminalCapabilities {
+        rpi_tui::terminal_image::TerminalCapabilities {
+            images: Some(rpi_tui::terminal_image::ImageProtocol::Kitty),
+            true_color: true,
+            hyperlinks: false,
+        }
+    }
+
+    /// A minimal 1x1 24-bit BMP (blue/green/red byte order + pad) as base64
+    /// — decodable by the `image` crate.
+    fn minimal_bmp(blue: u8, green: u8, red: u8) -> String {
+        use base64::Engine;
+        let mut bytes: Vec<u8> = Vec::with_capacity(58);
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&58u32.to_le_bytes()); // file size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
+        bytes.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+        bytes.extend_from_slice(&1i32.to_le_bytes()); // width
+        bytes.extend_from_slice(&1i32.to_le_bytes()); // height
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bytes.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // image size
+        bytes.extend_from_slice(&2835u32.to_le_bytes()); // x ppm
+        bytes.extend_from_slice(&2835u32.to_le_bytes()); // y ppm
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // colors used
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // colors important
+        bytes.extend_from_slice(&[blue, green, red, 0]); // BGR + pad
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
 
     fn theme() -> Arc<Theme> {
         Arc::new(load_theme("dark", None).expect("builtin dark theme"))
@@ -1298,18 +1268,16 @@ mod tests {
         assert!(stripped.contains("[Image: [image/png]]"));
     }
 
+    // tool-execution-component.test.ts: "renders a text fallback for
+    // non-PNG images without a transcoder" (#10292, a276dabe5).
     #[test]
-    fn kitty_images_skip_non_png_without_conversion() {
-        // The terminal-image capability cache is a process global; serialize
-        // with the fallback test.
+    fn non_png_kitty_images_render_a_text_fallback_without_a_transcoder() {
+        let _transcoder_guard = crate::utils::image_convert::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::utils::image_convert::reset_png_transcoder_state();
         let _guard = CAPS_LOCK.lock().unwrap();
-        rpi_tui::terminal_image::set_capabilities(rpi_tui::terminal_image::TerminalCapabilities {
-            images: Some(ImageProtocol::Kitty),
-            true_color: true,
-            hyperlinks: false,
-        });
-        // A bogus base64 JPEG cannot be converted; the image must be skipped
-        // (tool-execution.ts:339), not crash.
+        rpi_tui::terminal_image::set_capabilities(kitty_caps());
         let mut component = make_component();
         component.update_result(
             ToolResultState {
@@ -1323,71 +1291,58 @@ mod tests {
             },
             false,
         );
-        let _ = component.render(60);
+        let stripped = strip_ansi(&component.render(60).join("\n"));
+        assert!(
+            stripped.contains("[Image: [image/jpeg]"),
+            "fallback without a transcoder: {stripped:?}"
+        );
+        rpi_tui::terminal_image::reset_capabilities_cache();
     }
 
-    // ---------------------------------------------------------------------
-    // it("keeps the final tool image when a partial image conversion
-    // finishes late") (#8743, `21b8cc1a4`)
-    // ---------------------------------------------------------------------
-
-    /// A minimal 1×1 24-bit BMP (blue/green/red byte order + pad) as
-    /// base64 — decodable by the `image` crate, so `convert_to_png`
-    /// succeeds and the conversion cache engages.
-    fn minimal_bmp(blue: u8, green: u8, red: u8) -> String {
-        use base64::Engine;
-        let mut bytes: Vec<u8> = Vec::with_capacity(58);
-        bytes.extend_from_slice(b"BM");
-        bytes.extend_from_slice(&58u32.to_le_bytes()); // file size
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        bytes.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
-        bytes.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
-        bytes.extend_from_slice(&1i32.to_le_bytes()); // width
-        bytes.extend_from_slice(&1i32.to_le_bytes()); // height
-        bytes.extend_from_slice(&1u16.to_le_bytes()); // planes
-        bytes.extend_from_slice(&24u16.to_le_bytes()); // bpp
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
-        bytes.extend_from_slice(&4u32.to_le_bytes()); // image size
-        bytes.extend_from_slice(&2835u32.to_le_bytes()); // x ppm
-        bytes.extend_from_slice(&2835u32.to_le_bytes()); // y ppm
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // colors used
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // colors important
-        bytes.extend_from_slice(&[blue, green, red, 0]); // BGR + pad
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    }
-
-    /// A real 1×1 PNG as base64 (distinct payload from the BMP conversions).
-    fn minimal_png() -> String {
+    /// A real 1x1 PNG with the given pixel color, as base64.
+    fn png_with_pixel(red: u8, green: u8, blue: u8) -> String {
         use base64::Engine;
         let mut png = Vec::new();
         let mut image = image::RgbaImage::new(1, 1);
-        image.put_pixel(0, 0, image::Rgba([9, 8, 7, 255]));
+        image.put_pixel(0, 0, image::Rgba([red, green, blue, 255]));
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encode png");
         base64::engine::general_purpose::STANDARD.encode(png)
     }
 
-    /// #8743: the upstream race (an async conversion resolving after the
-    /// image was replaced) collapses to the sync contract — a cached
-    /// conversion is only valid while the source bytes at that index are
-    /// unchanged: a replaced image re-converts, and a cache entry from older
-    /// bytes never surfaces in the rendered output.
+    // tool-execution-component.test.ts: "converts non-PNG tool images once
+    // the transcoder loads" (#10292): the Image component keeps converted
+    // data per instance and the source-keyed shared cache, so repeated
+    // updates never re-convert, while a replaced image gets a fresh
+    // conversion instead of a stale one (#8743, `21b8cc1a4`).
     #[test]
-    fn stale_image_conversion_is_not_reused_after_the_image_is_replaced() {
-        // The terminal-image capability cache is a process global; serialize
-        // with the other capability tests.
+    fn converts_non_png_tool_images_once_a_transcoder_is_registered() {
+        let _transcoder_guard = crate::utils::image_convert::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let _guard = CAPS_LOCK.lock().unwrap();
-        rpi_tui::terminal_image::set_capabilities(rpi_tui::terminal_image::TerminalCapabilities {
-            images: Some(ImageProtocol::Kitty),
-            true_color: true,
-            hyperlinks: false,
-        });
-        let mut component = make_component();
+        rpi_tui::terminal_image::set_capabilities(kitty_caps());
+        let first_png = png_with_pixel(1, 2, 3);
+        let second_png = png_with_pixel(4, 5, 6);
+        let conversions: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        crate::utils::image_convert::install_test_transcoder(Arc::new({
+            let first_png = first_png.clone();
+            let second_png = second_png.clone();
+            let conversions = Arc::clone(&conversions);
+            move |_data: &str, _mime_type: &str| {
+                let mut count = conversions.lock().unwrap_or_else(|p| p.into_inner());
+                *count += 1;
+                Some(if *count == 1 {
+                    first_png.clone()
+                } else {
+                    second_png.clone()
+                })
+            }
+        }));
 
-        // Partial result with a convertible BMP: the conversion is cached
-        // with its source bytes.
         let first_bmp = minimal_bmp(0xF0, 0x00, 0x00);
+        let mut component = make_component();
         component.update_result(
             ToolResultState {
                 content: vec![ToolResultContentLoose::image(&first_bmp, "image/bmp")],
@@ -1397,18 +1352,26 @@ mod tests {
             },
             true,
         );
-        let cached = component
-            .converted_images
-            .get(&0)
-            .expect("conversion cached for the partial image");
-        assert_eq!(cached.source_data, first_bmp);
-        assert_eq!(cached.source_mime_type, "image/bmp");
-        assert_eq!(cached.mime_type, "image/png");
-        let first_conversion = cached.data.clone();
+        let rendered = component.render(120).join("\n");
+        assert!(rendered.contains(&first_png), "converted PNG rendered");
+        assert!(*conversions.lock().unwrap_or_else(|p| p.into_inner()) == 1);
 
-        // The image is replaced by different bytes at the same index: the
-        // stale entry must be replaced by a fresh conversion of the new
-        // source (upstream: the late old conversion is dropped).
+        // Same source: the Image instance and the shared cache keep the
+        // conversion (no second call).
+        component.update_result(
+            ToolResultState {
+                content: vec![ToolResultContentLoose::image(&first_bmp, "image/bmp")],
+                is_error: false,
+                details: None,
+                duration_ms: None,
+            },
+            true,
+        );
+        let rendered = component.render(120).join("\n");
+        assert!(rendered.contains(&first_png));
+        assert_eq!(*conversions.lock().unwrap_or_else(|p| p.into_inner()), 1);
+
+        // Replaced image: fresh conversion; the old one must not surface.
         let second_bmp = minimal_bmp(0x00, 0xF0, 0x00);
         component.update_result(
             ToolResultState {
@@ -1419,19 +1382,13 @@ mod tests {
             },
             true,
         );
-        let cached = component
-            .converted_images
-            .get(&0)
-            .expect("re-converted for the replaced image");
-        assert_eq!(cached.source_data, second_bmp, "stale entry replaced");
-        assert_ne!(cached.data, first_conversion, "new source re-converted");
-        let stale_conversions = [first_conversion, cached.data.clone()];
+        let rendered = component.render(120).join("\n");
+        assert!(rendered.contains(&second_png), "re-converted: {rendered:?}");
+        assert!(!rendered.contains(&first_png), "stale conversion dropped");
+        assert_eq!(*conversions.lock().unwrap_or_else(|p| p.into_inner()), 2);
 
-        // Final result with a real PNG (no conversion needed): the cache
-        // still holds the BMP entry, whose source no longer matches — the
-        // render must carry the final PNG bytes, never the stale
-        // conversion.
-        let final_png = minimal_png();
+        // Final real PNG: no conversion, raw bytes rendered.
+        let final_png = png_with_pixel(9, 8, 7);
         component.update_result(
             ToolResultState {
                 content: vec![ToolResultContentLoose::image(&final_png, "image/png")],
@@ -1442,16 +1399,11 @@ mod tests {
             false,
         );
         let rendered = component.render(120).join("\n");
-        assert!(
-            rendered.contains(&final_png),
-            "final PNG bytes rendered: {rendered:?}"
-        );
-        assert!(
-            !stale_conversions
-                .iter()
-                .any(|stale| rendered.contains(stale.as_str())),
-            "stale conversions must not surface: {rendered:?}"
-        );
+        assert!(rendered.contains(&final_png), "final PNG rendered");
+        assert!(!rendered.contains(&second_png), "final PNG replaces");
+        assert_eq!(*conversions.lock().unwrap_or_else(|p| p.into_inner()), 2);
+        crate::utils::image_convert::reset_png_transcoder_state();
+        rpi_tui::terminal_image::reset_capabilities_cache();
     }
 
     /// A stub render definition with no hooks and a configurable shell.

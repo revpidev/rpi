@@ -2896,6 +2896,9 @@ impl InteractiveUi {
         rpi_tui::terminal_image::set_capability_overrides(
             session.settings_manager(|settings| settings.get_terminal_capability_overrides()),
         );
+        // `this.ensurePngTranscoder()` (interactive-mode.ts:2062 @
+        // a276dabe5, #10292).
+        self.ensure_png_transcoder();
         let manager = session.session_manager();
         let cwd = lock(&manager).get_cwd().to_path_buf();
         drop(manager);

@@ -4406,6 +4406,18 @@ impl InteractiveUi {
         self.report_program_status();
     }
 
+    /// `ensurePngTranscoder` (interactive-mode.ts:2053-2058 @ a276dabe5,
+    /// #10292): register the PNG transcoder on Kitty terminals; the callback
+    /// invalidates and re-renders so images that showed a text fallback
+    /// repaint. Called from `init` and `apply_runtime_settings`.
+    pub(crate) fn ensure_png_transcoder(&self) {
+        let ui = self.ui.clone();
+        crate::utils::image_convert::ensure_png_transcoder(move || {
+            ui.invalidate();
+            ui.request_render(false);
+        });
+    }
+
     /// `updateAvailableProviderCount` (interactive-mode.ts:4364-4371).
     fn update_available_provider_count(&self) {
         let models = if !self.session().scoped_models().is_empty() {
@@ -5402,6 +5414,9 @@ impl InteractiveMode {
         // `this.programStatus.report()` (interactive-mode.ts:1000): the
         // resting `idle` status reaches the terminal from startup on.
         self.ui_state.report_program_status();
+        // `this.ensurePngTranscoder()` (interactive-mode.ts:1001 @
+        // a276dabe5, #10292).
+        self.ui_state.ensure_png_transcoder();
 
         // Theme file watcher (theme.ts:886-957): a polling thread detects
         // custom-theme file changes and queues `UiCommand::ThemeChanged`;
