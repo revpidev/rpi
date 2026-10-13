@@ -267,12 +267,12 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
         ),
         (
             "tui.editor.cursorLineStart",
-            m(&["home", "ctrl+home", "ctrl+a"]),
+            m(&["home", "ctrl+a"]),
             "Move to line start",
         ),
         (
             "tui.editor.cursorLineEnd",
-            m(&["end", "ctrl+end", "ctrl+e"]),
+            m(&["end", "ctrl+e"]),
             "Move to line end",
         ),
         (
@@ -413,10 +413,10 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             s("escape"),
             "Close transcript search",
         ),
-        ("tui.altScreen.top", s("home"), "Scroll viewport to top"),
+        ("tui.altScreen.top", s("ctrl+home"), "Scroll viewport to top"),
         (
             "tui.altScreen.bottom",
-            s("end"),
+            s("ctrl+end"),
             "Scroll viewport to bottom",
         ),
         // ---- app.* (43) ----
@@ -735,23 +735,61 @@ pub fn to_keybindings_config(
 /// default is remapped to `alt+t` so the two actions never double-bind the
 /// same key. Only the exact old default value is rewritten — any other
 /// custom binding is left alone.
+///
+/// V17-05 FR-B R2 (#10314): the editor `Home`/`End` defaults lost their
+/// `ctrl+home`/`ctrl+end` aliases (now `tui.altScreen.top`/`.bottom`), so an
+/// explicit old-default array is rewritten to the new default under the same
+/// rule. Custom bindings — including a single explicit `home`/`end` — are
+/// left alone, and the altScreen actions' own old single-key defaults are
+/// valid user choices, not migrated.
 fn migrate_keybinding_value(name: &str, value: &serde_json::Value) -> Option<serde_json::Value> {
-    if name != "app.thinking.cycle" {
-        return None;
-    }
-    match value {
-        serde_json::Value::String(key) if key == "shift+tab" => {
-            Some(serde_json::Value::String("alt+t".to_owned()))
-        }
-        serde_json::Value::Array(keys)
-            if keys.len() == 1 && keys[0].as_str() == Some("shift+tab") =>
-        {
-            Some(serde_json::Value::Array(vec![serde_json::Value::String(
-                "alt+t".to_owned(),
-            )]))
-        }
+    match name {
+        "app.thinking.cycle" => match value {
+            serde_json::Value::String(key) if key == "shift+tab" => {
+                Some(serde_json::Value::String("alt+t".to_owned()))
+            }
+            serde_json::Value::Array(keys)
+                if keys.len() == 1 && keys[0].as_str() == Some("shift+tab") =>
+            {
+                Some(serde_json::Value::Array(vec![serde_json::Value::String(
+                    "alt+t".to_owned(),
+                )]))
+            }
+            _ => None,
+        },
+        "tui.editor.cursorLineStart" => migrate_exact_key_array(
+            value,
+            &["home", "ctrl+home", "ctrl+a"],
+            &["home", "ctrl+a"],
+        ),
+        "tui.editor.cursorLineEnd" => migrate_exact_key_array(
+            value,
+            &["end", "ctrl+end", "ctrl+e"],
+            &["end", "ctrl+e"],
+        ),
         _ => None,
     }
+}
+
+/// Rewrite `value` to `new_default` when it is exactly the array
+/// `old_default` (order-sensitive, like the V16-05 single-value rule).
+fn migrate_exact_key_array(
+    value: &serde_json::Value,
+    old_default: &[&str],
+    new_default: &[&str],
+) -> Option<serde_json::Value> {
+    let serde_json::Value::Array(keys) = value else {
+        return None;
+    };
+    if keys.len() != old_default.len() || !keys.iter().zip(old_default).all(|(key, old)| key.as_str() == Some(*old)) {
+        return None;
+    }
+    Some(serde_json::Value::Array(
+        new_default
+            .iter()
+            .map(|key| serde_json::Value::String((*key).to_owned()))
+            .collect(),
+    ))
 }
 
 /// Migrate legacy key names in a raw config (keybindings.ts:289-309).
@@ -1333,6 +1371,78 @@ mod tests {
         assert_eq!(
             migrated.get("app.thinking.cycle"),
             Some(&serde_json::json!(["ctrl+y", "alt+y"]))
+        );
+    }
+
+    // --- Value migrations (V17-05 FR-B R2, #10314) ------------------------
+
+    #[test]
+    fn test_migrate_config_editor_home_end_old_defaults() {
+        // The editor line-start/end defaults lost `ctrl+home`/`ctrl+end`;
+        // an explicit old-default array is rewritten to the new default so
+        // the keys now reach `tui.altScreen.top`/`.bottom`.
+        let mut raw = serde_json::Map::new();
+        raw.insert(
+            "tui.editor.cursorLineStart".to_string(),
+            serde_json::json!(["home", "ctrl+home", "ctrl+a"]),
+        );
+        raw.insert(
+            "tui.editor.cursorLineEnd".to_string(),
+            serde_json::json!(["end", "ctrl+end", "ctrl+e"]),
+        );
+        let (migrated, was_migrated) = migrate_keybindings_config(&raw);
+        assert!(was_migrated);
+        assert_eq!(
+            migrated.get("tui.editor.cursorLineStart"),
+            Some(&serde_json::json!(["home", "ctrl+a"]))
+        );
+        assert_eq!(
+            migrated.get("tui.editor.cursorLineEnd"),
+            Some(&serde_json::json!(["end", "ctrl+e"]))
+        );
+    }
+
+    #[test]
+    fn test_migrate_config_editor_home_end_custom_values_kept() {
+        // Any deviation from the exact old default array stays untouched —
+        // including a single explicit key, reordered lists, and other keys.
+        let mut raw = serde_json::Map::new();
+        raw.insert(
+            "tui.editor.cursorLineStart".to_string(),
+            serde_json::json!("home"),
+        );
+        raw.insert(
+            "tui.editor.cursorLineEnd".to_string(),
+            serde_json::json!(["ctrl+end", "end"]),
+        );
+        raw.insert(
+            "tui.altScreen.top".to_string(),
+            serde_json::json!("home"),
+        );
+        raw.insert(
+            "tui.altScreen.bottom".to_string(),
+            serde_json::json!("end"),
+        );
+        let (migrated, was_migrated) = migrate_keybindings_config(&raw);
+        assert!(!was_migrated);
+        assert_eq!(
+            migrated.get("tui.editor.cursorLineStart"),
+            Some(&serde_json::json!("home"))
+        );
+        assert_eq!(
+            migrated.get("tui.editor.cursorLineEnd"),
+            Some(&serde_json::json!(["ctrl+end", "end"]))
+        );
+        // The altScreen actions' old single-key defaults are valid custom
+        // choices; the new altScreen defaults introduce no overlap with the
+        // editor defaults, so they are not migrated.
+        assert_eq!(
+            migrated.get("tui.altScreen.top"),
+            Some(&serde_json::json!("home"))
+        );
+        assert_eq!(
+            migrated.get("tui.altScreen.bottom"),
+            Some(&serde_json::json!("end"))
         );
     }
 

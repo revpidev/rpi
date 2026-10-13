@@ -337,11 +337,11 @@ fn test_all_tui_editor_defaults() {
     );
     assert_eq!(
         mgr.get_keys("tui.editor.cursorLineStart"),
-        vec!["home", "ctrl+home", "ctrl+a"]
+        vec!["home", "ctrl+a"]
     );
     assert_eq!(
         mgr.get_keys("tui.editor.cursorLineEnd"),
-        vec!["end", "ctrl+end", "ctrl+e"]
+        vec!["end", "ctrl+e"]
     );
     assert_eq!(mgr.get_keys("tui.editor.jumpForward"), vec!["ctrl+]"]);
     assert_eq!(mgr.get_keys("tui.editor.jumpBackward"), vec!["ctrl+alt+]"]);
@@ -414,8 +414,8 @@ fn test_all_tui_alt_screen_defaults() {
         mgr.get_keys("tui.altScreen.nextPrompt"),
         vec!["ctrl+shift+down", "ctrl+down"]
     );
-    assert_eq!(mgr.get_keys("tui.altScreen.top"), vec!["home"]);
-    assert_eq!(mgr.get_keys("tui.altScreen.bottom"), vec!["end"]);
+    assert_eq!(mgr.get_keys("tui.altScreen.top"), vec!["ctrl+home"]);
+    assert_eq!(mgr.get_keys("tui.altScreen.bottom"), vec!["ctrl+end"]);
 }
 
 #[test]

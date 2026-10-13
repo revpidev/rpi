@@ -549,12 +549,12 @@ fn build_tui_keybindings() -> Vec<(String, KeybindingDefinition)> {
         ),
         entry(
             "tui.editor.cursorLineStart",
-            multiple(&["home", "ctrl+home", "ctrl+a"]),
+            multiple(&["home", "ctrl+a"]),
             "Move to line start",
         ),
         entry(
             "tui.editor.cursorLineEnd",
-            multiple(&["end", "ctrl+end", "ctrl+e"]),
+            multiple(&["end", "ctrl+e"]),
             "Move to line end",
         ),
         entry(
@@ -702,12 +702,12 @@ fn build_tui_keybindings() -> Vec<(String, KeybindingDefinition)> {
         ),
         entry(
             "tui.altScreen.top",
-            single("home"),
+            single("ctrl+home"),
             "Scroll viewport to top",
         ),
         entry(
             "tui.altScreen.bottom",
-            single("end"),
+            single("ctrl+end"),
             "Scroll viewport to bottom",
         ),
     ]
@@ -1170,11 +1170,11 @@ mod tests {
 
         assert_eq!(
             keybindings.get_keys(Keybinding::EditorCursorLineStart),
-            keys(&["home", "ctrl+home", "ctrl+a"])
+            keys(&["home", "ctrl+a"])
         );
         assert_eq!(
             keybindings.get_keys(Keybinding::EditorCursorLineEnd),
-            keys(&["end", "ctrl+end", "ctrl+e"])
+            keys(&["end", "ctrl+e"])
         );
         assert_eq!(
             keybindings.get_keys(Keybinding::EditorPageUp),

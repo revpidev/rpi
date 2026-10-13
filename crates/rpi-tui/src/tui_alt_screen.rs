@@ -5396,7 +5396,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // it("routes Ctrl-modified viewport navigation to the focused component")
+    // it("routes Home and End to the focused component and Ctrl+Home/End to the transcript")
     // ---------------------------------------------------------------------
 
     /// Editor component recording its inputs (upstream's inline `{ focused,
@@ -5435,7 +5435,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_ctrl_modified_viewport_navigation_to_the_focused_component() {
+    fn routes_home_and_end_to_the_focused_component_and_ctrl_home_end_to_the_transcript() {
         // Serialized with the other global-state tests (capabilities,
         // kitty metadata/image caches are process globals).
         let _caps = CapsGuard::lock_only();
@@ -5481,30 +5481,38 @@ mod tests {
         tui.start();
         settle(&tui);
 
-        send_input(&terminal, &tui, "\x1bOH");
-        settle(&tui);
-        assert_eq!(with_sv(&transcript, ScrollView::scroll_top), 0);
-        assert!(lock_shared(&editor_inputs).is_empty());
+        let bottom = with_sv(&transcript, ScrollView::scroll_top);
+        assert!(bottom > 0);
 
-        let modified_inputs = [
-            "\x1b[1;5H",
-            "\x1b[1;5F",
-            "\x1b[5;5~",
-            "\x1b[6;5~",
-            "\x1b[57423;5u",
-        ];
-        for input in modified_inputs {
+        // #10314: unmodified Home/End belong to the editor in every UI mode.
+        let editor_keys = ["\x1bOH", "\x1b[F", "\x1b[57423u", "\x1b[5;5~", "\x1b[6;5~"];
+        for input in editor_keys {
             send_input(&terminal, &tui, input);
         }
+        settle(&tui);
+        assert_eq!(with_sv(&transcript, ScrollView::scroll_top), bottom);
+        assert_eq!(lock_shared(&editor_inputs).as_slice(), editor_keys);
+
+        // Ctrl+Home / Ctrl+End scroll the transcript and never reach the
+        // editor.
+        send_input(&terminal, &tui, "\x1b[1;5H");
+        settle(&tui);
+        assert_eq!(with_sv(&transcript, ScrollView::scroll_top), 0);
+
+        send_input(&terminal, &tui, "\x1b[1;5F");
+        settle(&tui);
+        assert_eq!(with_sv(&transcript, ScrollView::scroll_top), bottom);
+        assert!(with_sv(&transcript, ScrollView::is_following_end));
+
+        send_input(&terminal, &tui, "\x1b[57423;5u");
         send_input(&terminal, &tui, "\x1b[57423;5:3u");
         settle(&tui);
         assert_eq!(with_sv(&transcript, ScrollView::scroll_top), 0);
-        assert_eq!(lock_shared(&editor_inputs).as_slice(), modified_inputs);
 
         send_input(&terminal, &tui, "\x1b[6~");
         settle(&tui);
         assert_eq!(with_sv(&transcript, ScrollView::scroll_top), 1);
-        assert_eq!(lock_shared(&editor_inputs).as_slice(), modified_inputs);
+        assert_eq!(lock_shared(&editor_inputs).as_slice(), editor_keys);
 
         stop(&tui);
     }
