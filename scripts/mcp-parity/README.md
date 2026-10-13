@@ -25,8 +25,8 @@ node scripts/mcp-parity/run-builtin-mcp-parity.mjs   # V16-08 built-in leg (see 
 ## Built-in MCP parity (V16-08 G3)
 
 The built-in `crates/rpi-mcp` client is compared against the upstream package
-client `external/pi/packages/mcp` @ a13d35a74 (read-only) — the source package
-the standalone adapter also consumes. The same fixture server
+client `external/pi/packages/mcp` @ abe508e1b (v1.1.0, read-only) — the source
+package the standalone adapter also consumes. The same fixture server
 (`fixture-server.mjs`, stdio) drives both sides, and the normalized
 transcripts/results are diffed:
 

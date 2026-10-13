@@ -1,6 +1,6 @@
 # built-in MCP cross-implementation parity report (V16-08 §6 / G3)
 
-Upstream: external/pi/packages/mcp @ a13d35a74 (McpClient + StdioTransport, tsx)
+Upstream: external/pi/packages/mcp @ abe508e1b (McpClient + StdioTransport, tsx)
 rpi: crates/rpi-mcp
 
 Normalization: JSON-RPC ids → `$id`; `clientInfo.name` → `parity-client` (O1 brand exemption); frame transcripts recorded server-side by the shared fixture so a diff isolates the client.
