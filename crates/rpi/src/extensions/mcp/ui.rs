@@ -2861,4 +2861,212 @@ mod tests {
             "an aborted session cancels immediately"
         );
     }
+
+    // -- state-level manager tests (FR-A R4 / FR-C R3 / FR-D) ---------------
+
+    fn test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-mcp-ui-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn test_state(tag: &str) -> (Arc<McpBuiltinState>, std::path::PathBuf) {
+        let dir = test_dir(tag);
+        let extension = Arc::new(rpi_ext_host::api::LoadedExtension::new(
+            "<test:mcp>",
+            "<test:mcp>",
+        ));
+        let api = ExtensionApi::for_extension(
+            extension,
+            rpi_ext_host::api::ExtensionRuntime::new(),
+            &dir.to_string_lossy(),
+        );
+        let model_runtime = crate::core::model_runtime::ModelRuntime::create(
+            crate::core::model_runtime::CreateModelRuntimeOptions {
+                credentials: None,
+                auth_path: Some(dir.join("auth.json")),
+                models_path: crate::core::model_runtime::ModelsPathInput::Path(
+                    dir.join("models.json"),
+                ),
+                ..Default::default()
+            },
+        )
+        .await;
+        (Arc::new(McpBuiltinState::new(api, model_runtime)), dir)
+    }
+
+    fn test_server(name: &str, config: Value, source: &str) -> Arc<McpServer> {
+        Arc::new(McpServer {
+            entry: Mutex::new(McpServerEntry {
+                name: name.to_owned(),
+                config: validate_mcp_server_config(name, &config).unwrap(),
+                source: source.to_owned(),
+                scope: Some(McpScope::Global),
+                override_path: None,
+            }),
+            connection: Mutex::new(None),
+            registered_config: None,
+            message: Mutex::new(None),
+            ready: Mutex::new(None),
+            attempt: std::sync::atomic::AtomicU64::new(0),
+            closing: Mutex::new(None),
+        })
+    }
+
+    /// FR-A R4 end to end: "Enable/Disable in this project" writes the
+    /// project override and leaves the user's file untouched.
+    #[tokio::test]
+    async fn save_config_in_project_writes_the_project_file_only() {
+        let (state, dir) = test_state("in-project").await;
+        let global = dir.join("mcp.json");
+        let project_dir = dir
+            .join("project")
+            .join(super::super::config::CONFIG_DIR_NAME);
+        let project = project_dir.join("mcp.json");
+        std::fs::write(&global, r#"{"mcpServers":{"docs":{"command":"x"}}}"#).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(&project, r#"{"mcpServers":{}}"#).unwrap();
+        let global_before = std::fs::read_to_string(&global).unwrap();
+        *lock(&state.project_config) = Some(project.display().to_string());
+        let server = test_server(
+            "docs",
+            json!({"command": "x"}),
+            &global.display().to_string(),
+        );
+        lock(&state.servers).push(server.clone());
+
+        let failure = state.save_config(
+            &server,
+            McpServerConfigPatch {
+                enabled: Some(false),
+                exposure: None,
+            },
+            true,
+        );
+        assert!(failure.is_none(), "{failure:?}");
+        let project_raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&project).unwrap()).unwrap();
+        assert_eq!(project_raw["mcpServers"]["docs"], json!({"enabled": false}));
+        assert_eq!(
+            std::fs::read_to_string(&global).unwrap(),
+            global_before,
+            "the user's mcp.json is not rewritten"
+        );
+        let entry = lock(&server.entry).clone();
+        assert_eq!(
+            entry.override_path.as_deref(),
+            Some(project.display().to_string().as_str())
+        );
+        assert!(!entry.config.enabled());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FR-C R3 / FR-D: shutdown waits for tracked work (sign-ins and
+    /// manager actions) to clean up.
+    #[tokio::test]
+    async fn wait_background_waits_for_tracked_work() {
+        let (state, dir) = test_state("track").await;
+        let guard = state.track();
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move { state.wait_background().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait_background blocks while tracked"
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_background returns after the work settles")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FR-D R2: a background action's result is dropped when a later
+    /// connection attempt replaced it, and shown for the live attempt.
+    #[tokio::test]
+    async fn run_in_background_drops_the_result_of_a_replaced_attempt() {
+        let (state, dir) = test_state("background").await;
+        state.start_session();
+        let ctx = state.api.context();
+        let server = test_server("docs", json!({"url": "http://127.0.0.1:9/mcp"}), "test");
+        lock(&state.servers).push(server.clone());
+
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        state.run_in_background(&ctx, &server, async move {
+            let _ = wait.await;
+            Some("late".to_owned())
+        });
+        server.attempt.fetch_add(1, Ordering::SeqCst);
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            lock(&server.message).is_none(),
+            "a replaced attempt's result is dropped"
+        );
+
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        state.run_in_background(&ctx, &server, async move {
+            let _ = wait.await;
+            Some("shown".to_owned())
+        });
+        let _ = release.send(());
+        for _ in 0..100 {
+            if lock(&server.message).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(lock(&server.message).as_deref(), Some("shown"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FR-D R2: disabling registers a closing signal that the next enable
+    /// consumes, serializing the replacement.
+    #[tokio::test]
+    async fn disabling_serializes_the_next_enable() {
+        let (state, dir) = test_state("closing").await;
+        state.start_session();
+        let ctx = state.api.context();
+        let global = dir.join("mcp.json");
+        std::fs::write(
+            &global,
+            r#"{"mcpServers":{"docs":{"url":"http://127.0.0.1:9/mcp"}}}"#,
+        )
+        .unwrap();
+        let server = test_server(
+            "docs",
+            json!({"url": "http://127.0.0.1:9/mcp"}),
+            &global.display().to_string(),
+        );
+        lock(&state.servers).push(server.clone());
+
+        assert!(
+            state
+                .set_enabled(&ctx, "docs", false, false)
+                .await
+                .is_none()
+        );
+        assert!(
+            lock(&server.closing).is_some(),
+            "disable registers the closing receiver"
+        );
+        assert!(!lock(&server.entry).config.enabled());
+        assert!(state.set_enabled(&ctx, "docs", true, false).await.is_none());
+        assert!(
+            lock(&server.closing).is_none(),
+            "enable consumes the closing receiver before connecting"
+        );
+        assert!(lock(&server.entry).config.enabled());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

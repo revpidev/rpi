@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 /// `.rpi` project directory name.
 pub const CONFIG_DIR_NAME: &str = crate::config::CONFIG_DIR_NAME;
 
-/// `McpExposure` (mcp-servers.ts:11): server-side exposure tier.
+/// `McpExposure` (mcp-servers.ts): server-side exposure tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum McpExposure {
     Codemode,
@@ -53,7 +53,7 @@ impl McpExposure {
         }
     }
 
-    /// `toToolExposure` (tools.ts:38): `codemode` maps to the host's
+    /// `toToolExposure` (tools.ts): `codemode` maps to the host's
     /// `deferred` tier (registered, not declared; the codemode tool reaches
     /// it). `direct`/`hidden` map through.
     pub fn to_tool_exposure(self) -> ToolExposure {
@@ -66,7 +66,7 @@ impl McpExposure {
     }
 }
 
-/// `McpOAuthConfig` (mcp-servers.ts:94).
+/// `McpOAuthConfig` (mcp-servers.ts).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpOAuthConfig {
@@ -86,7 +86,7 @@ pub struct McpOAuthConfig {
     pub client_name: Option<String>,
     /// How the client identifies itself without `clientId`: `dcr` (default)
     /// registers dynamically; `cimd` uses rpi's Client ID Metadata Document
-    /// (mcp-servers.ts:115-119).
+    /// (mcp-servers.ts).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_registration: Option<String>,
     /// Authorization server metadata document used instead of discovery
@@ -95,7 +95,7 @@ pub struct McpOAuthConfig {
     pub auth_server_metadata_url: Option<String>,
 }
 
-/// Common server options (mcp-servers.ts:29).
+/// Common server options (mcp-servers.ts).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerCommon {
@@ -113,7 +113,7 @@ pub struct McpServerCommon {
     pub timeout: Option<f64>,
 }
 
-/// `McpStdioServerConfig` (mcp-servers.ts:61).
+/// `McpStdioServerConfig` (mcp-servers.ts).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpStdioServerConfig {
@@ -132,7 +132,7 @@ pub struct McpStdioServerConfig {
     pub extra: Map<String, Value>,
 }
 
-/// `McpHttpServerConfig` (mcp-servers.ts:109).
+/// `McpHttpServerConfig` (mcp-servers.ts).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpHttpServerConfig {
@@ -152,13 +152,13 @@ pub struct McpHttpServerConfig {
     pub extra: Map<String, Value>,
 }
 
-/// `auth: { provider }` (mcp-servers.ts:118).
+/// `auth: { provider }` (mcp-servers.ts).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpAuthConfig {
     pub provider: String,
 }
 
-/// `McpServerConfig` (mcp-servers.ts:125).
+/// `McpServerConfig` (mcp-servers.ts).
 #[derive(Debug, Clone, PartialEq)]
 pub enum McpServerConfig {
     Stdio(McpStdioServerConfig),
@@ -216,7 +216,7 @@ impl McpServerConfig {
     }
 }
 
-/// `McpScope` (config.ts:26): where an entry came from.
+/// `McpScope` (config.ts): where an entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpScope {
     Global,
@@ -234,7 +234,7 @@ impl McpScope {
     }
 }
 
-/// `McpServerEntry` (config.ts:20).
+/// `McpServerEntry` (config.ts).
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpServerEntry {
     pub name: String,
@@ -243,11 +243,11 @@ pub struct McpServerEntry {
     pub source: String,
     pub scope: Option<McpScope>,
     /// Project `mcp.json` with an override of this global server's
-    /// `enabled`, `exposure`, or `toolExposure` (config.ts:30).
+    /// `enabled`, `exposure`, or `toolExposure` (config.ts).
     pub override_path: Option<String>,
 }
 
-/// `LoadedMcpConfig` (config.ts:33).
+/// `LoadedMcpConfig` (config.ts).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LoadedMcpConfig {
     pub servers: Vec<McpServerEntry>,
@@ -255,16 +255,16 @@ pub struct LoadedMcpConfig {
     pub auto_enable_codemode: Option<bool>,
     pub errors: Vec<String>,
     /// The project `mcp.json` when the project is trusted, where `/mcp`
-    /// saves project overrides (config.ts:39).
+    /// saves project overrides (config.ts).
     pub project_config: Option<String>,
 }
 
-/// `mcpNamespace` (mcp-servers.ts:133): `mcp__<server>` with `-` → `_`.
+/// `mcpNamespace` (mcp-servers.ts): `mcp__<server>` with `-` → `_`.
 pub fn mcp_namespace(server: &str) -> String {
     format!("mcp__{}", server.replace('-', "_"))
 }
 
-/// `toolPatternRegExp` (mcp-servers.ts:213): `*` matches any characters,
+/// `toolPatternRegExp` (mcp-servers.ts): `*` matches any characters,
 /// everything else is literal.
 fn tool_pattern_matches(pattern: &str, value: &str) -> bool {
     let mut parts = pattern.split('*');
@@ -286,7 +286,7 @@ fn tool_pattern_matches(pattern: &str, value: &str) -> bool {
     value.ends_with(last)
 }
 
-/// `getMcpToolExposure` (mcp-servers.ts:225): an exact `toolExposure` key
+/// `getMcpToolExposure` (mcp-servers.ts): an exact `toolExposure` key
 /// wins; otherwise the first matching `*` pattern; otherwise the server's
 /// exposure (default `codemode`).
 pub fn get_mcp_tool_exposure(config: &McpServerConfig, tool_name: &str) -> McpExposure {
@@ -309,7 +309,7 @@ pub fn get_mcp_tool_exposure(config: &McpServerConfig, tool_name: &str) -> McpEx
     config.exposure()
 }
 
-/// `LOOPBACK_HOSTS` (mcp-servers.ts:90).
+/// `LOOPBACK_HOSTS` (mcp-servers.ts).
 const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
 
 /// `isLoopbackHost`: `url::Url::host_str()` keeps the brackets on IPv6
@@ -322,7 +322,7 @@ fn is_loopback_host(host: &str) -> bool {
         .any(|candidate| candidate.trim_matches(['[', ']']) == normalized)
 }
 
-/// `isLoopbackRedirectUri` (mcp-servers.ts:93): an http URI on a loopback
+/// `isLoopbackRedirectUri` (mcp-servers.ts): an http URI on a loopback
 /// host without query or fragment.
 pub fn is_loopback_redirect_uri(value: &str) -> bool {
     let Ok(url) = url::Url::parse(value) else {
@@ -360,7 +360,7 @@ fn resolve_exposure_alias(value: &Value) -> Value {
     }
 }
 
-/// `resolveExposureAliases` (mcp-servers.ts:200).
+/// `resolveExposureAliases` (mcp-servers.ts).
 fn resolve_exposure_aliases(mut value: Map<String, Value>) -> Map<String, Value> {
     if let Some(exposure) = value.get("exposure").cloned() {
         value.insert("exposure".to_owned(), resolve_exposure_alias(&exposure));
@@ -427,7 +427,7 @@ fn validate_oauth(value: Option<&Value>) -> Result<(), String> {
             return Err("oauth.clientName must be a non-empty string".to_owned());
         }
     }
-    // `clientRegistration` (mcp-servers.ts:172-182): values are `dcr` and
+    // `clientRegistration` (mcp-servers.ts): values are `dcr` and
     // `cimd`; `cimd` identifies with the metadata document, so it cannot
     // combine with a registered client and needs the default callback path
     // on a loopback host.
@@ -473,17 +473,17 @@ fn validate_oauth(value: Option<&Value>) -> Result<(), String> {
     Ok(())
 }
 
-/// `OVERRIDE_KEYS` (config.ts:41): the only keys a project override may
+/// `OVERRIDE_KEYS` (config.ts): the only keys a project override may
 /// set.
 const OVERRIDE_KEYS: [&str; 3] = ["enabled", "exposure", "toolExposure"];
 
-/// `isOverride` (config.ts:44): an entry without `command`, `url`, and
+/// `isOverride` (config.ts): an entry without `command`, `url`, and
 /// `type` overrides a server defined elsewhere instead of defining one.
 fn is_override(value: &Map<String, Value>) -> bool {
     !value.contains_key("command") && !value.contains_key("url") && !value.contains_key("type")
 }
 
-/// `validateMcpServerConfig` (mcp-servers.ts:246): a validated copy with
+/// `validateMcpServerConfig` (mcp-servers.ts): a validated copy with
 /// exposure aliases resolved, or an error message.
 pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<McpServerConfig, String> {
     if !is_server_name(name) {
@@ -617,7 +617,7 @@ pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<McpServerCo
     ))
 }
 
-/// `readConfigFile` (config.ts:55) into one loaded config.
+/// `readConfigFile` (config.ts) into one loaded config.
 fn read_config_file(path: &Path, scope: McpScope, state: &mut LoadedMcpConfig) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
@@ -658,7 +658,7 @@ fn read_config_file(path: &Path, scope: McpScope, state: &mut LoadedMcpConfig) {
     };
     for (name, raw) in servers {
         // `scope === "project" && isRecord(value) && isOverride(value)`
-        // (config.ts:76): a project entry without `command`, `url`, and
+        // (config.ts): a project entry without `command`, `url`, and
         // `type` changes only the listed keys of the global server with
         // the same name and keeps everything else.
         if scope == McpScope::Project
@@ -694,12 +694,17 @@ fn read_config_file(path: &Path, scope: McpScope, state: &mut LoadedMcpConfig) {
                     }
                     match validate_mcp_server_config(name, &merged) {
                         Ok(config) => {
-                            state.servers.retain(|server| server.name != *name);
-                            state.servers.push(McpServerEntry {
+                            // `servers.set(name, ...)`: replace in place so
+                            // the entry keeps its position (config.ts).
+                            let entry = McpServerEntry {
                                 config,
                                 override_path: Some(path.display().to_string()),
                                 ..base
-                            });
+                            };
+                            match state.servers.iter().position(|server| server.name == *name) {
+                                Some(index) => state.servers[index] = entry,
+                                None => state.servers.push(entry),
+                            }
                         }
                         Err(error) => {
                             state.errors.push(format!("{}: {error}", path.display()))
@@ -739,18 +744,23 @@ fn read_config_file(path: &Path, scope: McpScope, state: &mut LoadedMcpConfig) {
             ));
             continue;
         }
-        state.servers.retain(|server| server.name != *name);
-        state.servers.push(McpServerEntry {
+        // `servers.set(name, ...)`: replace in place so the entry keeps
+        // its position (config.ts).
+        let next = McpServerEntry {
             name: name.clone(),
             config,
             source: path.display().to_string(),
             scope: Some(scope),
             override_path: None,
-        });
+        };
+        match state.servers.iter().position(|server| server.name == *name) {
+            Some(index) => state.servers[index] = next,
+            None => state.servers.push(next),
+        }
     }
 }
 
-/// `loadMcpConfig` (config.ts:91): global and (when trusted) project MCP
+/// `loadMcpConfig` (config.ts): global and (when trusted) project MCP
 /// configuration. Disabled servers are included with `enabled: false`.
 pub fn load_mcp_config(agent_dir: &Path, cwd: &Path, project_trusted: bool) -> LoadedMcpConfig {
     let mut state = LoadedMcpConfig::default();
@@ -763,7 +773,7 @@ pub fn load_mcp_config(agent_dir: &Path, cwd: &Path, project_trusted: bool) -> L
     state
 }
 
-/// `McpServerConfigPatch` (config.ts:128): `/mcp` changes. Defaults
+/// `McpServerConfigPatch` (config.ts): `/mcp` changes. Defaults
 /// (`enabled: true`, `exposure: "codemode"`) remove the key.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct McpServerConfigPatch {
@@ -771,9 +781,9 @@ pub struct McpServerConfigPatch {
     pub exposure: Option<McpExposure>,
 }
 
-/// `updateMcpServerConfig` (config.ts:135). With `override_mode`, a
+/// `updateMcpServerConfig` (config.ts). With `override_mode`, a
 /// missing entry is added as an override; overrides keep default values,
-/// since they replace the global server's (config.ts:148).
+/// since they replace the global server's (config.ts).
 pub fn update_mcp_server_config(
     path: &Path,
     name: &str,
@@ -812,7 +822,7 @@ pub fn update_mcp_server_config(
     })
 }
 
-/// `addMcpServerConfig` (config.ts:158): true when an entry was replaced.
+/// `addMcpServerConfig` (config.ts): true when an entry was replaced.
 pub fn add_mcp_server_config(
     path: &Path,
     name: &str,
@@ -827,7 +837,7 @@ pub fn add_mcp_server_config(
     Ok(replaced)
 }
 
-/// `removeMcpServerConfig` (config.ts:173): false when the file does not
+/// `removeMcpServerConfig` (config.ts): false when the file does not
 /// define it.
 pub fn remove_mcp_server_config(path: &Path, name: &str) -> Result<bool, String> {
     if !path.exists() {
@@ -841,7 +851,7 @@ pub fn remove_mcp_server_config(path: &Path, name: &str) -> Result<bool, String>
     Ok(removed)
 }
 
-/// `editMcpServers` (config.ts:185): read an `mcp.json` (empty when
+/// `editMcpServers` (config.ts): read an `mcp.json` (empty when
 /// missing), let `edit` change its `mcpServers`, write it back with its
 /// indentation. Other content is kept.
 fn edit_mcp_servers(
@@ -1038,7 +1048,7 @@ mod tests {
         .unwrap();
     }
 
-    /// `oauth.clientRegistration` validation (mcp-servers.ts:172-182).
+    /// `oauth.clientRegistration` validation (mcp-servers.ts).
     #[test]
     fn client_registration_validates_cimd_rules() {
         // `dcr` (the default) and `cimd` pass.

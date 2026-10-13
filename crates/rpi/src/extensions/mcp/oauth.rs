@@ -30,7 +30,7 @@ use super::config::McpOAuthConfig;
 const CALLBACK_HOST: &str = "127.0.0.1";
 const CALLBACK_PATH: &str = "/callback";
 /// Where rpi serves its Client ID Metadata Documents: `client.json` and
-/// `<callback ID>/client.json` (oauth.ts:42; upstream base is
+/// `<callback ID>/client.json` (oauth.ts; upstream base is
 /// `https://pi.dev/oauth`, mapped to the rpi product domain).
 const CLIENT_METADATA_BASE_URL: &str = "https://revpi.dev/oauth";
 /// Redirect URI for refreshes when none is stored (`FALLBACK_REDIRECT_URL`).
@@ -38,7 +38,7 @@ const FALLBACK_REDIRECT_URL: &str = "http://127.0.0.1/callback";
 /// Access tokens this close to expiry are refreshed before they are sent.
 const REFRESH_SKEW_MS: f64 = 30_000.0;
 /// Bounds each request to the authorization server (`OAUTH_REQUEST_TIMEOUT_MS`,
-/// oauth.ts:51), so an unresponsive one cannot hold the refresh lock, delay
+/// oauth.ts), so an unresponsive one cannot hold the refresh lock, delay
 /// shutdown, or keep a sign-in waiting for long.
 const OAUTH_REQUEST_TIMEOUT_MS: u64 = 15_000;
 /// How long to wait for another process's refresh.
@@ -46,7 +46,7 @@ const REFRESH_LOCK_WAIT_MS: u64 = 25_000;
 /// Retry spacing while waiting for the refresh lock.
 const REFRESH_LOCK_RETRY_MS: u64 = 100;
 
-/// `McpOAuthSettings` (oauth.ts:43): the config surface the flow uses.
+/// `McpOAuthSettings` (oauth.ts): the config surface the flow uses.
 #[derive(Debug, Clone, Default)]
 pub struct McpOAuthSettings {
     pub client_id: Option<String>,
@@ -86,7 +86,7 @@ impl McpOAuthSettings {
     }
 }
 
-/// `CallbackSettings` (oauth.ts:56).
+/// `CallbackSettings` (oauth.ts).
 #[derive(Debug, Clone)]
 pub struct CallbackSettings {
     /// Address to listen on.
@@ -99,7 +99,7 @@ pub struct CallbackSettings {
     pub fixed_redirect_url: Option<String>,
 }
 
-/// `callbackSettings` (oauth.ts:65).
+/// `callbackSettings` (oauth.ts).
 pub fn callback_settings(settings: &McpOAuthSettings) -> CallbackSettings {
     let raw = settings
         .callback_url
@@ -141,7 +141,7 @@ pub fn callback_settings(settings: &McpOAuthSettings) -> CallbackSettings {
     }
 }
 
-/// `mergeScopes` (oauth.ts:89): both lists, each once.
+/// `mergeScopes` (oauth.ts): both lists, each once.
 pub fn merge_scopes(scopes: &[Option<&str>]) -> Option<String> {
     let mut merged: Vec<&str> = Vec::new();
     for scope in scopes.iter().flatten() {
@@ -158,7 +158,7 @@ pub fn merge_scopes(scopes: &[Option<&str>]) -> Option<String> {
     }
 }
 
-/// `storeKeys` (oauth.ts:117): the v1.0.0 key by name and URL plus the
+/// `storeKeys` (oauth.ts): the v1.0.0 key by name and URL plus the
 /// legacy URL-only key.
 pub fn store_keys(name: &str, server_url: &str) -> (String, String) {
     let legacy_key = Url::parse(server_url)
@@ -170,7 +170,7 @@ pub fn store_keys(name: &str, server_url: &str) -> (String, String) {
     )
 }
 
-/// `callbackId` (oauth.ts:246): 12 characters identifying an MCP server URL
+/// `callbackId` (oauth.ts): 12 characters identifying an MCP server URL
 /// in callback paths, computed like Codex does (the first 9 bytes of the
 /// SHA-256 of the URL without its fragment, base64url).
 fn callback_id(server_url: &str) -> String {
@@ -185,7 +185,7 @@ fn callback_id(server_url: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..9])
 }
 
-/// `clientMetadataDocument` (oauth.ts:255-270): rpi's Client ID Metadata
+/// `clientMetadataDocument` (oauth.ts): rpi's Client ID Metadata
 /// Document, for `clientRegistration: "cimd"`, chosen like Codex chooses
 /// its own. Without the `iss` parameter in authorization responses
 /// (RFC 9207), the redirect URI and the document are specific to the MCP
@@ -324,7 +324,7 @@ fn serialize_states(states: &HashMap<String, McpOAuthState>) -> String {
 }
 
 /// Per-server OAuth state (client registration, tokens, pending PKCE
-/// verifier) in `mcp-auth.json` (`McpOAuthServerStore`, oauth.ts:123).
+/// verifier) in `mcp-auth.json` (`McpOAuthServerStore`, oauth.ts).
 pub struct McpOAuthServerStore {
     path: PathBuf,
     lock_dir: Option<PathBuf>,
@@ -403,7 +403,7 @@ impl McpOAuthServerStore {
         &self.path
     }
 
-    /// `load` (oauth.ts:131): the first server to load legacy state takes it
+    /// `load` (oauth.ts): the first server to load legacy state takes it
     /// over inside the storage lock. `None` also covers an unreadable store
     /// (the lock/corruption branches fail closed).
     pub async fn load(&self) -> Option<McpOAuthState> {
@@ -431,7 +431,7 @@ impl McpOAuthServerStore {
         .map_err(|error| error.to_string())
     }
 
-    /// `withRefreshLock` (oauth.ts:162): a lock file per server, released on
+    /// `withRefreshLock` (oauth.ts): a lock file per server, released on
     /// drop, so another process can take over after a crash.
     ///
     /// Lock acquisition failures fail closed: upstream's proper-lockfile
@@ -562,7 +562,7 @@ impl McpOAuthServerStore {
     }
 }
 
-/// `McpOAuthCredentialStore` (oauth.ts:139).
+/// `McpOAuthCredentialStore` (oauth.ts).
 pub struct McpOAuthCredentialStore {
     path: PathBuf,
     lock_dir: Option<PathBuf>,
@@ -591,7 +591,7 @@ impl McpOAuthCredentialStore {
         &self.path
     }
 
-    /// `forServer` (oauth.ts:140).
+    /// `forServer` (oauth.ts).
     pub fn for_server(&self, name: &str, server_url: &str) -> McpOAuthServerStore {
         let (key, legacy_key) = store_keys(name, server_url);
         McpOAuthServerStore {
@@ -602,7 +602,7 @@ impl McpOAuthCredentialStore {
         }
     }
 
-    /// `tokens` (oauth.ts:184): stored tokens, for noticing sign-ins done by
+    /// `tokens` (oauth.ts): stored tokens, for noticing sign-ins done by
     /// another process. Does not take over legacy state.
     pub fn tokens(&self, name: &str, server_url: &str) -> Option<OAuthTokens> {
         let (key, legacy_key) = store_keys(name, server_url);
@@ -621,7 +621,7 @@ impl McpOAuthCredentialStore {
         })
     }
 
-    /// `remove` (oauth.ts:194): whether credentials were stored; removes
+    /// `remove` (oauth.ts): whether credentials were stored; removes
     /// legacy state the server would take over.
     pub fn remove(&self, name: &str, server_url: &str) -> bool {
         let (key, legacy_key) = store_keys(name, server_url);
@@ -648,14 +648,14 @@ impl McpOAuthCredentialStore {
     }
 }
 
-/// `registeredRedirectUrls` (oauth.ts:214).
+/// `registeredRedirectUrls` (oauth.ts).
 fn registered_redirect_urls(client: Option<&OAuthClientInformation>) -> Vec<String> {
     client
         .map(|client| client.redirect_uris.clone())
         .unwrap_or_default()
 }
 
-/// `createMcpAuthProvider` (oauth.ts:252): sends the stored access token and
+/// `createMcpAuthProvider` (oauth.ts): sends the stored access token and
 /// refreshes it when it is about to expire or after a 401. Throws
 /// [`McpError::AuthorizationRequired`] when the user has to sign in.
 pub struct McpAuthProvider {
@@ -684,7 +684,7 @@ impl McpAuthProvider {
         }
     }
 
-    /// `createProvider` (oauth.ts:272): the provider identifies with the
+    /// `createProvider` (oauth.ts): the provider identifies with the
     /// Client ID Metadata Document when `clientRegistration: "cimd"`.
     fn provider_for(
         &self,
@@ -727,7 +727,7 @@ impl McpAuthProvider {
         })
     }
 
-    /// `refresh` (oauth.ts:264): replace `stale_token`, the access token
+    /// `refresh` (oauth.ts): replace `stale_token`, the access token
     /// that expired or was rejected.
     async fn refresh(
         &self,
@@ -883,7 +883,7 @@ impl AuthProvider for McpAuthProvider {
 }
 
 impl McpAuthProvider {
-    /// `settled` (oauth.ts:349): resolves when no refresh is running, so
+    /// `settled` (oauth.ts): resolves when no refresh is running, so
     /// shutdown does not drop rotated tokens before they are saved.
     pub async fn settled(&self) {
         let _guard = self.refreshing.lock().await;
@@ -897,7 +897,7 @@ fn now_millis() -> f64 {
         .unwrap_or_default()
 }
 
-/// `McpSignInPrompt` (oauth.ts:357).
+/// `McpSignInPrompt` (oauth.ts).
 #[async_trait::async_trait]
 pub trait McpSignInPrompt: Send + Sync {
     /// Show the authorization URL and open it in a browser.
@@ -908,14 +908,14 @@ pub trait McpSignInPrompt: Send + Sync {
     async fn prompt_for_redirect_url(&self, signal: CancellationToken) -> Option<String>;
 }
 
-/// `McpSignInCancelledError` (oauth.ts:371).
+/// `McpSignInCancelledError` (oauth.ts).
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("Sign-in cancelled")]
 pub struct McpSignInCancelledError;
 
-/// `responseFromRedirectUrl` (oauth.ts:379): the pasted URL must be the
+/// `responseFromRedirectUrl` (oauth.ts): the pasted URL must be the
 /// full redirect URI of this sign-in. A server-specific redirect URI tells
-/// authorization servers apart, so it must match exactly (oauth.ts:391-393).
+/// authorization servers apart, so it must match exactly (oauth.ts).
 pub fn response_from_redirect_url(
     input: &str,
     state: &str,
@@ -945,7 +945,7 @@ pub fn response_from_redirect_url(
     Ok((code.clone(), params.get("iss").cloned()))
 }
 
-/// `waitForAuthorizationResponse` (oauth.ts:417): the browser callback or a
+/// `waitForAuthorizationResponse` (oauth.ts): the browser callback or a
 /// pasted redirect URL, whichever comes first. Aborting `signal` aborts the
 /// prompt, which then cancels the sign-in.
 pub async fn wait_for_authorization_response(
@@ -982,7 +982,7 @@ pub async fn wait_for_authorization_response(
     result
 }
 
-/// `listenForCallback` (oauth.ts:446): listen on `port`, or on a free port
+/// `listenForCallback` (oauth.ts): listen on `port`, or on a free port
 /// when it is taken and not `required`.
 async fn listen_for_callback(
     settings: &CallbackSettings,
@@ -1041,7 +1041,7 @@ async fn verify_sign_in_persisted(store: &McpOAuthServerStore) -> Result<(), Str
     }
 }
 
-/// `signInMcpServer` (oauth.ts:434): uses the stored refresh token when
+/// `signInMcpServer` (oauth.ts): uses the stored refresh token when
 /// possible; otherwise runs the browser authorization code flow.
 pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String> {
     let SignInOptions {
@@ -1099,7 +1099,7 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
             // A registered client cannot use another redirect URI, and its
             // tokens belong to it. A Client ID Metadata Document is not
             // stored, so with one, a stored client was registered before
-            // and is replaced (oauth.ts:500-508).
+            // and is replaced (oauth.ts).
             let keep_client = settings.client_id.is_some()
                 || if cimd {
                     stored.client_information.is_none()
@@ -1178,7 +1178,7 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
             scope: flow_scope,
             skip_refresh: step_up,
             // Requests to the authorization server are time-limited
-            // (`timedFetch`, oauth.ts:227-232).
+            // (`timedFetch`, oauth.ts).
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_millis(OAUTH_REQUEST_TIMEOUT_MS))
                 .build()
@@ -1203,15 +1203,17 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
             .await
             .ok_or_else(|| "OAuth flow did not produce a state parameter".to_owned())?;
         // The flow picks the redirect URI, which may be specific to the MCP
-        // server (oauth.ts:535-536).
+        // server (oauth.ts).
         let authorization_redirect_url = authorization_url
             .query_pairs()
             .find(|(key, _)| key == "redirect_uri")
             .map(|(_, value)| value.into_owned())
             .and_then(|value| Url::parse(&value).ok())
             .unwrap_or_else(|| {
-                Url::parse(&redirect_url)
-                    .unwrap_or_else(|_| Url::parse(FALLBACK_REDIRECT_URL).expect("valid fallback"))
+                Url::parse(&redirect_url).unwrap_or_else(|_| {
+                    // A compile-time constant that always parses.
+                    Url::parse(FALLBACK_REDIRECT_URL).expect("valid fallback")
+                })
             });
         prompt.show_authorization_url(authorization_url);
         let (code, iss) = wait_for_authorization_response(
@@ -1237,7 +1239,7 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
     .await;
     callback.close().await;
     // Aborted requests fail with the signal's reason; report them as the
-    // cancellation they are (oauth.ts:552-553).
+    // cancellation they are (oauth.ts).
     match result {
         Err(_) if signal.as_ref().is_some_and(CancellationToken::is_cancelled) => {
             Err(McpSignInCancelledError.to_string())
@@ -1376,7 +1378,7 @@ mod tests {
         .unwrap();
         assert_eq!(code, "x");
         assert_eq!(iss.as_deref(), Some("https://as.example"));
-        // A server-specific redirect URI must match exactly (oauth.ts:391).
+        // A server-specific redirect URI must match exactly (oauth.ts).
         assert!(
             response_from_redirect_url("http://127.0.0.1:1/other?code=x&state=s", "s", &redirect)
                 .is_err()

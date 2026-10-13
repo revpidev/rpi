@@ -339,6 +339,66 @@ async fn close_aborts_a_connect_still_in_progress() {
     assert!(result.is_err(), "the aborted connect reports an error");
 }
 
+/// A transport whose `start` fails with a transient (network) error, so
+/// `open()` enters its retry wait.
+struct FlakyTransport;
+
+#[async_trait::async_trait]
+impl McpTransport for FlakyTransport {
+    async fn start(&self) -> Result<(), McpTransportError> {
+        Err(McpTransportError::Io("connection refused".to_owned()))
+    }
+
+    async fn send(&self, _message: Value) -> Result<(), McpTransportError> {
+        Err(McpTransportError::ConnectionClosed)
+    }
+
+    async fn close(&self) -> Result<(), McpTransportError> {
+        Ok(())
+    }
+
+    fn events(&self) -> Arc<rpi_mcp::TransportEvents> {
+        Arc::new(rpi_mcp::TransportEvents::default())
+    }
+}
+
+/// #10249: `close()` interrupts the wait between HTTP connect retries
+/// instead of waiting out the full retry schedule.
+#[tokio::test]
+async fn close_interrupts_the_retry_wait() {
+    let factory: McpTransportFactory =
+        Arc::new(|_entry, _cwd, _auth| Ok(Arc::new(FlakyTransport) as Arc<dyn McpTransport>));
+    let connection = Arc::new(McpServerConnection::new(McpServerConnectionOptions {
+        entry: http_entry("flaky", "http://127.0.0.1:9/mcp"),
+        cwd: "/tmp".to_owned(),
+        create_transport: factory,
+        credentials: Arc::new(McpOAuthCredentialStore::new(std::path::Path::new(
+            "/tmp/rpi-mcp-test",
+        ))),
+        provider_token: None,
+        on_tools: Arc::new(|_| {}),
+        on_change: None,
+        log: None,
+    }));
+    let connecting = {
+        let connection = connection.clone();
+        tokio::spawn(async move { connection.get_client().await })
+    };
+    // Let the first attempt fail and the retry wait start (250 ms).
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let started = std::time::Instant::now();
+    tokio::time::timeout(std::time::Duration::from_secs(2), connection.close())
+        .await
+        .expect("close returns during the retry wait");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "close must not wait out the retry schedule (took {:?})",
+        started.elapsed()
+    );
+    assert_eq!(connection.state(), ServerState::Closed);
+    assert!(connecting.await.unwrap().is_err());
+}
+
 /// The `McpServerConfig` shape used by the tests stays the same as the
 /// validated runtime shape.
 #[test]
