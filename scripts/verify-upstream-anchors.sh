@@ -58,15 +58,12 @@ crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensio
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:52-57@const CODEMODE_MEMORY_LIMIT_BYTES = 256
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:105-117@export interface CodemodeNestedCall \{
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:91-96@function toModelInfo
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:122-157@function checkClassifierContext
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:159-183@function checkImagesContext
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:368-396@function truncateOutput
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:122-170@function checkClassifierContext
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:173-196@function checkImagesContext
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:373-396@function truncateOutput
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:232-243@function readCodemodeStore
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:539-548@function isNamespaceName
 crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:550-620@function createDiscoveryGlobals
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:316-434@export async function executeCodemode
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:398-410@function toScriptValue
-crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:519-630@function createModelGlobals
 crates/rpi-codemode/src/source.rs@packages/codemode/src/source.ts@source.ts:11@CODEMODE_OPTIONS_PREFIX
 crates/rpi-codemode/src/source.rs@packages/codemode/src/source.ts@source.ts:18-30@CODEMODE_SOURCE_GRAMMAR
 crates/rpi-codemode/src/source.rs@packages/codemode/src/source.ts@source.ts:15-16@const MAX_TIMEOUT_MS
@@ -91,7 +88,7 @@ crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:82-90@e
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:92-125@export interface CodemodeSandboxOptions
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:127-136@export interface CodemodeExecuteOptions
 crates/rpi-codemode/src/types.rs@packages/codemode/src/runtime/host.ts@host.ts:22@const DEFAULT_TIMEOUT_MS
-crates/rpi-codemode/src/types.rs@packages/codemode/src/runtime/prelude-source.ts@prelude-source.ts:32-33@MAX_STORE_VALUE_CHARS = 256 \* 1024
+crates/rpi-codemode/src/types.rs@packages/codemode/src/runtime/prelude-source.ts@prelude-source.ts:39-42@export const MAX_OUTPUT_CHARS = 16 \* 1024 \* 1024
 crates/rpi-codemode/src/types.rs@packages/codemode/src/runtime/host.ts@host.ts:24-35@const RESERVED_GLOBALS
 crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:102-106@interface PendingCall
 crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:297-308@private finish

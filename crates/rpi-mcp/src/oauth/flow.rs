@@ -719,34 +719,34 @@ async fn run_flow(
         }
     }
     let mut client = stored;
+    // `client = stored ?? (clientDocument && { client_id: clientDocument.url })`
+    // (flow.ts:362): identifying as the document skips registration.
+    if client.is_none()
+        && let Some(document) = &client_document
+    {
+        client = Some(OAuthClientInformation {
+            client_id: document.url.clone(),
+            ..Default::default()
+        });
+    }
     if client.is_none() {
         if options.authorization_code.is_some() {
             return Err(OAuthFlowError::Invalid(
                 "OAuth client information is missing during code exchange".to_owned(),
             ));
         }
-        let information = if let Some(document) = &client_document {
-            // `client = clientDocument && { client_id: clientDocument.url }`
-            // (flow.ts:362): identifying as the document skips registration.
-            OAuthClientInformation {
-                client_id: document.url.clone(),
-                ..Default::default()
-            }
-        } else {
-            let information = register_client(
-                &discovered.authorization_server_url,
-                &RegisterClientOptions {
-                    metadata: metadata.clone(),
-                    client_metadata: provider.client_metadata(),
-                    scope: scope.clone(),
-                    client: options.client.clone(),
-                    signal: options.signal.clone(),
-                },
-            )
-            .await?;
-            provider.save_client_information(information.clone()).await;
-            information
-        };
+        let information = register_client(
+            &discovered.authorization_server_url,
+            &RegisterClientOptions {
+                metadata: metadata.clone(),
+                client_metadata: provider.client_metadata(),
+                scope: scope.clone(),
+                client: options.client.clone(),
+                signal: options.signal.clone(),
+            },
+        )
+        .await?;
+        provider.save_client_information(information.clone()).await;
         client = Some(information);
     }
     let client = client.expect("client information is set above");

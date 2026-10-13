@@ -77,6 +77,10 @@ pub struct Args {
     pub no_builtin_tools: bool,
     pub extensions: Option<Vec<String>>,
     pub no_extensions: bool,
+    /// `--no-mcp` (v1.0.4 `04b97ef00`): disable the built-in MCP extension
+    /// for one run. The option is consumed by the runtime ([`crate::extensions::without_disabled_builtins`]);
+    /// the `--no-mcp` parse, help, and CLI matrix land with V17-04.
+    pub no_mcp: bool,
     pub print: bool,
     pub export: Option<String>,
     pub no_skills: bool,

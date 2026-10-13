@@ -786,7 +786,8 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     // path in print mode, i.e. without UI.
     let trust_prompt_has_ui =
         app_mode == AppMode::Interactive && !parsed.help && parsed.list_models.is_none();
-    let resolved_extension_paths = resolve_cli_paths(&cwd, &parsed.extensions);
+    let resolved_extension_paths = resolve_cli_paths(&cwd, &parsed.extensions)
+        .map(|paths| crate::extensions::without_disabled_builtins(paths, parsed.no_mcp));
     let resolved_skill_paths = resolve_cli_paths(&cwd, &parsed.skills);
     let resolved_prompt_template_paths = resolve_cli_paths(&cwd, &parsed.prompt_templates);
     let resolved_theme_paths = resolve_cli_paths(&cwd, &parsed.themes);
@@ -960,13 +961,16 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         .resource_loader
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    loader
+                    let paths: Vec<String> = loader
                         .resources()
                         .extensions
                         .paths
                         .iter()
                         .map(|path| path.to_string_lossy().into_owned())
-                        .collect()
+                        .collect();
+                    // `--no-mcp` drops `builtin:mcp` even when settings or
+                    // `-e` enable it (main.ts:785).
+                    crate::extensions::without_disabled_builtins(paths, parsed.no_mcp)
                 };
                 let extension_host =
                     rpi_ext_host::host::NativeExtensionHost::new(&cwd.to_string_lossy());
@@ -1079,33 +1083,42 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(cwd.clone(), trusted);
-                    let package_extension_paths = if trusted {
-                        {
-                            let mut loader = services
-                                .resource_loader
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            loader.settings_manager_mut().set_project_trusted(true);
-                            loader.set_project_trusted(true);
-                        }
-                        // Re-resolve packages with the trusted settings and
-                        // re-feed the loader before the reload (T15 W7).
-                        let trusted_paths =
-                            resolve_package_resource_paths(&cwd, &options.agent_dir, true).await;
-                        {
-                            let mut loader = services
-                                .resource_loader
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            loader.set_package_resources(trusted_paths);
-                            loader.reload();
-                        }
-                        // Trusted settings/auto/package/builtin extension
-                        // paths (V16-13 FR-A/B).
-                        resolve_host_extension_paths(&cwd, &options.agent_dir, true).await
-                    } else {
-                        resolve_host_extension_paths(&cwd, &options.agent_dir, trusted).await
-                    };
+                    let package_extension_paths = crate::extensions::without_disabled_builtins(
+                        if trusted {
+                            {
+                                let mut loader = services
+                                    .resource_loader
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                loader.settings_manager_mut().set_project_trusted(true);
+                                loader.set_project_trusted(true);
+                            }
+                            // Re-resolve packages with the trusted settings and
+                            // re-feed the loader before the reload (T15 W7).
+                            let mut trusted_paths =
+                                resolve_package_resource_paths(&cwd, &options.agent_dir, true)
+                                    .await;
+                            if parsed.no_mcp {
+                                trusted_paths
+                                    .extension_paths
+                                    .retain(|entry| entry.path.to_string_lossy() != "builtin:mcp");
+                            }
+                            {
+                                let mut loader = services
+                                    .resource_loader
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                loader.set_package_resources(trusted_paths);
+                                loader.reload();
+                            }
+                            // Trusted settings/auto/package/builtin extension
+                            // paths (V16-13 FR-A/B).
+                            resolve_host_extension_paths(&cwd, &options.agent_dir, true).await
+                        } else {
+                            resolve_host_extension_paths(&cwd, &options.agent_dir, trusted).await
+                        },
+                        parsed.no_mcp,
+                    );
 
                     // Final pass: the full set for the resolved trust state;
                     // pre-trust extensions are reused (resource-loader.ts:520-571).
@@ -1130,8 +1143,15 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         .load_startup_final(
                             options.agent_dir.clone(),
                             cli_extension_paths.clone(),
-                            resolve_host_extension_paths(&cwd, &options.agent_dir, project_trusted)
+                            crate::extensions::without_disabled_builtins(
+                                resolve_host_extension_paths(
+                                    &cwd,
+                                    &options.agent_dir,
+                                    project_trusted,
+                                )
                                 .await,
+                                parsed.no_mcp,
+                            ),
                             builtin_extensions.clone(),
                             project_trusted,
                             parsed.no_extensions,

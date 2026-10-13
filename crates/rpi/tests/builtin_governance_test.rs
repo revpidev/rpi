@@ -279,3 +279,60 @@ async fn no_extensions_drops_resolved_builtins_but_keeps_explicit_ones() {
         "builtin:codemode"
     );
 }
+
+/// `--no-mcp` consumption (V17-03 FR-F): the resolved `builtin:mcp` path is
+/// dropped, so the built-in MCP extension never loads — no `mcp.json` read,
+/// no connections, no `mcp__*` tools. Other built-ins are unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_mcp_drops_the_builtin_mcp_extension() {
+    let tmp = TempDir::new();
+    let cwd = tmp.path().join("cwd");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let runtime = model_runtime(&agent_dir).await;
+
+    let host = NativeExtensionHost::new(&cwd.to_string_lossy());
+    let errors = host
+        .load_startup_final(
+            agent_dir.clone(),
+            rpi::extensions::without_disabled_builtins(builtin_paths(), true),
+            Vec::new(),
+            builtin_factories(runtime.clone()),
+            false,
+            false,
+        )
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let core = host.core();
+    let paths: Vec<&str> = core
+        .extensions()
+        .iter()
+        .map(|ext| ext.path.as_str())
+        .collect();
+    assert!(!paths.contains(&"builtin:mcp"), "{paths:?}");
+    assert!(paths.contains(&"builtin:codemode"), "{paths:?}");
+    assert!(host.get_command("mcp").is_none());
+    assert!(host.get_command("llama").is_some());
+
+    // Without the flag the extension loads as before.
+    let host = NativeExtensionHost::new(&cwd.to_string_lossy());
+    let errors = host
+        .load_startup_final(
+            agent_dir,
+            rpi::extensions::without_disabled_builtins(builtin_paths(), false),
+            Vec::new(),
+            builtin_factories(runtime),
+            false,
+            false,
+        )
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(
+        host.core()
+            .extensions()
+            .iter()
+            .any(|ext| ext.path == "builtin:mcp")
+    );
+    assert!(host.get_command("mcp").is_some());
+}

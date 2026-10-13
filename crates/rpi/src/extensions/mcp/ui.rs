@@ -317,6 +317,12 @@ struct McpServer {
     registered_config: Option<String>,
     message: Mutex<Option<String>>,
     ready: Mutex<Option<watch::Receiver<bool>>>,
+    /// Bumped by every connection attempt, so a late result from an old
+    /// attempt is dropped (index.ts:585).
+    attempt: std::sync::atomic::AtomicU64,
+    /// Settles when the server's current connection was closed; a new
+    /// connection waits for it (index.ts:740-754).
+    closing: Mutex<Option<watch::Receiver<bool>>>,
 }
 
 /// Tool bookkeeping shared by the registration paths.
@@ -1039,8 +1045,8 @@ impl McpBuiltinState {
 
     /// `startConnection` (index.ts:583): connect the server in the
     /// background after `after` (a previous ready signal), unless the
-    /// session ended meanwhile. The returned receiver settles when the
-    /// attempt finished (`server.ready`).
+    /// session ended or a later attempt replaced this one. The returned
+    /// receiver settles when the attempt finished (`server.ready`).
     fn start_connection(
         self: &Arc<Self>,
         server: Arc<McpServer>,
@@ -1049,11 +1055,15 @@ impl McpBuiltinState {
         let (sender, receiver) = watch::channel(false);
         let state = self.clone();
         let session = self.session_signal();
+        let attempt = server.attempt.fetch_add(1, Ordering::SeqCst) + 1;
         tokio::spawn(async move {
             if let Some(mut after) = after {
                 let _ = after.wait_for(|ready| *ready).await;
             }
-            let is_current = move || !session.is_cancelled();
+            let is_current = {
+                let server = server.clone();
+                move || !session.is_cancelled() && server.attempt.load(Ordering::SeqCst) == attempt
+            };
             if !is_current() {
                 let _ = sender.send(true);
                 return;
@@ -1208,19 +1218,32 @@ impl McpBuiltinState {
             return Some(failure);
         }
         if !enabled {
+            // `server.attempt = undefined` + `closing = Promise.all([connection.close(), server.ready])`
+            // (index.ts:740-748): a later enable waits for the close.
+            server.attempt.fetch_add(1, Ordering::SeqCst);
             let connection = server
                 .connection
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .take();
+            let ready = lock_server_ready(&server).clone();
+            let (sender, receiver) = watch::channel(false);
+            *lock(&server.closing) = Some(receiver);
+            tokio::spawn(async move {
+                if let Some(connection) = connection {
+                    connection.close().await;
+                }
+                if let Some(mut ready) = ready {
+                    let _ = ready.wait_for(|ready| *ready).await;
+                }
+                let _ = sender.send(true);
+            });
             self.hide_tools(name);
-            if let Some(connection) = connection {
-                connection.close().await;
-            }
             return None;
         }
+        let after = lock(&server.closing).take();
         let server_for_ready = server.clone();
-        let ready = self.start_connection(server, None);
+        let ready = self.start_connection(server, after);
         *lock_server_ready(&server_for_ready) = Some(ready);
         self.ensure_discovery_active(ctx);
         None
@@ -1290,6 +1313,33 @@ impl McpBuiltinState {
         }
         self.sync_resource_tools();
         None
+    }
+
+    /// `runInBackground` (index.ts:930): keep the manager usable while a
+    /// connection opens or closes; the result shows in the server's
+    /// message. Late results of a replaced attempt are dropped (index.ts:936).
+    fn run_in_background<F>(
+        self: &Arc<Self>,
+        ctx: &ExtensionContext,
+        server: &Arc<McpServer>,
+        operation: F,
+    ) where
+        F: std::future::Future<Output = Option<String>> + Send + 'static,
+    {
+        let state = self.clone();
+        let ctx = ctx.clone();
+        let server = server.clone();
+        let attempt = server.attempt.load(Ordering::SeqCst);
+        let guard = self.track();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let message = operation.await;
+            if !state.session_active() || server.attempt.load(Ordering::SeqCst) != attempt {
+                return;
+            }
+            *lock(&server.message) = message;
+            state.ensure_discovery_active(&ctx);
+        });
     }
 
     /// `formatStatus` (index.ts:807).
@@ -1469,6 +1519,12 @@ impl McpBuiltinState {
         });
         servers
     }
+}
+
+/// `inProject` (index.ts:756): a global server without an override, in a
+/// trusted project, gets the "in this project" enable/disable arms.
+fn in_project_available(entry: &McpServerEntry, project_config: bool) -> bool {
+    entry.scope == Some(McpScope::Global) && entry.override_path.is_none() && project_config
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1758,6 +1814,8 @@ impl McpBuiltinState {
                         registered_config: None,
                         message: Mutex::new(None),
                         ready: Mutex::new(None),
+                        attempt: std::sync::atomic::AtomicU64::new(0),
+                        closing: Mutex::new(None),
                     })
                 })
                 .collect();
@@ -1830,6 +1888,8 @@ impl McpBuiltinState {
                 registered_config: Some(config.to_string()),
                 message: Mutex::new(None),
                 ready: Mutex::new(None),
+                attempt: std::sync::atomic::AtomicU64::new(0),
+                closing: Mutex::new(None),
             }));
         }
         (registered, overridden)
@@ -2342,11 +2402,12 @@ impl McpBuiltinState {
                     // `action.endsWith("-project")` (index.ts:969-974).
                     let enable = action.starts_with("enable");
                     let in_project = action.ends_with("-project");
-                    let failure = self.set_enabled(&base, &name, enable, in_project).await;
-                    *lock(&server.message) = failure.clone();
-                    if let Some(failure) = failure {
-                        ui.notify(&failure, NotifyType::Error);
-                    }
+                    let state = self.clone();
+                    let name = name.clone();
+                    let ctx = base.clone();
+                    self.run_in_background(&base, &server, async move {
+                        state.set_enabled(&ctx, &name, enable, in_project).await
+                    });
                 }
                 "reconnect" => {
                     let connection = server
@@ -2356,9 +2417,20 @@ impl McpBuiltinState {
                         .clone();
                     if let Some(connection) = connection {
                         ui.notify(&format!("Reconnecting to {name}…"), NotifyType::Info);
-                        if let Err(error) = connection.reconnect().await {
-                            ui.notify(&error.to_string(), NotifyType::Error);
-                        }
+                        let server_for_ready = server.clone();
+                        self.run_in_background(&base, &server, async move {
+                            // Reconnect after a pending readiness settles
+                            // (index.ts:723-731).
+                            let ready = lock_server_ready(&server_for_ready).clone();
+                            if let Some(mut ready) = ready {
+                                let _ = ready.wait_for(|ready| *ready).await;
+                            }
+                            connection
+                                .reconnect()
+                                .await
+                                .err()
+                                .map(|error| error.to_string())
+                        });
                     }
                 }
                 "signout" => {
@@ -2379,9 +2451,7 @@ impl McpBuiltinState {
             .clone();
         // Global servers without an override can be turned on or off for the
         // trusted project alone (index.ts:756-762).
-        let in_project = entry.scope == Some(McpScope::Global)
-            && entry.override_path.is_none()
-            && lock(&self.project_config).is_some();
+        let in_project = in_project_available(&entry, lock(&self.project_config).is_some());
         let mut options: Vec<String> = Vec::new();
         if !entry.config.enabled() {
             options.push("enable".to_owned());
@@ -2736,5 +2806,59 @@ mod tests {
         let plain = sign_in_url_display(&url, false);
         assert_eq!(plain, url.as_str());
         assert!(!plain.contains('\u{1b}'));
+    }
+
+    /// `inProject` (index.ts:756): only global servers without an override,
+    /// in a trusted project, get the project enable/disable arms.
+    #[test]
+    fn in_project_arms_only_for_global_servers_without_override() {
+        let global = entry("docs", json!({"url": "https://x"}));
+        assert!(in_project_available(&global, true));
+        assert!(!in_project_available(&global, false));
+
+        let mut overridden = global.clone();
+        overridden.override_path = Some("/p/.rpi/mcp.json".to_owned());
+        assert!(!in_project_available(&overridden, true));
+
+        let mut project = global.clone();
+        project.scope = Some(McpScope::Project);
+        assert!(!in_project_available(&project, true));
+    }
+
+    /// `AbortSignal.any` (index.ts:687): the merged sign-in signal cancels
+    /// when either the session or the cancel key aborts.
+    #[tokio::test]
+    async fn merged_signals_cancel_with_either_input() {
+        let session = CancellationToken::new();
+        let cancel = CancellationToken::new();
+        let merged = merge_signals(&session, Some(cancel.clone()));
+        assert!(!merged.is_cancelled());
+        cancel.cancel();
+        for _ in 0..100 {
+            if merged.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            merged.is_cancelled(),
+            "the cancel key aborts the merged token"
+        );
+
+        let session = CancellationToken::new();
+        let merged = merge_signals(&session, None);
+        session.cancel();
+        assert!(
+            merged.is_cancelled(),
+            "without a cancel key the session wins"
+        );
+
+        let cancelled_session = CancellationToken::new();
+        cancelled_session.cancel();
+        let merged = merge_signals(&cancelled_session, Some(CancellationToken::new()));
+        assert!(
+            merged.is_cancelled(),
+            "an aborted session cancels immediately"
+        );
     }
 }

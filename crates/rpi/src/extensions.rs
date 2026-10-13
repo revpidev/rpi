@@ -37,6 +37,20 @@ pub fn builtin_extension_names() -> Vec<String> {
         .collect()
 }
 
+/// `disabledBuiltinExtensions: ["mcp"]` (main.ts:785): `--no-mcp` disables
+/// the built-in MCP extension for the run — its servers never connect and
+/// its tools are never registered, even when settings or `-e` enable it.
+pub fn without_disabled_builtins(paths: Vec<String>, no_mcp: bool) -> Vec<String> {
+    if no_mcp {
+        paths
+            .into_iter()
+            .filter(|path| path != "builtin:mcp")
+            .collect()
+    } else {
+        paths
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Upstream: "registers a native provider and /llama command"
@@ -89,5 +103,21 @@ mod tests {
             super::BUILTIN_EXTENSION_NAMES,
             ["llama.cpp", "codemode", "tool-search", "mcp"]
         );
+    }
+
+    /// `--no-mcp` disables the built-in MCP extension, even when settings or
+    /// `-e` enable it (main.ts:785; resource-loader.test.ts).
+    #[test]
+    fn no_mcp_drops_the_builtin_mcp_path() {
+        let paths = vec![
+            "builtin:codemode".to_owned(),
+            "builtin:mcp".to_owned(),
+            "/tmp/ext.mjs".to_owned(),
+        ];
+        assert_eq!(
+            super::without_disabled_builtins(paths.clone(), true),
+            ["builtin:codemode", "/tmp/ext.mjs"]
+        );
+        assert_eq!(super::without_disabled_builtins(paths, false).len(), 3);
     }
 }

@@ -1259,6 +1259,8 @@ pub struct SignInOptions<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     fn store(name: &str) -> (McpOAuthCredentialStore, TempDir) {
@@ -1498,6 +1500,56 @@ mod tests {
         }
     }
 
+    /// V16-08 hardening confirmation (V17-03 FR-E R1): credentials are
+    /// bound to the server name AND URL — the v1.0.0 `mcp__<name>|<url>`
+    /// key. Same URL under another name or same name at another URL never
+    /// shares credentials.
+    #[tokio::test]
+    async fn credential_keys_bind_name_and_url() {
+        let (key, legacy) = store_keys("docs", "https://mcp.example/mcp");
+        assert_eq!(key, "mcp__docs|https://mcp.example/mcp");
+        assert_eq!(legacy, "https://mcp.example/mcp");
+
+        let dir = TempDir::new();
+        let credentials = McpOAuthCredentialStore::memory(dir.path.join("mcp-auth.json"));
+        let stored = McpOAuthState {
+            server_url: "https://mcp.example/mcp".to_owned(),
+            tokens: Some(OAuthTokens {
+                access_token: "token-a".to_owned(),
+                token_type: "bearer".to_owned(),
+                ..Default::default()
+            }),
+            ..sample_state("unused")
+        };
+        credentials
+            .for_server("docs", "https://mcp.example/mcp")
+            .save(stored)
+            .await
+            .unwrap();
+        assert_eq!(
+            credentials
+                .tokens("docs", "https://mcp.example/mcp")
+                .map(|tokens| tokens.access_token),
+            Some("token-a".to_owned())
+        );
+        assert!(
+            credentials
+                .tokens("other", "https://mcp.example/mcp")
+                .is_none(),
+            "the same URL under another name must not share credentials"
+        );
+        assert!(
+            credentials
+                .tokens("docs", "https://other.example/mcp")
+                .is_none(),
+            "the same name at another URL must not share credentials"
+        );
+        // The legacy URL-only key is only a read/take-over source; the
+        // v1.0.0 key is what new writes use.
+        assert!(legacy != key);
+        std::fs::remove_dir_all(&dir.path).ok();
+    }
+
     /// Round-2 O10: a write failure is reported to the caller instead of
     /// being swallowed (the sign-in flow turns it into a user-visible
     /// error). Unix-only: the setup simulates the failure with a read-only
@@ -1658,5 +1710,345 @@ mod tests {
         verify_sign_in_persisted(&server)
             .await
             .expect("persisted tokens verify");
+    }
+
+    // -- CIMD (#10302) integration tests ---------------------------------
+
+    /// A local authorization server stub for the sign-in flow: metadata,
+    /// `/authorize` (302 to the redirect URI), `/token`, and a counted
+    /// `/register`.
+    #[derive(Default)]
+    struct CimdState {
+        registrations: std::sync::atomic::AtomicUsize,
+        token_forms: Mutex<Vec<HashMap<String, String>>>,
+        issuer: Mutex<String>,
+        cimd_supported: std::sync::atomic::AtomicBool,
+        iss_parameter: std::sync::atomic::AtomicBool,
+    }
+
+    async fn cimd_handle(
+        axum::extract::State(state): axum::extract::State<Arc<CimdState>>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        let path = request.uri().path().to_owned();
+        let query = request.uri().query().unwrap_or_default().to_owned();
+        let base = state.issuer.lock().unwrap().clone();
+        match path.as_str() {
+            "/.well-known/oauth-authorization-server" => {
+                let metadata = serde_json::json!({
+                    "issuer": base,
+                    "authorization_endpoint": format!("{base}/authorize"),
+                    "token_endpoint": format!("{base}/token"),
+                    "registration_endpoint": format!("{base}/register"),
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "token_endpoint_auth_methods_supported": ["none"],
+                    "client_id_metadata_document_supported": state
+                        .cimd_supported
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "authorization_response_iss_parameter_supported": state
+                        .iss_parameter
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                });
+                axum::response::Response::builder()
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(metadata.to_string()))
+                    .unwrap()
+            }
+            "/authorize" => {
+                let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+                let redirect = params.get("redirect_uri").cloned().unwrap_or_default();
+                let state_param = params.get("state").cloned().unwrap_or_default();
+                let mut location = format!("{redirect}?code=cimd-code&state={state_param}");
+                if state
+                    .iss_parameter
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    location.push_str(&format!("&iss={base}"));
+                }
+                axum::response::Response::builder()
+                    .status(302)
+                    .header("location", location)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+            "/token" => {
+                let body = axum::body::to_bytes(request.into_body(), 65536)
+                    .await
+                    .unwrap_or_default();
+                state.token_forms.lock().unwrap().push(
+                    url::form_urlencoded::parse(&body)
+                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                        .collect(),
+                );
+                let tokens = serde_json::json!({
+                    "access_token": "access-1",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                    "refresh_token": "refresh-1",
+                });
+                axum::response::Response::builder()
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(tokens.to_string()))
+                    .unwrap()
+            }
+            "/register" => {
+                state
+                    .registrations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::response::Response::builder()
+                    .status(500)
+                    .body(axum::body::Body::from("must not register"))
+                    .unwrap()
+            }
+            _ => axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        }
+    }
+
+    async fn start_cimd_server(cimd_supported: bool, iss_parameter: bool) -> (Url, Arc<CimdState>) {
+        let state = Arc::new(CimdState::default());
+        state
+            .cimd_supported
+            .store(cimd_supported, std::sync::atomic::Ordering::SeqCst);
+        state
+            .iss_parameter
+            .store(iss_parameter, std::sync::atomic::Ordering::SeqCst);
+        let app = axum::Router::new()
+            .fallback(cimd_handle)
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        *state.issuer.lock().unwrap() = format!("http://{address}");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (Url::parse(&format!("http://{address}")).unwrap(), state)
+    }
+
+    /// A browser stand-in: fetching the authorization URL follows its 302
+    /// redirect to the loopback callback; pasting a URL never resolves.
+    struct BrowserPrompt;
+
+    #[async_trait::async_trait]
+    impl McpSignInPrompt for BrowserPrompt {
+        fn show_authorization_url(&self, url: Url) {
+            tokio::spawn(async move {
+                let _ = reqwest::get(url).await;
+            });
+        }
+
+        async fn prompt_for_redirect_url(&self, signal: CancellationToken) -> Option<String> {
+            signal.cancelled().await;
+            None
+        }
+    }
+
+    async fn cimd_settings() -> McpOAuthSettings {
+        McpOAuthSettings {
+            client_registration: Some("cimd".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// #10302: with the `iss` parameter the shared document is used and no
+    /// client is registered; without it the document and callback path are
+    /// specific to the MCP server.
+    #[tokio::test]
+    async fn cimd_uses_the_metadata_document_instead_of_registering() {
+        for iss_parameter in [true, false] {
+            let (as_url, state) = start_cimd_server(true, iss_parameter).await;
+            let credentials = McpOAuthCredentialStore::memory(std::env::temp_dir().join(format!(
+                "rpi-cimd-{}-{iss_parameter}.json",
+                std::process::id()
+            )));
+            let server_url = format!("{as_url}/mcp");
+            let server = credentials.for_server("issues", &server_url);
+            sign_in_mcp_server(SignInOptions {
+                server_url: server_url.clone(),
+                store: &server,
+                settings: cimd_settings().await,
+                challenge: None,
+                prompt: &BrowserPrompt,
+                signal: None,
+            })
+            .await
+            .expect("cimd sign-in");
+            assert_eq!(
+                state
+                    .registrations
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "cimd must not register dynamically"
+            );
+            let (token_count, client_id, redirect_uri) = {
+                let forms = state.token_forms.lock().unwrap();
+                (
+                    forms.len(),
+                    forms[0].get("client_id").cloned(),
+                    forms[0].get("redirect_uri").cloned(),
+                )
+            };
+            assert_eq!(token_count, 1);
+            let expected_client = if iss_parameter {
+                format!("{CLIENT_METADATA_BASE_URL}/client.json")
+            } else {
+                format!(
+                    "{CLIENT_METADATA_BASE_URL}/{}/client.json",
+                    callback_id(&server_url)
+                )
+            };
+            assert_eq!(client_id.as_deref(), Some(expected_client.as_str()));
+            let redirect =
+                Url::parse(redirect_uri.as_deref().expect("redirect_uri")).expect("redirect URL");
+            if iss_parameter {
+                assert_eq!(redirect.path(), "/callback");
+            } else {
+                assert_eq!(
+                    redirect.path(),
+                    format!("/callback/{}", callback_id(&server_url))
+                );
+            }
+            // The document is not stored, so a second sign-in refreshes the
+            // tokens with the same client id instead of discarding them.
+            sign_in_mcp_server(SignInOptions {
+                server_url: server_url.clone(),
+                store: &server,
+                settings: cimd_settings().await,
+                challenge: None,
+                prompt: &BrowserPrompt,
+                signal: None,
+            })
+            .await
+            .expect("cimd refresh");
+            let (token_count, grant_type, client_id) = {
+                let forms = state.token_forms.lock().unwrap();
+                (
+                    forms.len(),
+                    forms[1].get("grant_type").cloned(),
+                    forms[1].get("client_id").cloned(),
+                )
+            };
+            assert_eq!(token_count, 2);
+            assert_eq!(grant_type.as_deref(), Some("refresh_token"));
+            assert_eq!(client_id.as_deref(), Some(expected_client.as_str()));
+        }
+    }
+
+    /// #10302: an authorization server without CIMD support reports the
+    /// upstream error instead of registering.
+    #[tokio::test]
+    async fn cimd_requires_authorization_server_support() {
+        let (as_url, state) = start_cimd_server(false, false).await;
+        let credentials = McpOAuthCredentialStore::memory(
+            std::env::temp_dir().join(format!("rpi-cimd-unsupported-{}.json", std::process::id())),
+        );
+        let server_url = format!("{as_url}/mcp");
+        let server = credentials.for_server("issues", &server_url);
+        let error = sign_in_mcp_server(SignInOptions {
+            server_url,
+            store: &server,
+            settings: cimd_settings().await,
+            challenge: None,
+            prompt: &BrowserPrompt,
+            signal: None,
+        })
+        .await
+        .expect_err("cimd without support must fail");
+        assert!(
+            error.contains(
+                "The authorization server does not support Client ID Metadata Documents for public clients; remove oauth.clientRegistration \"cimd\""
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            state
+                .registrations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    /// #10302: a stored dynamically registered client is replaced when the
+    /// server switches to the document (its tokens are not refreshed under
+    /// another client id).
+    #[tokio::test]
+    async fn cimd_replaces_a_registered_client() {
+        let (as_url, state) = start_cimd_server(true, true).await;
+        let credentials = McpOAuthCredentialStore::memory(
+            std::env::temp_dir().join(format!("rpi-cimd-replace-{}.json", std::process::id())),
+        );
+        let server_url = format!("{as_url}/mcp");
+        let server = credentials.for_server("issues", &server_url);
+        server
+            .save(McpOAuthState {
+                server_url: server_url.clone(),
+                client_information: Some(OAuthClientInformation {
+                    client_id: "registered-client".to_owned(),
+                    redirect_uris: vec!["http://127.0.0.1:1/callback".to_owned()],
+                    ..Default::default()
+                }),
+                tokens: Some(OAuthTokens {
+                    access_token: "stale".to_owned(),
+                    token_type: "bearer".to_owned(),
+                    refresh_token: Some("old-refresh".to_owned()),
+                    ..Default::default()
+                }),
+                tokens_expire_at: None,
+                code_verifier: None,
+                oauth_state: None,
+                discovery: None,
+            })
+            .await
+            .unwrap();
+        sign_in_mcp_server(SignInOptions {
+            server_url,
+            store: &server,
+            settings: cimd_settings().await,
+            challenge: None,
+            prompt: &BrowserPrompt,
+            signal: None,
+        })
+        .await
+        .expect("cimd sign-in replaces the client");
+        let (grant_type, client_id) = {
+            let forms = state.token_forms.lock().unwrap();
+            (
+                forms[0].get("grant_type").cloned(),
+                forms[0].get("client_id").cloned(),
+            )
+        };
+        assert_eq!(grant_type.as_deref(), Some("authorization_code"));
+        let expected_client = format!("{CLIENT_METADATA_BASE_URL}/client.json");
+        assert_eq!(client_id.as_deref(), Some(expected_client.as_str()));
+        let stored = server.load().await.unwrap();
+        assert!(stored.client_information.is_none());
+    }
+
+    /// #10565: an already-aborted signal cancels the sign-in before any
+    /// request is made.
+    #[tokio::test]
+    async fn an_aborted_sign_in_returns_cancelled() {
+        let credentials = McpOAuthCredentialStore::memory(
+            std::env::temp_dir().join(format!("rpi-cimd-cancel-{}.json", std::process::id())),
+        );
+        let server = credentials.for_server("issues", "https://example.invalid/mcp");
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = sign_in_mcp_server(SignInOptions {
+            server_url: "https://example.invalid/mcp".to_owned(),
+            store: &server,
+            settings: McpOAuthSettings::default(),
+            challenge: None,
+            prompt: &BrowserPrompt,
+            signal: Some(cancelled),
+        })
+        .await
+        .expect_err("cancelled sign-in");
+        assert!(error.contains("Sign-in cancelled"), "{error}");
     }
 }
