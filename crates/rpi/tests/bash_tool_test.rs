@@ -771,6 +771,106 @@ mod bash_executor_tests {
         assert!(!result.cancelled);
         assert!(!result.truncated);
     }
+
+    /// #10504 (27c7b6ff4): a fake shell emitting fixed chunks; the streamed
+    /// deltas are recorded for the chunk assertions.
+    struct ChunkOperations {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl rpi::tools::bash::BashOperations for ChunkOperations {
+        async fn exec(
+            &self,
+            _command: &str,
+            _cwd: &std::path::Path,
+            _options: BashExecOptions,
+            on_data: &(dyn Fn(Vec<u8>) + Send + Sync),
+        ) -> Result<Option<i32>, rpi::tools::bash::BashExecError> {
+            for chunk in &self.chunks {
+                on_data(chunk.clone());
+            }
+            Ok(Some(0))
+        }
+    }
+
+    /// Runs the fake shell with the given chunks and returns
+    /// `(output, streamed_deltas)`.
+    async fn run_chunks(chunks: Vec<Vec<u8>>) -> (String, String) {
+        let streamed = Arc::new(Mutex::new(Vec::new()));
+        let streamed_for_cb = streamed.clone();
+        let ops = ChunkOperations { chunks };
+        let result = execute_bash(
+            "custom",
+            std::path::Path::new("."),
+            &ops,
+            BashExecutorOptions {
+                on_chunk: Some(Box::new(move |delta| {
+                    streamed_for_cb
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(delta.to_owned());
+                })),
+                signal: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let joined = streamed.lock().unwrap_or_else(|e| e.into_inner()).join("");
+        (result.output, joined)
+    }
+
+    #[tokio::test]
+    async fn test_split_color_reset_inside_params() {
+        let (output, streamed) = run_chunks(vec![
+            b"\x1b[31mERROR: file.py:1\x1b[0".to_vec(),
+            b"m\n".to_vec(),
+        ])
+        .await;
+        assert_eq!(output, "ERROR: file.py:1\n");
+        assert_eq!(streamed, "ERROR: file.py:1\n");
+    }
+
+    #[tokio::test]
+    async fn test_split_color_code_right_after_esc() {
+        let (output, streamed) = run_chunks(vec![
+            b"before\x1b".to_vec(),
+            b"[32mafter\n".to_vec(),
+        ])
+        .await;
+        assert_eq!(output, "beforeafter\n");
+        assert_eq!(streamed, "beforeafter\n");
+    }
+
+    #[tokio::test]
+    async fn test_split_osc_before_terminator() {
+        let (output, _streamed) = run_chunks(vec![
+            b"a\x1b]0;window ".to_vec(),
+            b"title\x1b".to_vec(),
+            b"\\b\n".to_vec(),
+        ])
+        .await;
+        assert_eq!(output, "ab\n");
+    }
+
+    #[tokio::test]
+    async fn test_flush_incomplete_multibyte_character() {
+        // The first byte of `é` (U+00E9) without its continuation.
+        let (output, streamed) = run_chunks(vec![b"ok".to_vec(), vec![0xC3]]).await;
+        assert_eq!(output, "ok\u{FFFD}");
+        assert_eq!(streamed, "ok\u{FFFD}");
+    }
+
+    #[tokio::test]
+    async fn test_long_unterminated_sequence_is_not_held_back() {
+        let long = "x".repeat(300);
+        let chunk = format!("\x1b]{long}").into_bytes();
+        let (output, streamed) = run_chunks(vec![chunk]).await;
+        // The introducer sits farther back than the pending window, so the
+        // text streams as-is; sanitize drops the ESC.
+        assert_eq!(streamed, format!("]{long}"));
+        assert_eq!(output, format!("]{long}"));
+    }
 }
 
 mod process_group_tests {

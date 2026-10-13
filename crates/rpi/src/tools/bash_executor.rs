@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::bash::{BashExecError, BashExecOptions, BashOperations};
-use crate::tools::sanitize::{sanitize_binary_output, strip_ansi};
+use crate::tools::sanitize::{
+    sanitize_binary_output, split_incomplete_ansi_suffix, strip_ansi,
+};
 use crate::tools::truncate::{self, DEFAULT_MAX_BYTES, TruncateOptions};
 
 /// Result of a user bash execution (bash-executor.ts:29-40).
@@ -60,6 +62,9 @@ struct OutputState {
     temp_file: Option<File>,
     /// Streaming UTF-8 decoder state.
     pending: Vec<u8>,
+    /// Unfinished escape sequence at the end of the previous chunk,
+    /// completed by the next chunk (bash-executor.ts:73, #10504).
+    pending_ansi: String,
 }
 
 impl OutputState {
@@ -86,20 +91,13 @@ impl OutputState {
         }
     }
 
-    /// Process one raw data chunk: decode, sanitize, buffer, and optionally
-    /// write to temp file (bash-executor.ts:78-105).
-    fn on_data(&mut self, data: &[u8], on_chunk: Option<&(dyn Fn(&str) + Send + Sync)>) {
-        self.total_bytes += data.len();
-
-        // Streaming UTF-8 decode (bash-executor.ts:76, 82).
-        self.pending.extend_from_slice(data);
-        let decoded = decode_streaming(&mut self.pending);
-        if decoded.is_empty() {
+    /// Sanitize and append one decoded piece of output
+    /// (bash-executor.ts:73-105). Empty text is dropped like upstream;
+    /// sanitization can erase a chunk that held only an escape sequence.
+    fn append_text(&mut self, text: String, on_chunk: Option<&(dyn Fn(&str) + Send + Sync)>) {
+        if text.is_empty() {
             return;
         }
-
-        // Sanitize: strip ANSI, remove binary garbage, drop \r (bash-executor.ts:82).
-        let text = sanitize_binary_output(&strip_ansi(&decoded)).replace('\r', "");
 
         // Start writing to temp file if exceeds threshold (bash-executor.ts:85-87).
         if self.total_bytes > DEFAULT_MAX_BYTES {
@@ -123,6 +121,27 @@ impl OutputState {
             cb(&text);
         }
     }
+
+    /// Process one raw data chunk: decode, hold back an unfinished escape
+    /// sequence, sanitize, buffer, and optionally write to temp file
+    /// (bash-executor.ts:76-105).
+    fn on_data(&mut self, data: &[u8], on_chunk: Option<&(dyn Fn(&str) + Send + Sync)>) {
+        self.total_bytes += data.len();
+
+        // Streaming UTF-8 decode (bash-executor.ts:76, 82).
+        self.pending.extend_from_slice(data);
+        let decoded = decode_streaming(&mut self.pending);
+
+        // Unfinished escape sequence at the end of the previous chunk,
+        // completed by this one (bash-executor.ts:73-75).
+        let combined = format!("{}{decoded}", self.pending_ansi);
+        let (complete, pending) = split_incomplete_ansi_suffix(&combined);
+        self.pending_ansi = pending;
+
+        // Sanitize: strip ANSI, remove binary garbage, drop \r (bash-executor.ts:82).
+        let text = sanitize_binary_output(&strip_ansi(&complete)).replace('\r', "");
+        self.append_text(text, on_chunk);
+    }
 }
 
 /// Execute a bash command using the given [`BashOperations`] (bash-executor.ts:50-155).
@@ -145,6 +164,7 @@ pub async fn execute_bash(
         temp_file_path: None,
         temp_file: None,
         pending: Vec::new(),
+        pending_ansi: String::new(),
     }));
 
     let on_chunk = Arc::new(options.on_chunk);
@@ -174,29 +194,20 @@ pub async fn execute_bash(
     // Extract state (we need owned values for the final result).
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Flush remaining pending bytes from the streaming decoder.
-    if !st.pending.is_empty() {
-        let decoded = String::from_utf8_lossy(&st.pending).into_owned();
-        st.pending.clear();
-        if !decoded.is_empty() {
-            // Actually handle the decoded remainder directly.
-            let text = sanitize_binary_output(&strip_ansi(&decoded)).replace('\r', "");
-            if st.total_bytes > DEFAULT_MAX_BYTES {
-                st.ensure_temp_file();
-            }
-            if let Some(ref mut file) = st.temp_file {
-                let _ = file.write_all(text.as_bytes());
-            }
-            st.output_chunks.push(text.clone());
-            st.output_bytes += text.len();
-            while st.output_bytes > MAX_OUTPUT_BYTES && st.output_chunks.len() > 1 {
-                let removed = st.output_chunks.remove(0);
-                st.output_bytes = st.output_bytes.saturating_sub(removed.len());
-            }
-            if let Some(cb) = on_chunk.as_ref() {
-                cb(&text);
-            }
-        }
+    // Flush the streaming decoder's remainder plus the held-back escape
+    // sequence (bash-executor.ts:106 `flushOutput`).
+    {
+        let remainder = if st.pending.is_empty() {
+            String::new()
+        } else {
+            let decoded = String::from_utf8_lossy(&st.pending).into_owned();
+            st.pending.clear();
+            decoded
+        };
+        let combined = format!("{}{remainder}", st.pending_ansi);
+        st.pending_ansi.clear();
+        let text = sanitize_binary_output(&strip_ansi(&combined)).replace('\r', "");
+        st.append_text(text, on_chunk.as_deref());
     }
 
     // Build final result (bash-executor.ts:113-129).

@@ -3033,6 +3033,53 @@ fn unknown_entry_types_roundtrip_losslessly() {
     assert_eq!(parsed[2].type_tag(), "quantum_state");
 }
 
+/// V17-04 FR-F R1 (R3.7.1, #10549): `ToolResultMessage.duration_ms`
+/// persists through the session JSONL and reloads; legacy results without
+/// the key stay absent (not 0). The `Took` render consumption is V17-05.
+#[test]
+fn tool_result_duration_ms_roundtrips_through_jsonl() {
+    let tmp = TempDir::new();
+    let file = tmp.path().join("durations.jsonl");
+    let with_duration = "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"out\"}],\"isError\":false,\"timestamp\":1,\"durationMs\":1234}}";
+    let legacy = "{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2025-01-01T00:00:02.000Z\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"c2\",\"toolName\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"old\"}],\"isError\":false,\"timestamp\":2}}";
+    let content = format!(
+        "{}\n{with_duration}\n{legacy}\n",
+        header_line("s1", "/tmp")
+    );
+    std::fs::write(&file, content).expect("write");
+
+    let sm = SessionManager::open(&file, Some(tmp.path()), None).expect("open");
+    let mut durations = Vec::new();
+    for entry in sm.get_entries() {
+        if let Some(SessionEntry::Message(message)) = entry.known()
+            && let AgentMessage::ToolResult(result) = &message.message
+        {
+            durations.push((result.tool_call_id.clone(), result.duration_ms));
+        }
+    }
+    assert_eq!(
+        durations,
+        vec![("c1".to_owned(), Some(1234)), ("c2".to_owned(), None)]
+    );
+
+    // Persistence is byte-faithful: the recorded value stays, the legacy
+    // result gains no key.
+    let exported = sm.export_jsonl().expect("export");
+    assert!(
+        exported.contains("\"durationMs\":1234"),
+        "recorded duration exported: {exported}"
+    );
+    assert!(
+        !exported.contains("\"durationMs\":null"),
+        "legacy result must not gain a null duration: {exported}"
+    );
+    assert_eq!(
+        exported.matches("\"durationMs\"").count(),
+        1,
+        "only the recorded result carries the key: {exported}"
+    );
+}
+
 /// Migration assigns id/parentId to unknown types too and keeps the remaining fields
 /// (requirements §6.6: write-back does not lose data).
 #[test]

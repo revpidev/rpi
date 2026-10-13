@@ -3158,6 +3158,17 @@ fn read_clipboard_image_png() -> Option<Vec<u8>> {
 /// replaced by the platform tools: `wl-paste` on Wayland, `xclip` on X11,
 /// `pbpaste` on macOS.
 fn read_clipboard_text() -> Option<String> {
+    // #10391 (592fb57b7): Termux reports platform "android", not "linux",
+    // so `termux-clipboard-get` runs before the Linux-only branch. An empty
+    // read is treated as no clipboard, like upstream `bytes.toString() || null`.
+    if std::env::var_os("TERMUX_VERSION").is_some()
+        && let Some(bytes) =
+            run_clipboard_command("termux-clipboard-get", &[], CLIPBOARD_READ_TIMEOUT)
+        && let Ok(text) = String::from_utf8(bytes)
+        && !text.is_empty()
+    {
+        return Some(text);
+    }
     #[cfg(target_os = "linux")]
     {
         let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()

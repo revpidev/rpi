@@ -199,13 +199,15 @@ pub(crate) fn copy_to_clipboard_via(
     if oversized {
         return Err("Clipboard unavailable: text exceeds the OSC 52 size limit".to_string());
     }
+    // Termux reports platform "android", not "linux" (#10391 592fb57b7):
+    // the hint must not be nested under the Linux branch.
+    if env.termux {
+        return Err(
+            "Clipboard unavailable: install the Termux:API app and `termux-api` package"
+                .to_string(),
+        );
+    }
     if env.platform == ClipboardPlatform::Linux {
-        if env.termux {
-            return Err(
-                "Clipboard unavailable: install the Termux:API app and `termux-api` package"
-                    .to_string(),
-            );
-        }
         if env.wayland {
             return Err(
                 "Clipboard unavailable: install `wl-clipboard` (`wl-copy`) or check Wayland access"
@@ -758,6 +760,29 @@ mod tests {
     #[test]
     fn termux_failure_reports_termux_guidance() {
         let mut env = env(ClipboardPlatform::Linux);
+        env.termux = true;
+        let mut recorder = Recorder::new(&[]);
+        let result = copy_to_clipboard_via(
+            "hello",
+            &env,
+            &mut |p, a, i, t| recorder.run(p, a, i, t),
+            &mut |_| true,
+        );
+        assert_eq!(
+            result,
+            Err(
+                "Clipboard unavailable: install the Termux:API app and `termux-api` package"
+                    .to_string()
+            )
+        );
+        assert_eq!(recorder.names(), vec!["termux-clipboard-set"]);
+    }
+
+    /// #10391 (592fb57b7): Termux reports platform `android`, so the hint
+    /// must not be nested under the Linux branch.
+    #[test]
+    fn termux_on_android_reports_termux_guidance() {
+        let mut env = env(ClipboardPlatform::Other);
         env.termux = true;
         let mut recorder = Recorder::new(&[]);
         let result = copy_to_clipboard_via(
