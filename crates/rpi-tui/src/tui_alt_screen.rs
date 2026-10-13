@@ -4076,7 +4076,7 @@ impl TuiAltScreenInner {
         });
         // WezTerm erases intersecting Kitty image cells when a later write
         // touches a covered row; redraw even when no image anchor itself
-        // changed (`imageCellsNeedRedraw`, tui-alt-screen.ts:1708-1721).
+        // changed (`imageCellsNeedRedraw`, tui-alt-screen.ts:1708-1720).
         let is_wezterm = is_wezterm_env();
         let image_cells_need_redraw = !image_anchors_need_redraw
             && is_wezterm
@@ -4125,7 +4125,7 @@ impl TuiAltScreenInner {
         // WezTerm erases intersecting Kitty image cells when a later row
         // write touches a covered row (`803f0e906`, #9169). Draw image
         // placements after every clear and text write so nothing later
-        // intersects them (`drawKittyImagesLast`, tui-alt-screen.ts:1746-1763
+        // intersects them (`drawKittyImagesLast`, tui-alt-screen.ts:1746-1762
         // @ 672000c80, #10319); preserve the existing interleaved output for
         // text-only frames and every other terminal.
         let draw_kitty_images_last = redraw_images

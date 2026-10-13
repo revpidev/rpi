@@ -22,7 +22,7 @@ use rpi_tui::program_status::{ProgramStatus, ProgramStatusKind, ProgramStatusSta
 use crate::config::APP_NAME;
 use crate::core::compaction_runner::CompactionReason;
 
-/// `BlockedStatus` (program-status-reporter.ts:5-9): what a blocked program
+/// `BlockedStatus` (program-status-reporter.ts:5): what a blocked program
 /// waits for plus the one-line dialog title.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedStatus {
@@ -30,7 +30,7 @@ pub struct BlockedStatus {
     pub message: String,
 }
 
-/// `firstLine` (program-status-reporter.ts:11-13): the first line of an
+/// `firstLine` (program-status-reporter.ts:7-9): the first line of an
 /// error, or `"Error"` when empty. Never the rest of the assistant output.
 fn first_line(text: Option<&str>) -> String {
     let line = text
@@ -44,7 +44,7 @@ fn first_line(text: Option<&str>) -> String {
     }
 }
 
-/// `ProgramStatusReporter` (program-status-reporter.ts:17-138).
+/// `ProgramStatusReporter` (program-status-reporter.ts:17-111).
 #[derive(Debug)]
 pub struct ProgramStatusReporter {
     run_active: bool,
@@ -159,7 +159,7 @@ impl ProgramStatusReporter {
         self.resting_status = ProgramStatus::idle();
     }
 
-    /// `report()` (program-status-reporter.ts:95-102): returns the status to
+    /// `report()` (program-status-reporter.ts:95-101): returns the status to
     /// send, or `None` when it equals the last one sent. The caller forwards
     /// a `Some` to [`rpi_tui::terminal::Terminal::set_program_status`].
     pub fn report(&mut self, session_name: Option<&str>) -> Option<ProgramStatus> {
@@ -172,7 +172,7 @@ impl ProgramStatusReporter {
         Some(status)
     }
 
-    /// `currentStatus()` (program-status-reporter.ts:103-138).
+    /// `currentStatus()` (program-status-reporter.ts:103-110).
     fn current_status(&self, session_name: Option<&str>) -> ProgramStatus {
         if let Some((_, blocked)) = self.blocked.last() {
             return ProgramStatus::blocked(blocked.kind, blocked.message.clone());

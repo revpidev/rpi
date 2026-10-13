@@ -16,7 +16,7 @@ use base64::Engine as _;
 use rpi_tui::components::image::{ImageTranscoder, set_image_transcoder};
 use rpi_tui::terminal_image::{ImageProtocol, get_capabilities};
 
-/// `loadPngTranscoder` (image-convert.ts:59-67): a synchronous transcoder
+/// `loadPngTranscoder` (image-convert.ts:61-68, JSDoc 57-60): a synchronous transcoder
 /// that decodes any image, applies EXIF orientation, and re-encodes PNG.
 pub fn load_png_transcoder() -> ImageTranscoder {
     Arc::new(|base64_data: &str, _mime_type: &str| {
@@ -28,7 +28,7 @@ pub fn load_png_transcoder() -> ImageTranscoder {
     })
 }
 
-/// `pngTranscoderRegistered` (image-convert.ts:70).
+/// `pngTranscoderRegistered` (image-convert.ts:71).
 static PNG_TRANSCODER_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Serializes crate tests that mutate the global transcoder state.
@@ -52,7 +52,7 @@ pub(crate) fn install_test_transcoder(transcoder: ImageTranscoder) {
     PNG_TRANSCODER_REGISTERED.store(true, Ordering::SeqCst);
 }
 
-/// `ensurePngTranscoder` (image-convert.ts:77-89): on Kitty-protocol
+/// `ensurePngTranscoder` (image-convert.ts:78-90, JSDoc 73-77): on Kitty-protocol
 /// terminals register the transcoder once so non-PNG images render.
 /// `on_registered` runs after registration so callers can re-render images
 /// that showed text fallbacks; it is not called when the transcoder was

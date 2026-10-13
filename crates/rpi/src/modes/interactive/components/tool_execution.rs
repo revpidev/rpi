@@ -22,8 +22,8 @@
 //!   contract).
 //! - Kitty image conversion happens inside the `rpi-tui` `Image` component
 //!   through the registered PNG transcoder (`utils/image_convert.rs`,
-//!   upstream `maybeConvertImagesForKitty` + photon,
-//!   tool-execution.ts:340-382 + utils/image-convert.ts): the component keeps
+//!   upstream `imageSources` reuse + `ensurePngTranscoder`,
+//!   tool-execution.ts:340-385 + utils/image-convert.ts:78): the component keeps
 //!   converted PNG data across updates and reuses `Image` instances whose
 //!   source bytes did not change. Upstream's async conversion has a
 //!   synchronous equivalent because the `image` crate is compiled in.

@@ -320,7 +320,7 @@ fn detect_capabilities_inner(
         };
     }
 
-    // Herdr supports OSC 8 but not images (terminal-image.ts:89-96 @
+    // Herdr supports OSC 8 but not images (terminal-image.ts:89-93 @
     // b2363841a, #10573). Checked BEFORE the Kitty branch so leaked
     // environment variables such as KITTY_WINDOW_ID do not enable images
     // inside Herdr panes.
@@ -756,7 +756,7 @@ fn get_registered_kitty_image_metadata(line: &str) -> Option<RegisteredKittyImag
     get_registered_kitty_image_metadata_from_controls(controls)
 }
 
-/// `getRegisteredKittyImageMetadataFromControls` (terminal-image.ts:359-364
+/// `getRegisteredKittyImageMetadataFromControls` (terminal-image.ts:359-362
 /// @ 672000c80 / #10319): the id lookup without re-extracting the controls.
 fn get_registered_kitty_image_metadata_from_controls(
     controls: &str,
@@ -794,7 +794,7 @@ pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
     get_registered_kitty_image_metadata(line).map(|registered| registered.metadata)
 }
 
-/// `KittyImagePlacement` (terminal-image.ts:336-347 @ 4181f66, `rows` since
+/// `KittyImagePlacement` (terminal-image.ts:336-344 @ 4181f66, `rows` since
 /// 672000c80 / #10319).
 #[derive(Debug, Clone, PartialEq)]
 pub struct KittyImagePlacement {
@@ -820,7 +820,7 @@ fn controls_have_m_1(controls: &str) -> bool {
 }
 
 /// Read the number of rows covered by an image placement without scanning
-/// its payload (`getKittyImagePlacementRows`, terminal-image.ts:413-420 @
+/// its payload (`getKittyImagePlacementRows`, terminal-image.ts:413-419 @
 /// 672000c80, #10319).
 pub fn get_kitty_image_placement_rows(line: &str) -> Option<u32> {
     let (_, controls, _) = find_kitty_command(line)?;
