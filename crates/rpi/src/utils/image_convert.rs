@@ -52,7 +52,7 @@ pub(crate) fn install_test_transcoder(transcoder: ImageTranscoder) {
     PNG_TRANSCODER_REGISTERED.store(true, Ordering::SeqCst);
 }
 
-/// `ensurePngTranscoder` (image-convert.ts:78-90, JSDoc 73-77): on Kitty-protocol
+/// `ensurePngTranscoder` (image-convert.ts:78-89, JSDoc 73-77): on Kitty-protocol
 /// terminals register the transcoder once so non-PNG images render.
 /// `on_registered` runs after registration so callers can re-render images
 /// that showed text fallbacks; it is not called when the transcoder was
