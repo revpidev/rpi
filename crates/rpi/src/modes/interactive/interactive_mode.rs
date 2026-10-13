@@ -4033,6 +4033,11 @@ impl InteractiveUi {
         entries: &[crate::core::session_manager::StoredEntry],
         options: RenderOptions,
     ) {
+        // `renderer.resetTextSelection()` (interactive-mode.ts:4054 @
+        // 83c9e2645, #10567): a transcript rebuild discards the fullscreen
+        // selection and multi-click state so stale coordinates cannot
+        // highlight unrelated text after a session switch.
+        self.ui.reset_text_selection();
         lock(&self.pending_tools).clear();
         let mut rendered_pending_tools: HashMap<String, Arc<Mutex<ToolExecutionComponent>>> =
             HashMap::new();
@@ -9377,6 +9382,36 @@ mod tests {
         assert!(
             !payload_text.trim().is_empty(),
             "selection text is a rendered screen line: {payload_text:?}"
+        );
+        mode.shutdown().await;
+    }
+
+    // V17-05 FR-D (#10567): a transcript rebuild drops the fullscreen
+    // selection and multi-click state (interactive-mode.ts:4054).
+    #[tokio::test]
+    async fn transcript_rebuild_drops_the_fullscreen_selection() {
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+        ui.push(UiCommand::SwitchTuiMode(TuiMode::Fullscreen));
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), TuiMode::Fullscreen);
+        ui.ui.render_now(false);
+
+        // Press/drag/release over the transcript creates an active selection
+        // (copyOnSelect is off after `/settings`, or the release would copy
+        // and clear it — either way this sequence leaves the selection, as
+        // the copy-path matrix test shows).
+        terminal.feed("\x1b[<0;1;2M");
+        terminal.feed("\x1b[<32;40;2M");
+        terminal.feed("\x1b[<0;40;2m");
+        ui.ui.tick(std::time::Instant::now());
+        assert!(ui.ui.has_active_selection(), "selection established");
+
+        ui.rebuild_chat_from_messages();
+        assert!(
+            !ui.ui.has_active_selection(),
+            "render_session_entries resets the selection (#10567)"
         );
         mode.shutdown().await;
     }

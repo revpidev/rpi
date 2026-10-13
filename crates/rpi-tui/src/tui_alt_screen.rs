@@ -1116,6 +1116,17 @@ impl TuiAltScreen {
         });
     }
 
+    /// `resetTextSelection()` (tui-alt-screen.ts:1325-1329 @ 83c9e2645,
+    /// #10567): drop the selection AND the multi-click state before a
+    /// transcript rebuild, so stale coordinates cannot highlight unrelated
+    /// text after a session switch.
+    pub fn reset_text_selection(&self) {
+        self.run_or_queue(|inner| {
+            inner.clear_text_selection();
+            inner.last_click = None;
+        });
+    }
+
     /// `flash` (tui-alt-screen.ts:380-383): show a transient message in the
     /// alternate-screen flash stack. `None` uses the upstream default
     /// duration ([`DEFAULT_DURATION_MS`]).
@@ -6099,6 +6110,42 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Copied!"))
         );
+
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("resetTextSelection drops the selection and multi-click state")
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn reset_text_selection_drops_selection_and_multi_click_state() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+
+        // A drag selects across two rows; a double click records the
+        // multi-click anchor.
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        send_input(&terminal, &tui, "\x1b[<0;4;2m");
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<0;1;1m");
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<0;1;1m");
+        settle(&tui);
+        assert!(tui.has_active_selection());
+        assert_eq!(tui.try_read(|inner| inner.last_click.is_some()), Some(true));
+
+        tui.reset_text_selection();
+        settle(&tui);
+        assert!(!tui.has_active_selection());
+        assert_eq!(tui.try_read(|inner| inner.last_click.is_none()), Some(true));
 
         stop(&tui);
     }

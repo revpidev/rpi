@@ -615,6 +615,15 @@ impl TuiHandle {
             RendererClone::Alt(tui) => tui.copy_active_selection_to_clipboard(),
         }
     }
+
+    /// `resetTextSelection` (tui-alt-screen.ts:1325-1329 @ 83c9e2645,
+    /// #10567): drop the fullscreen selection and multi-click state before a
+    /// transcript rebuild. No-op on the main screen (no selection surface).
+    pub fn reset_text_selection(&self) {
+        if let RendererClone::Alt(tui) = self.renderer_clone() {
+            tui.reset_text_selection();
+        }
+    }
 }
 
 /// Lock the inner renderer (poisoning recovered like `lock_shared`).
