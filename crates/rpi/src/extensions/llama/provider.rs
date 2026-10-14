@@ -395,8 +395,8 @@ impl Provider for LlamaProvider {
                     .collect();
                 // `restoredClassifiers = stored.filter(isLlamaClassifierModel)`
                 // (provider.ts:239): only this provider's decision
-                // classifiers are restored — the chat-model
-                // chat-model fallback classifier arm is not ported.
+                // classifiers are restored — the chat-model fallback
+                // classifier arm is not ported.
                 *lock(&this.classifiers) = stored
                     .models
                     .iter()
