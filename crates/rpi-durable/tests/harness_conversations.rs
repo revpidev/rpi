@@ -12,7 +12,12 @@ use std::sync::Arc;
 use harness_support::{context, init_append, open_recording};
 use rpi_durable::harness::{AgentChange, ConversationCreateOptions, RootOptions};
 use rpi_durable::ids::{ConversationId, id_from_number};
-use rpi_durable::session::{ConversationOwnership, DocOwner, commit_fn};
+use rpi_durable::session::{ConversationOwnership, DocOwner, EntryDraft, commit_fn};
+use rpi_durable::types::Storage;
+
+mod test_support;
+
+use test_support::{TempDir, cleanup_temp_dirs};
 
 async fn entry_kinds(
     harness: &Arc<rpi_durable::harness::HarnessImpl>,
@@ -209,6 +214,113 @@ async fn independent_conversations_get_init_and_roll_back_failures() {
             .await
             .contains(&"test.init".to_string())
     );
+}
+
+/// upstream: "forks at a concrete entry with as-of agent + overrides" and
+/// "identity/state across reopen": a conversation-level fork keeps its parent
+/// edge and its copied `pi.agent` state across a real storage reopen.
+#[tokio::test]
+async fn fork_keeps_the_parent_edge_and_survives_reopen() {
+    let dir = TempDir::new("rpi-durable-harness-fork");
+    let storage = open_jsonl_storage(&dir).await;
+    let (harness, _scheduler) = harness_support::open_recording_with(Arc::clone(&storage)).await;
+    let context = context();
+    let root = harness
+        .root(&context, RootOptions::default())
+        .await
+        .expect("root");
+    root.configure(
+        AgentChange {
+            instructions: Some(Some("forked".to_string())),
+            ..AgentChange::default()
+        },
+        &context,
+    )
+    .await
+    .expect("configure");
+
+    let entry = {
+        let conversation = root.id();
+        root.commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    let mut draft = EntryDraft::new("test.note");
+                    draft.data = Some(serde_json::json!({ "n": 1 }));
+                    let record = tx.append_entry(conversation, draft).await?;
+                    Ok(record.id)
+                })
+            }),
+            &context,
+        )
+        .await
+        .expect("commit")
+    };
+
+    let forked = root
+        .fork(
+            entry,
+            ConversationCreateOptions {
+                ownership: ConversationOwnership::Ownerless,
+                agent: None,
+                init: None,
+            },
+            &context,
+        )
+        .await
+        .expect("fork");
+    let record = storage
+        .conversation(forked.id(), &context)
+        .await
+        .expect("record")
+        .expect("present");
+    assert_eq!(
+        record
+            .parent
+            .as_ref()
+            .map(|parent| (parent.conversation_id, parent.at)),
+        Some((root.id(), entry))
+    );
+    // Forks start from the agent state as of the fork entry.
+    let agent = forked.agent(&context).await.expect("agent");
+    assert_eq!(agent.instructions.as_deref(), Some("forked"));
+
+    harness.close(&context).await.expect("close");
+    drop(storage);
+    let storage = open_jsonl_storage(&dir).await;
+    let (reopened, _scheduler) = harness_support::open_recording_with(Arc::clone(&storage)).await;
+    let again = reopened
+        .conversation(forked.id(), &context)
+        .await
+        .expect("lookup")
+        .expect("present");
+    assert_eq!(again.id(), forked.id());
+    assert_eq!(
+        again
+            .agent(&context)
+            .await
+            .expect("agent")
+            .instructions
+            .as_deref(),
+        Some("forked")
+    );
+    reopened.close(&context).await.expect("close");
+    drop(storage);
+    cleanup_temp_dirs("rpi-durable-harness-fork");
+}
+
+async fn open_jsonl_storage(dir: &TempDir) -> Arc<dyn Storage> {
+    let directory = dir.path_str();
+    let fs: Arc<dyn rpi_durable::fs::FileSystem> =
+        Arc::new(rpi_durable::fs::StdFileSystem::new(dir.path()));
+    let storage = rpi_durable::storage::JsonlStorage::open(
+        &directory,
+        fs,
+        rpi_durable::storage::JsonlStorageOptions { fsync: false },
+        &context(),
+    )
+    .await
+    .expect("open jsonl storage");
+    Arc::new(storage)
 }
 
 #[tokio::test]

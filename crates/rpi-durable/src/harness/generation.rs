@@ -9,7 +9,7 @@
 //! Ported phases: `prepare`, `request`, `retry`, `tools`. The upstream `poll`
 //! phase and `fetchDeferred`/`cancelDeferred` are [DEFER] (R2.2.1); a deferred
 //! provider response settles the run `unanswered`/`model_error` (registered
-//! FORM, design §7.3 item 8).
+//! FORM, V17-14 task §7.3 item 12).
 //!
 //! Rust shape notes: upstream `streamResponse` throttles partials with a timer
 //! and one commit in flight; the port commits synchronously when
@@ -724,7 +724,7 @@ async fn classify(
     } = request;
     if message.stop_reason == StopReason::Deferred {
         // [DEFER] R2.2.1: a deferred provider response settles the run
-        // `unanswered`/`model_error` (registered FORM; design §7.3 item 8).
+        // `unanswered`/`model_error` (registered FORM; V17-14 task §7.3 item 12).
         return fail_model_error(
             runtime,
             "Deferred model responses are not supported".to_string(),

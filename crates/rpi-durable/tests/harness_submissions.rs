@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harness_support::{clear_run, context, input, open_recording, write};
+use rpi_durable::chord::context::with_abort_signal;
 use rpi_durable::harness::{RootOptions, SubmissionAbort, WhenBusy};
 use rpi_durable::session::EntryDraft;
+use tokio_util::sync::CancellationToken;
 
 fn note(kind: &str) -> EntryDraft {
     EntryDraft::new(kind)
@@ -190,4 +192,43 @@ async fn queued_items_are_placed_in_order_on_the_next_submission() {
     assert_eq!(started[1].1, vec![queued.id()]);
     let record = queued.status(&context).await.expect("status");
     assert_eq!(record.status(), "placed");
+}
+
+/// upstream: "cancels only a wait ... the submission keeps its queue
+/// position" — the wait rejects on its context cancellation while the durable
+/// admission and the run are untouched.
+#[tokio::test]
+async fn cancelling_a_wait_does_not_cancel_the_queued_work() {
+    let (harness, scheduler) = open_recording().await;
+    let context = context();
+    let conversation = root_conversation(&harness).await;
+    conversation
+        .submit(input("start", None, None), &context)
+        .await
+        .expect("start");
+    let queued = conversation
+        .submit(input("later", Some(WhenBusy::FollowUp), None), &context)
+        .await
+        .expect("queue");
+
+    let token = CancellationToken::new();
+    let cancellable = with_abort_signal(token.clone(), &context);
+    let waiting = {
+        let queued = Arc::clone(&queued);
+        tokio::spawn(async move { queued.wait(&cancellable).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    token.cancel();
+
+    assert!(
+        waiting.await.expect("join").is_err(),
+        "the cancelled wait rejects"
+    );
+    // The queued work survives: still queued, same run, no new admission.
+    assert_eq!(
+        queued.status(&context).await.expect("status").status(),
+        "queued"
+    );
+    assert_eq!(scheduler.started_runs().len(), 1);
+    harness.close(&context).await.expect("close");
 }
