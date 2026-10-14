@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use rpi_ai::api::openai_completions::OpenAiCompletions;
+use rpi_ai::api::typesafe_system_one::{TYPESAFE_SYSTEM_ONE_API, typesafe_system_one_api};
 use rpi_ai::auth::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthInteraction, AuthPrompt, AuthResult,
     AuthType, Credential, ModelAuth, ModelsError, ModelsErrorCode, ProviderAuth,
@@ -30,8 +31,9 @@ use rpi_ai::auth::{
 use rpi_ai::models::{Provider, ProviderStreams, RefreshModelsContext, now_millis};
 use rpi_ai::models_store::ModelsStoreEntry;
 use rpi_ai::types::{
-    AnyModel, ApiKind, InputModality, MaxTokensField, Model, ModelCompat, ProviderEnv,
-    SimpleStreamOptions, StreamOptions, TranscriptContext,
+    AnyModel, ApiKind, ClassifierModel, InputModality, MaxTokensField, Model, ModelCompat,
+    ModelType, ProviderClassifier, ProviderEnv, SimpleStreamOptions, StreamOptions,
+    TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use tokio_util::sync::CancellationToken;
@@ -47,8 +49,8 @@ pub const LLAMA_PROVIDER_ID: &str = "llama.cpp";
 /// `DEFAULT_LLAMA_SERVER_URL` (provider.ts:14).
 pub const DEFAULT_LLAMA_SERVER_URL: &str = "http://127.0.0.1:8080";
 
-fn lock(models: &Mutex<Vec<Model>>) -> std::sync::MutexGuard<'_, Vec<Model>> {
-    models.lock().unwrap_or_else(|e| e.into_inner())
+fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    value.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn auth_error(error: LlamaError) -> ModelsError {
@@ -159,16 +161,51 @@ fn is_chat_model(model: &LlamaModelInfo) -> bool {
         })
 }
 
-fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaError> {
+/// `contextWindowOf(model, cachedContextWindow?)` (provider.ts:72-79): the
+/// runtime `n_ctx` wins, `n_ctx_train` fills in, 128000 otherwise. The
+/// upstream `configuredContextWindow` probe (`--ctx-size`/`-c`/`-ctx` args)
+/// and the refreshed-catalog `cachedContextWindow` fallback remain the
+/// v0.1.4 shape difference (V17-16 §7.3); chat and classifier entries share
+/// this one computation.
+fn context_window_of(model: &LlamaModelInfo) -> u32 {
     let reported_context_window = model
         .meta
         .as_ref()
         .and_then(|meta| meta.n_ctx)
         .or_else(|| model.meta.as_ref().and_then(|meta| meta.n_ctx_train));
-    let context_window = reported_context_window
+    reported_context_window
         .filter(|window| *window > 0)
         .and_then(|window| u32::try_from(window).ok())
-        .unwrap_or(128_000);
+        .unwrap_or(128_000)
+}
+
+/// `toPiClassifierModel` (provider.ts:96-112): a llama.cpp model used as a
+/// classifier. Decision models answer natively through llama.cpp's System
+/// One endpoint (`/v1/systemone`), so their base URL is the inference URL
+/// (`{server}/v1`) and the `typesafe-system-one` transport appends
+/// `/systemone`. The upstream chat-model label-probability fallback
+/// classifier is not ported ([N/A-struct], ADR-0034 decision 6 / V17-16).
+fn to_pi_classifier_model(
+    model: &LlamaModelInfo,
+    server_url: &str,
+) -> Result<ClassifierModel, LlamaError> {
+    Ok(ClassifierModel {
+        model_type: ModelType::Classifier,
+        id: model.id.clone(),
+        name: model.id.clone(),
+        api: ApiKind::from(TYPESAFE_SYSTEM_ONE_API),
+        provider: LLAMA_PROVIDER_ID.to_owned(),
+        base_url: llama_inference_url(server_url)?,
+        input: vec![InputModality::Text],
+        input_limits: None,
+        cost: rpi_ai::types::ModelCost::default(),
+        context_window: context_window_of(model),
+        headers: None,
+    })
+}
+
+fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaError> {
+    let context_window = context_window_of(model);
     let mut input = vec![InputModality::Text];
     if model
         .architecture
@@ -224,6 +261,10 @@ pub struct LlamaSetCatalogOptions {
 /// `createLlamaProvider` (provider.ts:58-131).
 pub struct LlamaProvider {
     models: Mutex<Vec<Model>>,
+    /// `classifiers` (provider.ts:96-112/179): the decision models the
+    /// catalog reports, registered as `typesafe-system-one` classifier
+    /// entries (`getAllModels` exposes chat + classifiers).
+    classifiers: Mutex<Vec<ClassifierModel>>,
     base_url: String,
     auth: ProviderAuth,
     api: Arc<dyn ProviderStreams>,
@@ -233,6 +274,7 @@ impl LlamaProvider {
     fn new() -> Self {
         LlamaProvider {
             models: Mutex::new(Vec::new()),
+            classifiers: Mutex::new(Vec::new()),
             // `DEFAULT_LLAMA_SERVER_URL` is a valid http URL, so the fallback
             // is exactly what `llamaInferenceUrl` would produce.
             base_url: llama_inference_url(DEFAULT_LLAMA_SERVER_URL)
@@ -245,11 +287,13 @@ impl LlamaProvider {
         }
     }
 
-    /// `setCatalog` (provider.ts:61-63 @ dcd461925): entries selectable via
-    /// [`model_is_selectable`] are published as pi models — loaded and
-    /// sleeping always; unloaded presets when the router autoloads. Decision
-    /// models are not listed for chat (provider.ts:176-178 @ f6127a1bf);
-    /// their classifier registration is the R2.4.3 ②③ evaluation (V17-06).
+    /// `setCatalog` (provider.ts:172-180 @ f6127a1bf): entries selectable
+    /// via [`model_is_selectable`] are published — loaded and sleeping
+    /// always; unloaded presets when the router autoloads. Chat entries skip
+    /// decision-only models (`isChatModel`, provider.ts:93-94); decision
+    /// models additionally become `typesafe-system-one` classifier entries
+    /// (`classifiers = selectable.map(toPiClassifierModel)` restricted to
+    /// the decision arm; the chat-model fallback classifier is not ported).
     pub fn set_catalog(
         &self,
         catalog: &[LlamaModelInfo],
@@ -257,12 +301,20 @@ impl LlamaProvider {
         options: LlamaSetCatalogOptions,
     ) -> Result<(), LlamaError> {
         let mut models = Vec::new();
+        let mut classifiers = Vec::new();
         for model in catalog {
-            if model_is_selectable(model, options.router_autoload) && is_chat_model(model) {
+            if !model_is_selectable(model, options.router_autoload) {
+                continue;
+            }
+            if is_chat_model(model) {
                 models.push(to_pi_model(model, server_url)?);
+            }
+            if is_decision_model(model) {
+                classifiers.push(to_pi_classifier_model(model, server_url)?);
             }
         }
         *lock(&self.models) = models;
+        *lock(&self.classifiers) = classifiers;
         Ok(())
     }
 }
@@ -292,6 +344,31 @@ impl Provider for LlamaProvider {
         lock(&self.models).clone()
     }
 
+    /// `getAllModels: () => [...models, ...classifiers]` (provider.ts:230 @
+    /// f6127a1bf): chat entries first, then the decision classifier entries.
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        let mut all: Vec<AnyModel> = lock(&self.models)
+            .iter()
+            .cloned()
+            .map(AnyModel::Chat)
+            .collect();
+        all.extend(
+            lock(&self.classifiers)
+                .iter()
+                .cloned()
+                .map(AnyModel::Classifier),
+        );
+        all
+    }
+
+    /// The classifier implementation behind this provider's entries
+    /// (`models.ts` provider classifiers registry): the decision models use
+    /// the shared `typesafe-system-one` transport, which appends
+    /// `/systemone` to the entry's inference base URL.
+    fn classifier(&self, api: &str) -> Option<Arc<dyn ProviderClassifier>> {
+        (api == TYPESAFE_SYSTEM_ONE_API).then(typesafe_system_one_api)
+    }
+
     /// `refreshModels` (provider.ts:113-128): restore the stored catalog,
     /// then — when network access is allowed, not cancelled, the credential
     /// is an api-key credential and it carries a `LLAMA_BASE_URL` — fetch
@@ -313,6 +390,23 @@ impl Provider for LlamaProvider {
                     .filter(|model| {
                         model.provider == LLAMA_PROVIDER_ID
                             && model.api.as_str() == ApiKind::OPENAI_COMPLETIONS
+                    })
+                    .cloned()
+                    .collect();
+                // `restoredClassifiers = stored.filter(isLlamaClassifierModel)`
+                // (provider.ts:239): only this provider's decision
+                // classifiers are restored — the chat-model
+                // chat-model fallback classifier arm is not ported.
+                *lock(&this.classifiers) = stored
+                    .models
+                    .iter()
+                    .filter_map(|model| match model {
+                        AnyModel::Classifier(classifier) => Some(classifier),
+                        _ => None,
+                    })
+                    .filter(|model| {
+                        model.provider == LLAMA_PROVIDER_ID
+                            && model.api.as_str() == TYPESAFE_SYSTEM_ONE_API
                     })
                     .cloned()
                     .collect();
@@ -346,11 +440,14 @@ impl Provider for LlamaProvider {
             .map_err(auth_error)?;
             if !context.signal.is_cancelled() {
                 let models = lock(&this.models).clone();
+                let classifiers = lock(&this.classifiers).clone();
+                let mut published: Vec<AnyModel> = models.into_iter().map(AnyModel::Chat).collect();
+                published.extend(classifiers.into_iter().map(AnyModel::Classifier));
                 context
                     .publish
                     .publish(rpi_ai::models::ModelsPublication {
                         persist: Some(Some(ModelsStoreEntry {
-                            models: models.into_iter().map(AnyModel::Chat).collect(),
+                            models: published,
                             last_modified: None,
                             checked_at: Some(now_millis()),
                             etag: None,
@@ -727,6 +824,131 @@ mod tests {
         assert_eq!(converted.context_window, 128_000);
     }
 
+    /// V17-16 FR-A/FR-B (R2.4.3 ②, provider.ts:96-112/172-180/230): decision
+    /// models become `typesafe-system-one` classifier entries whose base URL
+    /// is the inference URL (`{server}/v1`, so the transport requests
+    /// `/v1/systemone`); chat entries are unchanged and `get_all_models`
+    /// exposes chat + classifiers in catalog order.
+    #[test]
+    fn decision_models_become_system_one_classifier_entries() {
+        let controller = create_llama_provider();
+        let mut decision_only = model_info("lev", LlamaModelStatusValue::LOADED);
+        decision_only.architecture = Some(LlamaArchitecture {
+            input_modalities: vec!["text".to_owned()],
+            output_modalities: vec!["decisions".to_owned()],
+        });
+        decision_only.meta = Some(LlamaModelMeta {
+            n_ctx: Some(65536),
+            ..Default::default()
+        });
+        let mut decision_text = model_info("kev", LlamaModelStatusValue::LOADED);
+        decision_text.architecture = Some(LlamaArchitecture {
+            input_modalities: vec!["text".to_owned()],
+            output_modalities: vec!["decisions".to_owned(), "text".to_owned()],
+        });
+        let mut legacy = model_info("legacy", LlamaModelStatusValue::LOADED);
+        legacy.architecture = Some(LlamaArchitecture {
+            input_modalities: vec!["text".to_owned()],
+            output_modalities: vec!["text".to_owned()],
+        });
+        let no_architecture = model_info("bare", LlamaModelStatusValue::LOADED);
+        let mut unloaded_decision = model_info("off", LlamaModelStatusValue::UNLOADED);
+        unloaded_decision.architecture = Some(LlamaArchitecture {
+            input_modalities: vec!["text".to_owned()],
+            output_modalities: vec!["decisions".to_owned()],
+        });
+
+        controller
+            .set_catalog(
+                &[
+                    decision_only,
+                    decision_text,
+                    legacy,
+                    no_architecture,
+                    unloaded_decision,
+                ],
+                "http://localhost:8080",
+                LlamaSetCatalogOptions::default(),
+            )
+            .expect("set catalog");
+
+        // Chat list: V17-01 semantics unchanged (decision-only excluded).
+        let chat_models = controller.provider().get_models();
+        let chat_ids: Vec<&str> = chat_models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(chat_ids, vec!["kev", "legacy", "bare"]);
+
+        // All models: chat first, then the selectable decision classifiers.
+        let all = controller.provider().get_all_models();
+        let types: Vec<ModelType> = all.iter().map(AnyModel::model_type).collect();
+        assert_eq!(
+            types,
+            vec![
+                ModelType::Chat,
+                ModelType::Chat,
+                ModelType::Chat,
+                ModelType::Classifier,
+                ModelType::Classifier,
+            ]
+        );
+        let classifier_ids: Vec<&str> = all
+            .iter()
+            .filter_map(|model| match model {
+                AnyModel::Classifier(classifier) => Some(classifier.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            classifier_ids,
+            vec!["lev", "kev"],
+            "unselectable unloaded decision models stay out"
+        );
+
+        let Some(AnyModel::Classifier(lev)) = all.iter().find(|model| model.id() == "lev") else {
+            panic!("lev classifier")
+        };
+        assert_eq!(lev.model_type, ModelType::Classifier);
+        assert_eq!(lev.api.as_str(), TYPESAFE_SYSTEM_ONE_API);
+        assert_eq!(lev.provider, LLAMA_PROVIDER_ID);
+        assert_eq!(
+            lev.base_url, "http://localhost:8080/v1",
+            "inference URL: the transport appends /systemone"
+        );
+        assert_eq!(lev.input, vec![InputModality::Text]);
+        assert_eq!(lev.cost, rpi_ai::types::ModelCost::default());
+        assert_eq!(lev.context_window, 65536);
+
+        // The registry hook resolves the shared transport for this api.
+        let provider = controller.provider();
+        assert!(provider.classifier(TYPESAFE_SYSTEM_ONE_API).is_some());
+        assert!(provider.classifier("other-classifier").is_none());
+    }
+
+    /// V17-16 FR-A R1/R2: classifier context windows share the chat
+    /// computation (`contextWindowOf`, provider.ts:72-79).
+    #[test]
+    fn to_pi_classifier_model_context_window_matches_chat() {
+        let mut model = model_info("m", LlamaModelStatusValue::LOADED);
+        let classifier = to_pi_classifier_model(&model, "http://localhost:8080").expect("convert");
+        assert_eq!(classifier.context_window, 128_000);
+
+        model.meta = Some(LlamaModelMeta {
+            n_ctx_train: Some(8192),
+            ..Default::default()
+        });
+        let classifier = to_pi_classifier_model(&model, "http://localhost:8080").expect("convert");
+        assert_eq!(classifier.context_window, 8192);
+
+        model.meta = Some(LlamaModelMeta {
+            n_ctx: Some(4096),
+            n_ctx_train: Some(8192),
+            ..Default::default()
+        });
+        let classifier = to_pi_classifier_model(&model, "http://localhost:8080").expect("convert");
+        assert_eq!(classifier.context_window, 4096);
+        let chat = to_pi_model(&model, "http://localhost:8080").expect("convert");
+        assert_eq!(classifier.context_window, chat.context_window);
+    }
+
     struct StaticAuthContext {
         vars: std::collections::HashMap<String, String>,
     }
@@ -896,5 +1118,94 @@ mod tests {
             "stored catalog restored, models do not disappear: {:?}",
             models.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
         );
+    }
+
+    /// V17-16 FR-C R1 (provider.ts:236-247): the stored snapshot restores
+    /// this provider's `typesafe-system-one` classifiers alongside the chat
+    /// models; foreign providers and other api ids stay out.
+    #[tokio::test]
+    async fn offline_refresh_restores_stored_classifiers() {
+        use rpi_ai::models::{PublishHandle, PublishShared, RefreshModelsContext};
+        use rpi_ai::models_store::{InMemoryModelsStore, ModelsStore, ModelsStoreEntry};
+
+        let controller = create_llama_provider();
+        let provider = controller.provider();
+
+        let mut chat = model_info("kept-chat", LlamaModelStatusValue::LOADED);
+        chat.source = Some("preset".to_owned());
+        let chat = to_pi_model(&chat, "http://localhost:8080").expect("chat");
+
+        let mut decision = model_info("kept-decision", LlamaModelStatusValue::LOADED);
+        decision.architecture = Some(LlamaArchitecture {
+            input_modalities: vec!["text".to_owned()],
+            output_modalities: vec!["decisions".to_owned()],
+        });
+        let stored_classifier =
+            to_pi_classifier_model(&decision, "http://localhost:8080").expect("classifier");
+        let mut foreign = stored_classifier.clone();
+        foreign.provider = "other".to_owned();
+        let mut wrong_api = stored_classifier.clone();
+        wrong_api.api = ApiKind::from("other-classifier");
+
+        let store = Arc::new(InMemoryModelsStore::new());
+        store
+            .write(
+                LLAMA_PROVIDER_ID,
+                ModelsStoreEntry {
+                    models: vec![
+                        AnyModel::Chat(chat),
+                        AnyModel::Classifier(stored_classifier),
+                        AnyModel::Classifier(foreign),
+                        AnyModel::Classifier(wrong_api),
+                    ],
+                    last_modified: None,
+                    checked_at: None,
+                    etag: None,
+                },
+                None,
+            )
+            .await
+            .expect("seed store");
+
+        let signal = CancellationToken::new();
+        let context = RefreshModelsContext {
+            credential: None,
+            stored: store.read(LLAMA_PROVIDER_ID, None).await.unwrap_or(None),
+            publish: PublishHandle {
+                shared: Arc::new(PublishShared {
+                    provider_id: LLAMA_PROVIDER_ID.to_owned(),
+                    generation: 1,
+                    signal: signal.clone(),
+                    store,
+                    chain: Arc::new(tokio::sync::Mutex::new(None)),
+                    refresh_generations: Arc::new(std::sync::RwLock::new(
+                        [(LLAMA_PROVIDER_ID.to_owned(), 1u64)].into(),
+                    )),
+                }),
+            },
+            allow_network: false,
+            force: None,
+            signal,
+        };
+        provider
+            .refresh_models(context)
+            .expect("refreshable")
+            .await
+            .expect("offline refresh ok");
+
+        let chat_models = provider.get_models();
+        let chat_ids: Vec<&str> = chat_models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(chat_ids, vec!["kept-chat"]);
+        let classifiers: Vec<ClassifierModel> = provider
+            .get_all_models()
+            .into_iter()
+            .filter_map(|model| match model {
+                AnyModel::Classifier(classifier) => Some(classifier),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(classifiers.len(), 1, "foreign classifiers stay out");
+        assert_eq!(classifiers[0].id, "kept-decision");
+        assert_eq!(classifiers[0].api.as_str(), TYPESAFE_SYSTEM_ONE_API);
     }
 }

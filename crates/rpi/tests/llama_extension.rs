@@ -17,9 +17,12 @@ use rpi::extensions::llama::{
     NotifyLevel, ProgressState,
 };
 use rpi_ai::auth::{AuthResult, Credential, ModelAuth, ModelsError};
-use rpi_ai::models::{PublishHandle, PublishShared, RefreshModelsContext};
+use rpi_ai::models::{Models, PublishHandle, PublishShared, RefreshModelsContext};
 use rpi_ai::models_store::{InMemoryModelsStore, ModelsStore};
-use rpi_ai::types::ProviderEnv;
+use rpi_ai::types::{
+    AnyModel, ClassifierAnswer, ClassifierBoolCriteria, ClassifierBoolQuestion, ClassifierContext,
+    ClassifierOptions, ClassifierQuestion, ClassifierStopReason, ProviderEnv,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Build a test `RefreshModelsContext` for the llama provider tests.
@@ -499,6 +502,160 @@ async fn persists_and_restores_loaded_models_for_cache_only_startup_refreshes() 
     assert_eq!(models[0].id, "loaded");
     assert_eq!(models[0].base_url, format!("{}/v1", server.url));
     assert_eq!(models[0].context_window, 32768);
+}
+
+/// V17-16 FR-B/FR-C/FR-D (R2.4.3 ②, provider.ts:96-112/179/230): a refresh
+/// persists decision classifiers alongside chat models, cache-only startup
+/// restores them, and `models.classify()` drives them through
+/// `{server}/v1/systemone`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refreshes_decision_classifiers_and_classifies_through_system_one() {
+    let server = MockServer::start(Arc::new(move |request, _sse| match request.path.as_str() {
+        "/models" => MockResponse::json(serde_json::json!({
+            "data": [
+                { "id": "chat", "status": { "value": "loaded" }, "meta": { "n_ctx": 8192 } },
+                { "id": "lev", "status": { "value": "loaded" }, "meta": { "n_ctx": 16384 },
+                  "architecture": { "input_modalities": ["text"], "output_modalities": ["decisions"] } },
+                { "id": "off", "status": { "value": "unloaded" },
+                  "architecture": { "input_modalities": ["text"], "output_modalities": ["decisions"] } }
+            ]
+        })),
+        "/v1/systemone" => MockResponse::json(serde_json::json!({
+            "answers": { "q1": { "type": "noul", "noul": 0.75 } },
+            "usage": { "input_tokens": 10, "output_tokens": 2 }
+        })),
+        _ => MockResponse::status(404),
+    }))
+    .await;
+
+    let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
+    let credential = Credential::ApiKey(rpi_ai::auth::ApiKeyCredential {
+        key: Some("local".to_owned()),
+        env: Some(ProviderEnv::from([(
+            "LLAMA_BASE_URL".to_owned(),
+            server.url.clone(),
+        )])),
+    });
+    let controller = create_llama_provider();
+    controller
+        .provider()
+        .refresh_models(make_llama_context(store.clone(), Some(credential), true).await)
+        .expect("refresh")
+        .await
+        .expect("refresh");
+
+    // Chat list unchanged; classifiers exposed after chat.
+    let chat_ids: Vec<String> = controller
+        .provider()
+        .get_models()
+        .into_iter()
+        .map(|model| model.id)
+        .collect();
+    assert_eq!(chat_ids, ["chat"]);
+    let all = controller.provider().get_all_models();
+    let classifier_ids: Vec<String> = all
+        .iter()
+        .filter_map(|model| match model {
+            AnyModel::Classifier(classifier) => Some(classifier.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        classifier_ids,
+        ["lev"],
+        "unloaded non-selectable decision model stays out"
+    );
+    let Some(AnyModel::Classifier(lev)) = all.iter().find(|model| model.id() == "lev") else {
+        panic!("lev classifier")
+    };
+    assert_eq!(lev.base_url, format!("{}/v1", server.url));
+
+    // The persisted snapshot carries both model types.
+    let cached = store
+        .read(LLAMA_PROVIDER_ID, None)
+        .await
+        .expect("read")
+        .expect("entry");
+    let cached_json = serde_json::to_value(&cached).expect("json");
+    let types: Vec<&str> = cached_json["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .map(|model| model["type"].as_str().unwrap_or("chat"))
+        .collect();
+    assert_eq!(types, ["chat", "classifier"]);
+
+    // Cache-only startup restores the classifiers too.
+    let second = create_llama_provider();
+    second
+        .provider()
+        .refresh_models(make_llama_context(store, None, false).await)
+        .expect("refresh")
+        .await
+        .expect("refresh");
+    let restored: Vec<String> = second
+        .provider()
+        .get_all_models()
+        .into_iter()
+        .filter_map(|model| match model {
+            AnyModel::Classifier(classifier) => Some(classifier.id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(restored, ["lev"]);
+
+    // `models.classify()` resolves the provider's classifier hook and posts
+    // to `{server}/v1/systemone`.
+    let models = Models::new(None);
+    models.set_provider(second.provider());
+    let registered = models.get_models_of_type(
+        rpi_ai::types::ModelType::Classifier,
+        Some(LLAMA_PROVIDER_ID),
+    );
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].id(), "lev");
+    let context = ClassifierContext {
+        state: serde_json::json!({ "prompt": "hello" })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        images: None,
+        questions: std::collections::BTreeMap::from([(
+            "q1".to_owned(),
+            ClassifierQuestion::Bool(ClassifierBoolQuestion {
+                instructions: "Answer".to_owned(),
+                criteria: ClassifierBoolCriteria {
+                    yes: "yes".to_owned(),
+                    no: "no".to_owned(),
+                },
+            }),
+        )]),
+    };
+    let options = ClassifierOptions {
+        api_key: Some("local".to_owned()),
+        env: Some(ProviderEnv::from([(
+            "LLAMA_BASE_URL".to_owned(),
+            server.url.clone(),
+        )])),
+        ..Default::default()
+    };
+    let result = models.classify(lev, &context, Some(&options)).await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop);
+    match result.answers.get("q1") {
+        Some(ClassifierAnswer::Bool(answer)) => assert_eq!(answer.probability, 0.75),
+        other => panic!("q1: {other:?}"),
+    }
+
+    let requests = server.requests();
+    let classify = requests
+        .iter()
+        .find(|request| request.path == "/v1/systemone")
+        .expect("classify request");
+    assert_eq!(classify.method, "POST");
+    assert_eq!(classify.authorization.as_deref(), Some("Bearer local"));
+    let body: serde_json::Value = serde_json::from_str(&classify.body).expect("json");
+    assert_eq!(body["model"], serde_json::json!("lev"));
+    assert_eq!(body["questions"]["q1"]["type"], serde_json::json!("noul"));
 }
 
 // -------------------------------------------------------------------------
