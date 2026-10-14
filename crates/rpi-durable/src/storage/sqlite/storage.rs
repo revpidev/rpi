@@ -1,9 +1,8 @@
 //! Portable SQLite implementation of the storage contract
-//! (port of `src/storage/sqlite/storage.ts`).
+//! (port of `src/storage/sqlite/storage.ts` @ `abe508e1b`).
 
 use async_trait::async_trait;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::chord::context::Context;
 use crate::chord::delta::{Op, apply_immutable_batches};
@@ -103,11 +102,37 @@ struct DocumentAction {
     retire: bool,
 }
 
+#[derive(Default)]
+struct Admission {
+    closed: bool,
+    admitted_reads: usize,
+}
+
 /// Portable SQLite implementation of the storage contract.
 pub struct SqliteStorage {
     db: SqliteDatabase,
     next_id: Mutex<u64>,
-    closed: AtomicBool,
+    admission: Mutex<Admission>,
+    drained: tokio::sync::Notify,
+    close_lock: tokio::sync::Mutex<()>,
+}
+
+/// Keeps one admitted multi-query read alive until it settles so `close()` can
+/// wait for it (upstream `admitRead`).
+struct ReadGuard<'a> {
+    storage: &'a SqliteStorage,
+}
+
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.storage.admission.lock() {
+            admission.admitted_reads = admission.admitted_reads.saturating_sub(1);
+            if admission.admitted_reads == 0 {
+                drop(admission);
+                self.storage.drained.notify_waiters();
+            }
+        }
+    }
 }
 
 impl SqliteStorage {
@@ -136,15 +161,35 @@ impl SqliteStorage {
         Ok(Self {
             db: db.clone_handle(),
             next_id: Mutex::new(next_id),
-            closed: AtomicBool::new(false),
+            admission: Mutex::new(Admission::default()),
+            drained: tokio::sync::Notify::new(),
+            close_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     fn assert_open(&self) -> StorageResult<()> {
-        if self.closed.load(Ordering::SeqCst) {
+        let admission = self
+            .admission
+            .lock()
+            .map_err(|_| StorageError::message("SqliteStorage admission lock poisoned"))?;
+        if admission.closed {
             return Err(StorageError::Closed("SqliteStorage"));
         }
         Ok(())
+    }
+
+    /// Admit one multi-query read; `close()` drains these before it closes the
+    /// database (upstream `admitRead`).
+    fn admit_read(&self) -> StorageResult<ReadGuard<'_>> {
+        let mut admission = self
+            .admission
+            .lock()
+            .map_err(|_| StorageError::message("SqliteStorage admission lock poisoned"))?;
+        if admission.closed {
+            return Err(StorageError::Closed("SqliteStorage"));
+        }
+        admission.admitted_reads += 1;
+        Ok(ReadGuard { storage: self })
     }
 
     fn next_id_snapshot(&self) -> StorageResult<u64> {
@@ -1054,7 +1099,7 @@ impl Storage for SqliteStorage {
     }
 
     async fn entry(&self, id: EntryId, _context: &Context) -> StorageResult<Option<StoredEntry>> {
-        self.assert_open()?;
+        let _guard = self.admit_read()?;
         self.read_entry(id, None).await
     }
 
@@ -1064,7 +1109,7 @@ impl Storage for SqliteStorage {
         id: EntryId,
         _context: &Context,
     ) -> StorageResult<Option<StoredEntry>> {
-        self.assert_open()?;
+        let _guard = self.admit_read()?;
         self.read_entry(id, Some(conversation_id)).await
     }
 
@@ -1074,7 +1119,7 @@ impl Storage for SqliteStorage {
         at_or_before_entry_id: Option<EntryId>,
         _context: &Context,
     ) -> StorageResult<Option<EntryRecord>> {
-        self.assert_open()?;
+        let _guard = self.admit_read()?;
         self.read_latest_head_marker(conversation_id, at_or_before_entry_id)
             .await
     }
@@ -1086,7 +1131,7 @@ impl Storage for SqliteStorage {
         cursor: Option<Cursor>,
         _context: &Context,
     ) -> StorageResult<Page<EntryRecord>> {
-        self.assert_open()?;
+        let _guard = self.admit_read()?;
         let start = scan_start(query.order, cursor.as_ref(), ScanOrder::Descending)?;
         if start.order == ScanOrder::Ascending {
             self.read_entries_ascending(&query, limit, start.after)
@@ -1321,7 +1366,28 @@ impl Storage for SqliteStorage {
     }
 
     async fn close(&self, _context: &Context) -> StorageResult<()> {
-        self.closed.store(true, Ordering::SeqCst);
+        // Repeated closes coalesce: a second caller settles only after the
+        // first finished closing the database (upstream shares one promise).
+        let _close_guard = self.close_lock.lock().await;
+        {
+            let mut admission = self
+                .admission
+                .lock()
+                .map_err(|_| StorageError::message("SqliteStorage admission lock poisoned"))?;
+            admission.closed = true;
+        }
+        loop {
+            let notified = self.drained.notified();
+            let admitted = self
+                .admission
+                .lock()
+                .map_err(|_| StorageError::message("SqliteStorage admission lock poisoned"))?
+                .admitted_reads;
+            if admitted == 0 {
+                break;
+            }
+            notified.await;
+        }
         self.db.close().await
     }
 }

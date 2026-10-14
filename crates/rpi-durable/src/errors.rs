@@ -1,4 +1,4 @@
-//! Storage error surface (port of `src/errors.ts` + the validation errors the
+//! Storage error surface (port of `src/errors.ts` @ `abe508e1b` + the validation errors the
 //! storage backends raise; upstream uses plain `Error` subclasses with the same
 //! messages).
 

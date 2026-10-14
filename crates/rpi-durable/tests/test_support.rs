@@ -80,6 +80,7 @@ pub type ReopenFuture = Pin<Box<dyn Future<Output = StorageResult<Box<dyn Storag
 pub struct ReopeningStorage {
     inner: tokio::sync::Mutex<Box<dyn Storage>>,
     reopen: Box<dyn Fn() -> ReopenFuture + Send + Sync>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl ReopeningStorage {
@@ -91,6 +92,7 @@ impl ReopeningStorage {
         Self {
             inner: tokio::sync::Mutex::new(inner),
             reopen: Box::new(reopen),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -99,12 +101,14 @@ impl ReopeningStorage {
 impl Storage for ReopeningStorage {
     async fn commit(&self, writes: &[StorageWrite], context: &Context) -> StorageResult<Seq> {
         let mut guard = self.inner.lock().await;
-        let result = guard.commit(writes, context).await;
-        if result.is_ok() {
-            guard.close(context).await?;
-            let reopened = (self.reopen)().await?;
-            *guard = reopened;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return guard.commit(writes, context).await;
         }
+        let result = guard.commit(writes, context).await;
+        // Upstream reopens in `finally`, so rejected commits are covered too.
+        guard.close(context).await?;
+        let reopened = (self.reopen)().await?;
+        *guard = reopened;
         result
     }
 
@@ -268,6 +272,7 @@ impl Storage for ReopeningStorage {
     }
 
     async fn close(&self, context: &Context) -> StorageResult<()> {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         self.inner.lock().await.close(context).await
     }
 }

@@ -1,5 +1,5 @@
 //! Minimal FileSystem seam consumed by the JSONL backend (R-D9 partial
-//! adoption; the full `ExecutionEnv` surface stays with V17-15, 02 §5.5).
+//! adoption @ `abe508e1b`; the full `ExecutionEnv` surface stays with V17-15, 02 §5.5).
 //!
 //! The `StdFileSystem` implementation is the Tokio/std adapter of upstream
 //! `NodeExecutionEnv`. Results are explicit so JSONL recovery can treat

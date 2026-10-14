@@ -1,5 +1,5 @@
 //! Asynchronous SQLite facade (port of `src/storage/sqlite/database.ts` and
-//! `node.ts`).
+//! `node.ts` @ `abe508e1b`).
 //!
 //! Selected stack (FR-C R4): `rusqlite` + `bundled` + a dedicated blocking
 //! worker thread. All operations are serialized in call order; a transaction
@@ -633,6 +633,9 @@ impl SqliteDatabase {
 
     /// Release the database; repeated closes are no-ops.
     pub async fn close(&self) -> StorageResult<()> {
+        if in_transaction() {
+            return Err(StorageError::TransactionReentrant);
+        }
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }

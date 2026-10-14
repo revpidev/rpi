@@ -1,5 +1,5 @@
 //! Node-adapter equivalents: open a file-backed database or storage with the
-//! upstream defaults (port of `src/storage/sqlite/node.ts` entry points).
+//! upstream defaults (port of `src/storage/sqlite/node.ts` entry points @ `abe508e1b`).
 
 use crate::errors::StorageResult;
 use crate::storage::sqlite::database::{SqliteDatabase, SqliteDatabaseOptions};

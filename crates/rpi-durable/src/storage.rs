@@ -28,6 +28,14 @@ pub(crate) fn page_values<T>(
     order: ScanOrder,
     id_of: impl Fn(&T) -> u64,
 ) -> Page<T> {
+    if limit == 0 {
+        // Upstream `page()` throws on a zero limit (it indexes the empty
+        // slice); rpi returns an empty page instead (form difference).
+        return Page {
+            items: Vec::new(),
+            next: None,
+        };
+    }
     if values.len() <= limit {
         return Page {
             items: values,

@@ -1,4 +1,4 @@
-//! Scan order/cursor resolution (port of `src/storage/scan.ts`).
+//! Scan order/cursor resolution (port of `src/storage/scan.ts` @ `abe508e1b`).
 
 use crate::errors::{StorageError, StorageResult};
 use crate::types::{Cursor, ScanOrder};
@@ -28,6 +28,9 @@ pub fn scan_start(
             after: None,
         });
     };
+    if cursor.after > crate::storage::MAX_SAFE_INTEGER {
+        return Err(StorageError::InvalidCursor);
+    }
     let order = cursor.order.unwrap_or(fallback);
     if let Some(requested) = requested {
         if requested != order {

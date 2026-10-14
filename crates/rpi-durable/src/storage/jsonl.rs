@@ -1,5 +1,5 @@
 //! Portable JSONL implementation of the storage contract
-//! (port of `src/storage/jsonl/storage.ts`).
+//! (port of `src/storage/jsonl/storage.ts` @ `abe508e1b`).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -10,16 +10,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::chord::context::Context;
 use crate::chord::json::JsonObject;
-use crate::errors::{FileError, StorageError, StorageResult};
+use crate::errors::{StorageError, StorageResult};
 use crate::fs::{DirEntryKind, FileSystem, error_from_file};
 use crate::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId, id_from_number};
 use crate::storage::is_current_only_create;
 use crate::storage::memory::{MemoryStorage, PreparedMemoryCommit};
 use crate::types::{
     ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentContent,
-    DocumentCreate, DocumentPoint, DocumentQuery, DocumentRecord, DocumentScope, EntryQuery,
-    EntryRecord, Page, Storage, StorageWrite, StoredDocument, SubmissionQuery, SubmissionRecord,
-    TaskQuery, TaskRecord,
+    DocumentCreate, DocumentPoint, DocumentQuery, DocumentRecord, EntryQuery, EntryRecord, Page,
+    Storage, StorageWrite, StoredDocument, SubmissionQuery, SubmissionRecord, TaskQuery,
+    TaskRecord,
 };
 
 const FORMAT_VERSION: u64 = 1;
@@ -1284,10 +1284,3 @@ impl Storage for JsonlStorage {
 
 /// Convenience alias used by storage module re-exports.
 pub type MemoryFileSystem = crate::fs::StdFileSystem;
-
-#[allow(unused_imports)]
-use crate::ids::EntryId as _EntryIdAlias;
-#[allow(unused_imports)]
-use DocumentScope as _DocumentScopeAlias;
-#[allow(unused_imports)]
-use FileError as _FileErrorAlias;

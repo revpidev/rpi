@@ -1,4 +1,4 @@
-//! Branded record identities and commit sequences (port of `src/ids.ts`).
+//! Branded record identities and commit sequences (port of `src/ids.ts` @ `abe508e1b`).
 
 use std::fmt;
 use std::marker::PhantomData;

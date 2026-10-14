@@ -1,4 +1,4 @@
-//! `copyJson`/`JsonValue`/`isJsonValue` (port of `chord/src/json.ts`).
+//! `copyJson`/`JsonValue`/`isJsonValue` (port of `chord/src/json.ts` @ `abe508e1b`).
 //!
 //! Rust mapping (V17-13 §7.3): `JsonValue` is [`serde_json::Value`] with the
 //! workspace `preserve_order` feature, so object key order survives round

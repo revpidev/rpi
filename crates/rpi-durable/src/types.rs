@@ -1,5 +1,5 @@
 //! Durable data model and storage contract (port of the storage-relevant
-//! sections of `packages/durable/src/types.ts`).
+//! sections of `packages/durable/src/types.ts` @ `abe508e1b`).
 //!
 //! The minimal record set is exactly what the shared conformance suite and the
 //! three backends compile and run against (V17-13 §8-5): conversation, entry,
@@ -146,6 +146,9 @@ pub enum TaskOutcome {
     Failed {
         /// Failure snapshot.
         error: TaskOutcomeError,
+        /// Optional partial result retained by the implementation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<JsonValue>,
     },
     /// Explicit cancellation handled by the task's abort protocol.
     Aborted {
@@ -661,6 +664,7 @@ pub struct DocumentAddress {
 /// One record or document mutation in an atomic storage commit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)] // persisted wire shape; boxing would change it
 pub enum StorageWrite {
     /// Insert or replace a conversation.
     #[serde(rename = "conversation")]
@@ -1033,7 +1037,3 @@ impl<S: Storage + ?Sized> StorageExt for S {}
 
 /// The error type surfaced by the storage contract.
 pub type Error = StorageError;
-
-/// Convenience module alias for the imported `Id`.
-#[allow(unused_imports)]
-use crate::ids::TaskId as _TaskIdAlias;

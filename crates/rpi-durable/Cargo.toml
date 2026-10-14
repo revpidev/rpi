@@ -24,8 +24,8 @@ futures.workspace = true
 rpi-ai.workspace = true
 # FR-C R4 ruling (2026-10-14): rusqlite + spawn_blocking over sqlx. `bundled`
 # compiles SQLite into the binary, so the musl static single-file release
-# matrix needs no system library. `cache` gives per-SQL-text prepared
-# statements shared across transactions (FR-D R4).
+# matrix needs no system library. rusqlite 0.37 caches prepared statements per
+# SQL text (Connection::prepare_cached) shared across transactions (FR-D R4).
 rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
 
 [dev-dependencies]

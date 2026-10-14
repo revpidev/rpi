@@ -1,5 +1,5 @@
 //! Shared storage conformance suite, ported from
-//! `src/testing/storage-conformance.ts` (1662 lines of runner-independent
+//! `src/testing/storage-conformance.ts` @ `abe508e1b` (runner-independent
 //! cases).
 //!
 //! The upstream `describe`/`expect`/`it` runner injection maps to a Rust case
@@ -1197,6 +1197,22 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
                 .await,
             "Unknown conversation",
         )?;
+        check_eq!(
+            storage
+                .entry_in_conversation(grandchild, grandchild_tail, &BACKGROUND_CONTEXT)
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|stored| stored.commit_seq),
+            Some(grandchild_seq)
+        );
+        check!(
+            storage
+                .entry_in_conversation(grandchild, id_from_number(999_999), &BACKGROUND_CONTEXT)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_none(),
+            "missing entry must read as absent"
+        );
         check_err(
             storage
                 .scan_entries(
@@ -1212,7 +1228,8 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
                 )
                 .await,
             "Unknown conversation",
-        )
+        )?;
+        Ok(())
     })
 }
 
@@ -1340,53 +1357,180 @@ fn case_10_table_order_and_cursor(storage: Arc<dyn Storage>) -> ConformanceFutur
                 .await,
             "cursor",
         )?;
-        // Tasks and submissions follow the same order contract.
-        let mut task_page = storage
-            .scan_tasks(TaskQuery::default(), 2, None, &BACKGROUND_CONTEXT)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Tasks and submissions follow the same order/cursor contract.
+        let all_tasks =
+            async |order: Option<ScanOrder>, cursor: Option<Cursor>| -> Result<Vec<u64>, String> {
+                let mut found = Vec::new();
+                let mut page = storage
+                    .scan_tasks(
+                        TaskQuery {
+                            order,
+                            ..Default::default()
+                        },
+                        2,
+                        cursor,
+                        &BACKGROUND_CONTEXT,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                found.extend(page.items.iter().map(|task| task.id.get()));
+                while let Some(next) = page.next.clone() {
+                    page = storage
+                        .scan_tasks(TaskQuery::default(), 2, Some(next), &BACKGROUND_CONTEXT)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    found.extend(page.items.iter().map(|task| task.id.get()));
+                }
+                Ok(found)
+            };
+        let all_submissions =
+            async |order: Option<ScanOrder>, cursor: Option<Cursor>| -> Result<Vec<u64>, String> {
+                let mut found = Vec::new();
+                let mut page = storage
+                    .scan_submissions(
+                        SubmissionQuery {
+                            order,
+                            ..Default::default()
+                        },
+                        2,
+                        cursor,
+                        &BACKGROUND_CONTEXT,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                found.extend(page.items.iter().map(|submission| submission.id().get()));
+                while let Some(next) = page.next.clone() {
+                    page = storage
+                        .scan_submissions(
+                            SubmissionQuery::default(),
+                            2,
+                            Some(next),
+                            &BACKGROUND_CONTEXT,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    found.extend(page.items.iter().map(|submission| submission.id().get()));
+                }
+                Ok(found)
+            };
+        let mut reversed_tasks = expected_tasks.clone();
+        reversed_tasks.reverse();
+        check_eq!(all_tasks(None, None).await?, expected_tasks);
         check_eq!(
-            task_page
-                .items
-                .iter()
-                .map(|task| task.id.get())
-                .collect::<Vec<_>>(),
-            expected_tasks[..2].to_vec()
+            all_tasks(Some(ScanOrder::Ascending), None).await?,
+            expected_tasks
         );
-        task_page = storage
+        check_eq!(
+            all_tasks(Some(ScanOrder::Descending), None).await?,
+            reversed_tasks
+        );
+        let mut reversed_submissions = expected_submissions.clone();
+        reversed_submissions.reverse();
+        check_eq!(all_submissions(None, None).await?, expected_submissions);
+        check_eq!(
+            all_submissions(Some(ScanOrder::Ascending), None).await?,
+            expected_submissions
+        );
+        check_eq!(
+            all_submissions(Some(ScanOrder::Descending), None).await?,
+            reversed_submissions
+        );
+        let descending_tasks = storage
             .scan_tasks(
                 TaskQuery {
                     order: Some(ScanOrder::Descending),
                     ..Default::default()
                 },
-                10,
+                2,
                 None,
                 &BACKGROUND_CONTEXT,
             )
             .await
             .map_err(|e| e.to_string())?;
-        let mut reversed_tasks = expected_tasks.clone();
-        reversed_tasks.reverse();
+        let continued_tasks = storage
+            .scan_tasks(
+                TaskQuery::default(),
+                2,
+                descending_tasks.next.clone(),
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         check_eq!(
-            task_page
+            continued_tasks
                 .items
                 .iter()
                 .map(|task| task.id.get())
                 .collect::<Vec<_>>(),
             reversed_tasks
+                .iter()
+                .skip(2)
+                .take(2)
+                .copied()
+                .collect::<Vec<_>>()
         );
-        let submission_page = storage
-            .scan_submissions(SubmissionQuery::default(), 10, None, &BACKGROUND_CONTEXT)
+        check_err(
+            storage
+                .scan_tasks(
+                    TaskQuery {
+                        order: Some(ScanOrder::Ascending),
+                        ..Default::default()
+                    },
+                    2,
+                    descending_tasks.next,
+                    &BACKGROUND_CONTEXT,
+                )
+                .await,
+            "cursor",
+        )?;
+        let descending_submissions = storage
+            .scan_submissions(
+                SubmissionQuery {
+                    order: Some(ScanOrder::Descending),
+                    ..Default::default()
+                },
+                2,
+                None,
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let continued_submissions = storage
+            .scan_submissions(
+                SubmissionQuery::default(),
+                2,
+                descending_submissions.next.clone(),
+                &BACKGROUND_CONTEXT,
+            )
             .await
             .map_err(|e| e.to_string())?;
         check_eq!(
-            submission_page
+            continued_submissions
                 .items
                 .iter()
                 .map(|submission| submission.id().get())
                 .collect::<Vec<_>>(),
-            expected_submissions
+            reversed_submissions
+                .iter()
+                .skip(2)
+                .take(2)
+                .copied()
+                .collect::<Vec<_>>()
         );
+        check_err(
+            storage
+                .scan_submissions(
+                    SubmissionQuery {
+                        order: Some(ScanOrder::Ascending),
+                        ..Default::default()
+                    },
+                    2,
+                    descending_submissions.next,
+                    &BACKGROUND_CONTEXT,
+                )
+                .await,
+            "cursor",
+        )?;
         Ok(())
     })
 }
@@ -1566,6 +1710,7 @@ fn case_12_task_owners_and_status(storage: Arc<dyn Storage>) -> ConformanceFutur
                     message: "held".to_string(),
                     detail: None,
                 },
+                result: None,
             },
         };
         storage
@@ -3511,6 +3656,14 @@ fn case_22_identities_lossless(storage: Arc<dyn Storage>) -> ConformanceFuture {
                 .map_err(|e| e.to_string())?
                 .map(|record| record.id()),
             Some(second_submission)
+        );
+        check_eq!(
+            storage
+                .submission_by_request(root, first, &BACKGROUND_CONTEXT)
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|record| record.request_id().map(str::to_string)),
+            Some(first.to_string())
         );
         check_eq!(
             storage

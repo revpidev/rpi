@@ -669,3 +669,113 @@ async fn facade_queues_ordinary_operations_behind_an_active_transaction() {
     database.close().await.expect("close");
     cleanup_temp_dirs("rpi-durable-sqlite-facade-queue");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_multi_query_reads_finish_before_storage_closes() {
+    let dir = TempDir::new("rpi-durable-sqlite-admitted-reads");
+    let path = dir
+        .path()
+        .join("storage.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let storage = Arc::new(
+        open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+            .await
+            .expect("open"),
+    );
+    storage
+        .commit(
+            &[StorageWrite::Conversation {
+                value: ConversationRecord {
+                    id: ROOT_CONVERSATION_ID,
+                    parent: None,
+                    owner: None,
+                },
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("root");
+    let entry_id: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
+    storage
+        .commit(
+            &[StorageWrite::Entry {
+                value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "probe"),
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("entry");
+
+    // Poll each multi-query read once so it is admitted before close starts.
+    let mut scan = Box::pin(storage.scan_entries(
+        rpi_durable::types::EntryQuery {
+            conversation_id: ROOT_CONVERSATION_ID,
+            min_entry_id: None,
+            max_entry_id: None,
+            order: None,
+        },
+        10,
+        None,
+        &BACKGROUND_CONTEXT,
+    ));
+    let mut conversation_entry = Box::pin(storage.entry_in_conversation(
+        ROOT_CONVERSATION_ID,
+        entry_id,
+        &BACKGROUND_CONTEXT,
+    ));
+    let mut head =
+        Box::pin(storage.find_latest_head_marker(ROOT_CONVERSATION_ID, None, &BACKGROUND_CONTEXT));
+    assert!(futures::poll!(scan.as_mut()).is_pending());
+    assert!(futures::poll!(conversation_entry.as_mut()).is_pending());
+    assert!(futures::poll!(head.as_mut()).is_pending());
+
+    // Drive the reads, the close and a repeated close concurrently: the reads
+    // are already admitted, so close must wait for them.
+    let closer = Arc::clone(&storage);
+    let repeated = Arc::clone(&storage);
+    let (scan_page, entry, head, close, close_again) = tokio::join!(
+        scan,
+        conversation_entry,
+        head,
+        async move { closer.close(&BACKGROUND_CONTEXT).await },
+        async move { repeated.close(&BACKGROUND_CONTEXT).await },
+    );
+
+    let scan_page = scan_page.expect("scan");
+    assert_eq!(
+        scan_page
+            .items
+            .iter()
+            .map(|item| item.id.get())
+            .collect::<Vec<_>>(),
+        vec![entry_id.get()]
+    );
+    let entry = entry.expect("entry").expect("present");
+    assert_eq!(entry.entry.kind, "probe");
+    assert!(head.expect("head").is_none());
+    close.expect("close");
+    close_again.expect("repeated close");
+
+    let closed = storage
+        .scan_entries(
+            rpi_durable::types::EntryQuery {
+                conversation_id: ROOT_CONVERSATION_ID,
+                min_entry_id: None,
+                max_entry_id: None,
+                order: None,
+            },
+            10,
+            None,
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(
+        closed
+            .expect_err("closed read")
+            .to_string()
+            .contains("SqliteStorage is closed"),
+        "later reads must reject after close"
+    );
+    cleanup_temp_dirs("rpi-durable-sqlite-admitted-reads");
+}
