@@ -16,14 +16,13 @@ use rpi_durable::chord::context::{BACKGROUND_CONTEXT, Context};
 use rpi_durable::chord::json::JsonValue;
 use rpi_durable::harness::{
     AnyTask, ConversationInit, HarnessImpl, HarnessOptions, InboxItem, InputSubmissionDraft,
-    LiveRun, LiveState, QueueMode, QueueModes, RegistryImpl, SchedulerFactory, SchedulerService,
-    Scheduling, SettledTask, SubmissionDraft, TaskAbort, TaskDefinition, TaskInspection, WhenBusy,
-    WriteSubmissionDraft, entry_to_json, open_harness_with_scheduler,
+    LiveRun, LiveState, QueueMode, QueueModes, RegistryImpl, SchedulerDeps, SchedulerFactory,
+    SchedulerService, Scheduling, SettledTask, SubmissionDraft, TaskAbort, TaskDefinition,
+    TaskInspection, WhenBusy, WriteSubmissionDraft, entry_to_json, open_harness_with_scheduler,
 };
 use rpi_durable::ids::{ConversationId, SubmissionId, TaskId};
 use rpi_durable::session::{
-    DocDraft, EntryDraft, SessionError, SessionImpl, SessionResult, TaskCreate, TaskOwnership,
-    Transaction,
+    DocDraft, EntryDraft, SessionError, SessionResult, TaskCreate, TaskOwnership, Transaction,
 };
 use rpi_durable::storage::MemoryStorage;
 use rpi_durable::types::Storage;
@@ -229,9 +228,7 @@ pub async fn open_recording_with(
     let scheduler = Arc::new(RecordingScheduler::new());
     let factory: SchedulerFactory = {
         let scheduler = Arc::clone(&scheduler);
-        Arc::new(move |_session: &Arc<SessionImpl>| {
-            Arc::clone(&scheduler) as Arc<dyn SchedulerService>
-        })
+        Arc::new(move |_deps: SchedulerDeps| Arc::clone(&scheduler) as Arc<dyn SchedulerService>)
     };
     let harness = open_harness_with_scheduler(storage, options(), factory, &context())
         .await

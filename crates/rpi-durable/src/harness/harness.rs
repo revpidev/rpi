@@ -7,9 +7,10 @@
 //! Rust port composes ([`HarnessImpl::session`]) and delegates the document
 //! surface, keeping the public method set.
 //!
-//! The scheduler/generation pipeline is a separate worker; this composition
-//! installs a [`SchedulerService`] through [`open_harness_with_scheduler`] and
-//! falls back to [`UnavailableScheduler`] for the wait-free paths.
+//! The scheduler/generation pipeline composes here: [`HarnessImpl::open`]
+//! installs the real [`TaskScheduler`] by default, and
+//! [`open_harness_with_scheduler`] lets a caller inject another
+//! [`SchedulerService`] (the recording double in tests).
 
 // The design keeps the composition in `harness/harness.rs`; Clippy's
 // `module_inception` is a style lint for the resulting `harness::harness` path.
@@ -32,7 +33,7 @@ use crate::harness::live::LIVE_DOC;
 use crate::harness::provider::PROVIDER_DOC;
 use crate::harness::registry::BUILTIN_TASK_NAMES;
 use crate::harness::scheduler::{
-    InvocationBinding, SchedulerFactory, SchedulerService, UnavailableScheduler,
+    InvocationBinding, SchedulerDeps, SchedulerFactory, SchedulerService, TaskScheduler,
 };
 use crate::harness::submissions::Submissions;
 use crate::harness::task_graph::{TaskGraphView, TaskGraphWatch};
@@ -966,17 +967,16 @@ impl Submission for BoundSubmission {
 }
 
 impl HarnessImpl {
-    /// Open a Harness over storage with the default [`UnavailableScheduler`].
+    /// Open a Harness over storage with the real [`TaskScheduler`].
     ///
-    /// The registry may keep changing while the Harness runs. Scheduler-backed
-    /// operations reject until a real scheduler is installed through
-    /// [`open_harness_with_scheduler`].
+    /// The registry may keep changing while the Harness runs.
     pub async fn open(
         storage: Arc<dyn Storage>,
         options: HarnessOptions,
         context: &Context,
     ) -> SessionResult<Arc<HarnessImpl>> {
-        let factory: SchedulerFactory = Arc::new(|_session| Arc::new(UnavailableScheduler::new()));
+        let factory: SchedulerFactory =
+            Arc::new(|deps: SchedulerDeps| TaskScheduler::new(deps) as Arc<dyn SchedulerService>);
         open_harness_with_scheduler(storage, options, factory, context).await
     }
 }
@@ -1022,16 +1022,26 @@ pub async fn open_harness_with_scheduler(
         .now
         .clone()
         .unwrap_or_else(|| Arc::new(crate::session::default_now));
-    let session = SessionImpl::new(Arc::clone(&storage), Some(Arc::clone(&now)));
-    session.set_conversation_created_hook(conversation_created_hook(
-        options.conversation_created.clone(),
-    ));
-    let scheduler = scheduler_factory(&session);
     let settings = resolve_settings(options.settings.as_ref());
     let report = options
         .on_report
         .clone()
         .unwrap_or_else(|| Arc::new(|_| {}));
+    let session = SessionImpl::new(Arc::clone(&storage), Some(Arc::clone(&now)));
+    session.set_conversation_created_hook(conversation_created_hook(
+        options.conversation_created.clone(),
+    ));
+    let scheduler = scheduler_factory(SchedulerDeps {
+        session: Arc::clone(&session),
+        storage: Arc::clone(&storage),
+        models: options.models.clone(),
+        registry: Arc::clone(&options.registry),
+        settings: settings.clone(),
+        env: options.env.clone(),
+        report: Arc::clone(&report),
+        now: Arc::clone(&now),
+        context: without_abort_signal(context),
+    });
     let resume: Arc<dyn Fn() + Send + Sync> = {
         let scheduler = Arc::clone(&scheduler);
         Arc::new(move || scheduler.resume())
@@ -1050,6 +1060,8 @@ pub async fn open_harness_with_scheduler(
         queue_modes,
         resume,
     );
+    // Let an invocation-bound conversation handle admit input.
+    scheduler.install_submissions(Arc::clone(&submissions));
     let task_graph = TaskGraphView::open(Arc::clone(&session), Arc::clone(&storage));
     let harness = Arc::new_cyclic(|weak| HarnessImpl {
         weak: weak.clone(),

@@ -6,9 +6,9 @@
 //! The module carries the harness type surface, the extension registry, the
 //! per-conversation `pi.*` documents, submission admission/waits, inbox boundary
 //! placement, committed context derivation, the live task-graph mount, and the
-//! [`HarnessImpl`] composition. Task scheduling and generation are a separate
-//! worker: [`scheduler::SchedulerService`] is the injection seam, defaulting to
-//! [`scheduler::UnavailableScheduler`].
+//! [`HarnessImpl`] composition. [`scheduler::TaskScheduler`] is the durable task
+//! scheduler installed by default; [`scheduler::SchedulerService`] stays an
+//! injection seam for tests and alternative hosts.
 //!
 //! Rust shape notes (registered V17-14 §7.3): the upstream behaviour interfaces
 //! become seam traits; `Draft<T>` document proxies become `DocCell`-backed
@@ -63,8 +63,8 @@ pub use registry::{
     TOOL_TASK_NAME, create_registry, validate_extension,
 };
 pub use scheduler::{
-    InvocationBinding, SchedulerFactory, SchedulerService, UNAVAILABLE_MESSAGE,
-    UnavailableScheduler,
+    InvocationBinding, SchedulerDeps, SchedulerFactory, SchedulerService, TaskScheduler,
+    UNAVAILABLE_MESSAGE, UnavailableScheduler,
 };
 pub use submissions::{SubmissionHandle, Submissions, admit_submission, is_settled};
 pub use task_graph::{TaskGraph, TaskGraphNode, TaskGraphState, TaskGraphView, TaskGraphWatch};
@@ -74,13 +74,14 @@ pub use types::{
     ConversationCreateOptions, ConversationHandle, ConversationInit, DeferredOption,
     DeferredWindow, EnvFactory, EnvTarget, ExecutionEnv, Extension, ExtensionsChange,
     ExtensionsEdit, ExtensionsSelection, Harness, HarnessInspection, HarnessOptions,
-    HarnessSettings, HookApi, HookHandlers, HookRegistration, InputSubmissionDraft, ModelRef,
-    PromptInput, PromptRender, PromptSection, QueueMode, Registry, RegistryError, RegistryListener,
-    RegistryReader, RegistrySnapshot, ReportFn, RootOptions, Scheduling, Settings,
-    SettledSubmissionRecord, SettledTask, Submission, SubmissionAbort, SubmissionAbortResult,
-    SubmissionDraft, TaskAbort, TaskDefinition, TaskInspection, TaskInspectionState, ToolControl,
-    ToolDiagnostic, ToolExecutionApi, ToolExecutionMode, ToolRegistration, ToolReplay, ToolsChange,
-    ToolsSelection, UserInput, WhenBusy, Wrap, WriteSubmissionDraft,
+    HarnessSettings, HookApi, HookHandlers, HookRegistration, InputSubmissionDraft, Migration,
+    ModelRef, NextTaskState, PromptInput, PromptRender, PromptSection, QueueMode, Registry,
+    RegistryError, RegistryListener, RegistryReader, RegistrySnapshot, ReportFn, RootOptions,
+    RunningTask, Scheduling, Settings, SettledSubmissionRecord, SettledTask, Submission,
+    SubmissionAbort, SubmissionAbortResult, SubmissionDraft, TaskAbort, TaskCommitFn,
+    TaskDefinition, TaskInspection, TaskInspectionState, TaskRuntime, ToolControl, ToolDiagnostic,
+    ToolExecutionApi, ToolExecutionMode, ToolRegistration, ToolReplay, ToolsChange, ToolsSelection,
+    UserInput, WhenBusy, Wrap, WriteSubmissionDraft,
 };
 pub use usage::{USAGE_DOC, UsageBucket, UsageState, add_usage, add_usage_state, record_usage};
 pub use util::{WaitError, WaitFuture, Waiters, closed_error, scan_all};

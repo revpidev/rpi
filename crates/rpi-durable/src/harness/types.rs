@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use rpi_ai::models::Models;
 use rpi_ai::types::{
@@ -35,10 +36,13 @@ use crate::chord::json::{JsonObject, JsonValue};
 use crate::documents::DocToken;
 use crate::ids::{ConversationId, EntryId, SubmissionId, TaskId};
 use crate::session::{
-    ConversationCreatedHook, ConversationOwnership, DocOwner, EntryDraft, SessionError,
-    SessionFuture, Transaction,
+    CommittedWatch, ConversationCreatedHook, ConversationOwnership, DocOwner, EntryDraft,
+    SessionError, SessionFuture, SessionResult, Transaction,
 };
-use crate::types::{Cursor, EntryQuery, EntryRecord, Page, SubmissionRecord, TaskRecord};
+use crate::types::{
+    Cursor, EntryQuery, EntryRecord, JoinPolicy, Page, SubmissionRecord, TaskOutcome, TaskRecord,
+    TaskState,
+};
 
 /// A boxed future returned by the harness seam traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -159,10 +163,219 @@ pub struct SettledTask<R> {
     pub result: R,
 }
 
+/// Live task record reserved by one invocation (upstream `RunningTask`, `types.ts:137`).
+#[derive(Debug, Clone)]
+pub struct RunningTask {
+    /// Complete committed record; its state is `running` while a run invocation holds it.
+    pub record: TaskRecord,
+}
+
+impl RunningTask {
+    /// Wrap a record whose state is `running`.
+    pub fn new(record: TaskRecord) -> Self {
+        Self { record }
+    }
+
+    /// Task identity.
+    pub fn id(&self) -> TaskId {
+        self.record.id
+    }
+
+    /// Registered definition name.
+    pub fn kind(&self) -> &str {
+        &self.record.kind
+    }
+
+    /// Definition version stored with the record.
+    pub fn version(&self) -> u64 {
+        self.record.version
+    }
+
+    /// Conversation the task belongs to.
+    pub fn conversation_id(&self) -> ConversationId {
+        self.record.conversation_id
+    }
+
+    /// Whether this conversation-owned task is excluded from ordinary idle waits.
+    pub fn background(&self) -> bool {
+        self.record.background
+    }
+
+    /// Durable abort mark.
+    pub fn abort_requested(&self) -> bool {
+        self.record.abort_requested
+    }
+
+    /// Durable checkpoint while the task can run (`pending`/`running`/`waiting`).
+    pub fn checkpoint(&self) -> Option<&JsonValue> {
+        match &self.record.state {
+            TaskState::Pending { checkpoint }
+            | TaskState::Running { checkpoint }
+            | TaskState::Waiting { checkpoint, .. } => Some(checkpoint),
+            TaskState::Completing { .. } | TaskState::Terminal { .. } => None,
+        }
+    }
+
+    /// The `phase` discriminator of the checkpoint, when present.
+    pub fn phase(&self) -> Option<&str> {
+        self.checkpoint()?.get("phase").and_then(JsonValue::as_str)
+    }
+}
+
+/// Next state a task commits for itself (upstream `NextTaskState`, `types.ts:145`).
+///
+/// A returned [`NextTaskState::Terminal`] is stored as `completing` while the
+/// task's ordinary owned work below is live (spec §5.5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum NextTaskState {
+    /// Replace the checkpoint and keep running.
+    Running {
+        /// Complete durable state from which execution resumes.
+        checkpoint: JsonValue,
+    },
+    /// Park without an invocation until every task in `on` is terminal.
+    Waiting {
+        /// Complete durable state from which execution resumes.
+        checkpoint: JsonValue,
+        /// Tasks this task waits on.
+        on: Vec<TaskId>,
+        /// How the wait reacts to failures.
+        policy: JoinPolicy,
+    },
+    /// The task's outcome; stored `terminal`, or `completing` while owned work drains.
+    Terminal {
+        /// Decided outcome.
+        outcome: TaskOutcome,
+    },
+}
+
+impl NextTaskState {
+    /// A replacement running checkpoint.
+    pub fn running(checkpoint: JsonValue) -> Self {
+        Self::Running { checkpoint }
+    }
+
+    /// A terminal outcome.
+    pub fn terminal(outcome: TaskOutcome) -> Self {
+        Self::Terminal { outcome }
+    }
+}
+
+/// Result of migrating an older stored record at reservation (upstream
+/// `TaskDefinition.migrate`).
+#[derive(Debug, Clone)]
+pub struct Migration {
+    /// Migrated task input.
+    pub input: JsonValue,
+    /// Migrated checkpoint.
+    pub checkpoint: JsonValue,
+}
+
+/// One transaction-scoped change a phase handler commits through [`TaskRuntime::commit`].
+///
+/// The closure rereads the task on the Session line; a returned [`NextTaskState`]
+/// replaces the task's state in the same commit.
+// FORM: upstream passes an inline closure correlated to `Tx`; Rust boxes it so
+// the erased runtime stays object-safe.
+pub type TaskCommitFn = Arc<
+    dyn for<'a> Fn(
+            &'a mut Transaction,
+            RunningTask,
+        ) -> BoxFuture<'a, SessionResult<Option<NextTaskState>>>
+        + Send
+        + Sync,
+>;
+
+/// Operations of one task invocation (upstream `TaskRuntime`, `types.ts:170`).
+///
+/// Every operation rejects after the invocation ends; watches acquired through
+/// it stop at invocation end.
+#[async_trait]
+pub trait TaskRuntime: Send + Sync {
+    /// Task identity.
+    fn task_id(&self) -> TaskId;
+    /// Conversation the task belongs to.
+    fn conversation_id(&self) -> ConversationId;
+    /// Cancelled when the run is signalled by an abort mark, at close, or when the invocation ends.
+    fn signal(&self) -> CancellationToken;
+    /// Registry snapshot of the current phase; refreshed at every phase boundary.
+    fn registry(&self) -> Arc<dyn RegistrySnapshot>;
+    /// pi-ai model catalog.
+    fn models(&self) -> &Models;
+    /// `HarnessOptions.settings`, resolved.
+    fn settings(&self) -> Settings;
+    /// The task's conversation's agent, resolved at most once per phase.
+    async fn agent(&self, context: &Context) -> SessionResult<Agent>;
+    /// Build the task's conversation environment with `HarnessOptions.env`.
+    async fn env(&self, context: &Context) -> SessionResult<Option<Arc<dyn ExecutionEnv>>>;
+    /// Commit on the Session line after rereading the task.
+    async fn commit(&self, change: TaskCommitFn, context: &Context) -> SessionResult<()>;
+    /// Read a durable memo of this task.
+    async fn memo(&self, name: &str, context: &Context) -> SessionResult<Option<JsonValue>>;
+    /// Store a memo unless one already exists; return the durable winner.
+    async fn memo_set(
+        &self,
+        name: &str,
+        value: JsonValue,
+        context: &Context,
+    ) -> SessionResult<JsonValue>;
+    /// Committed task record.
+    async fn get_task(&self, id: TaskId, context: &Context) -> SessionResult<Option<TaskRecord>>;
+    /// Resolve with a task's terminal receipt; rejects when the invocation ends.
+    async fn wait_for_task(
+        &self,
+        id: TaskId,
+        context: &Context,
+    ) -> SessionResult<SettledTask<JsonValue>>;
+    /// Outcomes of terminal tasks, in order.
+    async fn outcomes(
+        &self,
+        ids: Vec<TaskId>,
+        context: &Context,
+    ) -> SessionResult<Vec<TaskOutcome>>;
+    /// Invocation-bound handle of an existing conversation.
+    async fn conversation(
+        &self,
+        id: ConversationId,
+        context: &Context,
+    ) -> SessionResult<Option<Arc<dyn ConversationHandle>>>;
+    /// Committed entry visible from the task's conversation.
+    async fn entry(&self, id: EntryId, context: &Context) -> SessionResult<Option<EntryRecord>>;
+    /// Committed raw active transcript and model context.
+    async fn context(
+        &self,
+        conversation_id: ConversationId,
+        context: &Context,
+        at: Option<EntryId>,
+    ) -> SessionResult<ContextView>;
+    /// Current committed value of one document, or `None` when absent.
+    async fn snapshot(
+        &self,
+        token: &DocToken,
+        owner: DocOwner<'_>,
+        context: &Context,
+    ) -> SessionResult<Option<JsonObject>>;
+    /// Attach a document watch; it stops at invocation end.
+    async fn watch_doc(
+        &self,
+        token: &DocToken,
+        owner: DocOwner<'_>,
+        context: &Context,
+    ) -> SessionResult<Option<CommittedWatch>>;
+    /// The Harness clock; rejects once the invocation ended.
+    fn now(&self) -> SessionResult<f64>;
+    /// Forward a non-fatal failure; rejects once the invocation ended.
+    fn report(&self, message: String) -> SessionResult<()>;
+    /// Resolve once the clock reaches `until`; rejects on invocation or context cancellation.
+    async fn sleep(&self, until: f64, context: &Context) -> SessionResult<()>;
+}
+
 /// Erased executable task definition stored in the registry (upstream `AnyTask`).
 ///
-/// Only the identity/initial portion is frozen here; the scheduler/text workers
-/// extend this trait with their phase and migration surface.
+/// Upstream indexes a phase map by `checkpoint.phase`; the Rust port dispatches
+/// on the phase name inside [`TaskDefinition::run_phase`] (registered FORM
+/// difference, V17-14 §7.3).
+#[async_trait]
 pub trait TaskDefinition: Send + Sync {
     /// Registered definition name.
     fn name(&self) -> &str;
@@ -170,6 +383,47 @@ pub trait TaskDefinition: Send + Sync {
     fn version(&self) -> u64;
     /// Initial checkpoint for a new task (`definition.initial`).
     fn initial(&self) -> JsonValue;
+    /// Run one phase handler; must commit a changed checkpoint or a terminal outcome.
+    ///
+    /// The default returns `Ok(())` without a durable change, so a definition
+    /// that omits its dispatch faults the task (no durable progress).
+    async fn run_phase(
+        &self,
+        phase: &str,
+        task: RunningTask,
+        runtime: &dyn TaskRuntime,
+        context: &Context,
+    ) -> SessionResult<()> {
+        let _ = (phase, task, runtime, context);
+        Ok(())
+    }
+    /// Run after an abort mark in a fresh invocation; must commit a terminal outcome.
+    async fn abort(
+        &self,
+        task: RunningTask,
+        runtime: &dyn TaskRuntime,
+        context: &Context,
+    ) -> SessionResult<()> {
+        let _ = (task, runtime, context);
+        Ok(())
+    }
+    /// Convert a record stored by an older supported version; runs at reservation.
+    fn migrate(
+        &self,
+        input: JsonValue,
+        checkpoint: JsonValue,
+        from_version: u64,
+    ) -> Option<Migration> {
+        let _ = (input, checkpoint, from_version);
+        None
+    }
+    /// Whether this definition implements [`TaskDefinition::migrate`].
+    ///
+    /// Upstream tests `migrate !== undefined`; Rust records it explicitly so
+    /// scheduling can take over a newer definition only when it can migrate.
+    fn has_migration(&self) -> bool {
+        false
+    }
 }
 
 /// Dyn-compatible task definition (upstream `AnyTask["definition"]`).
