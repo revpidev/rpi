@@ -16,6 +16,7 @@ pub mod documents;
 pub mod entries;
 pub mod errors;
 pub mod fs;
+pub mod harness;
 pub mod ids;
 pub mod session;
 pub mod storage;
