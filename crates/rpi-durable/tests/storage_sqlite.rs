@@ -779,3 +779,69 @@ async fn admitted_multi_query_reads_finish_before_storage_closes() {
     );
     cleanup_temp_dirs("rpi-durable-sqlite-admitted-reads");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn facade_reentrant_close_reports_explicit_error() {
+    let dir = TempDir::new("rpi-durable-sqlite-facade-reentrant-close");
+    let path = dir.path().join("db.sqlite").to_string_lossy().into_owned();
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open");
+    let database_for_callback = database.clone_handle();
+    let outcome: Result<(), StorageError> = database
+        .transaction(move |_tx| async move { database_for_callback.close().await })
+        .await;
+    assert_eq!(
+        outcome.expect_err("reentrant close").to_string(),
+        "SQLite database cannot be used from inside its own transaction callback"
+    );
+    // The database is still usable after the failed reentrant call.
+    database.exec("SELECT 1").await.expect("post-check");
+    database.close().await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-facade-reentrant-close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn facade_cross_task_close_queues_behind_an_active_transaction() {
+    let dir = TempDir::new("rpi-durable-sqlite-facade-close-queue");
+    let path = dir.path().join("db.sqlite").to_string_lossy().into_owned();
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open");
+    database
+        .exec("CREATE TABLE close_queue (value INTEGER)")
+        .await
+        .expect("table");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let transaction_db = database.clone_handle();
+    let transaction = tokio::spawn(async move {
+        transaction_db
+            .transaction(move |tx| async move {
+                tx.run(
+                    "INSERT INTO close_queue (value) VALUES (?)",
+                    vec![SqliteValue::Integer(1)],
+                )
+                .await?;
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok(())
+            })
+            .await
+    });
+    started_rx.await.expect("transaction started");
+    let closer = database.clone_handle();
+    let close = tokio::spawn(async move { closer.close().await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !close.is_finished(),
+        "close must queue behind the active transaction"
+    );
+    let _ = release_tx.send(());
+    transaction
+        .await
+        .expect("join transaction")
+        .expect("transaction");
+    close.await.expect("join close").expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-facade-close-queue");
+}

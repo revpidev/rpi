@@ -1199,6 +1199,31 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
         )?;
         check_eq!(
             storage
+                .scan_entries(
+                    EntryQuery {
+                        conversation_id: grandchild,
+                        min_entry_id: historical_marker.head,
+                        max_entry_id: Some(child_fork_point),
+                        order: None,
+                    },
+                    10,
+                    None,
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .items
+                .iter()
+                .map(|entry| entry.id.get())
+                .collect::<Vec<_>>(),
+            vec![
+                child_fork_point.get(),
+                root_fork_point.get(),
+                root_first.get()
+            ]
+        );
+        check_eq!(
+            storage
                 .entry_in_conversation(grandchild, grandchild_tail, &BACKGROUND_CONTEXT)
                 .await
                 .map_err(|e| e.to_string())?

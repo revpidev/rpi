@@ -1324,6 +1324,7 @@ impl Storage for SqliteStorage {
         _context: &Context,
     ) -> StorageResult<Page<DocumentRecord>> {
         self.assert_open()?;
+        crate::storage::validate_cursor(cursor.as_ref())?;
         let scope = scope_columns(&query.scope);
         let mut clauses = vec![
             "scope_kind = ?".to_string(),

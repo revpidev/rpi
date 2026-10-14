@@ -636,10 +636,12 @@ impl SqliteDatabase {
         if in_transaction() {
             return Err(StorageError::TransactionReentrant);
         }
+        // Mark closed inside the access critical section so operations that
+        // queued before close are served in FIFO order (upstream queue).
+        let _guard = self.inner.access.lock().await;
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let _guard = self.inner.access.lock().await;
         let worker = Arc::clone(&self.inner.executor.worker);
         tokio::task::spawn_blocking(move || worker.shutdown())
             .await

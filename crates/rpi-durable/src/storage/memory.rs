@@ -1259,6 +1259,7 @@ impl Storage for MemoryStorage {
     ) -> StorageResult<Page<DocumentRecord>> {
         let inner = self.lock()?;
         MemoryStorage::assert_open(&inner)?;
+        crate::storage::validate_cursor(cursor.as_ref())?;
         let empty = Vec::new();
         let ids = inner
             .state
