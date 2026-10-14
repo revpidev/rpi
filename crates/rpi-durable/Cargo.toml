@@ -1,0 +1,32 @@
+[package]
+name = "rpi-durable"
+description = "Port of @earendil-works/pi-durable storage stack: experimental durable task runtime (chord subset, Memory/JSONL/SQLite backends)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Crash-survival helper for the SQLite `kill -9` test (FR-E R4).
+[[bin]]
+name = "rpi-durable-crash-writer"
+path = "tests/fixtures/crash-writer.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+# Model message types reused from rpi-ai (upstream types.ts:3 type-only
+# `Message`/`Models` import from @earendil-works/pi-ai).
+rpi-ai.workspace = true
+# FR-C R4 ruling (2026-10-14): rusqlite + spawn_blocking over sqlx. `bundled`
+# compiles SQLite into the binary, so the musl static single-file release
+# matrix needs no system library. `cache` gives per-SQL-text prepared
+# statements shared across transactions (FR-D R4).
+rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
