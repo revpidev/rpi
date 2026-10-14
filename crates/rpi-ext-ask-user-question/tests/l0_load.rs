@@ -411,6 +411,8 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
             expanded,
             show_images: false,
             is_error: false,
+            duration_ms: None,
+            output_pad: 1,
             terminal_width: Some(100),
         };
 

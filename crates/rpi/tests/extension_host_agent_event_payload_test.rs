@@ -396,13 +396,124 @@ async fn agent_event_payloads_match_upstream_shapes() {
         "partialResult carries the AgentToolResult JSON"
     );
 
-    // tool_execution_end: {type, toolCallId, toolName, result, isError}.
+    // tool_execution_end: {type, toolCallId, toolName, result, isError,
+    // durationMs} — the tool ran, so the V17-06 duration is present
+    // (types.ts:1085-1094 @ abe508e1b, #10549).
     let tool_ends = records_of(&records, "tool_execution_end");
     assert_eq!(tool_ends.len(), 1);
     assert_eq!(tool_ends[0]["type"], "tool_execution_end");
     assert_eq!(tool_ends[0]["toolName"], "updating");
     assert_eq!(tool_ends[0]["isError"], false);
     assert!(tool_ends[0]["result"].is_object(), "result object");
+    assert!(
+        tool_ends[0]["durationMs"].is_u64(),
+        "executed tool carries durationMs: {}",
+        tool_ends[0]
+    );
+    // The tool-result message records the same monotonic duration
+    // (R2.7.2 — one clock for event and message).
+    let result_messages: Vec<_> = fixture_holder
+        .session
+        .agent()
+        .state()
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            rpi_agent::messages::AgentMessage::ToolResult(result) => Some(result.duration_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(result_messages.len(), 1, "one tool-result message");
+    assert_eq!(
+        result_messages[0],
+        tool_ends[0]["durationMs"].as_u64(),
+        "event payload and tool-result message share the recorded duration"
+    );
+}
+
+/// V17-06 FR-B R3 (types.ts:1092-1094 @ abe508e1b): `durationMs` is absent
+/// (not zero) when the tool did not run — here an unknown tool name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_execution_end_omits_duration_when_the_tool_did_not_run() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/payload-cwd");
+    let errors = host
+        .load_inline(&[recording_ext(records.clone(), &["tool_execution_end"])])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let fixture = fixture(
+        vec![
+            faux_assistant_message(
+                faux_tool_call("missing_tool", serde_json::Map::new(), None),
+                FauxAssistantOptions {
+                    stop_reason: Some(rpi_ai::types::StopReason::ToolUse),
+                    ..Default::default()
+                },
+            )
+            .into(),
+            text_step("after"),
+        ],
+        host,
+    )
+    .await;
+    run_prompt(&fixture).await;
+
+    let tool_ends = records_of(&records, "tool_execution_end");
+    assert_eq!(tool_ends.len(), 1);
+    assert_eq!(tool_ends[0]["toolName"], "missing_tool");
+    assert_eq!(tool_ends[0]["isError"], true);
+    assert!(
+        tool_ends[0].get("durationMs").is_none(),
+        "did-not-run payload omits the key: {}",
+        tool_ends[0]
+    );
+}
+
+/// V17-06 FR-C (types.ts:1005-1009 @ abe508e1b, #10607): the extension
+/// `agent_settled` payload carries `aborted` for both a cancelled run and a
+/// normal completion (the session/JSON faces assert the same value in
+/// `agent_session_test.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_settled_payload_carries_aborted() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/payload-cwd");
+    let errors = host
+        .load_inline(&[recording_ext(records.clone(), &["agent_settled"])])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let normal_fixture = fixture(vec![text_step("done")], host).await;
+    run_prompt(&normal_fixture).await;
+    let settled = records_of(&records, "agent_settled");
+    assert_eq!(
+        settled.last().expect("agent_settled dispatched"),
+        &json!({"type": "agent_settled", "aborted": false})
+    );
+
+    // An abort requested mid-run settles with `aborted: true`.
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/payload-cwd");
+    let errors = host
+        .load_inline(&[recording_ext(records.clone(), &["agent_settled"])])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let aborted_fixture = fixture(vec![text_step("done")], host).await;
+    let session = aborted_fixture.session.clone();
+    let _unsubscribe = aborted_fixture.session.subscribe(Arc::new(move |event| {
+        if let rpi::core::agent_session::AgentSessionEvent::Agent(agent_event) = &event
+            && matches!(
+                agent_event.as_ref(),
+                rpi_agent::types::AgentEvent::MessageEnd { .. }
+            )
+        {
+            session.request_abort();
+        }
+    }));
+    run_prompt(&aborted_fixture).await;
+    let settled = records_of(&records, "agent_settled");
+    assert_eq!(
+        settled.last().expect("agent_settled dispatched"),
+        &json!({"type": "agent_settled", "aborted": true})
+    );
 }
 
 /// HR-B: `turnIndex` resets to 0 on every `agent_start` — a second prompt

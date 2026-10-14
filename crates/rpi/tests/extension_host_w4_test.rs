@@ -623,6 +623,144 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
     assert!(out.contains("EXT-RESULT:call-ext-2"), "out: {out}");
 }
 
+/// V17-06 FR-A R3 (#10285): a resolver renders tools that are not
+/// registered — a resumed session's MCP tool calls. The resolver chain is
+/// consulted before `get_tool_definition`, whose miss no longer
+/// short-circuits the chain; a resolver that returns without `next()` wins
+/// over a registered tool's own renderers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4_tool_renderer_resolver_renders_unregistered_mcp_tools() {
+    let resolver_ext = rpi_ext_host::loader::InlineExtension::Anonymous(Arc::new(|api| {
+        api.register_tool_renderer(Arc::new(
+            |tool_name: &str, next: &dyn Fn() -> Option<rpi_ext_host::types::ToolRenderers>| {
+                if tool_name == "read" {
+                    // A resolver may replace a registered tool's renderers
+                    // outright (upstream: `return { renderCall }` without
+                    // calling `next()`).
+                    return Some(rpi_ext_host::types::ToolRenderers {
+                        render_call: Some(Arc::new(|_ctx| {
+                            Ok(json!({"type": "text", "props": {"text": "RESOLVER-WINS"}}))
+                        })),
+                        ..Default::default()
+                    });
+                }
+                if let Some(renderers) = next() {
+                    return Some(renderers);
+                }
+                let rest = tool_name.strip_prefix("mcp__")?;
+                let (server, tool) = rest.split_once("__")?;
+                if server.is_empty() || tool.is_empty() {
+                    return None;
+                }
+                let label = format!("{server}/{tool}");
+                Some(rpi_ext_host::types::ToolRenderers {
+                    render_call: Some(Arc::new(move |_ctx| {
+                        Ok(json!({"type": "text", "props": {"text": label}}))
+                    })),
+                    ..Default::default()
+                })
+            },
+        ))
+        .unwrap();
+        Box::pin(async { Ok(()) })
+    }));
+    let host = rpi_ext_host::host::NativeExtensionHost::new("/w4-cwd");
+    assert!(host.load_inline(&[resolver_ext]).await.is_empty());
+    let (session, _tmp) = w4_session_with_host(host).await;
+
+    let context = rpi::modes::interactive::components::tool_execution::ToolRenderContext {
+        args: json!({}),
+        tool_call_id: "call-mcp-1".to_owned(),
+        render_handle: rpi_tui::tui::RenderHandle::new(|| {}),
+        state: rpi::modes::interactive::components::tool_execution::RendererStateSlot::default(),
+        cwd: "/w4-cwd".to_owned(),
+        execution_started: true,
+        args_complete: true,
+        is_partial: false,
+        expanded: false,
+        show_images: false,
+        is_error: false,
+        duration_ms: None,
+        output_pad: 0,
+        terminal_width: 0,
+    };
+    let theme = rpi::core::themes::get_theme_by_name("dark").expect("dark");
+
+    let definition = rpi::modes::interactive::extension_renderers::host_tool_definition(
+        &session,
+        "mcp__my_docs__search",
+    )
+    .expect("resolver-provided definition");
+    let component = definition
+        .render_call(&json!({"query": "pi"}), &theme, &context)
+        .expect("call render");
+    let out = rpi_test_support::vt::strip_ansi(&component.render(80).join("\n"));
+    assert!(out.contains("my_docs/search"), "out: {out}");
+
+    let definition =
+        rpi::modes::interactive::extension_renderers::host_tool_definition(&session, "read")
+            .expect("resolver short-circuit definition");
+    let component = definition
+        .render_call(&json!({}), &theme, &context)
+        .expect("call render");
+    let out = rpi_test_support::vt::strip_ansi(&component.render(80).join("\n"));
+    assert!(out.contains("RESOLVER-WINS"), "out: {out}");
+
+    // Non-MCP unregistered names still yield no definition.
+    assert!(
+        rpi::modes::interactive::extension_renderers::host_tool_definition(&session, "not_mcp")
+            .is_none()
+    );
+}
+
+/// V17-06 FR-A red line: without any registered resolver,
+/// `host_tool_definition` keeps its v0.1.6 no-hook shortcut — a registered
+/// override that provides no render hooks returns `None`, so the built-in
+/// rendering by tool name applies unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4_tool_definition_without_resolvers_keeps_the_no_hook_none() {
+    let no_hook_ext = rpi_ext_host::loader::InlineExtension::Anonymous(Arc::new(|api| {
+        api.register_tool(rpi_ext_host::types::ToolDefinition {
+            name: "read".to_owned(),
+            label: "read".to_owned(),
+            description: "no hooks".to_owned(),
+            prompt_snippet: None,
+            prompt_guidelines: None,
+            parameters: json!({"type": "object"}),
+            constrained_sampling: None,
+            render_shell: None,
+            prepare_arguments: None,
+            execution_mode: None,
+            execute: Arc::new(|_req, _ctx| {
+                Box::pin(async { Ok(rpi_agent::types::AgentToolResult::default()) })
+            }),
+            render_call: None,
+            render_result: None,
+
+            exposure: Default::default(),
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
+        })
+        .expect("tool");
+        Box::pin(async { Ok(()) })
+    }));
+    let host = rpi_ext_host::host::NativeExtensionHost::new("/w4-cwd");
+    assert!(host.load_inline(&[no_hook_ext]).await.is_empty());
+    let (session, _tmp) = w4_session_with_host(host).await;
+    assert!(
+        rpi::modes::interactive::extension_renderers::host_tool_definition(&session, "read")
+            .is_none(),
+        "no-hook overrides keep the v0.1.6 None shortcut"
+    );
+    assert!(
+        rpi::modes::interactive::extension_renderers::host_tool_definition(&session, "missing")
+            .is_none()
+    );
+}
+
 /// Session with a real host (the W4 version of the W3 fixture).
 async fn w4_session_with_host(
     host: rpi_ext_host::host::NativeExtensionHost,

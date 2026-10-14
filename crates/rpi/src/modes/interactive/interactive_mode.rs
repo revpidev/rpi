@@ -385,6 +385,9 @@ pub(crate) enum UiCommand {
         tool_call_id: String,
         result: serde_json::Value,
         is_error: bool,
+        /// `durationMs` from the event (agent-loop.ts `tool_execution_end`
+        /// @ abe508e1b): rides the event, not the result payload.
+        duration_ms: Option<u64>,
     },
     QueueUpdate {
         steering: Vec<String>,
@@ -405,10 +408,9 @@ pub(crate) enum UiCommand {
         error: String,
     },
     AgentSettled {
-        /// Captured at emission time from `AgentSession::is_abort_requested`
-        /// (`_agentRunAbortRequested`, agent-session.ts:1079): the internal
-        /// precursor of the V17-06 `agent_settled.aborted` event field.
-        /// Aborted runs report `idle` instead of `done`.
+        /// `aborted` from the V17-06 `agent_settled` payload
+        /// (`_agentRunAbortRequested`, agent-session.ts:1083). Aborted runs
+        /// report `idle` instead of `done`.
         aborted: bool,
     },
     CompactionStart(CompactionReason),
@@ -543,11 +545,13 @@ impl From<AgentSessionEvent> for UiCommand {
                     tool_call_id,
                     result,
                     is_error,
+                    duration_ms,
                     ..
                 } => UiCommand::ToolExecutionEnd {
                     tool_call_id,
                     result,
                     is_error,
+                    duration_ms,
                 },
             },
             AgentSessionEvent::Compaction(event) => match *event {
@@ -584,10 +588,8 @@ impl From<AgentSessionEvent> for UiCommand {
                 }
             },
             AgentSessionEvent::Session(event) => match event {
-                crate::core::agent_session::SessionEvent::AgentSettled => {
-                    // Filled in by `subscribe_to_agent` at emission time; the
-                    // plain conversion cannot see the session.
-                    UiCommand::AgentSettled { aborted: false }
+                crate::core::agent_session::SessionEvent::AgentSettled { aborted } => {
+                    UiCommand::AgentSettled { aborted }
                 }
                 crate::core::agent_session::SessionEvent::QueueUpdate {
                     steering,
@@ -2014,23 +2016,9 @@ impl InteractiveUi {
     pub(crate) fn subscribe_to_agent(&self) -> Box<dyn FnOnce() + Send> {
         let queue = Arc::clone(&self.event_queue);
         let render_handle = self.render_handle.clone();
-        // `agent_settled` carries the run's abort request: read it at
-        // emission time inside the synchronous subscriber (the event gains
-        // the field only with V17-06's ABI payload).
-        let session = self.session().downgrade();
         self.session()
             .subscribe(Arc::new(move |event: AgentSessionEvent| {
-                let command = match &event {
-                    AgentSessionEvent::Session(
-                        crate::core::agent_session::SessionEvent::AgentSettled,
-                    ) => UiCommand::AgentSettled {
-                        aborted: session
-                            .upgrade()
-                            .is_some_and(|session| session.is_abort_requested()),
-                    },
-                    _ => UiCommand::from(event),
-                };
-                lock(&queue).push_back(command);
+                lock(&queue).push_back(UiCommand::from(event));
                 render_handle.request_render();
             }))
     }
@@ -2336,10 +2324,21 @@ impl InteractiveUi {
                 tool_call_id,
                 result,
                 is_error,
+                duration_ms,
             } => {
                 // tool_execution_end (interactive-mode.ts:3040-3048).
                 let mut pending_tools = lock(&self.pending_tools);
                 if let Some(component) = pending_tools.remove(&tool_call_id) {
+                    // `component.updateResult({ ...event.result, isError:
+                    // event.isError, durationMs: event.durationMs })`
+                    // (interactive-mode.ts:3646 @ abe508e1b): `durationMs`
+                    // is a sibling of the tool result on the event.
+                    let mut result = result;
+                    if let Some(duration_ms) = duration_ms
+                        && let Some(object) = result.as_object_mut()
+                    {
+                        object.insert("durationMs".to_owned(), serde_json::json!(duration_ms));
+                    }
                     lock(&component)
                         .update_result(tool_result_state_from_value(&result, is_error), false);
                     self.render_handle.request_render();
@@ -6728,6 +6727,7 @@ mod tests {
                     tool_name: "read".to_string(),
                     result: serde_json::json!({}),
                     is_error: false,
+                    duration_ms: Some(12),
 
                     parent_tool_call_id: None,
                 })),
@@ -6772,7 +6772,7 @@ mod tests {
                 "extension_error",
             ),
             (
-                AgentSessionEvent::Session(SessionEvent::AgentSettled),
+                AgentSessionEvent::Session(SessionEvent::AgentSettled { aborted: true }),
                 "agent_settled",
             ),
             (
@@ -7480,6 +7480,7 @@ mod tests {
                 "content": [{ "type": "text", "text": "file contents" }]
             }),
             is_error: false,
+            duration_ms: None,
         });
         ui.drain_events();
         assert!(!lock(&ui.pending_tools).contains_key("call_1"));

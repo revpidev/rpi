@@ -43,7 +43,7 @@ fn fixtures_dir() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 const DROPPED_EVENT_TYPES: &[&str] = &["message_update", "queue_update", "agent_settled"];
-const STRIPPED_KEYS: &[&str] = &["usage", "willRetry", "details"];
+const STRIPPED_KEYS: &[&str] = &["usage", "willRetry", "details", "durationMs"];
 
 fn strip_keys(value: &mut Value) {
     match value {

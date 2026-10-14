@@ -236,6 +236,11 @@ pub enum AgentEvent {
         tool_name: String,
         result: Value,
         is_error: bool,
+        /// Milliseconds `execute()` took, measured with a monotonic clock;
+        /// absent when the tool did not run (types.ts:1087-1094
+        /// @ abe508e1b, #10549).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
         /// Set when another tool (for example a codemode script) made this
         /// call.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -373,6 +378,7 @@ mod tests {
                     tool_name: "t".into(),
                     result: json!({}),
                     is_error: false,
+                    duration_ms: Some(7),
 
                     parent_tool_call_id: None,
                 },
@@ -423,12 +429,28 @@ mod tests {
             tool_name: "bash".to_owned(),
             result: json!({"content": []}),
             is_error: true,
+            duration_ms: None,
 
             parent_tool_call_id: None,
         };
         assert_eq!(
             to_json(&end),
             r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[]},"isError":true}"#
+        );
+        // `durationMs` rides the wire when the tool ran and stays absent
+        // (not null) when it did not (types.ts:1093-1094 @ abe508e1b).
+        let ran = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "c1".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: json!({"content": []}),
+            is_error: false,
+            duration_ms: Some(42),
+
+            parent_tool_call_id: None,
+        };
+        assert_eq!(
+            to_json(&ran),
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[]},"isError":false,"durationMs":42}"#
         );
     }
 

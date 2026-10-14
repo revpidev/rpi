@@ -32,7 +32,10 @@ use super::runtime::{
     McpServerConnection, McpServerConnectionHandle, McpServerConnectionOptions,
     McpTransportFactory, ServerState, create_default_transport, uses_oauth,
 };
-use super::tools::{CreateMcpToolOptions, create_mcp_tool_definition, create_mcp_tool_name};
+use super::tools::{
+    CreateMcpToolOptions, create_mcp_tool_definition, create_mcp_tool_name,
+    create_mcp_tool_renderers,
+};
 
 /// `MCP_SERVERS_SECTION` (index.ts:149).
 pub const MCP_SERVERS_SECTION: &str = "mcp_servers";
@@ -1614,6 +1617,23 @@ pub fn create_mcp_extension(
 
 impl McpBuiltinState {
     fn install(self: Arc<Self>, api: &ExtensionApi) -> Result<(), String> {
+        // `pi.registerToolRenderer((toolName, next) => next() ?? (match ?
+        // createMcpToolRenderers(...) : undefined))` (index.ts:383-385
+        // @ abe508e1b, #10285): a resumed session renders calls to MCP tools
+        // before their server connected, if it ever does. Registered tools
+        // keep their own renderers (the `next()` result wins).
+        api.register_tool_renderer(Arc::new(|tool_name, next| {
+            if let Some(renderers) = next() {
+                return Some(renderers);
+            }
+            let rest = tool_name.strip_prefix("mcp__")?;
+            let (server, tool) = rest.split_once("__")?;
+            if server.is_empty() || tool.is_empty() {
+                return None;
+            }
+            Some(create_mcp_tool_renderers(server, tool))
+        }))
+        .map_err(error_message)?;
         {
             let state = self.clone();
             api.on(

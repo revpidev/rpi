@@ -830,12 +830,21 @@ pub struct BeforeAgentStartCombinedResult {
     pub system_prompt: Option<String>,
 }
 
-/// `AgentEndEvent` (types.ts:711-714). `agent_start` / `agent_settled`
-/// carry no fields.
+/// `AgentEndEvent` (types.ts:711-714). `agent_start` carries no fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEndEvent {
     pub messages: Vec<AgentMessage>,
+}
+
+/// `AgentSettledEvent` (types.ts:1005-1009 @ abe508e1b, #10607): fired
+/// after an agent run has fully settled and no automatic retry,
+/// compaction, or queued continuation will run. `aborted` distinguishes
+/// a cancelled run (for example Escape) from a finished one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSettledEvent {
+    pub aborted: bool,
 }
 
 /// `TurnStartEvent` (types.ts:722-726). `timestamp` is unix milliseconds.
@@ -1056,6 +1065,11 @@ pub struct ToolExecutionEndEvent {
     pub tool_name: String,
     pub result: Value,
     pub is_error: bool,
+    /// Milliseconds `execute()` took, measured with a monotonic clock;
+    /// absent when the tool did not run (types.ts:1087-1094 @ abe508e1b,
+    /// #10549).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// Set when another tool (for example a codemode script) made this call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
@@ -1291,6 +1305,17 @@ pub struct ToolRenderContext {
     pub expanded: bool,
     pub show_images: bool,
     pub is_error: bool,
+    /// Milliseconds the tool's execution took, from the final result;
+    /// `None` while it runs, when it did not run, or for results stored
+    /// before durations were recorded (types.ts:494-496 @ abe508e1b,
+    /// #10549).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Horizontal padding configured by the outputPad setting; renderers
+    /// with `renderShell: "self"` apply it themselves (types.ts:497-498
+    /// @ abe508e1b, #10557).
+    #[serde(default)]
+    pub output_pad: u32,
     /// Viewport width in terminal columns (rpi extension over upstream's
     /// types.ts:413-438, which carries no width): lets renderers size bars
     /// and columns to the actual terminal instead of a fixed assumption.
@@ -1322,6 +1347,36 @@ pub struct ToolRenderResultOptions {
     pub expanded: bool,
     pub is_partial: bool,
 }
+
+/// `ToolRenderers` (types.ts:658 @ abe508e1b, #10285): the render slice
+/// a [`ToolRendererResolver`] picks — the same three fields a
+/// [`ToolDefinition`] carries. A resolver may return the base unchanged,
+/// replace any subset, or return `None` (no renderers).
+#[derive(Clone, Default)]
+pub struct ToolRenderers {
+    /// `"default" | "self"` (types.ts:458).
+    pub render_shell: Option<String>,
+    pub render_call: Option<RenderCallFn>,
+    pub render_result: Option<RenderResultFn>,
+}
+
+impl ToolRenderers {
+    /// Whether the slice provides a call/result hook at all.
+    pub fn has_render_hooks(&self) -> bool {
+        self.render_call.is_some() || self.render_result.is_some()
+    }
+}
+
+/// `ToolRendererResolver` (types.ts:664-668 @ abe508e1b, #10285): chooses
+/// how calls to a tool are drawn, including tools that are not registered.
+/// `next()` returns the renderers the remaining resolvers, then the
+/// registered tool, would use. Resolvers run in extension load order
+/// (runner.ts:790-796).
+///
+/// Native/L0 only: the chain is a synchronous callback and cannot cross the
+/// wasm/native-cdylib JSON boundary (see `docs/extension-abi.md` §8.5).
+pub type ToolRendererResolver =
+    Arc<dyn Fn(&str, &dyn Fn() -> Option<ToolRenderers>) -> Option<ToolRenderers> + Send + Sync>;
 
 /// Input to an extension tool's `execute` (types.ts:474-480). `signal`
 /// mirrors the upstream `AbortSignal`; `on_update` streams partial results.
@@ -1545,6 +1600,19 @@ impl std::fmt::Debug for ToolDefinition {
             .field("label", &self.label)
             .field("description", &self.description)
             .finish_non_exhaustive()
+    }
+}
+
+impl ToolDefinition {
+    /// The definition's render slice — `ToolRenderers` is
+    /// `Pick<ToolDefinition, "renderShell" | "renderCall" | "renderResult">`,
+    /// so the registered tool seeds a resolver chain's base unchanged.
+    pub fn renderers(&self) -> ToolRenderers {
+        ToolRenderers {
+            render_shell: self.render_shell.clone(),
+            render_call: self.render_call.clone(),
+            render_result: self.render_result.clone(),
+        }
     }
 }
 

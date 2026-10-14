@@ -134,7 +134,12 @@ pub struct AgentEndEvent {
     rename_all_fields = "camelCase"
 )]
 pub enum SessionEvent {
-    AgentSettled,
+    /// `{type: "agent_settled", aborted}` (agent-session.ts:203 @
+    /// abe508e1b, #10607): `aborted` distinguishes a cancelled run from a
+    /// finished one.
+    AgentSettled {
+        aborted: bool,
+    },
     QueueUpdate {
         steering: Vec<String>,
         follow_up: Vec<String>,
@@ -704,6 +709,7 @@ impl NestedToolCallHost for SessionNestedHost {
                 tool_call,
                 result: nested_error_result("No session issued this call"),
                 is_error: true,
+                duration_ms: None,
             });
         };
         let Some(assistant_message) = session.find_last_assistant_message() else {
@@ -711,6 +717,7 @@ impl NestedToolCallHost for SessionNestedHost {
                 tool_call,
                 result: nested_error_result("No assistant message issued this call"),
                 is_error: true,
+                duration_ms: None,
             });
         };
         let state = session.inner.agent.state();
@@ -802,24 +809,32 @@ impl NestedToolCallHost for SessionNestedHost {
                 tool_name,
                 result,
                 is_error,
+                duration_ms,
                 parent_tool_call_id,
             } => {
                 let result = serde_json::to_value(&result).unwrap_or(Value::Null);
+                let mut payload = serde_json::json!({
+                    "type": "tool_execution_end",
+                    "toolCallId": tool_call_id,
+                    "toolName": tool_name,
+                    "result": result,
+                    "isError": is_error,
+                    "parentToolCallId": parent_tool_call_id,
+                });
+                // `...(outcome.durationMs === undefined ? {} : {durationMs})`
+                // (nested-tool-calls.ts:246): absent, never null.
+                if let Some(duration_ms) = duration_ms {
+                    payload["durationMs"] = serde_json::json!(duration_ms);
+                }
                 (
                     "tool_execution_end",
-                    serde_json::json!({
-                        "type": "tool_execution_end",
-                        "toolCallId": tool_call_id,
-                        "toolName": tool_name,
-                        "result": result,
-                        "isError": is_error,
-                        "parentToolCallId": parent_tool_call_id,
-                    }),
+                    payload,
                     AgentEvent::ToolExecutionEnd {
                         tool_call_id,
                         tool_name,
                         result,
                         is_error,
+                        duration_ms,
                         parent_tool_call_id: Some(parent_tool_call_id),
                     },
                 )
@@ -2115,8 +2130,20 @@ impl AgentSession {
         self.inner
             .is_emitting_agent_settled
             .store(true, Ordering::SeqCst);
-        self.runner().emit("agent_settled").await;
-        self.emit(AgentSessionEvent::Session(SessionEvent::AgentSettled));
+        // `const aborted = this._agentRunAbortRequested` read once at
+        // emission time (agent-session.ts:1083 @ abe508e1b): extension
+        // handlers and session listeners must observe the same value even
+        // if a handler requests a new run while settling.
+        let aborted = self.inner.agent_run_abort_requested.load(Ordering::SeqCst);
+        self.runner()
+            .emit_event(
+                "agent_settled",
+                serde_json::json!({"type": "agent_settled", "aborted": aborted}),
+            )
+            .await;
+        self.emit(AgentSessionEvent::Session(SessionEvent::AgentSettled {
+            aborted,
+        }));
         self.inner
             .is_emitting_agent_settled
             .store(false, Ordering::SeqCst);
@@ -2431,6 +2458,7 @@ impl AgentSession {
                 tool_name,
                 result,
                 is_error,
+                duration_ms,
                 parent_tool_call_id,
             } => {
                 if runner.has_handlers("tool_execution_end") {
@@ -2439,6 +2467,7 @@ impl AgentSession {
                         tool_name: tool_name.clone(),
                         result: result.clone(),
                         is_error: *is_error,
+                        duration_ms: *duration_ms,
                         parent_tool_call_id: parent_tool_call_id.clone(),
                     })
                     .unwrap_or_else(|_| serde_json::json!({}));

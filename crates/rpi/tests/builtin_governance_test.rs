@@ -336,3 +336,52 @@ async fn no_mcp_drops_the_builtin_mcp_extension() {
     );
     assert!(host.get_command("mcp").is_some());
 }
+
+/// V17-06 FR-A (#10285): the built-in MCP extension registers a tool
+/// renderer resolver that matches `mcp__<server>__<tool>` names, so a
+/// resumed session renders MCP tool calls before their server connected.
+/// Registered tools keep their own renderers (the resolver defers through
+/// `next()` first, exactly like the upstream `next() ?? createMcpToolRenderers(...)`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn builtin_mcp_registers_a_tool_renderer_resolver() {
+    let tmp = TempDir::new();
+    let cwd = tmp.path().join("cwd");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let host = NativeExtensionHost::new(&cwd.to_string_lossy());
+    let errors = host
+        .load_startup_final(
+            agent_dir.clone(),
+            Vec::new(),
+            builtin_paths(),
+            builtin_factories(model_runtime(&agent_dir).await),
+            false,
+            false,
+        )
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(host.has_tool_renderer_resolvers());
+
+    let renderers = host
+        .resolve_tool_renderers("mcp__my_docs__search", &|| None)
+        .expect("resolver matches an unregistered MCP tool name");
+    assert!(renderers.render_call.is_some());
+
+    // Non-MCP names stay unresolved when nothing else provides renderers.
+    assert!(host.resolve_tool_renderers("read", &|| None).is_none());
+    assert!(host.resolve_tool_renderers("mcp__", &|| None).is_none());
+
+    // The registered tool's renderers win through `next()`.
+    let own = host
+        .resolve_tool_renderers("mcp__my_docs__search", &|| {
+            Some(rpi_ext_host::types::ToolRenderers {
+                render_shell: Some("self".to_owned()),
+                ..Default::default()
+            })
+        })
+        .expect("registered renderers");
+    assert_eq!(own.render_shell.as_deref(), Some("self"));
+    assert!(own.render_call.is_none());
+}

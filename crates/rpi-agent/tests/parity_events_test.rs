@@ -56,7 +56,7 @@ const DROPPED_EVENT_TYPES: &[&str] = &[
     // (`_omitRecoveryAttempt` -> entry_appended) is not an Agent event.
     "entry_appended",
 ];
-const STRIPPED_KEYS: &[&str] = &["usage", "willRetry", "details"];
+const STRIPPED_KEYS: &[&str] = &["usage", "willRetry", "details", "durationMs"];
 
 fn strip_keys(value: &mut Value) {
     match value {

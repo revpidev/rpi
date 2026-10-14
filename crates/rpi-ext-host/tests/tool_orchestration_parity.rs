@@ -62,6 +62,7 @@ fn tool_execution_events_wire_shape_matches() {
         tool_name: "echo".to_owned(),
         result: json!({"content": []}),
         is_error: true,
+        duration_ms: Some(42),
         parent_tool_call_id: None,
     };
     let guest_end = guest::ToolExecutionEndEvent {
@@ -69,11 +70,48 @@ fn tool_execution_events_wire_shape_matches() {
         tool_name: "echo".to_owned(),
         result: json!({"content": []}),
         is_error: true,
+        duration_ms: Some(42),
         parent_tool_call_id: None,
     };
     assert_eq!(
         serde_json::to_value(host_end).unwrap(),
         serde_json::to_value(guest_end).unwrap()
+    );
+    // Absent (not null) when the tool did not run: both sides omit the key.
+    let host_skipped = host::ToolExecutionEndEvent {
+        tool_call_id: "call/1".to_owned(),
+        tool_name: "echo".to_owned(),
+        result: json!({"content": []}),
+        is_error: true,
+        duration_ms: None,
+        parent_tool_call_id: None,
+    };
+    let guest_skipped = guest::ToolExecutionEndEvent {
+        tool_call_id: "call/1".to_owned(),
+        tool_name: "echo".to_owned(),
+        result: json!({"content": []}),
+        is_error: true,
+        duration_ms: None,
+        parent_tool_call_id: None,
+    };
+    let host_json = serde_json::to_value(host_skipped).unwrap();
+    assert_eq!(host_json, serde_json::to_value(guest_skipped).unwrap());
+    assert!(host_json.get("durationMs").is_none());
+}
+
+/// V17-06 FR-C: `agent_settled.aborted` payload parity
+/// (types.ts:1005-1009 @ abe508e1b, #10607).
+#[test]
+fn agent_settled_wire_shape_matches() {
+    let host_event = host::AgentSettledEvent { aborted: true };
+    let guest_event = guest::AgentSettledEvent { aborted: true };
+    assert_eq!(
+        serde_json::to_value(host_event).unwrap(),
+        serde_json::to_value(guest_event).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(host::AgentSettledEvent { aborted: false }).unwrap(),
+        json!({"aborted": false})
     );
 }
 

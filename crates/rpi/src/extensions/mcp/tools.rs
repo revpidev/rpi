@@ -14,7 +14,7 @@ use rpi_agent::types::AgentToolResult;
 use rpi_ai::types::{ImageContent, TextContent, ToolResultContent};
 use rpi_ext_host::types::{
     ComponentTree, ToolAnnotations, ToolDefinition, ToolExecuteRequest, ToolExposure,
-    ToolNamespace, ToolRenderContext, ToolRenderResultOptions,
+    ToolNamespace, ToolRenderContext, ToolRenderResultOptions, ToolRenderers,
 };
 use rpi_mcp::content::{LlmContent, block_to_llm_content};
 use rpi_mcp::protocol::McpError;
@@ -474,6 +474,68 @@ fn text_component(text: String) -> ComponentTree {
     json!({"type": "text", "props": {"text": text}})
 }
 
+/// `createMcpToolRenderers` (tools.ts:298 @ abe508e1b, #10285): the
+/// render slice of one MCP tool. Used both as the registered tool's own
+/// renderers and by the extension's `registerToolRenderer` resolver, so a
+/// resumed session renders calls to `mcp__<server>__<tool>` before the
+/// server connected.
+pub fn create_mcp_tool_renderers(server: &str, tool: &str) -> ToolRenderers {
+    let render_label = format!("{server}/{tool}");
+    ToolRenderers {
+        render_shell: None,
+        render_call: Some(Arc::new(move |context: ToolRenderContext| {
+            Ok(text_component(format_tool_call(
+                &render_label,
+                &context.args,
+                context.expanded,
+            )))
+        })),
+        render_result: Some(Arc::new(
+            move |result: AgentToolResult,
+                  render: ToolRenderResultOptions,
+                  _context: ToolRenderContext| {
+                let output = text_of(&result.content);
+                if output.trim().is_empty() {
+                    return Ok(json!({"type": "column", "children": []}));
+                }
+                let output = output.replace('\t', "    ");
+                let style = if result.is_error == Some(true) {
+                    "error"
+                } else {
+                    "toolOutput"
+                };
+                let mut children: Vec<ComponentTree> = Vec::new();
+                if render.expanded {
+                    children.push(json!({
+                        "type": "text",
+                        "props": {"text": output, "fg": style},
+                    }));
+                } else {
+                    // Limit wrapped lines, not logical ones: MCP results are
+                    // often one long JSON line (tools.ts @ 0582d9c11).
+                    children.push(json!({
+                        "type": "visualPreview",
+                        "props": {
+                            "text": output,
+                            "fg": style,
+                            "maxVisualLines": OUTPUT_PREVIEW_LINES,
+                            "keep": "start",
+                            "hint": "... ({hidden} more lines)",
+                        },
+                    }));
+                }
+                if let Some(path) = result.details.get("fullOutputPath").and_then(Value::as_str) {
+                    children.push(json!({
+                        "type": "text",
+                        "props": {"text": format!("Full output: {path}"), "fg": "muted"},
+                    }));
+                }
+                Ok(json!({"type": "column", "children": children}))
+            },
+        )),
+    }
+}
+
 /// `createMcpToolDefinition`: the host [`ToolDefinition`] for one MCP tool.
 pub fn create_mcp_tool_definition(options: CreateMcpToolOptions) -> ToolDefinition {
     let server = options.server.clone();
@@ -503,7 +565,9 @@ pub fn create_mcp_tool_definition(options: CreateMcpToolOptions) -> ToolDefiniti
     let get_client = options.get_client.clone();
     let readable_resources = options.readable_resources.clone();
     let tool_id = tool_name.clone();
-    let render_label = label.clone();
+    // The registered tool's renderers are the same slice the extension's
+    // `registerToolRenderer` resolver produces (#10285).
+    let renderers = create_mcp_tool_renderers(&server, &tool_name);
 
     ToolDefinition {
         name: options.name,
@@ -519,7 +583,7 @@ pub fn create_mcp_tool_definition(options: CreateMcpToolOptions) -> ToolDefiniti
         annotations,
         default_active: None,
         prepare_loadout: None,
-        render_shell: None,
+        render_shell: renderers.render_shell,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(move |mut request: ToolExecuteRequest, _context| {
@@ -589,56 +653,8 @@ pub fn create_mcp_tool_definition(options: CreateMcpToolOptions) -> ToolDefiniti
                 ))
             })
         }),
-        render_call: Some(Arc::new(move |context: ToolRenderContext| {
-            Ok(text_component(format_tool_call(
-                &render_label,
-                &context.args,
-                context.expanded,
-            )))
-        })),
-        render_result: Some(Arc::new(
-            move |result: AgentToolResult,
-                  render: ToolRenderResultOptions,
-                  _context: ToolRenderContext| {
-                let output = text_of(&result.content);
-                if output.trim().is_empty() {
-                    return Ok(json!({"type": "column", "children": []}));
-                }
-                let output = output.replace('\t', "    ");
-                let style = if result.is_error == Some(true) {
-                    "error"
-                } else {
-                    "toolOutput"
-                };
-                let mut children: Vec<ComponentTree> = Vec::new();
-                if render.expanded {
-                    children.push(json!({
-                        "type": "text",
-                        "props": {"text": output, "fg": style},
-                    }));
-                } else {
-                    // Limit wrapped lines, not logical ones: MCP results are
-                    // often one long JSON line (tools.ts @ 0582d9c11).
-                    children.push(json!({
-                        "type": "visualPreview",
-                        "props": {
-                            "text": output,
-                            "fg": style,
-                            "maxVisualLines": OUTPUT_PREVIEW_LINES,
-                            "keep": "start",
-                            "hint": "... ({hidden} more lines)",
-                        },
-                    }));
-                }
-                if let Some(path) = result.details.get("fullOutputPath").and_then(Value::as_str) {
-                    children.push(json!({
-                        "type": "text",
-                        "props": {"text": format!("Full output: {path}"), "fg": "muted"},
-                    }));
-                }
-                Ok(json!({"type": "column", "children": children}))
-            },
-        )),
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
     }
 }
 

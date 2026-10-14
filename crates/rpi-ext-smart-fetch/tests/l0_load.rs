@@ -500,6 +500,8 @@ async fn l0_load_capability_denied_and_full_surface() {
         expanded: false,
         show_images: false,
         is_error: false,
+        duration_ms: None,
+        output_pad: 1,
         terminal_width: None,
     };
     let call_tree = render_call(context).expect("renderCall returns a tree");
@@ -540,6 +542,8 @@ async fn l0_load_capability_denied_and_full_surface() {
             expanded: false,
             show_images: false,
             is_error: false,
+            duration_ms: None,
+            output_pad: 1,
             terminal_width: None,
         },
     )
@@ -580,6 +584,8 @@ async fn l0_load_capability_denied_and_full_surface() {
             expanded: false,
             show_images: false,
             is_error: false,
+            duration_ms: None,
+            output_pad: 1,
             terminal_width: None,
         },
     )
@@ -630,7 +636,9 @@ async fn l0_load_capability_denied_and_full_surface() {
             expanded: true,
             show_images: false,
             is_error: false,
-        terminal_width: None,
+            duration_ms: None,
+            output_pad: 1,
+            terminal_width: None,
         },
     )
     .expect("batch renderResult returns a tree");

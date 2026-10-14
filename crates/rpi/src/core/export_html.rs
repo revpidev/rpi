@@ -19,7 +19,12 @@
 //!   ANSI→HTML pipeline (`tool-renderer.ts` / `ansi-to-html.ts`), and rpi has
 //!   no JS extension renderers. `renderedTools` is always omitted; the
 //!   viewer's generic tool-call fallback renders those calls instead
-//!   (template.js `renderedTools?.[call.id]`).
+//!   (template.js `renderedTools?.[call.id]`). The v1.1.0 increment
+//!   (`createToolHtmlRenderer` takes `getToolRenderers` instead of
+//!   `getToolDefinition` and fills context `durationMs: undefined` /
+//!   `outputPad: 1`, tool-renderer.ts:25-32 @ abe508e1b, #10285/#10549/
+//!   #10557) therefore has no rpi counterpart to update — [N/A-struct]
+//!   (V17-06 §7.3).
 //! - Theme colours iterate a `HashMap` upstream-port (`get_resolved_theme_colors`);
 //!   the `--key: value;` lines are emitted in **sorted key order** for
 //!   determinism, while upstream emits the theme JSON's insertion order.

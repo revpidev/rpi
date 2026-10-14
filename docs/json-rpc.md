@@ -18,6 +18,12 @@ The first line of both modes is the session header:
 
 One prompt round emits `agent_start → message_start → message_update* → message_end → turn_end → … → agent_end` (retries/compaction/queued continuations may insert further rounds; `agent_settled` marks full quiescence).
 
+`agent_settled` carries `aborted` (v0.1.7 / #10607): `true` when the run was cancelled (for example an Escape-triggered `abort`), `false` when it finished on its own — integrations can tell a cancelled run from a completed one without inspecting the transcript.
+
+```json
+{"type":"agent_settled","aborted":false}
+```
+
 ## `message_update`: delta-only (v0.11 breaking change)
 
 Since v0.11, `message_update` carries **only incremental deltas and constant-size metadata** — no cumulative fields:
@@ -63,7 +69,7 @@ A successful `prompt` response means the prompt was accepted, queued, or handled
 {"type":"prompt","message":"New instruction","streamingBehavior":"steer"}
 ```
 
-`success: false` means the prompt was rejected before acceptance; failures after acceptance surface through the event stream, never as a second response for the same request id. After the response, keep consuming events — `agent_end` ends one run, while retries/compaction/queued work may follow; `agent_settled` marks quiescence.
+`success: false` means the prompt was rejected before acceptance; failures after acceptance surface through the event stream, never as a second response for the same request id. After the response, keep consuming events — `agent_end` ends one run, while retries/compaction/queued work may follow; `agent_settled` (`{"type":"agent_settled","aborted":bool}`) marks quiescence and reports whether the run was cancelled.
 
 ## Queue commands and the Esc combination (`abort` / `clear_queue`)
 

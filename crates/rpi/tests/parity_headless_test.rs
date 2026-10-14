@@ -118,7 +118,7 @@ impl std::io::Write for SharedBuf {
 // Normalization preparation (per the header-note convention)
 // ---------------------------------------------------------------------------
 
-const STRIPPED_KEYS: &[&str] = &["usage", "details"];
+const STRIPPED_KEYS: &[&str] = &["usage", "details", "durationMs"];
 const DROPPED_EVENT_TYPES: &[&str] = &["message_update", "tool_execution_update"];
 
 fn strip_keys(value: &mut Value) {
@@ -242,6 +242,15 @@ fn prepare_event_lines(text: &str) -> String {
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         if DROPPED_EVENT_TYPES.contains(&event_type) {
             continue;
+        }
+        // V17-06 (#10607): the goldens predate `agent_settled.aborted`; the
+        // field's semantics are covered by the agent-session tests, so this
+        // byte-level comparison drops it (G2). `compaction_end.aborted`
+        // keeps parity.
+        if event_type == "agent_settled"
+            && let Some(object) = value.as_object_mut()
+        {
+            object.remove("aborted");
         }
         strip_keys(&mut value);
         normalize_system_declaration(&mut value);

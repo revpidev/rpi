@@ -74,6 +74,9 @@ pub enum NestedToolExecutionEvent {
         tool_name: String,
         result: AgentToolResult,
         is_error: bool,
+        /// `outcome.durationMs` (nested-tool-calls.ts:246): absent when the
+        /// nested tool did not run.
+        duration_ms: Option<u64>,
         parent_tool_call_id: String,
     },
 }
@@ -403,6 +406,7 @@ impl NestedCallRunner {
                 tool_call: tool_call.clone(),
                 result: error_tool_result(error.to_string()),
                 is_error: true,
+                duration_ms: None,
             },
         };
 
@@ -421,6 +425,7 @@ impl NestedCallRunner {
                 tool_name: name.to_owned(),
                 result: outcome.result.clone(),
                 is_error: outcome.is_error,
+                duration_ms: outcome.duration_ms,
                 parent_tool_call_id: caller_id.to_owned(),
             })
             .await;

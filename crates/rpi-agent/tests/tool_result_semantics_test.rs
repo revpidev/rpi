@@ -386,6 +386,7 @@ async fn outcome_is_printable_for_nested_hosts() {
         tool_call: tool_call("x"),
         result: AgentToolResult::default(),
         is_error: false,
+        duration_ms: None,
     };
     assert_eq!(outcome.tool_call.name, "x");
 }

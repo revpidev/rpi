@@ -2647,6 +2647,74 @@ async fn agent_settled_handlers_defer_requested_runs() {
     assert!(settled_dispatches.load(AtomicOrdering::SeqCst) >= 2);
 }
 
+/// V17-06 FR-C (R3.6.3, #10607): `agent_settled` carries `aborted` on the
+/// session event and the JSON wire — a mid-run abort request reports
+/// `true`, a normal completion `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_settled_aborted_matrix_on_session_and_json_faces() {
+    // Normal completion.
+    let normal = session_fixture(
+        vec![assistant("done")],
+        FauxProviderOptions::default(),
+        None,
+    )
+    .await;
+    normal
+        .session
+        .prompt("hi", PromptOptions::default())
+        .await
+        .expect("prompt");
+    normal.session.wait_for_idle().await;
+    let settled = serde_json::to_value(
+        normal
+            .events_of_type("agent_settled")
+            .last()
+            .expect("agent_settled emitted"),
+    )
+    .expect("serialize");
+    assert_eq!(
+        settled,
+        serde_json::json!({"type": "agent_settled", "aborted": false})
+    );
+
+    // Mid-run abort request (the `_agentRunAbortRequested` source read at
+    // emission, agent-session.ts:1083).
+    let aborted = session_fixture(
+        vec![assistant("done")],
+        FauxProviderOptions::default(),
+        None,
+    )
+    .await;
+    let session = aborted.session.clone();
+    let _unsubscribe = aborted.session.subscribe(Arc::new(move |event| {
+        if let AgentSessionEvent::Agent(agent_event) = &event
+            && matches!(
+                agent_event.as_ref(),
+                rpi_agent::types::AgentEvent::MessageEnd { .. }
+            )
+        {
+            session.request_abort();
+        }
+    }));
+    aborted
+        .session
+        .prompt("hi", PromptOptions::default())
+        .await
+        .expect("prompt");
+    aborted.session.wait_for_idle().await;
+    let settled = serde_json::to_value(
+        aborted
+            .events_of_type("agent_settled")
+            .last()
+            .expect("agent_settled emitted"),
+    )
+    .expect("serialize");
+    assert_eq!(
+        settled,
+        serde_json::json!({"type": "agent_settled", "aborted": true})
+    );
+}
+
 // ---------------------------------------------------------------------------
 // V16-13 FR-C: defaultTools merge/reload differential + CLI override
 // ---------------------------------------------------------------------------

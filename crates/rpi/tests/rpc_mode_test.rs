@@ -416,18 +416,22 @@ async fn prompt_lifecycle_messages_state_stats() {
     // Event sequence (rpc.md §Events).
     let mut event_types = Vec::new();
     let mut message_updates = Vec::new();
+    let settled_event: Option<Value>;
     loop {
         let event = rpc.next_value().await;
         let event_type = event["type"].as_str().expect("event type").to_owned();
         let done = event_type == "agent_settled";
         if event_type == "message_update" {
-            message_updates.push(event);
+            message_updates.push(event.clone());
         }
-        event_types.push(event_type);
         if done {
+            settled_event = Some(event);
+            event_types.push(event_type);
             break;
         }
+        event_types.push(event_type);
     }
+    let settled_event = settled_event.expect("agent_settled captured");
     for expected in [
         "agent_start",
         "turn_start",
@@ -446,6 +450,13 @@ async fn prompt_lifecycle_messages_state_stats() {
     assert_eq!(
         event_types.last().map(String::as_str),
         Some("agent_settled")
+    );
+    // V17-06 FR-C R3 (#10607): the JSON face carries `aborted`; a completed
+    // run reports false (docs/json-rpc.md §Event sequence).
+    assert_eq!(
+        settled_event["aborted"],
+        Value::Bool(false),
+        "{settled_event}"
     );
 
     // T18 (rpc-mode.ts:355-356 toJsonEvent, docs/rpc.md:952-956): wire
@@ -1690,6 +1701,7 @@ fn json_rpc_doc_pins_prompt_dispositions() {
         "`\"queued\"`",
         "`\"started\"`",
         "agent_settled",
+        "{\"type\":\"agent_settled\",\"aborted\":false}",
         "`steer` / `follow_up`",
     ] {
         assert!(

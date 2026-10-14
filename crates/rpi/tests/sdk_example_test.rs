@@ -140,9 +140,10 @@ async fn sdk_quick_start_one_faux_round() {
             .iter()
             .any(|e| matches!(e, AgentSessionEvent::AgentEnd(_)))
     );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentSessionEvent::Session(SessionEvent::AgentSettled)))
-    );
+    assert!(events.iter().any(|e| {
+        matches!(
+            e,
+            AgentSessionEvent::Session(SessionEvent::AgentSettled { .. })
+        )
+    }));
 }

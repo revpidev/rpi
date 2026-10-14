@@ -15,9 +15,9 @@
 //! identical serde renames.
 //!
 //! Not represented (documented deltas, see V15-09 §7):
-//! - `ui_prompt_start` / `ui_prompt_end` / `agent_start` / `agent_settled`
-//!   payloads travel as raw JSON (no host structs exist — pre-existing shape
-//!   rule, unchanged by #9642);
+//! - `ui_prompt_start` / `ui_prompt_end` / `agent_start` payloads travel
+//!   as raw JSON (no host structs exist — pre-existing shape rule,
+//!   unchanged by #9642);
 //! - upstream's per-tool `ToolCallEvent` union (`ReadToolCallEvent`, …)
 //!   collapses to [`ToolCallEvent`] (`tool_name` discriminator) — the
 //!   TS-level narrowing has no runtime effect;
@@ -501,6 +501,15 @@ pub struct AgentEndEvent {
     pub messages: Value,
 }
 
+/// `agent_settled` payload (types.ts:1005-1009 @ abe508e1b, #10607):
+/// `aborted` distinguishes a cancelled run (for example Escape) from a
+/// finished one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSettledEvent {
+    pub aborted: bool,
+}
+
 /// `turn_start` payload (unix-ms timestamp).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -615,6 +624,10 @@ pub struct ToolExecutionEndEvent {
     pub tool_name: String,
     pub result: Value,
     pub is_error: bool,
+    /// Milliseconds `execute()` took, measured with a monotonic clock;
+    /// absent when the tool did not run (types.ts:1087-1094 @ abe508e1b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
 }
@@ -813,6 +826,7 @@ mod tests {
         exported::<BeforeAgentStartMessage>();
         exported::<BeforeAgentStartCombinedResult>();
         exported::<AgentEndEvent>();
+        exported::<AgentSettledEvent>();
         exported::<TurnStartEvent>();
         exported::<TurnEndEvent>();
         exported::<AgentBeforeSettleEvent>();
@@ -938,6 +952,14 @@ mod tests {
             "result": {"content": []},
             "isError": false,
         }));
+        round_trip::<ToolExecutionEndEvent>(serde_json::json!({
+            "toolCallId": "c2",
+            "toolName": "bash",
+            "result": {"content": []},
+            "isError": false,
+            "durationMs": 42,
+        }));
+        round_trip::<AgentSettledEvent>(serde_json::json!({"aborted": true}));
         round_trip::<ModelSelectEvent>(serde_json::json!({
             "model": {"id": "m"},
             "previousModel": null,

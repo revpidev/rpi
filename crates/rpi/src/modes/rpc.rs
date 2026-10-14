@@ -748,7 +748,7 @@ async fn rebind_session(
     let unsubscribe = session.subscribe(Arc::new(move |event: AgentSessionEvent| {
         let is_settled = matches!(
             &event,
-            AgentSessionEvent::Session(SessionEvent::AgentSettled)
+            AgentSessionEvent::Session(SessionEvent::AgentSettled { .. })
         );
         // `output(toJsonEvent(event))` (rpc-mode.ts:355-356, T18): the wire
         // event is delta-only — `to_json_event` strips the cumulative

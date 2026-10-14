@@ -574,6 +574,23 @@ impl NativeExtensionHost {
         self.core().get_tool_definition(tool_name)
     }
 
+    /// `resolveToolRenderers(toolName, base)` (runner.ts:790-796 @
+    /// abe508e1b, #10285): the registered tool's renderers resolved through
+    /// the extension resolver chain in load order. The TUI's
+    /// `getRegisteredToolDefinition` consumes this.
+    pub fn resolve_tool_renderers(
+        &self,
+        tool_name: &str,
+        base: &dyn Fn() -> Option<crate::types::ToolRenderers>,
+    ) -> Option<crate::types::ToolRenderers> {
+        self.core().resolve_tool_renderers(tool_name, base)
+    }
+
+    /// Whether any extension registered a tool-renderer resolver.
+    pub fn has_tool_renderer_resolvers(&self) -> bool {
+        self.core().has_tool_renderer_resolvers()
+    }
+
     pub fn get_flags(&self) -> InsertionMap<ExtensionFlag> {
         self.core().get_flags()
     }

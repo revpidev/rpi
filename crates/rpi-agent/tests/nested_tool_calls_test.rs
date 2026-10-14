@@ -138,6 +138,7 @@ impl NestedToolCallHost for MockHost {
                 result: text_result(&format!("Tool {} not found", tool_call.name)),
                 tool_call,
                 is_error: true,
+                duration_ms: None,
             });
         };
         // Forward partial updates through the sink like the real pipeline.
@@ -150,6 +151,7 @@ impl NestedToolCallHost for MockHost {
             ..Default::default()
         };
         on_update(update);
+        let started_at = std::time::Instant::now();
         let result = tool
             .execute(
                 &tool_call.id,
@@ -158,11 +160,13 @@ impl NestedToolCallHost for MockHost {
                 None,
             )
             .await?;
+        let duration_ms = started_at.elapsed().as_millis() as u64;
         let is_error = result.is_error.unwrap_or(false);
         Ok(AgentToolCallOutcome {
             tool_call,
             result,
             is_error,
+            duration_ms: Some(duration_ms),
         })
     }
 

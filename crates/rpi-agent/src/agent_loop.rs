@@ -1263,17 +1263,23 @@ enum Preparation {
     },
 }
 
-/// `ExecutedToolCallOutcome`.
+/// `ExecutedToolCallOutcome` (agent-loop.ts:667-672): the raw `execute()`
+/// result plus its monotonic duration.
 struct ExecutedToolCallOutcome {
     result: AgentToolResult,
     is_error: bool,
+    /// `durationMs` — always present on this path (the tool ran).
+    duration_ms: u64,
 }
 
-/// `FinalizedToolCallOutcome`.
+/// `FinalizedToolCallOutcome` (= upstream `AgentToolCallOutcome`, whose
+/// `durationMs` is optional): `None` when the tool never ran (immediate
+/// preflight outcomes, truncated-message failures, panics).
 struct FinalizedToolCallOutcome {
     tool_call: AgentToolCall,
     result: AgentToolResult,
     is_error: bool,
+    duration_ms: Option<u64>,
 }
 
 /// `AgentToolCallOutcome` (packages/agent/src/types.ts:449-453 @
@@ -1285,6 +1291,10 @@ pub struct AgentToolCallOutcome {
     pub tool_call: AgentToolCall,
     pub result: AgentToolResult,
     pub is_error: bool,
+    /// Milliseconds `execute()` took, measured with a monotonic clock;
+    /// absent when the tool did not run (types.ts:449-454 @ abe508e1b,
+    /// #10549).
+    pub duration_ms: Option<u64>,
 }
 
 /// Options for [`run_tool_call`] (`RunToolCallOptions`,
@@ -1333,6 +1343,9 @@ pub async fn run_tool_call(
                 tool_call,
                 result,
                 is_error,
+                // The tool did not run (unknown tool / blocked by
+                // `beforeToolCall`): absent, not zero.
+                duration_ms: None,
             };
         }
         Preparation::Prepared(prepared) => prepared,
@@ -1353,6 +1366,7 @@ pub async fn run_tool_call(
         tool_call: finalized.tool_call,
         result: finalized.result,
         is_error: finalized.is_error,
+        duration_ms: finalized.duration_ms,
     }
 }
 
@@ -1378,6 +1392,7 @@ async fn fail_tool_calls_from_truncated_message(
                 tool_call.name
             )),
             is_error: true,
+            duration_ms: None,
         };
         emit_tool_execution_end(&finalized, emit).await;
         let tool_result_message = create_tool_result_message(&finalized, None);
@@ -1464,6 +1479,7 @@ async fn execute_tool_calls_sequential(
                 tool_call: tool_call.clone(),
                 result,
                 is_error,
+                duration_ms: None,
             },
             Preparation::Prepared(prepared) => {
                 // rc.12 review (P2): a panicking tool must not kill the whole
@@ -1503,6 +1519,7 @@ async fn execute_tool_calls_sequential(
                                 "Tool task failed: {join_error}"
                             )),
                             is_error: true,
+                            duration_ms: None,
                         }
                     }
                 }
@@ -1577,6 +1594,7 @@ async fn execute_tool_calls_parallel(
                     tool_call: tool_call.clone(),
                     result,
                     is_error,
+                    duration_ms: None,
                 };
                 emit_tool_execution_end(&finalized, emit).await;
                 slots.push(Some(finalized));
@@ -1613,6 +1631,8 @@ async fn execute_tool_calls_parallel(
                     tool_call: prepared.tool_call.clone(),
                     result: create_error_tool_result("Operation aborted".to_owned()),
                     is_error: true,
+                    // The abort landed before `execute` was entered.
+                    duration_ms: None,
                 };
                 emit_tool_execution_end(&finalized, &task_emit).await;
                 return (index, finalized);
@@ -1652,6 +1672,7 @@ async fn execute_tool_calls_parallel(
                     tool_call: tool_calls[index].clone(),
                     result: create_error_tool_result(format!("Tool task failed: {message}")),
                     is_error: true,
+                    duration_ms: None,
                 });
                 // P1-4: the `tool_execution_start` for this call was already
                 // emitted before spawn, and the panicking task died before
@@ -1871,6 +1892,8 @@ async fn execute_prepared_tool_call_with_sink(
     sink: Option<crate::types::AgentToolUpdateCallback>,
 ) -> ExecutedToolCallOutcome {
     let accepting_updates = Arc::new(AtomicBool::new(true));
+    // `const startedAt = performance.now()` (agent-loop.ts:821).
+    let started_at = std::time::Instant::now();
     let on_update: crate::types::AgentToolUpdateCallback = {
         let accepting_updates = accepting_updates.clone();
         Box::new(move |partial_result: AgentToolResult| {
@@ -1892,6 +1915,11 @@ async fn execute_prepared_tool_call_with_sink(
             Some(on_update),
         )
         .await;
+    // `const startedAt = performance.now(); const elapsed = () =>
+    // Math.round(performance.now() - startedAt)` (agent-loop.ts:820-825):
+    // one monotonic clock around `execute()`, the same data source the
+    // tool-result message records (R2.7.2).
+    let duration_ms = started_at.elapsed().as_millis() as u64;
     accepting_updates.store(false, Ordering::SeqCst);
 
     match result {
@@ -1900,11 +1928,16 @@ async fn execute_prepared_tool_call_with_sink(
             // === true` — a tool may report a data-carrying failure without
             // throwing (V16-06 FR-C R2).
             let is_error = result.is_error.unwrap_or(false);
-            ExecutedToolCallOutcome { result, is_error }
+            ExecutedToolCallOutcome {
+                result,
+                is_error,
+                duration_ms,
+            }
         }
         Err(error) => ExecutedToolCallOutcome {
             result: create_error_tool_result(error.to_string()),
             is_error: true,
+            duration_ms,
         },
     }
 }
@@ -1977,6 +2010,7 @@ async fn finalize_executed_tool_call(
         tool_call: prepared.tool_call.clone(),
         result,
         is_error,
+        duration_ms: Some(executed.duration_ms),
     }
 }
 
@@ -1999,7 +2033,7 @@ async fn emit_tool_execution_end(finalized: &FinalizedToolCallOutcome, emit: &Ag
         tool_name: finalized.tool_call.name.clone(),
         result: serde_json::to_value(&finalized.result).unwrap_or(Value::Null),
         is_error: finalized.is_error,
-
+        duration_ms: finalized.duration_ms,
         parent_tool_call_id: None,
     })
     .await;
@@ -2044,7 +2078,7 @@ fn create_tool_result_message(
         nested_calls,
         is_error: finalized.is_error,
         timestamp: now_millis(),
-        duration_ms: None,
+        duration_ms: finalized.duration_ms,
     }
 }
 

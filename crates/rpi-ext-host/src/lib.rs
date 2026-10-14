@@ -42,7 +42,7 @@ pub use error::ExtError;
 // initial list omitted SessionInfoChangedEvent; review round 2 added
 // SessionCompactFailedEvent — upstream #9642 exports it from the entry).
 pub use types::{
-    AfterProviderResponseEvent, AgentEndEvent, BeforeAgentStartCombinedResult,
+    AfterProviderResponseEvent, AgentEndEvent, AgentSettledEvent, BeforeAgentStartCombinedResult,
     BeforeAgentStartEvent, BeforeAgentStartEventResult, BeforeAgentStartMessage,
     BeforeProviderHeadersEvent, BeforeProviderRequestEvent, CacheWarmingAction,
     CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult, CompactionReason, ContextEvent,

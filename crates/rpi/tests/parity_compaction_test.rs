@@ -318,7 +318,12 @@ impl Harness {
 // Comparison preparation
 // ---------------------------------------------------------------------------
 
-const STRIPPED_KEYS: &[&str] = &["usage", "tokensBefore", "estimatedTokensAfter"];
+const STRIPPED_KEYS: &[&str] = &[
+    "usage",
+    "tokensBefore",
+    "estimatedTokensAfter",
+    "durationMs",
+];
 const COMPACTION_EVENT_TYPES: &[&str] = &[
     "compaction_start",
     "compaction_end",

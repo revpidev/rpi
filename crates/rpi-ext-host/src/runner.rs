@@ -458,6 +458,47 @@ impl ExtensionRunnerCore {
         None
     }
 
+    /// Whether any extension registered a `registerToolRenderer` resolver
+    /// (rpi bridge helper): `host_tool_definition` keeps its v0.1.6
+    /// `None`-for-no-hooks shortcut only when the chain is empty.
+    pub fn has_tool_renderer_resolvers(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|ext| !ext.tool_renderers().is_empty())
+    }
+
+    /// Renderers of calls to `toolName`: extension resolvers in load order,
+    /// then `base` (runner.ts:790-796 @ abe508e1b, #10285). `base` is the
+    /// registered tool's renderers; tools without a resolver fall through
+    /// unchanged. The chain is synchronous and re-entrancy-free — each
+    /// resolver may call `next()` at most as often as it likes, but the
+    /// continuation is a plain closure (`resolve(index + 1)`).
+    pub fn resolve_tool_renderers(
+        &self,
+        tool_name: &str,
+        base: &dyn Fn() -> Option<crate::types::ToolRenderers>,
+    ) -> Option<crate::types::ToolRenderers> {
+        let resolvers: Vec<crate::types::ToolRendererResolver> = self
+            .extensions
+            .iter()
+            .flat_map(|ext| ext.tool_renderers())
+            .collect();
+        fn resolve(
+            index: usize,
+            resolvers: &[crate::types::ToolRendererResolver],
+            tool_name: &str,
+            base: &dyn Fn() -> Option<crate::types::ToolRenderers>,
+        ) -> Option<crate::types::ToolRenderers> {
+            match resolvers.get(index) {
+                Some(resolver) => resolver(tool_name, &|| {
+                    resolve(index + 1, resolvers, tool_name, base)
+                }),
+                None => base(),
+            }
+        }
+        resolve(0, &resolvers, tool_name, base)
+    }
+
     /// `getFlags` (runner.ts:470-480): first registration per name wins.
     pub fn get_flags(&self) -> InsertionMap<ExtensionFlag> {
         let mut all = InsertionMap::new();

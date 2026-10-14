@@ -62,22 +62,34 @@ pub fn host_entry_renderer(session: &AgentSession, custom_type: &str) -> Option<
     }))
 }
 
-/// `getRegisteredToolDefinition` (interactive-mode.ts:2944): the render
-/// hooks of the (possibly extension-overridden) tool definition. Overrides
-/// without render hooks return `None`, so the built-in rendering by tool
-/// name applies unchanged — the render-slot inheritance.
+/// `getRegisteredToolDefinition` (interactive-mode.ts:2223-2232 @
+/// abe508e1b): the render hooks of the (possibly extension-overridden) tool
+/// definition, resolved through the extension resolver chain in load order
+/// (`resolveToolRenderers(toolName, () => withBuiltInRenderers(...))`,
+/// #10285). Resolvers may render tools that are not registered, such as
+/// resumed-session MCP tools.
+///
+/// The chain's base is the registered tool's render slice; the component
+/// applies the built-in renderer fallback separately (its
+/// `built_in_tool_definition`). Without any registered resolver this
+/// returns exactly what v0.1.6 returned: overrides without render hooks
+/// return `None`, so the built-in rendering by tool name applies unchanged.
 pub fn host_tool_definition(
     session: &AgentSession,
     tool_name: &str,
 ) -> Option<Arc<dyn ToolDefinition>> {
-    let definition = host_of(session)?.get_tool_definition(tool_name)?;
-    if definition.render_call.is_none() && definition.render_result.is_none() {
+    let host = host_of(session)?;
+    let renderers = host.resolve_tool_renderers(tool_name, &|| {
+        host.get_tool_definition(tool_name)
+            .map(|definition| definition.renderers())
+    })?;
+    if !host.has_tool_renderer_resolvers() && !renderers.has_render_hooks() {
         return None;
     }
     Some(Arc::new(HostToolRenderDefinition {
-        render_call: definition.render_call,
-        render_result: definition.render_result,
-        render_shell: definition.render_shell,
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
+        render_shell: renderers.render_shell,
     }))
 }
 
@@ -100,6 +112,11 @@ fn to_render_context(
         expanded: context.expanded,
         show_images: context.show_images,
         is_error: context.is_error,
+        // `durationMs` / `outputPad` (extensions/types.ts:494-498
+        // @ abe508e1b): the TUI component carries both internally since
+        // V17-05; this bridge opens them to the extension ABI (V17-06).
+        duration_ms: context.duration_ms,
+        output_pad: context.output_pad as u32,
         // 0 = never rendered yet; omit so the renderer keeps its fallback.
         terminal_width: match context.terminal_width {
             0 => None,
@@ -208,6 +225,43 @@ mod tests {
             bridge_tool_result(&failed).is_error,
             Some(true),
             "an errored result must serialize isError for render hooks"
+        );
+    }
+
+    /// V17-06 FR-B (types.ts:494-498 @ abe508e1b): the TUI render context's
+    /// internal `duration_ms`/`output_pad` reach extension renderers through
+    /// the bridge — and only then does the extension ABI expose them.
+    #[test]
+    fn bridge_render_context_carries_duration_and_output_pad() {
+        let context = super::super::components::tool_execution::ToolRenderContext {
+            args: serde_json::json!({}),
+            tool_call_id: "call-1".to_owned(),
+            render_handle: rpi_tui::tui::RenderHandle::new(|| {}),
+            state: super::super::components::tool_execution::RendererStateSlot::default(),
+            cwd: "/w".to_owned(),
+            execution_started: true,
+            args_complete: true,
+            is_partial: false,
+            expanded: false,
+            show_images: false,
+            is_error: false,
+            duration_ms: Some(4_200),
+            output_pad: 3,
+            terminal_width: 0,
+        };
+        let bridged = to_render_context(&context);
+        assert_eq!(bridged.duration_ms, Some(4_200));
+        assert_eq!(bridged.output_pad, 3);
+        assert_eq!(bridged.terminal_width, None, "0 = never rendered yet");
+
+        let partial = super::super::components::tool_execution::ToolRenderContext {
+            duration_ms: None,
+            ..context
+        };
+        let bridged = to_render_context(&partial);
+        assert_eq!(
+            bridged.duration_ms, None,
+            "partial/legacy results carry none"
         );
     }
 }

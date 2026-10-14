@@ -430,6 +430,198 @@ async fn runner_entry_renderer_first_registration_wins_silently() {
     assert!(host.get_entry_renderer("other").is_none());
 }
 
+// ---------------------------------------------------------------------------
+// Tool renderer resolvers (runner.ts:790-796 @ abe508e1b, #10285)
+// ---------------------------------------------------------------------------
+
+fn caller_text(text: &str) -> ext::RenderCallFn {
+    let text = text.to_owned();
+    Arc::new(move |_ctx| Ok(json!({"type": "text", "props": {"text": text}})))
+}
+
+fn render_context() -> ext::ToolRenderContext {
+    ext::ToolRenderContext {
+        args: json!({}),
+        tool_call_id: "call-1".to_owned(),
+        cwd: "/test-cwd".to_owned(),
+        execution_started: true,
+        args_complete: true,
+        is_partial: false,
+        expanded: false,
+        show_images: false,
+        is_error: false,
+        duration_ms: None,
+        output_pad: 1,
+        terminal_width: None,
+    }
+}
+
+/// Port of `extensions-runner.test.ts` "resolves tool renderers in extension
+/// load order, each able to defer to the next" (:894-913 @ abe508e1b).
+#[tokio::test]
+async fn runner_resolves_tool_renderers_in_load_order() {
+    let host = host_with(vec![
+        inline_ext("ext-a", |api| {
+            api.register_tool_renderer(Arc::new(
+                |tool_name: &str, next: &dyn Fn() -> Option<ext::ToolRenderers>| {
+                    if tool_name == "a" {
+                        return Some(ext::ToolRenderers {
+                            render_call: Some(caller_text("from-a")),
+                            ..Default::default()
+                        });
+                    }
+                    next()
+                },
+            ))
+            .unwrap();
+        }),
+        inline_ext("ext-b", |api| {
+            api.register_tool_renderer(Arc::new(
+                |_tool_name: &str, next: &dyn Fn() -> Option<ext::ToolRenderers>| {
+                    next().or(Some(ext::ToolRenderers {
+                        render_shell: Some("self".to_owned()),
+                        ..Default::default()
+                    }))
+                },
+            ))
+            .unwrap();
+        }),
+    ])
+    .await;
+
+    let base_none = || None;
+    let a = host.resolve_tool_renderers("a", &base_none).expect("a");
+    assert!(a.render_call.is_some());
+    assert!(a.render_shell.is_none());
+
+    // `next() ?? { renderShell: "self" }`: the second resolver's fallback
+    // wins when nothing before it (or the base) matched.
+    let b = host.resolve_tool_renderers("b", &base_none).expect("b");
+    assert_eq!(b.render_shell.as_deref(), Some("self"));
+    assert!(b.render_call.is_none());
+
+    // `next()` may return the base unchanged (registered-tool renderers).
+    let base = || {
+        Some(ext::ToolRenderers {
+            render_call: Some(caller_text("base")),
+            ..Default::default()
+        })
+    };
+    let with_base = host.resolve_tool_renderers("b", &base).expect("b");
+    assert!(with_base.render_call.is_some());
+    assert!(with_base.render_shell.is_none());
+
+    assert!(host.has_tool_renderer_resolvers());
+    // No resolvers and no base → None (v0.1.6 behavior).
+    let empty_host = NativeExtensionHost::new("/test-cwd");
+    assert!(!empty_host.has_tool_renderer_resolvers());
+    assert!(empty_host.resolve_tool_renderers("x", &base_none).is_none());
+}
+
+/// #10285: the resolver matches unregistered tool names (a resumed session
+/// renders MCP tool calls before their server connected).
+#[tokio::test]
+async fn runner_tool_renderer_resolver_matches_unregistered_tools() {
+    let host = host_with(vec![inline_ext("mcp-ish", |api| {
+        api.register_tool_renderer(Arc::new(
+            |tool_name: &str, next: &dyn Fn() -> Option<ext::ToolRenderers>| {
+                if let Some(renderers) = next() {
+                    return Some(renderers);
+                }
+                let rest = tool_name.strip_prefix("mcp__")?;
+                let (server, tool) = rest.split_once("__")?;
+                if server.is_empty() || tool.is_empty() {
+                    return None;
+                }
+                Some(ext::ToolRenderers {
+                    render_call: Some(caller_text(&format!("{server}/{tool}"))),
+                    ..Default::default()
+                })
+            },
+        ))
+        .unwrap();
+    })])
+    .await;
+
+    let base_none = || None;
+    let matched = host
+        .resolve_tool_renderers("mcp__my_docs__search", &base_none)
+        .expect("resolver matches the unregistered tool name");
+    let component =
+        (matched.render_call.expect("renderCall"))(render_context()).expect("component");
+    assert_eq!(component["props"]["text"], json!("my_docs/search"));
+
+    // A registered tool's own renderers win over the fallback (`next()`
+    // first, exactly like `next() ?? createMcpToolRenderers(...)`).
+    let registered = host
+        .resolve_tool_renderers("read", &|| {
+            Some(ext::ToolRenderers {
+                render_call: Some(caller_text("registered")),
+                ..Default::default()
+            })
+        })
+        .expect("registered");
+    let component =
+        (registered.render_call.expect("renderCall"))(render_context()).expect("component");
+    assert_eq!(component["props"]["text"], json!("registered"));
+
+    // Malformed `mcp__` names fall through.
+    assert!(host.resolve_tool_renderers("mcp__", &base_none).is_none());
+    assert!(
+        host.resolve_tool_renderers("mcp__server__", &base_none)
+            .is_none()
+    );
+    assert!(
+        host.resolve_tool_renderers("mcp__x__y", &base_none)
+            .is_some()
+    );
+}
+
+/// `ToolRenderContext` additive fields (types.ts:494-498 @ abe508e1b):
+/// camelCase, `durationMs` omitted when absent, `outputPad` defaulted.
+#[test]
+fn tool_render_context_duration_and_output_pad_wire_shape() {
+    let with_fields = ext::ToolRenderContext {
+        args: json!({}),
+        tool_call_id: "call-1".to_owned(),
+        cwd: "/w".to_owned(),
+        execution_started: true,
+        args_complete: true,
+        is_partial: false,
+        expanded: false,
+        show_images: false,
+        is_error: false,
+        duration_ms: Some(1_500),
+        output_pad: 2,
+        terminal_width: Some(120),
+    };
+    let value = serde_json::to_value(&with_fields).expect("serialize");
+    assert_eq!(value["durationMs"], json!(1500));
+    assert_eq!(value["outputPad"], json!(2));
+    let without_duration = ext::ToolRenderContext {
+        duration_ms: None,
+        ..with_fields.clone()
+    };
+    let value = serde_json::to_value(&without_duration).expect("serialize");
+    assert!(value.get("durationMs").is_none(), "absent, not null");
+    // Pre-V17 carriers omit both keys on the wire; deserialization defaults
+    // them (`durationMs` absent, `outputPad: 0`).
+    let legacy: ext::ToolRenderContext = serde_json::from_value(json!({
+        "args": {},
+        "toolCallId": "call-1",
+        "cwd": "/w",
+        "executionStarted": true,
+        "argsComplete": true,
+        "isPartial": false,
+        "expanded": false,
+        "showImages": false,
+        "isError": false,
+    }))
+    .expect("legacy payload");
+    assert_eq!(legacy.duration_ms, None);
+    assert_eq!(legacy.output_pad, 0);
+}
+
 /// Markdown transformers (runner.ts:589-591 @ 4181f66): one per extension,
 /// flattened in load order; extensions without one contribute nothing.
 #[tokio::test]
@@ -2577,6 +2769,52 @@ fn tool_loadout_changes_and_namespace_wire_shape() {
 }
 
 #[test]
+fn tool_loadout_prompt_guidelines_accessor_and_wire_shape() {
+    // V17-06 FR-D (#10343): `loadout.getPromptGuidelines(name)` gives the
+    // tool's guidelines and an empty array for unknown tools; the loadout
+    // travels with `promptGuidelines` for native `prepareLoadout` hooks.
+    use rpi_ext_host::types::{ToolExposure, ToolLoadout, ToolLoadoutEntry};
+    let entry = |name: &str| ToolLoadoutEntry {
+        name: name.to_owned(),
+        description: format!("{name} desc"),
+        parameters: json!({"type": "object"}),
+        output_schema: None,
+    };
+    let loadout = ToolLoadout {
+        declared: vec![entry("echo")],
+        callable: Vec::new(),
+        registered: vec![entry("echo"), entry("hidden")],
+        exposures: [("hidden".to_owned(), ToolExposure::Hidden)]
+            .into_iter()
+            .collect(),
+        namespaces: Default::default(),
+        prompt_guidelines: [("echo".to_owned(), vec!["Echo exactly once.".to_owned()])]
+            .into_iter()
+            .collect(),
+    };
+    assert_eq!(
+        loadout.get_prompt_guidelines("echo"),
+        ["Echo exactly once.".to_owned()]
+    );
+    assert!(
+        loadout.get_prompt_guidelines("missing").is_empty(),
+        "unknown tools give an empty array, not None"
+    );
+    let value = serde_json::to_value(&loadout).expect("serialize");
+    assert_eq!(
+        value["promptGuidelines"],
+        json!({"echo": ["Echo exactly once."]})
+    );
+    // An empty map stays off the wire (additive field, no bytes when absent).
+    let empty = ToolLoadout {
+        prompt_guidelines: Default::default(),
+        ..loadout
+    };
+    let value = serde_json::to_value(&empty).expect("serialize");
+    assert!(value.get("promptGuidelines").is_none());
+}
+
+#[test]
 fn tool_event_payloads_carry_parent_and_structured_fields() {
     use rpi_ext_host::types::{ToolCallEvent, ToolExecutionEndEvent, ToolResultEventResult};
     let call = ToolCallEvent {
@@ -2591,6 +2829,7 @@ fn tool_event_payloads_carry_parent_and_structured_fields() {
         tool_name: "echo".to_owned(),
         result: json!({"structuredContent": {"ok": true}}),
         is_error: false,
+        duration_ms: None,
         parent_tool_call_id: Some("call".to_owned()),
     };
     assert_eq!(

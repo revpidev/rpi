@@ -2246,6 +2246,9 @@ pub struct LoadedExtension {
     tools: RwLock<InsertionMap<RegisteredTool>>,
     message_renderers: RwLock<InsertionMap<MessageRenderFn>>,
     entry_renderers: RwLock<InsertionMap<EntryRenderFn>>,
+    /// `extension.toolRenderers` (types.ts:2247 @ abe508e1b, #10285): the
+    /// resolver chain this extension registered, in registration order.
+    tool_renderers: RwLock<Vec<crate::types::ToolRendererResolver>>,
     commands: RwLock<InsertionMap<RegisteredCommand>>,
     flags: RwLock<InsertionMap<ExtensionFlag>>,
     shortcuts: RwLock<InsertionMap<ExtensionShortcut>>,
@@ -2353,6 +2356,7 @@ impl LoadedExtension {
             tools: RwLock::new(InsertionMap::new()),
             message_renderers: RwLock::new(InsertionMap::new()),
             entry_renderers: RwLock::new(InsertionMap::new()),
+            tool_renderers: RwLock::new(Vec::new()),
             commands: RwLock::new(InsertionMap::new()),
             flags: RwLock::new(InsertionMap::new()),
             shortcuts: RwLock::new(InsertionMap::new()),
@@ -2530,6 +2534,15 @@ impl LoadedExtension {
 
     pub(crate) fn insert_entry_renderer(&self, custom_type: &str, renderer: EntryRenderFn) {
         write(&self.entry_renderers).set(custom_type.to_owned(), renderer);
+    }
+
+    pub(crate) fn insert_tool_renderer(&self, resolver: crate::types::ToolRendererResolver) {
+        write(&self.tool_renderers).push(resolver);
+    }
+
+    /// `extension.toolRenderers` flatMap source (runner.ts:790-793).
+    pub fn tool_renderers(&self) -> Vec<crate::types::ToolRendererResolver> {
+        read(&self.tool_renderers).clone()
     }
 
     pub fn message_renderer(&self, custom_type: &str) -> Option<MessageRenderFn> {
@@ -3161,6 +3174,23 @@ impl ExtensionApi {
         self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension.insert_entry_renderer(custom_type, renderer);
+        Ok(())
+    }
+
+    /// `pi.registerToolRenderer(resolver)` (loader.ts:369-371 @ abe508e1b,
+    /// #10285): choose how calls to a tool are drawn — including tools that
+    /// are not registered (resumed-session MCP tools). Resolvers run in
+    /// extension load order; each may defer to `next()`.
+    ///
+    /// Native/L0 only; the synchronous chain cannot cross the JSON boundary
+    /// of wasm/native-cdylib carriers (`docs/extension-abi.md` §8.5).
+    pub fn register_tool_renderer(
+        &self,
+        resolver: crate::types::ToolRendererResolver,
+    ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
+        self.runtime.assert_active()?;
+        self.extension.insert_tool_renderer(resolver);
         Ok(())
     }
 
