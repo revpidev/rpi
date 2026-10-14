@@ -37,7 +37,7 @@ use crate::documents::DocToken;
 use crate::ids::{ConversationId, EntryId, SubmissionId, TaskId};
 use crate::session::{
     CommittedWatch, ConversationCreatedHook, ConversationOwnership, DocOwner, EntryDraft,
-    SessionError, SessionFuture, SessionResult, Transaction,
+    SessionError, SessionFuture, SessionResult, TaskOwnership, Transaction,
 };
 use crate::types::{
     Cursor, EntryQuery, EntryRecord, JoinPolicy, Page, SubmissionRecord, TaskOutcome, TaskRecord,
@@ -286,6 +286,14 @@ pub type TaskCommitFn = Arc<
         + Sync,
 >;
 
+/// One transaction-scoped change a tool execution commits through
+/// [`ToolExecutionApi::commit`].
+// FORM: upstream `ToolExecutionApi.commit(change)` receives a `Tx`-typed change;
+// Rust boxes a `Transaction`-taking closure so the erased API stays object-safe.
+pub type ToolCommitFn = Arc<
+    dyn for<'a> Fn(&'a mut Transaction) -> BoxFuture<'a, SessionResult<JsonValue>> + Send + Sync,
+>;
+
 /// Operations of one task invocation (upstream `TaskRuntime`, `types.ts:170`).
 ///
 /// Every operation rejects after the invocation ends; watches acquired through
@@ -319,6 +327,22 @@ pub trait TaskRuntime: Send + Sync {
         value: JsonValue,
         context: &Context,
     ) -> SessionResult<JsonValue>;
+    /// Create a task of `definition` and commit its record on the Session line
+    /// (upstream `TaskRuntime.createTask`).
+    async fn create_task(
+        &self,
+        definition: AnyTask,
+        input: JsonValue,
+        ownership: TaskOwnership,
+        background: bool,
+        context: &Context,
+    ) -> SessionResult<TaskId>;
+    /// Committed document reads handed to prompt section rendering
+    /// (`PromptInput.read`).
+    fn document_reader(&self) -> Arc<dyn DocumentReader>;
+    /// Stable provider-facing conversation identity, creating it when absent
+    /// (`ensureProviderSessionId`).
+    async fn provider_session_id(&self, context: &Context) -> SessionResult<String>;
     /// Committed task record.
     async fn get_task(&self, id: TaskId, context: &Context) -> SessionResult<Option<TaskRecord>>;
     /// Resolve with a task's terminal receipt; rejects when the invocation ends.
@@ -1529,6 +1553,41 @@ pub trait HookApi: Send + Sync {
     ) -> Result<JsonValue, SessionError>;
 }
 
+/// [`HookApi`] backed by one task invocation.
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeHookApi<'a> {
+    /// Runtime of the invocation running the hook.
+    pub runtime: &'a dyn TaskRuntime,
+}
+
+#[async_trait]
+impl HookApi for RuntimeHookApi<'_> {
+    fn task_id(&self) -> TaskId {
+        self.runtime.task_id()
+    }
+
+    fn conversation_id(&self) -> ConversationId {
+        self.runtime.conversation_id()
+    }
+
+    fn models(&self) -> &Models {
+        self.runtime.models()
+    }
+
+    async fn memo(&self, name: &str, context: &Context) -> Result<Option<JsonValue>, SessionError> {
+        self.runtime.memo(name, context).await
+    }
+
+    async fn memo_set(
+        &self,
+        name: &str,
+        value: JsonValue,
+        context: &Context,
+    ) -> Result<JsonValue, SessionError> {
+        self.runtime.memo_set(name, value, context).await
+    }
+}
+
 /// `beforeRequest` replacement payload.
 #[derive(Debug, Clone)]
 pub struct RequestMessages {
@@ -1700,7 +1759,7 @@ pub trait ToolExecutionApi: Send + Sync {
     /// Commit one change attributed to the tool task.
     async fn commit(
         &self,
-        change: SessionFuture<'static, JsonValue>,
+        change: ToolCommitFn,
         context: &Context,
     ) -> Result<JsonValue, SessionError>;
     /// Read one memo.
@@ -1712,4 +1771,22 @@ pub trait ToolExecutionApi: Send + Sync {
         value: JsonValue,
         context: &Context,
     ) -> Result<JsonValue, SessionError>;
+    /// Read a committed task record (upstream `api.getTask`).
+    async fn get_task(
+        &self,
+        id: TaskId,
+        context: &Context,
+    ) -> Result<Option<TaskRecord>, SessionError>;
+    /// Resolve with a task's terminal receipt (upstream `api.waitForTask`).
+    async fn wait_for_task(
+        &self,
+        id: TaskId,
+        context: &Context,
+    ) -> Result<SettledTask<JsonValue>, SessionError>;
+    /// Invocation-bound handle of an existing conversation (upstream `api.conversation`).
+    async fn conversation(
+        &self,
+        id: ConversationId,
+        context: &Context,
+    ) -> Result<Option<Arc<dyn ConversationHandle>>, SessionError>;
 }

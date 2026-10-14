@@ -7,9 +7,9 @@
 //! scheduler can reconsider blocked tasks.
 //!
 //! The built-in task definitions (`pi.generation`, `pi.tool`, `pi.compaction`)
-//! arrive with their own worker; this module reserves their names and accepts the
-//! definitions as a parameter ([`RegistryImpl::with_builtins`]) so the registry
-//! contract is complete without them.
+//! are supplied as a parameter ([`RegistryImpl::with_builtins`]); the module
+//! reserves their names so no extension can claim them. [`builtin_tasks`]
+//! returns the real definitions, and [`create_registry`] installs them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -275,9 +275,19 @@ fn installed_with(extension: Extension, mut installed: Vec<Arc<Extension>>) -> V
     installed
 }
 
-/// Create an application-owned registry holding only the reserved built-in names.
+/// The three real built-in task definitions (`pi.generation`, `pi.tool`,
+/// `pi.compaction`).
+pub fn builtin_tasks() -> Vec<AnyTask> {
+    vec![
+        Arc::new(crate::harness::generation::GenerationTask) as AnyTask,
+        Arc::new(crate::harness::tool::ToolTask),
+        Arc::new(crate::harness::compaction::CompactionTask),
+    ]
+}
+
+/// Create an application-owned registry holding the built-in task definitions.
 pub fn create_registry() -> RegistryImpl {
-    RegistryImpl::with_builtins(Vec::new())
+    RegistryImpl::with_builtins(builtin_tasks())
 }
 
 #[cfg(test)]

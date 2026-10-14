@@ -2508,6 +2508,50 @@ impl TaskRuntime for InvocationRuntime {
         self.gated(wrapper, context).await
     }
 
+    async fn create_task(
+        &self,
+        definition: AnyTask,
+        input: JsonValue,
+        ownership: TaskOwnership,
+        background: bool,
+        context: &Context,
+    ) -> SessionResult<TaskId> {
+        let conversation_id = self.invocation.conversation_id;
+        let wrapper: Arc<GatedFn<TaskId>> = Arc::new(move |tx, _current| {
+            let definition = Arc::clone(&definition);
+            let input = input.clone();
+            Box::pin(async move {
+                tx.create_task(TaskCreate {
+                    kind: definition.name().to_string(),
+                    version: definition.version(),
+                    input,
+                    checkpoint: definition.initial(),
+                    ownership,
+                    conversation_id: Some(conversation_id),
+                    background,
+                })
+                .await
+            })
+        });
+        self.gated(wrapper, context).await
+    }
+
+    fn document_reader(&self) -> Arc<dyn DocumentReader> {
+        Arc::new(SchedulerDocumentReader {
+            session: Arc::clone(&self.inner.session),
+        })
+    }
+
+    async fn provider_session_id(&self, context: &Context) -> SessionResult<String> {
+        self.ensure_open()?;
+        crate::harness::provider::ensure_provider_session_id(
+            &self.inner.session,
+            self.invocation.conversation_id,
+            context,
+        )
+        .await
+    }
+
     async fn get_task(&self, id: TaskId, context: &Context) -> SessionResult<Option<TaskRecord>> {
         self.ensure_open()?;
         let storage = Arc::clone(&self.inner.storage);
