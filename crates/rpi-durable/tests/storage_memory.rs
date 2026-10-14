@@ -74,3 +74,31 @@ async fn memory_rejects_commit_after_close() {
     storage.close(&BACKGROUND_CONTEXT).await.expect("close");
     assert!(storage.commit(&[], &BACKGROUND_CONTEXT).await.is_err());
 }
+
+#[tokio::test]
+async fn memory_document_scan_rejects_cursors_beyond_the_safe_integer() {
+    let storage = MemoryStorage::new();
+    let cursor = rpi_durable::types::Cursor {
+        after: 9_007_199_254_740_992,
+        order: None,
+    };
+    let result = storage
+        .scan_documents(
+            rpi_durable::types::DocumentQuery {
+                scope: rpi_durable::types::DocumentScope::Session,
+                at: rpi_durable::types::DocumentPoint::CURRENT,
+                kind: None,
+            },
+            10,
+            Some(cursor),
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(
+        result
+            .expect_err("invalid cursor")
+            .to_string()
+            .contains("Invalid storage cursor"),
+        "document scans must reject unsafe cursor IDs"
+    );
+}

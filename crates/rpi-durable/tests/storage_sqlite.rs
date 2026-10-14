@@ -845,3 +845,89 @@ async fn facade_cross_task_close_queues_behind_an_active_transaction() {
     close.await.expect("join close").expect("close");
     cleanup_temp_dirs("rpi-durable-sqlite-facade-close-queue");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_document_scan_rejects_cursors_beyond_the_safe_integer() {
+    let dir = TempDir::new("rpi-durable-sqlite-unsafe-cursor");
+    let path = dir
+        .path()
+        .join("storage.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open");
+    let cursor = rpi_durable::types::Cursor {
+        after: 9_007_199_254_740_992,
+        order: None,
+    };
+    let result = storage
+        .scan_documents(
+            rpi_durable::types::DocumentQuery {
+                scope: rpi_durable::types::DocumentScope::Session,
+                at: rpi_durable::types::DocumentPoint::CURRENT,
+                kind: None,
+            },
+            10,
+            Some(cursor),
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(
+        result
+            .expect_err("invalid cursor")
+            .to_string()
+            .contains("Invalid storage cursor"),
+        "document scans must reject unsafe cursor IDs"
+    );
+    storage.close(&BACKGROUND_CONTEXT).await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-unsafe-cursor");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn facade_serves_operations_queued_before_close() {
+    let dir = TempDir::new("rpi-durable-sqlite-facade-close-fifo");
+    let path = dir.path().join("db.sqlite").to_string_lossy().into_owned();
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let transaction_db = database.clone_handle();
+    let transaction = tokio::spawn(async move {
+        transaction_db
+            .transaction(move |_tx| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok(())
+            })
+            .await
+    });
+    started_rx.await.expect("transaction started");
+
+    // Queue a read and then a close behind the parked transaction.
+    let mut queued = Box::pin(database.get_text("SELECT 'ok'", vec![]));
+    assert!(futures::poll!(queued.as_mut()).is_pending());
+    let closer = database.clone_handle();
+    let mut close = Box::pin(async move { closer.close().await });
+    assert!(futures::poll!(close.as_mut()).is_pending());
+
+    let _ = release_tx.send(());
+    transaction
+        .await
+        .expect("join transaction")
+        .expect("transaction");
+    // The read queued before close is served; close then settles.
+    assert_eq!(queued.await.expect("queued read").as_deref(), Some("ok"));
+    close.await.expect("close");
+    // Operations after close reject as closed.
+    let after = database.get_text("SELECT 'late'", vec![]).await;
+    assert!(
+        after
+            .expect_err("post-close read")
+            .to_string()
+            .contains("SQLite database is closed"),
+        "operations after close must reject"
+    );
+    cleanup_temp_dirs("rpi-durable-sqlite-facade-close-fifo");
+}
