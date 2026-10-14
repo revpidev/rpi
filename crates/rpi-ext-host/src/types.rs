@@ -1057,7 +1057,7 @@ pub struct ToolExecutionUpdateEvent {
     pub parent_tool_call_id: Option<String>,
 }
 
-/// `ToolExecutionEndEvent` (types.ts:1065-1072 @ abe508e1b).
+/// `ToolExecutionEndEvent` (types.ts:1087-1094 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionEndEvent {
@@ -1068,7 +1068,7 @@ pub struct ToolExecutionEndEvent {
     /// Milliseconds `execute()` took, measured with a monotonic clock;
     /// absent when the tool did not run (types.ts:1087-1094 @ abe508e1b,
     /// #10549).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     /// Set when another tool (for example a codemode script) made this call.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1367,7 +1367,7 @@ impl ToolRenderers {
     }
 }
 
-/// `ToolRendererResolver` (types.ts:664-668 @ abe508e1b, #10285): chooses
+/// `ToolRendererResolver` (types.ts:664-667 @ abe508e1b, #10285): chooses
 /// how calls to a tool are drawn, including tools that are not registered.
 /// `next()` returns the renderers the remaining resolvers, then the
 /// registered tool, would use. Resolvers run in extension load order

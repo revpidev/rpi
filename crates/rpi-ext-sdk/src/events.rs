@@ -626,7 +626,7 @@ pub struct ToolExecutionEndEvent {
     pub is_error: bool,
     /// Milliseconds `execute()` took, measured with a monotonic clock;
     /// absent when the tool did not run (types.ts:1087-1094 @ abe508e1b).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
