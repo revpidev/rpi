@@ -12,9 +12,12 @@
 //! in the default CLI path: `crates/rpi` does not depend on `rpi-durable`.
 
 pub mod chord;
+pub mod documents;
+pub mod entries;
 pub mod errors;
 pub mod fs;
 pub mod ids;
+pub mod session;
 pub mod storage;
 pub mod testing;
 pub mod types;
@@ -40,3 +43,18 @@ pub use types::{
 
 pub use chord::context::{BACKGROUND_CONTEXT, Context, ContextKey, TODO_CONTEXT};
 pub use chord::json::{JsonObject, JsonValue, copy_json, is_json_value};
+pub use chord::tracker::{Change, DocCell, Prepared, Tracker, track};
+pub use documents::{
+    DocDefinition, DocScope, DocTarget, DocToken, DocumentError, ResolvedAddress, address_id,
+    check_record_scope, check_record_version, define_doc, define_doc_family, document_create,
+    materialize_document, materialize_document_value, resolve_address,
+};
+pub use session::{
+    CloseListener, CommitChange, CommitFn, CommitListener, CommitPublication, CommittedStateSource,
+    CommittedWatch, ConversationCreatedHook, ConversationDocumentView, ConversationOwnership,
+    DocDraft, DocOwner, DocumentChange, DocumentCopyChange, EntryDraft, EntryHead,
+    ForkDocumentCopy, LoadedDocument, NowFn, ObservedDocumentValue, SessionError, SessionFuture,
+    SessionImpl, SessionResult, Subscription, TaskCreate, TaskOwnership, Transaction,
+    TransactionScope, WatchEnd, WatchListener, commit_fn, create_session,
+    prepare_fork_document_copies, watch_listener,
+};
