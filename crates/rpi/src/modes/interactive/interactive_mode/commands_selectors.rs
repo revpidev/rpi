@@ -29,6 +29,14 @@
 //!   rebind through `InteractiveMode::rebind_session_ui` (upstream
 //!   `rebindCurrentSession`, interactive-mode.ts:1732-1758) instead of the
 //!   runtime's `setRebindSession` hook, which stays `None`.
+//! - V17-08 #63: `handleReloadCommand` mounts the reload box
+//!   (`show_extension_selector`/dismiss, interactive-mode.ts:6442-6468 @
+//!   v1.1.0) instead of the previous chat status line; the `/model` command
+//!   probe (the second `refreshModelCatalogs` consumption point,
+//!   interactive-mode.ts:5224-5249) passes a 15 s waiter token to
+//!   `refresh_catalogs_shared` and warns on timeout; the built-in
+//!   `show_extension_selector` / `show_extension_editor` helpers back the
+//!   #60 branch-summary ask loop and the #63 `/import` dialogs.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -63,7 +71,9 @@ use crate::core::session_manager::SessionManager;
 use crate::core::themes::get_available_themes;
 use crate::core::trust_manager::ProjectTrustStore;
 use crate::extensions::llama::{LlamaHost, NotifyLevel};
+use crate::modes::interactive::components::DynamicBorder;
 use crate::modes::interactive::components::bash_execution::BashExecutionComponent;
+use crate::modes::interactive::components::extension_editor::ExtensionEditorComponent;
 use crate::modes::interactive::components::extension_selector::ExtensionSelectorComponent;
 use crate::modes::interactive::components::llama_view::new_llama_view;
 use crate::modes::interactive::components::login_dialog::LoginDialogComponent;
@@ -82,6 +92,8 @@ use crate::modes::interactive::components::trust_selector::{TrustOption, TrustSe
 use crate::modes::interactive::program_status::BlockedStatus;
 use crate::modes::interactive::theme_watcher::{auto_theme_pair, detect_terminal_theme_for_auto};
 use crate::tools::truncate::TruncationResult;
+use rpi_tui::components::spacer::Spacer;
+use rpi_tui::components::text::Text;
 use rpi_tui::program_status::ProgramStatusKind;
 
 // =============================================================================
@@ -125,6 +137,136 @@ impl<T: Component> Focusable for FocusableShell<T> {
 
     fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
+    }
+}
+
+/// `showExtensionSelector` (interactive-mode.ts:2690-2741) for built-in
+/// callers (#60 branch-summary ask loop, #63 /import confirm): mount the
+/// selector in the editor region and await the choice. `None` = Escape /
+/// countdown expiry. Mirrors the extension bridge's dialog lifecycle (blocked
+/// report + guarded close) without the bridge's weak UI handle.
+pub(crate) async fn show_extension_selector(
+    ui: &Arc<InteractiveUi>,
+    title: &str,
+    options: Vec<String>,
+    blocked: BlockedStatus,
+) -> Option<String> {
+    let (tx, rx) = oneshot::channel();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let selector = Arc::new(Mutex::new(ExtensionSelectorComponent::new(
+        Arc::clone(&lock(&ui.theme)),
+        Some(title.to_owned()),
+        options,
+        {
+            let tx = tx.clone();
+            Box::new(move |selected: Option<String>| {
+                if let Some(tx) = lock(&tx).take() {
+                    let _ = tx.send(selected);
+                }
+            })
+        },
+        {
+            let tx = tx.clone();
+            Box::new(move || {
+                if let Some(tx) = lock(&tx).take() {
+                    let _ = tx.send(None);
+                }
+            })
+        },
+        None,
+    )));
+    let entry = shared_component_from_boxed(Box::new(FocusableShell {
+        inner: selector,
+        focused: false,
+    }));
+    ui.show_selector(entry.clone());
+    ui.set_program_status_blocked("extension-dialog", Some(blocked));
+    let result = rx.await.ok().flatten();
+    if ui.selector_is_current(&entry) {
+        ui.hide_selector_if_current(&entry);
+        ui.set_program_status_blocked("extension-dialog", None);
+    }
+    result
+}
+
+/// `showExtensionEditor` (interactive-mode.ts:2830-2858) for the #60 custom
+/// summarization prompt: mount the multi-line editor and await submit;
+/// `None` = cancel (Escape / ctrl+c).
+pub(crate) async fn show_extension_editor(ui: &Arc<InteractiveUi>, title: &str) -> Option<String> {
+    let (tx, rx) = oneshot::channel();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let editor = Arc::new(Mutex::new(ExtensionEditorComponent::new(
+        ui.ui.clone(),
+        Arc::clone(&lock(&ui.theme)),
+        title.to_owned(),
+        None,
+        {
+            let tx = tx.clone();
+            Box::new(move |text: &str| {
+                if let Some(tx) = lock(&tx).take() {
+                    let _ = tx.send(Some(text.to_owned()));
+                }
+            })
+        },
+        {
+            let tx = tx.clone();
+            Box::new(move || {
+                if let Some(tx) = lock(&tx).take() {
+                    let _ = tx.send(None);
+                }
+            })
+        },
+        None,
+    )));
+    let entry = shared_component_from_boxed(Box::new(FocusableRegion(editor)));
+    ui.show_selector(entry.clone());
+    ui.set_program_status_blocked(
+        "extension-dialog",
+        Some(BlockedStatus {
+            kind: ProgramStatusKind::Question,
+            message: title.to_owned(),
+        }),
+    );
+    let result = rx.await.ok().flatten();
+    if ui.selector_is_current(&entry) {
+        ui.hide_selector_if_current(&entry);
+        ui.set_program_status_blocked("extension-dialog", None);
+    }
+    result
+}
+
+/// The #60 branch-summary ask loop (interactive-mode.ts:5590-5616): `None`
+/// when the user escapes (the caller re-opens the tree selector with the
+/// same selection); `Some((summarize, custom_instructions))` for a complete
+/// choice. A cancelled custom-prompt editor loops back to the selector.
+pub(crate) async fn ask_branch_summary(ui: &Arc<InteractiveUi>) -> Option<(bool, Option<String>)> {
+    loop {
+        let choice = show_extension_selector(
+            ui,
+            "Summarize branch?",
+            vec![
+                "No summary".to_string(),
+                "Summarize".to_string(),
+                "Summarize with custom prompt".to_string(),
+            ],
+            BlockedStatus {
+                kind: ProgramStatusKind::Question,
+                message: "Summarize branch?".to_string(),
+            },
+        )
+        .await;
+        let Some(choice) = choice else {
+            // Escape — re-show the tree selector with the same selection.
+            return None;
+        };
+        if choice == "Summarize with custom prompt" {
+            match show_extension_editor(ui, "Custom summarization instructions").await {
+                Some(text) => return Some((true, Some(text))),
+                // Cancelled — loop back to the summary selector.
+                None => continue,
+            }
+        }
+        return Some((choice != "No summary", None));
     }
 }
 
@@ -2001,28 +2143,12 @@ impl InteractiveUi {
                     let _ = ui.shutdown_tx.send(true);
                 }
             }),
-            Some(Box::new({
-                let ui = Arc::clone(ui);
-                move |path: &str| {
-                    // Delete the session file the way upstream
-                    // `deleteSessionFile` does (session-selector.ts:645-680):
-                    // prefer the `trash` CLI (recoverable); fall back to a
-                    // plain unlink when it is unavailable.
-                    let trashed = std::process::Command::new("trash")
-                        .arg(path)
-                        .status()
-                        .map(|status| status.success())
-                        .unwrap_or(false);
-                    if trashed {
-                        ui.show_status("Session moved to trash");
-                        return;
-                    }
-                    match std::fs::remove_file(path) {
-                        Ok(()) => ui.show_status("Session deleted"),
-                        Err(error) => ui.show_error(&format!("Failed to delete session: {error}")),
-                    }
-                }
-            })),
+            // V17-08 FR-C (#64): deletion lives inside the component
+            // (`deleteSessionFile`, session-selector.ts:654-688); `on_delete`
+            // is a post-deletion observer only. Upstream's interactive mount
+            // passes no observer, so the component-internal chain (trash →
+            // unlink + method-dependent header status) runs alone.
+            None,
             Some(Box::new({
                 let ui = Arc::clone(ui);
                 move |path: &str, name: &str| {
@@ -2371,12 +2497,33 @@ impl InteractiveUi {
         // `getModelCandidates` (interactive-mode.ts:4350-4361): scoped models
         // win; otherwise refresh and list everything.
         let models: Vec<Model> = if self.session().scoped_models().is_empty() {
-            // Shared in-flight refresh (7d8c11d37): /model does not cancel
-            // and restart a running catalog refresh.
-            self.session()
-                .model_runtime()
-                .refresh_catalogs_shared()
-                .await;
+            // Second `refreshModelCatalogs` consumption point
+            // (interactive-mode.ts:5224-5249): a 15 s controller bounds the
+            // exact-match probe; a timeout warns and searches the cached
+            // models. Shared in-flight refresh (7d8c11d37): /model joins a
+            // running catalog refresh instead of restarting it.
+            {
+                let cancel = CancellationToken::new();
+                let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let timeout_task = {
+                    let cancel = cancel.clone();
+                    let timed_out = Arc::clone(&timed_out);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(15)).await;
+                        timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                        cancel.cancel();
+                    })
+                };
+                let result = self
+                    .session()
+                    .model_runtime()
+                    .refresh_catalogs_shared(Some(cancel))
+                    .await;
+                timeout_task.abort();
+                if result.aborted && timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.show_warning("Model refresh timed out; searching cached models.");
+                }
+            };
             self.session()
                 .model_runtime()
                 .get_available(None)
@@ -2404,9 +2551,11 @@ impl InteractiveUi {
         }
     }
 
-    /// `handleReloadCommand` (interactive-mode.ts:5318-5419), simplified: the
-    /// reload box and theme controller are skipped; the resource loader and
-    /// the keybinding globals are reloaded.
+    /// `handleReloadCommand` (interactive-mode.ts:6429-6518): mount the
+    /// reload box (`Reloading keybindings, extensions, skills, prompts,
+    /// themes, and context files...`) in the editor region, reload the
+    /// session in the background, then dismiss the box and restore the
+    /// editor.
     pub(crate) fn handle_reload_command(&self) {
         if self.session().is_streaming() {
             self.show_warning("Wait for the current response to finish before reloading.");
@@ -2416,18 +2565,43 @@ impl InteractiveUi {
             self.show_warning("Wait for compaction to finish before reloading.");
             return;
         }
-        // The reload box (interactive-mode.ts:5330-5356) is not ported; the
-        // editor stays mounted (unassigned — no v0.1 task claims it).
-        //
+        let Some(ui) = self.upgrade_self() else {
+            return;
+        };
+
+        // Reload box (interactive-mode.ts:6442-6462): bordered container
+        // with the muted reloading notice, swapped into the editor region
+        // and focused until the reload settles.
+        let reload_box = {
+            let border_color = {
+                let theme = Arc::clone(&lock(&ui.theme));
+                Box::new(move |text: &str| theme.fg("border", text))
+            };
+            let mut container = rpi_tui::tui::Container::new();
+            container.add_child(Box::new(DynamicBorder::new(border_color.clone())));
+            container.add_child(Box::new(Spacer::new(1)));
+            container.add_child(Box::new(Text::new(
+                lock(&ui.theme).fg(
+                    "muted",
+                    "Reloading keybindings, extensions, skills, prompts, themes, and context files...",
+                ),
+                1,
+                0,
+                None,
+            )));
+            container.add_child(Box::new(Spacer::new(1)));
+            container.add_child(Box::new(DynamicBorder::new(border_color)));
+            shared_component_from_boxed(Box::new(container))
+        };
+        ui.show_selector(reload_box.clone());
+        ui.render_handle.request_render();
+
         // `session.reload()` (agent-session.ts:2600-2628) — the upstream
-        // reload-box body (:5371): settings/resources reload + extension
+        // reload-box body (:6470): settings/resources reload + extension
         // host reload (factories re-run, factory cache generation bumped) +
         // tool-registry rebuild + session_start/resources_discover(reload)
         // events. Runs in the background so the TUI stays responsive.
         let session = self.session();
-        let Some(ui) = self.upgrade_self() else {
-            return;
-        };
         let ui_weak = Arc::downgrade(&ui);
         spawn_async(async move {
             session.reload().await;
@@ -2439,6 +2613,11 @@ impl InteractiveUi {
                 crate::modes::interactive::extension_shortcuts::install_extension_shortcuts(
                     &ui, &session,
                 );
+                // `dismissReloadBox` (interactive-mode.ts:6463-6468):
+                // restore the editor unless another selector superseded the
+                // box meanwhile.
+                ui.hide_selector_if_current(&reload_box);
+                ui.render_handle.request_render();
             }
         });
         // Re-install both keybinding globals (re-reads the config file,
@@ -2452,9 +2631,6 @@ impl InteractiveUi {
         {
             self.show_warning(&diagnostic);
         }
-        self.show_status(
-            "Reloading keybindings, extensions, skills, prompts, themes, and context files",
-        );
     }
 
     // =========================================================================
@@ -3316,7 +3492,16 @@ mod tests {
     /// runtime-dependent commands (`/new`, `/resume`, `/clone`) can switch
     /// sessions.
     async fn switchable_harness() -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
-        switchable_harness_with_factory(None).await
+        switchable_harness_inner(None, false).await
+    }
+
+    /// Like [`switchable_harness`] but the session manager persists into a
+    /// temp session directory. Import tests need a real destination dir: the
+    /// in-memory manager's empty session dir would copy imported files next
+    /// to the process cwd.
+    async fn switchable_harness_with_session_dir()
+    -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
+        switchable_harness_inner(None, true).await
     }
 
     /// Like [`switchable_harness`] but the session factory always fails with
@@ -3325,11 +3510,12 @@ mod tests {
     async fn failing_factory_harness(
         factory_error: &str,
     ) -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
-        switchable_harness_with_factory(Some(factory_error.to_owned())).await
+        switchable_harness_inner(Some(factory_error.to_owned()), false).await
     }
 
-    async fn switchable_harness_with_factory(
+    async fn switchable_harness_inner(
         factory_error: Option<String>,
+        persistent_sessions: bool,
     ) -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
         install_global_keybindings();
         let tmp = TempDir::new();
@@ -3366,10 +3552,19 @@ mod tests {
             .get_model("custom", "m1")
             .expect("test model must compose");
 
-        let session_manager = Arc::new(Mutex::new(
-            SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
-                .expect("in-memory session manager"),
-        ));
+        let session_manager = if persistent_sessions {
+            let sessions = tmp.path().join("sessions");
+            std::fs::create_dir_all(&sessions).expect("sessions dir");
+            let file = sessions.join("s.jsonl");
+            Arc::new(Mutex::new(
+                SessionManager::open(&file, Some(&sessions), None).expect("session manager"),
+            ))
+        } else {
+            Arc::new(Mutex::new(
+                SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+                    .expect("in-memory session manager"),
+            ))
+        };
 
         let created = create_agent_session(CreateAgentSessionOptions {
             cwd: Some(cwd.clone()),
@@ -3547,6 +3742,32 @@ mod tests {
 
     fn selector_mounted(ui: &InteractiveUi) -> bool {
         lock(&ui.active_selector).is_some()
+    }
+
+    /// Wait for the mounted built-in dialog carrying `needle`, then feed
+    /// `keys` one per tick (V17-08 #63 built-in selector dialogs).
+    async fn answer_mounted_dialog(
+        ui: &Arc<InteractiveUi>,
+        terminal: &Arc<TestTerminal>,
+        needle: &str,
+        keys: &[&str],
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mounted = lock(&ui.editor_container).render(120).join("\n");
+            if mounted.contains(needle) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dialog {needle:?} never mounted; content: {mounted}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for key in keys {
+            terminal.feed(key);
+            ui.ui.tick(Instant::now());
+        }
     }
 
     #[tokio::test]
@@ -3742,6 +3963,14 @@ mod tests {
         );
         terminal.feed("\r");
         mode.ui_state.ui.tick(std::time::Instant::now());
+        // The offer flow triggers `handleReloadCommand` synchronously in the
+        // selector callback, which mounts the reload box (V17-08 #63) before
+        // the background reload dismisses it.
+        let mounted = lock(&mode.ui_state.editor_container).render(80).join("\n");
+        assert!(
+            mounted.contains("Reloading keybindings"),
+            "reload box mounted by the radius offer flow: {mounted}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let body = std::fs::read_to_string(agent_dir.join("mcp.json")).expect("mcp.json");
@@ -3753,11 +3982,6 @@ mod tests {
         assert_eq!(
             parsed["mcpServers"]["radius"]["auth"]["provider"],
             serde_json::json!("radius")
-        );
-        let chat = rendered_chat(&mode.ui_state);
-        assert!(
-            chat.contains("Reloading keybindings"),
-            "reload triggered; chat: {chat}"
         );
     }
 
@@ -4055,15 +4279,218 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_reload_command_shows_status() {
+    async fn handle_reload_command_mounts_reload_box() {
         let (mode, _terminal, _session, _tmp) = mode_harness().await;
         mode.ui_state.handle_reload_command();
-        let chat = rendered_chat(&mode.ui_state);
-        // The dim status line wraps at the 60-cell render width. The reload
-        // itself runs in the background (session.reload is async).
+        // The reload box replaces the editor content (interactive-mode.ts:
+        // 6442-6462); the reload itself runs in the background.
+        let mounted = lock(&mode.ui_state.editor_container).render(80).join("\n");
         assert!(
-            chat.contains("Reloading keybindings, extensions, skills, prompts,"),
+            mounted.contains("Reloading keybindings, extensions, skills, prompts,"),
+            "reload box: {mounted}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // /import confirmation + missing-cwd recovery (V17-08 #63)
+    // ---------------------------------------------------------------------
+
+    /// Build an outside JSONL whose header cwd is `cwd` (an argument, so
+    /// callers can point at a missing directory).
+    fn write_import_file(path: &std::path::Path, cwd: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("import parent dir");
+        }
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 3,
+            "id": "imported",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "cwd": cwd.to_string_lossy(),
+        });
+        std::fs::write(path, format!("{header}\n")).expect("write import file");
+    }
+
+    /// #63 /import: the confirmation prompt gates the import; declining
+    /// keeps the current session untouched.
+    #[tokio::test]
+    async fn import_command_decline_keeps_current_session() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let source = tmp.path().join("outside").join("imported.jsonl");
+        write_import_file(&source, &tmp.path().join("cwd"));
+        let session_id_before = mode.ui_state.session().session_id();
+
+        // Decline: down to "No", Enter.
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Import session", &["\x1b[B", "\r"]).await;
+        };
+        let command = format!("/import {}", source.display());
+        let (_, ()) = tokio::join!(mode.handle_import_command(&command), feeder);
+
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(chat.contains("Import cancelled"), "chat: {chat}");
+        assert_eq!(
+            mode.ui_state.session().session_id(),
+            session_id_before,
+            "declining must not replace the session"
+        );
+    }
+
+    /// #63 /import: `MissingSessionCwdError` routes to the cwd prompt and the
+    /// confirmed fallback cwd retries the import successfully (instead of the
+    /// fatal path).
+    #[tokio::test]
+    async fn import_command_missing_cwd_prompts_and_retries() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let source = tmp.path().join("outside").join("imported.jsonl");
+        let missing_cwd = tmp.path().join("gone-cwd");
+        write_import_file(&source, &missing_cwd);
+        let expected_cwd = tmp.path().join("cwd");
+
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            // Confirm the import, then confirm the cwd prompt (fallback cwd).
+            answer_mounted_dialog(&ui, &terminal, "Import session", &["\r"]).await;
+            answer_mounted_dialog(&ui, &terminal, "Session cwd not found", &["\r"]).await;
+        };
+        let command = format!("/import {}", source.display());
+        let (_, ()) = tokio::join!(mode.handle_import_command(&command), feeder);
+
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(chat.contains("Session imported from:"), "chat: {chat}");
+        let imported_cwd = lock(&mode.ui_state.session().session_manager())
+            .get_cwd()
+            .to_path_buf();
+        assert_eq!(
+            imported_cwd, expected_cwd,
+            "imported under the fallback cwd"
+        );
+    }
+
+    /// A provider whose catalog refresh never completes — the `/model`
+    /// command probe's 15 s bound must cut it (V17-08 #63).
+    struct NeverFinishingCatalogProvider {
+        id: String,
+        auth: rpi_ai::auth::ProviderAuth,
+        model: Model,
+    }
+
+    impl rpi_ai::models::Provider for NeverFinishingCatalogProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            &self.id
+        }
+
+        fn base_url(&self) -> Option<&str> {
+            None
+        }
+
+        fn headers(&self) -> Option<&rpi_ai::types::ProviderHeaders> {
+            None
+        }
+
+        fn auth(&self) -> &rpi_ai::auth::ProviderAuth {
+            &self.auth
+        }
+
+        fn get_models(&self) -> Vec<Model> {
+            vec![self.model.clone()]
+        }
+
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &rpi_ai::types::TranscriptContext,
+            _options: Option<rpi_ai::types::StreamOptions>,
+        ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+            rpi_ai::utils::event_stream::AssistantMessageEventStream::new()
+        }
+
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &rpi_ai::types::TranscriptContext,
+            _options: Option<rpi_ai::types::SimpleStreamOptions>,
+        ) -> Result<rpi_ai::utils::event_stream::AssistantMessageEventStream, String> {
+            Err("NeverFinishingCatalogProvider does not stream".to_owned())
+        }
+
+        fn refresh_models(
+            &self,
+            _context: rpi_ai::models::RefreshModelsContext,
+        ) -> Option<futures::future::BoxFuture<'_, Result<(), rpi_ai::auth::ModelsError>>> {
+            Some(Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                Ok(())
+            }))
+        }
+    }
+
+    /// #63 /model: the command probe (second `refreshModelCatalogs`
+    /// consumption point) passes a 15 s waiter bound — a hanging catalog
+    /// refresh times out with the upstream warning and the selector still
+    /// opens over the cached models.
+    #[tokio::test(start_paused = true)]
+    async fn model_command_probe_times_out_and_warns() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        let model = session.model().expect("session model");
+        session
+            .model_runtime()
+            .register_native_provider(Arc::new(NeverFinishingCatalogProvider {
+                id: "never-catalog".to_owned(),
+                auth: rpi_ai::auth::ProviderAuth {
+                    api_key: None,
+                    oauth: None,
+                },
+                model,
+            }))
+            .await
+            .expect("register provider");
+
+        mode.ui_state.handle_model_command("does/not-exist").await;
+
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(
+            chat.contains("Model refresh timed out; searching cached models."),
             "chat: {chat}"
+        );
+        assert!(
+            selector_mounted(&mode.ui_state),
+            "the selector still opens with cached models"
+        );
+    }
+
+    /// #63 /import: declining the missing-cwd prompt cancels the import and
+    /// keeps the current session.
+    #[tokio::test]
+    async fn import_command_missing_cwd_cancel_keeps_session() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let source = tmp.path().join("outside").join("imported.jsonl");
+        write_import_file(&source, &tmp.path().join("gone-cwd"));
+        let session_id_before = mode.ui_state.session().session_id();
+
+        // Confirm the import, decline the cwd prompt (down + Enter).
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Import session", &["\r"]).await;
+            answer_mounted_dialog(&ui, &terminal, "Session cwd not found", &["\x1b[B", "\r"]).await;
+        };
+        let command = format!("/import {}", source.display());
+        let (_, ()) = tokio::join!(mode.handle_import_command(&command), feeder);
+
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(chat.contains("Import cancelled"), "chat: {chat}");
+        assert_eq!(
+            mode.ui_state.session().session_id(),
+            session_id_before,
+            "cancelling the cwd prompt must not replace the session"
         );
     }
 

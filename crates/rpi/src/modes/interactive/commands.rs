@@ -25,23 +25,27 @@
 //!   gist worker's completion settle in the drain (`UiCommand::ShareAbort` /
 //!   `ShareCompleted`) instead of upstream's inline promise continuation
 //!   (component lock contract).
-//! - Import (`handle_import_command`): the extension confirmation prompt
+//! - Import (`handle_import_command`): the confirmation prompt
 //!   (`showExtensionConfirm`, interactive-mode.ts:5474-5478) and the
-//!   missing-session-cwd prompt (interactive-mode.ts:5489-5501) are T15
-//!   extension hooks; local import proceeds directly and reports
-//!   failures uniformly.
+//!   missing-session-cwd prompt/recovery (interactive-mode.ts:5489-5501)
+//!   run through the built-in selector dialogs (V17-08 #63);
+//!   `MissingSessionCwdError` is a typed `RpiError` variant so the import
+//!   can retry with the fallback cwd instead of taking the fatal path.
 //! - Changelog (`handle_changelog_command`): the embedded CHANGELOG.md asset
 //!   (`core/changelog.rs`, compile-time `include_str!`) replaces upstream's
 //!   package-adjacent file; the display half of `getChangelogForDisplay`
 //!   runs at init (the recording/telemetry side lives in
 //!   `prepare_install_report`, D-046); `normalizeChangelogLinks` is not
 //!   ported (the asset carries no relative links).
-//! - Hotkeys (`handle_hotkeys_command`): the extension-registered shortcuts
-//!   section (interactive-mode.ts:5835-5848) is a T15 hook; the built-in
-//!   sections are identical to upstream.
-//! - Debug (`handle_debug_command`): `Tui` has no public full-render API,
-//!   so the "all rendered lines" section (interactive-mode.ts:5877-5890) is
-//!   a T14 hook; the log carries the header + agent-message JSONL sections.
+//! - Hotkeys (`handle_hotkeys_command`): the `**Extensions**` section reads
+//!   the live host shortcuts (V17-08 #63; `getShortcuts`,
+//!   interactive-mode.ts:6901-6916) with `description ?? extensionPath` and
+//!   capitalized key text; an empty set renders no section.
+//! - Debug (`handle_debug_command`): the full-render section uses
+//!   [`rpi_tui::tui_handle::TuiHandle::render`] (V17-08 #63; the main-screen
+//!   render is the interactive `ui.render(width)` equivalent), so the log
+//!   carries the real `Total lines` count and the visible-width line
+//!   section.
 //! - Session (`handle_session_command`): the cache-waste "Cache Re-billed"
 //!   line comes from `core::cache_stats` (V17-07, #57); it stays distinct
 //!   from the cache-warming "Cache miss penalty" economics line.
@@ -53,6 +57,7 @@ use rpi_agent::session::SessionEntry;
 use rpi_tui::components::markdown::Markdown;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
+use rpi_tui::utils::visible_width;
 
 use crate::RpiError;
 use crate::core::session_manager::now_iso8601;
@@ -60,12 +65,16 @@ use crate::core::themes::Theme;
 use crate::core::usage_totals::get_usage_cost_breakdown;
 use crate::modes::interactive::components::DynamicBorder;
 use crate::modes::interactive::components::bordered_loader::BorderedLoaderComponent;
-use crate::modes::interactive::components::keybinding_hints::key_display_text;
+use crate::modes::interactive::components::keybinding_hints::{
+    KeyTextFormatOptions, format_key_text, key_display_text,
+};
 use crate::modes::interactive::components::util::to_locale_string;
 use crate::modes::interactive::footer::format_tokens;
 use crate::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveUi, ShareState, UiCommand,
 };
+use crate::modes::interactive::program_status::BlockedStatus;
+use rpi_tui::program_status::ProgramStatusKind;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -621,7 +630,7 @@ impl InteractiveUi {
         // The markdown template matches the upstream hotkeys string
         // (interactive-mode.ts:5786-5832); the win32 new-line annotation is
         // skipped (rpi is not Windows-specific here).
-        let hotkeys = format!(
+        let mut hotkeys = format!(
             r#"
 **Navigation**
 | Key | Action |
@@ -671,8 +680,26 @@ impl InteractiveUi {
 "#
         );
 
-        // TODO(T15): extension-registered shortcuts section
-        // (extensionRunner.getShortcuts, interactive-mode.ts:5835-5848).
+        // Extension-registered shortcuts (interactive-mode.ts:6901-6916):
+        // `getShortcuts` with last-wins conflict resolution; the section is
+        // omitted when no extension registered one.
+        let shortcuts = super::extension_shortcuts::host_of(&self.session()).map(|host| {
+            host.get_shortcuts(&super::extension_shortcuts::builtin_keybinding_pairs())
+        });
+        if let Some(shortcuts) = shortcuts
+            && !shortcuts.is_empty()
+        {
+            hotkeys.push_str("\n**Extensions**\n| Key | Action |\n|-----|--------|\n");
+            for (key, shortcut) in shortcuts.iter() {
+                let description = shortcut
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| shortcut.extension_path.clone());
+                let key_display = format_key_text(key, KeyTextFormatOptions { capitalize: true });
+                hotkeys.push_str(&format!("| `{key_display}` | {description} |\n"));
+            }
+        }
+
         let border_theme = Arc::clone(&lock(&self.theme));
         let border = Box::new(move |text: &str| border_theme.fg("border", text));
 
@@ -699,19 +726,25 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
-    /// `handleDebugCommand` (interactive-mode.ts:5874-5905): write the debug
-    /// log to `{agent_dir}/rpi-debug.log` and confirm in the chat.
+    /// `handleDebugCommand` (interactive-mode.ts:6932-6973): write the debug
+    /// log to `{agent_dir}/rpi-debug.log` and confirm in the chat. The log
+    /// carries the full rendered frame (upstream `this.ui.render(width)`) and
+    /// the agent-message JSONL.
     pub(crate) fn handle_debug_command(&self) {
         let width = self.ui.with_terminal(|terminal| terminal.columns());
         let height = self.ui.terminal_rows();
-        // TODO(T14): the "all rendered lines" section
-        // (`this.ui.render(width)` + visibleWidth,
-        // interactive-mode.ts:5877-5890) — `Tui` has no public full-render
-        // API. Until then Total lines is 0 and the section is omitted; the
-        // agent-message JSONL section is written.
+        let all_lines = self.ui.render(width as usize);
+
         let mut debug_data = format!("Debug output at {}\n", now_iso8601());
         debug_data.push_str(&format!("Terminal: {width}x{height}\n"));
-        debug_data.push_str("Total lines: 0\n\n");
+        debug_data.push_str(&format!("Total lines: {}\n\n", all_lines.len()));
+        debug_data.push_str("=== All rendered lines with visible widths ===\n");
+        for (idx, line) in all_lines.iter().enumerate() {
+            let visible = visible_width(line);
+            let escaped = serde_json::to_string(line).unwrap_or_default();
+            debug_data.push_str(&format!("[{idx}] (w={visible}) {escaped}\n"));
+        }
+        debug_data.push('\n');
         debug_data.push_str("=== Agent messages (JSONL) ===\n");
         for message in self.session().messages() {
             debug_data.push_str(&serde_json::to_string(&message).unwrap_or_default());
@@ -761,15 +794,34 @@ impl InteractiveUi {
 }
 
 impl InteractiveMode {
-    /// `handleImportCommand` (interactive-mode.ts:5467-5509): replace the
-    /// current session with the one in the JSONL file.
+    /// `handleImportCommand` (interactive-mode.ts:5476-5576): confirm, replace
+    /// the current session with the one in the JSONL file, and recover from a
+    /// missing stored cwd by prompting for the fallback directory.
     pub(crate) async fn handle_import_command(&mut self, args: &str) {
         let Some(input_path) = get_path_command_argument(args, "/import") else {
             self.ui_state.show_error("Usage: /import <path.jsonl>");
             return;
         };
-        // TODO(T15): extension confirmation prompt (showExtensionConfirm,
-        // interactive-mode.ts:5474-5478).
+
+        // `showExtensionConfirm("Import session", …)`
+        // (interactive-mode.ts:5474-5478).
+        let confirmed = crate::modes::interactive::interactive_mode::commands_selectors::show_extension_selector(
+            &self.ui_state,
+            &format!("Import session\nReplace current session with {input_path}?"),
+            vec!["Yes".to_string(), "No".to_string()],
+            BlockedStatus {
+                kind: ProgramStatusKind::Permission,
+                message: "Import session".to_string(),
+            },
+        )
+        .await
+        .as_deref()
+            == Some("Yes");
+        if !confirmed {
+            self.ui_state.show_status("Import cancelled");
+            return;
+        }
+
         match self.runtime.import_from_jsonl(&input_path, None).await {
             Ok(true) => self.ui_state.show_status("Import cancelled"),
             Ok(false) => {
@@ -781,11 +833,56 @@ impl InteractiveMode {
                 self.ui_state
                     .show_status(&format!("Session imported from: {input_path}"));
             }
-            // Upstream distinguishes MissingSessionCwdError (cwd prompt,
-            // interactive-mode.ts:5489-5501 — a T15 extension hook still
-            // pending locally) and SessionImportFileNotFoundError
-            // (recoverable showError, interactive-mode.ts:5852-5854); every
-            // other import failure is fatal (interactive-mode.ts:5855).
+            Err(RpiError::MissingSessionCwd(error)) => {
+                // `promptForMissingSessionCwd` (interactive-mode.ts:2762-2766 +
+                // 5489-5501): confirm the fallback cwd, then retry the import
+                // with it; a decline cancels the import.
+                let confirmed = crate::modes::interactive::interactive_mode::commands_selectors::show_extension_selector(
+                    &self.ui_state,
+                    &format!(
+                        "Session cwd not found\n{}",
+                        crate::core::session_cwd::format_missing_session_cwd_prompt(&error.issue)
+                    ),
+                    vec!["Yes".to_string(), "No".to_string()],
+                    BlockedStatus {
+                        kind: ProgramStatusKind::Permission,
+                        message: "Session cwd not found".to_string(),
+                    },
+                )
+                .await
+                .as_deref()
+                    == Some("Yes");
+                if !confirmed {
+                    self.ui_state.show_status("Import cancelled");
+                    return;
+                }
+                let fallback_cwd = error.issue.fallback_cwd.clone();
+                match self
+                    .runtime
+                    .import_from_jsonl(&input_path, Some(&fallback_cwd))
+                    .await
+                {
+                    Ok(true) => self.ui_state.show_status("Import cancelled"),
+                    Ok(false) => {
+                        self.rebind_session_ui().await;
+                        self.ui_state
+                            .show_status(&format!("Session imported from: {input_path}"));
+                    }
+                    Err(RpiError::SessionImportFileNotFound(error)) => self
+                        .ui_state
+                        .show_error(&format!("Failed to import session: {error}")),
+                    Err(error) => {
+                        self.handle_fatal_runtime_error(
+                            "Failed to import session",
+                            &error.raw_message(),
+                        )
+                        .await
+                    }
+                }
+            }
+            // `SessionImportFileNotFoundError` (recoverable showError,
+            // interactive-mode.ts:5852-5854); every other import failure is
+            // fatal (interactive-mode.ts:5855).
             Err(RpiError::SessionImportFileNotFound(error)) => self
                 .ui_state
                 .show_error(&format!("Failed to import session: {error}")),
@@ -1420,11 +1517,35 @@ mod tests {
 
     #[tokio::test]
     async fn import_command_missing_file_reports_error() {
-        let (mut mode, _terminal) = mode_harness().await;
+        let (mut mode, terminal) = mode_harness().await;
+        // Drive the mounted dialog through the TUI dispatch: install the
+        // keybindings and start the terminal input handler (the full
+        // `init` also mounts the editor/chat tree, not needed here).
+        crate::modes::interactive::interactive_mode::install_global_keybindings();
+        mode.ui_state.ui.start();
         let tmp = crate::modes::interactive::test_support::TempDir::new();
         let missing = tmp.path().join("nope.jsonl");
-        mode.handle_import_command(&format!("/import {}", missing.display()))
-            .await;
+        // Confirm the import dialog; the missing file then takes the
+        // recoverable error arm.
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let mounted = ui.editor_region_render(120).join("\n");
+                if mounted.contains("Import session") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "import dialog never mounted: {mounted}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            terminal.feed("\r");
+            ui.ui.tick(std::time::Instant::now());
+        };
+        let command = format!("/import {}", missing.display());
+        let (_, ()) = tokio::join!(mode.handle_import_command(&command), feeder);
         let rendered = chat_render(&mode.ui_state);
         assert!(
             rendered.contains("Failed to import session: File not found"),
@@ -1500,6 +1621,55 @@ mod tests {
         assert!(rendered.contains("Other"), "rendered: {rendered}");
         assert!(rendered.contains("Move cursor"), "rendered: {rendered}");
         assert!(rendered.contains("Slash commands"), "rendered: {rendered}");
+        // No extension host wired: the Extensions section is absent.
+        assert!(!rendered.contains("Extensions"), "rendered: {rendered}");
+    }
+
+    /// #63 /hotkeys: an extension-registered shortcut renders the
+    /// `**Extensions**` table with `description ?? extensionPath` and
+    /// capitalized key text (interactive-mode.ts:6901-6916).
+    #[tokio::test]
+    async fn hotkeys_command_renders_extension_section() {
+        use rpi_ext_host::api::{ExtensionApi, ExtensionContext};
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+        let factory: ExtensionFactory = Arc::new(|api: ExtensionApi| {
+            api.register_shortcut(
+                "ctrl+shift+p",
+                Some("Plan mode".to_string()),
+                Arc::new(|_ctx: ExtensionContext| {
+                    Box::pin(async { Ok(()) })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+                        >
+                }),
+            )
+            .expect("register shortcut");
+            Box::pin(async { Ok(()) })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new(
+            "/rpi-test-cwd",
+        ));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+
+        let harness = build_test_session_with(None, Some(host)).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        install_noop_product_transports(&mode);
+        crate::modes::interactive::interactive_mode::install_global_keybindings();
+
+        mode.ui_state.handle_hotkeys_command();
+        let rendered = strip_ansi(&chat_render(&mode.ui_state));
+        assert!(rendered.contains("Extensions"), "rendered: {rendered}");
+        assert!(rendered.contains("Plan mode"), "rendered: {rendered}");
+        assert!(rendered.contains("Ctrl+Shift+P"), "rendered: {rendered}");
     }
 
     // ---------------------------------------------------------------------
@@ -1535,6 +1705,15 @@ mod tests {
             "header: {contents}"
         );
         assert!(contents.contains("Terminal: 80x24"), "contents: {contents}");
+        // Full-render section (V17-08 #63): the log carries the section
+        // header even when the TUI has no mounted frame yet (this harness
+        // does not `init`); the non-zero frame case is covered by the
+        // interactive-mode `debug_command_includes_full_render_section`.
+        assert!(contents.contains("Total lines: "), "contents: {contents}");
+        assert!(
+            contents.contains("=== All rendered lines with visible widths ==="),
+            "contents: {contents}"
+        );
         assert!(
             contents.contains("=== Agent messages (JSONL) ==="),
             "contents: {contents}"

@@ -494,6 +494,17 @@ impl TuiHandle {
         }
     }
 
+    /// Full-frame render of the live renderer (upstream `ui.render(width)`):
+    /// the alt screen's layout root / children plus overlays, or the main
+    /// screen's children. Backs the `/debug` "all rendered lines" section;
+    /// empty on lock contention.
+    pub fn render(&self, width: usize) -> Vec<String> {
+        match self.renderer_clone() {
+            RendererClone::Main(tui) => tui.render(width),
+            RendererClone::Alt(tui) => tui.render(width),
+        }
+    }
+
     // --- event-loop driving (Rust additions) ------------------------------
 
     /// Drive the TUI ([`TuiMainScreen::tick`] / [`TuiAltScreen::tick`]).

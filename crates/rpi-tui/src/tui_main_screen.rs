@@ -689,6 +689,16 @@ impl TuiMainScreen {
         self.size_cache.rows.load(Ordering::Relaxed)
     }
 
+    /// Full-render access (upstream `ui.render(width)`, tui-main-screen.ts):
+    /// every child rendered as one frame. The main-screen painter itself
+    /// renders incrementally, so this exists for callers that need the whole
+    /// document (the `/debug` "all rendered lines" section). Empty on lock
+    /// contention — mirrors [`TuiAltScreen::render`].
+    pub fn render(&self, width: usize) -> Vec<String> {
+        self.try_read(|inner| inner.render_children(width as i32))
+            .unwrap_or_default()
+    }
+
     // --- lifecycle and driving --------------------------------------------
 
     /// Upstream `start` (tui.ts:691-705 @ 4181f66); the terminal callbacks

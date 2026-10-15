@@ -15,10 +15,11 @@
 //!   `await modelRuntime.refresh(...)`), and Rust cannot borrow the
 //!   component from a spawned future — same pattern as bash-execution's
 //!   shared `Loader`.
-//! - The 15 s AbortController timeout (model-selector.ts:162-192) is not
-//!   enforced: `ModelRuntime::refresh` takes no signal (model_runtime.rs:
-//!   1089). TODO(port): enforce a timeout once the runtime gains
-//!   cancellation.
+//! - The 15 s aggregate timeout (model-selector.ts:71/163-168) is enforced
+//!   through a `CancellationToken` waiter on `refresh_catalogs_shared`
+//!   (V17-08 #63): on timeout the waiter aborts and the cached list stays
+//!   (`aborted: true` instead of the upstream AbortError rejection —
+//!   §7.3). `close` cancels the waiter on teardown.
 //! - Upstream reports per-catalog refresh errors from `result.errors`
 //!   (model-selector.ts:175-178); the port reports
 //!   `ModelRuntime::get_error()` instead (the local `refresh` returns no
@@ -34,6 +35,7 @@
 //!   config-selector.rs); upstream `Text` children wrap instead.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rpi_ai::models::models_are_equal;
 use rpi_ai::types::{Model, ModelThinkingLevel};
@@ -44,6 +46,7 @@ use rpi_tui::keybindings::get_keybindings;
 use rpi_tui::tui::{Component, Focusable};
 use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::utils::truncate_to_width;
+use tokio_util::sync::CancellationToken;
 
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::themes::Theme;
@@ -94,6 +97,10 @@ struct SelectorState {
     /// Mirror of the search input value, read by the refresh task when it
     /// re-filters (model-selector.ts:187 reads `searchInput.getValue()`).
     search_value: String,
+    /// Waiter cancellation for the in-flight catalog refresh
+    /// (`refreshAbortController`, model-selector.ts:71): the 15 s timeout
+    /// cancels it, and `close`/drop cancel it on teardown.
+    refresh_cancel: Option<CancellationToken>,
     closed: bool,
 }
 
@@ -111,6 +118,7 @@ impl Default for SelectorState {
             refresh_status_success: false,
             scope: ModelScope::All,
             search_value: String::new(),
+            refresh_cancel: None,
             closed: false,
         }
     }
@@ -402,27 +410,50 @@ impl ModelSelectorComponent {
         let tui = self.tui.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move {
-                    // TODO(port): upstream aborts the refresh after 15 s via
-                    // AbortController (model-selector.ts:163-168); the local
-                    // `ModelRuntime::refresh` takes no signal
-                    // (model_runtime.rs:1089), so the timeout is not
-                    // enforced here.
-                    // Shared in-flight refresh (7d8c11d37): joining a
-                    // running catalog refresh instead of restarting it.
-                    runtime.refresh_catalogs_shared().await;
+                // 15 s aggregate timeout (`refreshAbortController`,
+                // model-selector.ts:71/163-168): the timer cancels the
+                // waiter; the shared run keeps going while other waiters
+                // remain.
+                let cancel = CancellationToken::new();
+                let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                {
                     let mut state = lock(&state);
+                    state.refresh_cancel = Some(cancel.clone());
+                }
+                let timeout_task = {
+                    let cancel = cancel.clone();
+                    let timed_out = Arc::clone(&timed_out);
+                    handle.spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(15)).await;
+                        timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                        cancel.cancel();
+                    })
+                };
+                handle.spawn(async move {
+                    let result = runtime.refresh_catalogs_shared(Some(cancel)).await;
+                    timeout_task.abort();
+                    let mut state = lock(&state);
+                    state.refresh_cancel = None;
                     if state.closed {
                         return;
                     }
                     state.refresh_status_message = String::new();
-                    // Upstream inspects `result.errors` per catalog
-                    // (model-selector.ts:175-178); the local refresh returns
-                    // no error map, so `get_error` covers catalog errors.
-                    state.error_message = runtime.get_error();
-                    if state.error_message.is_none() {
-                        state.refresh_status_message = "Model catalogs refreshed.".to_string();
-                        state.refresh_status_success = true;
+                    if result.aborted && timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Timeout abort: keep the cached list
+                        // (model-selector.ts:176-177); `load_from_snapshot`
+                        // below reloads it.
+                        state.error_message =
+                            Some("Model refresh timed out; showing cached models.".to_string());
+                    } else {
+                        // Upstream inspects `result.errors` per catalog
+                        // (model-selector.ts:175-178); the local refresh
+                        // returns no error map, so `get_error` covers
+                        // catalog errors.
+                        state.error_message = runtime.get_error();
+                        if state.error_message.is_none() {
+                            state.refresh_status_message = "Model catalogs refreshed.".to_string();
+                            state.refresh_status_success = true;
+                        }
                     }
                     load_models_from_snapshot(&mut state, &runtime, &current_model);
                     let query = state.search_value.clone();
@@ -439,11 +470,15 @@ impl ModelSelectorComponent {
         }
     }
 
-    /// `close` (model-selector.ts:194-198). Upstream also clears the refresh
-    /// timeout and aborts the in-flight refresh; the port has neither (see
-    /// module docs), so it only marks the component closed.
+    /// `close` (model-selector.ts:194-198): mark closed and abort the
+    /// in-flight refresh waiter (upstream clears the timeout and aborts
+    /// `refreshAbortController`).
     fn close(&mut self) {
-        lock(&self.state).closed = true;
+        let mut state = lock(&self.state);
+        state.closed = true;
+        if let Some(cancel) = state.refresh_cancel.take() {
+            cancel.cancel();
+        }
     }
 
     /// `handleSelect` (model-selector.ts:382-385 @ 2ff8ba622 family):
@@ -465,6 +500,18 @@ impl ModelSelectorComponent {
     /// `getSearchInput` (model-selector.ts:358-360).
     pub fn get_search_input(&self) -> &Input {
         &self.search_input
+    }
+}
+
+/// Upstream `dispose` teardown (model-selector.ts:194-198): superseding the
+/// selector without an explicit `close` still aborts the refresh waiter.
+impl Drop for ModelSelectorComponent {
+    fn drop(&mut self) {
+        let mut state = lock(&self.state);
+        state.closed = true;
+        if let Some(cancel) = state.refresh_cancel.take() {
+            cancel.cancel();
+        }
     }
 }
 
@@ -1196,6 +1243,142 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// A provider whose catalog refresh parks longer than the selector's
+    /// 15 s aggregate timeout (V17-08 #63).
+    struct SlowCatalogProvider {
+        id: String,
+        auth: rpi_ai::auth::ProviderAuth,
+        model: Model,
+    }
+
+    impl rpi_ai::models::Provider for SlowCatalogProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            &self.id
+        }
+
+        fn base_url(&self) -> Option<&str> {
+            None
+        }
+
+        fn headers(&self) -> Option<&rpi_ai::types::ProviderHeaders> {
+            None
+        }
+
+        fn auth(&self) -> &rpi_ai::auth::ProviderAuth {
+            &self.auth
+        }
+
+        fn get_models(&self) -> Vec<Model> {
+            vec![self.model.clone()]
+        }
+
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &rpi_ai::types::TranscriptContext,
+            _options: Option<rpi_ai::types::StreamOptions>,
+        ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+            rpi_ai::utils::event_stream::AssistantMessageEventStream::new()
+        }
+
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &rpi_ai::types::TranscriptContext,
+            _options: Option<rpi_ai::types::SimpleStreamOptions>,
+        ) -> Result<rpi_ai::utils::event_stream::AssistantMessageEventStream, String> {
+            Err("SlowCatalogProvider does not stream".to_owned())
+        }
+
+        fn refresh_models(
+            &self,
+            _context: rpi_ai::models::RefreshModelsContext,
+        ) -> Option<futures::future::BoxFuture<'_, Result<(), rpi_ai::auth::ModelsError>>> {
+            Some(Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            }))
+        }
+    }
+
+    fn slow_provider_model(provider: &str) -> Model {
+        Model {
+            id: "slow-model".to_owned(),
+            name: "Slow Model".to_owned(),
+            api: rpi_ai::types::ApiKind::from("openai-completions"),
+            provider: provider.to_owned(),
+            base_url: "https://example.test/v1".to_owned(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![rpi_ai::types::InputModality::Text],
+            input_limits: None,
+            cost: rpi_ai::types::ModelCost::default(),
+            prompt_cache: None,
+            context_window: 1000,
+            max_tokens: 100,
+            headers: None,
+            compat: None,
+            sampling_params: None,
+            sampling_params_by_thinking_level: None,
+        }
+    }
+
+    /// #63 test plan: the 15 s aggregate bound aborts the refresh and the
+    /// cached catalog list stays (no blank state).
+    #[tokio::test(start_paused = true)]
+    async fn refresh_times_out_and_keeps_the_cached_catalog() {
+        const ENV_KEY: &str = "RPI_TEST_MODEL_SELECTOR_TIMEOUT_KEY";
+        rpi_test_env::set_var(ENV_KEY, "test-key");
+        let runtime = ModelRuntime::create(crate::core::model_runtime::CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: crate::core::model_runtime::ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        runtime
+            .register_native_provider(Arc::new(SlowCatalogProvider {
+                id: "slow-catalog".to_owned(),
+                auth: rpi_ai::auth::ProviderAuth {
+                    api_key: Some(Arc::new(rpi_ai::auth::helpers::env_api_key_auth(
+                        "Test API key",
+                        &[ENV_KEY],
+                    ))),
+                    oauth: None,
+                },
+                model: slow_provider_model("slow-catalog"),
+            }))
+            .await
+            .expect("register slow provider");
+
+        let (component, _, _, _) = build(None, Arc::clone(&runtime), Vec::new(), None, None, None);
+        // Virtual time: the 15 s timeout fires while the provider refresh
+        // still has ~45 s to go.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let state = lock(&component.state);
+        assert_eq!(
+            state.error_message.as_deref(),
+            Some("Model refresh timed out; showing cached models.")
+        );
+        assert!(
+            !state.all_models.is_empty(),
+            "the cached catalog list must survive the abort"
+        );
+        assert!(
+            state
+                .all_models
+                .iter()
+                .any(|model| model.id == "slow-model"),
+            "the slow provider's cached entry stays listed"
+        );
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     #[tokio::test]

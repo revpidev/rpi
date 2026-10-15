@@ -131,8 +131,10 @@ pub(crate) async fn select_session_with_terminal(
         // `onExit` (session-picker.ts:40-43) stops the UI and exits; the
         // component port never fires it, so a no-op suffices here.
         Box::new(|| {}),
-        // No delete / rename in the startup picker (session-picker.ts passes
-        // neither; `showRenameHint: false`).
+        // `session-picker.ts:41-49` passes no delete/rename hooks; since
+        // V17-08 (#64) the component performs the deletion itself, so
+        // confirming a delete still removes the file (no observer needed).
+        // `showRenameHint: false`.
         None,
         None,
         // No running session yet — nothing to protect from deletion.
@@ -297,5 +299,52 @@ mod tests {
         .await
         .expect("picker timed out");
         assert_eq!(result.expect("picker result"), Some(session_file));
+    }
+
+    /// #64 test plan (startup picker): with no `on_delete` hook wired (the
+    /// session-picker passes none), confirming the delete still removes the
+    /// file through the component-internal chain and shows the
+    /// method-dependent status.
+    #[tokio::test]
+    async fn ctrl_d_enter_deletes_the_session_without_hooks() {
+        let (_tmp, cwd, session_dir, settings, session_file) = picker_fixture();
+        let terminal = TestTerminal::new();
+        let picker = select_session_with_terminal(
+            &cwd,
+            Some(&session_dir),
+            &settings,
+            Box::new(terminal.clone()),
+        );
+        let feeder = async {
+            // Enter the confirmation state once the list rendered.
+            feed_when_rendered(&terminal, "hello", "\x04").await;
+            // Confirm the delete.
+            feed_when_rendered(&terminal, "Delete session?", "\r").await;
+            // Wait for the method-dependent status message, then cancel the
+            // picker so the driver future resolves.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "delete status never rendered"
+                );
+                let writes = terminal.writes();
+                if writes.contains("Session deleted") || writes.contains("Session moved to trash") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            terminal.feed("\x1b");
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(picker, feeder)
+        })
+        .await
+        .expect("picker timed out");
+        assert_eq!(result.expect("picker result"), None);
+        assert!(
+            !std::path::Path::new(&session_file).exists(),
+            "confirming the delete removes the file without a hook"
+        );
     }
 }

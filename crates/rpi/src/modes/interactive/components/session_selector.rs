@@ -21,18 +21,16 @@
 //! - The header status-message auto-hide timer (`setTimeout`, 116-126) is not
 //!   ported: messages persist until the next status change (unassigned — no
 //!   v0.1 task claims the timer).
-//! - Actual session deletion and renaming are delegated: the component only
-//!   implements the confirmation state machine and exposes `on_delete`
-//!   (path) / `on_rename` (path, new name) hooks — the local
-//!   [`SessionManager`] has no `deleteSession`/`renameSession` (it only
-//!   lists). Upstream performs the delete itself (`deleteSessionFile`,
-//!   session-selector.ts:645-680, trash CLI + unlink fallback) and shows a
-//!   method-dependent status message; the port optimistically removes the
-//!   session from the loaded lists and shows "Session deleted". With no
-//!   `on_delete` hook, confirming the deletion is a no-op. Rename: upstream
+//! - Actual session deletion follows upstream: the component performs the
+//!   delete itself ([`delete_session_file`], session-selector.ts:654-688 —
+//!   trash CLI first, unlink fallback) and shows the method-dependent status
+//!   message. `on_delete` is a post-deletion observer (not a delegate); the
+//!   hook is optional and no longer gates the removal — with no hook wired
+//!   the file is still deleted (V17-08 FR-C, 02 §4.4). Rename: upstream
 //!   passes `(path, newName)` to the callback and refreshes afterwards
 //!   (interactive-mode.ts:4787-4792); the port calls `on_rename(path,
-//!   new_name)` and refreshes.
+//!   new_name)` and refreshes (the local [`SessionManager`] has no
+//!   `renameSession`, it only lists).
 //! - Upstream `SessionList` owns public callback properties wired by the
 //!   outer component (session-selector.ts:792-829); Rust ownership prevents
 //!   wiring closures into the outer during its own construction, so the list
@@ -1030,6 +1028,102 @@ enum SelectorMode {
     Rename,
 }
 
+/// Deletion method reported by [`delete_session_file`]
+/// (`{ ok, method, error? }`, session-selector.ts:656-658).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteMethod {
+    Trash,
+    Unlink,
+}
+
+/// Result of [`delete_session_file`].
+#[derive(Debug)]
+pub(crate) struct DeleteResult {
+    pub ok: bool,
+    pub method: DeleteMethod,
+    /// Present on failure only — the unlink error with the trash error hint
+    /// appended (`${unlinkError} (${trashErrorHint})`, session-selector.ts:684).
+    pub error: Option<String>,
+}
+
+/// `deleteSessionFile` (session-selector.ts:654-688): try the `trash` CLI
+/// first, fall back to a permanent unlink.
+///
+/// - `--` guards paths that start with `-` (session-selector.ts:661-662).
+/// - A zero exit **or** a file that is gone afterwards counts as a trash
+///   success (session-selector.ts:674-677) — a `trash` wrapper may exit
+///   non-zero after moving the file.
+/// - The unlink failure message carries the first stderr line / spawn error
+///   of the trash call as a hint, truncated to 200 chars
+///   (session-selector.ts:664-672).
+///
+/// `trash_bin` is the CLI name/path (production `"trash"`; test injection).
+fn delete_session_file(trash_bin: &str, session_path: &str) -> DeleteResult {
+    let mut command = std::process::Command::new(trash_bin);
+    if session_path.starts_with('-') {
+        command.arg("--");
+    }
+    let trash_output = command.arg(session_path).output();
+
+    let (trash_succeeded, trash_error_hint) = match &trash_output {
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let hint = if stderr.is_empty() {
+                None
+            } else {
+                let first_line = stderr.lines().next().unwrap_or(stderr);
+                Some(format!("trash: {}", truncate_chars(first_line, 200)))
+            };
+            (output.status.success(), hint)
+        }
+        Err(error) => (
+            false,
+            Some(format!(
+                "trash: {}",
+                truncate_chars(&error.to_string(), 200)
+            )),
+        ),
+    };
+
+    // If trash reports success, or the file is gone afterwards, treat it as
+    // successful (session-selector.ts:674-677).
+    if trash_succeeded || !Path::new(session_path).exists() {
+        return DeleteResult {
+            ok: true,
+            method: DeleteMethod::Trash,
+            error: None,
+        };
+    }
+
+    // Fallback to permanent deletion (session-selector.ts:679-687).
+    match std::fs::remove_file(session_path) {
+        Ok(()) => DeleteResult {
+            ok: true,
+            method: DeleteMethod::Unlink,
+            error: None,
+        },
+        Err(error) => {
+            let unlink_error = error.to_string();
+            let message = match trash_error_hint {
+                Some(hint) => format!("{unlink_error} ({hint})"),
+                None => unlink_error,
+            };
+            DeleteResult {
+                ok: false,
+                method: DeleteMethod::Unlink,
+                error: Some(message),
+            }
+        }
+    }
+}
+
+/// JS `String.prototype.slice(0, max)` equivalent for the trash hint
+/// (session-selector.ts:670) — char-boundary safe.
+fn truncate_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
 /// Component that renders a session selector
 /// (`SessionSelectorComponent`, session-selector.ts:685-1031).
 pub struct SessionSelectorComponent {
@@ -1068,10 +1162,16 @@ pub struct SessionSelectorComponent {
     /// `sessionList.onExit`, which nothing calls (session-selector.ts:800-803).
     #[allow(dead_code)]
     _on_exit: Box<dyn FnMut() + Send>,
+    /// Post-deletion observer (V17-08 FR-C, 02 §4.4): invoked with the path
+    /// after a successful component-internal deletion. Never a delegate —
+    /// the file is removed by the component either way.
     #[allow(clippy::type_complexity)] // mirrors the upstream callback type
     on_delete: Option<Box<dyn FnMut(&str) + Send>>,
     #[allow(clippy::type_complexity)] // mirrors the upstream callback type
     on_rename: Option<Box<dyn FnMut(&str, &str) + Send>>,
+    /// `trash` CLI binary used by [`delete_session_file`] (test injection
+    /// seam; production default `"trash"`).
+    trash_bin: String,
     focused: bool,
 }
 
@@ -1156,6 +1256,7 @@ impl SessionSelectorComponent {
             _on_exit: on_exit,
             on_delete,
             on_rename,
+            trash_bin: "trash".to_string(),
             focused: false,
         };
 
@@ -1174,6 +1275,13 @@ impl SessionSelectorComponent {
     /// mirrors the upstream `currentLoad/allLoad` null checks).
     pub(crate) fn loads_pending(&self) -> bool {
         self.current_load.is_some() || self.all_load.is_some()
+    }
+
+    /// Test injection for the `trash` CLI binary (#64 trash-availability
+    /// arms; the CI/dev image has no `trash` on PATH).
+    #[cfg(test)]
+    pub(crate) fn set_trash_bin_for_tests(&mut self, trash_bin: impl Into<String>) {
+        self.trash_bin = trash_bin.into();
     }
 
     fn load_slot(&mut self, scope: SessionScope) -> &mut Option<ScopeLoad> {
@@ -1420,19 +1528,23 @@ impl SessionSelectorComponent {
         self.tui.request_render(false);
     }
 
-    /// `onDeleteSession` (session-selector.ts:832-856), synchronous: invoke
-    /// the `on_delete` hook, drop the session from the loaded lists, show the
-    /// status and refresh from disk. Upstream awaits the actual file
-    /// deletion (`deleteSessionFile`) and shows a trash/unlink-dependent
-    /// message; the port delegates the deletion (see module header).
+    /// `onDeleteSession` (session-selector.ts:842-866): delete the file
+    /// through [`delete_session_file`], drop the session from the loaded
+    /// lists, show the method-dependent status and refresh from disk; on
+    /// failure show `Failed to delete: {error}` and keep the list untouched.
+    /// `on_delete` is notified after a successful deletion (observer only,
+    /// V17-08 FR-C).
     fn delete_session(&mut self, path: &str) {
-        let Some(on_delete) = self.on_delete.as_mut() else {
-            // No delete hook wired by the caller: confirming is a no-op —
-            // the session file is not removed.
-            self.refresh_sessions_after_mutation();
+        let result = delete_session_file(&self.trash_bin, path);
+        if !result.ok {
+            let error_message = result.error.unwrap_or_else(|| "Unknown error".to_string());
+            self.header.set_status_message(Some((
+                StatusKind::Error,
+                format!("Failed to delete: {error_message}"),
+            )));
+            self.tui.request_render(false);
             return;
-        };
-        on_delete(path);
+        }
 
         if let Some(current_sessions) = self.current_sessions.as_mut() {
             current_sessions.retain(|s| s.path.to_string_lossy() != path);
@@ -1448,8 +1560,16 @@ impl SessionSelectorComponent {
         let show_cwd = self.scope == SessionScope::All;
         self.session_list.set_sessions(sessions, show_cwd);
 
+        let message = match result.method {
+            DeleteMethod::Trash => "Session moved to trash",
+            DeleteMethod::Unlink => "Session deleted",
+        };
         self.header
-            .set_status_message(Some((StatusKind::Info, "Session deleted".to_string())));
+            .set_status_message(Some((StatusKind::Info, message.to_string())));
+
+        if let Some(on_delete) = self.on_delete.as_mut() {
+            on_delete(path);
+        }
         self.refresh_sessions_after_mutation();
         self.tui.request_render(false);
     }
@@ -2231,7 +2351,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_confirmation_intercepts_then_invokes_hook() {
+    fn delete_confirmation_deletes_file_and_notifies_observer() {
         install_global_keybindings();
         let harness = Harness::new();
         let cwd = harness.cwd_str();
@@ -2254,51 +2374,33 @@ mod tests {
             Some("kept"),
             1_000,
         );
-        let deleted: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let target_arc = Arc::new(target.clone());
-        let component = SessionSelectorComponent::new(
-            harness.cwd.clone(),
-            Some(harness.session_dir.clone()),
-            theme(),
-            tui(),
-            Box::new(|_| {}),
-            Box::new(|| {}),
-            Box::new(|| {}),
-            Some(Box::new({
-                // The integration layer performs the actual file deletion;
-                // the refresh after the mutation then drops the session from
-                // the list.
-                let deleted = Arc::clone(&deleted);
-                let target = Arc::clone(&target_arc);
-                move |path: &str| {
-                    if path == target.to_string_lossy() {
-                        std::fs::remove_file(&*target).expect("remove session file");
-                    }
-                    deleted.lock().unwrap().push(path.to_string());
-                }
-            })),
-            None,
-            None,
-            None,
+        let callbacks = Callbacks::new();
+        let mut component = build(&harness, &callbacks, true, false, None);
+        // Deterministic unlink arm (the test image has no `trash`).
+        component.set_trash_bin_for_tests(
+            harness
+                .cwd
+                .join("no-such-trash")
+                .to_string_lossy()
+                .to_string(),
         );
-        let mut component = pump_until_loaded(component);
 
         // Ctrl+D enters the confirmation state: header shows the confirm hint.
         component.handle_input("\x04");
         let joined = body_lines(&component, 80).join("\n");
         assert!(joined.contains("Delete session?"));
-        assert!(deleted.lock().unwrap().is_empty());
+        assert!(callbacks.deleted.lock().unwrap().is_empty());
 
         // Arrow keys are ignored while confirming.
         component.handle_input("\x1b[B");
-        assert!(deleted.lock().unwrap().is_empty());
+        assert!(callbacks.deleted.lock().unwrap().is_empty());
 
-        // Enter confirms: the hook fires with the selected path and the
-        // session disappears from the list.
+        // Enter confirms: the component removes the file itself, notifies
+        // the observer and drops the session from the list.
         component.handle_input("\r");
+        assert!(!target.exists(), "component must delete the session file");
         assert_eq!(
-            deleted.lock().unwrap().clone(),
+            callbacks.deleted.lock().unwrap().clone(),
             vec![target.to_string_lossy().to_string()]
         );
         let joined = body_lines(&component, 80).join("\n");
@@ -2401,11 +2503,11 @@ mod tests {
     }
 
     #[test]
-    fn delete_without_hook_is_noop() {
+    fn delete_without_hook_still_deletes_file() {
         install_global_keybindings();
         let harness = Harness::new();
         let cwd = harness.cwd_str();
-        write_session(
+        let target = write_session(
             &harness.session_dir,
             "s1",
             &cwd,
@@ -2416,12 +2518,171 @@ mod tests {
         );
         let callbacks = Callbacks::new();
         let mut component = build(&harness, &callbacks, false, false, None);
+        component.set_trash_bin_for_tests(
+            harness
+                .cwd
+                .join("no-such-trash")
+                .to_string_lossy()
+                .to_string(),
+        );
 
         component.handle_input("\x04");
         component.handle_input("\r");
-        // No hook was invoked; the session stays listed.
+        // No observer wired — the component-internal deletion still runs
+        // (V17-08 FR-C: the hook is an observer, not a delegate).
         assert!(callbacks.deleted.lock().unwrap().is_empty());
-        assert!(body_lines(&component, 80).join("\n").contains("stays"));
+        assert!(!target.exists(), "file must be deleted without a hook");
+        assert!(
+            !body_lines(&component, 80).join("\n").contains("stays"),
+            "session dropped from the list"
+        );
+        let status = component.header.status_message.clone();
+        assert_eq!(
+            status
+                .as_ref()
+                .map(|(kind, message)| (*kind, message.as_str())),
+            Some((StatusKind::Info, "Session deleted"))
+        );
+    }
+
+    /// #64 test plan: trash available (PATH stub) → the file moves to trash
+    /// and the method-specific message shows; no unconditional "Session
+    /// deleted" overwrite.
+    #[cfg(unix)]
+    #[test]
+    fn delete_via_trash_stub_reports_moved_to_trash() {
+        use std::os::unix::fs::PermissionsExt;
+        install_global_keybindings();
+        let harness = Harness::new();
+        let cwd = harness.cwd_str();
+        let target = write_session(
+            &harness.session_dir,
+            "s1",
+            &cwd,
+            None,
+            None,
+            Some("to trash"),
+            1_000,
+        );
+        let trashcan = harness.cwd.join("trashcan");
+        std::fs::create_dir_all(&trashcan).expect("trashcan");
+        let stub = harness.cwd.join("trash");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\nmv \"$1\" '{}/' && exit 0\n", trashcan.display()),
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let callbacks = Callbacks::new();
+        let mut component = build(&harness, &callbacks, true, false, None);
+        component.set_trash_bin_for_tests(stub.to_string_lossy().to_string());
+        component.handle_input("\x04");
+        component.handle_input("\r");
+
+        assert!(!target.exists(), "trash stub moved the file");
+        assert!(trashcan.join("s1.jsonl").exists(), "file landed in trash");
+        let status = component.header.status_message.clone();
+        assert_eq!(
+            status
+                .as_ref()
+                .map(|(kind, message)| (*kind, message.as_str())),
+            Some((StatusKind::Info, "Session moved to trash"))
+        );
+        assert_eq!(
+            callbacks.deleted.lock().unwrap().clone(),
+            vec![target.to_string_lossy().to_string()]
+        );
+    }
+
+    /// #64 test plan: `trash` exits non-zero but the file is already gone →
+    /// still a trash success (session-selector.ts:676).
+    #[cfg(unix)]
+    #[test]
+    fn delete_trash_nonzero_with_file_gone_counts_as_trash() {
+        use std::os::unix::fs::PermissionsExt;
+        install_global_keybindings();
+        let harness = Harness::new();
+        let cwd = harness.cwd_str();
+        let target = write_session(
+            &harness.session_dir,
+            "s1",
+            &cwd,
+            None,
+            None,
+            Some("gone"),
+            1_000,
+        );
+        let stub = harness.cwd.join("trash");
+        std::fs::write(&stub, "#!/bin/sh\nrm -f \"$1\"\nexit 1\n").expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let mut component = build(&harness, &Callbacks::new(), false, false, None);
+        component.set_trash_bin_for_tests(stub.to_string_lossy().to_string());
+        component.handle_input("\x04");
+        component.handle_input("\r");
+
+        assert!(!target.exists());
+        let status = component.header.status_message.clone();
+        assert_eq!(
+            status
+                .as_ref()
+                .map(|(kind, message)| (*kind, message.as_str())),
+            Some((StatusKind::Info, "Session moved to trash"))
+        );
+    }
+
+    /// #64 test plan: trash fails and unlink fails → `Failed to delete: …`
+    /// (no list removal, no observer call).
+    #[test]
+    fn delete_failure_reports_failed_to_delete() {
+        install_global_keybindings();
+        let harness = Harness::new();
+        let cwd = harness.cwd_str();
+        write_session(
+            &harness.session_dir,
+            "s2",
+            &cwd,
+            None,
+            None,
+            Some("kept"),
+            1_000,
+        );
+        // An existing path that `remove_file` cannot delete (a directory)
+        // exercises the unlink-failure arm; the trash stub is absent so the
+        // error carries the spawn hint.
+        let blocked = harness.session_dir.join("blocked.jsonl");
+        std::fs::create_dir_all(&blocked).expect("blocked dir");
+        let callbacks = Callbacks::new();
+        let mut component = build(&harness, &callbacks, true, false, None);
+        component.set_trash_bin_for_tests(
+            harness
+                .cwd
+                .join("no-such-trash")
+                .to_string_lossy()
+                .to_string(),
+        );
+
+        component.delete_session(&blocked.to_string_lossy());
+
+        let status = component.header.status_message.clone();
+        let (kind, message) = status.expect("failure status");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(
+            message.starts_with("Failed to delete: "),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("trash:"),
+            "unlink failure carries the trash hint: {message}"
+        );
+        assert!(callbacks.deleted.lock().unwrap().is_empty());
+        // The list keeps its session (only the blocked path failed).
+        assert!(body_lines(&component, 80).join("\n").contains("kept"));
     }
 
     #[test]

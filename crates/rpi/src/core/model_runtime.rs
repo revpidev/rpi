@@ -403,6 +403,22 @@ pub struct CompatibilityRequestConfig {
 type CatalogRefreshShared =
     futures::future::Shared<futures::future::BoxFuture<'static, ModelsRefreshResult>>;
 
+/// One in-flight all-catalog refresh shared across waiters — the rpi
+/// counterpart of the upstream coordinator entry
+/// (`model-catalog-refresh.ts:5-13`): the shared future, the shared-run
+/// abort token (cancelled when the last waiter detaches) and the waiter
+/// count.
+#[derive(Clone)]
+struct CatalogRefreshInflight {
+    shared: CatalogRefreshShared,
+    cancel: CancellationToken,
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
+    /// Identity token for the cleanup task's "still the current run"
+    /// check (a newer run replaces the slot; the old run's cleanup must not
+    /// clear the replacement).
+    id: Arc<()>,
+}
+
 /// Configured pi-ai Models collection used by coding-agent and SDK consumers
 /// (`ModelRuntime`, model-runtime.ts:94-593).
 pub struct ModelRuntime {
@@ -448,7 +464,7 @@ pub struct ModelRuntime {
     /// instead of restarting it (opening /model while a refresh runs must
     /// not cancel-and-restart it). Cleared by the runner on completion so
     /// the next call starts fresh.
-    catalog_refresh_inflight: Mutex<Option<CatalogRefreshShared>>,
+    catalog_refresh_inflight: Mutex<Option<CatalogRefreshInflight>>,
     // ------------------------------------------------------------------
     // Generation counters (model-runtime.ts:148-152, commits 8f9e76974 +
     // c6eb6281a + a077fff0b): seq-gating prevents stale availability passes
@@ -3035,41 +3051,102 @@ impl ModelRuntime {
         self.models.complete_simple(model, context, options).await
     }
 
-    /// `refreshModelCatalogs` (model-catalog-refresh.ts:47-55 @ 7d8c11d37):
-    /// share concurrent interactive all-catalog refreshes — the first
-    /// caller runs [`ModelRuntime::refresh`] with default options
-    /// (`allowNetwork = model_network_enabled`, no signal); concurrent
-    /// callers join the same in-flight future and get its result. Upstream
-    /// keeps each caller's abort signal independent (detaching a waiter
-    /// does not abort the shared run unless ALL waiters leave); rpi's two
-    /// interactive call sites (the /model selector refresh and the /model
-    /// command exact-match probe) pass no signal and always run to
-    /// completion, so the waiter-abort arm has no reachable caller and is
-    /// not ported (noted in V14-13 §7).
-    pub async fn refresh_catalogs_shared(self: &Arc<Self>) -> ModelsRefreshResult {
-        let (shared, runner) = {
+    /// `refreshModelCatalogs` (model-catalog-refresh.ts:12-55 @ 7d8c11d37):
+    /// share concurrent interactive all-catalog refreshes while keeping each
+    /// caller's cancellation independent — the first caller starts
+    /// [`ModelRuntime::refresh`] with the shared-run token; concurrent
+    /// callers join the same in-flight future. `signal` is the per-waiter
+    /// abort (detaching one waiter does not abort the shared run; the last
+    /// waiter leaving cancels it, `model-catalog-refresh.ts:38-43`).
+    ///
+    /// A waiter whose signal fires returns `aborted: true` instead of
+    /// rejecting (rpi shape difference: the upstream `raceWithAbortSignal`
+    /// rejects with an AbortError; both callers map the abort to the same
+    /// timeout/error message — §7.3).
+    pub async fn refresh_catalogs_shared(
+        self: &Arc<Self>,
+        signal: Option<CancellationToken>,
+    ) -> ModelsRefreshResult {
+        // `signal.throwIfAborted()` (model-catalog-refresh.ts:15): an
+        // already-cancelled waiter returns without starting or joining a run.
+        if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return ModelsRefreshResult {
+                aborted: true,
+                errors: Vec::new(),
+            };
+        }
+
+        let active = {
             let mut slot = lock(&self.catalog_refresh_inflight);
-            match slot.take() {
-                Some(shared) => {
-                    // Already in flight: re-insert and join it.
-                    *slot = Some(shared.clone());
-                    (shared, false)
-                }
+            // A settled run is replaced by the next call
+            // (`finally { activeByRuntime.delete }`,
+            // model-catalog-refresh.ts:24-28).
+            let existing = slot
+                .as_ref()
+                .filter(|entry| entry.shared.peek().is_none())
+                .cloned();
+            match existing {
+                Some(entry) => entry,
                 None => {
                     let runtime = Arc::clone(self);
-                    let shared: CatalogRefreshShared =
-                        async move { runtime.refresh(None).await }.boxed().shared();
-                    *slot = Some(shared.clone());
-                    (shared, true)
+                    let cancel = CancellationToken::new();
+                    let run_signal = cancel.clone();
+                    let shared: CatalogRefreshShared = async move {
+                        runtime
+                            .refresh(Some(ModelsRefreshOptions {
+                                signal: Some(run_signal),
+                                ..Default::default()
+                            }))
+                            .await
+                    }
+                    .boxed()
+                    .shared();
+                    let entry = CatalogRefreshInflight {
+                        shared: shared.clone(),
+                        cancel,
+                        waiters: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        id: Arc::new(()),
+                    };
+                    *slot = Some(entry.clone());
+                    entry
                 }
             }
         };
-        let result = shared.await;
-        if runner {
-            // The run finished; drop it so the next call starts fresh
-            // (`finally { activeByRuntime.delete }`). Late joiners that
-            // already hold a clone still observe the settled result.
-            *lock(&self.catalog_refresh_inflight) = None;
+
+        active
+            .waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result = match &signal {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => ModelsRefreshResult {
+                    aborted: true,
+                    errors: Vec::new(),
+                },
+                result = active.shared.clone() => result,
+            },
+            None => active.shared.clone().await,
+        };
+        if active
+            .waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            // Last waiter left: abort the shared run
+            // (model-catalog-refresh.ts:41).
+            active.cancel.cancel();
+        }
+        // A settled run drops its slot (upstream `finally`,
+        // model-catalog-refresh.ts:24-28) unless a newer run replaced it. A
+        // detached-but-still-running run stays joinable by later callers.
+        if active.shared.peek().is_some() {
+            let mut slot = lock(&self.catalog_refresh_inflight);
+            let is_current = slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&current.id, &active.id));
+            if is_current {
+                *slot = None;
+            }
         }
         result
     }
@@ -5830,8 +5907,8 @@ mod tests {
             .expect("register");
 
         // Two concurrent shared refreshes while the first is in flight.
-        let a = runtime.refresh_catalogs_shared();
-        let b = runtime.refresh_catalogs_shared();
+        let a = runtime.refresh_catalogs_shared(None);
+        let b = runtime.refresh_catalogs_shared(None);
         let (ra, rb) = tokio::join!(a, b);
         assert!(!ra.aborted);
         assert!(!rb.aborted);
@@ -5848,12 +5925,194 @@ mod tests {
             lock(&runtime.catalog_refresh_inflight).is_none(),
             "in-flight slot cleared after completion"
         );
-        let c = runtime.refresh_catalogs_shared().await;
+        let c = runtime.refresh_catalogs_shared(None).await;
         assert!(!c.aborted);
         assert!(
             lock(&runtime.catalog_refresh_inflight).is_none(),
             "a later run also clears its slot"
         );
+        rpi_test_env::remove_var(ENV_KEY);
+    }
+
+    /// A provider whose `refresh_models` parks for 200 ms and records when
+    /// the shared-run signal is cancelled (V17-08 #63 per-waiter semantics).
+    struct SignalWatchingProvider {
+        id: String,
+        auth: ProviderAuth,
+        cancel_observed: Arc<std::sync::atomic::AtomicBool>,
+        #[allow(dead_code)] // kept for symmetry with the other fake providers
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl rpi_ai::models::Provider for SignalWatchingProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            &self.id
+        }
+
+        fn base_url(&self) -> Option<&str> {
+            None
+        }
+
+        fn headers(&self) -> Option<&rpi_ai::types::ProviderHeaders> {
+            None
+        }
+
+        fn auth(&self) -> &ProviderAuth {
+            &self.auth
+        }
+
+        fn get_models(&self) -> Vec<Model> {
+            Vec::new()
+        }
+
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &rpi_ai::types::TranscriptContext,
+            _options: Option<rpi_ai::types::StreamOptions>,
+        ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+            rpi_ai::utils::event_stream::AssistantMessageEventStream::new()
+        }
+
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &rpi_ai::types::TranscriptContext,
+            _options: Option<rpi_ai::types::SimpleStreamOptions>,
+        ) -> Result<rpi_ai::utils::event_stream::AssistantMessageEventStream, String> {
+            Err("SignalWatchingProvider does not stream".to_owned())
+        }
+
+        fn refresh_models(
+            &self,
+            context: RefreshModelsContext,
+        ) -> Option<futures::future::BoxFuture<'_, Result<(), ModelsError>>> {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let cancel_observed = Arc::clone(&self.cancel_observed);
+            let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = context.signal.clone();
+            let watcher_finished = Arc::clone(&finished);
+            tokio::spawn(async move {
+                signal.cancelled().await;
+                // A cancel arriving after the work settled is the
+                // coordinator's post-completion cleanup, not an abort of a
+                // live run. The flag only ever flips to true.
+                if !watcher_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    cancel_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            Some(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }))
+        }
+    }
+
+    /// Build a runtime with one signal-watching provider (env credential so
+    /// the network phase runs).
+    async fn signal_watching_runtime(
+        env_key: &str,
+    ) -> (
+        Arc<ModelRuntime>,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        rpi_test_env::set_var(env_key, "test-key");
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let cancel_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        runtime
+            .register_native_provider(Arc::new(SignalWatchingProvider {
+                id: "signal-watching-test".to_owned(),
+                auth: ProviderAuth {
+                    api_key: Some(Arc::new(env_api_key_auth("Test API key", &[env_key]))),
+                    oauth: None,
+                },
+                cancel_observed: Arc::clone(&cancel_observed),
+                hits: Arc::clone(&hits),
+            }))
+            .await
+            .expect("register provider");
+        (runtime, cancel_observed, hits)
+    }
+
+    /// V17-08 #63 (`model-catalog-refresh.ts:38-43`): detaching ONE waiter
+    /// does not abort the shared run — the remaining waiter completes
+    /// successfully and the run's signal stays live.
+    #[tokio::test]
+    async fn catalog_refresh_waiter_detach_keeps_the_shared_run() {
+        const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_WAITER_DETACH_KEY";
+        let (runtime, cancel_observed, _hits) = signal_watching_runtime(ENV_KEY).await;
+
+        let waiter_token = CancellationToken::new();
+        let runtime_a = Arc::clone(&runtime);
+        let token_a = waiter_token.clone();
+        let a = tokio::spawn(async move { runtime_a.refresh_catalogs_shared(Some(token_a)).await });
+        let runtime_b = Arc::clone(&runtime);
+        let b = tokio::spawn(async move { runtime_b.refresh_catalogs_shared(None).await });
+
+        // Let the shared run start, then detach the first waiter.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        waiter_token.cancel();
+
+        let ra = a.await.expect("waiter a");
+        assert!(ra.aborted, "the detached waiter reports aborted");
+        let rb = b.await.expect("waiter b");
+        assert!(!rb.aborted, "the remaining waiter completes the run");
+        assert!(
+            !cancel_observed.load(std::sync::atomic::Ordering::SeqCst),
+            "one waiter leaving must not cancel the shared run"
+        );
+        rpi_test_env::remove_var(ENV_KEY);
+    }
+
+    /// V17-08 #63 (`model-catalog-refresh.ts:41`): when the LAST waiter
+    /// leaves, the shared run's controller is cancelled.
+    #[tokio::test]
+    async fn catalog_refresh_all_waiters_detach_aborts_the_run() {
+        const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_WAITER_ABORT_KEY";
+        let (runtime, cancel_observed, _hits) = signal_watching_runtime(ENV_KEY).await;
+
+        let token_a = CancellationToken::new();
+        let token_b = CancellationToken::new();
+        let runtime_a = Arc::clone(&runtime);
+        let runtime_b = Arc::clone(&runtime);
+        let a_token = token_a.clone();
+        let b_token = token_b.clone();
+        let a = tokio::spawn(async move { runtime_a.refresh_catalogs_shared(Some(a_token)).await });
+        let b = tokio::spawn(async move { runtime_b.refresh_catalogs_shared(Some(b_token)).await });
+
+        // Let the shared run start, then detach both waiters.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token_a.cancel();
+        token_b.cancel();
+
+        let ra = a.await.expect("waiter a");
+        assert!(ra.aborted);
+        let rb = b.await.expect("waiter b");
+        assert!(rb.aborted);
+
+        // The shared run's signal was cancelled (the watcher parked on it
+        // wakes).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !cancel_observed.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "all-waiter detach must cancel the shared run"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         rpi_test_env::remove_var(ENV_KEY);
     }
 

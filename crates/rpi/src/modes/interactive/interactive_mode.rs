@@ -3056,6 +3056,13 @@ impl InteractiveUi {
             .is_some_and(|current| Arc::ptr_eq(current, entry))
     }
 
+    /// Rendered editor-region content (the mounted selector or editor) —
+    /// test probe for the built-in dialogs (V17-08 #63).
+    #[cfg(test)]
+    pub(crate) fn editor_region_render(&self, width: usize) -> Vec<String> {
+        lock(&self.editor_container).render(width)
+    }
+
     /// Swap the editor-container content to `entry` and move focus to
     /// `focus` in ONE container critical section (V13-05 FR-B): clear →
     /// add → set_focus under the same `editor_container` lock, so no render
@@ -3080,11 +3087,11 @@ impl InteractiveUi {
         self.ui.request_render(false);
     }
 
-    /// `showTreeSelector` (interactive-mode.ts:4635-4747), basic path:
-    /// selecting an entry closes the selector and navigates the session
-    /// (the default no-summary behavior); the branch-summarization ask loop
-    /// (No summary / Summarize / custom prompt, interactive-mode.ts:4661-4690)
-    /// is an unassigned hook (wired through `ExtensionSelectorComponent`).
+    /// `showTreeSelector` (interactive-mode.ts:5540-5700): selecting an entry
+    /// closes the selector, asks about branch summarization when
+    /// `branchSummary.skipPrompt` is off (#60; No summary / Summarize /
+    /// custom prompt with the Escape-back-to-tree and abort-summary escape
+    /// arms), then navigates the session.
     pub(crate) fn show_tree_selector(ui: &Arc<Self>, initial_selected_id: Option<String>) {
         let session_manager_arc = ui.session().session_manager();
         let manager = lock(&session_manager_arc);
@@ -3109,40 +3116,115 @@ impl InteractiveUi {
             Box::new(move |entry_id: &str| {
                 let entry_id = entry_id.to_string();
                 let real_leaf_id = real_leaf_id.clone();
-                // `done()` first, then navigate (interactive-mode.ts:4659).
+                // `done()` first, then navigate (interactive-mode.ts:5587).
                 select_ui.hide_selector();
                 let session = select_ui.session();
                 let ui = Arc::clone(&select_ui);
                 commands_selectors::spawn_async(async move {
                     if Some(entry_id.as_str()) == real_leaf_id.as_deref() {
                         // Selecting the current leaf is a no-op
-                        // (interactive-mode.ts:4652-4656).
+                        // (interactive-mode.ts:5580-5585).
                         ui.show_status("Already at this point");
                         return;
                     }
-                    // TODO(unassigned): branch-summarization ask loop
-                    // (showExtensionSelector, interactive-mode.ts:4661-4690)
-                    // plus the abort escape handler + BranchSummaryStatus
-                    // indicator (interactive-mode.ts:4694-4706); navigation
-                    // always uses `summarize: false`.
-                    let result = session
+
+                    // Ask about summarization unless the setting suppresses
+                    // the prompt (interactive-mode.ts:5590-5616).
+                    let mut wants_summary = false;
+                    let mut custom_instructions: Option<String> = None;
+                    if !ui
+                        .session()
+                        .settings_manager(|settings| settings.get_branch_summary_skip_prompt())
+                    {
+                        match commands_selectors::ask_branch_summary(&ui).await {
+                            Some((summarize, custom)) => {
+                                wants_summary = summarize;
+                                custom_instructions = custom;
+                            }
+                            None => {
+                                // User pressed escape — re-show the tree
+                                // selector with the same selection.
+                                InteractiveUi::show_tree_selector(&ui, Some(entry_id));
+                                return;
+                            }
+                        }
+                    }
+
+                    // The user committed to navigating: stop the active
+                    // response first (interactive-mode.ts:5619-5624).
+                    if session.is_streaming() {
+                        ui.restore_queued_messages_to_editor(false);
+                        session.abort().await;
+                    }
+
+                    // Recheck after the dialogs and streaming abort, before
+                    // replacing another operation's UI
+                    // (interactive-mode.ts:5627-5633).
+                    if session.is_compacting() {
+                        ui.show_error(
+                            "Wait for the current compaction or tree navigation to finish before navigating the session tree.",
+                        );
+                        return;
+                    }
+
+                    // Escape aborts an in-flight branch summary
+                    // (interactive-mode.ts:5636-5650).
+                    let mut showing_summary_indicator = false;
+                    let original_on_escape = lock(&ui.editor).on_escape.take();
+                    if wants_summary {
+                        let abort_session = session.clone();
+                        lock(&ui.editor).on_escape = Some(Box::new(move || {
+                            abort_session.abort_branch_summary();
+                        }));
+                        lock(&ui.chat_container)
+                            .children
+                            .push(Box::new(Spacer::new(1)));
+                        ui.show_status_indicator(ActiveStatus::BranchSummary {
+                            indicator: Arc::new(Mutex::new(BranchSummaryStatusIndicator::new(
+                                ui.render_handle.clone(),
+                                Arc::clone(&lock(&ui.theme)),
+                            ))),
+                            // `showStatusIndicator` decides the final embed
+                            // state.
+                            embedded: false,
+                        });
+                        showing_summary_indicator = true;
+                        ui.render_handle.request_render();
+                    }
+
+                    let navigate = session
                         .navigate_tree(
                             &entry_id,
                             crate::core::agent_session::NavigateTreeOptions {
-                                summarize: false,
-                                custom_instructions: None,
+                                summarize: wants_summary,
+                                custom_instructions: custom_instructions.clone(),
                                 replace_instructions: false,
                                 label: None,
                             },
                         )
                         .await;
-                    match result {
+
+                    // `finally` (interactive-mode.ts:5676-5680).
+                    if showing_summary_indicator {
+                        ui.clear_status_indicator(Some(StatusIndicatorKind::BranchSummary));
+                    }
+                    lock(&ui.editor).on_escape = original_on_escape;
+
+                    match navigate {
                         Ok(result) => {
+                            if result.aborted {
+                                // Summarization aborted — re-show the tree
+                                // selector with the same selection
+                                // (interactive-mode.ts:5657-5662).
+                                ui.show_status("Branch summarization cancelled");
+                                InteractiveUi::show_tree_selector(&ui, Some(entry_id));
+                                return;
+                            }
                             if result.cancelled {
                                 ui.show_status("Navigation cancelled");
                                 return;
                             }
-                            // Update UI (interactive-mode.ts:4712-4717).
+                            // Update UI (interactive-mode.ts:5664-5682).
                             lock(&ui.chat_container).clear();
                             ui.render_initial_messages();
                             if let Some(editor_text) = result.editor_text
@@ -3166,10 +3248,22 @@ impl InteractiveUi {
                     ui.render_handle.request_render();
                 }
             }),
-            // TODO(unassigned): label editing writes through to the session
-            // manager (`SessionManager::append_label_change` exists; the UI
-            // wiring is unclaimed).
-            None,
+            // Label editing writes through to the session manager and
+            // re-renders (interactive-mode.ts:5684-5688).
+            Some(Box::new({
+                let ui = Arc::clone(ui);
+                move |entry_id: &str, label: Option<&str>| {
+                    let session_manager = ui.session().session_manager();
+                    let mut manager = lock(&session_manager);
+                    if let Err(error) = manager.append_label_change(entry_id, label) {
+                        drop(manager);
+                        ui.show_error(&format!("Failed to update label: {error}"));
+                        return;
+                    }
+                    drop(manager);
+                    ui.render_handle.request_render();
+                }
+            })),
             initial_selected_id,
             initial_filter_mode,
         )));
@@ -8380,6 +8474,551 @@ mod tests {
         assert!(focused, "editor focused after hide");
     }
 
+    // ---------------------------------------------------------------------
+    // #60 /tree three gaps (skipPrompt gate / ask loop / abort + label)
+    // ---------------------------------------------------------------------
+
+    /// Seed `u1 → a1` (leaf = a1) and return `(u1_id, a1_id)`.
+    fn seed_tree_pair(session: &AgentSession) -> (String, String) {
+        let manager = session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let user = manager
+            .append_message(user_message("first question"))
+            .expect("append user message");
+        let assistant = manager
+            .append_message(assistant_message(
+                vec![text_content("first answer")],
+                StopReason::Stop,
+            ))
+            .expect("append assistant message");
+        (user, assistant)
+    }
+
+    /// Editor-container content (the mounted selector or editor).
+    fn mounted_content(ui: &Arc<InteractiveUi>) -> String {
+        lock(&ui.editor_container).render(100).join("\n")
+    }
+
+    /// Poll a predicate on the test runtime until it holds.
+    async fn wait_until<F: FnMut() -> bool>(what: &str, mut probe: F) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            if probe() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    fn feed_and_tick(terminal: &TestTerminal, ui: &Arc<InteractiveUi>, data: &str) {
+        terminal.feed(data);
+        ui.ui.tick(std::time::Instant::now());
+    }
+
+    /// V17-08 #60: after a tree selection the ask selector mounts; choose the
+    /// default "No summary" option to keep the legacy navigation assertions.
+    async fn choose_no_summary(terminal: &Arc<TestTerminal>, ui: &Arc<InteractiveUi>) {
+        wait_until("ask selector mounts", || {
+            mounted_content(ui).contains("Summarize branch?")
+        })
+        .await;
+        feed_and_tick(terminal, ui, "\r");
+    }
+
+    /// #60 test plan: the three-choice ask loop maps to the summarize flag,
+    /// and Escape yields `None` (the caller re-opens the tree).
+    #[tokio::test]
+    async fn ask_branch_summary_maps_choices_and_escape() {
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        install_global_keybindings();
+        let ui = Arc::clone(&mode.ui_state);
+
+        // Default option "No summary" → summarize=false.
+        let task = tokio::spawn({
+            let ui = Arc::clone(&ui);
+            async move {
+                crate::modes::interactive::interactive_mode::commands_selectors::ask_branch_summary(
+                    &ui,
+                )
+                .await
+            }
+        });
+        wait_until("ask selector mounts", || {
+            lock(&ui.active_selector).is_some()
+        })
+        .await;
+        assert!(
+            mounted_content(&ui).contains("Summarize branch?"),
+            "selector title renders: {}",
+            mounted_content(&ui)
+        );
+        feed_and_tick(&terminal, &ui, "\r");
+        assert_eq!(task.await.expect("ask task"), Some((false, None)));
+
+        // "Summarize" (down once) → summarize=true.
+        let task = tokio::spawn({
+            let ui = Arc::clone(&ui);
+            async move {
+                crate::modes::interactive::interactive_mode::commands_selectors::ask_branch_summary(
+                    &ui,
+                )
+                .await
+            }
+        });
+        wait_until("ask selector remounts", || {
+            mounted_content(&ui).contains("Summarize branch?")
+        })
+        .await;
+        feed_and_tick(&terminal, &ui, "\x1b[B");
+        feed_and_tick(&terminal, &ui, "\r");
+        assert_eq!(task.await.expect("ask task"), Some((true, None)));
+
+        // Escape → None.
+        let task = tokio::spawn({
+            let ui = Arc::clone(&ui);
+            async move {
+                crate::modes::interactive::interactive_mode::commands_selectors::ask_branch_summary(
+                    &ui,
+                )
+                .await
+            }
+        });
+        wait_until("ask selector remounts", || {
+            mounted_content(&ui).contains("Summarize branch?")
+        })
+        .await;
+        feed_and_tick(&terminal, &ui, "\x1b");
+        assert_eq!(task.await.expect("ask task"), None);
+    }
+
+    /// #60 test plan: a cancelled custom-prompt editor loops back to the
+    /// summary selector; a submitted prompt returns the instructions.
+    #[tokio::test]
+    async fn ask_branch_summary_custom_prompt_cancel_loops_back() {
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        install_global_keybindings();
+        let ui = Arc::clone(&mode.ui_state);
+
+        let task = tokio::spawn({
+            let ui = Arc::clone(&ui);
+            async move {
+                crate::modes::interactive::interactive_mode::commands_selectors::ask_branch_summary(
+                    &ui,
+                )
+                .await
+            }
+        });
+        wait_until("ask selector mounts", || {
+            mounted_content(&ui).contains("Summarize branch?")
+        })
+        .await;
+        // Third option: "Summarize with custom prompt".
+        feed_and_tick(&terminal, &ui, "\x1b[B");
+        feed_and_tick(&terminal, &ui, "\x1b[B");
+        feed_and_tick(&terminal, &ui, "\r");
+        wait_until("custom prompt editor mounts", || {
+            mounted_content(&ui).contains("Custom summarization instructions")
+        })
+        .await;
+
+        // Cancel the editor → back at the summary selector.
+        feed_and_tick(&terminal, &ui, "\x1b");
+        wait_until("selector remounts after editor cancel", || {
+            mounted_content(&ui).contains("Summarize branch?")
+        })
+        .await;
+
+        // Choose the custom prompt again and submit it.
+        feed_and_tick(&terminal, &ui, "\x1b[B");
+        feed_and_tick(&terminal, &ui, "\x1b[B");
+        feed_and_tick(&terminal, &ui, "\r");
+        wait_until("custom prompt editor remounts", || {
+            mounted_content(&ui).contains("Custom summarization instructions")
+        })
+        .await;
+        for ch in "keep it short".chars() {
+            feed_and_tick(&terminal, &ui, &ch.to_string());
+        }
+        feed_and_tick(&terminal, &ui, "\r");
+        assert_eq!(
+            task.await.expect("ask task"),
+            Some((true, Some("keep it short".to_string())))
+        );
+    }
+
+    /// #60 test plan: Escape from the ask selector re-opens the tree with the
+    /// same selection (Enter on it asks again instead of the leaf no-op).
+    #[tokio::test]
+    async fn tree_selector_escape_reopens_with_same_selection() {
+        let (mut mode, terminal, session) = mode_harness().await;
+        mode.init().await;
+        install_global_keybindings();
+        let ui = Arc::clone(&mode.ui_state);
+        let (u1, _a1) = seed_tree_pair(&session);
+
+        InteractiveUi::show_tree_selector(&Arc::clone(&ui), Some(u1));
+        wait_until("tree selector mounts", || {
+            mounted_content(&ui).contains("Session Tree")
+        })
+        .await;
+        feed_and_tick(&terminal, &ui, "\r");
+        wait_until("ask selector mounts", || {
+            mounted_content(&ui).contains("Summarize branch?")
+        })
+        .await;
+
+        // Escape → the tree selector re-opens (same selection retained).
+        feed_and_tick(&terminal, &ui, "\x1b");
+        wait_until("tree selector re-opens", || {
+            mounted_content(&ui).contains("Session Tree")
+        })
+        .await;
+        // Enter on the re-opened tree asks again — proof the initial
+        // selection is still u1 (the leaf a1 would show the no-op status).
+        feed_and_tick(&terminal, &ui, "\r");
+        wait_until("ask selector remounts", || {
+            mounted_content(&ui).contains("Summarize branch?")
+        })
+        .await;
+    }
+
+    /// #60 test plan: `branchSummary.skipPrompt` skips the ask loop and
+    /// navigates with `summarize: false`.
+    #[tokio::test]
+    async fn tree_selector_skip_prompt_navigates_without_asking() {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "branchSummary".to_owned(),
+            serde_json::json!({"skipPrompt": true}),
+        );
+        let manager = crate::core::settings_manager::SettingsManager::in_memory(
+            crate::core::settings_manager::Settings::from_map(fields),
+            Default::default(),
+        );
+        let (mut mode, terminal, session) = mode_harness_with_settings(manager).await;
+        mode.init().await;
+        install_global_keybindings();
+        let ui = Arc::clone(&mode.ui_state);
+        let (u1, _a1) = seed_tree_pair(&session);
+        // Navigating to a user message moves the leaf to its parent (the
+        // upstream `newLeafId = messageEntry.parentId` rule).
+        let u1_parent = {
+            let manager = session.session_manager();
+            let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager
+                .get_entry(&u1)
+                .and_then(|entry| match entry.known() {
+                    Some(rpi_agent::session::SessionEntry::Message(message)) => {
+                        message.parent_id.clone()
+                    }
+                    _ => None,
+                })
+        };
+
+        InteractiveUi::show_tree_selector(&Arc::clone(&ui), Some(u1));
+        wait_until("tree selector mounts", || {
+            mounted_content(&ui).contains("Session Tree")
+        })
+        .await;
+        feed_and_tick(&terminal, &ui, "\r");
+
+        // No ask selector — navigation lands directly (leaf moves to u1's
+        // parent, i.e. back to the root).
+        wait_until("navigation status", || {
+            lock(&ui.chat_container)
+                .render(80)
+                .join("\n")
+                .contains("Navigated to selected point")
+        })
+        .await;
+        assert!(
+            !terminal.writes().contains("Summarize branch?"),
+            "skipPrompt must suppress the ask selector"
+        );
+        let manager = session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            manager.get_leaf_id().map(str::to_owned),
+            u1_parent,
+            "leaf moved to the target's parent"
+        );
+    }
+
+    /// #60 test plan: choosing "Summarize" passes `summarize: true` into
+    /// `navigate_tree` — the `session_before_tree` extension summary is only
+    /// consumed when `options.summarize` is set, and the written
+    /// `branchSummary` entry proves it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tree_selector_summarize_flag_reaches_navigate_tree() {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+        use rpi_ext_host::types as ext;
+
+        let factory: ExtensionFactory = Arc::new(|api: ExtensionApi| {
+            api.on(
+                ext::EVENT_SESSION_BEFORE_TREE,
+                Arc::new(move |_payload: serde_json::Value, _ctx| {
+                    Box::pin(async move {
+                        Ok(serde_json::json!({
+                            "summary": {"summary": "extension branch summary"}
+                        }))
+                    })
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<Output = Result<serde_json::Value, String>>
+                                    + Send,
+                            >,
+                        >
+                }),
+            )
+            .expect("register session_before_tree handler");
+            Box::pin(async { Ok(()) })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new(
+            "/rpi-test-cwd",
+        ));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+
+        let (mut mode, terminal, session, _tmp) = mode_harness_with_host(host).await;
+        mode.init().await;
+        install_global_keybindings();
+        let ui = Arc::clone(&mode.ui_state);
+        let (u1, _a1) = seed_tree_pair(&session);
+
+        InteractiveUi::show_tree_selector(&Arc::clone(&ui), Some(u1));
+        wait_until("tree selector mounts", || {
+            mounted_content(&ui).contains("Session Tree")
+        })
+        .await;
+        feed_and_tick(&terminal, &ui, "\r");
+        wait_until("ask selector mounts", || {
+            mounted_content(&ui).contains("Summarize branch?")
+        })
+        .await;
+        // "Summarize" (down once) → navigate with summarize=true.
+        feed_and_tick(&terminal, &ui, "\x1b[B");
+        feed_and_tick(&terminal, &ui, "\r");
+
+        wait_until("branch summary entry", || {
+            let manager = session.session_manager();
+            let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager.get_entries().iter().any(|entry| {
+                matches!(
+                    entry.known(),
+                    Some(rpi_agent::session::SessionEntry::BranchSummary(summary))
+                        if summary.summary == "extension branch summary"
+                )
+            })
+        })
+        .await;
+        let rendered = lock(&ui.chat_container).render(80).join("\n");
+        assert!(
+            rendered.contains("Navigated to selected point"),
+            "rendered: {rendered}"
+        );
+    }
+
+    /// #60 test plan (supplement): Escape during summarization aborts the
+    /// branch summary (`abort_branch_summary` through the editor's escape
+    /// handler) and the `result.aborted` arm re-opens the tree with the same
+    /// selection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tree_selector_escape_aborts_summary_and_reopens_tree() {
+        use rpi_test_support::faux::{
+            FauxAiProvider, FauxAssistantOptions, FauxProvider, FauxProviderOptions,
+            faux_assistant_message,
+        };
+
+        let provider = FauxProvider::new(FauxProviderOptions {
+            // Slow enough to press Escape mid-summary.
+            tokens_per_second: Some(0.5),
+            ..Default::default()
+        });
+        provider.set_responses(vec![
+            faux_assistant_message(
+                "branch summary ".repeat(50),
+                FauxAssistantOptions::default(),
+            )
+            .into(),
+        ]);
+        let tmp = TempDir::new();
+        let runtime = crate::core::model_runtime::ModelRuntime::create(
+            crate::core::model_runtime::CreateModelRuntimeOptions {
+                credentials: None,
+                auth_path: Some(tmp.path().join("auth.json")),
+                models_path: crate::core::model_runtime::ModelsPathInput::Disabled,
+                ..Default::default()
+            },
+        )
+        .await;
+        runtime
+            .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+            .await
+            .expect("register faux provider");
+        let model = runtime
+            .get_available(None)
+            .await
+            .expect("available models")
+            .into_iter()
+            .next()
+            .expect("faux model");
+        let (mut mode, terminal, session) = mode_harness_with_model_runtime(runtime, model).await;
+        mode.init().await;
+        install_global_keybindings();
+        let ui = Arc::clone(&mode.ui_state);
+        let (u1, _a1) = seed_tree_pair(&session);
+        // A second exchange gives the summarizer entries to summarize.
+        {
+            let manager = session.session_manager();
+            let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager
+                .append_message(user_message("second question"))
+                .expect("append u2");
+            manager
+                .append_message(assistant_message(
+                    vec![text_content("second answer")],
+                    StopReason::Stop,
+                ))
+                .expect("append a2");
+        }
+
+        InteractiveUi::show_tree_selector(&Arc::clone(&ui), Some(u1));
+        wait_until("tree selector mounts", || {
+            mounted_content(&ui).contains("Session Tree")
+        })
+        .await;
+        feed_and_tick(&terminal, &ui, "\r");
+        wait_until("ask selector mounts", || {
+            mounted_content(&ui).contains("Summarize branch?")
+        })
+        .await;
+        feed_and_tick(&terminal, &ui, "\x1b[B");
+        feed_and_tick(&terminal, &ui, "\r");
+
+        // Wait for the summary request to start (the abort token then
+        // exists) and the BranchSummary indicator to be mounted.
+        wait_until("summary stream starts", || provider.call_count() >= 1).await;
+        wait_until("branch summary indicator", || {
+            matches!(*lock(&ui.status), ActiveStatus::BranchSummary { .. })
+        })
+        .await;
+
+        // Escape → abort_branch_summary → `result.aborted` arm.
+        feed_and_tick(&terminal, &ui, "\x1b");
+        wait_until("aborted status", || {
+            lock(&ui.chat_container)
+                .render(80)
+                .join("\n")
+                .contains("Branch summarization cancelled")
+        })
+        .await;
+        wait_until("tree selector reopens", || {
+            mounted_content(&ui).contains("Session Tree")
+        })
+        .await;
+    }
+
+    /// #60 test plan (label edit): the mounted tree selector's `Shift+L`
+    /// label input writes through to `SessionManager::append_label_change`
+    /// and the row shows the label; an empty label clears it.
+    #[tokio::test]
+    async fn tree_selector_label_edit_writes_label_change() {
+        let (mut mode, terminal, session) = mode_harness().await;
+        mode.init().await;
+        install_global_keybindings();
+        let ui = Arc::clone(&mode.ui_state);
+        let (u1, _a1) = seed_tree_pair(&session);
+
+        InteractiveUi::show_tree_selector(&Arc::clone(&ui), Some(u1.clone()));
+        wait_until("tree selector mounts", || {
+            mounted_content(&ui).contains("Session Tree")
+        })
+        .await;
+
+        // Shift+L opens the label input on the selected entry (u1).
+        feed_and_tick(&terminal, &ui, "L");
+        wait_until("label input mounts", || {
+            mounted_content(&ui).contains("Label (empty to remove):")
+        })
+        .await;
+        for ch in "important".chars() {
+            feed_and_tick(&terminal, &ui, &ch.to_string());
+        }
+        feed_and_tick(&terminal, &ui, "\r");
+        wait_until("label lands on the entry", || {
+            let manager = session.session_manager();
+            let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager.get_label(&u1) == Some("important")
+        })
+        .await;
+
+        // Re-open the selector: the fresh tree is built from the session
+        // manager's labels, so the row shows the label.
+        feed_and_tick(&terminal, &ui, "\x1b");
+        InteractiveUi::show_tree_selector(&Arc::clone(&ui), Some(u1.clone()));
+        wait_until("tree selector remounts with label", || {
+            mounted_content(&ui).contains("[important]")
+        })
+        .await;
+
+        // Re-open the label input and submit empty → the label is removed
+        // (the input is prefilled with the current label, so clear it).
+        feed_and_tick(&terminal, &ui, "L");
+        wait_until("label input remounts", || {
+            mounted_content(&ui).contains("Label (empty to remove):")
+        })
+        .await;
+        // Clear the prefilled text with the editor's clear-line bindings
+        // (ctrl+a + ctrl+k) and submit empty → the label is removed.
+        feed_and_tick(&terminal, &ui, "\x01");
+        feed_and_tick(&terminal, &ui, "\x0b");
+        feed_and_tick(&terminal, &ui, "\r");
+        wait_until("label cleared", || {
+            let manager = session.session_manager();
+            let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager.get_label(&u1).is_none()
+        })
+        .await;
+    }
+
+    /// V17-08 #63 /debug: the full-render section carries the mounted frame
+    /// with a non-zero `Total lines` count and visible-width rows.
+    #[tokio::test]
+    async fn debug_command_includes_full_render_section() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        let tmp = TempDir::new();
+        let agent_dir = tmp.path().join("agent-debug");
+        let guard = crate::modes::interactive::test_support::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+        let log_path = crate::config::get_agent_dir().join("rpi-debug.log");
+        ui.handle_debug_command();
+        rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
+        drop(guard);
+
+        let contents = std::fs::read_to_string(&log_path).expect("debug log written");
+        let total_lines: usize = contents
+            .lines()
+            .find_map(|line| line.strip_prefix("Total lines: "))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("Total lines header");
+        assert!(total_lines > 0, "contents: {contents}");
+        assert!(contents.contains("[0] (w="), "contents: {contents}");
+    }
+
     #[tokio::test]
     async fn show_tree_selector_mounts_selector_and_escape_closes_it() {
         let (mut mode, terminal, _session) = mode_harness().await;
@@ -10283,6 +10922,7 @@ mod tests {
         ui.ui.tick(std::time::Instant::now());
         terminal.feed("\r");
         ui.ui.tick(std::time::Instant::now());
+        choose_no_summary(&terminal, ui).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         assert!(lock(&ui.active_selector).is_none(), "selector closed");
@@ -10336,11 +10976,13 @@ mod tests {
                 .expect("append");
         }
         InteractiveUi::show_tree_selector(&Arc::clone(&mode.ui_state), None);
-        // Select the assistant (leaf) → Up to the root user → Enter.
+        // Select the assistant (leaf) → Up to the root user → Enter; the ask
+        // selector then defaults to "No summary".
         terminal.feed("\u{1b}[A");
         ui.ui.tick(std::time::Instant::now());
         terminal.feed("\r");
         ui.ui.tick(std::time::Instant::now());
+        choose_no_summary(&terminal, ui).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let leaf = lock(&session.session_manager())
@@ -10441,11 +11083,12 @@ mod tests {
                 .expect("append assistant tail");
         }
         InteractiveUi::show_tree_selector(&Arc::clone(&mode.ui_state), None);
-        // leaf=tail assistant → Up to the custom → Enter.
+        // leaf=tail assistant → Up to the custom → Enter (then "No summary").
         terminal.feed("\u{1b}[A");
         ui.ui.tick(std::time::Instant::now());
         terminal.feed("\r");
         ui.ui.tick(std::time::Instant::now());
+        choose_no_summary(&terminal, ui).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // leaf = the custom's parent (root user); the editor fills back the custom text.

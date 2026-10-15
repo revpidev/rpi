@@ -17,8 +17,9 @@ use crate::core::agent_session::AgentSession;
 
 /// Resolved built-in keybindings as `(action_id, keys)` pairs — the input
 /// shape of the host's `getShortcuts` (`KeybindingsConfig`, keys split into
-/// lists; runner.ts:92-111 normalizes case itself).
-fn builtin_keybinding_pairs() -> Vec<(String, Vec<String>)> {
+/// lists; runner.ts:92-111 normalizes case itself). Also consumed by the
+/// `/hotkeys` extension section (V17-08 #63).
+pub(crate) fn builtin_keybinding_pairs() -> Vec<(String, Vec<String>)> {
     let manager = crate::core::keybindings::get_keybindings()
         .read()
         .unwrap_or_else(|e| e.into_inner());
@@ -31,7 +32,7 @@ fn builtin_keybinding_pairs() -> Vec<(String, Vec<String>)> {
 
 /// Reach the host through the session's extension runner (no-op for the
 /// no-op runner / non-host runners).
-fn host_of(session: &AgentSession) -> Option<Arc<NativeExtensionHost>> {
+pub(crate) fn host_of(session: &AgentSession) -> Option<Arc<NativeExtensionHost>> {
     crate::core::extension_host_adapter::host_of_runner(&session.extension_runner())
 }
 

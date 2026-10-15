@@ -2399,10 +2399,11 @@ impl TreeSelectorComponent {
         self.label_input = Some(label_input);
     }
 
-    /// `getTreeList` (tree-selector.ts:1424-1426).
-    /// Reserved for the label-edit wiring (TODO(unassigned), see
-    /// `interactive_mode.rs` `show_tree_selector`).
-    #[allow(dead_code)]
+    /// `getTreeList` (tree-selector.ts:1424-1426) — the outer component's
+    /// test/access probe for the inner list (V17-08 #60 wired
+    /// `show_tree_selector`'s label callback; the list itself is covered by
+    /// the component tests).
+    #[allow(dead_code)] // test-only access probe
     pub(crate) fn get_tree_list(&mut self) -> &mut TreeList {
         &mut self.tree_list
     }
