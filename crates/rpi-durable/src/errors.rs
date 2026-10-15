@@ -108,38 +108,83 @@ impl StorageError {
 }
 
 /// Filesystem seam error (port of the result-shaped `FileError` from `env/`).
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{message}")]
 pub struct FileError {
     /// Upstream `FileError.code`; `not_found` is control flow in JSONL recovery.
     pub code: FileErrorCode,
     /// Human-readable message.
     pub message: String,
+    /// Path the failure concerns, when known.
+    pub path: Option<String>,
+    /// Cause chain as text (upstream `{ cause }`).
+    pub cause: Option<String>,
 }
 
 impl FileError {
-    pub fn not_found(path: impl Into<String>) -> Self {
+    /// Build an error with the upstream code and message.
+    pub fn new(code: FileErrorCode, message: impl Into<String>) -> Self {
         Self {
-            code: FileErrorCode::NotFound,
-            message: format!("File not found: {}", path.into()),
+            code,
+            message: message.into(),
+            path: None,
+            cause: None,
         }
+    }
+
+    /// Build an error attributed to `path`.
+    pub fn with_path(
+        code: FileErrorCode,
+        message: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            path: Some(path.into()),
+            cause: None,
+        }
+    }
+
+    /// Attach the text of an underlying failure.
+    pub fn caused_by(mut self, cause: impl std::fmt::Display) -> Self {
+        self.cause = Some(cause.to_string());
+        self
+    }
+
+    pub fn not_found(path: impl Into<String>) -> Self {
+        let path = path.into();
+        Self::with_path(
+            FileErrorCode::NotFound,
+            format!("File not found: {path}"),
+            path,
+        )
     }
 
     pub fn other(message: impl Into<String>) -> Self {
-        Self {
-            code: FileErrorCode::Other,
-            message: message.into(),
-        }
+        Self::new(FileErrorCode::Unknown, message)
     }
 }
 
-/// Upstream `FileError` code subset used by the storage stack.
+/// Upstream `FileError` codes (`env/index.ts:41-50`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileErrorCode {
+    /// The operation was cancelled.
+    Aborted,
     /// The path does not exist.
     NotFound,
+    /// Access was refused.
+    PermissionDenied,
+    /// A path component is not a directory.
+    NotDirectory,
+    /// The path is a directory.
+    IsDirectory,
+    /// The path or the arguments are invalid.
+    Invalid,
+    /// The file system cannot provide the operation.
+    NotSupported,
     /// Any other filesystem failure.
-    Other,
+    Unknown,
 }
 
 /// Upstream `StorageRejected` marker used by error-matching tests.

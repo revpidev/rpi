@@ -1804,7 +1804,7 @@ impl SchedulerInner {
                 inner: Arc::clone(self),
                 invocation: Arc::clone(&invocation),
                 snapshot: Arc::clone(&snapshot_cell),
-                agent: tokio::sync::OnceCell::new(),
+                agent: Arc::new(tokio::sync::OnceCell::new()),
             };
             let outcome = task
                 .run_phase(&phase, current, &runtime, &invocation.context)
@@ -1836,7 +1836,7 @@ impl SchedulerInner {
             inner: Arc::clone(self),
             invocation: Arc::clone(invocation),
             snapshot: Arc::new(Mutex::new(Arc::clone(&reservation.snapshot))),
-            agent: tokio::sync::OnceCell::new(),
+            agent: Arc::new(tokio::sync::OnceCell::new()),
         };
         let failure = reservation
             .task
@@ -2305,11 +2305,14 @@ impl DocumentReader for SchedulerDocumentReader {
 }
 
 /// Operations of one task invocation (upstream `#runtime`).
+#[derive(Clone)]
 struct InvocationRuntime {
     inner: Arc<SchedulerInner>,
     invocation: Arc<Invocation>,
     snapshot: Arc<Mutex<Arc<dyn RegistrySnapshot>>>,
-    agent: tokio::sync::OnceCell<Result<Agent, String>>,
+    /// Shared so a clone (the owned handle for spawned progress commits)
+    /// resolves the agent once per invocation.
+    agent: Arc<tokio::sync::OnceCell<Result<Agent, String>>>,
 }
 
 /// The boxed change `gated` commits with.
@@ -2431,7 +2434,7 @@ impl TaskRuntime for InvocationRuntime {
         let invocation_context = self.invocation.context.clone();
         let snapshot = self.current_snapshot();
         let inner = Arc::clone(&self.inner);
-        let cell = &self.agent;
+        let cell = Arc::clone(&self.agent);
         let future = cell.get_or_init(|| async move {
             inner
                 .resolve_agent(conversation_id, snapshot, &invocation_context)
@@ -2770,6 +2773,10 @@ impl TaskRuntime for InvocationRuntime {
                 Ok(Some(watch))
             }
         }
+    }
+
+    fn handle(&self) -> Arc<dyn TaskRuntime> {
+        Arc::new(self.clone())
     }
 
     fn now(&self) -> SessionResult<f64> {

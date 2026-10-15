@@ -29,10 +29,9 @@ use crate::harness::agent::agent_hooks;
 use crate::harness::live::{LIVE_DOC, LiveState, ToolSlot, finish_slot};
 use crate::harness::registry::TOOL_TASK_NAME;
 use crate::harness::types::{
-    Agent, ConversationHandle, DiagnosticSeverity, ExecutionEnv, HookHandlers, NextTaskState,
-    OutputWindow, RegistrySnapshot, RunningTask, SettledTask, TaskCommitFn, TaskDefinition,
-    TaskRuntime, ToolCommitFn, ToolDiagnostic, ToolExecuteError, ToolExecutionApi,
-    ToolExecutionResult, ToolRegistration, ToolReplay,
+    Agent, ConversationHandle, DiagnosticSeverity, HookHandlers, NextTaskState, RegistrySnapshot,
+    RunningTask, SettledTask, TaskCommitFn, TaskDefinition, TaskRuntime, ToolCommitFn,
+    ToolDiagnostic, ToolExecutionApi, ToolExecutionResult, ToolRegistration, ToolReplay,
 };
 use crate::harness::usage::{UsageBucket, record_usage};
 use crate::ids::{ConversationId, EntryId, TaskId};
@@ -127,7 +126,7 @@ impl TaskDefinition for ToolTask {
         let slot = read_slot(runtime, context).await?;
         let message = format!("Tool {} was aborted", call.name);
         let result = from_slot(slot.as_ref(), "aborted", &message);
-        settle(runtime, &call, Ending::Aborted, result, context).await
+        settle(runtime, &call, Ending::Aborted, result, context, None).await
     }
 }
 
@@ -162,7 +161,7 @@ async fn call_phase(
             "tool_unavailable",
             &format!("Tool {} is not available", call.name),
         );
-        return settle(runtime, &call, Ending::Completed, error, context).await;
+        return settle(runtime, &call, Ending::Completed, error, context, None).await;
     };
     let prepared = prepare(&tool, call.arguments.clone());
     let checked = match prepared {
@@ -172,7 +171,7 @@ async fn call_phase(
     let mut args = match checked {
         Err(error) => {
             let result = invalid(&error);
-            return settle(runtime, &call, Ending::Completed, result, context).await;
+            return settle(runtime, &call, Ending::Completed, result, context, None).await;
         }
         Ok(args) => args,
     };
@@ -196,13 +195,13 @@ async fn call_phase(
     }
     if let Some(reason) = block {
         let result = harness_error("blocked", &format!("Tool call blocked: {reason}"));
-        return settle(runtime, &call, Ending::Completed, result, context).await;
+        return settle(runtime, &call, Ending::Completed, result, context, None).await;
     }
     let validated = match validate(&tool, &call, args) {
         Ok(args) => args,
         Err(error) => {
             let result = invalid(&error);
-            return settle(runtime, &call, Ending::Completed, result, context).await;
+            return settle(runtime, &call, Ending::Completed, result, context, None).await;
         }
     };
     let final_args = validated;
@@ -273,7 +272,53 @@ async fn execute_phase(
     );
     let slot = read_slot(runtime, context).await?;
     let result = from_slot(slot.as_ref(), "interrupted", &message);
-    settle(runtime, &call, Ending::Failed(message), result, context).await
+    settle(
+        runtime,
+        &call,
+        Ending::Failed(message),
+        result,
+        context,
+        None,
+    )
+    .await
+}
+
+/// Resolved output bounds of one tool call.
+#[derive(Debug, Clone, Copy)]
+struct OutputLimitsSpec {
+    max_bytes: u64,
+    max_lines: u64,
+    retain: crate::harness::types::OutputRetain,
+}
+
+fn resolve_output_limits(limits: Option<crate::harness::types::OutputLimits>) -> OutputLimitsSpec {
+    OutputLimitsSpec {
+        max_bytes: limits
+            .and_then(|limits| limits.max_bytes)
+            .unwrap_or(crate::truncate::DEFAULT_MAX_BYTES),
+        max_lines: limits
+            .and_then(|limits| limits.max_lines)
+            .unwrap_or(crate::truncate::DEFAULT_MAX_LINES),
+        retain: limits
+            .and_then(|limits| limits.retain)
+            .unwrap_or(crate::harness::types::OutputRetain::Head),
+    }
+}
+
+/// What a running tool reported through its api: output, the last details, and
+/// diagnostics.
+struct Reported {
+    output: crate::harness::output::OutputBuffer,
+    limits: OutputLimitsSpec,
+    diagnostics: Vec<ToolDiagnostic>,
+    details: Option<JsonValue>,
+}
+
+/// What one progress commit has already written.
+struct WrittenReport {
+    text: String,
+    details: Option<JsonValue>,
+    diagnostics: usize,
 }
 
 /// Execute with the resolved implementation, run `afterTool`, then settle.
@@ -284,63 +329,292 @@ async fn run(
     args: JsonObject,
     context: &Context,
 ) -> SessionResult<()> {
-    let api = ToolApi::new(runtime, call.id.clone());
-    let executed = tool.execute.execute(args, &api, context).await;
-    let (ending, result) = match executed {
-        Ok(result) => (Ending::Completed, result),
+    let limits = resolve_output_limits(tool.output_limits);
+    let reported = Arc::new(Mutex::new(Reported {
+        output: crate::harness::output::OutputBuffer::new(crate::harness::output::OutputLimits {
+            max_bytes: limits.max_bytes,
+            max_lines: limits.max_lines,
+            retain: limits.retain,
+        }),
+        limits,
+        diagnostics: Vec::new(),
+        details: None,
+    }));
+    let progress = publish_progress(runtime, Arc::clone(&reported), context);
+    // Built for this call, so a rerun after recovery gets the conversation's
+    // environment at that time.
+    let env_error: Option<String>;
+    let env: Option<Arc<dyn crate::env::types::ExecutionEnv>>;
+    match runtime.env(context).await {
+        Ok(value) => {
+            env = value;
+            env_error = None;
+        }
         Err(error) => {
             if runtime.signal().is_cancelled() {
-                return Err(SessionError::Aborted);
+                return Err(error);
             }
-            let message = format!("Tool {} threw", call.name);
-            (
-                Ending::Failed(message),
-                ToolExecutionResult {
-                    content: Some(Vec::new()),
-                    is_error: Some(true),
-                    diagnostics: Some(vec![tool_diagnostic("tool_error", &error_text(&error))]),
-                    ..Default::default()
-                },
-            )
+            env = None;
+            env_error = Some(error.to_string());
+        }
+    }
+    let api = ToolApi::new(
+        runtime,
+        call.id.clone(),
+        Arc::clone(&reported),
+        env,
+        progress.clone(),
+    );
+
+    let started = std::time::Instant::now();
+    let mut ending = Ending::Completed;
+    let result = if let Some(message) = env_error {
+        ending = Ending::Failed(format!("Tool {} threw", call.name));
+        error_result(&message)
+    } else {
+        match tool.execute.execute(args, &api, context).await {
+            Ok(result) => result,
+            Err(error) => {
+                if runtime.signal().is_cancelled() {
+                    api.mark_ended();
+                    let pending = progress.stop().await;
+                    reject_waiters(pending, error.to_string());
+                    return Err(SessionError::Aborted);
+                }
+                ending = Ending::Failed(format!("Tool {} threw", call.name));
+                error_result(&error.to_string())
+            }
         }
     };
-    let result = final_result(runtime, call, result, &api, context).await?;
-    settle(runtime, call, ending, result, context).await
+    let duration_ms = started.elapsed().as_millis() as u64;
+    api.mark_ended();
+    if let Ok(mut reported) = reported.lock() {
+        reported.output.end();
+    }
+    // Details still waiting for a progress commit settle with the terminal
+    // commit, the final flush.
+    let pending = progress.stop().await;
+    let settled = final_result(runtime, call, result, &reported, context).await;
+    let result = match settled {
+        Ok(result) => result,
+        Err(error) => {
+            reject_waiters(pending, error.to_string());
+            return Err(error);
+        }
+    };
+    settle(runtime, call, ending, result, context, Some(duration_ms)).await?;
+    resolve_waiters(pending);
+    Ok(())
 }
 
+fn error_result(message: &str) -> ToolExecutionResult {
+    ToolExecutionResult {
+        is_error: Some(true),
+        diagnostics: Some(vec![tool_diagnostic("tool_error", message)]),
+        ..Default::default()
+    }
+}
+
+fn resolve_waiters(waiters: Vec<crate::harness::output::ProgressWaiter>) {
+    for waiter in waiters {
+        waiter.resolve();
+    }
+}
+
+fn reject_waiters(waiters: Vec<crate::harness::output::ProgressWaiter>, error: String) {
+    for waiter in waiters {
+        waiter.reject(error.clone());
+    }
+}
+
+/// Throttled commits of what the tool reported into its `pi.live.tools` slot,
+/// each writing only what changed since the last one.
+fn publish_progress(
+    runtime: &dyn TaskRuntime,
+    reported: Arc<Mutex<Reported>>,
+    context: &Context,
+) -> crate::harness::output::Progress {
+    let shared = runtime.handle();
+    let settings = runtime.settings();
+    let written = Arc::new(Mutex::new(WrittenReport {
+        text: String::new(),
+        details: None,
+        diagnostics: 0,
+    }));
+    let context = context.clone();
+    let write_shared = Arc::clone(&shared);
+    let write_reported = Arc::clone(&reported);
+    let write_written = Arc::clone(&written);
+    let error_shared = Arc::clone(&shared);
+    crate::harness::output::Progress::new(
+        move || {
+            let shared = Arc::clone(&write_shared);
+            let reported = Arc::clone(&write_reported);
+            let written = Arc::clone(&write_written);
+            let context = context.clone();
+            Box::pin(async move { flush_reported(shared, context, reported, written).await })
+        },
+        move |error| {
+            if !error_shared.signal().is_cancelled() {
+                let _ = error_shared.report(error);
+            }
+        },
+        settings.progress.output_interval_ms,
+    )
+}
+
+async fn flush_reported(
+    runtime: Arc<dyn TaskRuntime>,
+    context: Context,
+    reported: Arc<Mutex<Reported>>,
+    written: Arc<Mutex<WrittenReport>>,
+) -> Result<u64, String> {
+    // Capture everything synchronously: the tool keeps reporting while the
+    // commit is in flight.
+    let (text, dropped_bytes, dropped_lines, diagnostics, details) = {
+        let mut guard = reported.lock().map_err(|_| "tool state".to_string())?;
+        let snapshot = guard.output.snapshot();
+        (
+            snapshot.text,
+            snapshot.dropped_bytes,
+            snapshot.dropped_lines,
+            guard.diagnostics.clone(),
+            guard.details.clone(),
+        )
+    };
+    let (previous_text, previous_details, previous_count) = {
+        let guard = written.lock().map_err(|_| "progress state".to_string())?;
+        (guard.text.clone(), guard.details.clone(), guard.diagnostics)
+    };
+    let added: Vec<ToolDiagnostic> = diagnostics[previous_count.min(diagnostics.len())..].to_vec();
+    let details_changed = details != previous_details;
+    // What the commit writes as a Chord diff of the string: an append, or the
+    // whole window when the retained tail slid.
+    let mut bytes: u64 = 0;
+    if text != previous_text {
+        let shared = if text.starts_with(&previous_text) {
+            previous_text.len()
+        } else {
+            0
+        };
+        bytes += (text.len() - shared) as u64;
+    }
+    if details_changed {
+        bytes += serde_json::to_string(&details.clone().unwrap_or(JsonValue::Null))
+            .map(|text| text.len() as u64)
+            .unwrap_or(0);
+    }
+    if !added.is_empty() {
+        bytes += serde_json::to_string(&added)
+            .map(|text| text.len() as u64)
+            .unwrap_or(0);
+    }
+    let task_id = runtime.task_id();
+    let conversation_id = runtime.conversation_id();
+    let commit_text = text.clone();
+    let commit_details = details.clone();
+    let commit_added = added;
+    let commit: TaskCommitFn = Arc::new(move |tx, _current| {
+        let text = commit_text.clone();
+        let details = commit_details.clone();
+        let added = commit_added.clone();
+        Box::pin(async move {
+            let live = tx
+                .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            let mut state: LiveState = crate::harness::types::read_state(&live)?;
+            if let Some(slots) = state.tools.as_mut()
+                && let Some(slot) = slots.iter_mut().find(|slot| slot.task_id == Some(task_id))
+            {
+                if slot.output.as_deref() != Some(text.as_str()) {
+                    slot.output = Some(text);
+                }
+                if dropped_bytes > 0 {
+                    slot.dropped_bytes = Some(dropped_bytes);
+                }
+                if dropped_lines > 0 {
+                    slot.dropped_lines = Some(dropped_lines);
+                }
+                if details_changed && details.is_some() {
+                    slot.details = details;
+                }
+                if !added.is_empty() {
+                    let list = slot.diagnostics.get_or_insert_with(Vec::new);
+                    list.extend(added);
+                }
+            }
+            crate::harness::types::write_state(&live, &state)?;
+            Ok(None)
+        })
+    });
+    runtime
+        .commit(commit, &context)
+        .await
+        .map_err(|error| error.to_string())?;
+    {
+        let mut guard = written.lock().map_err(|_| "progress state".to_string())?;
+        guard.text = text;
+        guard.details = details;
+        guard.diagnostics = diagnostics.len();
+    }
+    Ok(bytes)
+}
+
+/// The settled result: the tool's result with the retained output and last
+/// details as fallbacks, its diagnostics after those reported through the api,
+/// `afterTool` applied, and explicit text bounded, with the Harness's
+/// truncation diagnostic last.
 async fn final_result(
     runtime: &dyn TaskRuntime,
     call: &ToolCall,
     result: ToolExecutionResult,
-    api: &ToolApi<'_>,
+    reported: &Arc<Mutex<Reported>>,
     context: &Context,
 ) -> SessionResult<ToolExecutionResult> {
-    let content = match &result.content {
-        Some(content) => content.clone(),
-        None => {
-            let text = api.output_text();
-            if text.is_empty() {
+    let limits = reported
+        .lock()
+        .map(|guard| guard.limits)
+        .unwrap_or(OutputLimitsSpec {
+            max_bytes: crate::truncate::DEFAULT_MAX_BYTES,
+            max_lines: crate::truncate::DEFAULT_MAX_LINES,
+            retain: crate::harness::types::OutputRetain::Head,
+        });
+    let (retained, diagnostics, details) = {
+        let mut guard = reported
+            .lock()
+            .map_err(|_| SessionError::message("tool state"))?;
+        let retained = if result.content.is_none() {
+            Some(guard.output.snapshot())
+        } else {
+            None
+        };
+        (retained, guard.diagnostics.clone(), guard.details.clone())
+    };
+    let content = match &retained {
+        Some(retained) => {
+            if retained.text.is_empty() {
                 Vec::new()
             } else {
                 vec![ToolResultContent::Text(TextContent {
-                    text,
+                    text: retained.text.clone(),
                     text_signature: None,
                 })]
             }
         }
-    };
-    let diagnostics = {
-        let mut diagnostics = api.diagnostics();
-        diagnostics.extend(result.diagnostics.clone().unwrap_or_default());
-        diagnostics
+        None => result.content.clone().unwrap_or_default(),
     };
     let mut final_result = ToolExecutionResult {
-        content: Some(content),
+        content: Some(content.clone()),
         is_error: result.is_error,
-        details: result.details.or_else(|| api.details_value()),
-        diagnostics: Some(diagnostics),
-        usage: result.usage,
-        control: result.control,
+        details: result.details.clone().or(details),
+        diagnostics: Some(
+            diagnostics
+                .into_iter()
+                .chain(result.diagnostics.clone().unwrap_or_default())
+                .collect(),
+        ),
+        usage: result.usage.clone(),
+        control: result.control.clone(),
     };
     let agent = runtime.agent(context).await?;
     for handlers in agent_hooks(&agent, TOOL_TASK_NAME) {
@@ -354,7 +628,102 @@ async fn final_result(
             }
         }
     }
+    let mut harness: Vec<ToolDiagnostic> = Vec::new();
+    // The retained output's truncation applies only while afterTool kept that
+    // content.
+    if let Some(retained) = &retained
+        && retained.dropped_bytes > 0
+        && final_result.content.as_ref() == Some(&content)
+    {
+        harness.push(truncated(retained, Some(limits.retain)));
+    }
+    let (bounded, dropped_bytes, dropped_lines) =
+        bound_content(final_result.content.clone().unwrap_or_default(), limits);
+    if dropped_bytes > 0 {
+        harness.push(truncated(
+            &crate::harness::output::BoundedOutput {
+                text: String::new(),
+                dropped_bytes,
+                dropped_lines,
+            },
+            Some(limits.retain),
+        ));
+    }
+    final_result.content = Some(bounded);
+    let mut all_diagnostics = final_result.diagnostics.clone().unwrap_or_default();
+    all_diagnostics.extend(harness);
+    final_result.diagnostics = Some(all_diagnostics);
     Ok(final_result)
+}
+
+/// The Harness's truncation diagnostic; `retain` is unknown when rebuilt from
+/// a slot after recovery.
+fn truncated(
+    dropped: &crate::harness::output::BoundedOutput,
+    retain: Option<crate::harness::types::OutputRetain>,
+) -> ToolDiagnostic {
+    let kept = match retain {
+        Some(crate::harness::types::OutputRetain::Head) => " to its beginning",
+        Some(crate::harness::types::OutputRetain::Tail) => " to its end",
+        None => "",
+    };
+    ToolDiagnostic {
+        severity: DiagnosticSeverity::Warn,
+        code: Some("truncated".to_string()),
+        message: format!(
+            "Output truncated{kept}: {} lines, {} bytes dropped",
+            dropped.dropped_lines, dropped.dropped_bytes
+        ),
+    }
+}
+
+/// Bound the text of result content. When the joined text exceeds the limits,
+/// the text items are replaced by one bounded item at the position of the
+/// first (head) or last (tail) text item; other content is kept.
+fn bound_content(
+    content: Vec<ToolResultContent>,
+    limits: OutputLimitsSpec,
+) -> (Vec<ToolResultContent>, u64, u64) {
+    let joined: String = content
+        .iter()
+        .filter_map(|item| match item {
+            ToolResultContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let bounded = crate::harness::output::bound_output(
+        &joined,
+        crate::harness::output::OutputLimits {
+            max_bytes: limits.max_bytes,
+            max_lines: limits.max_lines,
+            retain: limits.retain,
+        },
+    );
+    if bounded.dropped_bytes == 0 {
+        return (content, 0, 0);
+    }
+    let keep_index = match limits.retain {
+        crate::harness::types::OutputRetain::Head => content
+            .iter()
+            .position(|item| matches!(item, ToolResultContent::Text(_))),
+        crate::harness::types::OutputRetain::Tail => content
+            .iter()
+            .rposition(|item| matches!(item, ToolResultContent::Text(_))),
+    };
+    let mut result = Vec::with_capacity(content.len());
+    for (index, item) in content.into_iter().enumerate() {
+        match item {
+            ToolResultContent::Text(text) if Some(index) == keep_index => {
+                result.push(ToolResultContent::Text(TextContent {
+                    text: bounded.text.clone(),
+                    text_signature: text.text_signature,
+                }));
+            }
+            ToolResultContent::Text(_) => {}
+            other => result.push(other),
+        }
+    }
+    (result, bounded.dropped_bytes, bounded.dropped_lines)
 }
 
 /// Append the result entry, mark the slot done, and complete (or end aborted/failed).
@@ -364,6 +733,7 @@ async fn settle(
     ending: Ending,
     result: ToolExecutionResult,
     context: &Context,
+    duration_ms: Option<u64>,
 ) -> SessionResult<()> {
     let conversation_id = runtime.conversation_id();
     let task_id = runtime.task_id();
@@ -377,7 +747,8 @@ async fn settle(
             let live = tx
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
-            let entry = append_tool_result(tx, conversation_id, &call, &result, now, None).await?;
+            let entry =
+                append_tool_result(tx, conversation_id, &call, &result, now, duration_ms).await?;
             let mut state: LiveState = crate::harness::types::read_state(&live)?;
             if let Some(slots) = state.tools.as_mut()
                 && let Some(slot) = slots
@@ -530,10 +901,6 @@ fn invalid(message: &str) -> ToolExecutionResult {
     harness_error("invalid_arguments", message)
 }
 
-fn error_text(error: &ToolExecuteError) -> String {
-    error.to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Result construction
 // ---------------------------------------------------------------------------
@@ -644,46 +1011,49 @@ fn render_diagnostics(diagnostics: &[ToolDiagnostic]) -> String {
 // ---------------------------------------------------------------------------
 
 /// [`ToolExecutionApi`] backed by the tool task's invocation.
-struct ToolApi<'a> {
-    runtime: &'a dyn TaskRuntime,
+struct ToolApi {
+    runtime: Arc<dyn TaskRuntime>,
     call_id: String,
-    output: Mutex<String>,
-    diagnostics: Mutex<Vec<ToolDiagnostic>>,
-    details: Mutex<Option<JsonValue>>,
+    env: Option<Arc<dyn crate::env::types::ExecutionEnv>>,
+    reported: Arc<Mutex<Reported>>,
+    progress: crate::harness::output::Progress,
+    ended: std::sync::atomic::AtomicBool,
 }
 
-impl<'a> ToolApi<'a> {
-    fn new(runtime: &'a dyn TaskRuntime, call_id: String) -> Self {
+impl ToolApi {
+    fn new(
+        runtime: &dyn TaskRuntime,
+        call_id: String,
+        reported: Arc<Mutex<Reported>>,
+        env: Option<Arc<dyn crate::env::types::ExecutionEnv>>,
+        progress: crate::harness::output::Progress,
+    ) -> Self {
         Self {
-            runtime,
+            runtime: runtime.handle(),
             call_id,
-            output: Mutex::new(String::new()),
-            diagnostics: Mutex::new(Vec::new()),
-            details: Mutex::new(None),
+            env,
+            reported,
+            progress,
+            ended: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn output_text(&self) -> String {
-        self.output
-            .lock()
-            .map(|output| output.clone())
-            .unwrap_or_default()
+    /// Mark the call settled: later reports fail like upstream's `assertLive`.
+    fn mark_ended(&self) {
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn diagnostics(&self) -> Vec<ToolDiagnostic> {
-        self.diagnostics
-            .lock()
-            .map(|diagnostics| diagnostics.clone())
-            .unwrap_or_default()
-    }
-
-    fn details_value(&self) -> Option<JsonValue> {
-        self.details.lock().ok().and_then(|details| details.clone())
+    fn assert_live(&self) -> Result<(), String> {
+        if self.ended.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(format!("Tool call {} has settled", self.call_id))
+        } else {
+            Ok(())
+        }
     }
 }
 
 #[async_trait]
-impl ToolExecutionApi for ToolApi<'_> {
+impl ToolExecutionApi for ToolApi {
     fn task_id(&self) -> TaskId {
         self.runtime.task_id()
     }
@@ -708,31 +1078,76 @@ impl ToolExecutionApi for ToolApi<'_> {
         self.runtime.models()
     }
 
-    fn env(&self) -> Option<Arc<dyn ExecutionEnv>> {
-        None
+    fn env(&self) -> Option<Arc<dyn crate::env::types::ExecutionEnv>> {
+        self.env.clone()
     }
 
-    fn output(&self, chunk: &[u8], _skipped: Option<crate::harness::types::OutputSkip>) {
-        if let Ok(mut output) = self.output.lock() {
-            output.push_str(&String::from_utf8_lossy(chunk));
+    fn output(
+        &self,
+        chunk: &[u8],
+        skipped: Option<crate::harness::types::OutputSkip>,
+    ) -> Result<(), String> {
+        self.assert_live()?;
+        let accepted = {
+            let mut reported = self.reported.lock().map_err(|_| "tool state".to_string())?;
+            reported
+                .output
+                .push(crate::harness::output::OutputChunk::Bytes(chunk), skipped)
+                .map_err(|error| error.to_string())?
+        };
+        if accepted {
+            self.progress().mark();
         }
+        Ok(())
     }
 
-    fn output_window(&self) -> Option<OutputWindow> {
-        None
+    fn output_window(&self) -> Option<crate::harness::types::OutputWindow> {
+        let reported = self.reported.lock().ok()?;
+        if reported.limits.retain != crate::harness::types::OutputRetain::Tail {
+            return None;
+        }
+        Some(crate::harness::types::OutputWindow {
+            max_bytes: reported.limits.max_bytes,
+            max_lines: reported.limits.max_lines,
+            min_interval_ms: self.runtime.settings().progress.output_interval_ms,
+            bytes_per_second: crate::harness::output::PROGRESS_BYTES_PER_SECOND,
+        })
     }
 
     fn diagnostic(&self, diagnostic: ToolDiagnostic) {
-        if let Ok(mut diagnostics) = self.diagnostics.lock() {
-            diagnostics.push(diagnostic);
+        if self.assert_live().is_err() {
+            return;
         }
+        if let Ok(mut reported) = self.reported.lock() {
+            reported.diagnostics.push(diagnostic);
+        }
+        self.progress().mark();
     }
 
-    async fn details(&self, value: JsonValue, _context: &Context) -> Result<(), SessionError> {
-        if let Ok(mut details) = self.details.lock() {
-            *details = Some(value);
+    async fn details(&self, value: JsonValue, context: &Context) -> Result<(), SessionError> {
+        self.assert_live().map_err(SessionError::message)?;
+        if context
+            .abort_signal()
+            .map(|signal| signal.is_cancelled())
+            .unwrap_or(false)
+        {
+            return Err(SessionError::Aborted);
         }
-        Ok(())
+        if let Ok(mut reported) = self.reported.lock() {
+            reported.details = Some(value);
+        }
+        let receiver = self.progress().mark_and_wait();
+        // Cancelling the wait leaves the update in place; the commit's own
+        // outcome stays observed.
+        match crate::chord::context::await_with_context(
+            async { receiver.await.map_err(|_| SessionError::Aborted) },
+            context,
+        )
+        .await
+        {
+            Ok(result) => result?.map_err(SessionError::message),
+            Err(_) => Err(SessionError::Aborted),
+        }
     }
 
     async fn commit(
@@ -795,6 +1210,13 @@ impl ToolExecutionApi for ToolApi<'_> {
         context: &Context,
     ) -> Result<Option<Arc<dyn ConversationHandle>>, SessionError> {
         self.runtime.conversation(id, context).await
+    }
+}
+
+impl ToolApi {
+    /// The progress pump shared with the run loop.
+    fn progress(&self) -> &crate::harness::output::Progress {
+        &self.progress
     }
 }
 

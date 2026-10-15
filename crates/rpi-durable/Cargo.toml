@@ -27,6 +27,18 @@ rpi-ai.workspace = true
 # matrix needs no system library. rusqlite 0.37 caches prepared statements per
 # SQL text (Connection::prepare_cached) shared across transactions (FR-D R4).
 rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
+# [N/A-struct] `diff` package: the jsdiff-compatible Myers diff and unified
+# patch writer are hand-ported (edit-diff.ts consumes `createTwoFilesPatch` and
+# `diffLines`); see `tools/edit_diff.rs` for the FR-C R2 ruling.
+# NFKC fuzzy matching + NFD read-path variants (edit-diff.ts/path-utils.ts).
+unicode-normalization.workspace = true
+# V17-15 FR-C: native file-change events for the durable ExecutionEnv watcher
+# (`node-watch.ts` consumes `fs.watch` + snapshot rescans).
+notify = "8.2"
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

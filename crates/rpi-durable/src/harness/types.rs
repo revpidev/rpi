@@ -386,6 +386,9 @@ pub trait TaskRuntime: Send + Sync {
         owner: DocOwner<'_>,
         context: &Context,
     ) -> SessionResult<Option<CommittedWatch>>;
+    /// An owned handle to this runtime for spawned work (the tool task's
+    /// throttled progress commits).
+    fn handle(&self) -> Arc<dyn TaskRuntime>;
     /// The Harness clock; rejects once the invocation ended.
     fn now(&self) -> SessionResult<f64>;
     /// Forward a non-fatal failure; rejects once the invocation ended.
@@ -544,14 +547,12 @@ pub struct ToolExecutionResult {
     pub control: Option<ToolControl>,
 }
 
-/// What an environment dropped before one output chunk (`ShellOutputSkip`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OutputSkip {
-    /// Bytes dropped before the chunk.
-    pub bytes: u64,
-    /// Lines dropped before the chunk.
-    pub lines: u64,
-}
+/// What an environment dropped before one output chunk; the V17-15 env
+/// domain's `ShellOutputSkip` is the canonical shape.
+pub use crate::env::types::ShellOutputSkip as OutputSkip;
+/// Output bounds handed to an environment; the V17-15 env domain's
+/// `ShellOutputWindow` is the canonical shape.
+pub use crate::env::types::ShellOutputWindow as OutputWindow;
 
 /// Which end of a bounded output buffer is retained (`ShellOutputWindow.retain`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,17 +561,6 @@ pub enum OutputRetain {
     Head,
     /// Keep the tail.
     Tail,
-}
-
-/// Output bounds handed to an environment (`ShellOutputWindow`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutputWindow {
-    /// Maximum retained bytes.
-    pub max_bytes: Option<u64>,
-    /// Maximum retained lines.
-    pub max_lines: Option<u64>,
-    /// Retained end.
-    pub retain: OutputRetain,
 }
 
 /// Failure surface of one tool execution.
@@ -697,11 +687,10 @@ pub struct SectionRef {
 // Prompt sections, hooks, extensions, registry
 // ---------------------------------------------------------------------------
 
-/// Execution environment of one conversation (`ExecutionEnv`).
-///
-/// V17-14 exposes the hook with a `None` default; the env domain deepens this
-/// seam in the V17-15 window.
-pub trait ExecutionEnv: Send + Sync {}
+/// Execution environment of one conversation (`ExecutionEnv`); the V17-15 env
+/// domain is the canonical surface ([`crate::env::types::ExecutionEnv`]) and
+/// V17-14's marker trait is replaced by it.
+pub use crate::env::types::ExecutionEnv;
 
 /// Future returned by [`PromptSection::render`].
 pub type PromptRenderFuture = Pin<Box<dyn Future<Output = Option<String>> + Send + 'static>>;
@@ -1748,8 +1737,8 @@ pub trait ToolExecutionApi: Send + Sync {
     fn models(&self) -> &Models;
     /// Environment built for this call, if any.
     fn env(&self) -> Option<Arc<dyn ExecutionEnv>>;
-    /// Append running output.
-    fn output(&self, chunk: &[u8], skipped: Option<OutputSkip>);
+    /// Append running output; fails when the retained window cannot accept it.
+    fn output(&self, chunk: &[u8], skipped: Option<OutputSkip>) -> Result<(), String>;
     /// Retained output window, if any.
     fn output_window(&self) -> Option<OutputWindow>;
     /// Record a model-visible remark.

@@ -272,7 +272,7 @@ impl ToolExecute for EchoTool {
         api: &dyn ToolExecutionApi,
         _context: &Context,
     ) -> Result<ToolExecutionResult, ToolExecuteError> {
-        api.output(b"hello output", None);
+        api.output(b"hello output", None).expect("output");
         api.diagnostic(ToolDiagnostic {
             severity: DiagnosticSeverity::Warn,
             message: "note".to_string(),

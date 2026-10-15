@@ -26,6 +26,7 @@ pub mod harness;
 pub mod inbox;
 pub mod json;
 pub mod live;
+pub mod output;
 pub mod prompt;
 pub mod provider;
 pub mod registry;
@@ -65,6 +66,7 @@ pub use live::{
     clear_progress, compaction_status, end_run, finish_slot, remove_compaction_status,
     settle_scheduler_outcome, tool_slot,
 };
+pub use output::{OutputBuffer, Progress, bound_output, sanitize_output};
 pub use prompt::{plan_system_entries, render_sections, replay_sections};
 pub use provider::{PROVIDER_DOC, ProviderState, ensure_provider_session_id};
 pub use registry::{

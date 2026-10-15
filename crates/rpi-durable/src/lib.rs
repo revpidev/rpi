@@ -14,6 +14,7 @@
 pub mod chord;
 pub mod documents;
 pub mod entries;
+pub mod env;
 pub mod errors;
 pub mod fs;
 pub mod harness;
@@ -21,6 +22,8 @@ pub mod ids;
 pub mod session;
 pub mod storage;
 pub mod testing;
+pub mod tools;
+pub mod truncate;
 pub mod types;
 
 pub use errors::{FileError, FileErrorCode, StorageError, StorageResult};
