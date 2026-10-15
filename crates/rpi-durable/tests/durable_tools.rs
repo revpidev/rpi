@@ -475,19 +475,21 @@ async fn bash_spills_large_output_and_reports_the_file() {
     );
 }
 
+/// The committed fake PowerShell, never written at test time (a
+/// write-then-exec script is flaky on Linux: ETXTBSY when a concurrent fork
+/// copies its open write fd).
+#[cfg(unix)]
+fn fake_pwsh() -> String {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-pwsh").to_string()
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn powershell_transports_its_argv_without_a_shell() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new("durable-powershell");
     let env = create_env(&dir);
-    let script = dir.path_str() + "/fake-pwsh";
-    std::fs::write(&script, "#!/bin/sh\nprintf '%s|' \"$@\"\n").expect("script");
-    let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&script, permissions).expect("chmod");
     let tool = create_power_shell_tool(Some(rpi_durable::tools::PowerShellToolOptions {
-        programs: Some(vec![script.clone()]),
+        programs: Some(vec![fake_pwsh()]),
         ..Default::default()
     }));
     let (result, output, _) = run_tool(
@@ -506,16 +508,10 @@ async fn powershell_transports_its_argv_without_a_shell() {
 #[cfg(unix)]
 #[tokio::test]
 async fn powershell_falls_back_to_the_next_program() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new("durable-powershell-fallback");
     let env = create_env(&dir);
-    let script = dir.path_str() + "/fake-pwsh";
-    std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("script");
-    let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&script, permissions).expect("chmod");
     let tool = create_power_shell_tool(Some(rpi_durable::tools::PowerShellToolOptions {
-        programs: Some(vec!["pi-durable-missing-pwsh".to_string(), script]),
+        programs: Some(vec!["pi-durable-missing-pwsh".to_string(), fake_pwsh()]),
         ..Default::default()
     }));
     let (result, _, _) = run_tool(&tool, json!({ "command": "x" }), Some(Arc::clone(&env))).await;

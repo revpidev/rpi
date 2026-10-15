@@ -90,3 +90,39 @@ fn replace_ampm_space(path: &str) -> String {
     }
     result
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::env::node::{NodeExecutionEnv, NodeExecutionEnvOptions};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn context() -> Context {
+        crate::chord::context::BACKGROUND_CONTEXT.clone()
+    }
+
+    /// A denied `exists` propagates like the upstream `getOrThrow` instead of
+    /// being swallowed into a missing variant.
+    #[tokio::test]
+    async fn exists_errors_propagate_from_read_path_resolution() {
+        let dir = std::env::temp_dir().join(format!("path-utils-{}", std::process::id()));
+        let denied = dir.join("denied");
+        std::fs::create_dir_all(&denied).expect("denied dir");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::symlink_metadata(denied.join("x")).is_ok() {
+            // Root or a permissive file system: nothing to assert.
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).ok();
+            return;
+        }
+        let env = NodeExecutionEnv::new(NodeExecutionEnvOptions {
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        let error = resolve_read_tool_path(&env, "denied/x.txt", &context())
+            .await
+            .expect_err("a denied exists must propagate");
+        assert!(!error.to_string().is_empty(), "got {error}");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
