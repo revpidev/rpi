@@ -249,6 +249,21 @@ pub trait Component: Send {
     /// `set_output_pad`.)
     fn set_output_pad(&mut self, _output_pad: usize) {}
 
+    /// Show-images change, mirroring upstream's `child instanceof
+    /// ToolExecutionComponent` walk (`onShowImagesChange`,
+    /// interactive-mode.ts:4964-4970, #59): the mode updates every mounted
+    /// tool component in place. Default: no image-surface state — a no-op,
+    /// like upstream components that are not tool executions. (V17-09
+    /// extension to the frozen contract; tool components override this and
+    /// forward to their inherent `set_show_images`.)
+    fn set_show_images(&mut self, _show: bool) {}
+
+    /// Image-width change, mirroring upstream's `child instanceof
+    /// ToolExecutionComponent` walk (`onImageWidthCellsChange`,
+    /// interactive-mode.ts:4972-4978, #59). Default: no image-surface state
+    /// — a no-op. (V17-09 extension to the frozen contract.)
+    fn set_image_width_cells(&mut self, _width: usize) {}
+
     /// Layout node for the T30 layout engine: replaces upstream's
     /// `LAYOUT_NODE` symbol protocol (`getLayoutNode`, layout-node.ts:48-51).
     /// Stack/scroll containers override this; the returned node borrows the

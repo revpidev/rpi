@@ -301,6 +301,13 @@ pub struct ProjectTrustEventResult {
 /// `RegisteredCommand`). Never produced by the no-op runner.
 #[derive(Debug, Clone)]
 pub struct ExtensionCommand {
+    /// The name the extension registered (`ResolvedCommand.name`,
+    /// runner.ts:807-841 @ abe508e1b): duplicates across extensions keep the
+    /// base name while [`Self::invocation_name`] gets a `:occurrence`
+    /// suffix. The built-in conflict diagnostics and the autocomplete
+    /// filter both key on this field (interactive-mode.ts:710-723,
+    /// :795-797).
+    pub name: String,
     pub invocation_name: String,
     pub description: Option<String>,
     /// Provenance for `getCommands` (`SlashCommandInfo.sourceInfo`).

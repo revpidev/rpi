@@ -233,6 +233,13 @@ pub struct AgentSessionConfig {
     /// Keeps the prompt cache entry of the last session request warm
     /// (#9668; agent-session.ts:223 `cacheWarmer`).
     pub cache_warmer: Option<Arc<crate::core::cache_warming::CacheWarmer>>,
+    /// Shared HTTP idle-timeout slot (`configureHttpDispatcher`,
+    /// http-dispatcher.ts:81) read by the session's stream function. `None`
+    /// seeds the slot with rpi's settings default
+    /// ([`crate::core::settings_manager::DEFAULT_HTTP_IDLE_TIMEOUT_MS`],
+    /// disabled per rpi#54 / D-103) so direct `AgentSession::new`
+    /// constructions keep the process default.
+    pub http_dispatcher: Option<Arc<crate::core::http_dispatcher::HttpDispatcher>>,
 }
 
 /// `ExtensionBindings` (agent-session.ts:228-235), T10 subset.
@@ -592,6 +599,10 @@ struct AgentSessionInner {
     /// Mode-provided shutdown handler (`ExtensionBindings::shutdown`, T15 W5).
     extension_shutdown_handler: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     extension_error_unsubscriber: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Shared HTTP idle-timeout slot (`configureHttpDispatcher`,
+    /// http-dispatcher.ts:81): the session's stream function reads it per
+    /// request, the settings chain reconfigures it.
+    http_dispatcher: Arc<crate::core::http_dispatcher::HttpDispatcher>,
 }
 
 /// `routedModel` (agent-session.ts:1422-1427 @ abe508e1b): the physical
@@ -1023,6 +1034,11 @@ impl AgentSession {
             extension_error_listener: Mutex::new(None),
             extension_shutdown_handler: Mutex::new(None),
             extension_error_unsubscriber: Mutex::new(None),
+            http_dispatcher: config.http_dispatcher.unwrap_or_else(|| {
+                Arc::new(crate::core::http_dispatcher::HttpDispatcher::new(
+                    crate::core::settings_manager::DEFAULT_HTTP_IDLE_TIMEOUT_MS,
+                ))
+            }),
         });
 
         // Subscribe to agent events for internal handling (persistence,
@@ -6299,6 +6315,16 @@ impl AgentSession {
             loader.settings_manager_mut().reload();
             loader.reload();
         }
+        // `applyRuntimeSettings`'s `configureHttpDispatcher(
+        // getHttpIdleTimeoutMs())` (interactive-mode.ts:2063) also runs on
+        // the `/reload` path (interactive-mode.ts:6489): re-apply the
+        // reloaded file's idle budget to the live seam.
+        if let Ok(timeout_ms) = lock(&self.inner.resource_loader)
+            .settings_manager()
+            .get_http_idle_timeout_ms()
+        {
+            self.configure_http_dispatcher(timeout_ms);
+        }
         if let Some(host) = crate::core::extension_host_adapter::host_of_runner(&runner) {
             let errors = host.reload().await;
             for error in errors {
@@ -6353,6 +6379,20 @@ impl AgentSession {
 
     pub fn extension_mode(&self) -> ExtensionMode {
         *lock(&self.inner.extension_mode)
+    }
+
+    /// The session's HTTP idle-timeout slot (`configureHttpDispatcher`,
+    /// http-dispatcher.ts:81): the stream function reads it per request.
+    pub fn http_dispatcher(&self) -> Arc<crate::core::http_dispatcher::HttpDispatcher> {
+        Arc::clone(&self.inner.http_dispatcher)
+    }
+
+    /// `configureHttpDispatcher(timeoutMs)` (http-dispatcher.ts:81): the
+    /// runtime reconfiguration seam behind the `/settings` arm
+    /// (interactive-mode.ts:5001-5004) and `applyRuntimeSettings`
+    /// (interactive-mode.ts:2063).
+    pub fn configure_http_dispatcher(&self, timeout_ms: u64) {
+        self.inner.http_dispatcher.configure(timeout_ms);
     }
 }
 

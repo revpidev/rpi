@@ -472,13 +472,27 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
         }
         SettingsChange::ShowImages(enabled) => {
             session.settings_manager(|s| s.set_show_images(enabled));
-            // TODO(unassigned): propagate to mounted ToolExecutionComponents
-            // (interactive-mode.ts:4176-4182) — no v0.1 task claims this.
+            // `onShowImagesChange` (interactive-mode.ts:4964-4970): update
+            // the mode's own field (components mounted later read it at
+            // construction) and every mounted tool execution in place — no
+            // rebuild, so streaming tool components keep their partial
+            // output. The defaulted `Component::set_show_images` reproduces
+            // the upstream `child instanceof ToolExecutionComponent` check.
+            ui.show_images.store(enabled, Ordering::Relaxed);
+            for child in lock(&ui.chat_container).children.iter_mut() {
+                child.set_show_images(enabled);
+            }
         }
         SettingsChange::ImageWidthCells(width) => {
             session.settings_manager(|s| s.set_image_width_cells(width));
-            // TODO(unassigned): propagate to mounted ToolExecutionComponents
-            // (as above).
+            // `onImageWidthCellsChange` (interactive-mode.ts:4972-4978):
+            // `setImageWidthCells` clamps to >= 1; same in-place walk as
+            // the show-images arm.
+            let width = width.max(1) as usize;
+            ui.image_width_cells.store(width, Ordering::Relaxed);
+            for child in lock(&ui.chat_container).children.iter_mut() {
+                child.set_image_width_cells(width);
+            }
         }
         SettingsChange::AutoResizeImages(enabled) => {
             session.settings_manager(|s| s.set_image_auto_resize(enabled));
@@ -488,8 +502,10 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
         }
         SettingsChange::EnableSkillCommands(enabled) => {
             session.settings_manager(|s| s.set_enable_skill_commands(enabled));
-            // TODO(unassigned): re-run setupAutocompleteProvider
-            // (interactive-mode.ts:4199) — no v0.1 task claims this.
+            // `onEnableSkillCommandsChange` (interactive-mode.ts:4986-4990):
+            // rebuild the provider so `skill:<name>` completions appear or
+            // disappear immediately.
+            crate::modes::interactive::autocomplete::setup_autocomplete(ui);
         }
         SettingsChange::SteeringMode(mode) => {
             session.set_steering_mode(mode);
@@ -499,12 +515,17 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
         }
         SettingsChange::Transport(transport) => {
             session.settings_manager(|s| s.set_transport(transport));
-            // TODO(T13): session.agent.transport = transport.
+            // `onTransportChange` (interactive-mode.ts:4996-4999): persist,
+            // then reassign the live agent's transport; the next request
+            // reads it when assembling `StreamOptions`.
+            session.agent().set_transport(transport);
         }
         SettingsChange::HttpIdleTimeoutMs(timeout_ms) => {
             session.settings_manager(|s| s.set_http_idle_timeout_ms(timeout_ms));
-            // TODO(T13): configureHttpDispatcher(timeout_ms) — the HTTP
-            // dispatcher is provider-layer plumbing (app.rs header).
+            // `onHttpIdleTimeoutMsChange` (interactive-mode.ts:5000-5005):
+            // persist, reconfigure the live dispatcher slot (the stream
+            // function reads it per request), then surface the new value.
+            session.configure_http_dispatcher(timeout_ms);
             ui.show_status(&format!(
                 "HTTP idle timeout: {}",
                 format_http_idle_timeout_ms(timeout_ms)
@@ -2624,12 +2645,22 @@ impl InteractiveUi {
         // keybindings.ts:354-357).
         install_global_keybindings();
         // Extension-command conflicts with built-ins
-        // (interactive-mode.ts:530-543); the extension list is a T15 hook,
-        // so this is currently always empty.
+        // (interactive-mode.ts:710-723; upstream folds the diagnostics into
+        // the loaded-resources block at :1944). The registered-command list
+        // comes from the live runner.
+        let commands = self.session().extension_runner().registered_commands();
         for diagnostic in
-            crate::modes::interactive::autocomplete::get_builtin_command_conflict_diagnostics(self)
+            crate::modes::interactive::autocomplete::get_builtin_command_conflict_diagnostics(
+                &commands,
+            )
         {
-            self.show_warning(&diagnostic);
+            // Upstream renders the path line above the message
+            // (`formatDiagnostics`); the status-line consumer joins them.
+            let message = match &diagnostic.path {
+                Some(path) => format!("{} ({})", diagnostic.message, path.display()),
+                None => diagnostic.message.clone(),
+            };
+            self.show_warning(&message);
         }
     }
 
@@ -3071,11 +3102,17 @@ impl InteractiveUi {
     /// fullscreen scrollbar + copyOnSelect refreshes
     /// (`applyFullscreenScrollbarSetting` / `setCopyOnSelect`, :1940-1945 —
     /// the scrollbar line predates this task but was never ported; V14-16
-    /// closes the gap alongside its own copyOnSelect line).
-    /// `configureHttpDispatcher` has no local equivalent yet (TODO(T13) at
-    /// the settings selector); the `!clearOnShrink` status-container clear is
-    /// folded into the rebind's full render-state reset.
+    /// closes the gap alongside its own copyOnSelect line) and the
+    /// `configureHttpDispatcher(getHttpIdleTimeoutMs())` refresh
+    /// (:2063); the `!clearOnShrink` status-container clear is folded into
+    /// the rebind's full render-state reset.
     fn apply_runtime_settings(&self, session: &AgentSession) {
+        // `configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs())`
+        // (interactive-mode.ts:2063): re-apply the (possibly new project's)
+        // idle budget to the live dispatcher slot the stream function reads.
+        if let Ok(timeout_ms) = session.settings_manager(|s| s.get_http_idle_timeout_ms()) {
+            session.configure_http_dispatcher(timeout_ms);
+        }
         // `setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides())`
         // (interactive-mode.ts:1940 @ 9841914, e86823096 / #8665): refresh
         // the capability overrides first — the rebind re-renders with the
@@ -3455,7 +3492,7 @@ mod tests {
     use crate::core::session_manager::NewSessionOptions;
     use crate::modes::interactive::interactive_mode::InteractiveModeOptions;
     use crate::modes::interactive::test_support::{
-        TempDir, TestSession, TestTerminal, build_test_session,
+        TempDir, TestSession, TestTerminal, build_test_session, build_test_session_with,
     };
     use crate::sdk::{CreateAgentSessionOptions, NoTools, create_agent_session};
 
@@ -4289,6 +4326,61 @@ mod tests {
             mounted.contains("Reloading keybindings, extensions, skills, prompts,"),
             "reload box: {mounted}"
         );
+    }
+
+    /// #62: the `/reload` consumer surfaces the built-in command conflict
+    /// diagnostics from the live extension runner
+    /// (interactive-mode.ts:710-723).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reload_warns_about_builtin_command_conflicts() {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+        let factory: ExtensionFactory = Arc::new(|api: ExtensionApi| {
+            api.register_command(
+                "model",
+                Some("shadow".to_owned()),
+                Arc::new(|_args, _ctx| Box::pin(async { Ok(()) })),
+            )
+            .expect("register command");
+            Box::pin(async { Ok(()) })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/w3-cwd"));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+
+        let TestSession {
+            _tmp,
+            runtime,
+            session,
+            cwd: _,
+        } = build_test_session_with(None, Some(host)).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        // The diagnostic producer sees the registered command.
+        let commands = session.extension_runner().registered_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "model");
+
+        mode.ui_state.handle_reload_command();
+        let chat = rendered_chat(&mode.ui_state);
+        // The message wraps at the render width; normalize whitespace so the
+        // full warning text is matched.
+        let normalized = chat.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(
+                "Extension command '/model' conflicts with built-in interactive command. Skipping in autocomplete."
+            ),
+            "conflict warning: {chat}"
+        );
+        // Let the spawned reload body settle before the temp dir drops.
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
     // ---------------------------------------------------------------------
@@ -5224,6 +5316,150 @@ mod tests {
             12
         );
         assert_eq!(lock(&ui.editor).get_autocomplete_max_visible(), 12);
+    }
+
+    /// A mounted transcript block that records the image-surface walk calls
+    /// (`child instanceof ToolExecutionComponent` equivalent, #59).
+    struct ImageSurfaceProbe {
+        show_images: Arc<Mutex<Vec<bool>>>,
+        image_widths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Component for ImageSurfaceProbe {
+        fn render(&self, _width: usize) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn set_show_images(&mut self, show: bool) {
+            lock(&self.show_images).push(show);
+        }
+
+        fn set_image_width_cells(&mut self, width: usize) {
+            lock(&self.image_widths).push(width);
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_show_images_and_image_width_update_mounted_children() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let show_images = Arc::new(Mutex::new(Vec::new()));
+        let image_widths = Arc::new(Mutex::new(Vec::new()));
+        ui.add_chat_child(Box::new(ImageSurfaceProbe {
+            show_images: Arc::clone(&show_images),
+            image_widths: Arc::clone(&image_widths),
+        }));
+
+        let before = ui.show_images.load(Ordering::Relaxed);
+        apply_settings_change(ui, SettingsChange::ShowImages(!before));
+        assert_eq!(
+            session.settings_manager(|s| s.get_show_images()),
+            !before,
+            "setting persisted"
+        );
+        assert_eq!(
+            ui.show_images.load(Ordering::Relaxed),
+            !before,
+            "the mode's field is updated for components mounted later"
+        );
+        assert_eq!(
+            lock(&show_images).as_slice(),
+            &[!before],
+            "mounted children got the new show-images value"
+        );
+
+        apply_settings_change(ui, SettingsChange::ImageWidthCells(120));
+        assert_eq!(
+            session.settings_manager(|s| s.get_image_width_cells()),
+            120,
+            "setting persisted"
+        );
+        assert_eq!(
+            ui.image_width_cells.load(Ordering::Relaxed),
+            120,
+            "the mode's field is updated for components mounted later"
+        );
+        assert_eq!(
+            lock(&image_widths).as_slice(),
+            &[120],
+            "mounted children got the new image width"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_transport_updates_the_live_agent() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        let ui = &mode.ui_state;
+        // The fixture's settings default to Auto; a plain settings write
+        // (pre-#59) left the constructed agent's transport untouched.
+        assert_eq!(session.agent().transport(), rpi_ai::types::Transport::Auto);
+
+        apply_settings_change(
+            ui,
+            SettingsChange::Transport(rpi_ai::types::Transport::Websocket),
+        );
+        assert_eq!(
+            session.settings_manager(|s| s.get_transport()),
+            rpi_ai::types::Transport::Websocket,
+            "setting persisted"
+        );
+        assert_eq!(
+            session.agent().transport(),
+            rpi_ai::types::Transport::Websocket,
+            "the live agent reads the new transport on its next request"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_http_idle_timeout_reconfigures_the_dispatcher() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        let ui = &mode.ui_state;
+
+        apply_settings_change(ui, SettingsChange::HttpIdleTimeoutMs(60_000));
+        assert_eq!(
+            session
+                .settings_manager(|s| s.get_http_idle_timeout_ms())
+                .expect("valid setting"),
+            60_000,
+            "setting persisted"
+        );
+        assert_eq!(
+            session.http_dispatcher().timeout_ms(),
+            60_000,
+            "the live dispatcher slot is reconfigured"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_enable_skill_commands_rebuilds_autocomplete() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        let ui = &mode.ui_state;
+        // Load a skill after the mode mounted (its init provider saw none).
+        let skills_dir = lock(&session.resource_loader()).agent_dir().join("skills");
+        let skill_file = skills_dir.join("test-skill").join("SKILL.md");
+        std::fs::create_dir_all(skill_file.parent().expect("skill dir")).expect("create skill dir");
+        std::fs::write(
+            &skill_file,
+            "---\nname: test-skill\ndescription: A test skill\n---\nbody\n",
+        )
+        .expect("write skill file");
+        lock(&session.resource_loader()).reload();
+        assert!(lock(&ui.skill_commands).is_empty(), "not yet rebuilt");
+
+        // Toggling the setting rebuilds the provider (`setupAutocompleteProvider`,
+        // interactive-mode.ts:4986-4990); the rebuild repopulates the map.
+        apply_settings_change(ui, SettingsChange::EnableSkillCommands(true));
+        assert!(
+            lock(&ui.skill_commands).contains_key("skill:test-skill"),
+            "provider rebuilt with the skill: {:?}",
+            lock(&ui.skill_commands).keys().collect::<Vec<_>>()
+        );
+
+        apply_settings_change(ui, SettingsChange::EnableSkillCommands(false));
+        assert!(
+            lock(&ui.skill_commands).is_empty(),
+            "provider rebuilt without skill commands"
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
 //!
 //! The provider combines four command sources: the built-in slash commands
 //! (`core::slash_commands::BUILTIN_SLASH_COMMANDS`), prompt templates
-//! (`session.prompt_templates()`), extension commands (T15 hook — empty) and
+//! (`session.prompt_templates()`), extension commands (the live runner) and
 //! skill commands (`skill:<name>`). It is assembled into a
 //! [`CombinedAutocompleteProvider`] wrapped for trigger-character parity.
 //!
@@ -20,22 +20,18 @@
 //!   completion ranks provider-prefixed queries (e.g. `openrouter/gpt-5`)
 //!   ahead of proxy-provider model IDs, matching the /model selector
 //!   (T12-S5b spec decision).
-//! - `/login` argument completions are a T13 hook (`get_login_provider_options`
-//!   returns `None` + TODO); upstream wires `getLoginProviderOptions`
-//!   (interactive-mode.ts:4845) through `getLoginProviderCompletionOptions`
-//!   (:269-289) and `getLoginProviderSearchText` (:291-296).
-//! - Extension commands and the `fdPath` are T15 hooks (empty / `None`);
-//!   `getBuiltinCommandConflictDiagnostics` therefore reports no conflicts
-//!   yet. Upstream returns `ResourceDiagnostic[]`; the port returns plain
-//!   messages (`Vec<String>`) until the extension runner lands.
-//! - Git sources in [`get_autocomplete_source_tag`] fall back to the plain
-//!   scope prefix (upstream's last line): `parseGitUrl` (utils/git.ts:172,
-//!   hosted-git-info) is not ported. Local `SourceInfo`s only carry
-//!   `"local"`/`"auto"`/`"package"` sources today, so the fallback is
-//!   unobservable in this slice.
+//! - `/login` argument completions build the provider list through
+//!   `AuthSelectorProvider::from_provider` with no cached auth status;
+//!   `getLoginProviderCompletionOptions` (interactive-mode.ts:386-407)
+//!   drops `status` anyway, so the difference is unobservable.
+//! - `fd` resolution is lookup-only: upstream `getToolPath`
+//!   (tools-manager.ts:83-102) checks the managed `<agentDir>/bin` and then
+//!   `PATH` after `ensureTool` may have downloaded the binary
+//!   (tools-manager.ts:349-410). rpi has no managed-tool store, so a missing
+//!   `fd` falls back to the existing path completion.
 //! - The `skill_commands` map lives on [`InteractiveUi`] (allowed field
 //!   addition, upstream class field cleared at the top of
-//!   `createBaseAutocompleteProvider`, interactive-mode.ts:611-616); the
+//!   `createBaseAutocompleteProvider`, interactive-mode.ts:803-806); the
 //!   slash-command dispatch reads it.
 //! - The base provider is wrapped so `trigger_characters()` reports the
 //!   editor defaults plus `/`. The editor merges provider triggers with its
@@ -46,16 +42,23 @@
 
 use std::sync::{Arc, Mutex};
 
+use rpi_ai::auth::types::AuthType;
 use rpi_tui::autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, CombinedAutocompleteProvider,
     CompletionResult, GetSuggestionsOptions, SlashCommand as TuiSlashCommand, SlashCommandOrItem,
 };
 use rpi_tui::fuzzy::fuzzy_filter;
 
-use crate::core::skills::{SourceInfo, SourceScope};
+use crate::core::extensions::ExtensionCommand;
+use crate::core::git_url::parse_git_url;
+use crate::core::skills::{DiagnosticKind, ResourceDiagnostic, SourceInfo, SourceScope};
 use crate::core::slash_commands::{BUILTIN_SLASH_COMMANDS, is_builtin_command};
+use crate::core::tool_paths::{FD_BINARY_NAMES, get_tool_path};
 use crate::modes::interactive::components::model_search::{
     ModelSearchItem, get_model_selector_search_text,
+};
+use crate::modes::interactive::components::oauth_selector::{
+    AuthSelectorProvider, auth_type_str, format_auth_selector_provider_type,
 };
 use crate::modes::interactive::interactive_mode::InteractiveUi;
 
@@ -66,16 +69,23 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------------
-// Source tags (interactive-mode.ts:497-528)
+// Source tags (interactive-mode.ts:676-708)
 // ---------------------------------------------------------------------------
 
-/// `getAutocompleteSourceTag` (interactive-mode.ts:497-520): the short
+/// `getAutocompleteSourceTag` (interactive-mode.ts:676-701): the short
 /// `[u]`-style prefix shown on command descriptions. `scope` maps to
 /// `u`/`p`/`t` (user/project/temporary); the source string narrows it:
-/// `auto`/`local`/`cli` → scope prefix only, `npm:` → `scope:npm:...`, a git
-/// source → `scope:git:host/path@ref` (not ported, see module header).
+/// `auto`/`local`/`cli` → scope prefix only, `npm:` → `scope:npm:...`, a
+/// parseable git source → `scope:git:host/path@ref`, anything else → the
+/// bare scope prefix (upstream's last line). Built-in extension commands
+/// (source `builtin`) are untagged like built-in commands.
 pub(crate) fn get_autocomplete_source_tag(source_info: Option<&SourceInfo>) -> Option<String> {
     let source_info = source_info?;
+    if source_info.source == "builtin" {
+        // Built-in extension commands are untagged, like built-in
+        // commands (interactive-mode.ts:678-680, source-info.ts:18-21).
+        return None;
+    }
     let scope_prefix = match source_info.scope {
         SourceScope::User => "u",
         SourceScope::Project => "p",
@@ -88,8 +98,20 @@ pub(crate) fn get_autocomplete_source_tag(source_info: Option<&SourceInfo>) -> O
     if source.starts_with("npm:") {
         return Some(format!("{scope_prefix}:{source}"));
     }
-    // TODO(T14): git sources (`parseGitUrl`, utils/git.ts:172) — fall back
-    // to the scope prefix, upstream's last line (interactive-mode.ts:519).
+    // `parseGitUrl(source)` (interactive-mode.ts:693-697; utils/git.ts:172):
+    // `scope:git:<host>/<path>@<ref>` when the source parses, else the bare
+    // scope prefix (interactive-mode.ts:699-700).
+    if let Some(git_source) = parse_git_url(source) {
+        let reference = git_source
+            .ref_
+            .as_deref()
+            .map(|git_ref| format!("@{git_ref}"))
+            .unwrap_or_default();
+        return Some(format!(
+            "{scope_prefix}:git:{}/{}{reference}",
+            git_source.host, git_source.path
+        ));
+    }
     Some(scope_prefix.to_string())
 }
 
@@ -115,36 +137,138 @@ pub(crate) fn prefix_autocomplete_description(
 }
 
 // ---------------------------------------------------------------------------
-// Conflict diagnostics (interactive-mode.ts:530-543)
+// Conflict diagnostics (interactive-mode.ts:710-723)
 // ---------------------------------------------------------------------------
 
-/// `getBuiltinCommandConflictDiagnostics` (interactive-mode.ts:530-543):
-/// warnings for extension commands whose name collides with a built-in. The
-/// extension command list is a T15 hook, so there is nothing to diagnose yet.
-///
-/// Upstream returns `ResourceDiagnostic[]` (`{ type: "warning", message,
-/// path }`); the port returns the message strings until the extension runner
-/// lands (T15 will switch to the full diagnostic shape).
-pub(crate) fn get_builtin_command_conflict_diagnostics(_ui: &InteractiveUi) -> Vec<String> {
-    // TODO(T15): for each registered extension command whose name is a
-    // built-in (core::slash_commands::is_builtin_command), emit
-    //   invocationName === name
-    //     ? `Extension command '/{name}' conflicts with built-in interactive
-    //        command. Skipping in autocomplete.`
-    //     : `Extension command '/{name}' conflicts with built-in interactive
-    //        command. Available as '/{invocationName}'.`
-    // (interactive-mode.ts:535-541).
-    Vec::new()
+/// `getBuiltinCommandConflictDiagnostics` (interactive-mode.ts:710-723):
+/// warnings for extension commands whose registered `name` collides with a
+/// built-in. The message distinguishes a plain shadow (the command is
+/// skipped in autocomplete) from a suffixed invocation name (the command is
+/// reachable under `/<name>:<n>`).
+pub(crate) fn get_builtin_command_conflict_diagnostics(
+    extension_commands: &[ExtensionCommand],
+) -> Vec<ResourceDiagnostic> {
+    extension_commands
+        .iter()
+        .filter(|command| is_builtin_command(&command.name))
+        .map(|command| ResourceDiagnostic {
+            kind: DiagnosticKind::Warning,
+            message: if command.invocation_name == command.name {
+                format!(
+                    "Extension command '/{}' conflicts with built-in interactive command. Skipping in autocomplete.",
+                    command.name
+                )
+            } else {
+                format!(
+                    "Extension command '/{}' conflicts with built-in interactive command. Available as '/{}'.",
+                    command.name, command.invocation_name
+                )
+            },
+            path: command
+                .source_info
+                .as_ref()
+                .map(|source_info| source_info.path.clone()),
+            collision: None,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// /login provider argument completions (interactive-mode.ts:375-421,
+// :776-783)
+// ---------------------------------------------------------------------------
+
+/// `LoginProviderCompletionOption` (interactive-mode.ts:364-369): one
+/// provider with its merged auth methods and subscription flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoginProviderCompletionOption {
+    pub id: String,
+    pub name: String,
+    pub auth_types: Vec<AuthType>,
+    pub subscription: Option<bool>,
+}
+
+/// `AUTH_TYPE_ORDER` (interactive-mode.ts:373): `oauth` sorts before
+/// `api_key` when the merged methods are listed.
+fn auth_type_order(auth_type: AuthType) -> u8 {
+    match auth_type {
+        AuthType::Oauth => 0,
+        AuthType::ApiKey => 1,
+    }
+}
+
+/// `getLoginProviderCompletionOptions` (interactive-mode.ts:386-407): merge
+/// the per-method selector rows into one entry per provider id (auth types
+/// deduped and ordered), sorted by display name.
+pub(crate) fn get_login_provider_completion_options(
+    provider_options: &[AuthSelectorProvider],
+) -> Vec<LoginProviderCompletionOption> {
+    let mut options: Vec<LoginProviderCompletionOption> = Vec::new();
+    for provider in provider_options {
+        if let Some(existing) = options.iter_mut().find(|option| option.id == provider.id) {
+            if !existing.auth_types.contains(&provider.auth_type) {
+                existing.auth_types.push(provider.auth_type);
+                existing
+                    .auth_types
+                    .sort_by_key(|auth_type| auth_type_order(*auth_type));
+            }
+            continue;
+        }
+        options.push(LoginProviderCompletionOption {
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            auth_types: vec![provider.auth_type],
+            subscription: provider.subscription,
+        });
+    }
+    options.sort_by(|a, b| a.name.cmp(&b.name));
+    options
+}
+
+/// `getLoginProviderSearchText` (interactive-mode.ts:409-414): the fuzzy
+/// haystack — id, name, and each auth type with its display label.
+pub(crate) fn get_login_provider_search_text(option: &LoginProviderCompletionOption) -> String {
+    let auth_types = option
+        .auth_types
+        .iter()
+        .map(|auth_type| {
+            format!(
+                "{} {}",
+                auth_type_str(auth_type),
+                format_auth_selector_provider_type(auth_type, option.subscription)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{} {} {auth_types}", option.id, option.name)
+}
+
+/// `formatLoginProviderCompletionDescription` (interactive-mode.ts:416-421):
+/// `API key`, `subscription`/`account`, `/`-joined when both are offered,
+/// prefixed with the display name when it differs from the id.
+pub(crate) fn format_login_provider_completion_description(
+    option: &LoginProviderCompletionOption,
+) -> String {
+    let auth_types = option
+        .auth_types
+        .iter()
+        .map(|auth_type| format_auth_selector_provider_type(auth_type, option.subscription))
+        .collect::<Vec<_>>()
+        .join("/");
+    if option.name == option.id {
+        auth_types
+    } else {
+        format!("{} · {}", option.name, auth_types)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Base provider (interactive-mode.ts:545-629)
 // ---------------------------------------------------------------------------
 
-/// `createBaseAutocompleteProvider` (interactive-mode.ts:545-629): the
+/// `createBaseAutocompleteProvider` (interactive-mode.ts:545-810): the
 /// combined slash-command provider — built-ins (+ `/model` and `/login`
-/// argument completions), prompt templates, extension commands (T15) and
-/// skills.
+/// argument completions), prompt templates, extension commands and skills.
 pub(crate) fn create_base_autocomplete_provider(
     ui: &Arc<InteractiveUi>,
 ) -> Arc<dyn AutocompleteProvider> {
@@ -212,14 +336,39 @@ pub(crate) fn create_base_autocomplete_provider(
         }));
     }
 
-    // /login argument completions (interactive-mode.ts:580-590) — T13 hook.
+    // /login argument completions (interactive-mode.ts:776-783):
+    // `getLoginProviderOptions()` filtered through the completion helpers,
+    // fuzzy-matched against the typed prefix.
+    let login_ui = Arc::clone(ui);
     if let Some(login_command) = slash_commands.iter_mut().find(|c| c.name == "login") {
-        login_command.get_argument_completions = Some(Box::new(|_prefix: &str| {
-            // TODO(T13): getLoginProviderOptions (interactive-mode.ts:4845)
-            // → getLoginProviderCompletionOptions (:269-289) → fuzzy items
-            // with getLoginProviderSearchText (:291-296) and
-            // formatLoginProviderCompletionDescription (:298-301).
-            None
+        login_command.get_argument_completions = Some(Box::new(move |prefix: &str| {
+            let providers: Vec<AuthSelectorProvider> = login_ui
+                .session()
+                .model_runtime()
+                .get_providers()
+                .iter()
+                .flat_map(|provider| AuthSelectorProvider::from_provider(provider, None))
+                .collect();
+            let options = get_login_provider_completion_options(&providers);
+            if options.is_empty() {
+                return None;
+            }
+            // `createFuzzyAutocompleteItems(providers, prefix,
+            // getLoginProviderSearchText, ...)` (interactive-mode.ts:778-782).
+            let filtered = fuzzy_filter(options, prefix, get_login_provider_search_text);
+            if filtered.is_empty() {
+                return None;
+            }
+            Some(
+                filtered
+                    .into_iter()
+                    .map(|option| AutocompleteItem {
+                        value: option.id.clone(),
+                        label: option.id.clone(),
+                        description: Some(format_login_provider_completion_description(&option)),
+                    })
+                    .collect(),
+            )
         }));
     }
 
@@ -240,16 +389,17 @@ pub(crate) fn create_base_autocomplete_provider(
         })
         .collect();
 
-    // Extension commands (interactive-mode.ts:599-608): filtered to names
-    // not shadowed by a built-in, invocation name as command name, from the
-    // extension host's registry (T15). The hidden built-in carries no
-    // source tag, so the description passes through unprefixed.
+    // Extension commands (interactive-mode.ts:795-802): filtered to names
+    // not shadowed by a built-in (keyed on the registered `name`, so a
+    // suffixed `help:1` invocation is skipped too), invocation name as
+    // command name, from the extension host's registry. The hidden built-in
+    // carries no source tag, so the description passes through unprefixed.
     let extension_commands: Vec<SlashCommandOrItem> = ui
         .session()
         .extension_runner()
         .registered_commands()
         .iter()
-        .filter(|command| !is_builtin_command(&command.invocation_name))
+        .filter(|command| !is_builtin_command(&command.name))
         .map(|command| {
             SlashCommandOrItem::Command(TuiSlashCommand {
                 name: command.invocation_name.clone(),
@@ -287,13 +437,14 @@ pub(crate) fn create_base_autocomplete_provider(
         }
     }
 
-    // Assemble (interactive-mode.ts:624-628): upstream passes
-    // `this.sessionManager.getCwd()` and `this.fdPath` (T15 hook here).
+    // Assemble (interactive-mode.ts:804-810): upstream passes
+    // `this.sessionManager.getCwd()` and `this.fdPath` (resolved by
+    // `ensureTool("fd", ...)` at startup, interactive-mode.ts:1088-1092).
     let base_path = lock(&ui.session().session_manager())
         .get_cwd()
         .to_string_lossy()
         .into_owned();
-    let fd_path: Option<String> = None; // TODO(T15)
+    let fd_path = resolve_fd_path();
     let mut commands: Vec<SlashCommandOrItem> = slash_commands
         .into_iter()
         .map(SlashCommandOrItem::Command)
@@ -306,6 +457,28 @@ pub(crate) fn create_base_autocomplete_provider(
     Arc::new(TriggerCharactersWrapper {
         delegate: Arc::new(combined),
     })
+}
+
+/// Resolve the `fd` binary for file completions (`getToolPath`,
+/// tools-manager.ts:83-102): the managed `<agentDir>/bin` first, then `PATH`
+/// under `fd` and its Debian alias `fdfind`. rpi has no managed-tool
+/// download, so a missing `fd` returns `None` and the provider keeps its
+/// existing path completion (a spawn failure is treated as an empty walk).
+fn resolve_fd_path() -> Option<String> {
+    let bin_dir = crate::config::get_agent_dir().join("bin");
+    let path_env = std::env::var_os("PATH");
+    resolve_fd_path_in(&bin_dir, path_env.as_deref())
+}
+
+/// Environment-injected core of [`resolve_fd_path`] (test seam, same shape
+/// as the clipboard env overrides): managed bin dir first, then `PATH`.
+fn resolve_fd_path_in(
+    bin_dir: &std::path::Path,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    FD_BINARY_NAMES
+        .iter()
+        .find_map(|name| get_tool_path(name, bin_dir, path_env))
 }
 
 // ---------------------------------------------------------------------------
@@ -474,13 +647,29 @@ mod tests {
     }
 
     #[test]
-    fn source_tag_npm_and_unknown_sources() {
+    fn source_tag_npm_and_git_sources() {
         assert_eq!(
             get_autocomplete_source_tag(Some(&source_info(SourceScope::User, "npm:@scope/skill"))),
             Some("u:npm:@scope/skill".to_string())
         );
-        // Unparseable sources (git in this slice, TODO(T14)) fall back to
-        // the scope prefix (interactive-mode.ts:519).
+        // `parseGitUrl` (utils/git.ts:172) successes carry the
+        // `scope:git:<host>/<path>@<ref>` label (interactive-mode.ts:693-697).
+        assert_eq!(
+            get_autocomplete_source_tag(Some(&source_info(
+                SourceScope::User,
+                "git:github.com/user/repo@v1"
+            ))),
+            Some("u:git:github.com/user/repo@v1".to_string())
+        );
+        assert_eq!(
+            get_autocomplete_source_tag(Some(&source_info(
+                SourceScope::Project,
+                "https://github.com/user/repo"
+            ))),
+            Some("p:git:github.com/user/repo".to_string())
+        );
+        // Unparseable sources fall back to the scope prefix
+        // (interactive-mode.ts:699-700).
         assert_eq!(
             get_autocomplete_source_tag(Some(&source_info(SourceScope::Project, "git:custom"))),
             Some("p".to_string())
@@ -490,6 +679,56 @@ mod tests {
             get_autocomplete_source_tag(Some(&source_info(SourceScope::User, " local "))),
             Some("u".to_string())
         );
+        // Built-in extension commands are untagged (interactive-mode.ts:678-680).
+        assert_eq!(
+            get_autocomplete_source_tag(Some(&source_info(SourceScope::User, "builtin"))),
+            None
+        );
+    }
+
+    #[test]
+    fn fd_path_present_and_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "rpi-fd-autocomplete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let managed = root.join("bin");
+        let path_dir = root.join("path");
+        let empty = root.join("empty");
+        for dir in [&managed, &path_dir, &empty] {
+            std::fs::create_dir_all(dir).expect("temp dir");
+        }
+
+        // Absent: no managed `fd` and no `PATH` hit → `None`, so the
+        // combined provider keeps its existing path completion.
+        let empty_path = std::env::join_paths([&empty]).expect("join paths");
+        assert_eq!(
+            resolve_fd_path_in(&managed, Some(empty_path.as_os_str())),
+            None
+        );
+        assert_eq!(resolve_fd_path_in(&managed, None), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fd = path_dir.join("fd");
+            std::fs::write(&fd, "#!/bin/sh\nexit 0\n").expect("write fake fd");
+            std::fs::set_permissions(&fd, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake fd");
+            let path_env = std::env::join_paths([&path_dir]).expect("join paths");
+            // Present on `PATH` → the bare command name (`getToolPath`
+            // convention, tools-manager.ts:93-101).
+            assert_eq!(
+                resolve_fd_path_in(&managed, Some(path_env.as_os_str())),
+                Some("fd".to_string())
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -521,13 +760,130 @@ mod tests {
         assert_eq!(prefix_autocomplete_description(None, None), None);
     }
 
-    // ---- conflict diagnostics (T15 hook) ----
+    // ---- conflict diagnostics (interactive-mode.ts:710-723) ----
 
-    #[tokio::test]
-    async fn conflict_diagnostics_empty_without_extensions() {
-        let mode = mode_harness().await;
-        let ui = Arc::clone(&mode.ui_state);
-        assert!(get_builtin_command_conflict_diagnostics(&ui).is_empty());
+    fn extension_command(name: &str, invocation_name: &str) -> ExtensionCommand {
+        ExtensionCommand {
+            name: name.to_string(),
+            invocation_name: invocation_name.to_string(),
+            description: None,
+            source_info: Some(source_info(SourceScope::User, "local")),
+        }
+    }
+
+    #[test]
+    fn conflict_diagnostics_two_message_shapes() {
+        let commands = vec![
+            extension_command("model", "model"),
+            extension_command("tree", "tree:1"),
+            extension_command("custom", "custom"),
+        ];
+        let diagnostics = get_builtin_command_conflict_diagnostics(&commands);
+        assert_eq!(diagnostics.len(), 2, "only built-in name collisions warn");
+        assert_eq!(diagnostics[0].kind, DiagnosticKind::Warning);
+        assert_eq!(
+            diagnostics[0].message,
+            "Extension command '/model' conflicts with built-in interactive command. Skipping in autocomplete."
+        );
+        assert_eq!(
+            diagnostics[1].message,
+            "Extension command '/tree' conflicts with built-in interactive command. Available as '/tree:1'."
+        );
+        // The path comes from the registered command's source info.
+        assert_eq!(
+            diagnostics[0].path.as_deref(),
+            Some(std::path::Path::new("/tmp/resource.md"))
+        );
+    }
+
+    #[test]
+    fn conflict_diagnostics_empty_without_conflicts() {
+        assert!(get_builtin_command_conflict_diagnostics(&[]).is_empty());
+        assert!(
+            get_builtin_command_conflict_diagnostics(&[extension_command("custom", "custom")])
+                .is_empty()
+        );
+    }
+
+    // ---- /login provider completions (interactive-mode.ts:386-421) ----
+
+    fn provider_row(
+        id: &str,
+        name: &str,
+        auth_type: AuthType,
+        subscription: Option<bool>,
+    ) -> AuthSelectorProvider {
+        AuthSelectorProvider {
+            id: id.to_string(),
+            name: name.to_string(),
+            auth_type,
+            method_name: None,
+            method_login: true,
+            status: None,
+            subscription,
+        }
+    }
+
+    #[test]
+    fn login_completion_options_merge_duplicate_ids() {
+        let options = get_login_provider_completion_options(&[
+            provider_row("zai", "Z.ai", AuthType::ApiKey, None),
+            provider_row("anthropic", "Anthropic", AuthType::Oauth, Some(true)),
+            provider_row("anthropic", "Anthropic", AuthType::ApiKey, Some(true)),
+            provider_row("zai", "Z.ai", AuthType::Oauth, None),
+        ]);
+        // Sorted by display name (`localeCompare`).
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["anthropic", "zai"]
+        );
+        // Auth types are deduped and `oauth`-first.
+        assert_eq!(
+            options[0].auth_types,
+            vec![AuthType::Oauth, AuthType::ApiKey]
+        );
+        assert_eq!(
+            options[1].auth_types,
+            vec![AuthType::Oauth, AuthType::ApiKey]
+        );
+        assert_eq!(options[0].subscription, Some(true));
+    }
+
+    #[test]
+    fn login_completion_search_text_and_description() {
+        let option = LoginProviderCompletionOption {
+            id: "anthropic".to_string(),
+            name: "Anthropic".to_string(),
+            auth_types: vec![AuthType::Oauth, AuthType::ApiKey],
+            subscription: Some(true),
+        };
+        assert_eq!(
+            get_login_provider_search_text(&option),
+            "anthropic Anthropic oauth subscription api_key API key"
+        );
+        assert_eq!(
+            format_login_provider_completion_description(&option),
+            "Anthropic · subscription/API key"
+        );
+        // A display name equal to the id drops the prefix
+        // (interactive-mode.ts:419-420).
+        let bare = LoginProviderCompletionOption {
+            id: "openai".to_string(),
+            name: "openai".to_string(),
+            auth_types: vec![AuthType::ApiKey],
+            subscription: None,
+        };
+        assert_eq!(
+            get_login_provider_search_text(&bare),
+            "openai openai api_key API key"
+        );
+        assert_eq!(
+            format_login_provider_completion_description(&bare),
+            "API key"
+        );
     }
 
     // ---- provider assembly ----
@@ -622,11 +978,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_argument_completions_are_t13_hook() {
+    async fn login_argument_completions_from_provider_catalog() {
         let mode = mode_harness().await;
         let ui = Arc::clone(&mode.ui_state);
         let provider = create_base_autocomplete_provider(&ui);
-        assert!(get_suggestions(provider.as_ref(), "/login openai", false).is_none());
+        let result = get_suggestions(provider.as_ref(), "/login anthropic", false);
+        let items = result.expect("provider completions").items;
+        let item = items
+            .iter()
+            .find(|item| item.value == "anthropic")
+            .expect("anthropic provider offered");
+        assert_eq!(item.label, "anthropic");
+        let description = item.description.as_deref().expect("description");
+        assert!(
+            description.contains("Anthropic"),
+            "display name in description: {description:?}"
+        );
     }
 
     // ---- skills ----

@@ -135,7 +135,7 @@ impl AuthSelectorMode {
 
 /// `formatAuthSelectorProviderType` (oauth-selector.ts:22-32 @ ed8b3bcc1):
 /// OAuth sign-ins without a subscription are labeled as accounts.
-fn format_auth_selector_provider_type(
+pub(crate) fn format_auth_selector_provider_type(
     auth_type: &AuthType,
     subscription: Option<bool>,
 ) -> &'static str {
@@ -147,7 +147,7 @@ fn format_auth_selector_provider_type(
 }
 
 /// Wire-format auth type label (`provider.authType`).
-fn auth_type_str(auth_type: &AuthType) -> &'static str {
+pub(crate) fn auth_type_str(auth_type: &AuthType) -> &'static str {
     match auth_type {
         AuthType::Oauth => "oauth",
         AuthType::ApiKey => "api_key",

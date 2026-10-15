@@ -855,6 +855,17 @@ impl Component for ToolExecutionComponent {
         // inherent method without recursing.
         ToolExecutionComponent::set_output_pad(self, output_pad);
     }
+
+    fn set_show_images(&mut self, show: bool) {
+        // `child instanceof ToolExecutionComponent` walk equivalent (#59):
+        // route to the inherent method without recursing.
+        ToolExecutionComponent::set_show_images(self, show);
+    }
+
+    fn set_image_width_cells(&mut self, width: usize) {
+        // `child instanceof ToolExecutionComponent` walk equivalent (#59).
+        ToolExecutionComponent::set_image_width_cells(self, width);
+    }
 }
 
 /// `imageSources` entry (tool-execution.ts:42 @ a276dabe5, #10292): the
@@ -1163,6 +1174,14 @@ mod tests {
         assert_eq!(component.image_width_cells, 30);
         component.set_image_width_cells(0);
         assert_eq!(component.image_width_cells, 1);
+        component.set_show_images(false);
+        assert!(!component.show_images);
+        // The trait walk (#59) routes to the inherent setters, so a mounted
+        // component updates in place.
+        Component::set_show_images(&mut component, true);
+        assert!(component.show_images);
+        Component::set_image_width_cells(&mut component, 42);
+        assert_eq!(component.image_width_cells, 42);
     }
 
     // ------------------------------------------------------------------

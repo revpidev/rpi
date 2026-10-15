@@ -719,6 +719,7 @@ async fn constructor_restores_transcript_declared_tools_without_initial_set() {
             previous_session_file: None,
         },
         cache_warmer: None,
+        http_dispatcher: None,
     });
 
     let mut active = session.get_active_tool_names();
@@ -2607,6 +2608,7 @@ async fn agent_settled_handlers_defer_requested_runs() {
             previous_session_file: None,
         },
         cache_warmer: None,
+        http_dispatcher: None,
     });
 
     let run_session = session.clone();

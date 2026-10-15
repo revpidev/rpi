@@ -730,6 +730,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
 
     fn get_command(&self, name: &str) -> Option<ExtensionCommand> {
         self.host.get_command(name).map(|command| ExtensionCommand {
+            name: command.name,
             invocation_name: command.invocation_name,
             description: command.description,
             source_info: Some(convert_source_info(&command.source_info)),
@@ -745,6 +746,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
             .get_registered_commands()
             .into_iter()
             .map(|command| ExtensionCommand {
+                name: command.name,
                 invocation_name: command.invocation_name,
                 description: command.description,
                 source_info: Some(convert_source_info(&command.source_info)),

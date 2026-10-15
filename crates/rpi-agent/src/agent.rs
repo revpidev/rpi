@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures::future::BoxFuture;
@@ -372,6 +372,26 @@ fn default_convert_to_llm() -> ConvertToLlmFn {
 // Agent (agent.ts:171-577)
 // ---------------------------------------------------------------------------
 
+/// `Transport` → `u8` for the interior-mutable field. Kept local: the
+/// decoders only need a total (lossless) mapping.
+fn transport_to_u8(transport: Transport) -> u8 {
+    match transport {
+        Transport::Sse => 0,
+        Transport::Websocket => 1,
+        Transport::WebsocketCached => 2,
+        Transport::Auto => 3,
+    }
+}
+
+fn transport_from_u8(value: u8) -> Transport {
+    match value {
+        0 => Transport::Sse,
+        1 => Transport::Websocket,
+        2 => Transport::WebsocketCached,
+        _ => Transport::Auto,
+    }
+}
+
 /// Stateful wrapper around the low-level agent loop.
 ///
 /// All methods take `&self`; wrap in `Arc` to share across tasks. Event
@@ -422,7 +442,15 @@ pub struct Agent {
     /// function.
     pub thinking_budgets: Option<ThinkingBudgets>,
     /// Preferred transport forwarded to the stream function.
-    pub transport: Transport,
+    ///
+    /// Interior-mutable (`AtomicU8`) because the interactive settings chain
+    /// reassigns the live agent's transport
+    /// (`this.session.agent.transport = transport`,
+    /// interactive-mode.ts:4997-4999): the shared `Arc<Agent>` is also held
+    /// by the running loop, so a plain field could not be updated after
+    /// construction. Read via [`Agent::transport`], written via
+    /// [`Agent::set_transport`].
+    transport: AtomicU8,
     /// Optional cap for provider-requested retry delays.
     pub max_retry_delay_ms: Option<u64>,
     /// Tool execution strategy for assistant messages with multiple tool calls.
@@ -492,7 +520,9 @@ impl Agent {
             prepare_next_turn_with_context: RwLock::new(options.prepare_next_turn_with_context),
             session_id: options.session_id,
             thinking_budgets: options.thinking_budgets,
-            transport: options.transport.unwrap_or(Transport::Auto),
+            transport: AtomicU8::new(transport_to_u8(
+                options.transport.unwrap_or(Transport::Auto),
+            )),
             max_retry_delay_ms: options.max_retry_delay_ms,
             tool_execution: options
                 .tool_execution
@@ -625,6 +655,19 @@ impl Agent {
 
     pub fn set_model(&self, model: Model) {
         lock(&self.state).model = model;
+    }
+
+    /// Current preferred transport.
+    pub fn transport(&self) -> Transport {
+        transport_from_u8(self.transport.load(Ordering::Relaxed))
+    }
+
+    /// `this.session.agent.transport = transport` (interactive-mode.ts:4997-
+    /// 4999): reassign the live agent's transport; the next request reads it
+    /// when assembling [`StreamOptions`].
+    pub fn set_transport(&self, transport: Transport) {
+        self.transport
+            .store(transport_to_u8(transport), Ordering::Relaxed);
     }
 
     pub fn set_thinking_level(&self, thinking_level: ThinkingLevel) {
@@ -1016,7 +1059,7 @@ impl Agent {
             thinking_budgets: self.thinking_budgets.clone(),
             stream_options: StreamOptions {
                 session_id: self.session_id.clone(),
-                transport: Some(self.transport),
+                transport: Some(self.transport()),
                 request: rpi_ai::ProviderRequestOptions {
                     on_payload: self.on_payload.clone(),
                     on_response: self.on_response.clone(),

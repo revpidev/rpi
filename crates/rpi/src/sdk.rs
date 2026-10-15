@@ -507,6 +507,22 @@ pub async fn create_agent_session(
     // `let agent` binding, sdk.ts:368-376). Unset → warming never starts
     // (no requests exist before the agent does).
     let agent_cell: Arc<std::sync::OnceLock<Arc<Agent>>> = Arc::new(std::sync::OnceLock::new());
+    // `configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs())`
+    // (interactive-mode.ts:2063) equivalent: the session's stream function
+    // reads the shared slot for its default idle budget, and the settings
+    // chain reconfigures it at runtime (`/settings` arm, session rebind,
+    // `/reload`). Seeded from the settings manager so construction keeps
+    // upstream's startup configuration step.
+    let http_dispatcher = {
+        let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
+        let timeout_ms = loader
+            .settings_manager()
+            .get_http_idle_timeout_ms()
+            .unwrap_or(crate::core::settings_manager::DEFAULT_HTTP_IDLE_TIMEOUT_MS);
+        Arc::new(crate::core::http_dispatcher::HttpDispatcher::new(
+            timeout_ms,
+        ))
+    };
     let stream_fn = {
         let model_runtime = model_runtime.clone();
         let loader = resource_loader.clone();
@@ -514,6 +530,7 @@ pub async fn create_agent_session(
         let cache_warmer = cache_warmer.clone();
         let agent_cell = agent_cell.clone();
         let session_manager_for_warming = session_manager.clone();
+        let http_dispatcher = http_dispatcher.clone();
         Arc::new(
             move |model: Model,
                   context: rpi_ai::types::TranscriptContext,
@@ -521,14 +538,11 @@ pub async fn create_agent_session(
                 let model_runtime = model_runtime.clone();
                 let loader = loader.clone();
                 let runner_ref = runner_ref.clone();
-                let (retry, http_idle_timeout_ms, websocket_connect_timeout_ms) = {
+                let (retry, websocket_connect_timeout_ms) = {
                     let loader = loader.lock().unwrap_or_else(|e| e.into_inner());
                     let settings = loader.settings_manager();
                     (
                         settings.get_provider_retry_settings(),
-                        settings
-                            .get_http_idle_timeout_ms()
-                            .unwrap_or(crate::core::settings_manager::DEFAULT_HTTP_IDLE_TIMEOUT_MS),
                         settings.get_websocket_connect_timeout_ms().unwrap_or(None),
                     )
                 };
@@ -537,12 +551,10 @@ pub async fn create_agent_session(
                 // budgets upstream (undici headersTimeout/bodyTimeout): the
                 // connect phase, the headers wait, and inter-chunk body gaps
                 // — never the stream's total duration (see
-                // rpi-ai/src/api/stream_timeouts.rs).
-                let effective_timeout_ms = if http_idle_timeout_ms == 0 {
-                    2_147_483_647
-                } else {
-                    http_idle_timeout_ms
-                };
+                // rpi-ai/src/api/stream_timeouts.rs). The budget lives on
+                // the shared dispatcher slot so `/settings` reconfigures
+                // the live session without a restart.
+                let effective_timeout_ms = effective_http_idle_timeout_ms(&http_dispatcher);
                 let mut stream_options = options;
                 stream_options.timeout_ms = stream_options
                     .timeout_ms
@@ -871,6 +883,7 @@ pub async fn create_agent_session(
             previous_session_file: None,
         }),
         cache_warmer: Some(cache_warmer),
+        http_dispatcher: Some(http_dispatcher),
     });
 
     Ok(CreateAgentSessionResult {
@@ -878,6 +891,21 @@ pub async fn create_agent_session(
         model_fallback_message,
         services: provided_services,
     })
+}
+
+/// The effective `StreamOptions::timeout_ms` for a request, read from the
+/// session's [`HttpDispatcher`](crate::core::http_dispatcher::HttpDispatcher)
+/// slot at call time. Upstream maps a configured `0` ("disabled") to the TS
+/// SDKs' max-int32 convention (sdk.ts:305-308); the stream-timeout helpers
+/// treat zero as "no budget" themselves, so the mapping preserves the
+/// upstream option value in recorded requests.
+fn effective_http_idle_timeout_ms(
+    dispatcher: &crate::core::http_dispatcher::HttpDispatcher,
+) -> u64 {
+    match dispatcher.timeout_ms() {
+        0 => 2_147_483_647,
+        timeout_ms => timeout_ms,
+    }
 }
 
 /// `Image reading is disabled.` placeholder (sdk.ts:271).
@@ -1153,5 +1181,28 @@ mod default_tools_tests {
         // Empty array = no built-in tools, extension/SDK tools preserved
         // (541045ae0).
         assert_eq!(empty.get_default_tools(), Some(Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod http_dispatcher_tests {
+    //! #59 R4: the stream function reads the shared dispatcher slot at
+    //! request time, so `apply_settings_change` reaches live sessions.
+
+    use crate::core::http_dispatcher::HttpDispatcher;
+
+    use super::effective_http_idle_timeout_ms;
+
+    #[test]
+    fn reads_the_slot_live() {
+        let dispatcher = HttpDispatcher::new(0);
+        // 0 = disabled maps to the TS SDKs' max-int32 convention
+        // (sdk.ts:305-308).
+        assert_eq!(effective_http_idle_timeout_ms(&dispatcher), 2_147_483_647);
+        // A runtime reconfiguration is visible to the next request.
+        dispatcher.configure(600_000);
+        assert_eq!(effective_http_idle_timeout_ms(&dispatcher), 600_000);
+        dispatcher.configure(0);
+        assert_eq!(effective_http_idle_timeout_ms(&dispatcher), 2_147_483_647);
     }
 }

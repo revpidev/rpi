@@ -9,9 +9,7 @@
 //! selectors, slash commands, queue UX, model cycling, clipboard, suspend
 //! and settings hot-apply all live here and in the `commands.rs` /
 //! `commands_selectors.rs` submodules. Remaining upstream gaps carry
-//! `TODO(T13)`/`TODO(T14)`/`TODO(T15)` markers (provider/auth flows,
-//! share/export HTML, extension UI respectively); gaps no v0.1 task claims
-//! are marked `TODO(unassigned)`.
+//! `TODO(unassigned)` markers (gaps no v0.1 task claims).
 //!
 //! ## Structure vs upstream
 //!
@@ -684,6 +682,18 @@ impl<T: Component> Component for SharedChild<T> {
     fn set_output_pad(&mut self, output_pad: usize) {
         lock(&self.0).set_output_pad(output_pad);
     }
+
+    /// Forwards the `child instanceof ToolExecutionComponent` show-images
+    /// walk (#59) to the wrapped component.
+    fn set_show_images(&mut self, show: bool) {
+        lock(&self.0).set_show_images(show);
+    }
+
+    /// Forwards the `child instanceof ToolExecutionComponent` image-width
+    /// walk (#59) to the wrapped component.
+    fn set_image_width_cells(&mut self, width: usize) {
+        lock(&self.0).set_image_width_cells(width);
+    }
 }
 
 /// Tree entry for a shared focusable component (selectors, T12-S5a): the
@@ -782,6 +792,18 @@ impl Component for SharedEntry {
         // dashed editor mounted in the editor container is not a transcript
         // block; forwarding keeps the wrapper transparent.
         lock(&self.0).set_output_pad(output_pad);
+    }
+
+    fn set_show_images(&mut self, show: bool) {
+        // Transparent-forwarding counterpart of the tool-component walk
+        // (#59); the editor container never holds tool executions.
+        lock(&self.0).set_show_images(show);
+    }
+
+    fn set_image_width_cells(&mut self, width: usize) {
+        // Transparent-forwarding counterpart of the tool-component walk
+        // (#59).
+        lock(&self.0).set_image_width_cells(width);
     }
 
     fn as_focusable(&self) -> Option<&dyn Focusable> {
@@ -1514,8 +1536,14 @@ pub(crate) struct InteractiveUi {
 
     /// Settings snapshot (read at init).
     show_terminal_progress: bool,
-    show_images: bool,
-    image_width_cells: usize,
+    /// `showImages` (interactive-mode.ts:373): the terminal image-surface
+    /// toggle. Atomic because the `/settings` arm
+    /// (`onShowImagesChange`) rewrites it through `&Arc<InteractiveUi>` and
+    /// new tool components read it at construction.
+    show_images: AtomicBool,
+    /// `imageWidthCells` (interactive-mode.ts:374): the image render width.
+    /// Atomic for the same reason.
+    image_width_cells: AtomicUsize,
     double_escape_action: DoubleEscapeAction,
     cwd: String,
     /// `options.verbose` (interactive-mode.ts:1077-1079) — startup listing
@@ -2937,8 +2965,8 @@ impl InteractiveUi {
             tool_call_id.to_string(),
             args.clone(),
             ToolExecutionOptions {
-                show_images: self.show_images,
-                image_width_cells: self.image_width_cells,
+                show_images: self.show_images.load(Ordering::Relaxed),
+                image_width_cells: self.image_width_cells.load(Ordering::Relaxed),
                 output_pad: self.output_pad.load(Ordering::Relaxed),
             },
             // `getRegisteredToolDefinition` (interactive-mode.ts:2944):
@@ -5385,10 +5413,14 @@ impl InteractiveMode {
             retry_escape_handler: Mutex::new(None),
             show_terminal_progress: session
                 .settings_manager(|settings| settings.get_show_terminal_progress()),
-            show_images: session.settings_manager(|settings| settings.get_show_images()),
-            image_width_cells: session
-                .settings_manager(|settings| settings.get_image_width_cells())
-                .clamp(1, 1024) as usize,
+            show_images: AtomicBool::new(
+                session.settings_manager(|settings| settings.get_show_images()),
+            ),
+            image_width_cells: AtomicUsize::new(
+                session
+                    .settings_manager(|settings| settings.get_image_width_cells())
+                    .clamp(1, 1024) as usize,
+            ),
             double_escape_action: session
                 .settings_manager(|settings| settings.get_double_escape_action()),
             cwd: cwd.display().to_string(),
