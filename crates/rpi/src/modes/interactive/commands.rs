@@ -580,7 +580,7 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
-    /// `handleHotkeysCommand` (interactive-mode.ts:5742-5857): render the
+    /// `handleHotkeysCommand` (interactive-mode.ts:6809-6924): render the
     /// built-in keybinding tables as markdown plus the extension-registered
     /// shortcuts section (interactive-mode.ts:6901-6916).
     pub(crate) fn handle_hotkeys_command(&self) {
@@ -881,8 +881,8 @@ impl InteractiveMode {
                 }
             }
             // `SessionImportFileNotFoundError` (recoverable showError,
-            // interactive-mode.ts:5852-5854); every other import failure is
-            // fatal (interactive-mode.ts:5855).
+            // interactive-mode.ts:6603-6606); every other import failure is
+            // fatal (interactive-mode.ts:6607).
             Err(RpiError::SessionImportFileNotFound(error)) => self
                 .ui_state
                 .show_error(&format!("Failed to import session: {error}")),

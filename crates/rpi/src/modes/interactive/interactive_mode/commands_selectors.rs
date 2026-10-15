@@ -2838,9 +2838,9 @@ impl InteractiveMode {
                 lock(&self.ui_state.editor).set_text("");
                 self.ui_state.show_status("Cloned to new session");
             }
-            // interactive-mode.ts:4947-4949: clone failure is a recoverable
+            // interactive-mode.ts:5554-5555: clone failure is a recoverable
             // `showError`, unlike the five fatal call sites (create ×2
-            // :1832/:6222, fork :1844, resume :5164, import :5855).
+            // :1986/:6937, fork :1998, resume :5784, import :6607).
             Err(error) => self.ui_state.show_error(&error.raw_message()),
         }
     }

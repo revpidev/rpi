@@ -21,7 +21,7 @@
 //!   (`aborted: true` instead of the upstream AbortError rejection —
 //!   §7.3). `close` cancels the waiter on teardown.
 //! - Upstream reports per-catalog refresh errors from `result.errors`
-//!   (model-selector.ts:175-178); the port reports
+//!   (model-selector.ts:197-200); the port reports
 //!   `ModelRuntime::get_error()` instead (the local `refresh` returns no
 //!   error map).
 //! - `sortModels` uses plain `provider.cmp` where upstream uses
@@ -95,7 +95,7 @@ struct SelectorState {
     refresh_status_success: bool,
     scope: ModelScope,
     /// Mirror of the search input value, read by the refresh task when it
-    /// re-filters (model-selector.ts:187 reads `searchInput.getValue()`).
+    /// re-filters (model-selector.ts:209 reads `searchInput.getValue()`).
     search_value: String,
     /// Waiter cancellation for the in-flight catalog refresh
     /// (`refreshAbortController`, model-selector.ts:72): the 15 s timeout
@@ -440,13 +440,13 @@ impl ModelSelectorComponent {
                     state.refresh_status_message = String::new();
                     if result.aborted && timed_out.load(std::sync::atomic::Ordering::SeqCst) {
                         // Timeout abort: keep the cached list
-                        // (model-selector.ts:176-177); `load_from_snapshot`
+                        // (model-selector.ts:195-196); `load_from_snapshot`
                         // below reloads it.
                         state.error_message =
                             Some("Model refresh timed out; showing cached models.".to_string());
                     } else {
                         // Upstream inspects `result.errors` per catalog
-                        // (model-selector.ts:175-178); the local refresh
+                        // (model-selector.ts:197-200); the local refresh
                         // returns no error map, so `get_error` covers
                         // catalog errors.
                         state.error_message = runtime.get_error();
@@ -470,8 +470,9 @@ impl ModelSelectorComponent {
         }
     }
 
-    /// `close` (model-selector.ts:194-198): mark closed and abort the
-    /// in-flight refresh waiter (upstream clears the timeout and aborts
+    /// `close` (port-local teardown; upstream `dispose`,
+    /// model-selector.ts:224-229): mark closed and abort the in-flight
+    /// refresh waiter (upstream clears the timeout and aborts
     /// `refreshAbortController`).
     fn close(&mut self) {
         let mut state = lock(&self.state);
@@ -503,7 +504,7 @@ impl ModelSelectorComponent {
     }
 }
 
-/// Upstream `dispose` teardown (model-selector.ts:194-198): superseding the
+/// Upstream `dispose` teardown (model-selector.ts:224-229): superseding the
 /// selector without an explicit `close` still aborts the refresh waiter.
 impl Drop for ModelSelectorComponent {
     fn drop(&mut self) {
