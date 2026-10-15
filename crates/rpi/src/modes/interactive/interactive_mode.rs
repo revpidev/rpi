@@ -5709,7 +5709,7 @@ impl InteractiveMode {
         lock(&ui_state.footer).set_auto_compact_enabled(self.session.auto_compaction_enabled());
 
         // Render initial messages AFTER showing loaded resources
-        // (interactive-mode.ts:796-797).
+        // (interactive-mode.ts:1102-1103).
         ui_state.render_initial_messages();
         ui_state.update_available_provider_count();
         ui_state.update_editor_border_color();
