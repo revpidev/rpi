@@ -3215,7 +3215,7 @@ impl InteractiveUi {
                             if result.aborted {
                                 // Summarization aborted — re-show the tree
                                 // selector with the same selection
-                                // (interactive-mode.ts:5657-5662).
+                                // (interactive-mode.ts:5653-5658).
                                 ui.show_status("Branch summarization cancelled");
                                 InteractiveUi::show_tree_selector(&ui, Some(entry_id));
                                 return;

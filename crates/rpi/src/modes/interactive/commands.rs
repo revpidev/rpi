@@ -26,8 +26,8 @@
 //!   `ShareCompleted`) instead of upstream's inline promise continuation
 //!   (component lock contract).
 //! - Import (`handle_import_command`): the confirmation prompt
-//!   (`showExtensionConfirm`, interactive-mode.ts:5474-5478) and the
-//!   missing-session-cwd prompt/recovery (interactive-mode.ts:5489-5501)
+//!   (interactive-mode.ts:6574-6579) and the missing-session-cwd
+//!   prompt/recovery (interactive-mode.ts:6590-6608)
 //!   run through the built-in selector dialogs (V17-08 #63);
 //!   `MissingSessionCwdError` is a typed `RpiError` variant so the import
 //!   can retry with the fallback cwd instead of taking the fatal path.
@@ -581,8 +581,8 @@ impl InteractiveUi {
     }
 
     /// `handleHotkeysCommand` (interactive-mode.ts:5742-5857): render the
-    /// built-in keybinding tables as markdown. The extension-registered
-    /// shortcuts section (interactive-mode.ts:5835-5848) is a T15 hook.
+    /// built-in keybinding tables as markdown plus the extension-registered
+    /// shortcuts section (interactive-mode.ts:6901-6916).
     pub(crate) fn handle_hotkeys_command(&self) {
         // Navigation keybindings.
         let cursor_up = key_display_text("tui.editor.cursorUp");
@@ -726,7 +726,7 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
-    /// `handleDebugCommand` (interactive-mode.ts:6932-6973): write the debug
+    /// `handleDebugCommand` (interactive-mode.ts:6941-6973): write the debug
     /// log to `{agent_dir}/rpi-debug.log` and confirm in the chat. The log
     /// carries the full rendered frame (upstream `this.ui.render(width)`) and
     /// the agent-message JSONL.
@@ -794,7 +794,7 @@ impl InteractiveUi {
 }
 
 impl InteractiveMode {
-    /// `handleImportCommand` (interactive-mode.ts:5476-5576): confirm, replace
+    /// `handleImportCommand` (interactive-mode.ts:6567-6608): confirm, replace
     /// the current session with the one in the JSONL file, and recover from a
     /// missing stored cwd by prompting for the fallback directory.
     pub(crate) async fn handle_import_command(&mut self, args: &str) {
@@ -804,7 +804,7 @@ impl InteractiveMode {
         };
 
         // `showExtensionConfirm("Import session", …)`
-        // (interactive-mode.ts:5474-5478).
+        // (interactive-mode.ts:6574-6579).
         let confirmed = crate::modes::interactive::interactive_mode::commands_selectors::show_extension_selector(
             &self.ui_state,
             &format!("Import session\nReplace current session with {input_path}?"),
@@ -835,7 +835,7 @@ impl InteractiveMode {
             }
             Err(RpiError::MissingSessionCwd(error)) => {
                 // `promptForMissingSessionCwd` (interactive-mode.ts:2762-2766 +
-                // 5489-5501): confirm the fallback cwd, then retry the import
+                // 6590-6608): confirm the fallback cwd, then retry the import
                 // with it; a decline cancels the import.
                 let confirmed = crate::modes::interactive::interactive_mode::commands_selectors::show_extension_selector(
                     &self.ui_state,

@@ -15,7 +15,7 @@
 //!   `await modelRuntime.refresh(...)`), and Rust cannot borrow the
 //!   component from a spawned future — same pattern as bash-execution's
 //!   shared `Loader`.
-//! - The 15 s aggregate timeout (model-selector.ts:71/163-168) is enforced
+//! - The 15 s aggregate timeout (model-selector.ts:72/184-192) is enforced
 //!   through a `CancellationToken` waiter on `refresh_catalogs_shared`
 //!   (V17-08 #63): on timeout the waiter aborts and the cached list stays
 //!   (`aborted: true` instead of the upstream AbortError rejection —
@@ -98,7 +98,7 @@ struct SelectorState {
     /// re-filters (model-selector.ts:187 reads `searchInput.getValue()`).
     search_value: String,
     /// Waiter cancellation for the in-flight catalog refresh
-    /// (`refreshAbortController`, model-selector.ts:71): the 15 s timeout
+    /// (`refreshAbortController`, model-selector.ts:72): the 15 s timeout
     /// cancels it, and `close`/drop cancel it on teardown.
     refresh_cancel: Option<CancellationToken>,
     closed: bool,
@@ -399,7 +399,7 @@ impl ModelSelectorComponent {
         component
     }
 
-    /// `refreshModels` (model-selector.ts:162-192): background catalog
+    /// `refreshModels` (model-selector.ts:184-192): background catalog
     /// refresh, started from the constructor. The spawned task updates the
     /// shared [`SelectorState`] and requests a re-render when done.
     fn start_refresh(&self) {
@@ -411,7 +411,7 @@ impl ModelSelectorComponent {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 // 15 s aggregate timeout (`refreshAbortController`,
-                // model-selector.ts:71/163-168): the timer cancels the
+                // model-selector.ts:72/184-192): the timer cancels the
                 // waiter; the shared run keeps going while other waiters
                 // remain.
                 let cancel = CancellationToken::new();
