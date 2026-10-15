@@ -10,8 +10,8 @@
 //! and settings hot-apply all live here and in the `commands.rs` /
 //! `commands_selectors.rs` submodules. Remaining upstream gaps carry
 //! `TODO(T13)`/`TODO(T14)`/`TODO(T15)` markers (provider/auth flows,
-//! cache-stats/share/export HTML, extension UI respectively); gaps no v0.1
-//! task claims are marked `TODO(unassigned)`.
+//! share/export HTML, extension UI respectively); gaps no v0.1 task claims
+//! are marked `TODO(unassigned)`.
 //!
 //! ## Structure vs upstream
 //!
@@ -44,8 +44,9 @@
 //! Intentional differences:
 //! - `bindExtensions` is called with `mode: None` (upstream binds via
 //!   `bindCurrentSessionExtensions` with no explicit mode for interactive).
-//! - Startup notices (changelog asset — T15) and the package-update check
-//!   (npm-registry probing, not a product endpoint) are not ported; the
+//! - Startup notices are ported (`show_startup_notices_if_needed`, V17-07
+//!   #68 — the changelog asset in condensed or full form); the package-update
+//!   check (npm-registry probing, not a product endpoint) is not ported; the
 //!   startup version check and install telemetry landed with T14-W6a
 //!   (ADR-0002 §8); the tmux keyboard checks (unassigned) are not ported;
 //!   the `loadedResourcesContainer` shows the merged diagnostics block only
@@ -126,7 +127,7 @@ use crate::modes::interactive::custom_editor::{CustomEditor, CustomEditorRegion,
 use crate::modes::interactive::footer::{FooterComponent, FooterDataProvider};
 use crate::modes::interactive::header::{ExpandableText, build_builtin_header};
 use crate::modes::interactive::program_status::{BlockedStatus, ProgramStatusReporter};
-use crate::modes::interactive::theme::markdown_theme;
+use crate::modes::interactive::theme::markdown_theme_with_settings;
 use crate::tools::truncate::TruncationResult;
 
 /// Terminal title prefix (upstream `APP_TITLE`, config.ts:490: `"π"` when no
@@ -1497,6 +1498,14 @@ pub(crate) struct InteractiveUi {
     /// `lastSigintTime` / `lastEscapeTime` (interactive-mode.ts:354-355).
     last_sigint_time: AtomicU64,
     last_escape_time: AtomicU64,
+    /// `anthropicSubscriptionWarningShown` (interactive-mode.ts:328 @
+    /// abe508e1b): the Anthropic extra-usage warning fires at most once per
+    /// session, no matter which call site reaches it first.
+    anthropic_subscription_warning_shown: AtomicBool,
+    /// `startupNoticesShown` (interactive-mode.ts:494 @ abe508e1b):
+    /// `show_startup_notices_if_needed` renders the changelog block only
+    /// once per mode instance.
+    startup_notices_shown: AtomicBool,
 
     /// Saved escape handlers while compaction / retry install their own
     /// (interactive-mode.ts:395-398).
@@ -1692,9 +1701,125 @@ pub(crate) struct ShareState {
     pub(crate) tmp_file: std::path::PathBuf,
 }
 
+/// `ANTHROPIC_SUBSCRIPTION_AUTH_WARNING` (interactive-mode.ts:321-322 @
+/// abe508e1b), verbatim.
+const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str = "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.";
+
+/// `isAnthropicSubscriptionAuthKey` (interactive-mode.ts:324-326): the key
+/// itself is never logged — only the prefix is inspected.
+fn is_anthropic_subscription_auth_key(api_key: Option<&str>) -> bool {
+    api_key.is_some_and(|key| key.starts_with("sk-ant-oat"))
+}
+
+/// The `showStartupNoticesIfNeeded` body (interactive-mode.ts:856-870 @
+/// abe508e1b): the bordered condensed line or the full "What's New" block.
+/// A free function so the golden-frame snapshot tests can render the exact
+/// block without a full mode.
+pub(crate) fn startup_notice_components(
+    changelog_markdown: &str,
+    collapse_changelog: bool,
+    theme: &crate::modes::interactive::components::ThemeHandle,
+    markdown_theme: &Mutex<Arc<MarkdownTheme>>,
+) -> Vec<Box<dyn rpi_tui::tui::Component>> {
+    let border_theme = Arc::clone(&lock(theme));
+    let border = Box::new(move |text: &str| border_theme.fg("border", text));
+    let mut components: Vec<Box<dyn rpi_tui::tui::Component>> = Vec::new();
+    components.push(Box::new(DynamicBorder::new(border.clone())));
+    if collapse_changelog {
+        // `##\s+\[?(\d+\.\d+\.\d+)\]?` (interactive-mode.ts:858): the
+        // first version heading in the markdown; fallback = current version.
+        let version = crate::core::changelog::parse_changelog(changelog_markdown)
+            .first()
+            .map(|entry| format!("{}.{}.{}", entry.major, entry.minor, entry.patch))
+            .unwrap_or_else(|| VERSION.to_owned());
+        components.push(Box::new(Text::new(
+            format!(
+                "Updated to v{version}. Use {} to view full changelog.",
+                Theme::bold("/changelog")
+            ),
+            1,
+            0,
+            None,
+        )));
+    } else {
+        components.push(Box::new(
+            crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(theme),
+                |theme| Theme::bold(&theme.fg("accent", "What's New")),
+                1,
+                0,
+            ),
+        ));
+        components.push(Box::new(Spacer::new(1)));
+        components.push(Box::new(Markdown::new(
+            changelog_markdown.trim().to_owned(),
+            1,
+            0,
+            Arc::clone(&lock(markdown_theme)),
+            None,
+            None,
+        )));
+        components.push(Box::new(Spacer::new(1)));
+    }
+    components.push(Box::new(DynamicBorder::new(border)));
+    components
+}
+
 impl InteractiveUi {
     pub(crate) fn push(&self, command: UiCommand) {
         lock(&self.event_queue).push_back(command);
+    }
+
+    /// `maybeWarnAboutAnthropicSubscriptionAuth` (interactive-mode.ts:
+    /// 5261-5289 @ abe508e1b): warn once per session when the selected
+    /// anthropic model authenticates through a Claude subscription (OAuth or
+    /// an `sk-ant-oat…` key). Auth lookup failures are swallowed
+    /// (warning-only); `warnings.anthropicExtraUsage === false` disables it.
+    pub(crate) async fn maybe_warn_about_anthropic_subscription_auth(
+        &self,
+        model: Option<rpi_ai::types::Model>,
+    ) {
+        if self.session().settings_manager(|settings| {
+            settings.get_warnings().anthropic_extra_usage == Some(false)
+        }) {
+            return;
+        }
+        if self
+            .anthropic_subscription_warning_shown
+            .load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let model = match model.or_else(|| self.session().model()) {
+            Some(model) => model,
+            None => return,
+        };
+        if model.provider != "anthropic" {
+            return;
+        }
+
+        let runtime = Arc::clone(self.session().model_runtime());
+        let check = match runtime.check_auth("anthropic").await {
+            Ok(check) => check,
+            // Ignore auth lookup failures for warning-only checks.
+            Err(_) => return,
+        };
+        if check.is_some_and(|check| check.kind == rpi_ai::auth::types::AuthType::Oauth) {
+            self.anthropic_subscription_warning_shown
+                .store(true, Ordering::SeqCst);
+            self.show_warning(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING);
+            return;
+        }
+        let api_key = match runtime.get_auth(&model, None).await {
+            Ok(Some(auth)) => auth.auth.api_key,
+            _ => return,
+        };
+        if !is_anthropic_subscription_auth_key(api_key.as_deref()) {
+            return;
+        }
+        self.anthropic_subscription_warning_shown
+            .store(true, Ordering::SeqCst);
+        self.show_warning(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING);
     }
 
     /// `switchTuiMode` (interactive-mode.ts:788-837 @ b103937d3) —
@@ -3226,6 +3351,36 @@ impl InteractiveUi {
         self.ui.request_render(false);
     }
 
+    /// `showStartupNoticesIfNeeded` (interactive-mode.ts:843-871 @
+    /// abe508e1b): render the new-entry changelog block once per mode
+    /// instance. Resumed sessions never have `changelog_markdown`
+    /// (`getChangelogForDisplay` skips sessions with messages), so the
+    /// early return keeps the restore path unchanged.
+    pub(crate) fn show_startup_notices_if_needed(&self) {
+        if self.startup_notices_shown.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(changelog_markdown) = lock(&self.changelog_markdown).clone() else {
+            return;
+        };
+        let collapse_changelog = self
+            .session()
+            .settings_manager(|settings| settings.get_collapse_changelog());
+        let components = startup_notice_components(
+            &changelog_markdown,
+            collapse_changelog,
+            &self.theme,
+            &self.markdown_theme,
+        );
+        let mut chat = lock(&self.chat_container);
+        if !chat.children.is_empty() {
+            chat.children.push(Box::new(Spacer::new(1)));
+        }
+        chat.children.extend(components);
+        drop(chat);
+        self.render_handle.request_render();
+    }
+
     /// `showLoadedResources` (interactive-mode.ts:1421-1627): the loaded
     /// resources listing — Context / Skills / Prompts / Extensions sections (ExpandableText, compact name lists) plus the diagnostics
     /// block. Renders into the dedicated `loaded_resources_container`, so
@@ -3426,21 +3581,64 @@ impl InteractiveUi {
         }
     }
 
-    /// `maybeShowCacheMissNotice` (interactive-mode.ts:3449-3455): the
-    /// setting gate plus the `detectCacheMiss` structure are in place; the
-    /// cache-stats port (`core/cache-stats.ts`) is TODO(T14), so nothing
-    /// renders yet.
-    pub(crate) fn maybe_show_cache_miss_notice(
-        &self,
-        _assistant: &rpi_ai::types::AssistantMessage,
-    ) {
-        // detectCacheMiss(sessionManager.getEntries(), message, session.modelRuntime)
-        // → CacheMiss { missedTokens, missedCost, modelChanged, idleMs }
-        // (core/cache-stats.ts, wired at interactive-mode.ts:3453).
-        // TODO(T14/cache-stats): port the detector and render the notice
-        // (interactive-mode.ts:3457-3471 — 20k-token / $0.10 thresholds,
-        // warning label, chat spacer + text) behind the
-        // get_show_cache_miss_notices gate.
+    /// `maybeShowCacheMissNotice` (interactive-mode.ts:4185-4191 @
+    /// abe508e1b): behind the `showCacheMissNotices` gate, detect a cache
+    /// miss on the just-completed assistant message and render the notice.
+    /// rpi's session listener may have already persisted the message before
+    /// the UI drain; the detector skips the message itself either way.
+    pub(crate) fn maybe_show_cache_miss_notice(&self, assistant: &rpi_ai::types::AssistantMessage) {
+        if !self
+            .session()
+            .settings_manager(|settings| settings.get_show_cache_miss_notices())
+        {
+            return;
+        }
+        let entries = lock(&self.session().session_manager()).get_entries();
+        let price_source = Arc::clone(self.session().model_runtime());
+        let miss =
+            crate::core::cache_stats::detect_cache_miss(&entries, assistant, price_source.as_ref());
+        if let Some(miss) = miss {
+            self.add_cache_miss_notice(&miss);
+        }
+    }
+
+    /// `addCacheMissNotice` (interactive-mode.ts:4193-4206 @ abe508e1b):
+    /// display thresholds (20k tokens or $0.10), label priority
+    /// model-switch > idle > generic, `{tokens} tokens re-billed (~$x.xx)`.
+    /// The notice is derived state and is never persisted.
+    fn add_cache_miss_notice(&self, miss: &crate::core::cache_stats::CacheMiss) {
+        if miss.missed_tokens < 20_000 && miss.missed_cost < 0.1 {
+            return;
+        }
+        let cost = if miss.missed_cost >= 0.01 {
+            format!(" (~${:.2})", miss.missed_cost)
+        } else {
+            String::new()
+        };
+        let re_billed = format!(
+            "{} tokens re-billed{cost}",
+            crate::modes::interactive::footer::format_tokens(miss.missed_tokens)
+        );
+        let label = if miss.model_changed {
+            "Cache miss after model switch".to_owned()
+        } else if miss.idle_ms >= crate::core::cache_stats::CACHE_TTL_MS {
+            format!(
+                "Cache miss after {}m idle",
+                (miss.idle_ms as f64 / 60_000.0).round() as i64
+            )
+        } else {
+            "Cache miss".to_owned()
+        };
+        let message = format!("{label}: {re_billed}");
+        self.add_chat_child(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
+        self.add_chat_child(Box::new(
+            crate::modes::interactive::components::ThemedText::new(
+                Arc::clone(&self.theme),
+                move |theme| theme.fg("warning", &message),
+                1,
+                0,
+            ),
+        ));
     }
 
     /// `maybeShowAssistantDiagnostics` (interactive-mode.ts:3816-3839 @
@@ -4040,9 +4238,20 @@ impl InteractiveUi {
         lock(&self.pending_tools).clear();
         let mut rendered_pending_tools: HashMap<String, Arc<Mutex<ToolExecutionComponent>>> =
             HashMap::new();
-        // TODO(T14): cache-miss notices (collectCacheMisses /
-        // addCacheMissNotice, interactive-mode.ts:3347-3350, 3457-3471) —
-        // needs the cache-stats port.
+        // Cache misses are not persisted, unlike successful cache-warming
+        // usage. Re-derive them and inject the notice after the assistant
+        // messages that paid for them (interactive-mode.ts:3999-4001,
+        // 4063-4064); the map is keyed by the paying `MessageEntry.id`.
+        let cache_misses = if self
+            .session()
+            .settings_manager(|settings| settings.get_show_cache_miss_notices())
+        {
+            let entries = lock(&self.session().session_manager()).get_entries();
+            let price_source = Arc::clone(self.session().model_runtime());
+            crate::core::cache_stats::collect_cache_misses(&entries, price_source.as_ref())
+        } else {
+            HashMap::new()
+        };
         if options.update_footer {
             Component::invalidate(&mut *lock(&self.footer));
             self.update_editor_border_color();
@@ -4127,6 +4336,12 @@ impl InteractiveUi {
                                 rendered_pending_tools.insert(tool_call.id.clone(), handle);
                             }
                         }
+                    }
+                    if assistant.stop_reason != StopReason::Aborted
+                        && assistant.stop_reason != StopReason::Error
+                        && let Some(miss) = cache_misses.get(stored_entry.id())
+                    {
+                        self.add_cache_miss_notice(miss);
                     }
                 } else if let AgentMessage::ToolResult(tool_result) = &message {
                     // Match tool results to pending tool components
@@ -4309,12 +4524,18 @@ impl InteractiveUi {
     /// 800-804). Called from the drain / the color-scheme listener — never
     /// concurrently with component callbacks.
     pub(crate) fn apply_theme(&self, theme: Arc<Theme>) {
+        // Read the code-block indent before swapping the theme: the session
+        // settings lock must not be taken under the theme lock
+        // (interactive-mode.ts:1378-1383).
+        let code_block_indent = self
+            .session()
+            .settings_manager(|settings| settings.get_code_block_indent());
         *lock(&self.active_theme_name) = theme.name.clone();
         *lock(&self.theme) = Arc::clone(&theme);
         *lock(&self.scrollbar_theme) = Arc::clone(&theme);
         let markdown = {
             let current = lock(&self.theme);
-            markdown_theme(&current)
+            markdown_theme_with_settings(&current, &code_block_indent)
         };
         *lock(&self.markdown_theme) = markdown;
         // Rebuild the pending-messages block from the queue with the new
@@ -4866,7 +5087,10 @@ impl InteractiveMode {
     ) -> Self {
         let session = runtime.session().clone();
         let theme = resolve_theme(&session, options.initial_theme_setting.as_deref());
-        let markdown_theme = markdown_theme(&theme);
+        let markdown_theme = markdown_theme_with_settings(
+            &theme,
+            &session.settings_manager(|settings| settings.get_code_block_indent()),
+        );
         // Clipboard env override seam (V15-11 FR-A): created before the
         // renderer (the fullscreen copySelection closure captures it) and
         // owned by InteractiveUi afterwards.
@@ -5061,6 +5285,8 @@ impl InteractiveMode {
             share_state: Mutex::new(None),
             last_sigint_time: AtomicU64::new(0),
             last_escape_time: AtomicU64::new(0),
+            anthropic_subscription_warning_shown: AtomicBool::new(false),
+            startup_notices_shown: AtomicBool::new(false),
             auto_compaction_escape_handler: Mutex::new(None),
             retry_escape_handler: Mutex::new(None),
             show_terminal_progress: session
@@ -5479,6 +5705,7 @@ impl InteractiveMode {
         // `rebind_session_ui` (commands_selectors.rs); the git branch watcher
         // was started above and follows `FooterDataProvider::set_cwd`.
         ui_state.show_loaded_resources();
+        ui_state.show_startup_notices_if_needed();
         lock(&ui_state.footer).set_auto_compact_enabled(self.session.auto_compaction_enabled());
 
         // Render initial messages AFTER showing loaded resources
@@ -5561,6 +5788,17 @@ impl InteractiveMode {
                     resume_ui.start();
                     resume_state.render_handle.request_render();
                 }
+            });
+        }
+
+        // `void this.maybeWarnAboutAnthropicSubscriptionAuth()`
+        // (interactive-mode.ts:1228 @ abe508e1b): fire-and-forget before the
+        // initial-message processing (rpi has no crash-notification face to
+        // sit after; the startup sequence position is the correspondence).
+        {
+            let ui = Arc::clone(&self.ui_state);
+            commands_selectors::spawn_async(async move {
+                ui.maybe_warn_about_anthropic_subscription_auth(None).await;
             });
         }
 
@@ -8882,7 +9120,9 @@ mod tests {
             vec![text_content("answer")],
             StopReason::Stop,
         )));
-        ui.push(UiCommand::MessageEnd(assistant_turn(0, 12_000, 0.045, 120_000)));
+        ui.push(UiCommand::MessageEnd(assistant_turn(
+            0, 12_000, 0.045, 120_000,
+        )));
         ui.drain_events();
 
         let rendered = lock(&ui.chat_container).render(100).join("\n");
@@ -8930,7 +9170,10 @@ mod tests {
         let notice = rendered
             .find("Cache miss after 9m idle")
             .expect("notice rendered");
-        assert!(paid < notice, "notice follows the paying message: {rendered}");
+        assert!(
+            paid < notice,
+            "notice follows the paying message: {rendered}"
+        );
     }
 
     /// `/session` gains a "Cache Re-billed" line, distinct from the
@@ -8977,14 +9220,15 @@ mod tests {
 
         ui.handle_session_command();
         let rendered = lock(&ui.chat_container).render(100).join("\n");
+        let start = rendered
+            .find("Cache Re-billed:")
+            .expect("Cache Re-billed line rendered");
+        let line = rendered[start..].lines().next().unwrap_or("");
         assert!(
-            rendered.contains("Cache Re-billed: 100,000 tokens, 1 miss"),
+            line.contains("100,000 tokens, 1 miss"),
             "rendered: {rendered}"
         );
-        assert!(
-            !rendered.contains("Cache Re-billed: $"),
-            "rendered: {rendered}"
-        );
+        assert!(!line.contains('$'), "no amount below $0.0001: {line:?}");
     }
 
     // ---------------------------------------------------------------------
@@ -9027,7 +9271,10 @@ mod tests {
             .find(|line| line.contains('x') && !line.contains("```"))
             .expect("code line rendered");
         let indent = code_line.chars().take_while(|c| *c == ' ').count();
-        assert_eq!(indent, 4, "code line carries the four-space indent: {code_line:?}");
+        assert_eq!(
+            indent, 4,
+            "code line carries the four-space indent: {code_line:?}"
+        );
 
         // apply_theme re-reads the current setting.
         ui.apply_theme(Arc::new(
@@ -9161,7 +9408,10 @@ mod tests {
             .handle_model_command(&format!("anthropic/{}", model.id))
             .await;
         let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
-        assert!(!rendered.contains(ANTHROPIC_WARNING), "rendered: {rendered}");
+        assert!(
+            !rendered.contains(ANTHROPIC_WARNING),
+            "rendered: {rendered}"
+        );
     }
 
     /// `warnings.anthropicExtraUsage = false` disables the warning.
@@ -9178,7 +9428,10 @@ mod tests {
             .handle_model_command(&format!("anthropic/{}", model.id))
             .await;
         let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
-        assert!(!rendered.contains(ANTHROPIC_WARNING), "rendered: {rendered}");
+        assert!(
+            !rendered.contains(ANTHROPIC_WARNING),
+            "rendered: {rendered}"
+        );
     }
 
     /// A non-anthropic model never triggers the warning.
@@ -9191,7 +9444,34 @@ mod tests {
             .await;
         mode.ui_state.handle_model_command("custom/m1").await;
         let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
-        assert!(!rendered.contains(ANTHROPIC_WARNING), "rendered: {rendered}");
+        assert!(
+            !rendered.contains(ANTHROPIC_WARNING),
+            "rendered: {rendered}"
+        );
+    }
+
+    /// Auth lookup failure (no credential configured) is swallowed: no
+    /// warning and no error banner.
+    #[tokio::test]
+    async fn anthropic_subscription_warning_swallows_auth_lookup_failure() {
+        let (mode, _terminal, _session, model) = anthropic_auth_fixture(None).await;
+        mode.ui_state
+            .maybe_warn_about_anthropic_subscription_auth(Some(model))
+            .await;
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(
+            !rendered.contains(ANTHROPIC_WARNING),
+            "rendered: {rendered}"
+        );
+        assert!(!rendered.contains("Warning:"), "rendered: {rendered}");
+    }
+
+    /// Predicate: only the OAuth-style `sk-ant-oat` prefix counts.
+    #[test]
+    fn anthropic_subscription_auth_key_predicate_matches_oat_prefix() {
+        assert!(is_anthropic_subscription_auth_key(Some("sk-ant-oat-123")));
+        assert!(!is_anthropic_subscription_auth_key(Some("sk-ant-api-123")));
+        assert!(!is_anthropic_subscription_auth_key(None));
     }
 
     // ---------------------------------------------------------------------
@@ -9203,8 +9483,7 @@ mod tests {
     #[tokio::test]
     async fn startup_notices_show_whats_new_for_fresh_sessions() {
         let (mut mode, _terminal, session) = mode_harness().await;
-        session
-            .settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
+        session.settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
         mode.init().await;
 
         let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
@@ -9243,8 +9522,7 @@ mod tests {
     #[tokio::test]
     async fn startup_notices_skip_resumed_sessions() {
         let (mut mode, _terminal, session) = mode_harness().await;
-        session
-            .settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
+        session.settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
         lock(&session.session_manager())
             .append_message(user_message("resume me"))
             .expect("append message");
@@ -9261,15 +9539,18 @@ mod tests {
     #[tokio::test]
     async fn startup_notices_render_once() {
         let (mut mode, _terminal, session) = mode_harness().await;
-        session
-            .settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
+        session.settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
         mode.init().await;
         mode.ui_state.render_initial_messages();
         // A second init is a no-op (`is_initialized` guard).
         mode.init().await;
 
         let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
-        assert_eq!(rendered.matches("What's New").count(), 1, "rendered: {rendered}");
+        assert_eq!(
+            rendered.matches("What's New").count(),
+            1,
+            "rendered: {rendered}"
+        );
     }
 
     // ---------------------------------------------------------------------

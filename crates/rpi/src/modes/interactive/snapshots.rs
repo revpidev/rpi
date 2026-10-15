@@ -337,6 +337,48 @@ fn diff_render_hunk() {
     assert_snapshot("diff_render_hunk", &lines);
 }
 
+// --- startup What's New block (V17-07 #68; new frames, G14) -----------------
+
+#[test]
+fn startup_notice_full_block() {
+    use std::sync::Mutex;
+
+    let theme: crate::modes::interactive::components::ThemeHandle =
+        Arc::new(Mutex::new(dark_theme()));
+    let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
+    let components = crate::modes::interactive::interactive_mode::startup_notice_components(
+        "## [0.1.7] - 2026-10-15\n\n### Fixed\n\n- Something fixed.\n",
+        false,
+        &theme,
+        &markdown_theme,
+    );
+    let lines: Vec<String> = components
+        .iter()
+        .flat_map(|component| component.render(60))
+        .collect();
+    assert_snapshot("startup_notice_full_block", &lines);
+}
+
+#[test]
+fn startup_notice_condensed_line() {
+    use std::sync::Mutex;
+
+    let theme: crate::modes::interactive::components::ThemeHandle =
+        Arc::new(Mutex::new(dark_theme()));
+    let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
+    let components = crate::modes::interactive::interactive_mode::startup_notice_components(
+        "## [0.1.7] - 2026-10-15\n\n### Fixed\n\n- Something fixed.\n",
+        true,
+        &theme,
+        &markdown_theme,
+    );
+    let lines: Vec<String> = components
+        .iter()
+        .flat_map(|component| component.render(60))
+        .collect();
+    assert_snapshot("startup_notice_condensed_line", &lines);
+}
+
 // --- editor-border status spinners (c1d4c8011, V15-07 FR-C) ----------------
 //
 // Golden frames for the three spinner states now embedded in the editor's

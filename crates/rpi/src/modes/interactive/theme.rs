@@ -24,6 +24,18 @@ use crate::core::themes::Theme;
 ///   D-051); the hook is attached here so fenced code blocks render colored.
 /// - The theme is passed explicitly instead of read from a global.
 pub fn markdown_theme(theme: &Theme) -> Arc<MarkdownTheme> {
+    build_markdown_theme(theme, None)
+}
+
+/// `getMarkdownThemeWithSettings` (interactive-mode.ts:1378-1383 @
+/// abe508e1b): the base theme with `markdown.codeBlockIndent` applied.
+/// `snapshots.rs` and `MarkdownTheme::identity()` keep the explicit `None`
+/// fallback (byte-stable default extraction).
+pub fn markdown_theme_with_settings(theme: &Theme, code_block_indent: &str) -> Arc<MarkdownTheme> {
+    build_markdown_theme(theme, Some(code_block_indent.to_owned()))
+}
+
+fn build_markdown_theme(theme: &Theme, code_block_indent: Option<String>) -> Arc<MarkdownTheme> {
     let fg = |color: &'static str| -> ThemeTextFn {
         let theme = theme.clone();
         Box::new(move |text: &str| theme.fg(color, text))
@@ -50,7 +62,7 @@ pub fn markdown_theme(theme: &Theme) -> Arc<MarkdownTheme> {
         strikethrough: Box::new(|text: &str| Theme::strikethrough(text)),
         underline: Box::new(|text: &str| Theme::underline(text)),
         highlight_code: Some(highlight_code),
-        code_block_indent: None,
+        code_block_indent,
     })
 }
 

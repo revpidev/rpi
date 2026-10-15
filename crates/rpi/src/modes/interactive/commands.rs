@@ -42,9 +42,9 @@
 //! - Debug (`handle_debug_command`): `Tui` has no public full-render API,
 //!   so the "all rendered lines" section (interactive-mode.ts:5877-5890) is
 //!   a T14 hook; the log carries the header + agent-message JSONL sections.
-//! - Session (`handle_session_command`): the cache-waste section
-//!   (interactive-mode.ts:5648, 5692-5699) is a T14 hook — no local
-//!   `computeCacheWaste` (cache-stats port).
+//! - Session (`handle_session_command`): the cache-waste "Cache Re-billed"
+//!   line comes from `core::cache_stats` (V17-07, #57); it stays distinct
+//!   from the cache-warming "Cache miss penalty" economics line.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -109,8 +109,9 @@ impl InteractiveUi {
             .cloned()
             .collect();
         let usage_breakdown = get_usage_cost_breakdown(&known_entries);
-        // TODO(T14): cache-waste section (computeCacheWaste,
-        // interactive-mode.ts:5648, 5692-5699) — needs the cache-stats port.
+        let price_source = Arc::clone(self.session().model_runtime());
+        let cache_waste =
+            crate::core::cache_stats::compute_cache_waste(&entries, price_source.as_ref());
 
         let mut info = format!("{}\n\n", Theme::bold("Session Info"));
         if let Some(session_name) = &session_name {
@@ -246,7 +247,7 @@ impl InteractiveUi {
             ));
         }
 
-        if stats.cost > 0.0 {
+        if stats.cost > 0.0 || cache_waste.missed_tokens > 0 {
             info.push_str(&format!("\n{}\n", Theme::bold("Cost")));
             info.push_str(&format!(
                 "{} ${:.3}",
@@ -274,6 +275,27 @@ impl InteractiveUi {
                         "\n  {} ${:.3} {}",
                         key_label, entry.cost, tokens_label
                     ));
+                }
+            }
+            if cache_waste.missed_tokens > 0 {
+                let miss_label = if cache_waste.miss_count == 1 {
+                    "1 miss".to_owned()
+                } else {
+                    format!("{} misses", cache_waste.miss_count)
+                };
+                let detail = format!(
+                    "{} tokens, {miss_label}",
+                    to_locale_string(cache_waste.missed_tokens)
+                );
+                let label = lock(&self.theme).fg("dim", "Cache Re-billed:");
+                if cache_waste.missed_cost >= 0.0001 {
+                    let amount = lock(&self.theme).fg("dim", &format!("({detail})"));
+                    info.push_str(&format!(
+                        "\n{label} ${:.3} {amount}",
+                        cache_waste.missed_cost
+                    ));
+                } else {
+                    info.push_str(&format!("\n{label} {detail}"));
                 }
             }
         }

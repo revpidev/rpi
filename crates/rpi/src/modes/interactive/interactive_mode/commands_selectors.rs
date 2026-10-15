@@ -1229,9 +1229,12 @@ async fn finish_authentication(
             selected.id,
             auth_path.display()
         ));
-        // `maybeWarnAboutAnthropicSubscriptionAuth` /
-        // `checkDaxnutsEasterEgg` (interactive-mode.ts:5124-5125) are
-        // not ported (unassigned hooks).
+        // `void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel)`
+        // (interactive-mode.ts:6120-6126 @ abe508e1b). The login flow no
+        // longer carries the removed upstream `checkDaxnutsEasterEgg`
+        // (ADR-0036 decision 5; upstream deleted it in v1.0.1).
+        ui.maybe_warn_about_anthropic_subscription_auth(Some(selected.clone()))
+            .await;
     } else {
         ui.show_status(&format!(
             "{action_label}. Credentials saved to {}",
@@ -1239,6 +1242,8 @@ async fn finish_authentication(
         ));
         if let Some(selection_error) = selection_error {
             ui.show_error(&selection_error);
+        } else {
+            ui.maybe_warn_about_anthropic_subscription_auth(None).await;
         }
     }
     Ok(())
@@ -1649,6 +1654,8 @@ impl InteractiveUi {
                                 "Default model: {}/{}",
                                 model.provider, model.id
                             ));
+                            ui.maybe_warn_about_anthropic_subscription_auth(Some(model))
+                                .await;
                         }
                         Err(error) => {
                             ui.hide_selector();
@@ -1683,6 +1690,8 @@ impl InteractiveUi {
                             ui.hide_selector();
                             ui.update_editor_border_color();
                             ui.show_status(&format!("Model: {}", model.id));
+                            ui.maybe_warn_about_anthropic_subscription_auth(Some(model))
+                                .await;
                         }
                         Err(error) => ui.show_error(&error.raw_message()),
                     }
@@ -2386,6 +2395,8 @@ impl InteractiveUi {
                 Ok(()) => {
                     self.update_editor_border_color();
                     self.show_status(&format!("Model: {}", model.id));
+                    self.maybe_warn_about_anthropic_subscription_auth(Some(model))
+                        .await;
                 }
                 Err(error) => self.show_error(&error.raw_message()),
             },
@@ -3000,6 +3011,8 @@ impl InteractiveUi {
                             result.model.name.as_str()
                         }
                     ));
+                    ui.maybe_warn_about_anthropic_subscription_auth(Some(result.model))
+                        .await;
                 }
                 Ok(None) => {
                     let message = if !session.scoped_models().is_empty() {
