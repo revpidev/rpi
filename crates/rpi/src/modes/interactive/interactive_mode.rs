@@ -6280,6 +6280,7 @@ mod tests {
     use super::*;
     use crate::modes::interactive::test_support::{
         TempDir, TestSession, TestTerminal, build_test_session, build_test_session_with,
+        build_test_session_with_model_runtime, build_test_session_with_settings,
         install_noop_product_transports,
     };
 
@@ -6385,6 +6386,39 @@ mod tests {
         );
         // M1 (T14 review): unit tests must never reach product endpoints —
         // swap the production transports for no-op ones before `init()`.
+        install_noop_product_transports(&mode);
+        (mode, terminal, harness.session)
+    }
+
+    /// [`mode_harness`] over a caller-provided model runtime (V17-07 #67:
+    /// anthropic auth fixtures with an in-memory credential store).
+    async fn mode_harness_with_model_runtime(
+        model_runtime: Arc<crate::core::model_runtime::ModelRuntime>,
+        model: rpi_ai::types::Model,
+    ) -> (InteractiveMode, Arc<TestTerminal>, AgentSession) {
+        let harness = build_test_session_with_model_runtime(model_runtime, model).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        install_noop_product_transports(&mode);
+        (mode, terminal, harness.session)
+    }
+
+    /// [`mode_harness`] over a caller-provided in-memory settings manager
+    /// (V17-07 #58: `markdown.codeBlockIndent`).
+    async fn mode_harness_with_settings(
+        settings_manager: crate::core::settings_manager::SettingsManager,
+    ) -> (InteractiveMode, Arc<TestTerminal>, AgentSession) {
+        let harness = build_test_session_with_settings(settings_manager).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
         install_noop_product_transports(&mode);
         (mode, terminal, harness.session)
     }
@@ -8742,31 +8776,500 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Cache-miss notices (`maybeShowCacheMissNotice` + restore-path
+    // re-derivation, cache-stats port — V17-07 FR-A)
+    // ---------------------------------------------------------------------
+
+    /// Assistant message with explicit cache usage and cost, mirroring the
+    /// upstream `test/cache-stats.test.ts` fixtures.
+    fn assistant_turn(
+        cache_read: u64,
+        cache_write: u64,
+        cost_cache_write: f64,
+        timestamp: i64,
+    ) -> AgentMessage {
+        let mut message = assistant_message_raw(vec![text_content("answer")], StopReason::Stop);
+        message.usage = rpi_ai::types::Usage {
+            input: 0,
+            output: 10,
+            cache_read,
+            cache_write,
+            total_tokens: 0,
+            cost: rpi_ai::types::UsageCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: cost_cache_write,
+                total: 0.0,
+            },
+            ..Default::default()
+        };
+        message.timestamp = timestamp;
+        AgentMessage::Assistant(message)
+    }
+
+    /// Upstream turn 1 + turn 2 in the session history; returns the
+    /// over-threshold miss message (105k tokens re-billed after 9m idle).
+    /// The `custom/m1` catalog price is 0, so the paid cache-write rate is
+    /// the whole difference: 105k * ($0.4125 / 110k) = ~$0.39.
+    fn append_cache_fixture(session: &AgentSession) -> AgentMessage {
+        let session_manager = session.session_manager();
+        let mut manager = lock(&session_manager);
+        manager
+            .append_message(user_message("turn 1"))
+            .expect("append turn 1");
+        manager
+            .append_message(assistant_turn(0, 100_000, 0.375, 0))
+            .expect("append turn 1 assistant");
+        manager
+            .append_message(assistant_turn(100_000, 5_000, 0.019, 60_000))
+            .expect("append turn 2 assistant");
+        drop(manager);
+        assistant_turn(0, 110_000, 0.4125, 600_000)
+    }
+
+    /// Flip of the T14 gap-locking test: a message-end cache miss above the
+    /// display thresholds renders the notice (label + tokens + cost) behind
+    /// the `showCacheMissNotices` gate.
     #[tokio::test]
-    async fn cache_miss_hook_runs_on_message_end_without_rendering() {
-        let (mode, _terminal, _session) = mode_harness().await;
+    async fn cache_miss_notice_renders_on_message_end() {
+        let (mode, _terminal, session) = mode_harness().await;
         let ui = &mode.ui_state;
         ui.session()
             .settings_manager(|settings| settings.set_show_cache_miss_notices(true));
+        let miss = append_cache_fixture(&session);
 
         ui.push(UiCommand::MessageStart(assistant_message(
             vec![text_content("answer")],
             StopReason::Stop,
         )));
-        ui.push(UiCommand::MessageEnd(assistant_message(
+        ui.push(UiCommand::MessageEnd(miss));
+        ui.drain_events();
+
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(
+            rendered.contains("Cache miss after 9m idle"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("105k tokens re-billed"),
+            "rendered: {rendered}"
+        );
+        assert!(rendered.contains("(~$0.39)"), "rendered: {rendered}");
+    }
+
+    /// Below both display thresholds (tokens < 20k and cost < $0.10) the
+    /// notice stays hidden.
+    #[tokio::test]
+    async fn cache_miss_notice_skips_below_display_thresholds() {
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.session()
+            .settings_manager(|settings| settings.set_show_cache_miss_notices(true));
+        {
+            let session_manager = session.session_manager();
+            let mut manager = lock(&session_manager);
+            manager
+                .append_message(assistant_turn(0, 10_000, 0.0375, 0))
+                .expect("append turn 1");
+            manager
+                .append_message(assistant_turn(10_000, 1_000, 0.00375, 60_000))
+                .expect("append turn 2");
+        }
+
+        ui.push(UiCommand::MessageStart(assistant_message(
             vec![text_content("answer")],
             StopReason::Stop,
         )));
+        ui.push(UiCommand::MessageEnd(assistant_turn(0, 12_000, 0.045, 120_000)));
         ui.drain_events();
 
-        // The hook compiles and runs in the drain; the T14 detector renders
-        // nothing yet, so the chat holds only the streaming component.
-        assert_eq!(
-            chat_children(ui),
-            1,
-            "no cache-miss notice children yet (T14): {}",
-            lock(&ui.chat_container).render(60).join("\n")
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(!rendered.contains("Cache miss"), "rendered: {rendered}");
+    }
+
+    /// The setting gate still suppresses the notice (default off).
+    #[tokio::test]
+    async fn cache_miss_notice_respects_the_gate() {
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let miss = append_cache_fixture(&session);
+
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("answer")],
+            StopReason::Stop,
+        )));
+        ui.push(UiCommand::MessageEnd(miss));
+        ui.drain_events();
+
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(!rendered.contains("Cache miss"), "rendered: {rendered}");
+    }
+
+    /// Restore path: the transcript rebuild re-derives the misses from the
+    /// persisted entries and injects the notice after the paying message.
+    #[tokio::test]
+    async fn render_session_entries_re_injects_cache_miss_notice() {
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.session()
+            .settings_manager(|settings| settings.set_show_cache_miss_notices(true));
+        let miss = append_cache_fixture(&session);
+        lock(&session.session_manager())
+            .append_message(miss)
+            .expect("append miss");
+
+        ui.render_initial_messages();
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(
+            rendered.contains("Cache miss after 9m idle"),
+            "rendered: {rendered}"
         );
+        let paid = rendered.rfind("answer").expect("assistant message");
+        let notice = rendered
+            .find("Cache miss after 9m idle")
+            .expect("notice rendered");
+        assert!(paid < notice, "notice follows the paying message: {rendered}");
+    }
+
+    /// `/session` gains a "Cache Re-billed" line, distinct from the
+    /// cache-warming "Cache miss penalty" economics line. The cost line
+    /// renders even though the stats cost is zero (only the entry usage is
+    /// populated here).
+    #[tokio::test]
+    async fn session_command_reports_cache_re_billed() {
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let miss = append_cache_fixture(&session);
+        lock(&session.session_manager())
+            .append_message(miss)
+            .expect("append miss");
+
+        ui.handle_session_command();
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(
+            rendered.contains("Cache Re-billed:"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("105,000 tokens, 1 miss"),
+            "rendered: {rendered}"
+        );
+        assert!(rendered.contains("$0.394"), "rendered: {rendered}");
+    }
+
+    /// Below the $0.0001 amount threshold the line shows tokens/misses only.
+    #[tokio::test]
+    async fn session_command_reports_cache_re_billed_without_amount() {
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        {
+            let session_manager = session.session_manager();
+            let mut manager = lock(&session_manager);
+            manager
+                .append_message(assistant_turn(0, 100_000, 0.0, 0))
+                .expect("append turn 1");
+            manager
+                .append_message(assistant_turn(0, 110_000, 0.0, 60_000))
+                .expect("append turn 2");
+        }
+
+        ui.handle_session_command();
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(
+            rendered.contains("Cache Re-billed: 100,000 tokens, 1 miss"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Cache Re-billed: $"),
+            "rendered: {rendered}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // markdown.codeBlockIndent wiring (V17-07 FR-B)
+    // ---------------------------------------------------------------------
+
+    /// The interactive markdown theme reads `markdown.codeBlockIndent`
+    /// (default "  "), and `apply_theme` re-reads the current value.
+    #[tokio::test]
+    async fn interactive_markdown_theme_reads_code_block_indent() {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "markdown".to_owned(),
+            serde_json::json!({"codeBlockIndent": "    "}),
+        );
+        let manager = crate::core::settings_manager::SettingsManager::in_memory(
+            crate::core::settings_manager::Settings::from_map(fields),
+            Default::default(),
+        );
+        let (mode, _terminal, _session) = mode_harness_with_settings(manager).await;
+        let ui = &mode.ui_state;
+        assert_eq!(
+            lock(&ui.markdown_theme).code_block_indent.as_deref(),
+            Some("    ")
+        );
+
+        // A fenced code block renders with the configured indent.
+        use rpi_tui::tui::Component as _;
+        let markdown = rpi_tui::components::markdown::Markdown::new(
+            "```\nlet x = 1;\n```",
+            0,
+            0,
+            Arc::clone(&lock(&ui.markdown_theme)),
+            None,
+            None,
+        );
+        let lines = markdown.render(80);
+        let code_line = lines
+            .iter()
+            .find(|line| line.contains('x') && !line.contains("```"))
+            .expect("code line rendered");
+        let indent = code_line.chars().take_while(|c| *c == ' ').count();
+        assert_eq!(indent, 4, "code line carries the four-space indent: {code_line:?}");
+
+        // apply_theme re-reads the current setting.
+        ui.apply_theme(Arc::new(
+            crate::core::themes::load_theme("dark", None).expect("dark theme"),
+        ));
+        assert_eq!(
+            lock(&ui.markdown_theme).code_block_indent.as_deref(),
+            Some("    ")
+        );
+    }
+
+    /// Default keep: the config-level default (`"  "`) is byte-identical to
+    /// the previous hardcoded `None` fallback.
+    #[tokio::test]
+    async fn interactive_markdown_theme_defaults_to_two_space_indent() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        assert_eq!(
+            lock(&mode.ui_state.markdown_theme)
+                .code_block_indent
+                .as_deref(),
+            Some("  ")
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Anthropic subscription-auth warning (V17-07 FR-C)
+    // ---------------------------------------------------------------------
+
+    const ANTHROPIC_WARNING: &str = "Anthropic subscription auth is active";
+
+    fn oauth_credential() -> rpi_ai::auth::types::Credential {
+        rpi_ai::auth::types::Credential::OAuth(rpi_ai::auth::types::OAuthCredential {
+            refresh: "refresh-token".to_owned(),
+            access: "access-token".to_owned(),
+            expires: i64::MAX,
+            extra: serde_json::Map::new(),
+        })
+    }
+
+    fn api_key_credential(key: &str) -> rpi_ai::auth::types::Credential {
+        rpi_ai::auth::types::Credential::ApiKey(rpi_ai::auth::types::ApiKeyCredential {
+            key: Some(key.to_owned()),
+            env: None,
+        })
+    }
+
+    /// V17-07 #67 fixture: the built-in anthropic catalog over an in-memory
+    /// credential store (the remote catalog overlay is disabled — offline).
+    async fn anthropic_auth_fixture(
+        credential: Option<rpi_ai::auth::types::Credential>,
+    ) -> (
+        InteractiveMode,
+        Arc<TestTerminal>,
+        AgentSession,
+        rpi_ai::types::Model,
+    ) {
+        use rpi_ai::auth::credential_store::InMemoryCredentialStore;
+        use rpi_ai::auth::types::CredentialStore as _;
+        let store = Arc::new(InMemoryCredentialStore::new());
+        if let Some(credential) = credential {
+            store
+                .modify(
+                    "anthropic",
+                    Arc::new(move |_| {
+                        let credential = credential.clone();
+                        Box::pin(async move { Ok(Some(credential)) })
+                    }),
+                    None,
+                )
+                .await
+                .expect("seed anthropic credential");
+        }
+        let runtime = crate::core::model_runtime::ModelRuntime::create(
+            crate::core::model_runtime::CreateModelRuntimeOptions {
+                catalog_base_url: Some("off".to_owned()),
+                credentials: Some(store),
+                auth_path: None,
+                models_path: crate::core::model_runtime::ModelsPathInput::Disabled,
+                ..Default::default()
+            },
+        )
+        .await;
+        let model = runtime
+            .get_models(Some("anthropic"))
+            .into_iter()
+            .next()
+            .expect("built-in anthropic catalog");
+        let (mode, terminal, session) =
+            mode_harness_with_model_runtime(runtime, model.clone()).await;
+        (mode, terminal, session, model)
+    }
+
+    /// OAuth credential: the warning renders on the model switch and is not
+    /// repeated for the next switch in the same session.
+    #[tokio::test]
+    async fn anthropic_subscription_warning_renders_once_for_oauth() {
+        let (mode, _terminal, _session, model) =
+            anthropic_auth_fixture(Some(oauth_credential())).await;
+        let search = format!("anthropic/{}", model.id);
+        mode.ui_state.handle_model_command(&search).await;
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(rendered.contains(ANTHROPIC_WARNING), "rendered: {rendered}");
+
+        mode.ui_state.handle_model_command(&search).await;
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert_eq!(
+            rendered.matches(ANTHROPIC_WARNING).count(),
+            1,
+            "every-session-once: {rendered}"
+        );
+    }
+
+    /// Subscription-style API key (`sk-ant-oat…`) also triggers the warning.
+    #[tokio::test]
+    async fn anthropic_subscription_warning_renders_for_subscription_key() {
+        let (mode, _terminal, _session, model) =
+            anthropic_auth_fixture(Some(api_key_credential("sk-ant-oat-123"))).await;
+        mode.ui_state
+            .handle_model_command(&format!("anthropic/{}", model.id))
+            .await;
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(rendered.contains(ANTHROPIC_WARNING), "rendered: {rendered}");
+    }
+
+    /// A regular API key does not trigger the warning.
+    #[tokio::test]
+    async fn anthropic_subscription_warning_ignores_regular_key() {
+        let (mode, _terminal, _session, model) =
+            anthropic_auth_fixture(Some(api_key_credential("sk-ant-api-123"))).await;
+        mode.ui_state
+            .handle_model_command(&format!("anthropic/{}", model.id))
+            .await;
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(!rendered.contains(ANTHROPIC_WARNING), "rendered: {rendered}");
+    }
+
+    /// `warnings.anthropicExtraUsage = false` disables the warning.
+    #[tokio::test]
+    async fn anthropic_subscription_warning_respects_the_setting() {
+        let (mode, _terminal, _session, model) =
+            anthropic_auth_fixture(Some(oauth_credential())).await;
+        mode.ui_state.session().settings_manager(|settings| {
+            settings.set_warnings(&crate::core::settings_manager::WarningSettings {
+                anthropic_extra_usage: Some(false),
+            });
+        });
+        mode.ui_state
+            .handle_model_command(&format!("anthropic/{}", model.id))
+            .await;
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(!rendered.contains(ANTHROPIC_WARNING), "rendered: {rendered}");
+    }
+
+    /// A non-anthropic model never triggers the warning.
+    #[tokio::test]
+    async fn anthropic_subscription_warning_ignores_non_anthropic_models() {
+        let (mode, _terminal, session) = mode_harness().await;
+        let _ = session
+            .model_runtime()
+            .set_runtime_api_key("custom", "sk-test-interactive")
+            .await;
+        mode.ui_state.handle_model_command("custom/m1").await;
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(!rendered.contains(ANTHROPIC_WARNING), "rendered: {rendered}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Startup "What's New" block (V17-07 FR-D)
+    // ---------------------------------------------------------------------
+
+    /// Fresh session + new changelog entries → the startup block renders
+    /// after `showLoadedResources` (before the initial messages).
+    #[tokio::test]
+    async fn startup_notices_show_whats_new_for_fresh_sessions() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        session
+            .settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
+        mode.init().await;
+
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(rendered.contains("What's New"), "rendered: {rendered}");
+    }
+
+    /// `collapseChangelog = true` → condensed single line with the version
+    /// parsed from the markdown (fallback: the current version).
+    #[tokio::test]
+    async fn startup_notices_condense_when_collapse_changelog_is_set() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        session.settings_manager(|settings| {
+            settings.set_last_changelog_version("0.1.5");
+            settings.set_collapse_changelog(true);
+        });
+        mode.init().await;
+
+        let first = crate::core::changelog::parse_changelog(crate::core::changelog::CHANGELOG_MD)
+            .first()
+            .cloned()
+            .expect("embedded changelog has a top section");
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(
+            rendered.contains(&format!(
+                "Updated to v{}.{}.{}.",
+                first.major, first.minor, first.patch
+            )),
+            "rendered: {rendered}"
+        );
+        assert!(rendered.contains("/changelog"), "rendered: {rendered}");
+        assert!(!rendered.contains("What's New"), "rendered: {rendered}");
+    }
+
+    /// Resumed sessions (messages present) skip the block, like `/changelog`
+    /// does not auto-fire on restore.
+    #[tokio::test]
+    async fn startup_notices_skip_resumed_sessions() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        session
+            .settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
+        lock(&session.session_manager())
+            .append_message(user_message("resume me"))
+            .expect("append message");
+        session.refresh_context();
+        mode.init().await;
+
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(!rendered.contains("What's New"), "rendered: {rendered}");
+        assert!(!rendered.contains("Updated to v"), "rendered: {rendered}");
+    }
+
+    /// The startup block renders exactly once even when the mount path runs
+    /// twice (renderInitialMessages from session switches does not re-add).
+    #[tokio::test]
+    async fn startup_notices_render_once() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        session
+            .settings_manager(|settings| settings.set_last_changelog_version("0.1.5"));
+        mode.init().await;
+        mode.ui_state.render_initial_messages();
+        // A second init is a no-op (`is_initialized` guard).
+        mode.init().await;
+
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert_eq!(rendered.matches("What's New").count(), 1, "rendered: {rendered}");
     }
 
     // ---------------------------------------------------------------------

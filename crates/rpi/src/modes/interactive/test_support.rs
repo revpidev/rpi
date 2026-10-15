@@ -287,7 +287,7 @@ pub(crate) async fn build_test_session() -> TestSession {
 pub(crate) async fn build_test_session_with_manager(
     manager: Option<SessionManager>,
 ) -> TestSession {
-    build_test_session_with(manager, None).await
+    build_test_session_inner(manager, None, None, None).await
 }
 
 /// [`build_test_session_with_manager`] plus an optional extension host,
@@ -296,6 +296,37 @@ pub(crate) async fn build_test_session_with_manager(
 pub(crate) async fn build_test_session_with(
     manager: Option<SessionManager>,
     extension_host: Option<Arc<rpi_ext_host::host::NativeExtensionHost>>,
+) -> TestSession {
+    build_test_session_inner(manager, extension_host, None, None).await
+}
+
+/// [`build_test_session_with`] with a caller-provided model runtime and
+/// initial model (V17-07 #67: anthropic auth fixtures that models.json
+/// alone cannot express).
+pub(crate) async fn build_test_session_with_model_runtime(
+    model_runtime: Arc<crate::core::model_runtime::ModelRuntime>,
+    model: rpi_ai::types::Model,
+) -> TestSession {
+    build_test_session_inner(None, None, Some((model_runtime, model)), None).await
+}
+
+/// [`build_test_session_with`] with a caller-provided settings manager
+/// (V17-07 #58: seed `markdown.codeBlockIndent` without a settings file).
+pub(crate) async fn build_test_session_with_settings(
+    settings_manager: crate::core::settings_manager::SettingsManager,
+) -> TestSession {
+    build_test_session_inner(None, None, None, Some(settings_manager)).await
+}
+
+#[allow(clippy::too_many_lines)] // single fixture builder; the options are one-line pass-throughs
+async fn build_test_session_inner(
+    manager: Option<SessionManager>,
+    extension_host: Option<Arc<rpi_ext_host::host::NativeExtensionHost>>,
+    model_runtime_override: Option<(
+        Arc<crate::core::model_runtime::ModelRuntime>,
+        rpi_ai::types::Model,
+    )>,
+    settings_manager: Option<crate::core::settings_manager::SettingsManager>,
 ) -> TestSession {
     let tmp = TempDir::new();
     let agent_dir = tmp.path().join("agent");
@@ -319,18 +350,23 @@ pub(crate) async fn build_test_session_with(
     let services = create_agent_session_services(CreateAgentSessionServicesOptions {
         cwd: cwd.clone(),
         agent_dir: Some(agent_dir.clone()),
-        settings_manager: None,
-        model_runtime: None,
+        settings_manager,
+        model_runtime: model_runtime_override
+            .as_ref()
+            .map(|(model_runtime, _)| Arc::clone(model_runtime)),
         extension_flag_values: Vec::new(),
         resource_loader_options: None,
     })
     .await
     .expect("create services");
 
-    let model = services
-        .model_runtime
-        .get_model("custom", "m1")
-        .expect("test model must compose");
+    let model = match model_runtime_override {
+        Some((_, model)) => model,
+        None => services
+            .model_runtime
+            .get_model("custom", "m1")
+            .expect("test model must compose"),
+    };
 
     let session_manager = match manager {
         Some(manager) => manager,
