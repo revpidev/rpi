@@ -116,8 +116,8 @@ async fn create_tool_task(
         .expect("create tool task")
 }
 
-/// The one `pi.tool-result` entry's `(isError, text, data)`.
-fn tool_result(entries: &[EntryRecord]) -> (bool, String, serde_json::Value) {
+/// The one `pi.tool-result` entry's `(isError, text, data, durationMs)`.
+fn tool_result(entries: &[EntryRecord]) -> (bool, String, serde_json::Value, Option<u64>) {
     let entry = entries
         .iter()
         .find(|entry| entry.kind == TOOL_RESULT_ENTRY)
@@ -137,6 +137,7 @@ fn tool_result(entries: &[EntryRecord]) -> (bool, String, serde_json::Value) {
                 result.is_error,
                 text,
                 entry.data.clone().unwrap_or(serde_json::Value::Null),
+                result.duration_ms,
             );
         }
     }
@@ -178,10 +179,14 @@ async fn execute_appends_result_with_output_and_diagnostics() {
         rpi_durable::types::TaskState::Terminal { .. }
     ));
     let entries = conversation_entries(&opened, conversation.id()).await;
-    let (is_error, text, data) = tool_result(&entries);
+    let (is_error, text, data, duration_ms) = tool_result(&entries);
     assert!(!is_error);
     assert!(text.contains("hello output"), "got {text}");
     assert!(text.contains("[warn] note"), "got {text}");
+    assert!(
+        duration_ms.is_some(),
+        "the tool task records the execution duration"
+    );
     assert_eq!(
         data.get("diagnostics")
             .and_then(|diagnostics| diagnostics.get(0))
@@ -231,7 +236,7 @@ async fn validation_failure_result() {
         rpi_durable::types::TaskState::Terminal { .. }
     ));
     let entries = conversation_entries(&opened, conversation.id()).await;
-    let (is_error, text, data) = tool_result(&entries);
+    let (is_error, text, data, _) = tool_result(&entries);
     assert!(is_error);
     assert!(text.contains("Validation failed"), "got {text}");
     assert_eq!(

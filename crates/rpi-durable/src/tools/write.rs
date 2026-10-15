@@ -85,7 +85,7 @@ fn parameters() -> serde_json::Value {
     })
 }
 
-/// `createWriteTool` (write.ts:17).
+/// `createWriteTool` (write.ts:16).
 pub fn create_write_tool() -> ToolRegistration {
     ToolRegistration {
         tool: Tool {

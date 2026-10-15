@@ -264,7 +264,7 @@ fn parameters() -> Value {
     })
 }
 
-/// `createEditTool` (edit.ts:86).
+/// `createEditTool` (edit.ts:90).
 pub fn create_edit_tool() -> ToolRegistration {
     ToolRegistration {
         tool: Tool {

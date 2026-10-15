@@ -703,6 +703,64 @@ async fn watch_follows_a_directory_replaced_at_the_same_path() {
     .await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn watch_reports_an_error_and_stops_when_the_target_becomes_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("env-watch-error");
+    let env = create_env(&dir);
+    env.create_dir("watched", None, &context())
+        .await
+        .expect("watched");
+    write(&env, "watched/file.txt", "x");
+    watching(
+        Arc::clone(&env),
+        vec![watch_target("watched")],
+        |env, watch| async move {
+            std::fs::set_permissions(
+                dir.path().join("watched"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .expect("chmod");
+            // Root and permissive file systems ignore the mode: nothing to assert.
+            if std::fs::read_dir(dir.path().join("watched")).is_ok() {
+                std::fs::set_permissions(
+                    dir.path().join("watched"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .expect("restore");
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let saw_error = {
+                    let changes = watch.changes.lock().expect("changes");
+                    changes
+                        .iter()
+                        .any(|change| matches!(change, WatchChange::Error(_)))
+                };
+                if saw_error {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no error change reported: {:#?}",
+                    watch.changes.lock().expect("changes").to_vec()
+                );
+                // Prod the ancestor watcher so a rescan happens.
+                write(&env, "probe.txt", "p");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            std::fs::set_permissions(
+                dir.path().join("watched"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("restore");
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn watch_stops_reporting_once_closed() {
     let dir = TempDir::new("env-watch-close");

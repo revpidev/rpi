@@ -19,12 +19,12 @@
 use unicode_normalization::UnicodeNormalization;
 
 // ---------------------------------------------------------------------------
-// Line-ending helpers (edit-diff.ts:10-24)
+// Line-ending helpers (edit-diff.ts:7-21)
 // ---------------------------------------------------------------------------
 
 /// Detect the dominant line ending style.
 ///
-/// Port of `detectLineEnding` (edit-diff.ts:10-16). Finds the first `\r\n` and
+/// Port of `detectLineEnding` (edit-diff.ts:7-13). Finds the first `\r\n` and
 /// the first `\n`. If neither exists, or `\r\n` does not exist, returns `"\n"`.
 /// If `\r\n` appears before the first lone `\n`, returns `"\r\n"`.
 pub fn detect_line_ending(content: &str) -> &'static str {
@@ -38,14 +38,14 @@ pub fn detect_line_ending(content: &str) -> &'static str {
 
 /// Normalise `\r\n` → `\n`, then remaining `\r` → `\n`.
 ///
-/// Port of `normalizeToLF` (edit-diff.ts:18-20).
+/// Port of `normalizeToLF` (edit-diff.ts:15-17).
 pub fn normalize_to_lf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Restore line endings: if `ending` is `"\r\n"`, replace all `\n` with `\r\n`.
 ///
-/// Port of `restoreLineEndings` (edit-diff.ts:22-24).
+/// Port of `restoreLineEndings` (edit-diff.ts:19-21).
 pub fn restore_line_endings(text: &str, ending: &str) -> String {
     if ending == "\r\n" {
         text.replace('\n', "\r\n")
@@ -55,14 +55,14 @@ pub fn restore_line_endings(text: &str, ending: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// BOM (edit-diff.ts:247-249)
+// BOM (edit-diff.ts:244-246)
 // ---------------------------------------------------------------------------
 
 /// Strip a leading UTF-8 BOM (`\u{FEFF}`) if present.
 ///
 /// Returns `(bom, text_without_bom)`.
 ///
-/// Port of `stripBom` (edit-diff.ts:247-249).
+/// Port of `stripBom` (edit-diff.ts:244-246).
 pub fn strip_bom(content: &str) -> (String, String) {
     if let Some(rest) = content.strip_prefix('\u{FEFF}') {
         ("\u{FEFF}".to_string(), rest.to_string())
@@ -72,12 +72,12 @@ pub fn strip_bom(content: &str) -> (String, String) {
 }
 
 // ---------------------------------------------------------------------------
-// Fuzzy normalisation (edit-diff.ts:33-54)
+// Fuzzy normalisation (edit-diff.ts:30-51)
 // ---------------------------------------------------------------------------
 
 /// Normalise text for fuzzy matching.
 ///
-/// Applies progressive transformations in order (edit-diff.ts:33-54):
+/// Applies progressive transformations in order (edit-diff.ts:30-51):
 /// 1. NFKC Unicode normalisation (full-width → half-width, compatibility forms)
 /// 2. Per-line trailing whitespace stripping (`trim_end`)
 /// 3. Smart single quotes `\u{2018}\u{2019}\u{201A}\u{201B}` → `'`
@@ -117,12 +117,12 @@ pub fn normalize_for_fuzzy_match(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Line splitting helpers (edit-diff.ts:56-81)
+// Line splitting helpers (edit-diff.ts:53-78)
 // ---------------------------------------------------------------------------
 
 /// Split content into lines, each INCLUDING its trailing `\n` if present.
 ///
-/// Equivalent to the JS regex `/[^\n]*\n|[^\n]+/g` (edit-diff.ts:56-58).
+/// Equivalent to the JS regex `/[^\n]*\n|[^\n]+/g` (edit-diff.ts:53-55).
 /// Returns string slices (no allocation).
 fn split_lines_with_endings(content: &str) -> Vec<&str> {
     let mut result = Vec::new();
@@ -148,7 +148,7 @@ struct LineSpan {
 
 /// Compute byte-offset spans for each line in `content`.
 ///
-/// Port of `getLineSpans` (edit-diff.ts:74-81).
+/// Port of `getLineSpans` (edit-diff.ts:71-78).
 fn get_line_spans(content: &str) -> Vec<LineSpan> {
     let mut offset = 0;
     split_lines_with_endings(content)
@@ -196,12 +196,12 @@ struct MatchedEdit {
 }
 
 // ---------------------------------------------------------------------------
-// Line-range computation (edit-diff.ts:83-108)
+// Line-range computation (edit-diff.ts:80-105)
 // ---------------------------------------------------------------------------
 
 /// Find the range of lines (exclusive end) touched by a replacement.
 ///
-/// Port of `getReplacementLineRange` (edit-diff.ts:83-108).
+/// Port of `getReplacementLineRange` (edit-diff.ts:80-105).
 fn get_replacement_line_range(
     lines: &[LineSpan],
     match_index: usize,
@@ -232,12 +232,12 @@ fn get_replacement_line_range(
 }
 
 // ---------------------------------------------------------------------------
-// Apply replacements (edit-diff.ts:110-172)
+// Apply replacements (edit-diff.ts:107-169)
 // ---------------------------------------------------------------------------
 
 /// Apply replacements directly in the given content (reverse order for stability).
 ///
-/// Port of `applyReplacements` (edit-diff.ts:110-119). `offset` is subtracted
+/// Port of `applyReplacements` (edit-diff.ts:107-116). `offset` is subtracted
 /// from each `match_index` because the content may be a slice of a larger string.
 fn apply_replacements(content: &str, replacements: &[MatchedEdit], offset: usize) -> String {
     let mut result = content.to_string();
@@ -254,7 +254,7 @@ fn apply_replacements(content: &str, replacements: &[MatchedEdit], offset: usize
 /// Apply replacements matched against `base_content` to `original_content`,
 /// preserving unchanged line blocks from the original.
 ///
-/// Port of `applyReplacementsPreservingUnchangedLines` (edit-diff.ts:131-172).
+/// Port of `applyReplacementsPreservingUnchangedLines` (edit-diff.ts:128-169).
 /// Each replacement is widened to the lines it touches; touched lines are
 /// rewritten from the normalized base, all other lines are copied verbatim
 /// from the original. This prevents duplicate normalized lines from being
@@ -342,7 +342,7 @@ fn apply_replacements_preserving_unchanged_lines(
 }
 
 // ---------------------------------------------------------------------------
-// Fuzzy matching (edit-diff.ts:206-255)
+// Fuzzy matching (edit-diff.ts:203-252)
 // ---------------------------------------------------------------------------
 
 /// Result of a fuzzy text search.
@@ -355,7 +355,7 @@ struct FuzzyMatchResult {
 
 /// Find `old_text` in `content`, trying exact match first, then fuzzy match.
 ///
-/// Port of `fuzzyFindText` (edit-diff.ts:206-244).
+/// Port of `fuzzyFindText` (edit-diff.ts:203-241).
 fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
     // Try exact match first.
     if let Some(index) = content.find(old_text) {
@@ -389,7 +389,7 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
 
 /// Count occurrences of `old_text` in `content`, always in fuzzy-normalized space.
 ///
-/// Port of `countOccurrences` (edit-diff.ts:251-255). Even if an exact match
+/// Port of `countOccurrences` (edit-diff.ts:248-252). Even if an exact match
 /// succeeded, counting happens in fuzzy space so that fuzzy-normalized
 /// duplicates are detected.
 fn count_occurrences(content: &str, old_text: &str) -> usize {
@@ -402,7 +402,7 @@ fn count_occurrences(content: &str, old_text: &str) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Error message builders (edit-diff.ts:257-293)
+// Error message builders (edit-diff.ts:254-290)
 // ---------------------------------------------------------------------------
 
 fn get_not_found_error(path: &str, edit_index: usize, total_edits: usize) -> String {
@@ -453,7 +453,7 @@ fn get_no_change_error(path: &str, total_edits: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// apply_edits_to_normalized_content (edit-diff.ts:304-366)
+// apply_edits_to_normalized_content (edit-diff.ts:301-363)
 // ---------------------------------------------------------------------------
 
 /// Apply one or more exact-text replacements to LF-normalized content.
@@ -464,7 +464,7 @@ fn get_no_change_error(path: &str, total_edits: usize) -> String {
 /// those line-level changes onto the original content so unchanged line blocks
 /// keep their original bytes.
 ///
-/// Port of `applyEditsToNormalizedContent` (edit-diff.ts:304-366).
+/// Port of `applyEditsToNormalizedContent` (edit-diff.ts:301-363).
 pub fn apply_edits_to_normalized_content(
     normalized_content: &str,
     edits: &[Edit],
@@ -757,7 +757,7 @@ fn group_diff_parts(entries: &[DiffEntry]) -> Vec<DiffPart> {
 }
 
 // ---------------------------------------------------------------------------
-// Diff display generation (edit-diff.ts:380-503)
+// Diff display generation (edit-diff.ts:377-500)
 // ---------------------------------------------------------------------------
 
 /// Result of `generate_diff_string`.
@@ -771,7 +771,7 @@ pub struct DiffResult {
 
 /// Generate a display-oriented diff string with line numbers and context.
 ///
-/// Port of `generateDiffString` (edit-diff.ts:380-503). Uses a Myers line-level
+/// Port of `generateDiffString` (edit-diff.ts:377-500). Uses a Myers line-level
 /// diff instead of jsdiff's `Diff.diffLines`, producing the same output format.
 pub fn generate_diff_string(
     old_content: &str,
@@ -937,12 +937,12 @@ pub fn generate_diff_string(
 }
 
 // ---------------------------------------------------------------------------
-// Unified patch generation (edit-diff.ts:369-374, jsdiff createTwoFilesPatch)
+// Unified patch generation (edit-diff.ts:366-371, jsdiff createTwoFilesPatch)
 // ---------------------------------------------------------------------------
 
 /// Generate a standard unified patch.
 ///
-/// Port of `generateUnifiedPatch` (edit-diff.ts:369-374), which delegates to
+/// Port of `generateUnifiedPatch` (edit-diff.ts:366-371), which delegates to
 /// jsdiff's `createTwoFilesPatch` with `FILE_HEADERS_ONLY` (no timestamps, no
 /// `Index:` line). The hunk format matches jsdiff output:
 /// `@@ -oldStart,oldLines +newStart,newLines @@`.

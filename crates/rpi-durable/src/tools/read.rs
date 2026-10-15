@@ -520,13 +520,14 @@ mod tests {
             _context: &Context,
         ) -> Result<LineScan, crate::errors::FileError> {
             let content = self.content.lock().expect("content");
-            let mut scanner = LineScanner::new(options.start_line, options.end_line).map_err(|_| {
-                crate::errors::FileError::with_path(
-                    FileErrorCode::Invalid,
-                    "Invalid line range",
-                    &self.path,
-                )
-            })?;
+            let mut scanner =
+                LineScanner::new(options.start_line, options.end_line).map_err(|_| {
+                    crate::errors::FileError::with_path(
+                        FileErrorCode::Invalid,
+                        "Invalid line range",
+                        &self.path,
+                    )
+                })?;
             scanner.push(&content);
             Ok(scanner.finish())
         }
@@ -568,7 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn rereads_once_then_reports_a_file_changing_twice() {
-        let reader = ScheduledReader::new("one\ntwo\n", vec![(8, 2.0), (8, 1.0), (8, 1.0), (8, 0.5)]);
+        let reader =
+            ScheduledReader::new("one\ntwo\n", vec![(8, 2.0), (8, 1.0), (8, 1.0), (8, 0.5)]);
         let error = read_stable_text(&reader, "f.txt", None, None, &context())
             .await
             .expect_err("must fail");

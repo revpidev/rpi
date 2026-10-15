@@ -522,6 +522,76 @@ async fn powershell_falls_back_to_the_next_program() {
     result.expect("fallback");
 }
 
+// ---------------------------------------------------------------------------
+// Parameter schemas (the typebox replacement face)
+// ---------------------------------------------------------------------------
+
+/// Every tool declares an object schema whose properties carry types and
+/// descriptions, and the shared `rpi-ai` validation face enforces required
+/// fields and coerces numeric strings.
+#[test]
+fn tool_parameters_validate_and_are_described() {
+    let tools = [
+        create_read_tool(),
+        create_write_tool(),
+        create_edit_tool(),
+        create_bash_tool(None),
+        create_power_shell_tool(None),
+    ];
+    for tool in &tools {
+        let parameters = &tool.tool.parameters;
+        assert_eq!(
+            parameters.get("type"),
+            Some(&json!("object")),
+            "{}",
+            tool.name()
+        );
+        let properties = parameters
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .unwrap_or_else(|| panic!("{} declares properties", tool.name()));
+        for (name, schema) in properties {
+            assert!(
+                schema.get("type").is_some(),
+                "{}::{name} declares a type",
+                tool.name()
+            );
+            assert!(
+                schema
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|description| !description.is_empty()),
+                "{}::{name} has a description",
+                tool.name()
+            );
+        }
+        assert!(
+            parameters.get("required").is_some(),
+            "{} declares required fields",
+            tool.name()
+        );
+    }
+
+    let read = create_read_tool();
+    let call = |arguments: serde_json::Value| rpi_ai::types::ToolCall {
+        id: "c".to_string(),
+        name: "read".to_string(),
+        arguments: arguments.as_object().cloned().unwrap_or_default(),
+        thought_signature: None,
+        namespace: None,
+    };
+    assert!(
+        rpi_ai::utils::validation::validate_tool_arguments(&read.tool, &call(json!({}))).is_err(),
+        "a missing required path is rejected"
+    );
+    let validated = rpi_ai::utils::validation::validate_tool_arguments(
+        &read.tool,
+        &call(json!({ "path": "x", "offset": "3" })),
+    )
+    .expect("numeric strings coerce");
+    assert_eq!(validated.get("offset"), Some(&json!(3)));
+}
+
 /// The fake api's `details` path is exercised through `edit`; keep a compile
 /// check that the support type is used.
 #[tokio::test]

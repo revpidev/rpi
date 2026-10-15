@@ -57,7 +57,7 @@ pub async fn resolve_read_tool_path(
             continue;
         }
         seen.push(variant.clone());
-        if env.exists(&variant, context).await.unwrap_or(false) {
+        if env.exists(&variant, context).await? {
             return Ok(variant);
         }
     }
