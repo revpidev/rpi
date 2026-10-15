@@ -662,8 +662,7 @@ impl Agent {
         transport_from_u8(self.transport.load(Ordering::Relaxed))
     }
 
-    /// `this.session.agent.transport = transport` (interactive-mode.ts:4997-
-    /// 4999): reassign the live agent's transport; the next request reads it
+    /// `this.session.agent.transport = transport` (interactive-mode.ts:4998): reassign the live agent's transport; the next request reads it
     /// when assembling [`StreamOptions`].
     pub fn set_transport(&self, transport: Transport) {
         self.transport

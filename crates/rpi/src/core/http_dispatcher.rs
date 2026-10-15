@@ -4,7 +4,7 @@
 //! Upstream swaps the process-global undici dispatcher whenever the HTTP
 //! idle timeout changes (`configureHttpDispatcher`, http-dispatcher.ts:81-113;
 //! called at startup, on session rebind — interactive-mode.ts:2063 — and from
-//! the `/settings` arm — interactive-mode.ts:5001-5004). rpi's provider
+//! the `/settings` arm — interactive-mode.ts:5000-5004). rpi's provider
 //! requests do not go through a global dispatcher: each streamed request
 //! carries its idle budget as `StreamOptions::timeout_ms`, consumed by
 //! `rpi_ai::api::stream_timeouts`. This module carries the reconfigurable

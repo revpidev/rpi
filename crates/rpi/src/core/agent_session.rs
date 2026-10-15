@@ -6389,7 +6389,7 @@ impl AgentSession {
 
     /// `configureHttpDispatcher(timeoutMs)` (http-dispatcher.ts:81): the
     /// runtime reconfiguration seam behind the `/settings` arm
-    /// (interactive-mode.ts:5001-5004) and `applyRuntimeSettings`
+    /// (interactive-mode.ts:5000-5004) and `applyRuntimeSettings`
     /// (interactive-mode.ts:2063).
     pub fn configure_http_dispatcher(&self, timeout_ms: u64) {
         self.inner.http_dispatcher.configure(timeout_ms);

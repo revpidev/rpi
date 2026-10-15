@@ -1,7 +1,7 @@
 //! Idle-timeout plumbing for provider streaming requests.
 //!
 //! Upstream bounds provider requests with undici's `headersTimeout` /
-//! `bodyTimeout` (http-dispatcher.ts:81-99): both are **idle** timeouts —
+//! `bodyTimeout` (http-dispatcher.ts:81-113): both are **idle** timeouts —
 //! `headersTimeout` is the maximum gap between sending the request and
 //! receiving response headers, `bodyTimeout` the maximum gap between two
 //! body chunks. An actively streaming response can therefore run for any

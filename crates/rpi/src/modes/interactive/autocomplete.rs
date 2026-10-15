@@ -437,7 +437,7 @@ pub(crate) fn create_base_autocomplete_provider(
         }
     }
 
-    // Assemble (interactive-mode.ts:818-825): upstream passes
+    // Assemble (interactive-mode.ts:818-822): upstream passes
     // `this.sessionManager.getCwd()` and `this.fdPath` (resolved by
     // `ensureTool("fd", ...)` at startup, interactive-mode.ts:1088-1092).
     let base_path = lock(&ui.session().session_manager())
