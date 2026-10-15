@@ -74,7 +74,7 @@ impl Focusable for PickerRegion {
     }
 }
 
-/// `selectSession` (session-picker.ts:15-57) on the process terminal.
+/// `selectSession` (session-picker.ts:15-55) on the process terminal.
 /// Returns the selected session file path, or `None` when cancelled.
 pub(crate) async fn select_session(
     cwd: &Path,
@@ -92,7 +92,7 @@ pub(crate) async fn select_session_with_terminal(
     terminal: Box<dyn rpi_tui::terminal::Terminal + Send>,
 ) -> Result<Option<String>, RpiError> {
     // The component's input matching reads the global keybinding tables
-    // (session-picker.ts:24-25 `setKeybindings`).
+    // (session-picker.ts:23 `setKeybindings`).
     crate::modes::interactive::interactive_mode::install_global_keybindings();
 
     // `createStartupTui` (startup-ui.ts:77-85): theme from settings, then a
@@ -128,10 +128,10 @@ pub(crate) async fn select_session_with_terminal(
                 let _ = tx.send(());
             }
         }),
-        // `onExit` (session-picker.ts:40-43) stops the UI and exits; the
+        // `onExit` (session-picker.ts:43-46) stops the UI and exits; the
         // component port never fires it, so a no-op suffices here.
         Box::new(|| {}),
-        // `session-picker.ts:41-49` passes no delete/rename hooks; since
+        // `session-picker.ts:26-49` passes no delete/rename hooks; since
         // V17-08 (#64) the component performs the deletion itself, so
         // confirming a delete still removes the file (no observer needed).
         // `showRenameHint: false`.

@@ -31,7 +31,7 @@ pub enum RpiError {
 
     /// `MissingSessionCwdError` (session-cwd.ts:44-52) — kept typed so
     /// `/import` can route it to the cwd prompt/recovery path
-    /// (interactive-mode.ts:5489-5501; V17-08 #63).
+    /// (interactive-mode.ts:6589-6600; V17-08 #63).
     #[error(transparent)]
     MissingSessionCwd(#[from] crate::core::session_cwd::MissingSessionCwdError),
 }

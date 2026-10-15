@@ -140,7 +140,7 @@ impl<T: Component> Focusable for FocusableShell<T> {
     }
 }
 
-/// `showExtensionSelector` (interactive-mode.ts:2690-2741) for built-in
+/// `showExtensionSelector` (interactive-mode.ts:2690-2732) for built-in
 /// callers (#60 branch-summary ask loop, #63 /import confirm): mount the
 /// selector in the editor region and await the choice. `None` = Escape /
 /// countdown expiry. Mirrors the extension bridge's dialog lifecycle (blocked
@@ -189,7 +189,7 @@ pub(crate) async fn show_extension_selector(
     result
 }
 
-/// `showExtensionEditor` (interactive-mode.ts:2830-2858) for the #60 custom
+/// `showExtensionEditor` (interactive-mode.ts:2831-2860) for the #60 custom
 /// summarization prompt: mount the multi-line editor and await submit;
 /// `None` = cancel (Escape / ctrl+c).
 pub(crate) async fn show_extension_editor(ui: &Arc<InteractiveUi>, title: &str) -> Option<String> {
@@ -2551,7 +2551,7 @@ impl InteractiveUi {
         }
     }
 
-    /// `handleReloadCommand` (interactive-mode.ts:6429-6518): mount the
+    /// `handleReloadCommand` (interactive-mode.ts:6430-6518): mount the
     /// reload box (`Reloading keybindings, extensions, skills, prompts,
     /// themes, and context files...`) in the editor region, reload the
     /// session in the background, then dismiss the box and restore the

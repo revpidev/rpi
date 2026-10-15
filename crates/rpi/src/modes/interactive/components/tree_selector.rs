@@ -2399,7 +2399,7 @@ impl TreeSelectorComponent {
         self.label_input = Some(label_input);
     }
 
-    /// `getTreeList` (tree-selector.ts:1424-1426) — the outer component's
+    /// `getTreeList` (tree-selector.ts:1432-1434) — the outer component's
     /// test/access probe for the inner list (V17-08 #60 wired
     /// `show_tree_selector`'s label callback; the list itself is covered by
     /// the component tests).

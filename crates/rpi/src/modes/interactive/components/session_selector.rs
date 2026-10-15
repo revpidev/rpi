@@ -1029,7 +1029,7 @@ enum SelectorMode {
 }
 
 /// Deletion method reported by [`delete_session_file`]
-/// (`{ ok, method, error? }`, session-selector.ts:656-658).
+/// (`{ ok, method, error? }`, session-selector.ts:656).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeleteMethod {
     Trash,
@@ -1042,20 +1042,20 @@ pub(crate) struct DeleteResult {
     pub ok: bool,
     pub method: DeleteMethod,
     /// Present on failure only — the unlink error with the trash error hint
-    /// appended (`${unlinkError} (${trashErrorHint})`, session-selector.ts:684).
+    /// appended (`${unlinkError} (${trashErrorHint})`, session-selector.ts:686).
     pub error: Option<String>,
 }
 
-/// `deleteSessionFile` (session-selector.ts:654-688): try the `trash` CLI
+/// `deleteSessionFile` (session-selector.ts:654-689): try the `trash` CLI
 /// first, fall back to a permanent unlink.
 ///
-/// - `--` guards paths that start with `-` (session-selector.ts:661-662).
+/// - `--` guards paths that start with `-` (session-selector.ts:658).
 /// - A zero exit **or** a file that is gone afterwards counts as a trash
 ///   success (session-selector.ts:674-677) — a `trash` wrapper may exit
 ///   non-zero after moving the file.
 /// - The unlink failure message carries the first stderr line / spawn error
 ///   of the trash call as a hint, truncated to 200 chars
-///   (session-selector.ts:664-672).
+///   (session-selector.ts:661-672).
 ///
 /// `trash_bin` is the CLI name/path (production `"trash"`; test injection).
 fn delete_session_file(trash_bin: &str, session_path: &str) -> DeleteResult {
@@ -1119,7 +1119,7 @@ fn delete_session_file(trash_bin: &str, session_path: &str) -> DeleteResult {
 }
 
 /// JS `String.prototype.slice(0, max)` equivalent for the trash hint
-/// (session-selector.ts:670) — char-boundary safe.
+/// (session-selector.ts:671) — char-boundary safe.
 fn truncate_chars(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }

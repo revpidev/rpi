@@ -3087,7 +3087,7 @@ impl InteractiveUi {
         self.ui.request_render(false);
     }
 
-    /// `showTreeSelector` (interactive-mode.ts:5540-5700): selecting an entry
+    /// `showTreeSelector` (interactive-mode.ts:5559-5706): selecting an entry
     /// closes the selector, asks about branch summarization when
     /// `branchSummary.skipPrompt` is off (#60; No summary / Summarize /
     /// custom prompt with the Escape-back-to-tree and abort-summary escape
@@ -3116,7 +3116,7 @@ impl InteractiveUi {
             Box::new(move |entry_id: &str| {
                 let entry_id = entry_id.to_string();
                 let real_leaf_id = real_leaf_id.clone();
-                // `done()` first, then navigate (interactive-mode.ts:5587).
+                // `done()` first, then navigate (interactive-mode.ts:5583).
                 select_ui.hide_selector();
                 let session = select_ui.session();
                 let ui = Arc::clone(&select_ui);

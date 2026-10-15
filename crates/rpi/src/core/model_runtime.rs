@@ -405,7 +405,7 @@ type CatalogRefreshShared =
 
 /// One in-flight all-catalog refresh shared across waiters — the rpi
 /// counterpart of the upstream coordinator entry
-/// (`model-catalog-refresh.ts:5-13`): the shared future, the shared-run
+/// (`model-catalog-refresh.ts:7-11`): the shared future, the shared-run
 /// abort token (cancelled when the last waiter detaches) and the waiter
 /// count.
 #[derive(Clone)]
@@ -459,7 +459,7 @@ pub struct ModelRuntime {
     snapshot: RwLock<ModelRuntimeSnapshot>,
     /// Interactive all-catalog refresh in-flight slot
     /// (`ModelCatalogRefreshCoordinator.activeByRuntime`,
-    /// model-catalog-refresh.ts:16-43 @ 7d8c11d37): the first caller runs
+    /// model-catalog-refresh.ts:16-40 @ 7d8c11d37): the first caller runs
     /// [`ModelRuntime::refresh`]; concurrent callers await the same future
     /// instead of restarting it (opening /model while a refresh runs must
     /// not cancel-and-restart it). Cleared by the runner on completion so
@@ -3051,13 +3051,13 @@ impl ModelRuntime {
         self.models.complete_simple(model, context, options).await
     }
 
-    /// `refreshModelCatalogs` (model-catalog-refresh.ts:12-55 @ 7d8c11d37):
+    /// `refreshModelCatalogs` (model-catalog-refresh.ts:13-51 @ 7d8c11d37):
     /// share concurrent interactive all-catalog refreshes while keeping each
     /// caller's cancellation independent — the first caller starts
     /// [`ModelRuntime::refresh`] with the shared-run token; concurrent
     /// callers join the same in-flight future. `signal` is the per-waiter
     /// abort (detaching one waiter does not abort the shared run; the last
-    /// waiter leaving cancels it, `model-catalog-refresh.ts:38-43`).
+    /// waiter leaving cancels it, `model-catalog-refresh.ts:34-39`).
     ///
     /// A waiter whose signal fires returns `aborted: true` instead of
     /// rejecting (rpi shape difference: the upstream `raceWithAbortSignal`
@@ -3067,7 +3067,7 @@ impl ModelRuntime {
         self: &Arc<Self>,
         signal: Option<CancellationToken>,
     ) -> ModelsRefreshResult {
-        // `signal.throwIfAborted()` (model-catalog-refresh.ts:15): an
+        // `signal.throwIfAborted()` (model-catalog-refresh.ts:17): an
         // already-cancelled waiter returns without starting or joining a run.
         if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return ModelsRefreshResult {
@@ -3080,7 +3080,7 @@ impl ModelRuntime {
             let mut slot = lock(&self.catalog_refresh_inflight);
             // A settled run is replaced by the next call
             // (`finally { activeByRuntime.delete }`,
-            // model-catalog-refresh.ts:24-28).
+            // model-catalog-refresh.ts:23-27).
             let existing = slot
                 .as_ref()
                 .filter(|entry| entry.shared.peek().is_none())
@@ -3133,11 +3133,11 @@ impl ModelRuntime {
             == 1
         {
             // Last waiter left: abort the shared run
-            // (model-catalog-refresh.ts:41).
+            // (model-catalog-refresh.ts:36-38).
             active.cancel.cancel();
         }
         // A settled run drops its slot (upstream `finally`,
-        // model-catalog-refresh.ts:24-28) unless a newer run replaced it. A
+        // model-catalog-refresh.ts:23-27) unless a newer run replaced it. A
         // detached-but-still-running run stays joinable by later callers.
         if active.shared.peek().is_some() {
             let mut slot = lock(&self.catalog_refresh_inflight);
@@ -6047,7 +6047,7 @@ mod tests {
         (runtime, cancel_observed, hits)
     }
 
-    /// V17-08 #63 (`model-catalog-refresh.ts:38-43`): detaching ONE waiter
+    /// V17-08 #63 (`model-catalog-refresh.ts:34-39`): detaching ONE waiter
     /// does not abort the shared run — the remaining waiter completes
     /// successfully and the run's signal stays live.
     #[tokio::test]
@@ -6077,7 +6077,7 @@ mod tests {
         rpi_test_env::remove_var(ENV_KEY);
     }
 
-    /// V17-08 #63 (`model-catalog-refresh.ts:41`): when the LAST waiter
+    /// V17-08 #63 (`model-catalog-refresh.ts:36-38`): when the LAST waiter
     /// leaves, the shared run's controller is cancelled.
     #[tokio::test]
     async fn catalog_refresh_all_waiters_detach_aborts_the_run() {

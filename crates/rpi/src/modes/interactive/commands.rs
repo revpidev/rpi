@@ -794,7 +794,7 @@ impl InteractiveUi {
 }
 
 impl InteractiveMode {
-    /// `handleImportCommand` (interactive-mode.ts:6567-6608): confirm, replace
+    /// `handleImportCommand` (interactive-mode.ts:6567-6609): confirm, replace
     /// the current session with the one in the JSONL file, and recover from a
     /// missing stored cwd by prompting for the fallback directory.
     pub(crate) async fn handle_import_command(&mut self, args: &str) {
@@ -834,7 +834,7 @@ impl InteractiveMode {
                     .show_status(&format!("Session imported from: {input_path}"));
             }
             Err(RpiError::MissingSessionCwd(error)) => {
-                // `promptForMissingSessionCwd` (interactive-mode.ts:2762-2766 +
+                // `promptForMissingSessionCwd` (interactive-mode.ts:2762-2768 +
                 // 6590-6608): confirm the fallback cwd, then retry the import
                 // with it; a decline cancels the import.
                 let confirmed = crate::modes::interactive::interactive_mode::commands_selectors::show_extension_selector(

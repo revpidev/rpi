@@ -624,7 +624,7 @@ impl AgentSessionRuntime {
             cwd_override.map(Path::new),
         )?;
         // Keep the typed `MissingSessionCwdError` for `/import`'s
-        // prompt/recovery arm (V17-08 #63; interactive-mode.ts:5489-5501).
+        // prompt/recovery arm (V17-08 #63; interactive-mode.ts:6589-6600).
         assert_session_cwd_exists(&session_manager, self.cwd()).map_err(RpiError::from)?;
         let new_cwd = session_manager.get_cwd().to_path_buf();
         let target_file = session_manager

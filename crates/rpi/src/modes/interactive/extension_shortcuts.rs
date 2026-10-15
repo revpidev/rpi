@@ -4,7 +4,7 @@
 //!
 //! The editor consults the hook before its own key handling; conflict
 //! resolution (reserved built-ins, last-wins across extensions, override
-//! warnings) lives in the host (`getShortcuts`, runner.ts:490-533). Handler
+//! warnings) lives in the host (`getShortcuts`, runner.ts:673-716). Handler
 //! errors surface via `showError` (interactive-mode.ts:1835-1837).
 
 use std::sync::Arc;
@@ -17,7 +17,8 @@ use crate::core::agent_session::AgentSession;
 
 /// Resolved built-in keybindings as `(action_id, keys)` pairs — the input
 /// shape of the host's `getShortcuts` (`KeybindingsConfig`, keys split into
-/// lists; runner.ts:92-111 normalizes case itself). Also consumed by the
+/// lists; runner.ts:94-130 builds the reserved map and normalizes case
+/// itself, `:126`). Also consumed by the
 /// `/hotkeys` extension section (V17-08 #63).
 pub(crate) fn builtin_keybinding_pairs() -> Vec<(String, Vec<String>)> {
     let manager = crate::core::keybindings::get_keybindings()
