@@ -3533,7 +3533,7 @@ impl InteractiveUi {
         // Snapshot the loaded resources so the loader lock is released
         // before any further `self` locks.
         let loader = self.session().resource_loader();
-        let (skills, prompts, extensions, context_files, diagnostics) = {
+        let (skills, prompts, extensions, context_files, mut diagnostics) = {
             let loader = lock(&loader);
             let loaded = loader.resources();
             let skills: Vec<String> = loaded
@@ -3583,6 +3583,27 @@ impl InteractiveUi {
             (skills, prompts, extensions, context_files, diagnostics)
         };
         drop(loader);
+
+        // `extensionDiagnostics.push(...getBuiltInCommandConflictDiagnostics(...))`
+        // (interactive-mode.ts:1944): extension commands shadowing a built-in
+        // join the diagnostics block at startup and reload. A configuration
+        // without conflicts appends nothing, so the block stays
+        // byte-identical for existing snapshots.
+        if show_diagnostics {
+            let commands = self.session().extension_runner().registered_commands();
+            diagnostics.extend(
+                crate::modes::interactive::autocomplete::get_builtin_command_conflict_diagnostics(
+                    &commands,
+                )
+                .into_iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.message,
+                        diagnostic.path.map(|path| path.display().to_string()),
+                    )
+                }),
+            );
+        }
 
         // Bodies are plain text; the closures style them with the shared
         // theme on every invalidation, so a theme change repaints the
@@ -6806,6 +6827,43 @@ mod tests {
         );
         install_noop_product_transports(&mode);
         (mode, terminal, session, _tmp)
+    }
+
+    /// #62: the startup loaded-resources diagnostics include the built-in
+    /// command conflicts from the live extension runner
+    /// (interactive-mode.ts:1944).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn startup_loaded_resources_include_command_conflicts() {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+        let factory: ExtensionFactory = Arc::new(|api: ExtensionApi| {
+            api.register_command(
+                "model",
+                Some("shadow".to_owned()),
+                Arc::new(|_args, _ctx| Box::pin(async { Ok(()) })),
+            )
+            .expect("register command");
+            Box::pin(async { Ok(()) })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/w3-cwd"));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+        let (mode, _terminal, _session, _tmp) = mode_harness_with_host(host).await;
+
+        mode.ui_state.show_loaded_resources();
+        let rendered = lock(&mode.ui_state.loaded_resources_container)
+            .render(120)
+            .join("\n");
+        let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(
+                "Extension command '/model' conflicts with built-in interactive command. Skipping in autocomplete."
+            ),
+            "loaded-resources conflict diagnostic: {rendered}"
+        );
     }
 
     /// V15-08 FR-D review follow-up: the interactive `!`/`!!` interception

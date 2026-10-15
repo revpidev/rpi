@@ -2,7 +2,7 @@
 //! `packages/coding-agent/src/core/http-dispatcher.ts` (T13, #59).
 //!
 //! Upstream swaps the process-global undici dispatcher whenever the HTTP
-//! idle timeout changes (`configureHttpDispatcher`, http-dispatcher.ts:81-99;
+//! idle timeout changes (`configureHttpDispatcher`, http-dispatcher.ts:81-113;
 //! called at startup, on session rebind — interactive-mode.ts:2063 — and from
 //! the `/settings` arm — interactive-mode.ts:5001-5004). rpi's provider
 //! requests do not go through a global dispatcher: each streamed request
@@ -22,9 +22,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `DEFAULT_HTTP_IDLE_TIMEOUT_MS` (http-dispatcher.ts:4): upstream's 5-minute
-/// default. The resolved default rpi uses comes from the settings manager
+/// default, kept as the upstream reference ([`HttpDispatcher::default`]).
+/// Production code seeds the slot from the settings manager
 /// (`settings_manager::DEFAULT_HTTP_IDLE_TIMEOUT_MS`, disabled by default per
-/// rpi#54 / D-103); this constant is the fallback when no value is available.
+/// rpi#54 / D-103).
 pub const DEFAULT_HTTP_IDLE_TIMEOUT_MS: u64 = 300_000;
 
 /// Shared, atomically reconfigurable HTTP idle-timeout slot.

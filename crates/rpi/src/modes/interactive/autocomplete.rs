@@ -27,7 +27,7 @@
 //! - `fd` resolution is lookup-only: upstream `getToolPath`
 //!   (tools-manager.ts:83-102) checks the managed `<agentDir>/bin` and then
 //!   `PATH` after `ensureTool` may have downloaded the binary
-//!   (tools-manager.ts:349-410). rpi has no managed-tool store, so a missing
+//!   (tools-manager.ts:349-400). rpi has no managed-tool store, so a missing
 //!   `fd` falls back to the existing path completion.
 //! - The `skill_commands` map lives on [`InteractiveUi`] (allowed field
 //!   addition, upstream class field cleared at the top of
@@ -437,7 +437,7 @@ pub(crate) fn create_base_autocomplete_provider(
         }
     }
 
-    // Assemble (interactive-mode.ts:804-810): upstream passes
+    // Assemble (interactive-mode.ts:818-825): upstream passes
     // `this.sessionManager.getCwd()` and `this.fdPath` (resolved by
     // `ensureTool("fd", ...)` at startup, interactive-mode.ts:1088-1092).
     let base_path = lock(&ui.session().session_manager())
@@ -560,7 +560,9 @@ mod tests {
     use crate::core::model_resolver::ScopedModel;
     use crate::core::skills::{SourceInfo, SourceOrigin, SourceScope};
     use crate::modes::interactive::interactive_mode::{InteractiveMode, InteractiveModeOptions};
-    use crate::modes::interactive::test_support::{TestTerminal, build_test_session};
+    use crate::modes::interactive::test_support::{
+        TestTerminal, build_test_session, build_test_session_with,
+    };
 
     use super::*;
 
@@ -975,6 +977,70 @@ mod tests {
         );
         let provider = create_base_autocomplete_provider(&ui);
         assert!(get_suggestions(provider.as_ref(), "/model m1", false).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn extension_commands_shadowing_builtins_are_filtered_by_name() {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+        let shadow: ExtensionFactory = Arc::new(|api: ExtensionApi| {
+            api.register_command(
+                "model",
+                Some("shadow".to_owned()),
+                Arc::new(|_args, _ctx| Box::pin(async { Ok(()) })),
+            )
+            .expect("register shadowed command");
+            Box::pin(async { Ok(()) })
+        });
+        // A second extension with the same name forces the `:N` invocation
+        // suffix, so the filter's key field (`name` vs `invocation_name`)
+        // is observable.
+        let shadow_duplicate: ExtensionFactory = Arc::new(|api: ExtensionApi| {
+            api.register_command(
+                "model",
+                Some("second shadow".to_owned()),
+                Arc::new(|_args, _ctx| Box::pin(async { Ok(()) })),
+            )
+            .expect("register duplicate command");
+            api.register_command(
+                "custom",
+                Some("kept".to_owned()),
+                Arc::new(|_args, _ctx| Box::pin(async { Ok(()) })),
+            )
+            .expect("register custom command");
+            Box::pin(async { Ok(()) })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/w3-cwd"));
+        let errors = host
+            .load_inline(&[
+                InlineExtension::Anonymous(shadow),
+                InlineExtension::Anonymous(shadow_duplicate),
+            ])
+            .await;
+        assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+
+        clear_test_api_key();
+        let harness = build_test_session_with(None, Some(host)).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        let ui = Arc::clone(&mode.ui_state);
+        let provider = create_base_autocomplete_provider(&ui);
+
+        let result = get_suggestions(provider.as_ref(), "/model", false);
+        let values = item_values(&result);
+        assert!(values.contains(&"model".to_string()), "{values:?}");
+        assert!(
+            !values.iter().any(|value| value.starts_with("model:")),
+            "built-in shadowed commands are filtered by name: {values:?}"
+        );
+        // A non-conflicting extension command is still offered.
+        let custom = get_suggestions(provider.as_ref(), "/custom", false);
+        assert_eq!(item_values(&custom), vec!["custom".to_string()]);
     }
 
     #[tokio::test]

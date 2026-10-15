@@ -522,7 +522,7 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
         }
         SettingsChange::HttpIdleTimeoutMs(timeout_ms) => {
             session.settings_manager(|s| s.set_http_idle_timeout_ms(timeout_ms));
-            // `onHttpIdleTimeoutMsChange` (interactive-mode.ts:5000-5005):
+            // `onHttpIdleTimeoutMsChange` (interactive-mode.ts:5000-5004):
             // persist, reconfigure the live dispatcher slot (the stream
             // function reads it per request), then surface the new value.
             session.configure_http_dispatcher(timeout_ms);

@@ -5,7 +5,7 @@
 //! (`getBinDir()` = `<agentDir>/bin`, config.ts:639-641) first and from the
 //! system `PATH` second, returning the bare command name for a `PATH` hit
 //! (the caller resolves it again when spawning). rpi has no managed-tool
-//! download/install step (`ensureTool`, tools-manager.ts:349-410), so only
+//! download/install step (`ensureTool`, tools-manager.ts:349-400), so only
 //! the lookup half is ported; a missing tool makes the caller fall back to
 //! its own path resolution.
 //!
@@ -19,7 +19,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-/// The `fd` command names tried in order (tools-manager.ts:41
+/// The `fd` command names tried in order (tools-manager.ts:34
 /// `systemBinaryNames: ["fd", "fdfind"]`).
 pub const FD_BINARY_NAMES: [&str; 2] = ["fd", "fdfind"];
 
@@ -168,6 +168,9 @@ mod tests {
         assert_eq!(get_tool_path("fd", &bin_dir, None), None);
     }
 
+    /// A plain file on `PATH` is not a hit on Unix (no executable bit);
+    /// Windows has no such distinction, so the case is Unix-only.
+    #[cfg(unix)]
     #[test]
     fn non_executable_file_is_not_a_hit() {
         let bin_dir = temp_dir("non-exec-managed");

@@ -446,7 +446,7 @@ pub struct Agent {
     /// Interior-mutable (`AtomicU8`) because the interactive settings chain
     /// reassigns the live agent's transport
     /// (`this.session.agent.transport = transport`,
-    /// interactive-mode.ts:4997-4999): the shared `Arc<Agent>` is also held
+    /// interactive-mode.ts:4996-4999): the shared `Arc<Agent>` is also held
     /// by the running loop, so a plain field could not be updated after
     /// construction. Read via [`Agent::transport`], written via
     /// [`Agent::set_transport`].
