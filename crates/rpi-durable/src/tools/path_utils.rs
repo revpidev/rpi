@@ -109,9 +109,10 @@ mod tests {
         let denied = dir.join("denied");
         std::fs::create_dir_all(&denied).expect("denied dir");
         std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-        if std::fs::symlink_metadata(denied.join("x")).is_ok() {
+        if std::fs::read_dir(&denied).is_ok() {
             // Root or a permissive file system: nothing to assert.
             std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).ok();
+            let _ = std::fs::remove_dir_all(&dir);
             return;
         }
         let env = NodeExecutionEnv::new(NodeExecutionEnvOptions {
