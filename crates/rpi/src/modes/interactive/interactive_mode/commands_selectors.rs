@@ -189,7 +189,7 @@ pub(crate) async fn show_extension_selector(
     result
 }
 
-/// `showExtensionEditor` (interactive-mode.ts:2831-2860) for the #60 custom
+/// `showExtensionEditor` (interactive-mode.ts:2831-2857) for the #60 custom
 /// summarization prompt: mount the multi-line editor and await submit;
 /// `None` = cancel (Escape / ctrl+c).
 pub(crate) async fn show_extension_editor(ui: &Arc<InteractiveUi>, title: &str) -> Option<String> {
