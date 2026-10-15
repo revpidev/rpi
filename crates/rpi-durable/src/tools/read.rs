@@ -126,15 +126,12 @@ async fn read_stable_text(
     let mut attempt = 0;
     loop {
         let before = reader.info(context).await?;
-        let result = read_text(reader, &before, path, offset, limit, context).await;
-        if result.is_err() {
-            return result;
-        }
+        let result = read_text(reader, &before, path, offset, limit, context).await?;
         let after = reader.info(context).await?;
         if after.size > before.size
             || (after.size == before.size && after.mtime_ms == before.mtime_ms)
         {
-            return result;
+            return Ok(result);
         }
         if attempt == 1 {
             return Err(tool_error(format!("{path} changed while it was read")));
