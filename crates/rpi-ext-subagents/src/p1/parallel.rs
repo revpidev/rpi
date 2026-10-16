@@ -846,6 +846,11 @@ pub fn child_details(entry: &TaskEntry, outcome: &ChildOutcome, run_id: &str) ->
     if let Some(error) = &result.error {
         single["error"] = json!(error);
     }
+    // #2653 (9bc8f2d1): unfinished streamed text returned on timeout or a
+    // child error is labeled and marked partial.
+    if result.output_partial {
+        single["outputPartial"] = json!(true);
+    }
     if let Some(session_file) = &result.session_file {
         single["sessionFile"] = json!(session_file.to_string_lossy());
     }

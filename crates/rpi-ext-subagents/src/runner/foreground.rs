@@ -313,6 +313,11 @@ pub struct ForegroundRunResult {
     pub thinking: Option<String>,
     pub timed_out: bool,
     pub process_signal: Option<String>,
+    /// #2653 (9bc8f2d1): the final output is unfinished streamed text
+    /// recovered from a timeout or a child session/prompt error. It is
+    /// labeled in `final_output`, never satisfies acceptance, and is never
+    /// written to a bound output file.
+    pub output_partial: bool,
     pub tool_count: u64,
     /// Assistant turns (`AgentProgress.turnCount` terminal projection).
     pub turns: u64,
@@ -1330,8 +1335,30 @@ fn synthesize_exit_from_parts(
         error = Some(raw_stdout.trim().to_string());
     }
 
-    // Timeout partial-output rewrite (1269-1273).
     let mut final_output = final_output_raw;
+    // #2653 (9bc8f2d1): text still streaming when the child timed out or its
+    // session/prompt failed never reached a completed message. The partial
+    // text is kept for those two causes only; stop, interrupt, abort, and
+    // ordinary non-zero exits are unchanged.
+    let child_prompt_failed = stream_error.is_some() || state.assistant_error.is_some();
+    let partial_cause = if timed_out {
+        Some("timeout")
+    } else if child_prompt_failed && !user_aborted && process_signal.is_none() {
+        Some("child error")
+    } else {
+        None
+    };
+    let mut output_partial = false;
+    if let Some(cause) = partial_cause
+        && let Some(streamed) = state.partial_output_text()
+    {
+        final_output = if cause == "timeout" {
+            streamed
+        } else {
+            format!("Partial output before child error:\n{streamed}")
+        };
+        output_partial = true;
+    }
     if timed_out && !final_output.trim().is_empty() {
         let timeout_note = format!(
             "Subagent timed out after {}ms.",
@@ -1395,6 +1422,7 @@ fn synthesize_exit_from_parts(
         thinking: input.thinking.clone(),
         timed_out,
         process_signal,
+        output_partial,
         tool_count: state.tool_count,
         turns: state.turns,
         duration_ms,
@@ -1422,6 +1450,7 @@ fn failed_result(
         thinking: input.thinking.clone(),
         timed_out: false,
         process_signal: None,
+        output_partial: false,
         tool_count: 0,
         turns: 0,
         duration_ms: start.elapsed().as_millis() as u64,
@@ -1641,6 +1670,126 @@ mod terminal_classification_tests {
             result.error.as_deref(),
             Some("Subagent produced no output (possible model cold-start or empty response).")
         );
+    }
+
+    /// #2653 (9bc8f2d1): text still streaming when the run times out is
+    /// returned, labeled, and marked `outputPartial`.
+    #[test]
+    fn timeout_returns_streamed_partial_text() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}"#,
+            0,
+        );
+        state.process_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"half a rep"}}"#,
+            1,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            None,
+            Some(9),
+            true,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert!(result.output_partial);
+        assert!(
+            result
+                .final_output
+                .contains("Partial output before timeout:"),
+            "{}",
+            result.final_output
+        );
+        assert!(result.final_output.contains("half a rep"));
+        assert!(result.final_output.starts_with("Subagent timed out after"));
+    }
+
+    /// #2653: a child session/prompt error returns the unfinished streamed
+    /// text labeled `Partial output before child error:`.
+    #[test]
+    fn child_error_returns_streamed_partial_text() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"partial reasoning"}}"#,
+            0,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(1),
+            None,
+            false,
+            false,
+            Some("provider blew up"),
+            None,
+            String::new(),
+            0,
+        );
+        assert!(result.output_partial);
+        assert_eq!(
+            result.final_output,
+            "Partial output before child error:\npartial reasoning"
+        );
+        assert_eq!(result.error.as_deref(), Some("provider blew up"));
+    }
+
+    /// #2653: a completed reply clears the partial text, so a later timeout
+    /// reports the completed output rather than stale streamed text.
+    #[test]
+    fn completed_reply_leaves_no_partial_text() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"draft"}}"#,
+            0,
+        );
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"final"}],"stopReason":"stop"}}"#,
+            1,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            None,
+            Some(9),
+            true,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert!(!result.output_partial);
+        assert!(result.final_output.contains("final"));
+    }
+
+    /// #2653: stop, interrupt, abort, and ordinary non-zero exits are
+    /// unchanged — no partial recovery on a user-ordered kill.
+    #[test]
+    fn user_aborted_run_does_not_return_partial_text() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"partial"}}"#,
+            0,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            None,
+            Some(9),
+            false,
+            true,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert!(!result.output_partial);
+        assert!(result.final_output.is_empty());
     }
 
     #[test]

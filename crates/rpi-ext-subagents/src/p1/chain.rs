@@ -624,6 +624,11 @@ pub async fn run_chain_async(
         if let Some(error) = &outcome.result.error {
             details["error"] = json!(error);
         }
+        // #2653 (9bc8f2d1): unfinished streamed text recovered on timeout or
+        // a child error is labeled and marked partial.
+        if outcome.result.output_partial {
+            details["outputPartial"] = json!(true);
+        }
         if let Some(signal) = &outcome.result.process_signal {
             details["processSignal"] = json!(signal);
         }

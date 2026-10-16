@@ -1008,7 +1008,13 @@ pub async fn run_child_async(
             &spec.task,
             false,
         );
-        let report = crate::p1::acceptance::parse_acceptance_report(&result.final_output);
+        // #2653 (9bc8f2d1): recovered partial output never stands in for
+        // acceptance evidence.
+        let report = if result.output_partial {
+            None
+        } else {
+            crate::p1::acceptance::parse_acceptance_report(&result.final_output)
+        };
         if let Some(Err(message)) = &report {
             tracing::warn!(%message, "invalid acceptance report in child output");
         }
@@ -1123,9 +1129,11 @@ pub async fn run_child_async(
     }
 
     // Output file: write the full output to the declared path on success.
+    // #2653: recovered partial output is never written to a bound output file.
     let mut saved_output_path = None;
     if let Some(output_path) = &output_path
         && result.exit_code == 0
+        && !result.output_partial
         && !result.final_output.trim().is_empty()
         && crate::artifacts::write_artifact(output_path, &result.final_output).is_ok()
     {

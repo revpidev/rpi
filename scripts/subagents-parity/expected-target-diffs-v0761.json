@@ -1,0 +1,4 @@
+{
+  "//": "Target-track attribution manifest for the v0.1.7 rebase window (TE48, ADR-0036): expected-source pin = pi-subagents v0.76.1 @ 7d072b91d (switched with V17-00 on 2026-10-12). Stays EMPTY by design — every case MATCHes; TE48 closed its triage with zero unattributed diffs (the model-resolution additions #2491/#2538 and the virtual-model verification branch #2638 are handled on the rpi side or outside the driven faces). The args leg is the frozen v0.48 golden on both tracks ([RPI-OWN], ADR-0025 §4).",
+  "cases": []
+}

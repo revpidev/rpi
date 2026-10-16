@@ -37,6 +37,7 @@ mod render;
 mod runner;
 mod runtime;
 mod session_fork;
+mod settings_lease;
 mod tool;
 
 use std::path::PathBuf;

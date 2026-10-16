@@ -855,6 +855,14 @@ pub struct ChildRunState {
     pub turns: u64,
     pub agent_settled_received: bool,
     pub assistant_error: Option<String>,
+    /// #2653 (9bc8f2d1): text streamed by the current unfinished assistant
+    /// message. The child wire strips the cumulative `message` from
+    /// `message_update` (json_event.rs), so the text is accumulated from
+    /// `text_delta` deltas; a completed assistant `message_end` clears it and
+    /// an errored one replaces it with that message's extracted text. Read
+    /// only when a run ends by timeout or child error
+    /// (`partial_output_text`).
+    pub partial_text: String,
     // Streaming progress face (execution.ts:891-929 + :931-1006).
     pub current_tool: Option<String>,
     pub current_tool_args: Option<String>,
@@ -958,6 +966,7 @@ impl ChildRunState {
                 self.current_path = None;
                 outcome.progress_event = true;
             }
+            "message_update" => self.process_message_update(&value),
             "message_end" | "tool_result_end" => {
                 self.process_message_end(event_type, &value, &mut outcome);
             }
@@ -970,6 +979,36 @@ impl ChildRunState {
             outcome.activity_event = true;
         }
         outcome
+    }
+
+    /// #2653 (9bc8f2d1): accumulate streamed assistant text. The child wire
+    /// carries `assistantMessageEvent` deltas, not the cumulative message
+    /// (json_event.rs strips it), so text blocks are joined with "\n"
+    /// exactly like `extractTextFromContent` joins completed content.
+    fn process_message_update(&mut self, event: &Value) {
+        let Some(assistant_event) = event.get("assistantMessageEvent") else {
+            return;
+        };
+        match assistant_event.get("type").and_then(Value::as_str) {
+            Some("text_start") => {
+                if !self.partial_text.is_empty() && !self.partial_text.ends_with('\n') {
+                    self.partial_text.push('\n');
+                }
+            }
+            Some("text_delta") => {
+                if let Some(delta) = assistant_event.get("delta").and_then(Value::as_str) {
+                    self.partial_text.push_str(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// #2653: the latest unfinished assistant text, or `None` when the
+    /// message completed or streamed no text. Whitespace-only text reads as
+    /// absent (upstream `text().trim() ? text : undefined`).
+    pub fn partial_output_text(&self) -> Option<String> {
+        (!self.partial_text.trim().is_empty()).then(|| self.partial_text.clone())
     }
 
     fn process_message_end(&mut self, event_type: &str, event: &Value, outcome: &mut LineOutcome) {
@@ -1038,6 +1077,18 @@ impl ChildRunState {
                 {
                     self.assistant_error = None;
                 }
+            }
+            // #2653 (9bc8f2d1): a completed assistant message clears the
+            // streamed partial text; an errored one becomes the latest
+            // unfinished text (upstream isErroredAssistant: stopReason
+            // "error" or a non-empty errorMessage).
+            if stop_reason == Some("error") || error_message.is_some() {
+                self.partial_text = message
+                    .get("content")
+                    .map(super::display::extract_text_from_content)
+                    .unwrap_or_default();
+            } else {
+                self.partial_text.clear();
             }
             // recentOutput append (execution.ts:962, inside the assistant
             // block): the assistant text's last 10 lines.
@@ -1385,6 +1436,43 @@ mod tests {
         // 10 bytes > 8: drop 2 from the front ("ab"), é stays whole.
         assert_eq!(tail.text(), "cdefghé");
         assert_eq!(tail.byte_length(), 8);
+    }
+
+    #[test]
+    fn partial_text_accumulates_and_clears() {
+        // #2653 (9bc8f2d1): text deltas accumulate across message_update
+        // events; a completed assistant message clears them and an errored
+        // one replaces them with that message's extracted text.
+        let mut state = ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"a"}}"#,
+            0,
+        );
+        state.process_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"b"}}"#,
+            1,
+        );
+        assert_eq!(state.partial_output_text().as_deref(), Some("ab"));
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ab"}],"stopReason":"stop"}}"#,
+            2,
+        );
+        assert_eq!(state.partial_output_text(), None);
+        state.process_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"c"}}"#,
+            3,
+        );
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"c-done"}],"stopReason":"error","errorMessage":"boom"}}"#,
+            4,
+        );
+        assert_eq!(state.partial_output_text().as_deref(), Some("c-done"));
+        // A later completed reply clears the errored text again.
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"recovered"}],"stopReason":"stop"}}"#,
+            5,
+        );
+        assert_eq!(state.partial_output_text(), None);
     }
 
     #[test]

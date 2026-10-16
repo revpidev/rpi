@@ -623,7 +623,7 @@ impl ActiveAsyncCapacity {
     }
 }
 
-fn pid_alive(pid: u64) -> bool {
+pub(crate) fn pid_alive(pid: u64) -> bool {
     if pid == 0 {
         return false;
     }
@@ -1253,6 +1253,11 @@ fn record_step_result(
         }
         if let Some(error) = &result.error {
             step["error"] = json!(error);
+        }
+        // #2653 (9bc8f2d1): the recovered unfinished text is marked partial
+        // on the terminal step.
+        if result.output_partial {
+            step["outputPartial"] = json!(true);
         }
         // Terminal steps drop the live-activity fields (upstream shows
         // currentTool only for pending/running steps).
@@ -3116,6 +3121,7 @@ pub(crate) mod tests {
             thinking: thinking.map(str::to_string),
             timed_out: false,
             process_signal: None,
+            output_partial: false,
             tool_count: 0,
             turns: 1,
             duration_ms: 1,

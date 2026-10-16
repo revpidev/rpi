@@ -1,18 +1,22 @@
 // Upstream leg of the subagents parity harness (TE04 G3; dual-track TE13;
-// re-rotated by TE37 for v0.1.5 and by TE45 for v0.1.6, ADR-0034).
+// re-rotated by TE37 for v0.1.5, by TE45 for v0.1.6 (ADR-0034) and by TE48
+// for v0.1.7 (ADR-0036)).
 //
-// Track `target` (default since the TE45 rotation): the v0.74.0 snapshot =
+// Track `target` (default since the TE45 rotation): the v0.76.1 snapshot =
 // the current pin (see setup-target-source.sh).
 //
 // Mode roots (verified against both pins):
 //   - frontmatter / final-output / discovery / notify: the track root
-//     (all four module faces exist unchanged at v0.74).
+//     (all four module faces exist unchanged at v0.76.1).
 //   - argv/env (`args`): the frozen v0.48 golden on BOTH tracks
 //     ([RPI-OWN], ADR-0025 §4 — upstream deleted pi-args.ts in v0.65 and it
-//     stayed deleted at v0.74; there is no live upstream face to drive).
+//     stayed deleted at v0.76.1; there is no live upstream face to drive).
 //   - fallback / model: anchored at TARGET_ROOT's model-resolution.ts on both
 //     tracks (TE39 followed #2270 and re-anchored; v0.74 added the `scoped`
-//     token (#2538) and provider-prefixed catalog ids (#2491)).
+//     token (#2538) and provider-prefixed catalog ids (#2491); v0.76.1 added
+//     the virtual-model branch of formatSubagentModelVerificationError
+//     (#2638), which this leg does not drive — the driven functions are
+//     unchanged).
 //
 // Prints normalized JSON lines that the orchestrator diffs against the Rust
 // parity_runner example.
@@ -26,13 +30,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TRACK = process.env.RPI_SUBAGENTS_PARITY_TRACK ?? "regression";
-// regression = the retired v0.70.0 snapshot (b72714de);
-// target = the v0.74.0 snapshot = the current pin (TE45, ADR-0034).
+// regression = the retired v0.74.0 snapshot (b6bda32f);
+// target = the v0.76.1 snapshot = the current pin (TE48, ADR-0036).
 // Both are extracted by setup-target-source.sh.
 const REGRESSION_ROOT =
-	process.env.RPI_SUBAGENTS_REGRESSION_SRC ?? "/tmp/rpi-subagents-parity-regression-v070";
+	process.env.RPI_SUBAGENTS_REGRESSION_SRC ?? "/tmp/rpi-subagents-parity-regression-v074";
 const TARGET_ROOT =
-	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v074";
+	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v0761";
 const ARGS_GOLDEN = resolve(HERE, "args-golden-v048.json");
 
 // Normalize an argv array the same way the Rust runner does.

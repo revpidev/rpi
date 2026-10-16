@@ -1408,7 +1408,17 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
                 let Some(description) = value.as_str() else {
                     return Err("config.description must be a string.".to_string());
                 };
-                lines.push(format!("description: {description}"));
+                // #2681 (49a3ec7f): a multiline description is written as a
+                // YAML literal block so every line survives rediscovery
+                // (upstream agent-serializer.ts:63-72).
+                if description.contains('\n') {
+                    lines.push("description: |-".to_string());
+                    for line in description.split('\n') {
+                        lines.push(format!("  {line}"));
+                    }
+                } else {
+                    lines.push(format!("description: {description}"));
+                }
             }
             "systemPrompt" => {
                 let Some(prompt) = value.as_str() else {
@@ -1554,61 +1564,62 @@ fn manage_disable_enable(
     let Some(settings_path) = settings_path else {
         return ToolOutcome::error("No project settings file location for this cwd.".to_string());
     };
-    let mut root: Value = std::fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| json!({}));
-    if !root.is_object() {
-        root = json!({});
-    }
-    if !root.is_object() {
-        root = json!({});
-    }
-    let Some(root_object) = root.as_object_mut() else {
-        return ToolOutcome::error("settings root is not an object.".to_string());
-    };
-    let subagents = root_object.entry("subagents").or_insert_with(|| json!({}));
-    if !subagents.is_object() {
-        return ToolOutcome::error("settings subagents key is not an object.".to_string());
-    }
-    let Some(subagents_object) = subagents.as_object_mut() else {
-        return ToolOutcome::error("settings subagents key is not an object.".to_string());
-    };
-    let overrides = subagents_object
-        .entry("agentOverrides")
-        .or_insert_with(|| json!({}));
-    let Some(overrides_object) = overrides.as_object_mut() else {
-        return ToolOutcome::error("settings agentOverrides key is not an object.".to_string());
-    };
-    let entry = overrides_object
-        .entry(name.to_string())
-        .or_insert_with(|| json!({}));
-    if !entry.is_object() {
-        return ToolOutcome::error(format!("agentOverrides.{name} is not an object."));
-    }
-    let Some(entry_object) = entry.as_object_mut() else {
-        return ToolOutcome::error(format!("agentOverrides.{name} is not an object."));
-    };
-    if disable {
-        entry_object.insert("disabled".to_string(), json!(true));
-    } else {
-        entry_object.remove("disabled");
-    }
-    if let Some(parent) = settings_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(message) = std::fs::write(
+    // #2627/#2680 (TE48 W3/W4): the whole read-modify-write runs under the
+    // physical settings file's cross-session lease, and the save replaces the
+    // document atomically.
+    let result = crate::settings_lease::with_settings_file_lease(
         &settings_path,
-        serde_json::to_string_pretty(&root).unwrap_or_default(),
-    ) {
-        return ToolOutcome::error(message.to_string());
-    }
+        || -> Result<(), String> {
+            let mut root: Value = std::fs::read_to_string(&settings_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_else(|| json!({}));
+            if !root.is_object() {
+                root = json!({});
+            }
+            let Some(root_object) = root.as_object_mut() else {
+                return Err("settings root is not an object.".to_string());
+            };
+            let subagents = root_object.entry("subagents").or_insert_with(|| json!({}));
+            if !subagents.is_object() {
+                return Err("settings subagents key is not an object.".to_string());
+            }
+            let Some(subagents_object) = subagents.as_object_mut() else {
+                return Err("settings subagents key is not an object.".to_string());
+            };
+            let overrides = subagents_object
+                .entry("agentOverrides")
+                .or_insert_with(|| json!({}));
+            let Some(overrides_object) = overrides.as_object_mut() else {
+                return Err("settings agentOverrides key is not an object.".to_string());
+            };
+            let entry = overrides_object
+                .entry(name.to_string())
+                .or_insert_with(|| json!({}));
+            if !entry.is_object() {
+                return Err(format!("agentOverrides.{name} is not an object."));
+            }
+            let Some(entry_object) = entry.as_object_mut() else {
+                return Err(format!("agentOverrides.{name} is not an object."));
+            };
+            if disable {
+                entry_object.insert("disabled".to_string(), json!(true));
+            } else {
+                entry_object.remove("disabled");
+            }
+            crate::settings_lease::write_settings_json(&settings_path, &root)
+                .map_err(|error| error.to_string())
+        },
+    );
     let _ = settings;
-    ToolOutcome::text(format!(
-        "Agent '{name}' {}d via settings override ({}).",
-        if disable { "disable" } else { "enable" },
-        settings_path.to_string_lossy()
-    ))
+    match result {
+        Ok(()) => ToolOutcome::text(format!(
+            "Agent '{name}' {}d via settings override ({}).",
+            if disable { "disable" } else { "enable" },
+            settings_path.to_string_lossy()
+        )),
+        Err(message) => ToolOutcome::error(message),
+    }
 }
 
 fn manage_reset(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) -> ToolOutcome {
@@ -1624,33 +1635,46 @@ fn manage_reset(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) ->
     } else {
         Some(crate::paths::get_agent_dir().join("settings.json"))
     };
-    if let Some(settings_path) = settings_path.filter(|p| p.exists())
-        && let Ok(raw) = std::fs::read_to_string(&settings_path)
-        && let Ok(mut root) = serde_json::from_str::<Value>(&raw)
-    {
-        let mut changed = false;
-        if let Some(entry) = root
-            .get_mut("subagents")
-            .and_then(|s| s.get_mut("agentOverrides"))
-            .and_then(|o| o.get_mut(name))
-            .and_then(Value::as_object_mut)
-        {
-            changed = entry.remove("disabled").is_some();
-            if entry.is_empty() {
-                // Empty entries are pruned.
-                root.get_mut("subagents")
-                    .and_then(|s| s.as_object_mut())
+    if let Some(settings_path) = settings_path.filter(|p| p.exists()) {
+        // #2627/#2680 (TE48 W3/W4): read-modify-write under the settings
+        // file's cross-session lease; the save is atomic.
+        let reset_result = crate::settings_lease::with_settings_file_lease(
+            &settings_path,
+            || -> Result<bool, String> {
+                let Ok(raw) = std::fs::read_to_string(&settings_path) else {
+                    return Ok(false);
+                };
+                let Ok(mut root) = serde_json::from_str::<Value>(&raw) else {
+                    return Ok(false);
+                };
+                let mut changed = false;
+                if let Some(entry) = root
+                    .get_mut("subagents")
                     .and_then(|s| s.get_mut("agentOverrides"))
-                    .and_then(|o| o.as_object_mut())
-                    .map(|o| o.remove(name));
-            }
-        }
-        if changed {
-            let _ = std::fs::write(
-                &settings_path,
-                serde_json::to_string_pretty(&root).unwrap_or_default(),
-            );
-            notes.push("removed the settings override".to_string());
+                    .and_then(|o| o.get_mut(name))
+                    .and_then(Value::as_object_mut)
+                {
+                    changed = entry.remove("disabled").is_some();
+                    if entry.is_empty() {
+                        // Empty entries are pruned.
+                        root.get_mut("subagents")
+                            .and_then(|s| s.as_object_mut())
+                            .and_then(|s| s.get_mut("agentOverrides"))
+                            .and_then(|o| o.as_object_mut())
+                            .map(|o| o.remove(name));
+                    }
+                }
+                if changed {
+                    crate::settings_lease::write_settings_json(&settings_path, &root)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(changed)
+            },
+        );
+        match reset_result {
+            Ok(true) => notes.push("removed the settings override".to_string()),
+            Ok(false) => {}
+            Err(message) => return ToolOutcome::error(message),
         }
     }
     if notes.is_empty() {
@@ -1900,6 +1924,48 @@ mod tests {
                 params: Some(params),
             },
         )
+    }
+
+    /// #2681 (49a3ec7f): a multiline description serializes as a YAML
+    /// literal block (`description: |-` + two-space-indented lines) and
+    /// survives the discovery parser round-trip; single-line descriptions
+    /// keep the inline form.
+    #[test]
+    fn agent_config_serializes_multiline_description_as_block() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-agents-2681-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (label, description) in [
+            ("single", "Summarize project documentation."),
+            (
+                "multi",
+                "Summarize project documentation.\nKeep the summary concise.",
+            ),
+            (
+                "indent",
+                "Summarize documentation.\n\n  Keep examples indented.\n保留中文说明。",
+            ),
+        ] {
+            let target = dir.join(format!("{label}.md"));
+            write_agent_config(
+                &json!({ "description": description, "systemPrompt": "body" }),
+                &target,
+            )
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let raw = std::fs::read_to_string(&target).unwrap();
+            if description.contains('\n') {
+                assert!(raw.contains("\ndescription: |-\n"), "{label}: {raw}");
+            } else {
+                assert!(raw.contains("\ndescription: Summarize project documentation.\n"));
+            }
+            let parsed = crate::agents::frontmatter::parse_frontmatter(&raw);
+            assert_eq!(
+                parsed.frontmatter.get("description").map(String::as_str),
+                Some(description),
+                "{label} round-trip"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TE38 W5 (#2242 @ b72714de): a stopped last child has no continuation

@@ -674,16 +674,20 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         } else {
             CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS
         };
+        // #2693 (17e17673): the child boundary block follows Pi's base
+        // prompt so providers/extensions that recognize the prompt by its
+        // opening sentence keep recognizing it; the <active_agent> tag stays
+        // the first line (pi-args.ts:609-613 metadata).
         let tagged_prompt = match &input.child_agent_name {
-            // <active_agent> prefix (pi-args.ts:609-613) + boundary block
-            // (parent-side injection, TE-D17).
+            // <active_agent> prefix (pi-args.ts:609-613) + prompt + boundary
+            // block (parent-side injection, TE-D17).
             Some(name) => format!(
                 "<active_agent name=\"{}\"/>\n\n{}\n\n{}",
                 escape_xml_attr(name),
-                boundary,
-                system_prompt
+                system_prompt,
+                boundary
             ),
-            None => format!("{boundary}\n\n{system_prompt}"),
+            None => format!("{system_prompt}\n\n{boundary}"),
         };
         write_private_file(&prompt_path, &tagged_prompt)?;
         args.push(
@@ -1345,8 +1349,16 @@ mod tests {
         let prompt_path = PathBuf::from(&result.args[prompt_flag + 1]);
         let content = std::fs::read_to_string(&prompt_path).unwrap();
         assert!(content.starts_with("<active_agent name=\"scout\"/>\n\n"));
-        assert!(content.contains("You are a child subagent, not the parent orchestrator."));
-        assert!(content.ends_with("be brief"));
+        assert!(content.contains("\n\nbe brief\n\n"));
+        assert!(
+            content.contains("You are a child subagent, not the parent orchestrator."),
+            "the boundary block follows the base prompt (#2693)"
+        );
+        assert!(
+            content
+                .ends_with("Do not print tool-call syntax, patches, or pseudo-tool calls as text."),
+            "#2693: the boundary block is last, not first"
+        );
         let mode = std::fs::metadata(&prompt_path).unwrap();
         #[cfg(unix)]
         {
@@ -1362,6 +1374,39 @@ mod tests {
             result.env.get(SUBAGENT_CHILD_AGENT_ENV),
             Some(&Some("scout".into()))
         );
+        cleanup_temp_dir(&result.temp_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn child_boundary_instructions_follow_the_base_prompt() {
+        // #2693 (17e17673): the boundary block follows Pi's base prompt so
+        // providers/extensions that recognize the prompt by its opening
+        // sentence keep recognizing it; the <active_agent> tag stays first.
+        let dir = std::env::temp_dir().join(format!("rpi-sub-args-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut input = base_input();
+        input.system_prompt = Some("be brief".into());
+        input.prompt_file_stem = Some("worker".into());
+        input.child_agent_name = Some("worker".into());
+        input.session_dir = Some(dir.join("run-0"));
+        let result = build_rpi_args(&input).unwrap();
+        let prompt_flag = result
+            .args
+            .iter()
+            .position(|a| a == "--system-prompt")
+            .expect("replace mode uses --system-prompt");
+        let content = std::fs::read_to_string(&result.args[prompt_flag + 1]).unwrap();
+        let prompt_at = content.find("be brief").expect("base prompt present");
+        let boundary_at = content
+            .find("You are a child subagent, not the parent orchestrator.")
+            .expect("boundary present");
+        assert!(
+            prompt_at < boundary_at,
+            "#2693: base prompt must precede the boundary block"
+        );
+        assert!(content.starts_with("<active_agent name=\"worker\"/>\n\n"));
         cleanup_temp_dir(&result.temp_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
