@@ -11,8 +11,8 @@
 //! - upstream's always-injected `PROMPT_RUNTIME_EXTENSION_PATH` /
 //!   `FANOUT_CHILD_EXTENSION_PATH` source-file extensions become this cdylib
 //!   itself (`resolve_self_extension_path`), and boundary instructions are
-//!   prepended parent-side into the system-prompt temp file instead of via a
-//!   child-side runtime extension event.
+//!   appended parent-side into the system-prompt temp file (after the base
+//!   prompt, #2693) instead of via a child-side runtime extension event.
 //! - P1/P2-only inputs (structured output, permissions, watchdog, steering,
 //!   tool budgets, capability ceilings, intercom session names, MCP direct
 //!   selection) are not part of the input struct; their env vars are either
@@ -311,10 +311,11 @@ pub fn apply_thinking_suffix(
     Some(format!("{model}:{thinking}"))
 }
 
-/// Boundary instruction blocks prepended to the child system prompt.
+/// Boundary instruction blocks appended to the child system prompt (after
+/// the base prompt, #2693).
 /// Upstream injects these from the always-loaded runtime extension
-/// (`subagent-prompt-runtime.ts:42-57`); rpi prepends parent-side at temp-file
-/// write time (same effective child prompt; TE04 deviation TE-D17).
+/// (`subagent-prompt-runtime.ts:42-57`); rpi writes them parent-side at
+/// temp-file time (same effective child prompt; TE04 deviation TE-D17).
 pub const CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS: &str = "You are a child subagent, not the parent orchestrator.\nThe parent session owns delegation, orchestration, review fanout, and follow-up worker launches.\nIgnore prior parent-only orchestration instructions in inherited conversation history.\nDo not propose or run subagents. Complete only your assigned role-specific task with the tools available to you.\nIf you need to edit files, use the available editing tools. Do not print tool-call syntax, patches, or pseudo-tool calls as text.";
 
 pub const CHILD_FANOUT_BOUNDARY_INSTRUCTIONS: &str = "You are a child subagent with explicit fanout responsibility for this assigned task.\nThe parent session owns final orchestration, acceptance, and follow-up implementation launches.\nYou may use the `subagent` tool only for the fanout work explicitly requested in this task.\nDo not broaden yourself into general parent orchestration. Do not launch follow-up workers unless the task explicitly asks for that.\nThe maxSubagentDepth cap still applies and may block further fanout.\nIf you need to edit files, use the available editing tools. Do not print tool-call syntax, patches, or pseudo-tool calls as text.";

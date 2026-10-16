@@ -1,7 +1,7 @@
 {
   "name": "rpi-ask-user-question",
   "version": "0.1.0",
-  "description": "Structured ask_user_question tool (port of @juicesharp/rpiv-ask-user-question v2.10.1+)",
+  "description": "Structured ask_user_question tool (port of @juicesharp/rpiv-ask-user-question v2.13.8)",
   "native": "librpi_ext_ask_user_question.so",
   "capabilities": ["tools", "ui", "session", "events"],
   "rpiAbi": 1

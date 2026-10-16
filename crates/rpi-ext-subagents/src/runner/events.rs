@@ -857,7 +857,8 @@ pub struct ChildRunState {
     pub assistant_error: Option<String>,
     /// #2653 (9bc8f2d1): text streamed by the current unfinished assistant
     /// message. The child wire strips the cumulative `message` from
-    /// `message_update` (json_event.rs), so the text is accumulated from
+    /// `message_update` (`crates/rpi/src/modes/json_event.rs`), so the text
+    /// is accumulated from
     /// `text_delta` deltas; a completed assistant `message_end` clears it and
     /// an errored one replaces it with that message's extracted text. Read
     /// only when a run ends by timeout or child error
@@ -983,7 +984,8 @@ impl ChildRunState {
 
     /// #2653 (9bc8f2d1): accumulate streamed assistant text. The child wire
     /// carries `assistantMessageEvent` deltas, not the cumulative message
-    /// (json_event.rs strips it), so text blocks are joined with "\n"
+    /// (`crates/rpi/src/modes/json_event.rs` strips it), so text blocks are
+    /// joined with "\n"
     /// exactly like `extractTextFromContent` joins completed content.
     fn process_message_update(&mut self, event: &Value) {
         let Some(assistant_event) = event.get("assistantMessageEvent") else {
