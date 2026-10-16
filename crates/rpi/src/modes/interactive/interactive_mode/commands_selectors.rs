@@ -3380,30 +3380,47 @@ impl InteractiveUi {
 // Clipboard helpers (`utils/clipboard-image.ts` / `utils/clipboard.ts`)
 // -----------------------------------------------------------------------------
 
-/// Upstream `DEFAULT_READ_TIMEOUT_MS` (clipboard-image.ts:18) — caps how
-/// long a clipboard read may block (xclip `-o` waits for the selection
-/// owner, which can hang on an empty clipboard).
+/// Upstream `runClipboardCommand` default timeout (`options?.timeoutMs ??
+/// 3000`, clipboard-command.ts:30) — caps how long a clipboard read may
+/// block (xclip `-o` waits for the selection owner, which can hang on an
+/// empty clipboard).
 const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(3000);
 /// Upstream `DEFAULT_LIST_TIMEOUT_MS` (clipboard-image.ts:19): the MIME
 /// listing probes answer immediately when a clipboard owner exists.
 const CLIPBOARD_LIST_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Upstream `DEFAULT_POWERSHELL_TIMEOUT_MS` (clipboard-image.ts:20).
 const CLIPBOARD_POWERSHELL_TIMEOUT: Duration = Duration::from_millis(5000);
+/// Upstream `maxBufferBytes` default (`options?.maxBufferBytes ?? 50 * 1024
+/// * 1024`, clipboard-command.ts:38): a larger payload aborts the read
+/// and resolves `undefined`.
+const CLIPBOARD_MAX_BUFFER_BYTES: usize = 50 * 1024 * 1024;
 
 /// Upstream `SUPPORTED_IMAGE_MIME_TYPES` (clipboard-image.ts:17).
 const SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] =
     ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
-/// Run a command capturing stdout, bounded by `timeout` (upstream
-/// `spawnSync` `timeout`/`maxBuffer` options, clipboard-image.ts:89-116).
-/// A reader thread drains the pipe so large payloads cannot deadlock the
-/// child against the buffer. `None` = spawn failure, timeout or non-zero
-/// exit (upstream `ok: false`). Also the subprocess seam of the tmux
-/// keyboard check (`tmux_check`).
+/// Run a command capturing stdout, bounded by `timeout` and by the
+/// upstream max-buffer cap (clipboard-command.ts:30/38). A reader thread
+/// drains the pipe so large payloads cannot deadlock the child against
+/// the buffer; past the cap it stops reading and the call yields `None`
+/// (upstream aborts the child and resolves `undefined`). `None` = spawn
+/// failure, timeout, non-zero exit or oversized output. Also the
+/// subprocess seam of the tmux keyboard check (`tmux_check`).
 pub(super) fn run_clipboard_command(
     program: &str,
     args: &[&str],
     timeout: Duration,
+) -> Option<Vec<u8>> {
+    run_clipboard_command_with_cap(program, args, timeout, CLIPBOARD_MAX_BUFFER_BYTES)
+}
+
+/// [`run_clipboard_command`] with the buffer cap injected for tests
+/// (production passes [`CLIPBOARD_MAX_BUFFER_BYTES`]).
+fn run_clipboard_command_with_cap(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_buffer_bytes: usize,
 ) -> Option<Vec<u8>> {
     use std::io::Read;
 
@@ -3417,8 +3434,22 @@ pub(super) fn run_clipboard_command(
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
+        let mut buffer = [0u8; 8192];
+        let mut overflow = false;
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if bytes.len() + read > max_buffer_bytes {
+                        overflow = true;
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                Err(_) => break,
+            }
+        }
+        if overflow { None } else { Some(bytes) }
     });
 
     let deadline = Instant::now() + timeout;
@@ -3435,8 +3466,8 @@ pub(super) fn run_clipboard_command(
             }
         }
     };
-    let bytes = reader.join().unwrap_or_default();
-    status.filter(|status| status.success()).map(|_| bytes)
+    let bytes = reader.join().unwrap_or(None);
+    status.filter(|status| status.success()).and(bytes)
 }
 
 /// The cursor-aware spacing rule (interactive-mode.ts:3160-3165): a space
@@ -5946,6 +5977,79 @@ mod tests {
         );
     }
 
+    /// The image hit must short-circuit the text fallback (task §4 chain
+    /// order: files → image → text).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_image_short_circuits_the_text_fallback() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let log = tmp.path().join("args.log");
+        fake_reader_tool(
+            &tmp,
+            "xclip",
+            "image/png",
+            Some(b"\x89PNG\r\n\x1a\n"),
+            Some(&log),
+        );
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        let inserted = lock(&ui.editor).get_text();
+        assert!(
+            inserted.ends_with(".png"),
+            "image path inserted: {inserted}"
+        );
+        let log = std::fs::read_to_string(&log).expect("argument log");
+        assert!(
+            !log.lines().any(|line| line == "-selection clipboard -o"),
+            "the text fallback must not be read after an image hit: {log}"
+        );
+        let _ = std::fs::remove_file(&inserted);
+    }
+
+    /// Upstream `maxBufferBytes` default (`options?.maxBufferBytes ?? 50 *
+    /// 1024 * 1024`, clipboard-command.ts:38): past the cap the read
+    /// aborts and resolves `undefined` (rpi `None`).
+    #[cfg(unix)]
+    #[test]
+    fn run_clipboard_command_aborts_past_the_buffer_cap() {
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("huge");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 100 ]; do printf '0123456789012345678901234567890123456789'; i=$((i+1)); done\n",
+        )
+        .expect("write fake tool");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake tool");
+        }
+        let small = run_clipboard_command_with_cap(
+            script.to_str().expect("script path"),
+            &[],
+            Duration::from_millis(5000),
+            32,
+        );
+        assert!(small.is_none(), "output past the cap yields None");
+        let within = run_clipboard_command_with_cap(
+            script.to_str().expect("script path"),
+            &[],
+            Duration::from_millis(5000),
+            8192,
+        );
+        assert!(
+            within.is_some_and(|bytes| bytes.len() == 4000),
+            "a payload within the cap is returned whole"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
     async fn paste_image_uses_the_mime_derived_extension() {
@@ -6897,5 +7001,25 @@ mod tests {
         let _path_restore = prepend_path(&bin);
         let _tmux_restore = set_tmux_env("1");
         assert_eq!(run_tmux_check(Duration::from_millis(150)), None);
+    }
+
+    /// Issue #65 test plan ② (real spawn path): a non-zero exit is silent.
+    #[test]
+    fn tmux_keyboard_check_stays_silent_on_a_non_zero_exit() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("tmux");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").expect("write fake tmux");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake tmux");
+        }
+        let _path_restore = prepend_path(&bin);
+        let _tmux_restore = set_tmux_env("1");
+        assert_eq!(run_tmux_check(Duration::from_millis(2000)), None);
     }
 }

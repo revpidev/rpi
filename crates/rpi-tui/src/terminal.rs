@@ -76,13 +76,14 @@
 //!   implements the flag itself through the Windows console API
 //!   (V17-10 #69; `enable_windows_vt_input`, set after raw mode and
 //!   restored on `stop()`), so Shift+Tab reaches the parser as `\x1b[Z`.
-//!   Failure stays silent, keeping the upstream addon-missing fallback
+//!   Failure stays silent, keeping the helper-unavailable fallback
 //!   (plain `\t`).
 //! - Native Shift+Enter normalization (Apple Terminal on macOS, all consoles
 //!   on Windows — 73dd066ee) is wired exactly like upstream
 //!   (`forwardInputSequence`, terminal.ts:317-327 @ 4181f66);
 //!   `is_native_modifier_pressed` now queries CoreGraphics on macOS
-//!   (V17-10 #69) and keeps the upstream addon-missing fallback elsewhere
+//!   (V17-10 #69) and keeps the helper-unavailable fallback elsewhere —
+//!   notably the win32 modifier query, which the port does not implement
 //!   (see `native_modifiers.rs`; ADR-0004).
 //! - `drain_input` observes pending input by consuming and discarding queued
 //!   channel events; upstream attaches a side listener that only timestamps
@@ -471,14 +472,14 @@ fn default_query_size() -> io::Result<(u16, u16)> {
     }
 }
 
-/// `ENABLE_VIRTUAL_TERMINAL_INPUT` (wincon.h, 0x0200; terminal.ts:420-431
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT` (wincon.h, 0x0200; terminal.ts:420-427
 /// @ `abe508e1b`): without it Windows consoles lose modifier state and
 /// Shift+Tab arrives as plain `\t` instead of `\x1b[Z`.
 #[cfg(any(windows, test))]
 const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
 
 /// Enables [`ENABLE_VIRTUAL_TERMINAL_INPUT`] through the console-mode
-/// accessors (upstream `enableWindowsVTInput`, terminal.ts:420-431):
+/// accessors (upstream `enableWindowsVTInput`, terminal.ts:420-427):
 /// returns the previous mode when it was changed, so `stop()` can restore
 /// it, and `None` when the flag was already set, the query failed, or the
 /// update failed (silent fallback, upstream try/catch). The accessors are
@@ -546,7 +547,7 @@ mod win_console {
 }
 
 /// Applies the VT-input flag on Windows (upstream
-/// `enableWindowsVTInput`, terminal.ts:420-431): silent on failure.
+/// `enableWindowsVTInput`, terminal.ts:420-427): silent on failure.
 #[cfg(windows)]
 fn enable_windows_vt_input() -> Option<u32> {
     apply_virtual_terminal_input(win_console::get_input_mode, win_console::set_input_mode)
@@ -580,7 +581,7 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
     was_raw: bool,
     /// Windows console input mode captured before
     /// `ENABLE_VIRTUAL_TERMINAL_INPUT` was added (upstream
-    /// `enableWindowsVTInput`, terminal.ts:420-431); restored in `stop()`.
+    /// `enableWindowsVTInput`, terminal.ts:420-427); restored in `stop()`.
     /// `None` = not Windows / never applied / the flag was already set.
     #[cfg(windows)]
     windows_console_mode: Option<u32>,
@@ -1098,7 +1099,7 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         // ioctl on every `size()` call, so there is no stale cache to
         // refresh.
         //
-        // Upstream `enableWindowsVTInput` (terminal.ts:215-219/420-431):
+        // Upstream `enableWindowsVTInput` (terminal.ts:215-219/420-427):
         // must run AFTER `setRawMode(true)` — raw mode resets the console
         // mode flags. Process terminals only, like raw mode itself.
         #[cfg(windows)]

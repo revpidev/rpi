@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-/// Upstream `setTimeout(..., 2000)` (interactive-mode.ts:1289-1292).
+/// Upstream `setTimeout(..., 2000)` (interactive-mode.ts:1290-1293).
 pub(crate) const TMUX_CHECK_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Verbatim upstream warning (`interactive-mode.ts:1318` @ `abe508e1b`).
@@ -222,6 +222,22 @@ mod tests {
                 stub.run(p, a, t)
             });
         assert_eq!(warning, None, "don't warn when the query failed");
+    }
+
+    /// Upstream `code === 0 ? stdout.trim() : undefined`
+    /// (interactive-mode.ts:1304) plus the `!== "on" && !== "always"` check
+    /// (`:1317`): a successful query whose output is empty is not an
+    /// accepted value, so it warns. (Review B1: the task §4 "空输出→无警告"
+    /// wording contradicted upstream; the implementation follows upstream
+    /// and this test pins it.)
+    #[test]
+    fn warns_when_the_successful_query_output_is_empty() {
+        let stub = Stub::new(Some(""), Some("csi-u"));
+        let warning =
+            check_tmux_keyboard_setup_with(true, Duration::from_millis(50), &|p, a, t| {
+                stub.run(p, a, t)
+            });
+        assert_eq!(warning.as_deref(), Some(EXTENDED_KEYS_OFF_WARNING));
     }
 
     #[test]

@@ -8,14 +8,16 @@
 //! since `73dd066ee`). This port implements the macOS arm with a
 //! CoreGraphics FFI query (V17-10 #69, ADR-0004's reserved helper seam):
 //! Apple Terminal's Shift+Enter normalization needs the physical modifier
-//! state. Windows keeps the upstream addon-missing fallback here
-//! (`native_helper_supported` is macOS-only); the VT-input half of the
-//! win32 helper is implemented in `terminal.rs`.
+//! state. Windows keeps the fallback used when a native helper is
+//! unavailable (`native_helper_supported` is macOS-only — the win32
+//! addon's modifier query is not ported); the VT-input half of the win32
+//! helper is implemented in `terminal.rs`.
 //! - `ModifierKey` is an enum instead of a string-literal union;
 //!   `ModifierKey::name()` returns the upstream byte values
 //!   ("shift" | "command" | "control" | "option").
 
-/// Native macOS modifier key names (`ModifierKey`, native-modifiers.ts:7).
+/// Native macOS modifier key names (`ModifierKey`, native-platform.ts:7;
+/// re-exported by native-modifiers.ts:3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModifierKey {
     Shift,
@@ -25,7 +27,7 @@ pub enum ModifierKey {
 }
 
 impl ModifierKey {
-    /// Upstream string value (`ModifierKey` literal, native-modifiers.ts:7).
+    /// Upstream string value (`ModifierKey` literal, native-platform.ts:7).
     pub fn name(self) -> &'static str {
         match self {
             ModifierKey::Shift => "shift",
@@ -82,7 +84,7 @@ fn is_native_modifier_pressed_with(
 }
 
 /// The production query. Only reachable on macOS (`native_helper_supported`);
-/// other platforms keep the addon-missing fallback.
+/// other platforms keep the helper-unavailable fallback.
 fn native_modifier_query(key: ModifierKey) -> Option<bool> {
     #[cfg(target_os = "macos")]
     {
