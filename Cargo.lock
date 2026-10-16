@@ -3595,6 +3595,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

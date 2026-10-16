@@ -3285,12 +3285,9 @@ impl InteractiveUi {
         self.handle_open_external_editor_real();
     }
 
-    /// `handleClipboardPaste` (interactive-mode.ts:2629-2652): image paste
-    /// via the X11 clipboard (`utils/clipboard-image.ts`
-    /// `readClipboardImageViaXclip`, simplified to the PNG probe), else a
-    /// plain-text paste via the platform tools (`utils/clipboard.ts`
-    /// `readClipboardText`, native addon replaced by xclip / wl-paste /
-    /// pbpaste). Image paths are inserted by absolute path; the temp file is
+    /// `handleClipboardPaste` (interactive-mode.ts:3152-3192): the
+    /// three-stage chain — file paths, images, then plain text.
+    /// Image paths are inserted by absolute path; the temp file is
     /// intentionally left in place (upstream never removes it either).
     /// Dispatch-side entry: deferred to the drain (insertion touches the
     /// editor, which is locked during the dispatch).
@@ -3298,13 +3295,45 @@ impl InteractiveUi {
         self.handle_paste_image_impl();
     }
 
-    /// `handleClipboardPaste` (interactive-mode.ts:2629-2652) — runs from
-    /// the drain (UiCommand::PasteImage).
+    /// `handleClipboardPaste` (interactive-mode.ts:3152-3192) — runs from
+    /// the drain (UiCommand::PasteImage). Each stage that finds nothing
+    /// falls through to the next; failures never bubble (upstream's
+    /// catch → `showError` is mapped to the existing `show_status` form).
     pub(crate) fn handle_paste_image_impl(&self) {
-        if let Some(bytes) = read_clipboard_image_png() {
-            let file_path =
-                std::env::temp_dir().join(format!("rpi-clipboard-{}.png", clipboard_uuid()));
-            if std::fs::write(&file_path, bytes).is_ok() {
+        if let Some(file_paths) = read_clipboard_file_paths() {
+            if file_paths
+                .iter()
+                .any(|path| path.chars().any(char::is_control))
+            {
+                self.show_status(
+                    "Failed to paste from clipboard: Clipboard file path contains control characters",
+                );
+                return;
+            }
+            // `paths = isBashMode ? filePaths.map(quoteIfNeeded).join(" ")
+            // : filePaths.join("\n")` (interactive-mode.ts:3159).
+            let text = if *lock(&self.is_bash_mode) {
+                file_paths
+                    .iter()
+                    .map(|path| super::quote_if_needed(path))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                file_paths.join("\n")
+            };
+            let text = self.with_cursor_spacing(&text);
+            lock(&self.editor).insert_text_at_cursor(&text);
+            self.render_handle.request_render();
+            return;
+        }
+
+        if let Some(image) = read_clipboard_image() {
+            // `extensionForImageMimeType(image.mimeType) ?? "png"`
+            // (interactive-mode.ts:3174).
+            let extension = extension_for_image_mime_type(&image.mime_type).unwrap_or("png");
+            let file_path = std::env::temp_dir()
+                .join(format!("rpi-clipboard-{}.{extension}", clipboard_uuid()));
+            if std::fs::write(&file_path, image.bytes).is_ok() {
                 lock(&self.editor).insert_text_at_cursor(&file_path.display().to_string());
                 self.render_handle.request_render();
                 return;
@@ -3324,6 +3353,22 @@ impl InteractiveUi {
         }
     }
 
+    /// Cursor-aware spacing (interactive-mode.ts:3160-3165): surround the
+    /// pasted text with a space when the cursor sits directly between
+    /// non-whitespace characters.
+    fn with_cursor_spacing(&self, text: &str) -> String {
+        let editor = lock(&self.editor);
+        let (line, col) = editor.get_cursor();
+        let content = editor.get_text();
+        let current_line = content
+            .split('\n')
+            .nth(line)
+            .unwrap_or_default()
+            .to_string();
+        drop(editor);
+        apply_cursor_spacing(text, &current_line, col)
+    }
+
     /// `app.session.toggleNamedFilter` — acts inside the session selector;
     /// outside it there is nothing to toggle.
     pub(crate) fn handle_toggle_named_filter(&self) {
@@ -3339,13 +3384,27 @@ impl InteractiveUi {
 /// long a clipboard read may block (xclip `-o` waits for the selection
 /// owner, which can hang on an empty clipboard).
 const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(3000);
+/// Upstream `DEFAULT_LIST_TIMEOUT_MS` (clipboard-image.ts:19): the MIME
+/// listing probes answer immediately when a clipboard owner exists.
+const CLIPBOARD_LIST_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Upstream `DEFAULT_POWERSHELL_TIMEOUT_MS` (clipboard-image.ts:20).
+const CLIPBOARD_POWERSHELL_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// Upstream `SUPPORTED_IMAGE_MIME_TYPES` (clipboard-image.ts:17).
+const SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] =
+    ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 /// Run a command capturing stdout, bounded by `timeout` (upstream
 /// `spawnSync` `timeout`/`maxBuffer` options, clipboard-image.ts:89-116).
 /// A reader thread drains the pipe so large payloads cannot deadlock the
 /// child against the buffer. `None` = spawn failure, timeout or non-zero
-/// exit (upstream `ok: false`).
-fn run_clipboard_command(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+/// exit (upstream `ok: false`). Also the subprocess seam of the tmux
+/// keyboard check (`tmux_check`).
+pub(super) fn run_clipboard_command(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
     use std::io::Read;
 
     let mut child = std::process::Command::new(program)
@@ -3380,34 +3439,494 @@ fn run_clipboard_command(program: &str, args: &[&str], timeout: Duration) -> Opt
     status.filter(|status| status.success()).map(|_| bytes)
 }
 
-/// Probe the X11 clipboard for a PNG image (#9786 `8676a0dcd`): list the
-/// advertised TARGETS first and only read `image/png` when the clipboard
-/// advertises it. Clipboard owners such as browsers answer unadvertised
-/// image targets, which misidentified text as an image. `None` when xclip
-/// is absent, times out, or holds no image.
-fn read_clipboard_image_png() -> Option<Vec<u8>> {
-    if !cfg!(target_os = "linux") {
+/// The cursor-aware spacing rule (interactive-mode.ts:3160-3165): a space
+/// is added on each side whose neighbour character is non-whitespace.
+fn apply_cursor_spacing(text: &str, current_line: &str, col: usize) -> String {
+    let before = if col > 0 {
+        current_line.chars().nth(col - 1)
+    } else {
+        None
+    };
+    let after = current_line.chars().nth(col);
+    let leading = before.is_some_and(|c| !c.is_whitespace());
+    let trailing = after.is_some_and(|c| !c.is_whitespace());
+    format!(
+        "{}{}{}",
+        if leading { " " } else { "" },
+        text,
+        if trailing { " " } else { "" }
+    )
+}
+
+/// The `ClipboardImage` shape (clipboard-image.ts:12-15).
+struct ClipboardImage {
+    bytes: Vec<u8>,
+    mime_type: String,
+}
+
+/// `baseMimeType` (clipboard-image.ts:26-28): strips parameters and
+/// lowercases.
+fn base_mime_type(mime_type: &str) -> String {
+    mime_type
+        .split(';')
+        .next()
+        .unwrap_or(mime_type)
+        .trim()
+        .to_lowercase()
+}
+
+/// `extensionForImageMimeType` (clipboard-image.ts:30-43).
+fn extension_for_image_mime_type(mime_type: &str) -> Option<&'static str> {
+    match base_mime_type(mime_type).as_str() {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+/// `isSupportedImageMimeType` (clipboard-image.ts:62-65).
+fn is_supported_image_mime_type(mime_type: &str) -> bool {
+    let base = base_mime_type(mime_type);
+    SUPPORTED_IMAGE_MIME_TYPES
+        .iter()
+        .any(|supported| *supported == base)
+}
+
+/// `selectPreferredImageMimeType` (clipboard-image.ts:45-60): the first
+/// supported type in the fixed preference order, else any `image/*`.
+fn select_preferred_image_mime_type(mime_types: &str) -> Option<String> {
+    let normalized: Vec<(String, String)> = mime_types
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|raw| (raw.to_string(), base_mime_type(raw)))
+        .collect();
+    for preferred in SUPPORTED_IMAGE_MIME_TYPES {
+        if let Some((raw, _)) = normalized.iter().find(|(_, base)| base == preferred) {
+            return Some(raw.clone());
+        }
+    }
+    normalized
+        .iter()
+        .find(|(_, base)| base.starts_with("image/"))
+        .map(|(raw, _)| raw.clone())
+}
+
+/// The file-list flavours the Linux command-line readers probe, in
+/// preference order. GNOME writes `x-special/gnome-copied-files` with a
+/// `copy`/`cut` header line; KDE and most other toolkits use
+/// `text/uri-list` (RFC 2483). Upstream reads `getFilePaths()` from the
+/// native helper instead (D-104/D-106).
+const FILE_LIST_MIME_TYPES: [&str; 2] = ["text/uri-list", "x-special/gnome-copied-files"];
+
+/// Picks the first advertised file-list flavour.
+fn select_file_list_mime_type(types: &str) -> Option<&'static str> {
+    let advertised: Vec<String> = types
+        .lines()
+        .map(|line| line.trim().to_lowercase())
+        .collect();
+    FILE_LIST_MIME_TYPES
+        .iter()
+        .find(|mime| advertised.iter().any(|advertised| advertised == *mime))
+        .copied()
+}
+
+/// Parses an RFC 2483 `text/uri-list` (or the GNOME `copy`/`cut` variant)
+/// into local paths; `url::Url::to_file_path` decodes percent escapes.
+/// Non-`file:` entries and non-UTF-8 payloads are ignored (`None` when no
+/// path survives).
+fn parse_file_uri_list(bytes: &[u8], mime_type: &str) -> Option<Vec<String>> {
+    let text = String::from_utf8(bytes.to_vec()).ok()?;
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if mime_type == "x-special/gnome-copied-files" && (line == "copy" || line == "cut") {
+            continue;
+        }
+        let Ok(url) = url::Url::parse(line) else {
+            continue;
+        };
+        if url.scheme() != "file" {
+            continue;
+        }
+        let Ok(path) = url.to_file_path() else {
+            continue;
+        };
+        paths.push(path.display().to_string());
+    }
+    if paths.is_empty() { None } else { Some(paths) }
+}
+
+/// `isWaylandSession` (clipboard-image.ts:22-25): `WAYLAND_DISPLAY` or
+/// `XDG_SESSION_TYPE=wayland`. The text read already uses this same double
+/// predicate (`read_clipboard_text`); the expression is repeated because
+/// that function is frozen (V17-10 FR-B red line).
+fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|session| session == "wayland")
+}
+
+/// `isWSL` for the image orchestration (clipboard-image.ts:213-220) —
+/// reused from the write-side env snapshot.
+fn is_wsl_session() -> bool {
+    crate::modes::interactive::clipboard::ClipboardEnv::from_env().wsl
+}
+
+/// The file-path stage of `handleClipboardPaste`
+/// (interactive-mode.ts:3154-3169): upstream delegates to the native
+/// `getFilePaths()`; rpi has no native helper (D-104/D-106), so the
+/// platform command-line equivalents are probed instead. `None` = the
+/// clipboard holds no file list.
+fn read_clipboard_file_paths() -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        read_clipboard_file_paths_linux()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        read_clipboard_file_paths_macos()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        read_clipboard_file_paths_windows()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Linux file-path stage: `text/uri-list` probing via wl-paste on
+/// Wayland and xclip on X11 ([RPI-OWN] mechanism, D-106). Compiled on
+/// every host so the platform readers stay stub-testable off-platform
+/// (only the dispatch is cfg-gated).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_clipboard_file_paths_linux() -> Option<Vec<String>> {
+    if is_wayland_session() {
+        // A working Wayland clipboard is authoritative: a listing without
+        // a file-list flavour does not fall through to the XWayland
+        // clipboard (the same null-blocks-fallback rule as the image
+        // reader); only a failed probe falls back, like the text read.
+        let Some(bytes) =
+            run_clipboard_command("wl-paste", &["--list-types"], CLIPBOARD_LIST_TIMEOUT)
+        else {
+            return read_clipboard_file_paths_x11();
+        };
+        let mime = select_file_list_mime_type(&String::from_utf8_lossy(&bytes));
+        return mime.and_then(|mime| {
+            run_clipboard_command(
+                "wl-paste",
+                &["--type", mime, "--no-newline"],
+                CLIPBOARD_READ_TIMEOUT,
+            )
+            .and_then(|data| parse_file_uri_list(&data, mime))
+        });
+    }
+    read_clipboard_file_paths_x11()
+}
+
+/// The X11 file-list probe (also the Wayland fallback when the wl-paste
+/// probe failed).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_clipboard_file_paths_x11() -> Option<Vec<String>> {
+    if let Some(bytes) = run_clipboard_command(
+        "xclip",
+        &["-selection", "clipboard", "-t", "TARGETS", "-o"],
+        CLIPBOARD_LIST_TIMEOUT,
+    ) && let Some(mime) = select_file_list_mime_type(&String::from_utf8_lossy(&bytes))
+        && let Some(data) = run_clipboard_command(
+            "xclip",
+            &["-selection", "clipboard", "-t", mime, "-o"],
+            CLIPBOARD_READ_TIMEOUT,
+        )
+        && let Some(paths) = parse_file_uri_list(&data, mime)
+    {
+        return Some(paths);
+    }
+    None
+}
+
+/// macOS file-path stage: the `getFilePaths()` command-line equivalent
+/// (AppleScript coerces the pasteboard to file URLs).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn read_clipboard_file_paths_macos() -> Option<Vec<String>> {
+    let bytes = run_clipboard_command(
+        "osascript",
+        &["-e", MACOS_FILE_PATHS_SCRIPT],
+        CLIPBOARD_READ_TIMEOUT,
+    )?;
+    let text = String::from_utf8_lossy(&bytes);
+    let paths: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if paths.is_empty() { None } else { Some(paths) }
+}
+
+/// POSIX paths of file URLs on the clipboard, one per line
+/// (`getFilePaths()` equivalent). A non-file clipboard leaves the list
+/// empty and returns nothing.
+const MACOS_FILE_PATHS_SCRIPT: &str = r#"
+set theItems to {}
+try
+	set theItems to (the clipboard as «class furl»)
+end try
+if class of theItems is not list then set theItems to {theItems}
+set output to ""
+repeat with theItem in theItems
+	try
+		set output to output & POSIX path of theItem & linefeed
+	end try
+end repeat
+return output
+"#;
+
+/// Windows file-path stage: `Get-Clipboard -Format FileDropList` (the
+/// native `getFilePaths()` equivalent).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn read_clipboard_file_paths_windows() -> Option<Vec<String>> {
+    let bytes = run_clipboard_command(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-Command",
+            "Get-Clipboard -Format FileDropList | ForEach-Object { $_ }",
+        ],
+        CLIPBOARD_READ_TIMEOUT,
+    )?;
+    let text = String::from_utf8_lossy(&bytes);
+    let paths: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if paths.is_empty() { None } else { Some(paths) }
+}
+
+/// `readClipboardImage` (clipboard-image.ts:200-239) — the reader
+/// orchestration and the unsupported-format conversion. The native reader
+/// (`:193`) has no Rust counterpart; each platform substitutes the
+/// command-line equivalent (D-104/D-106): wl-paste / xclip on Linux
+/// (PowerShell as the WSL fallback), PowerShell on Windows, osascript on
+/// macOS.
+fn read_clipboard_image() -> Option<ClipboardImage> {
+    // `if (env.TERMUX_VERSION) return null` (clipboard-image.ts:207-209).
+    if std::env::var_os("TERMUX_VERSION").is_some_and(|value| !value.is_empty()) {
         return None;
     }
+
+    #[cfg(target_os = "linux")]
+    let image = read_clipboard_image_linux();
+    #[cfg(target_os = "windows")]
+    let image = read_clipboard_image_via_power_shell();
+    #[cfg(target_os = "macos")]
+    let image = read_clipboard_image_via_osascript();
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let image = None;
+
+    let image = image?;
+    // Convert unsupported formats (e.g. Windows DIB data wrapped as BMP)
+    // to PNG (clipboard-image.ts:230-237).
+    if !is_supported_image_mime_type(&image.mime_type) {
+        let png = convert_to_png(&image.bytes)?;
+        return Some(ClipboardImage {
+            bytes: png,
+            mime_type: "image/png".to_string(),
+        });
+    }
+    Some(image)
+}
+
+/// Linux image orchestration (clipboard-image.ts:213-221): wl-paste on
+/// Wayland/WSL, xclip next, then the PowerShell fallback on WSL. The
+/// tri-state mirrors upstream: outer `None` = backend failed
+/// (`undefined`), `Some(None)` = no image (`null`); a `null` from wl-paste
+/// blocks the xclip fallback, preserving the empty-Wayland-clipboard
+/// semantics. Compiled on every host (see `read_clipboard_image`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_clipboard_image_linux() -> Option<ClipboardImage> {
+    let wsl = is_wsl_session();
+    let mut image: Option<Option<ClipboardImage>> = None;
+    if is_wayland_session() || wsl {
+        image = read_clipboard_image_via_wl_paste();
+    }
+    if image.is_none() {
+        image = read_clipboard_image_via_xclip();
+    }
+    // `if (!image && wsl) image = (await readClipboardImageViaPowerShell())
+    // ?? image` (clipboard-image.ts:220): a null/failed PowerShell result
+    // keeps the prior state.
+    if !matches!(image, Some(Some(_)))
+        && wsl
+        && let Some(png) = read_clipboard_image_via_power_shell()
+    {
+        image = Some(Some(png));
+    }
+    image.flatten()
+}
+
+/// `readClipboardImageViaWlPaste` (clipboard-image.ts:91-111).
+fn read_clipboard_image_via_wl_paste() -> Option<Option<ClipboardImage>> {
+    let list = run_clipboard_command("wl-paste", &["--list-types"], CLIPBOARD_LIST_TIMEOUT)?;
+    // A successful listing without an image is upstream `null` (no image),
+    // not `undefined` (backend failed): it blocks the xclip fallback.
+    let Some(selected) = select_preferred_image_mime_type(&String::from_utf8_lossy(&list)) else {
+        return Some(None);
+    };
+    let data = run_clipboard_command(
+        "wl-paste",
+        &["--type", &selected, "--no-newline"],
+        CLIPBOARD_READ_TIMEOUT,
+    )?;
+    if data.is_empty() {
+        return Some(None);
+    }
+    Some(Some(ClipboardImage {
+        bytes: data,
+        mime_type: base_mime_type(&selected),
+    }))
+}
+
+/// `readClipboardImageViaXclip` (clipboard-image.ts:172-191): list the
+/// advertised TARGETS first and only read a preferred image MIME
+/// (#9786 `8676a0dcd`).
+fn read_clipboard_image_via_xclip() -> Option<Option<ClipboardImage>> {
     let targets = run_clipboard_command(
         "xclip",
         &["-selection", "clipboard", "-t", "TARGETS", "-o"],
+        CLIPBOARD_LIST_TIMEOUT,
+    )?;
+    // Advertised targets without an image = upstream `null` (#9786).
+    let Some(selected) = select_preferred_image_mime_type(&String::from_utf8_lossy(&targets))
+    else {
+        return Some(None);
+    };
+    let data = run_clipboard_command(
+        "xclip",
+        &["-selection", "clipboard", "-t", &selected, "-o"],
         CLIPBOARD_READ_TIMEOUT,
     )?;
-    let targets = String::from_utf8_lossy(&targets);
-    let advertises_png = targets
-        .lines()
-        .map(str::trim)
-        .any(|target| target == "image/png");
-    if !advertises_png {
+    if data.is_empty() {
+        return Some(None);
+    }
+    Some(Some(ClipboardImage {
+        bytes: data,
+        mime_type: base_mime_type(&selected),
+    }))
+}
+
+/// The Windows/WSL image reader: `Get-Clipboard -Format Image` through
+/// PowerShell (`readClipboardImageViaPowerShell`, clipboard-image.ts:
+/// 118-170). Upstream streams the bitmap to a temp file; the port returns
+/// it as base64 on stdout — the same bytes without the `wslpath` round
+/// trip (D-106). `None` = no image or failure.
+fn read_clipboard_image_via_power_shell() -> Option<ClipboardImage> {
+    let script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $img = [System.Windows.Forms.Clipboard]::GetImage(); if ($img) { $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Console]::Out.Write([Convert]::ToBase64String($ms.ToArray())) }";
+    let bytes = run_clipboard_command(
+        "powershell.exe",
+        &["-NoProfile", "-Command", script],
+        CLIPBOARD_POWERSHELL_TIMEOUT,
+    )?;
+    let encoded = String::from_utf8_lossy(&bytes);
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
         return None;
     }
-    let bytes = run_clipboard_command(
-        "xclip",
-        &["-selection", "clipboard", "-t", "image/png", "-o"],
-        CLIPBOARD_READ_TIMEOUT,
-    )?;
-    if bytes.is_empty() { None } else { Some(bytes) }
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .ok()?;
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(ClipboardImage {
+        bytes: decoded,
+        mime_type: "image/png".to_string(),
+    })
+}
+
+/// macOS image reader: the native `getImage()` command-line equivalent.
+/// AppleScript writes the pasteboard image to a temp file and returns the
+/// class token the MIME is derived from (PNG → JPEG → GIF, the upstream
+/// `detectSupportedImageMimeType` coverage). Compiled on every host so a
+/// stub `osascript` can exercise it on the test host.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn read_clipboard_image_via_osascript() -> Option<ClipboardImage> {
+    let path = std::env::temp_dir().join(format!("rpi-clipboard-{}.img", clipboard_uuid()));
+    let script = format!(
+        r#"set outPath to "{}"
+try
+	set d to (the clipboard as «class PNGf»)
+	set f to open for access POSIX file outPath with write permission
+	write d to f
+	close access f
+	return "png"
+end try
+try
+	set d to (the clipboard as «class JPEG»)
+	set f to open for access POSIX file outPath with write permission
+	write d to f
+	close access f
+	return "jpeg"
+end try
+try
+	set d to (the clipboard as «class GIFf»)
+	set f to open for access POSIX file outPath with write permission
+	write d to f
+	close access f
+	return "gif"
+end try
+return ""
+"#,
+        applescript_string(&path.display().to_string())
+    );
+    let token = run_clipboard_command("osascript", &["-e", &script], CLIPBOARD_READ_TIMEOUT)
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .unwrap_or_default();
+    let mime_type = match token.as_str() {
+        "png" => "image/png",
+        "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        _ => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let bytes = std::fs::read(&path);
+    let _ = std::fs::remove_file(&path);
+    let bytes = bytes.ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(ClipboardImage {
+        bytes,
+        mime_type: mime_type.to_string(),
+    })
+}
+
+/// Escape a value for an AppleScript string literal.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// `convertToPng` (clipboard-image.ts:71-87): the Photon WASM converter is
+/// replaced by the workspace's `image` crate (already a dependency of the
+/// read tool). `None` when the bytes cannot be decoded or re-encoded.
+fn convert_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let format = image::guess_format(bytes).ok()?;
+    let decoded = image::load_from_memory_with_format(bytes, format).ok()?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    decoded.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
 }
 
 /// `readClipboardText` (clipboard.ts:36-47) — the native clipboard addon is
@@ -4927,6 +5446,46 @@ mod tests {
         PathEnvRestore { previous }
     }
 
+    /// Environment keys the paste chain reads. Tests clear all of them so
+    /// the ambient session (Wayland / X11 / WSL / Termux) cannot pick a
+    /// branch, then set only the branch they exercise.
+    const PASTE_ENV_KEYS: [&str; 6] = [
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+        "DISPLAY",
+        "WSL_DISTRO_NAME",
+        "WSLENV",
+        "TERMUX_VERSION",
+    ];
+
+    struct PasteEnvRestore {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Drop for PasteEnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                match value {
+                    Some(value) => rpi_test_env::set_var(key, value),
+                    None => rpi_test_env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Clears every environment key the paste chain reads (restores on
+    /// drop); callers set the branch they exercise explicitly.
+    fn clear_paste_env() -> PasteEnvRestore {
+        let previous = PASTE_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in PASTE_ENV_KEYS {
+            rpi_test_env::remove_var(key);
+        }
+        PasteEnvRestore { previous }
+    }
+
     /// Write fake `xclip`/`wl-paste` executables: `-t TARGETS` advertises
     /// `image/png` only when `image` is true (otherwise `text/plain`), the
     /// `-t image/png` probe emits PNG bytes when `image` is true, and plain
@@ -4959,7 +5518,7 @@ mod tests {
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\n{log_line}for arg in \"$@\"; do\n  if [ \"$arg\" = TARGETS ]; then\n    {targets_payload}    exit 0\n  fi\n  if [ \"$arg\" = image/png ]; then\n    {image_payload}exit 0\n  fi\ndone\nprintf pasted-text\n"
+                    "#!/bin/sh\n{log_line}for arg in \"$@\"; do\n  if [ \"$arg\" = TARGETS ]; then\n    {targets_payload}    exit 0\n  fi\n  if [ \"$arg\" = --list-types ]; then\n    {targets_payload}    exit 0\n  fi\n  if [ \"$arg\" = image/png ]; then\n    {image_payload}exit 0\n  fi\ndone\nprintf pasted-text\n"
                 ),
             )
             .expect("write fake clipboard tool");
@@ -4981,6 +5540,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
     async fn paste_with_clipboard_image_inserts_temp_path() {
         let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
         let tmp = TempDir::new();
         let bin = fake_clipboard_tools(&tmp, true);
         let _path_restore = prepend_path(&bin);
@@ -5011,6 +5571,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
     async fn paste_without_image_inserts_clipboard_text() {
         let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
         let tmp = TempDir::new();
         let bin = fake_clipboard_tools(&tmp, false);
         let _path_restore = prepend_path(&bin);
@@ -5031,6 +5592,7 @@ mod tests {
     async fn paste_does_not_probe_unadvertised_image_targets() {
         // Regression for #9786 (`8676a0dcd`).
         let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
         let tmp = TempDir::new();
         let log = tmp.path().join("clipboard-args.log");
         let bin = fake_clipboard_tools_with_log(&tmp, false, Some(&log));
@@ -5055,6 +5617,7 @@ mod tests {
     async fn paste_does_not_probe_image_targets_when_listing_fails() {
         // Regression for #9786 (`8676a0dcd`).
         let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
         let tmp = TempDir::new();
         let log = tmp.path().join("clipboard-args.log");
         let bin = tmp.path().join("bin");
@@ -5097,10 +5660,11 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
     async fn paste_without_clipboard_tools_shows_status() {
         let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
         // The host really has a working clipboard tool (dev machine): the
         // status path is environment-dependent, so skip instead of flaking.
         // CI has none, which is what this test asserts.
-        if read_clipboard_image_png().is_some() || read_clipboard_text().is_some() {
+        if read_clipboard_image().is_some() || read_clipboard_text().is_some() {
             eprintln!(
                 "skipping paste_without_clipboard_tools_shows_status: host clipboard tool present"
             );
@@ -5116,6 +5680,494 @@ mod tests {
         assert!(
             rendered.contains("no clipboard tool found"),
             "status must explain the missing tool: {rendered}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // V17-10 #66: the clipboard paste chain (files → images → text).
+    // ---------------------------------------------------------------------
+
+    /// Write a fake clipboard tool answering a MIME listing (`TARGETS` /
+    /// `--list-types`) with `listing` (shell `\n` escapes are interpreted)
+    /// and every other invocation with the bytes of `payload` (or
+    /// `pasted-text`); every call is appended to `log` when given.
+    fn fake_reader_tool(
+        dir: &TempDir,
+        name: &str,
+        listing: &str,
+        payload: Option<&[u8]>,
+        log: Option<&std::path::Path>,
+    ) -> std::path::PathBuf {
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join(name);
+        let payload_command = match payload {
+            Some(bytes) => {
+                let payload_path = bin.join(format!("{name}-payload.bin"));
+                std::fs::write(&payload_path, bytes).expect("write fake payload");
+                format!("cat '{}'", payload_path.display())
+            }
+            None => "printf pasted-text".to_string(),
+        };
+        let log_line = match log {
+            Some(log) => format!("printf '%s\\n' \"$*\" >> '{}';\n", log.display()),
+            None => String::new(),
+        };
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n{log_line}for arg in \"$@\"; do\n  if [ \"$arg\" = TARGETS ] || [ \"$arg\" = --list-types ]; then\n    printf '{listing}\\n'; exit 0\n  fi\ndone\n{payload_command}\n"
+            ),
+        )
+        .expect("write fake tool");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake tool");
+        }
+        script
+    }
+
+    #[test]
+    fn cursor_spacing_matches_upstream_rules() {
+        // interactive-mode.ts:3160-3165.
+        assert_eq!(apply_cursor_spacing("/p", "abc", 3), " /p");
+        assert_eq!(apply_cursor_spacing("/p", "abc", 0), "/p ");
+        assert_eq!(apply_cursor_spacing("/p", "abcd", 2), " /p ");
+        assert_eq!(apply_cursor_spacing("/p", "ab ", 3), "/p");
+        assert_eq!(apply_cursor_spacing("/p", " ab", 1), "/p ");
+        assert_eq!(apply_cursor_spacing("/p", "", 0), "/p");
+    }
+
+    #[test]
+    fn image_mime_helpers_match_upstream() {
+        // clipboard-image.ts:26-65.
+        assert_eq!(base_mime_type("Image/PNG; charset=x"), "image/png");
+        assert_eq!(extension_for_image_mime_type("image/png"), Some("png"));
+        assert_eq!(extension_for_image_mime_type("image/jpeg"), Some("jpg"));
+        assert_eq!(extension_for_image_mime_type("image/webp"), Some("webp"));
+        assert_eq!(extension_for_image_mime_type("image/gif"), Some("gif"));
+        assert_eq!(extension_for_image_mime_type("image/bmp"), None);
+        assert_eq!(
+            select_preferred_image_mime_type("text/plain\nimage/gif\nimage/png\n").as_deref(),
+            Some("image/png"),
+            "fixed preference order: png before gif"
+        );
+        assert_eq!(
+            select_preferred_image_mime_type("image/bmp\n").as_deref(),
+            Some("image/bmp"),
+            "any image/* is selected when no supported type is on offer"
+        );
+        assert_eq!(select_preferred_image_mime_type("text/plain\n"), None);
+    }
+
+    #[test]
+    fn file_uri_list_parsing_matches_rfc_2483() {
+        assert_eq!(
+            parse_file_uri_list(
+                b"# comment\nfile:///tmp/a%20b.txt\nfile://localhost/tmp/d.txt\nfile://otherhost/tmp/c.txt\nhttps://x/y\n\n",
+                "text/uri-list"
+            ),
+            Some(vec![
+                "/tmp/a b.txt".to_string(),
+                "/tmp/d.txt".to_string()
+            ]),
+            "comments, non-file URLs and non-local hosts are skipped"
+        );
+        assert_eq!(parse_file_uri_list(b"", "text/uri-list"), None);
+        // GNOME's flavour carries a copy/cut header line.
+        assert_eq!(
+            parse_file_uri_list(b"copy\nfile:///tmp/x\n", "x-special/gnome-copied-files"),
+            Some(vec!["/tmp/x".to_string()])
+        );
+        assert_eq!(
+            select_file_list_mime_type("image/png\ntext/uri-list\n"),
+            Some("text/uri-list")
+        );
+        assert_eq!(select_file_list_mime_type("text/plain\n"), None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_file_paths_inserts_joined_paths() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        fake_reader_tool(
+            &tmp,
+            "xclip",
+            "text/uri-list",
+            Some(b"file:///tmp/a%20b.txt\nfile:///tmp/c.txt\n"),
+            None,
+        );
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        assert_eq!(lock(&ui.editor).get_text(), "/tmp/a b.txt\n/tmp/c.txt");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_file_paths_quote_in_bash_mode_and_space_at_cursor() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        fake_reader_tool(
+            &tmp,
+            "xclip",
+            "text/uri-list",
+            Some(b"file:///tmp/a%20b.txt\nfile:///tmp/c.txt\n"),
+            None,
+        );
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        // Bash mode: `quoteIfNeeded` joined by a single space
+        // (interactive-mode.ts:3159).
+        *lock(&ui.is_bash_mode) = true;
+        ui.handle_paste_image();
+        assert_eq!(lock(&ui.editor).get_text(), "'/tmp/a b.txt' /tmp/c.txt");
+
+        // Non-bash: joined by newlines; the cursor after "abc" adds the
+        // leading spacing space (interactive-mode.ts:3160-3165).
+        lock(&ui.editor).set_text("abc");
+        *lock(&ui.is_bash_mode) = false;
+        ui.handle_paste_image();
+        assert_eq!(lock(&ui.editor).get_text(), "abc /tmp/a b.txt\n/tmp/c.txt");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_file_paths_reject_control_characters() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        fake_reader_tool(
+            &tmp,
+            "xclip",
+            "text/uri-list",
+            Some(b"file:///tmp/a%01b.txt\n"),
+            None,
+        );
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        assert_eq!(lock(&ui.editor).get_text(), "", "nothing inserted");
+        let rendered = lock(&ui.chat_container).render(120).join("\n");
+        assert!(
+            rendered.contains("Clipboard file path contains control characters"),
+            "control-character guard surfaces the upstream message: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_file_paths_short_circuit_image_and_text() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let log = tmp.path().join("args.log");
+        fake_reader_tool(
+            &tmp,
+            "xclip",
+            "text/uri-list\\nimage/png",
+            Some(b"file:///tmp/f\n"),
+            Some(&log),
+        );
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        assert_eq!(lock(&ui.editor).get_text(), "/tmp/f");
+        let log = std::fs::read_to_string(&log).expect("argument log");
+        assert!(log.contains("-t text/uri-list -o"), "file list read: {log}");
+        assert!(
+            !log.contains("image/png"),
+            "the image stage must not run once file paths were found: {log}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_wayland_file_paths_via_wl_paste() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        rpi_test_env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        let tmp = TempDir::new();
+        fake_reader_tool(
+            &tmp,
+            "wl-paste",
+            "text/uri-list",
+            Some(b"file:///tmp/wayland%20file.txt\n"),
+            None,
+        );
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        assert_eq!(lock(&ui.editor).get_text(), "/tmp/wayland file.txt");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_wayland_empty_clipboard_does_not_fall_through_to_x11() {
+        // clipboard-image.ts:89-90: an empty Wayland clipboard must not
+        // fall through to stale X11 contents.
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        rpi_test_env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        let tmp = TempDir::new();
+        let log = tmp.path().join("xclip.log");
+        fake_reader_tool(&tmp, "wl-paste", "text/plain", None, None);
+        fake_reader_tool(
+            &tmp,
+            "xclip",
+            "image/png",
+            Some(b"\x89PNG\r\n\x1a\n"),
+            Some(&log),
+        );
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        assert_eq!(lock(&ui.editor).get_text(), "pasted-text");
+        assert!(
+            !log.exists(),
+            "the xclip fallback must be skipped when wl-paste reported no image"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_image_uses_the_mime_derived_extension() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        fake_reader_tool(&tmp, "xclip", "image/jpeg", Some(b"JPEGDATA"), None);
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        let inserted = lock(&ui.editor).get_text();
+        assert!(inserted.ends_with(".jpg"), "jpeg maps to .jpg: {inserted}");
+        assert_eq!(
+            std::fs::read(&inserted).expect("image written"),
+            b"JPEGDATA"
+        );
+        let _ = std::fs::remove_file(&inserted);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_unsupported_image_mime_converts_to_png() {
+        // `convertToPng` (clipboard-image.ts:71-87): a BMP offer is
+        // converted, so the file lands as `.png` (not a BMP named .png).
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bmp = {
+            let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut out, image::ImageFormat::Bmp)
+                .expect("encode bmp");
+            out.into_inner()
+        };
+        fake_reader_tool(&tmp, "xclip", "image/bmp", Some(&bmp), None);
+        let _path_restore = prepend_path(&tmp.path().join("bin"));
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        let inserted = lock(&ui.editor).get_text();
+        assert!(inserted.ends_with(".png"), "converted to PNG: {inserted}");
+        let bytes = std::fs::read(&inserted).expect("image written");
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(image::load_from_memory(&bytes).is_ok(), "valid PNG bytes");
+        let _ = std::fs::remove_file(&inserted);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn paste_wsl_falls_back_to_powershell() {
+        // clipboard-image.ts:113-170/219-220: Win+Shift+S images land on
+        // the Windows clipboard, reached through PowerShell on WSL.
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        rpi_test_env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        for name in ["xclip", "wl-paste"] {
+            let script = bin.join(name);
+            std::fs::write(&script, "#!/bin/sh\nexit 1\n").expect("write failing tool");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        let png = b"\x89PNG\r\n\x1a\nWSL";
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        let powershell = bin.join("powershell.exe");
+        std::fs::write(&powershell, format!("#!/bin/sh\nprintf '%s' '{encoded}'\n"))
+            .expect("write fake powershell");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&powershell, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let _path_restore = prepend_path(&bin);
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.handle_paste_image();
+        let inserted = lock(&ui.editor).get_text();
+        assert!(inserted.ends_with(".png"), "{inserted}");
+        assert_eq!(std::fs::read(&inserted).expect("image written"), png);
+        let _ = std::fs::remove_file(&inserted);
+    }
+
+    /// The macOS file-path arm parses the `POSIX path of` output of the
+    /// `getFilePaths()` command-line equivalent (stubbed `osascript`).
+    #[test]
+    fn macos_file_paths_reader_parses_osascript_output() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("osascript");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '/tmp/a b.txt\\n/tmp/c.txt\\n'\n",
+        )
+        .expect("write fake osascript");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let _path_restore = prepend_path(&bin);
+        assert_eq!(
+            read_clipboard_file_paths_macos(),
+            Some(vec!["/tmp/a b.txt".to_string(), "/tmp/c.txt".to_string()])
+        );
+    }
+
+    /// The Windows file-path arm parses the `FileDropList` output.
+    #[test]
+    fn windows_file_paths_reader_parses_powershell_output() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("powershell.exe");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' 'C:\\Users\\me\\a.txt' 'C:\\b.txt'\n",
+        )
+        .expect("write fake powershell");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let _path_restore = prepend_path(&bin);
+        assert_eq!(
+            read_clipboard_file_paths_windows(),
+            Some(vec![
+                "C:\\Users\\me\\a.txt".to_string(),
+                "C:\\b.txt".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn applescript_string_escapes_quotes_and_backslashes() {
+        assert_eq!(applescript_string("a\"b\\c"), "a\\\"b\\\\c");
+    }
+
+    /// The macOS image arm writes the pasteboard image to a temp file and
+    /// derives the MIME from the class token (stubbed `osascript`).
+    #[test]
+    fn osascript_image_reader_writes_and_reads_the_temp_file() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let payload = bin.join("payload.png");
+        std::fs::write(&payload, b"\x89PNG\r\n\x1a\nMAC").expect("write payload");
+        let script = bin.join("osascript");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\npath=$(printf '%s' \"$2\" | sed -n 's/.*set outPath to \"\\(.*\\)\".*/\\1/p' | head -1)\ncat '{}' > \"$path\"\nprintf 'png'\n",
+                payload.display()
+            ),
+        )
+        .expect("write fake osascript");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let _path_restore = prepend_path(&bin);
+
+        let image = read_clipboard_image_via_osascript().expect("image read");
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.bytes, b"\x89PNG\r\n\x1a\nMAC");
+        let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .expect("temp dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rpi-clipboard-")
+                    && entry.path().extension().is_some_and(|ext| ext == "img")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "the temp file is removed");
+    }
+
+    #[test]
+    fn osascript_image_reader_returns_none_without_an_image() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("osascript");
+        std::fs::write(&script, "#!/bin/sh\nprintf ''\n").expect("write fake osascript");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let _path_restore = prepend_path(&bin);
+        assert_eq!(
+            read_clipboard_image_via_osascript().map(|i| i.mime_type),
+            None
         );
     }
 
@@ -5745,5 +6797,105 @@ mod tests {
             llama_cpp_post_login_guidance("Logged in to llama.cpp", 2),
             "Logged in to llama.cpp. Use /model to select a loaded llama.cpp model, or /llama to manage models."
         );
+    }
+
+    // ------------------------------------------------------------------
+    // V17-10 #65: the tmux keyboard check through the real spawn path.
+    // These mutate `TMUX`/`$PATH`, so they share `PATH_ENV_LOCK` with the
+    // clipboard tests (the process environment is global).
+    // ------------------------------------------------------------------
+
+    /// Temporarily sets `TMUX` (restores on drop). `TMUX` is only read by
+    /// the tmux keyboard check.
+    struct TmuxEnvRestore {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TmuxEnvRestore {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => rpi_test_env::set_var("TMUX", value),
+                None => rpi_test_env::remove_var("TMUX"),
+            }
+        }
+    }
+
+    fn set_tmux_env(value: &str) -> TmuxEnvRestore {
+        let previous = std::env::var_os("TMUX");
+        rpi_test_env::set_var("TMUX", value);
+        TmuxEnvRestore { previous }
+    }
+
+    /// Write a fake `tmux` answering the two `show -gv` queries.
+    fn fake_tmux(dir: &TempDir, keys: &str, format: &str) -> std::path::PathBuf {
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("tmux");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = extended-keys ]; then\n    printf '%s\\n' '{keys}'\n    exit 0\n  fi\n  if [ \"$arg\" = extended-keys-format ]; then\n    printf '%s\\n' '{format}'\n    exit 0\n  fi\ndone\nexit 1\n"
+            ),
+        )
+        .expect("write fake tmux");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake tmux");
+        }
+        bin
+    }
+
+    fn run_tmux_check(timeout: Duration) -> Option<String> {
+        crate::modes::interactive::interactive_mode::tmux_check::check_tmux_keyboard_setup(timeout)
+    }
+
+    /// Issue #65 test plan ①: `TMUX` set + a stubbed `tmux` on `$PATH`
+    /// returning `off` → the verbatim warning; `on` + `csi-u` → nothing.
+    #[test]
+    fn tmux_keyboard_check_warns_through_the_real_spawn_path() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new();
+        let bin = fake_tmux(&tmp, "off", "xterm");
+        let _path_restore = prepend_path(&bin);
+        let _tmux_restore = set_tmux_env("1");
+        assert_eq!(
+            run_tmux_check(Duration::from_millis(2000)).as_deref(),
+            Some(
+                crate::modes::interactive::interactive_mode::tmux_check::EXTENDED_KEYS_OFF_WARNING
+            )
+        );
+    }
+
+    #[test]
+    fn tmux_keyboard_check_passes_through_the_real_spawn_path() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new();
+        let bin = fake_tmux(&tmp, "on", "csi-u");
+        let _path_restore = prepend_path(&bin);
+        let _tmux_restore = set_tmux_env("1");
+        assert_eq!(run_tmux_check(Duration::from_millis(2000)), None);
+    }
+
+    /// Issue #65 test plan ②: a hanging `tmux` is killed at the timeout
+    /// with no warning and no error surface.
+    #[test]
+    fn tmux_keyboard_check_times_out_silently() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("tmux");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("write fake tmux");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake tmux");
+        }
+        let _path_restore = prepend_path(&bin);
+        let _tmux_restore = set_tmux_env("1");
+        assert_eq!(run_tmux_check(Duration::from_millis(150)), None);
     }
 }

@@ -141,7 +141,7 @@ pub fn startup_instructions(theme: &Theme) -> (String, String) {
         hint("app.message.dequeue", "to edit all queued messages"),
         hint(
             "app.clipboard.pasteImage",
-            "to paste image (with text fallback)",
+            "to paste files on macOS, images, or text",
         ),
         raw_key_hint(theme, "drop files", "to attach"),
     ]
@@ -316,6 +316,17 @@ mod tests {
         assert_eq!(lines.len(), 19);
         assert!(lines.iter().any(|l| l.contains("to interrupt")));
         assert!(lines.iter().any(|l| l.contains("to exit (empty)")));
+    }
+
+    /// V17-10 #66 FR-B R5: the clipboard hints match the shipped chain
+    /// (files → images → text) after the V17-10 port; the upstream wording
+    /// is restored (interactive-mode.ts:1046-1047 @ abe508e1b).
+    #[test]
+    fn clipboard_hints_match_the_shipped_paste_subset() {
+        let (expanded, _) = startup_instructions(&theme());
+        assert!(expanded.contains("to paste files on macOS, images, or text"));
+        assert!(expanded.contains("drop files"));
+        assert!(expanded.contains("to attach"));
     }
 
     #[test]

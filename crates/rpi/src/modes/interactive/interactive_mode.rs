@@ -46,7 +46,8 @@
 //!   #68 — the changelog asset in condensed or full form); the package-update
 //!   check (npm-registry probing, not a product endpoint) is not ported; the
 //!   startup version check and install telemetry landed with T14-W6a
-//!   (ADR-0002 §8); the tmux keyboard checks (unassigned) are not ported;
+//!   (ADR-0002 §8); the tmux keyboard checks landed with V17-10 #65
+//!   (`tmux_check`, async probe at startup);
 //!   the `loadedResourcesContainer` shows the merged diagnostics block only
 //!   (see `show_loaded_resources`).
 //! - `setRebindSession`/`setBeforeSessionInvalidate` runtime hooks stay
@@ -163,6 +164,7 @@ fn now_millis() -> u64 {
 #[allow(dead_code)]
 pub(crate) mod commands_selectors;
 pub(crate) mod component_registry;
+pub(crate) mod tmux_check;
 pub(crate) mod ui_bridge;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -481,6 +483,11 @@ pub(crate) enum UiCommand {
     /// Mode-internal: the startup version check found a newer release
     /// (interactive-mode.ts:843-847 → `showNewVersionNotification`).
     NewVersionAvailable(crate::core::version_check::LatestRpiRelease),
+    /// Mode-internal: the async tmux keyboard check resolved with a warning
+    /// (interactive-mode.ts:1180-1185 → `showWarning`). Routed through the
+    /// drain like every other async result (the chat container is mutated
+    /// on the driver thread).
+    ShowWarning(String),
     /// `/share`: the loader's `on_abort` (interactive-mode.ts:5549-5554) —
     /// kill gh, restore the editor, clean up, "Share cancelled".
     ShareAbort,
@@ -2892,6 +2899,12 @@ impl InteractiveUi {
                 // (interactive-mode.ts:843-847), routed through the drain
                 // like every other async result.
                 self.show_new_version_notification(&release);
+            }
+            UiCommand::ShowWarning(message) => {
+                // `checkTmuxKeyboardSetup().then((warning) => ...)`
+                // (interactive-mode.ts:1180-1185): the async probe result
+                // is appended on the driver thread.
+                self.show_warning(&message);
             }
             UiCommand::ShareAbort => {
                 // `loader.onAbort` (interactive-mode.ts:5549-5554): kill gh
@@ -5965,6 +5978,23 @@ impl InteractiveMode {
                 .await;
         }
 
+        // Check tmux keyboard setup asynchronously
+        // (interactive-mode.ts:1180-1185): the probe runs off the main loop
+        // and its warning, if any, is appended through the drain.
+        {
+            let ui = Arc::clone(&self.ui_state);
+            commands_selectors::spawn_async(async move {
+                let warning = tokio::task::spawn_blocking(|| {
+                    tmux_check::check_tmux_keyboard_setup(tmux_check::TMUX_CHECK_TIMEOUT)
+                })
+                .await
+                .unwrap_or(None);
+                if let Some(warning) = warning {
+                    ui.push(UiCommand::ShowWarning(warning));
+                }
+            });
+        }
+
         // Show startup warnings (interactive-mode.ts:872-885).
         if let Some(message) = self.options.model_fallback_message.clone() {
             self.ui_state.show_warning(&message);
@@ -7095,6 +7125,7 @@ mod tests {
             UiCommand::SwitchTuiMode(_) => "switch_tui_mode",
             UiCommand::GitBranchChanged => "git_branch_changed",
             UiCommand::NewVersionAvailable(_) => "new_version_available",
+            UiCommand::ShowWarning(_) => "show_warning",
             UiCommand::ShareAbort => "share_abort",
             UiCommand::ShareCompleted(_) => "share_completed",
             UiCommand::Dequeue => "dequeue",
@@ -12706,6 +12737,27 @@ mod tests {
         mode.show_startup_diagnostics();
         let after = chat_children(&mode.ui_state);
         assert_eq!(after, before + 1, "warning appended to the transcript");
+    }
+
+    /// V17-10 #65: the async tmux check warning reaches the transcript
+    /// through the drain with the `showWarning` "Warning: " prefix.
+    #[tokio::test]
+    async fn tmux_warning_command_renders_through_the_drain() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let before = chat_children(ui);
+        ui.push(UiCommand::ShowWarning(
+            crate::modes::interactive::interactive_mode::tmux_check::EXTENDED_KEYS_OFF_WARNING
+                .to_string(),
+        ));
+        ui.drain_events();
+        assert_eq!(chat_children(ui), before + 1, "warning appended");
+        let rendered = lock(&ui.chat_container).render(120).join("\n");
+        assert!(
+            rendered
+                .contains("Warning: tmux extended-keys is off. Modified Enter keys may not work."),
+            "showWarning prefix + verbatim upstream text: {rendered}"
+        );
     }
 
     /// Round-2 blocker: the transcript rebuild must carry the persisted

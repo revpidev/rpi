@@ -100,6 +100,9 @@ zstd = "0.13"
 # T06 built-in tools (rpi/src/tools/).
 unicode-normalization = "0.1"   # NFKC/NFD for edit fuzzy matching + read path variants
 libc = "0.2"                    # unix process-group kill (bash kill tree)
+# V17-10 #69: Windows console API for ENABLE_VIRTUAL_TERMINAL_INPUT (the
+# `win32-console-mode.node` helper replacement). Windows-target only.
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Console"] }
 base64 = "0.22"                 # read tool image attachments; google-vertex ADC JWT encoding (T13)
 ring = "0.17"                   # RS256 signing for google-vertex ADC service-account JWT (T13)
 # Pure-Rust image decode/encode/resize for the read tool (replaces upstream Photon WASM).

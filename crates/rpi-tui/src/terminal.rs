@@ -72,17 +72,18 @@
 //!   is a terminal and otherwise fails fast into the COLUMNS/LINES/default
 //!   chain of `columns()`/`rows()`.
 //! - Windows `ENABLE_VIRTUAL_TERMINAL_INPUT`: upstream loads a native Node
-//!   helper (`win32-console-mode.node`, terminal.ts:338-366); crossterm's
-//!   raw mode does not set this flag and no native helper is bundled, so on
-//!   Windows Shift+Tab arrives as plain `\t` (same gap class as
-//!   `native_modifiers.rs`).
+//!   helper (`win32-console-mode.node`, terminal.ts:338-366); the port
+//!   implements the flag itself through the Windows console API
+//!   (V17-10 #69; `enable_windows_vt_input`, set after raw mode and
+//!   restored on `stop()`), so Shift+Tab reaches the parser as `\x1b[Z`.
+//!   Failure stays silent, keeping the upstream addon-missing fallback
+//!   (plain `\t`).
 //! - Native Shift+Enter normalization (Apple Terminal on macOS, all consoles
 //!   on Windows — 73dd066ee) is wired exactly like upstream
-//!   (`forwardInputSequence`, terminal.ts:317-327 @ 4181f66), but
-//!   `is_native_modifier_pressed` always returns `false` in this port (see
-//!   `native_modifiers.rs`; ADR-0004 keeps the upstream addon-missing fallback
-//!   branch), so the normalization can never fire until a native binding
-//!   exists.
+//!   (`forwardInputSequence`, terminal.ts:317-327 @ 4181f66);
+//!   `is_native_modifier_pressed` now queries CoreGraphics on macOS
+//!   (V17-10 #69) and keeps the upstream addon-missing fallback elsewhere
+//!   (see `native_modifiers.rs`; ADR-0004).
 //! - `drain_input` observes pending input by consuming and discarding queued
 //!   channel events; upstream attaches a side listener that only timestamps
 //!   arrivals (terminal.ts:385-389). Both leave the drained bytes unhandled;
@@ -470,6 +471,94 @@ fn default_query_size() -> io::Result<(u16, u16)> {
     }
 }
 
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT` (wincon.h, 0x0200; terminal.ts:420-431
+/// @ `abe508e1b`): without it Windows consoles lose modifier state and
+/// Shift+Tab arrives as plain `\t` instead of `\x1b[Z`.
+#[cfg(any(windows, test))]
+const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+/// Enables [`ENABLE_VIRTUAL_TERMINAL_INPUT`] through the console-mode
+/// accessors (upstream `enableWindowsVTInput`, terminal.ts:420-431):
+/// returns the previous mode when it was changed, so `stop()` can restore
+/// it, and `None` when the flag was already set, the query failed, or the
+/// update failed (silent fallback, upstream try/catch). The accessors are
+/// injected so the set/restore bookkeeping is testable off-Windows.
+#[cfg(any(windows, test))]
+fn apply_virtual_terminal_input(
+    mut get_mode: impl FnMut() -> Option<u32>,
+    mut set_mode: impl FnMut(u32) -> bool,
+) -> Option<u32> {
+    let previous = get_mode()?;
+    let updated = previous | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    if updated == previous {
+        return None;
+    }
+    if !set_mode(updated) {
+        return None;
+    }
+    Some(previous)
+}
+
+/// Restores a console input mode captured by [`apply_virtual_terminal_input`]
+/// (best-effort; a failure leaves the console as-is).
+#[cfg(any(windows, test))]
+fn restore_virtual_terminal_input(previous: u32, mut set_mode: impl FnMut(u32) -> bool) {
+    let _ = set_mode(previous);
+}
+
+/// The Windows console API bindings (V17-10 #69): the upstream helper's
+/// `enableVirtualTerminalInput` reads and writes the stdin console mode.
+#[cfg(windows)]
+mod win_console {
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+
+    /// The stdin console handle (`None` when detached / invalid).
+    fn input_handle() -> Option<HANDLE> {
+        // SAFETY: `GetStdHandle` is a trivial accessor with no pointers.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        Some(handle)
+    }
+
+    /// `GetConsoleMode` on the stdin handle.
+    pub(super) fn get_input_mode() -> Option<u32> {
+        let handle = input_handle()?;
+        let mut mode = 0u32;
+        // SAFETY: `handle` is a valid console handle and `mode` is a live
+        // out-pointer for the call.
+        let ok = unsafe { GetConsoleMode(handle, &mut mode) };
+        (ok != 0).then_some(mode)
+    }
+
+    /// `SetConsoleMode` on the stdin handle.
+    pub(super) fn set_input_mode(mode: u32) -> bool {
+        let Some(handle) = input_handle() else {
+            return false;
+        };
+        // SAFETY: same as `get_input_mode`.
+        unsafe { SetConsoleMode(handle, mode) != 0 }
+    }
+}
+
+/// Applies the VT-input flag on Windows (upstream
+/// `enableWindowsVTInput`, terminal.ts:420-431): silent on failure.
+#[cfg(windows)]
+fn enable_windows_vt_input() -> Option<u32> {
+    apply_virtual_terminal_input(win_console::get_input_mode, win_console::set_input_mode)
+}
+
+/// Restores the Windows console input mode (issue #69: "restoring the
+/// previous mode on shutdown").
+#[cfg(windows)]
+fn restore_windows_console_mode(previous: u32) {
+    restore_virtual_terminal_input(previous, win_console::set_input_mode);
+}
+
 /// Real terminal on process stdin/stdout (upstream `ProcessTerminal`,
 /// terminal.ts:99-531), based on crossterm for raw mode and size queries.
 ///
@@ -489,6 +578,12 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
     /// fix).
     owns_raw_mode: bool,
     was_raw: bool,
+    /// Windows console input mode captured before
+    /// `ENABLE_VIRTUAL_TERMINAL_INPUT` was added (upstream
+    /// `enableWindowsVTInput`, terminal.ts:420-431); restored in `stop()`.
+    /// `None` = not Windows / never applied / the flag was already set.
+    #[cfg(windows)]
+    windows_console_mode: Option<u32>,
     /// Raw mode was toggled by `start()`; guards raw restore in `stop()`
     /// (upstream calls `setRawMode` unconditionally, which is a no-op there
     /// when stdin was never resumed).
@@ -555,6 +650,8 @@ impl<W: Write> ProcessTerminal<W> {
             write_log_path: resolve_write_log_path(),
             owns_raw_mode: false,
             was_raw: false,
+            #[cfg(windows)]
+            windows_console_mode: None,
             started: false,
             input_handler: None,
             resize_handler: None,
@@ -1001,9 +1098,13 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         // ioctl on every `size()` call, so there is no stale cache to
         // refresh.
         //
-        // Upstream `enableWindowsVTInput` (terminal.ts:338-366) loads a
-        // native Node helper to set ENABLE_VIRTUAL_TERMINAL_INPUT; no
-        // equivalent binding is bundled in this port (see header note).
+        // Upstream `enableWindowsVTInput` (terminal.ts:215-219/420-431):
+        // must run AFTER `setRawMode(true)` — raw mode resets the console
+        // mode flags. Process terminals only, like raw mode itself.
+        #[cfg(windows)]
+        if self.owns_raw_mode && self.windows_console_mode.is_none() {
+            self.windows_console_mode = enable_windows_vt_input();
+        }
 
         self.query_and_enable_kitty_protocol();
         Self::spawn_stdin_reader();
@@ -1072,6 +1173,14 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
                 };
             }
             self.started = false;
+        }
+
+        // Restore the Windows console input mode AFTER the raw-mode
+        // restore (crossterm rewrites the console mode, which would clear
+        // the captured flag again) — issue #69.
+        #[cfg(windows)]
+        if let Some(previous) = self.windows_console_mode.take() {
+            restore_windows_console_mode(previous);
         }
     }
 
@@ -1982,6 +2091,65 @@ mod tests {
         terminal.set_query_size(|| Ok((80, 24)));
         terminal.start(Box::new(|_| {}), Box::new(|| {}));
         terminal.stop();
+    }
+
+    /// V17-10 #69: the Windows VT-input flag is added when absent and the
+    /// previous mode is captured for `stop()`; the console accessors are
+    /// injected so the bookkeeping is testable off-Windows.
+    #[test]
+    fn virtual_terminal_input_sets_and_captures_the_previous_mode() {
+        let mut set_calls = Vec::new();
+        let previous = apply_virtual_terminal_input(
+            || Some(0x0080),
+            |mode| {
+                set_calls.push(mode);
+                true
+            },
+        );
+        assert_eq!(previous, Some(0x0080));
+        assert_eq!(set_calls, vec![0x0080 | ENABLE_VIRTUAL_TERMINAL_INPUT]);
+        let mut restored = Vec::new();
+        restore_virtual_terminal_input(0x0080, |mode| {
+            restored.push(mode);
+            true
+        });
+        assert_eq!(restored, vec![0x0080], "stop() restores the captured mode");
+    }
+
+    #[test]
+    fn virtual_terminal_input_is_a_noop_when_already_set() {
+        let mut sets = 0;
+        let previous = apply_virtual_terminal_input(
+            || Some(ENABLE_VIRTUAL_TERMINAL_INPUT),
+            |_| {
+                sets += 1;
+                true
+            },
+        );
+        assert_eq!(previous, None, "nothing to restore");
+        assert_eq!(sets, 0, "the flag was already set");
+    }
+
+    #[test]
+    fn virtual_terminal_input_failures_are_silent() {
+        assert_eq!(
+            apply_virtual_terminal_input(|| None, |_| true),
+            None,
+            "a failed console-mode query is a silent fallback"
+        );
+        let mut sets = 0;
+        assert_eq!(
+            apply_virtual_terminal_input(
+                || Some(0),
+                |_| {
+                    sets += 1;
+                    false
+                }
+            ),
+            None,
+            "a failed set is not recorded for restore"
+        );
+        assert_eq!(sets, 1);
     }
 
     /// Regression: all started terminals share ONE process-global stdin

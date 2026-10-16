@@ -21,3 +21,7 @@ comrak.workspace = true
 [dev-dependencies]
 rpi-test-support.workspace = true
 rpi-test-env.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# V17-10 #69: ENABLE_VIRTUAL_TERMINAL_INPUT via GetConsoleMode/SetConsoleMode.
+windows-sys.workspace = true

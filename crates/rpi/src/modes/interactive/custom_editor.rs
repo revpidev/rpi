@@ -114,6 +114,13 @@ impl CustomEditor {
         self.editor.get_text()
     }
 
+    /// Cursor position (`getCursor`, editor.ts:1110): (line, col) in
+    /// characters. Used by the clipboard file-path spacing rule
+    /// (interactive-mode.ts:3160-3165, V17-10).
+    pub fn get_cursor(&self) -> (usize, usize) {
+        self.editor.get_cursor()
+    }
+
     /// `pasteToEditor` (types.ts:212): full paste handling (large-paste
     /// collapse) via the inner editor's paste path.
     pub fn paste_text(&mut self, text: &str) {
