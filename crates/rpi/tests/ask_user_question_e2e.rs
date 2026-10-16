@@ -924,7 +924,8 @@ async fn tui_type_something_custom_answer_with_ctrl_u() {
 /// q1 multi-select confirmed with an EMPTY selection (Next row, zero
 /// toggles) → `"(no input)"`; q2 deliberately skipped via Tab; q3 answered
 /// with a per-question note (`n` on the question tab). Partial submit: the
-/// unanswered q2 produces no segment, empty multi still does.
+/// partial submit with an empty multi: the skipped q2 is named in the
+/// `unanswered:` segment, the empty multi still keeps its own segment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tui_partial_submit_empty_multi_and_question_note() {
     let params = json!({
@@ -993,15 +994,18 @@ async fn tui_partial_submit_empty_multi_and_question_note() {
     let (result, _bus) = fixture.finish().await;
     assert_eq!(result["details"]["cancelled"], json!(false));
     // Envelope: q1 empty multi keeps its segment with the placeholder,
-    // q2 produces none, q3 carries the `user notes:` suffix.
+    // q2 is named in the `unanswered:` segment (#291), q3 carries the
+    // `user notes:` suffix.
     assert_eq!(
         result["content"][0]["text"],
         concat!(
             "User has answered your questions: \"Pick many?\"=\"(no input)\". ",
             "\"Pick one?\"=\"Alpha\". user notes: kept for later. ",
+            "unanswered: \"Skip me?\". ",
             "You can now continue with the user's answers in mind."
         )
     );
+    assert_eq!(result["details"]["unanswered"], json!([1]));
     // details: q1 (questionIndex 0) = empty multi, q3 (questionIndex 2) =
     // option + notes; no entry for the skipped q2 (questionIndex 1).
     let answers = &result["details"]["answers"];
