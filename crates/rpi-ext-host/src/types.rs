@@ -1099,10 +1099,10 @@ pub struct ThinkingLevelSelectEvent {
 }
 
 // ============================================================================
-// User bash events (types.ts:802-815)
+// User bash events (types.ts:1121-1148 @ abe508e1b)
 // ============================================================================
 
-/// `UserBashEvent` (types.ts:807-815).
+/// `UserBashEvent` (types.ts:1125-1133 @ abe508e1b).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserBashEvent {
@@ -1111,10 +1111,10 @@ pub struct UserBashEvent {
     pub cwd: String,
 }
 
-/// `UserBashEventResult` (types.ts:1072-1077). `operations` / `result` are
-/// the upstream `BashOperations` / `BashResult` JSON. Since V17-11 the
-/// `operations` arm carries a declarative [`UserBashOperations`] policy
-/// (the closure bundle cannot cross the JSON boundary).
+/// `UserBashEventResult` (types.ts:1438-1448 @ abe508e1b). `operations` /
+/// `result` are the upstream `BashOperations` / `BashResult` JSON. Since
+/// V17-11 the `operations` arm carries a declarative [`UserBashOperations`]
+/// policy (the closure bundle cannot cross the JSON boundary).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserBashEventResult {

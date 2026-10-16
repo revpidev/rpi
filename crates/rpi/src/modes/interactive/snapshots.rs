@@ -48,7 +48,7 @@ fn snapshot_dir() -> PathBuf {
 
 /// Compare `lines` against `tests/snapshots/<name>.snap`; rewrite the golden
 /// when `RPI_UPDATE_SNAPSHOTS=1` is set.
-fn assert_snapshot(name: &str, lines: &[String]) {
+pub(crate) fn assert_snapshot(name: &str, lines: &[String]) {
     let actual = format!("{}\n", lines.join("\n"));
     let path = snapshot_dir().join(format!("{name}.snap"));
 
@@ -503,4 +503,84 @@ fn editor_border_opt_out_keeps_plain_border_and_standalone_row() {
         "editor_border_opt_out_keeps_plain_border_and_standalone_row",
         &lines,
     );
+}
+
+// --- loadedResources frames (V17-11 FR-C R4; new frames, G14) ---------------
+
+#[test]
+fn loaded_resources_diagnostics_blocks() {
+    use crate::core::skills::{DiagnosticKind, DiagnosticResourceType, ResourceCollision};
+    use crate::modes::interactive::interactive_mode::{
+        LoadedDiagnostic, render_loaded_diagnostics,
+    };
+
+    let entries = vec![
+        LoadedDiagnostic {
+            kind: DiagnosticKind::Collision,
+            message: "skill name collision".to_owned(),
+            path: None,
+            collision: Some(ResourceCollision {
+                resource_type: DiagnosticResourceType::Skill,
+                name: "review".to_owned(),
+                winner_path: PathBuf::from("/home/user/.rpi/agent/skills/review/SKILL.md"),
+                loser_path: PathBuf::from("/repo/.rpi/skills/review/SKILL.md"),
+                winner_source: None,
+                loser_source: None,
+            }),
+        },
+        LoadedDiagnostic {
+            kind: DiagnosticKind::Error,
+            message: "Failed to parse frontmatter".to_owned(),
+            path: Some("/repo/.rpi/prompts/broken.md".to_owned()),
+            collision: None,
+        },
+        LoadedDiagnostic {
+            kind: DiagnosticKind::Warning,
+            message: "theme path does not exist".to_owned(),
+            path: Some("/repo/.rpi/themes/missing.json".to_owned()),
+            collision: None,
+        },
+    ];
+    let rendered = render_loaded_diagnostics(&dark_theme(), &entries);
+    let lines: Vec<String> = rendered.split('\n').map(str::to_string).collect();
+    assert_snapshot("loaded_resources_diagnostics_blocks", &lines);
+}
+
+#[test]
+fn loaded_resources_scope_groups() {
+    use crate::core::skills::{SourceInfo, SourceOrigin, SourceScope};
+    use crate::modes::interactive::interactive_mode::scope_group_lines;
+
+    let info = |scope: SourceScope, source: &str| SourceInfo {
+        path: PathBuf::from("/resources/skill.md"),
+        source: source.to_owned(),
+        scope,
+        origin: SourceOrigin::TopLevel,
+        base_dir: None,
+    };
+    let items = vec![
+        (
+            "/home/user/.rpi/agent/skills/local.md".to_owned(),
+            Some(info(SourceScope::User, "local")),
+        ),
+        (
+            "/repo/.rpi/skills/project.md".to_owned(),
+            Some(info(SourceScope::Project, "local")),
+        ),
+        (
+            "/repo/node_modules/@scope/pkg/skill.md".to_owned(),
+            Some(info(SourceScope::Project, "npm:@scope/pkg")),
+        ),
+        (
+            "/tmp/cli-skill.md".to_owned(),
+            Some(info(SourceScope::Temporary, "cli")),
+        ),
+        ("/repo/prompts/review.md".to_owned(), None),
+    ];
+    let theme = dark_theme();
+    let lines: Vec<String> = scope_group_lines(&items)
+        .iter()
+        .map(|(color, text)| theme.fg(color, text))
+        .collect();
+    assert_snapshot("loaded_resources_scope_groups", &lines);
 }

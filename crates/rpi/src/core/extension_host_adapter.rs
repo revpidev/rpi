@@ -13,9 +13,12 @@
 //! - `emit_project_trust` handler errors are routed to `emit_error`
 //!   listeners; upstream reports them through a mode callback as a
 //!   formatted string (project-trust.ts:60-62).
-//! - `user_bash` custom `operations` (a closure bundle upstream) cannot
-//!   cross the JSON dispatch boundary and are dropped with a warning;
-//!   the full-replacement `result` branch works (candidate deviation).
+//! - `user_bash` `operations` is the declarative V17-11 policy
+//!   (`{ rules: [{pattern, action: allow|deny|rewrite}] }`): the upstream
+//!   `exec` closure bundle cannot cross the JSON boundary, so a declarative
+//!   policy is interpreted here (first match wins, no match denies) and a
+//!   malformed policy fails the command closed (ADR-0007 gap 1, D-048
+//!   item 2). The full-replacement `result` branch is unchanged.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

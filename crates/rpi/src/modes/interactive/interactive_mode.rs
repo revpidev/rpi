@@ -5410,15 +5410,15 @@ impl InteractiveUi {
 /// `LoadedExtensions::errors`; this shape carries the category and the
 /// collision detail across the `ThemedText` render boundary.
 #[derive(Debug, Clone)]
-struct LoadedDiagnostic {
-    kind: crate::core::skills::DiagnosticKind,
-    message: String,
-    path: Option<String>,
-    collision: Option<crate::core::skills::ResourceCollision>,
+pub(crate) struct LoadedDiagnostic {
+    pub(crate) kind: crate::core::skills::DiagnosticKind,
+    pub(crate) message: String,
+    pub(crate) path: Option<String>,
+    pub(crate) collision: Option<crate::core::skills::ResourceCollision>,
 }
 
 impl LoadedDiagnostic {
-    fn from_resource(diagnostic: crate::core::skills::ResourceDiagnostic) -> Self {
+    pub(crate) fn from_resource(diagnostic: crate::core::skills::ResourceDiagnostic) -> Self {
         Self {
             kind: diagnostic.kind,
             message: diagnostic.message,
@@ -5432,7 +5432,7 @@ impl LoadedDiagnostic {
 /// group by resource name (winner marked with the success glyph, losers with
 /// the warning glyph + `(skipped)`), the rest render as `path` + optional
 /// message colored by kind (error vs warning).
-fn render_loaded_diagnostics(
+pub(crate) fn render_loaded_diagnostics(
     theme: &crate::core::themes::Theme,
     entries: &[LoadedDiagnostic],
 ) -> String {
@@ -5507,7 +5507,7 @@ fn render_loaded_diagnostics(
 /// group items into project → user → path (empty groups dropped), splitting
 /// `npm:`/`git:` package sources into a `source` sub-group. Returns themed
 /// `(color, text)` line pairs for the expandable section body.
-fn scope_group_lines(
+pub(crate) fn scope_group_lines(
     items: &[(String, Option<crate::core::skills::SourceInfo>)],
 ) -> Vec<(String, String)> {
     use crate::core::skills::SourceScope;
@@ -5571,7 +5571,7 @@ fn scope_group_lines(
     lines
 }
 
-/// `isExtensionCommand` (interactive-mode.ts:4017-4027).
+/// `isExtensionCommand` (interactive-mode.ts:4771-4779 @ abe508e1b).
 fn is_extension_command(runner: &Arc<dyn ExtensionRunner>, text: &str) -> bool {
     if !text.starts_with('/') {
         return false;
@@ -6808,24 +6808,73 @@ impl InteractiveMode {
         }
         self.ui_state.update_pending_messages_display();
 
+        // The restore helpers are shared by both branches: upstream wraps
+        // the whole body in try/catch -> restoreQueue
+        // (interactive-mode.ts:4801-4858, :4887-4891).
+        let restore_messages = |ui_state: &InteractiveUi, msgs: &[CompactionQueuedMessage]| {
+            *lock(&ui_state.compaction_queue) = msgs.to_vec();
+            ui_state.update_pending_messages_display();
+        };
+        let restore_queue = |ui_state: &InteractiveUi, error: &RpiError| {
+            ui_state.session().clear_queue();
+            restore_messages(ui_state, &messages);
+            ui_state.show_error(&format!(
+                "Failed to send queued message{}: {}",
+                if messages.len() > 1 { "s" } else { "" },
+                error.raw_message()
+            ));
+        };
+
         // When a retry is pending, queue every message for the retry turn
         // instead of flushing them into the aborted run
-        // (interactive-mode.ts:4801-4814).
+        // (interactive-mode.ts:4802-4815). A failed send restores the whole
+        // queue like the non-retry branch (upstream try/catch).
         if will_retry {
-            for message in messages {
-                if is_extension_command(&self.session.extension_runner(), &message.text) {
-                    self.prompt_or_shutdown(&message.text, PromptOptions::default())
-                        .await;
+            for message in &messages {
+                let result = if is_extension_command(
+                    &self.session.extension_runner(),
+                    &message.text,
+                ) {
+                    tokio::select! {
+                        biased;
+                        _ = self.shutdown_rx.changed() => {
+                            restore_messages(&self.ui_state, &messages);
+                            return;
+                        }
+                        result = self.session.prompt(&message.text, PromptOptions::default()) => {
+                            result.map(|_| ())
+                        }
+                    }
                 } else if message.mode == StreamingBehavior::FollowUp {
-                    let _ = self
-                        .session
-                        .follow_up(&message.text, None, InputSource::Interactive)
-                        .await;
+                    tokio::select! {
+                        biased;
+                        _ = self.shutdown_rx.changed() => {
+                            restore_messages(&self.ui_state, &messages);
+                            return;
+                        }
+                        result = self.session.follow_up(
+                            &message.text,
+                            None,
+                            InputSource::Interactive,
+                        ) => result.map(|_| ()),
+                    }
                 } else {
-                    let _ = self
-                        .session
-                        .steer(&message.text, None, InputSource::Interactive)
-                        .await;
+                    tokio::select! {
+                        biased;
+                        _ = self.shutdown_rx.changed() => {
+                            restore_messages(&self.ui_state, &messages);
+                            return;
+                        }
+                        result = self.session.steer(
+                            &message.text,
+                            None,
+                            InputSource::Interactive,
+                        ) => result.map(|_| ()),
+                    }
+                };
+                if let Err(error) = result {
+                    restore_queue(&self.ui_state, &error);
+                    return;
                 }
             }
             self.ui_state.update_pending_messages_display();
@@ -6864,20 +6913,6 @@ impl InteractiveMode {
         // they are not lost (the mode's shutdown path reports them via the
         // resume hint, and a subsequent `/resume` re-enqueues nothing — the
         // queue simply survives in memory until then).
-        let restore_messages = |ui_state: &InteractiveUi, msgs: &[CompactionQueuedMessage]| {
-            *lock(&ui_state.compaction_queue) = msgs.to_vec();
-            ui_state.update_pending_messages_display();
-        };
-        let restore_queue = |ui_state: &InteractiveUi, error: &RpiError| {
-            ui_state.session().clear_queue();
-            restore_messages(ui_state, &messages);
-            ui_state.show_error(&format!(
-                "Failed to send queued message{}: {}",
-                if messages.len() > 1 { "s" } else { "" },
-                error.raw_message()
-            ));
-        };
-
         let prompt_result = tokio::select! {
             // `biased`: an in-flight shutdown wins over a simultaneously
             // ready prompt result, so the queue restore below always runs.
@@ -10165,6 +10200,24 @@ mod tests {
         let queue = lock(&mode.ui_state.compaction_queue);
         let texts: Vec<&str> = queue.iter().map(|message| message.text.as_str()).collect();
         assert_eq!(texts, ["first msg", "second msg"], "queue restored");
+    }
+
+    /// V17-11 FR-A: the `willRetry` branch shares the non-retry branch's
+    /// restore-on-shutdown rule (upstream's try/catch restores the whole
+    /// queue in both branches).
+    #[tokio::test]
+    async fn flush_compaction_queue_will_retry_restores_on_shutdown() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        {
+            let ui = &mode.ui_state;
+            ui.queue_compaction_message("retry msg".to_string(), StreamingBehavior::Steer);
+        }
+        let _ = mode.ui_state.shutdown_tx.send(true);
+        mode.flush_compaction_queue(true).await;
+        let queue = lock(&mode.ui_state.compaction_queue);
+        let texts: Vec<&str> = queue.iter().map(|message| message.text.as_str()).collect();
+        assert_eq!(texts, ["retry msg"], "willRetry queue restored on shutdown");
     }
 
     /// Stub extension exposing one slash command plus an `input` handler that

@@ -1,0 +1,9 @@
+[38;2;167;152;215m  project[39m
+[38;2;126;136;142m    /repo/.rpi/skills/project.md[39m
+[38;2;126;136;142m    /repo/prompts/review.md[39m
+[38;2;105;173;208m    npm:@scope/pkg[39m
+[38;2;126;136;142m      /repo/node_modules/@scope/pkg/skill.md[39m
+[38;2;167;152;215m  user[39m
+[38;2;126;136;142m    /home/user/.rpi/agent/skills/local.md[39m
+[38;2;167;152;215m  path[39m
+[38;2;126;136;142m    /tmp/cli-skill.md[39m
