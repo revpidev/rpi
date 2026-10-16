@@ -24,7 +24,9 @@ pub(crate) const EXTENDED_KEYS_FORMAT_WARNING: &str = "tmux extended-keys-format
 /// `checkTmuxKeyboardSetup` (interactive-mode.ts:1281-1326 @ `abe508e1b`):
 /// `TMUX` gate, the two `tmux show -gv` queries in parallel, and the
 /// misconfiguration warnings. `None` = don't warn (no tmux, timeout,
-/// spawn failure, non-zero exit, or a correct configuration).
+/// spawn failure, non-zero exit, or a correct configuration). A successful
+/// query with empty output is a misconfiguration like upstream
+/// (`code === 0 ? stdout.trim() : undefined`, :1304 → :1317 warns).
 pub(crate) fn check_tmux_keyboard_setup(timeout: Duration) -> Option<String> {
     // `if (!process.env.TMUX) return undefined` (interactive-mode.ts:1282):
     // an empty value is falsy in JS.

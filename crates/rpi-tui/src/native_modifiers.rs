@@ -64,7 +64,8 @@ fn native_helper_supported() -> bool {
 /// `const helper = loadNativeModifiersHelper(); if (!helper) return false;
 /// try { return helper.isModifierPressed(key) === true; } catch { return
 /// false; }`. The `false` fallback also covers non-macOS platforms and
-/// unsupported architectures (ADR-0004: the addon-missing branch).
+/// unsupported architectures (ADR-0004: the helper-absent fallback
+/// branch).
 pub fn is_native_modifier_pressed(key: ModifierKey) -> bool {
     if !native_helper_supported() {
         return false;
@@ -156,7 +157,7 @@ mod tests {
 
     /// ADR-0004 fallback: platforms without the native helper always report
     /// `false` and never panic. On macOS the physical modifier state
-    /// decides, so the check is the addon-missing branch only.
+    /// decides, so the check is the helper-absent branch only.
     #[test]
     fn fallback_is_false_without_the_native_helper() {
         if native_helper_supported() {
