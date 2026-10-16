@@ -349,7 +349,7 @@ pub struct BuildArgsInput {
     pub child_agent_name: Option<String>,
     pub child_index: Option<usize>,
     pub parent_session_id: Option<String>,
-    /// Boundary block to prepend (None = fanout child gets the fanout variant).
+    /// Boundary block to append after the base prompt (`true` = fanout child gets the fanout variant; #2693).
     pub fanout_authorized: bool,
     /// This cdylib's path for child `--extension` injection (upstream's
     /// always-injected PROMPT_RUNTIME slot). `None` skips injection — used by

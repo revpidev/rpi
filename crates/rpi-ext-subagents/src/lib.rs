@@ -1,7 +1,8 @@
 //! rpi-subagents: delegation extension (L0 native plugin, TE04 P0 core).
 //!
-//! Port of pi-subagents v0.74.0 (b6bda32f, TE45/M0.75 rebase under ADR-0034;
-//! previously v0.70.0/b72714de at v0.1.5 and v0.66.0/0fc0eebb at v0.1.4,
+//! Port of pi-subagents v0.76.1 (7d072b91d, TE48/V17-00 rebase under ADR-0036;
+//! previously v0.74.0/b6bda32f at v0.1.6 (TE45/M0.75, ADR-0034),
+//! v0.70.0/b72714de at v0.1.5 and v0.66.0/0fc0eebb at v0.1.4,
 //! originally ported from v0.48.0/56f97234 — see per-file provenance
 //! headers) — registers the `subagent` tool
 //! (structured single delegation + management actions) and the `/run`,
