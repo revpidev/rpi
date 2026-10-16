@@ -57,8 +57,8 @@ pub fn home_dir() -> Option<PathBuf> {
     }
 }
 
-/// `RPI_CODING_AGENT_DIR` else `~/.rpi/agent` (ADR-0001; the statusline /
-/// mcp-adapter derivation). Unit tests may pin an isolated directory.
+/// `RPI_CODING_AGENT_DIR` else `~/.rpi/agent` (ADR-0001; the statusline
+/// derivation). Unit tests may pin an isolated directory.
 pub fn agent_dir() -> PathBuf {
     #[cfg(test)]
     {

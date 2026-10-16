@@ -1,5 +1,4 @@
-//! Private tokio runtime for the plugin (same shape as mcp-adapter's
-//! `runtime.rs`, design §2.3): the host calls the cdylib synchronously, so
+//! Private tokio runtime for the plugin (design §2.3): the host calls the cdylib synchronously, so
 //! async work (child process streaming) runs here and dispatch blocks on it.
 
 /// Plugin-owned runtime. Two worker threads cover stdout/stderr streaming and
@@ -11,7 +10,7 @@ pub struct PluginRuntime {
 
 impl PluginRuntime {
     /// Build the runtime; `None` when the tokio builder refuses (treated as a
-    /// load failure by the caller, mirroring mcp-adapter).
+    /// load failure by the caller).
     pub fn new() -> Option<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

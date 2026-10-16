@@ -28,9 +28,10 @@ fixtures/
 > recorded against `9841914` except the five `generated/` scenarios, re-recorded @ `19451accd`
 > with V15-06 (#9548); the pi submodule
 > at `19451accd` is the read source for those tasks. New **target tracks** (expectation source = new
-> pins, read-only snapshots): `fixtures/generated/subagents-parity-v070/` (v0.70.0 @ `b72714de`)
-> and the mcp v2.34.0+9 snapshot via `scripts/mcp-parity/TARGET-TRACK.md` — both start as skeleton
-> (TE37); the current-pin regression tracks (`subagents-parity-v066/`, default driver = submodule)
+> pins, read-only snapshots): `fixtures/generated/subagents-parity-v070/` (v0.70.0 @ `b72714de`);
+> the sibling mcp v2.34.0+9 target track (and its tracked record) was
+> retired together with the adapter in v0.1.7 (TE49, ADR-0037); the current-pin regression tracks
+> (`subagents-parity-v066/`, default driver = submodule)
 > stay green as the zero-regression baselines of the window.
 >
 > **Plugin rebases**: `external/pi-subagents` @ **`b72714de` (v0.70.0)** — switched atomically with TE39
@@ -41,12 +42,14 @@ fixtures/
 > the v0.66 snapshot reports under `subagents-parity-v066/` are retired (kept for history).
 > **The old-tag regression tracks (subagents v0.48.0 / mcp v2.24.0) reached end-of-life with the pin switch**:
 > historical reports are preserved under `fixtures/generated/subagents-parity/` (subagents — its
-> zero-regression red-line mission complete) and the pre-tag archived versions of
-> `fixtures/generated/mcp-parity/`, not deleted; driving the old tracks requires an old-pin worktree
+> zero-regression red-line mission complete); the mcp track's adapter-leg evidence was kept for
+> history until the adapter itself was removed in v0.1.7 (TE49, ADR-0037) — the remaining
+> `fixtures/generated/mcp-parity/` evidence is `builtin-parity-*` (built-in `rpi-mcp` vs upstream
+> `packages/mcp`). Driving the old subagents track requires an old-pin worktree
 > (`git -C external/pi-subagents checkout 56f97234`, reset afterwards).
-> The mcp-side target-track record is `scripts/mcp-parity/TARGET-TRACK.md` (the v0.1.4-era re-record was completed by
-> TE23/TE24, with goldens snapshotted against v2.32.1/`7a7b01b`; the v0.1.5 target track was re-recorded @
-> `97435aab` with TE40 — see the same file).
+> The mcp-side target-track record (the v0.1.4-era re-record by TE23/TE24 against v2.32.1/`7a7b01b`,
+> and the v0.1.5 re-record @ `97435aab` with TE40) was retired with the adapter; the live runbook
+> is `scripts/mcp-parity/README.md` (builtin-only).
 
 ## 2. Runbook (repeatable generation)
 

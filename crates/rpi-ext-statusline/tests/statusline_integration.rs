@@ -1,7 +1,7 @@
 //! Integration tests over the L0 carrier seam: install against a fake
 //! host (an `extern "C"` call recorder), drive events through the real
-//! `dispatch`, and assert the host-call traffic (mcp-adapter
-//! `install_for_test` precedent).
+//! `dispatch`, and assert the host-call traffic (`install_for_test`
+//! precedent).
 //!
 //! All scenarios share one process-global plugin install (the state is a
 //! `OnceLock`), so they run sequentially inside a single test — the

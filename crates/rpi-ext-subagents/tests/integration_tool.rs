@@ -1,7 +1,7 @@
 //! In-process tool surface integration: management actions, schema shape,
 //! ADR-0016/async rejections — against a fake host (`install_for_test`,
 //! one install per binary because of the OnceLock plugin state; the
-//! mcp-adapter `integration_wiring.rs` pattern).
+//! `integration_wiring` pattern).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,8 +51,8 @@ fn sandbox() -> PathBuf {
 }
 
 fn install(host: Arc<FakeHost>) {
-    // Keep the host alive for the process lifetime (mem::forget pattern from
-    // mcp-adapter integration_wiring.rs).
+    // Keep the host alive for the process lifetime (the `integration_wiring`
+    // mem::forget pattern).
     let response = rpi_ext_subagents::install_for_test(
         RpiHostCalls {
             call: fake_host_call,

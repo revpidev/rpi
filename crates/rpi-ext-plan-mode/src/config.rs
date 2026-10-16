@@ -63,7 +63,7 @@ impl Default for PlanModeConfig {
 }
 
 /// Home directory (`$HOME` on Unix, `%USERPROFILE%` on Windows — the
-/// rpi-todo / mcp-adapter convention).
+/// rpi-todo convention).
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {

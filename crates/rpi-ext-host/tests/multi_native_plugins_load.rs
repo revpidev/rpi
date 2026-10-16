@@ -8,9 +8,13 @@
 //! in `native::load_native_plugin` fixed it; this test pins it.
 //!
 //! Packaging mirrors l0_load.rs: copies each cdylib from target/debug into
-//! a throwaway package dir with its crate manifest. Skips when the cdylibs
-//! are missing (build first: `cargo build -p rpi-ext-smart-fetch -p
-//! rpi-ext-subagents -p rpi-ext-mcp-adapter`).
+//! a throwaway package dir with its crate manifest. The cdylibs are built
+//! by `cargo build` (G1) before the test gate (G2); a missing artifact is
+//! a hard failure, never a silent skip (TE49 FR-A: no skip path).
+//!
+//! Carriers (TE49): rpi-ext-subagents / rpi-ext-todo / rpi-ext-smart-fetch
+//! — three first-party cdylibs with disjoint tool sets. The previous third
+//! carrier was removed with its crate (ADR-0037).
 
 use std::path::{Path, PathBuf};
 
@@ -28,19 +32,24 @@ fn target_dir() -> PathBuf {
 }
 
 /// One packaged plugin: temp dir + crate manifest + the release of
-/// `librpi_ext_<name>.so` from target/debug.
-fn package(tag: &str, spec: &str, plugin_root: &Path) -> Option<PathBuf> {
+/// `librpi_ext_<name>.so` from target/debug. Hard-fails when the cdylib is
+/// missing (run `cargo build -p rpi-ext-<name>` / `cargo test --workspace`
+/// after a workspace build first) — the pre-TE49 silent skip hid the test.
+fn package(tag: &str, spec: &str, plugin_root: &Path) -> PathBuf {
     let so = target_dir()
         .join("debug")
         .join(format!("librpi_ext_{}.so", spec.replace('-', "_")));
-    if !so.is_file() {
-        eprintln!(
-            "skipping: cdylib missing at {} — build the plugin crates first",
-            so.display()
-        );
-        return None;
-    }
+    assert!(
+        so.is_file(),
+        "cdylib missing at {} — build it first: cargo build -p rpi-ext-{spec}",
+        so.display()
+    );
     let manifest = plugin_root.join(format!("crates/rpi-ext-{spec}/rpi-extension.json"));
+    assert!(
+        manifest.is_file(),
+        "plugin manifest missing at {}",
+        manifest.display()
+    );
     let dir = std::env::temp_dir().join(format!(
         "rpi-multi-native-{}-{}-{}",
         tag,
@@ -53,7 +62,7 @@ fn package(tag: &str, spec: &str, plugin_root: &Path) -> Option<PathBuf> {
     std::fs::create_dir_all(&dir).expect("temp package dir");
     std::fs::copy(&so, dir.join(so.file_name().unwrap())).expect("copy cdylib");
     std::fs::copy(&manifest, dir.join("rpi-extension.json")).expect("copy manifest");
-    Some(dir)
+    dir
 }
 
 fn cleanup(dirs: &[PathBuf]) {
@@ -64,15 +73,6 @@ fn cleanup(dirs: &[PathBuf]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_native_plugin_gets_its_own_module_table() {
-    // Isolate from the AMBIENT user MCP config: on a machine with configured
-    // MCP servers (e.g. a developer box running the tavily gateway) the
-    // adapter would register their direct proxy tools at load time and the
-    // `vec!["mcp"]` assertion below fails — a pre-existing isolation gap
-    // (noted at TE13 §7, resurfaced by the TE37 gate re-run). The adapter's
-    // designed test seam `MCP_DIRECT_TOOLS=__none__` suppresses direct-tool
-    // resolution; this binary runs a single test, so the process-wide env is
-    // contained (TE37 hardening).
-    rpi_test_env::set_var("MCP_DIRECT_TOOLS", "__none__");
     // The subagents cdylib splits on `RPI_SUBAGENT_CHILD` at load time: a
     // gate run from inside a subagent session (ambient RPI_SUBAGENT_CHILD=1)
     // would load it in child mode and register only `contact_supervisor`.
@@ -91,18 +91,10 @@ async fn each_native_plugin_gets_its_own_module_table() {
     let plugin_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let Some(subagents) = package("a", "subagents", &plugin_root) else {
-        return;
-    };
-    let Some(mcp) = package("b", "mcp-adapter", &plugin_root) else {
-        cleanup(&[subagents]);
-        return;
-    };
-    let Some(smart_fetch) = package("c", "smart-fetch", &plugin_root) else {
-        cleanup(&[subagents, mcp]);
-        return;
-    };
-    let paths = [subagents.clone(), mcp.clone(), smart_fetch.clone()];
+    let subagents = package("a", "subagents", &plugin_root);
+    let todo = package("b", "todo", &plugin_root);
+    let smart_fetch = package("c", "smart-fetch", &plugin_root);
+    let paths = [subagents.clone(), todo.clone(), smart_fetch.clone()];
 
     // subagents FIRST on purpose: the memoization bug returned the first
     // loaded module for every path, so with this order a regression makes
@@ -128,27 +120,35 @@ async fn each_native_plugin_gets_its_own_module_table() {
         "subagents tools belong to the subagents extension"
     );
     assert_eq!(
-        tools_of("librpi_ext_mcp_adapter.so"),
-        vec!["mcp"],
-        "mcp-adapter registers only the mcp proxy tool"
+        tools_of("librpi_ext_todo.so"),
+        vec!["todo"],
+        "todo tool belongs to the todo extension"
     );
     assert_eq!(
         tools_of("librpi_ext_smart_fetch.so"),
         vec!["web_fetch", "batch_web_fetch"],
         "smart-fetch registers its two tools"
     );
-    // The commands face too (subagents is the only command registrar).
-    let subagents_commands: Vec<String> = exts
-        .iter()
-        .find(|ext| ext.path.ends_with("librpi_ext_subagents.so"))
-        .unwrap()
-        .commands()
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect();
+    // The commands face too (subagents and todo are command registrars).
+    let commands_of = |so_suffix: &str| -> Vec<String> {
+        exts.iter()
+            .find(|ext| ext.path.ends_with(so_suffix))
+            .unwrap_or_else(|| panic!("extension for {so_suffix} missing"))
+            .commands()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    let subagents_commands = commands_of("librpi_ext_subagents.so");
     assert!(
         subagents_commands.iter().any(|c| c == "subagents"),
         "subagents commands registered on the right extension: {subagents_commands:?}"
+    );
+    let todo_commands = commands_of("librpi_ext_todo.so");
+    assert_eq!(
+        todo_commands,
+        vec!["todos"],
+        "todo commands belong to the todo extension"
     );
 
     cleanup(&paths);

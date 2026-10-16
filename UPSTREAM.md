@@ -17,7 +17,6 @@ Plugin reference pins (move only via the same ADR process; verified by `scripts/
 | Submodule | Git commit | Upstream tag |
 |------|-------|------|
 | `external/pi-subagents` | `7d072b91dca7e1aa915282f0159cec0175d65efa` | v0.76.1 |
-| `external/pi-mcp-adapter` | `5884ac4e45f5834f51ab8914f61b6a36a6a0a51b` | v4.0.0 |
 | `external/rpiv-mono` | `afc21bc25f7d07cae9fb3103dc309240a16b9f49` | v2.13.8 |
 | `external/agent-smart-fetch` | `b01116124971de44f16a4477e34c06ba2ab1d0bf` | v0.3.17 |
 

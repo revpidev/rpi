@@ -48,7 +48,7 @@ it is in scope.
 | `crates/rpi-tui` | Terminal UI library (rendering, widgets, mouse, theming) |
 | `crates/rpi-ext-*` | First-party L0 extension crates shipped as `.rpix` — **lockstep** with the workspace version (`version.workspace = true`) |
 | `crates/rpi-ext-host` / `rpi-ext-sdk` | Extension host ABI and SDK used by plugins |
-| `external/` | **Pinned, read-only upstream references** (git submodules): `pi` (gold standard), `pi-subagents`, `pi-mcp-adapter`, `agent-smart-fetch`, `rpiv-mono`. Never commit changes inside `external/`. |
+| `external/` | **Pinned, read-only upstream references** (git submodules): `pi` (gold standard), `pi-subagents`, `agent-smart-fetch`, `rpiv-mono`. Never commit changes inside `external/`. |
 | `vendor/syntect` | Patched fork of syntect (visibility patches for the build-time grammar rewrite, issue #47). Any new patch must be documented in `vendor/syntect/PATCHES.md`. |
 | `fixtures/` | Recorded golden data (sessions, themes, upstream snapshots). Re-recording follows the documented runbooks. |
 | `scripts/` | Parity harnesses (`subagents-parity`, `mcp-parity`, `interactive-ui-parity`, …) and release tooling (`unwrap-release-notes.py`). |
@@ -61,8 +61,9 @@ it is in scope.
    `UPSTREAM.md` (currently `abe508e1b`, Pi v1.1.0). Behavior changes that
    diverge from upstream require an ADR first (registered in the docs
    repository). The red-line pins (`abe508e1b` / subagents `7d072b91d` /
-   mcp-adapter `5884ac4e` / smart-fetch `b0111612` / rpiv-mono `7c9bc924`)
-   move only via the documented rebase process, never opportunistically.
+   smart-fetch `b0111612` / rpiv-mono `afc21bc2`) move only via the documented
+   rebase process, never opportunistically. (mcp-adapter was removed from the
+   pin set with ADR-0037, TE49.)
 2. **Quality gates are local and mandatory.** CI builds releases but is not
    the test gate (see the rc.12 note in `changes/v0.1.4.md`). Before every
    merge, run and pass:

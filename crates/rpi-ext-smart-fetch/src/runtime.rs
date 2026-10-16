@@ -1,5 +1,5 @@
-//! Private tokio runtime for the plugin (same shape as mcp-adapter's and
-//! subagents' `runtime.rs`, design §2.2): the host calls the cdylib
+//! Private tokio runtime for the plugin (same shape as subagents'
+//! `runtime.rs`, design §2.2): the host calls the cdylib
 //! synchronously, so the async wreq pipeline runs here and dispatch blocks
 //! on it. Not shared with the host runtime — no cross-runtime handles.
 

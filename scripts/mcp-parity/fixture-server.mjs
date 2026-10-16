@@ -1,13 +1,15 @@
 #!/usr/bin/env node
-// Node twin of `crates/rpi-ext-mcp-adapter/examples/fixture_stdio_server.rs`
-// for the cross-implementation parity harness (design §5.2).
+// Shared fixture MCP server for the built-in MCP parity harness (V16-08 G3):
+// the Node side both parity clients spawn, driving the built-in `rpi-mcp`
+// client and the upstream `packages/mcp` client over stdio (design §5.2).
 //
 // Both sides of the parity run (upstream Node McpServerManager and the rpi
-// Rust crate) talk to byte-identical fixture servers, so any difference in
-// the recorded frame transcripts or result JSON is attributable to the
-// client implementations alone.
+// Rust crate) talk to the same fixture server, so any difference in the
+// recorded frame transcripts or result JSON is attributable to the
+// client implementations alone. (The former adapter parity harness shared
+// this file too; it was removed with its crate in v0.1.7.)
 //
-// Responses mirror the Rust fixture server exactly (initialize → 2025-03-26
+// Responses are deterministic (initialize → 2025-03-26
 // + resources/prompts capabilities + "fixture instructions"; tools echo/fail;
 // fixture://config resource; standup prompt; -32601 for anything else).
 //

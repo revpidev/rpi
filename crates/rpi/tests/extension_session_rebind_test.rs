@@ -57,7 +57,7 @@ struct Fixture {
 }
 
 /// Mirrors the app.rs `create_runtime` wiring: a FRESH host per creation,
-/// extension tool registered at activate (the mcp-adapter shape), actions
+/// extension tool registered at activate (the native plugin shape), actions
 /// bound right after session construction.
 async fn fixture() -> Fixture {
     let tmp = TempDir::new();

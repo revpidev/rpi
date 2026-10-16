@@ -60,7 +60,7 @@ pub struct AskUserQuestionConfig {
 }
 
 /// Home directory (`$HOME` on Unix, `%USERPROFILE%` on Windows — the
-/// mcp-adapter `home_dir` convention).
+/// `home_dir` convention).
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {

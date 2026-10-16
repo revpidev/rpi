@@ -156,8 +156,8 @@ function runRust(mode, modeFile) {
 
 let rustRunnerPath;
 // P2-9: the workspace's parity examples are uniquely named
-// (`subagents_parity_runner` / `mcp_adapter_parity_runner` /
-// `ask_user_question_parity_runner`), so cargo's shared
+// (`subagents_parity_runner` / `ask_user_question_parity_runner`), so
+// cargo's shared
 // target/debug/examples directory no longer collides. The private-path copy
 // is kept: it pins the exact binary this run executes regardless of any
 // concurrent builds.

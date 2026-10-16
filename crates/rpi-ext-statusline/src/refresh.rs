@@ -21,14 +21,14 @@ use crate::state::{EngineState, Snapshot};
 use crate::{AsyncHostCalls, ENGINE, host_ok};
 
 /// `ui.setStatus` key (the `status` placement channel). Distinct from the
-/// mcp-adapter's "mcp" key so both footers can coexist.
+/// legacy "mcp" status key so both footers can coexist.
 pub const STATUS_KEY: &str = "rpi-statusline";
 
 /// CC debounce: rapid changes batch together, the script runs once after
 /// they stop.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// UI-bridge retry cadence (mcp-adapter lib.rs:463-483 precedent: install
+/// UI-bridge retry cadence (install
 /// runs before the TUI binds the bridge).
 const BRIDGE_RETRY_INTERVAL: Duration = Duration::from_millis(1500);
 const BRIDGE_RETRIES: usize = 15;

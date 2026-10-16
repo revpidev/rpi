@@ -1,5 +1,4 @@
-//! Plugin-owned tokio runtime (mcp-adapter `src/runtime.rs` precedent,
-//! design §2.3 runtime model).
+//! Plugin-owned tokio runtime (design §2.3 runtime model).
 //!
 //! L0 dispatch runs synchronously on the host's calling thread, while the
 //! refresh loop (debounce / script execution / UI pushes) is a long-lived
@@ -8,13 +7,13 @@
 //! `block_on` after install — the dispatch path only does in-memory state
 //! updates plus a channel send (TE-D6 dispatch-blocking discipline).
 //!
-//! Cancellation: unlike mcp-adapter there is no session-scoped
+//! Cancellation: there is no session-scoped
 //! CancellationToken — cancellation is per-script
 //! ([`crate::runner::CancelToken`]) plus a generation counter in the
 //! refresh loop; `session_shutdown` stops the loop and `Drop` parks the
 //! runtime with `shutdown_background()`.
 
-/// Number of runtime worker threads (mcp-adapter precedent: 2).
+/// Number of runtime worker threads.
 const RUNTIME_WORKERS: usize = 2;
 
 /// The plugin's private tokio runtime.

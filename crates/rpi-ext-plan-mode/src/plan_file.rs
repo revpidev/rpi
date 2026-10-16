@@ -37,7 +37,7 @@ pub fn session_key(session_id: &str) -> String {
 
 /// Expand a leading `~` (alone or `~/...`) with the user's home directory
 /// (v0.1.6 review round 2). `~user` forms are left untouched (a relative
-/// path), matching the mcp-adapter `~/` convention.
+/// path), matching the `~/` convention.
 fn expand_tilde(path: &str) -> Option<PathBuf> {
     let trimmed = path.trim();
     if trimmed == "~" {

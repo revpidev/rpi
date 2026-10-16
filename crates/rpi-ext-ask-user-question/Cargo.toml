@@ -6,8 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 # rlib: all logic lives in the library for unit/parity tests; cdylib is the
-# distributed artifact loaded by rpi-ext-host's native loader (mcp-adapter
-# Cargo.toml precedent; design §1).
+# distributed artifact loaded by rpi-ext-host's native loader (design §1).
 [lib]
 crate-type = ["rlib", "cdylib"]
 

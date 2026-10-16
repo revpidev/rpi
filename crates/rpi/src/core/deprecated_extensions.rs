@@ -3,9 +3,11 @@
 //!
 //! v0.1.6 moved MCP into the host (`builtin:mcp`,
 //! [`crate::extensions::mcp`]), which retires the first-party
-//! `rpi-mcp-adapter` extension's reason to exist. The extension stays
-//! loadable — it is still the optional-replacement escape hatch for users
-//! who intentionally keep it — but it is deprecated:
+//! `rpi-mcp-adapter` extension's reason to exist; v0.1.7 removed the
+//! extension from the workspace and the registry entirely (ADR-0037,
+//! TE49), so it can no longer be installed again. An already-installed
+//! copy stays loadable for users who intentionally keep it, but it is
+//! deprecated:
 //!
 //! - every `rpi update` path (extension update included) skips it, so it is
 //!   never upgraded again ([`crate::core::package_manager`] consumes
@@ -35,10 +37,11 @@ pub struct DeprecatedExtension {
     pub replacement: &'static str,
 }
 
-/// Deprecated first-party extensions. Keep in sync with the official-site
-/// registry entries (`rpi-pages/registry/<name>.json`, `"deprecated": true`)
-/// and the release packaging list (`.github/workflows/build.yml`
-/// `EXT_CRATES` — deprecated extensions are no longer packaged).
+/// Deprecated first-party extensions. The official-site registry entry was
+/// retired with the extension (ADR-0037, TE49), so this table now only
+/// drives the installed-user guidance below; it stays until the mechanism
+/// itself is removed. Deprecated extensions are not packaged (see
+/// `.github/workflows/build.yml` `EXT_CRATES`).
 pub const DEPRECATED_EXTENSIONS: &[DeprecatedExtension] = &[DeprecatedExtension {
     name: "rpi-mcp-adapter",
     replacement: "MCP",

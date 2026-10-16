@@ -10,13 +10,13 @@ and diffs the two legs case by case. **Non-zero exit = any difference.**
 node scripts/ask-user-question-parity/run-parity.mjs
 ```
 
-The orchestrator builds this crate's `parity_runner` example itself before the
-Rust leg: three workspace crates (ask-user-question / mcp-adapter / subagents)
-ship an example with that name, so cargo's shared
-the example is uniquely named (`ask_user_question_parity_runner`, P2-9), so `target/debug/examples/` has no same-name collision. The in-script
+The orchestrator builds this crate's `ask_user_question_parity_runner` example
+itself before the Rust leg (two workspace crates ship a parity runner —
+ask-user-question / subagents — and both use unique example names, P2-9, so
+`target/debug/examples/` has no same-name collision). The in-script
 build makes the harness independent of workspace build order (mcp-parity
-precedent); the manual `cargo build -p rpi-ext-ask-user-question --example
-parity_runner` step is therefore optional.
+precedent); a manual `cargo build -p rpi-ext-ask-user-question --example
+ask_user_question_parity_runner` step is therefore optional.
 
 Report: `fixtures/generated/ask-user-question-parity/parity-report.md` (plus
 `upstream-<group>.jsonl` / `rust-<group>.jsonl` raw legs).

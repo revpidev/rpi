@@ -45,8 +45,8 @@ use crate::types::{FetchOutcome, WebFetchParams};
 /// frames themselves are a render-side concern (render.rs `SPINNER_FRAMES`).
 const SPINNER_INTERVAL_MS: u64 = 100;
 
-/// Host-call channel to the CURRENT extension host (mcp-adapter lib.rs
-/// precedent). `RawLibrary::load_at` dlopen-memoizes per path, so a session
+/// Host-call channel to the CURRENT extension host. `RawLibrary::load_at`
+/// dlopen-memoizes per path, so a session
 /// switch re-runs `install` on the same statics — the channel must follow
 /// the newest host or calls go through the replaced host's freed cookie.
 #[derive(Clone, Copy)]
@@ -262,7 +262,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         })),
     }) {
         Ok(()) => {}
-        // Rebind (mcp-adapter / subagents session-switch discipline): a
+        // Rebind (subagents session-switch discipline): a
         // second install on a fresh `NativeExtensionHost` (session
         // replacement via `/resume` `/new` `/fork` `/clone` `/import`
         // re-loads this same dlopen-memoized cdylib) adopts the NEW host
@@ -897,7 +897,7 @@ pub fn module() -> RpiNativeModule_Ref {
     .leak_into_prefix()
 }
 
-/// Test seam: install with a fake host (mcp-adapter `install_for_test`
+/// Test seam: install with a fake host (`install_for_test`
 /// pattern; one install per test binary because of the OnceLock state).
 #[doc(hidden)]
 pub fn install_for_test(calls: RpiHostCalls, cookie: PluginCookie) -> Value {

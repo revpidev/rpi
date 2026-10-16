@@ -53,7 +53,7 @@ const tsxCandidates = [
 ];
 const tsxLoader = tsxCandidates.find((candidate) => existsSync(candidate));
 if (!tsxLoader) {
-  console.error(`tsx not found; run scripts/mcp-parity/setup-deps.sh or install external/pi deps`);
+  console.error(`tsx not found; install the external/pi deps (npm ci in external/pi) or point RPI_MCP_PARITY_DEPS at a closure containing tsx`);
   process.exit(2);
 }
 if (!existsSync(join(PI, "packages", "mcp", "src", "index.ts"))) {

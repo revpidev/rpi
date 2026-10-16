@@ -3062,7 +3062,7 @@ impl InteractiveMode {
         // shape keeps `set_ui` on the host, and each replaced session owns a
         // fresh host (app.rs `create_runtime`), so both must be re-attached
         // here — without this the new host has no UI bridge and extension
-        // status-bar entries (e.g. the mcp-adapter's "mcp" key) and widgets
+        // status-bar entries (extension `setStatus` keys) and widgets
         // silently no-op after `/new` / `/resume` / `/clone` / `/fork` /
         // `/import`.
         //

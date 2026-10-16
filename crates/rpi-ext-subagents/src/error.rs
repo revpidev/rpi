@@ -1,7 +1,7 @@
 //! Crate error type (coding-standards §5.1: thiserror per library crate).
 //!
 //! Errors crossing the ABI boundary become tool-result text (the ABI has no
-//! throw channel — same tradeoff mcp-adapter recorded in TE-D04); the enum
+//! throw channel — same tradeoff recorded in TE-D04); the enum
 //! keeps the internal failure kinds typed for tests.
 
 #[derive(Debug, thiserror::Error)]

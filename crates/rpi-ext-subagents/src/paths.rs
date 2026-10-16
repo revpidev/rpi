@@ -70,8 +70,8 @@ pub fn get_project_config_dir(project_root: &Path) -> PathBuf {
 }
 
 /// Home directory from HOME/USERPROFILE (upstream `os.homedir()` on unix uses
-/// HOME; the plugin keeps the two-variable form TE-D03 established for
-/// mcp-adapter, no passwd fallback).
+/// HOME; the plugin keeps the two-variable form TE-D03 established, no
+/// passwd fallback).
 pub fn home_dir() -> Option<PathBuf> {
     for key in ["HOME", "USERPROFILE"] {
         if let Some(value) = std::env::var_os(key)

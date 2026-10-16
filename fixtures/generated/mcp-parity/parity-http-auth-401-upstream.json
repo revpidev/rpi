@@ -1,8 +1,0 @@
-{
-  "side": "upstream",
-  "transport": "http",
-  "frames": [],
-  "results": {},
-  "status": "error",
-  "error": "Error: fetch failed — probe: endpoint returned an untyped response (401) — authentication may be required; MCP endpoint shape could not be determined"
-}

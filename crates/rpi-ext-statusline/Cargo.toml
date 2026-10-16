@@ -6,8 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 # rlib: all logic lives in the library for unit/integration tests; cdylib is
-# the distributed artifact loaded by rpi-ext-host's native loader
-# (mcp-adapter Cargo.toml precedent).
+# the distributed artifact loaded by rpi-ext-host's native loader.
 [lib]
 crate-type = ["rlib", "cdylib"]
 
@@ -17,7 +16,7 @@ rpi-ext-host.workspace = true
 abi_stable = "0.11"
 serde.workspace = true
 serde_json.workspace = true
-# Plugin-owned tokio runtime (mcp-adapter runtime.rs precedent) + script
+# Plugin-owned tokio runtime + script
 # child-process execution (subagents runner/foreground.rs precedent).
 tokio.workspace = true
 tracing.workspace = true

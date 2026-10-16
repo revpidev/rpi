@@ -9,7 +9,7 @@
 //! `rpi-docs/plan/extensions/TE12-statusline.md` and
 //! `rpi-docs/extensions/rpi-statusline/` for the full spec.
 //!
-//! Runtime model (mcp-adapter / subagents precedents): the host dispatch
+//! Runtime model (subagents precedent): the host dispatch
 //! thread only does in-memory state updates plus a channel send (µs
 //! scale — the TE-D6 dispatch-blocking discipline); the refresh loop,
 //! host calls and script child processes live on the plugin's private
@@ -60,7 +60,7 @@ const LIVE_EVENTS: &[&str] = &["message_start", "message_update"];
 
 /// Host-call handle + plugin-owned runtime, established once by
 /// `rpi_extension_init`. The cookie is stored as `usize` to keep the state
-/// `Send + Sync` (mcp-adapter precedent). The fields are ownership keeps:
+/// `Send + Sync`. The fields are ownership keeps:
 /// dropping the runtime would park the refresh loop.
 #[allow(dead_code)]
 struct PluginState {
@@ -69,8 +69,8 @@ struct PluginState {
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
 
-/// The refresh loop's host channel, REBINDABLE across hosts (mcp-adapter /
-/// subagents session-switch discipline): a session replacement (`/resume`
+/// The refresh loop's host channel, REBINDABLE across hosts (subagents
+/// session-switch discipline): a session replacement (`/resume`
 /// `/new` `/fork` `/clone` `/import`) re-loads this same dlopen-memoized
 /// cdylib on a fresh `NativeExtensionHost`, and the replaced host is
 /// dropped once the outgoing session goes away — the loop must push
@@ -306,7 +306,7 @@ pub fn module() -> RpiNativeModule_Ref {
     .leak_into_prefix()
 }
 
-/// Test seam (mcp-adapter `install_for_test` precedent): install directly
+/// Test seam (`install_for_test` precedent): install directly
 /// from Rust, bypassing the cdylib/ABI boundary.
 pub fn install_for_test(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     install(calls, cookie)

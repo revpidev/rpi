@@ -9,7 +9,7 @@
 //! pixel-level parity are non-goals):
 //! - every horizontal multi-color composition collapses to a single text
 //!   node (the glyph/URL/`█░` bar line carries one foreground color);
-//! - the Markdown preview renders as plain text (mcp-adapter precedent);
+//! - the Markdown preview renders as plain text;
 //! - `getOptimisticProgress` time extrapolation is dropped (Out: depends on
 //!   `Date.now`) — bar fill uses the event's static progress value.
 //!

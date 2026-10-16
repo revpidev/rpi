@@ -54,7 +54,7 @@ use crate::runner::foreground::StreamFrameSink;
 
 /// Host-call handle + plugin-owned runtime, established by
 /// `rpi_extension_init`. The cookie is stored as `usize` to keep the state
-/// `Send + Sync` (mcp-adapter precedent).
+/// `Send + Sync`.
 struct PluginState {
     calls: RpiHostCalls,
     cookie: usize,
@@ -729,7 +729,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                         // TE11 FR-A/FR-B: the host attaches the render hooks
                         // and dispatches {"kind":"render","what":"toolCall"|
                         // "toolResult"} back here (host_call.rs render
-                        // protocol, mcp-adapter precedent).
+                        // protocol).
                         "renderCall": true,
                         "renderResult": true,
                     }),
@@ -1076,7 +1076,7 @@ fn dispatch_message(message: &Value) -> Value {
                 };
             }
             // TE11 FR-A/FR-B: the `subagent` tool's call title and run card
-            // (mcp-adapter render dispatch precedent — same envelope).
+            // (same envelope as the host render protocol).
             if what == Some("toolCall") {
                 let args = message
                     .get("context")
@@ -1396,8 +1396,8 @@ fn wait_update_details() -> Value {
 }
 
 /// Integration-test probes (not part of the plugin surface): budget-ledger
-/// access for deterministic rejection scenarios. Same shape as mcp-adapter's
-/// test seam (kept ungated so integration tests share the process state).
+/// access for deterministic rejection scenarios (kept ungated so
+/// integration tests share the process state).
 #[doc(hidden)]
 pub mod test_support {
     /// Exposed for integration tests of the skill-layout upgrade path
@@ -1508,9 +1508,9 @@ pub fn render_tool_for_test(
     }))
 }
 
-/// Test seam: install with a fake host (mcp-adapter `install_for_test`
+/// Test seam: install with a fake host (`install_for_test` pattern; one
 #[doc(hidden)]
-/// pattern; one install per test binary because of the OnceLock state).
+/// install per test binary because of the OnceLock state).
 pub fn install_for_test(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     install(calls, cookie)
 }

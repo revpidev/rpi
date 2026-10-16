@@ -20,7 +20,7 @@
 //! Parity harness: `scripts/ask-user-question-parity/` drives the pinned
 //! upstream pure-function modules and diffs them against [`parity`].
 //!
-//! Native plugin runtime model (mcp-adapter / subagents / statusline
+//! Native plugin runtime model (subagents / statusline
 //! precedents): `rpi_extension_init` registers through the host-call handle
 //! and stores the newest channel (session switches re-load the same
 //! dlopen-memoized cdylib on a fresh host); `rpi_dispatch` serves
@@ -282,7 +282,7 @@ pub fn module() -> RpiNativeModule_Ref {
 }
 
 /// Test seam: install directly from Rust, bypassing the cdylib/ABI boundary
-/// (mcp-adapter `install_for_test` precedent).
+/// (`install_for_test` precedent).
 #[doc(hidden)]
 pub fn install_for_test(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     install(calls, cookie)
