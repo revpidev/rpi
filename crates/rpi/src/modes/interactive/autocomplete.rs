@@ -2,10 +2,10 @@
 //! `packages/coding-agent/src/modes/interactive/interactive-mode.ts` @ pi
 //! 0.82.1 (2efa728):
 //! - `getAutocompleteSourceTag` / `prefixAutocompleteDescription`
-//!   (interactive-mode.ts:497-528)
-//! - `getBuiltinCommandConflictDiagnostics` (interactive-mode.ts:530-543)
-//! - `createBaseAutocompleteProvider` (interactive-mode.ts:545-629)
-//! - `setupAutocompleteProvider` (interactive-mode.ts:631-647)
+//!   (interactive-mode.ts:676-708 @ abe508e1b)
+//! - `getBuiltInCommandConflictDiagnostics` (interactive-mode.ts:710-723 @ abe508e1b)
+//! - `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ abe508e1b)
+//! - `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ abe508e1b)
 //!
 //! The provider combines four command sources: the built-in slash commands
 //! (`core::slash_commands::BUILTIN_SLASH_COMMANDS`), prompt templates
@@ -266,7 +266,7 @@ pub(crate) fn format_login_provider_completion_description(
 // Base provider (interactive-mode.ts:545-629)
 // ---------------------------------------------------------------------------
 
-/// `createBaseAutocompleteProvider` (interactive-mode.ts:545-810): the
+/// `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ abe508e1b): the
 /// combined slash-command provider — built-ins (+ `/model` and `/login`
 /// argument completions), prompt templates, extension commands and skills.
 pub(crate) fn create_base_autocomplete_provider(
@@ -454,9 +454,15 @@ pub(crate) fn create_base_autocomplete_provider(
     commands.extend(skill_commands);
     let combined = CombinedAutocompleteProvider::new(commands, base_path, fd_path);
 
-    Arc::new(TriggerCharactersWrapper {
-        delegate: Arc::new(combined),
-    })
+    // V17-11 FR-B R4: chain the extension-registered declarative sources
+    // over the base provider (upstream folds each wrapper over the provider
+    // in registration order, interactive-mode.ts:825-840).
+    let mut provider: Arc<dyn AutocompleteProvider> = Arc::new(combined);
+    for descriptor in lock(&ui.autocomplete_providers).iter().cloned() {
+        provider = Arc::new(ExtensionAutocompleteProvider::new(descriptor, provider));
+    }
+
+    Arc::new(TriggerCharactersWrapper { delegate: provider })
 }
 
 /// Resolve the `fd` binary for file completions (`getToolPath`,
@@ -538,13 +544,142 @@ impl AutocompleteProvider for TriggerCharactersWrapper {
     }
 }
 
+/// Declarative extension autocomplete source (V17-11 FR-B R4): the
+/// serializable replacement for upstream's closure-provider composition
+/// (`addAutocompleteProvider`, interactive-mode.ts:2659-2662). Suggestions
+/// appear when the text before the cursor contains the descriptor's
+/// `trigger`; the fragment typed after it filters the descriptor's items.
+/// The wrapper delegates to the provider below it when its trigger does not
+/// match.
+struct ExtensionAutocompleteProvider {
+    delegate: Arc<dyn AutocompleteProvider>,
+    trigger: char,
+    trigger_chars: Vec<char>,
+    items: Vec<AutocompleteItem>,
+}
+
+impl ExtensionAutocompleteProvider {
+    fn new(
+        descriptor: rpi_ext_host::types::AutocompleteProviderDescriptor,
+        delegate: Arc<dyn AutocompleteProvider>,
+    ) -> Self {
+        let trigger = descriptor.trigger.chars().next().unwrap_or('/');
+        let mut trigger_chars: Vec<char> = delegate.trigger_characters().to_vec();
+        if !trigger_chars.contains(&trigger) {
+            trigger_chars.push(trigger);
+        }
+        let items = descriptor
+            .items
+            .into_iter()
+            .map(|item| AutocompleteItem {
+                label: item.label.unwrap_or_else(|| item.value.clone()),
+                value: item.value,
+                description: item.description,
+            })
+            .collect();
+        Self {
+            delegate,
+            trigger,
+            trigger_chars,
+            items,
+        }
+    }
+
+    /// The fragment after the trigger character on the cursor's line, when
+    /// the line before the cursor contains the trigger.
+    fn fragment(&self, lines: &[String], cursor_line: usize, cursor_col: usize) -> Option<String> {
+        let line = lines.get(cursor_line)?;
+        let chars: Vec<char> = line.chars().collect();
+        let end = cursor_col.min(chars.len());
+        let position = chars[..end].iter().rposition(|c| *c == self.trigger)?;
+        Some(chars[position + 1..end].iter().collect())
+    }
+}
+
+impl AutocompleteProvider for ExtensionAutocompleteProvider {
+    fn trigger_characters(&self) -> &[char] {
+        &self.trigger_chars
+    }
+
+    fn get_suggestions(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        options: &GetSuggestionsOptions,
+    ) -> Option<AutocompleteSuggestions> {
+        if let Some(fragment) = self.fragment(lines, cursor_line, cursor_col) {
+            let lowered = fragment.to_lowercase();
+            let items: Vec<AutocompleteItem> = self
+                .items
+                .iter()
+                .filter(|item| item.value.to_lowercase().starts_with(&lowered))
+                .cloned()
+                .collect();
+            if !items.is_empty() {
+                return Some(AutocompleteSuggestions {
+                    items,
+                    prefix: fragment,
+                });
+            }
+        }
+        self.delegate
+            .get_suggestions(lines, cursor_line, cursor_col, options)
+    }
+
+    fn apply_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        item: &AutocompleteItem,
+        prefix: &str,
+    ) -> CompletionResult {
+        if self.items.iter().any(|own| own.value == item.value) {
+            let mut lines = lines.to_vec();
+            if let Some(line) = lines.get(cursor_line) {
+                let chars: Vec<char> = line.chars().collect();
+                let end = cursor_col.min(chars.len());
+                let start = end.saturating_sub(prefix.chars().count());
+                let mut replaced: Vec<char> = chars[..start].to_vec();
+                replaced.extend(item.value.chars());
+                replaced.extend_from_slice(&chars[end..]);
+                lines[cursor_line] = replaced.into_iter().collect();
+                return CompletionResult {
+                    lines,
+                    cursor_line,
+                    cursor_col: start + item.value.chars().count(),
+                };
+            }
+            return CompletionResult {
+                lines,
+                cursor_line,
+                cursor_col,
+            };
+        }
+        self.delegate
+            .apply_completion(lines, cursor_line, cursor_col, item, prefix)
+    }
+
+    fn should_trigger_file_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> bool {
+        self.delegate
+            .should_trigger_file_completion(lines, cursor_line, cursor_col)
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Setup (interactive-mode.ts:631-647)
+// Setup (interactive-mode.ts:825-841 @ abe508e1b)
 // ---------------------------------------------------------------------------
 
-/// `setupAutocompleteProvider` (interactive-mode.ts:631-647): build the base
-/// provider and install it on the editor. Upstream also sets it on a
-/// secondary editor when one is active; the mode has a single editor.
+/// `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ abe508e1b):
+/// build the base provider and install it on the editor. Upstream also sets
+/// it on a secondary editor when one is active; the mode has a single
+/// editor.
 pub(crate) fn setup_autocomplete(ui: &Arc<InteractiveUi>) {
     let provider = create_base_autocomplete_provider(ui);
     lock(&ui.editor).set_autocomplete_provider(provider);
@@ -1125,5 +1260,63 @@ mod tests {
         // Smoke-level: the provider is installed without error and slash
         // completion still returns built-ins afterwards.
         assert!(!lock(&ui.editor).is_showing_autocomplete());
+    }
+
+    // V17-11 FR-B R4: the declarative `{ trigger, items }` source is chained
+    // over the base provider and filtered by the fragment after the trigger.
+    #[test]
+    fn extension_autocomplete_provider_filters_on_trigger() {
+        use rpi_ext_host::types::{AutocompleteItemDescriptor, AutocompleteProviderDescriptor};
+
+        let base = Arc::new(CombinedAutocompleteProvider::new(
+            Vec::new(),
+            "/tmp".to_string(),
+            None,
+        ));
+        let provider = ExtensionAutocompleteProvider::new(
+            AutocompleteProviderDescriptor {
+                trigger: "@".to_owned(),
+                items: vec![
+                    AutocompleteItemDescriptor {
+                        value: "file.rs".to_owned(),
+                        label: None,
+                        description: None,
+                    },
+                    AutocompleteItemDescriptor {
+                        value: "folder".to_owned(),
+                        label: Some("Folder".to_owned()),
+                        description: Some("a directory".to_owned()),
+                    },
+                ],
+            },
+            base,
+        );
+
+        // Trigger + fragment: only matching items, prefix = the fragment.
+        let filtered = get_suggestions(&provider, "open @fo", false).expect("suggestions");
+        assert_eq!(filtered.prefix, "fo");
+        assert_eq!(
+            filtered
+                .items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            ["folder"]
+        );
+        let both = get_suggestions(&provider, "open @f", false).expect("both f items");
+        assert_eq!(both.items.len(), 2);
+        // Trigger with an empty fragment: every item (labels default to the
+        // value).
+        let all = get_suggestions(&provider, "open @", false).expect("all items");
+        assert_eq!(all.items.len(), 2);
+        assert_eq!(all.items[1].label, "Folder");
+        assert_eq!(all.items[1].description.as_deref(), Some("a directory"));
+        // Without the trigger the wrapper delegates (empty base → None).
+        assert!(get_suggestions(&provider, "plain text", false).is_none());
+
+        // Applying a descriptor item replaces the fragment after the trigger.
+        let applied = provider.apply_completion(&["open @".to_string()], 0, 6, &all.items[0], "");
+        assert_eq!(applied.lines[0], "open @file.rs");
+        assert_eq!(applied.cursor_col, 13);
     }
 }

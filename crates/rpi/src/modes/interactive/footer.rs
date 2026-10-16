@@ -261,6 +261,14 @@ impl FooterComponent {
         self.auto_compact_enabled = enabled;
     }
 
+    /// V17-11 FR-C R2 (#71 item 2): swap the theme snapshot after a hot
+    /// reload so the next render uses the new palette (upstream reads the
+    /// global `theme` Proxy lazily; the Rust footer holds an `Arc<Theme>`
+    /// snapshot, so the mode re-injects the live one).
+    pub fn set_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme;
+    }
+
     /// The footer data provider (shared with the mode so provider count /
     /// git branch can be refreshed live).
     pub fn data_provider(&self) -> &Arc<FooterDataProvider> {

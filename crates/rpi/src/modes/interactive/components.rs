@@ -16,6 +16,7 @@ pub mod custom_entry;
 pub mod custom_message;
 pub mod diff;
 pub mod dynamic_border;
+pub mod extension_custom;
 pub mod extension_editor;
 pub mod extension_input;
 pub mod extension_selector;
@@ -53,6 +54,7 @@ pub use custom_entry::CustomEntryComponent;
 pub use custom_message::CustomMessageComponent;
 pub use diff::{RenderDiffOptions, render_diff};
 pub use dynamic_border::DynamicBorder;
+pub use extension_custom::ExtensionCustomComponent;
 pub use keybinding_hints::{key_display_text, key_hint, key_text, raw_key_hint};
 pub use skill_invocation_message::SkillInvocationMessageComponent;
 pub use status_indicator::{

@@ -1003,6 +1003,19 @@ struct CompactionQueuedMessage {
     mode: StreamingBehavior,
 }
 
+/// Flush payload for the compaction queue (V17-11 FR-A): the previous
+/// generation counter plus the `compaction_end` event's `willRetry` flag.
+/// Upstream passes `{ willRetry: event.willRetry }` directly to
+/// `flushCompactionQueue` (interactive-mode.ts:3733); the watch channel is
+/// the Rust equivalent of that call, so the flag rides the signal instead of
+/// a second channel (02 §1.3 裁决 5; the `compaction_end` event contract is
+/// unchanged).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FlushSignal {
+    generation: u64,
+    will_retry: bool,
+}
+
 /// Render options for [`InteractiveUi::render_session_entries`]
 /// (interactive-mode.ts:3340-3342).
 #[derive(Debug, Clone, Copy, Default)]
@@ -1025,6 +1038,76 @@ enum EditorInput {
     /// User-message-selector pick (interactive-mode.ts:4589-4602): fork from
     /// the entry via `InteractiveMode::handle_fork_command`.
     ForkFrom(String),
+    /// Extension `ctx.command.*` session-control action (V17-11 FR-B R2):
+    /// queued through the inbox so the run loop owns the mutation and the
+    /// TUI event pump is never re-entered from inside an extension command.
+    ExtensionCommand(Box<ExtensionSessionCommand>),
+}
+
+/// One queued extension session-control command (V17-11 FR-B R2). The
+/// actions mirror the upstream `ExtensionCommandContextActions` handlers
+/// (interactive-mode.ts:2000-2030); they are plain data (plus the
+/// `withSession` callback Arcs) so the action can be sent to the run loop.
+enum ExtensionSessionCommand {
+    NewSession {
+        parent_session: Option<String>,
+        with_session: Option<rpi_ext_host::api::WithSessionFn>,
+    },
+    Fork {
+        entry_id: String,
+        position: Option<String>,
+        with_session: Option<rpi_ext_host::api::WithSessionFn>,
+    },
+    NavigateTree {
+        target_id: String,
+        options: rpi_ext_host::api::NavigateTreeOptions,
+    },
+    SwitchSession {
+        session_path: String,
+        with_session: Option<rpi_ext_host::api::WithSessionFn>,
+    },
+    Reload,
+}
+
+/// `RunCommand` derives `Debug`; the callback `Arc`s inside the session
+/// command are not printable, so report their presence instead.
+impl std::fmt::Debug for ExtensionSessionCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewSession {
+                parent_session,
+                with_session,
+            } => formatter
+                .debug_struct("NewSession")
+                .field("parent_session", parent_session)
+                .field("with_session", &with_session.is_some())
+                .finish(),
+            Self::Fork {
+                entry_id,
+                position,
+                with_session,
+            } => formatter
+                .debug_struct("Fork")
+                .field("entry_id", entry_id)
+                .field("position", position)
+                .field("with_session", &with_session.is_some())
+                .finish(),
+            Self::NavigateTree { target_id, options } => formatter
+                .debug_struct("NavigateTree")
+                .field("target_id", target_id)
+                .field("options", options)
+                .finish(),
+            Self::SwitchSession {
+                session_path,
+                with_session,
+            } => formatter
+                .debug_struct("SwitchSession")
+                .field("session_path", session_path)
+                .field("with_session", &with_session.is_some())
+                .finish(),
+            Self::Reload => formatter.write_str("Reload"),
+        }
+    }
 }
 
 /// `CompactionCostNotice.kind` (interactive-mode.ts:207-210 @ 836aee6d3):
@@ -1564,8 +1647,9 @@ pub(crate) struct InteractiveUi {
     /// `/quit`, SIGTERM/SIGHUP, extension shutdown).
     pub(crate) shutdown_tx: watch::Sender<bool>,
     /// Incremented when a compaction ends and the queued messages should be
-    /// flushed (run loop drains the compaction queue).
-    flush_tx: watch::Sender<u64>,
+    /// flushed (run loop drains the compaction queue). The payload carries
+    /// the event's `willRetry` flag (V17-11 FR-A).
+    flush_tx: watch::Sender<FlushSignal>,
     /// Messages queued while compaction is running
     /// (interactive-mode.ts:401).
     compaction_queue: Mutex<Vec<CompactionQueuedMessage>>,
@@ -1579,6 +1663,14 @@ pub(crate) struct InteractiveUi {
     /// `modes/interactive/autocomplete` port) and read by the slash-command
     /// dispatch.
     pub(crate) skill_commands: Mutex<HashMap<String, String>>,
+
+    /// `autocompleteProviderWrappers` (interactive-mode.ts:467): the
+    /// extension-registered declarative autocomplete sources (V17-11 FR-B
+    /// R4). Read by `createBaseAutocompleteProvider` on every rebuild;
+    /// cleared by the reset path that mirrors upstream's `resetExtensionUI`
+    /// (session replacement / reload).
+    pub(crate) autocomplete_providers:
+        Mutex<Vec<rpi_ext_host::types::AutocompleteProviderDescriptor>>,
 
     /// `mainScreenRenderState` (interactive-mode.ts:389 @ b103937d3):
     /// captured from the main-screen renderer before a switch, restored on
@@ -2564,10 +2656,10 @@ impl InteractiveUi {
                 will_retry,
                 error_message,
             } => {
-                // willRetry would drive the flush semantics
-                // (interactive-mode.ts:3117); currently unwired — see the
-                // known gap in `flush_compaction_queue` (D-019).
-                let _ = will_retry;
+                // `willRetry` drives the flush semantics
+                // (interactive-mode.ts:3733): when a retry is pending the
+                // queued messages are re-queued into the retry turn instead
+                // of being flushed into the aborted run.
                 // `programStatus.handleEvent` (program-status-reporter.ts:
                 // 50-65): a failed recovery compaction ends the run unless a
                 // later response succeeds; a manual compaction reports its
@@ -2634,14 +2726,12 @@ impl InteractiveUi {
                     }
                 }
                 // Signal the run loop to flush messages queued during
-                // compaction.
-                let _ = self
-                    .flush_tx
-                    .send(self.flush_generation.fetch_add(1, Ordering::Relaxed) + 1);
-                // Known gap (unassigned — no v0.1 task claims it):
-                // flushCompactionQueue willRetry semantics
-                // (interactive-mode.ts:3117, 4008-4040); see the
-                // `flush_compaction_queue` note and D-019.
+                // compaction, carrying the event's `willRetry`
+                // (interactive-mode.ts:3733).
+                let _ = self.flush_tx.send(FlushSignal {
+                    generation: self.flush_generation.fetch_add(1, Ordering::Relaxed) + 1,
+                    will_retry,
+                });
                 self.render_handle.request_render();
             }
             UiCommand::AutoRetryStart {
@@ -3274,9 +3364,9 @@ impl InteractiveUi {
                                 lock(&ui.editor).set_text(&editor_text);
                             }
                             ui.show_status("Navigated to selected point");
-                            // TODO(unassigned): flushCompactionQueue({ willRetry: false })
-                            // — same wiring gap as the willRetry note in
-                            // `flush_compaction_queue` (D-019).
+                            // `flushCompactionQueue({ willRetry: false })`
+                            // (interactive-mode.ts:5671).
+                            ui.flush_compaction_queue_now();
                         }
                         Err(error) => ui.show_error(&error.raw_message()),
                     }
@@ -3546,20 +3636,59 @@ impl InteractiveUi {
         // Snapshot the loaded resources so the loader lock is released
         // before any further `self` locks.
         let loader = self.session().resource_loader();
-        let (skills, prompts, extensions, context_files, mut diagnostics) = {
+        let (
+            skill_items,
+            prompt_items,
+            extension_items,
+            skill_labels,
+            prompt_labels,
+            extension_labels,
+            context_files,
+            skill_diagnostics,
+            prompt_diagnostics,
+            theme_diagnostics,
+            mut extension_diagnostics,
+        ) = {
             let loader = lock(&loader);
             let loaded = loader.resources();
-            let skills: Vec<String> = loaded
+            // Expanded-list items: `(display path, source info)` — upstream
+            // `buildScopeGroups` consumes `{ path, sourceInfo }`
+            // (interactive-mode.ts:1624-1659). Prompts and extension paths
+            // carry no source info in the local loader, so they group under
+            // "project" exactly like upstream's `getScopeGroup` default
+            // (source "local", scope "project").
+            let skill_items: Vec<(String, Option<crate::core::skills::SourceInfo>)> = loaded
+                .skills
+                .iter()
+                .map(|skill| {
+                    (
+                        skill.file_path.display().to_string(),
+                        Some(skill.source_info.clone()),
+                    )
+                })
+                .collect();
+            let prompt_items: Vec<(String, Option<crate::core::skills::SourceInfo>)> = loaded
+                .prompts
+                .iter()
+                .map(|template| (template.file_path.display().to_string(), None))
+                .collect();
+            let extension_items: Vec<(String, Option<crate::core::skills::SourceInfo>)> = loaded
+                .extensions
+                .paths
+                .iter()
+                .map(|path| (path.display().to_string(), None))
+                .collect();
+            let skill_labels: Vec<String> = loaded
                 .skills
                 .iter()
                 .map(|skill| skill.name.clone())
                 .collect();
-            let prompts: Vec<String> = loaded
+            let prompt_labels: Vec<String> = loaded
                 .prompts
                 .iter()
                 .map(|template| format!("/{}", template.name))
                 .collect();
-            let extensions: Vec<String> = loaded
+            let extension_labels: Vec<String> = loaded
                 .extensions
                 .paths
                 .iter()
@@ -3580,40 +3709,70 @@ impl InteractiveUi {
             for file in &loaded.context_files {
                 context_files.push(file.path.display().to_string());
             }
-            let diagnostics: Vec<(String, Option<String>)> = loaded
-                .diagnostics
+            // The loader keeps skill/prompt/theme diagnostics apart; snapshot
+            // each category so the four upstream blocks can be rendered
+            // (interactive-mode.ts:1916-1968).
+            let skill_diagnostics = loader
+                .skill_diagnostics()
                 .iter()
-                .map(|diagnostic| {
-                    (
-                        diagnostic.message.clone(),
-                        diagnostic
-                            .path
-                            .clone()
-                            .map(|path| path.display().to_string()),
-                    )
+                .cloned()
+                .map(LoadedDiagnostic::from_resource)
+                .collect();
+            let prompt_diagnostics = loader
+                .prompt_diagnostics()
+                .iter()
+                .cloned()
+                .map(LoadedDiagnostic::from_resource)
+                .collect();
+            let theme_diagnostics = loader
+                .theme_diagnostics()
+                .iter()
+                .cloned()
+                .map(LoadedDiagnostic::from_resource)
+                .collect();
+            let extension_diagnostics: Vec<LoadedDiagnostic> = loaded
+                .extensions
+                .errors
+                .iter()
+                .map(|error| LoadedDiagnostic {
+                    kind: crate::core::skills::DiagnosticKind::Error,
+                    message: error.error.clone(),
+                    path: Some(error.path.display().to_string()),
+                    collision: None,
                 })
                 .collect();
-            (skills, prompts, extensions, context_files, diagnostics)
+            (
+                skill_items,
+                prompt_items,
+                extension_items,
+                skill_labels,
+                prompt_labels,
+                extension_labels,
+                context_files,
+                skill_diagnostics,
+                prompt_diagnostics,
+                theme_diagnostics,
+                extension_diagnostics,
+            )
         };
         drop(loader);
 
         // `extensionDiagnostics.push(...getBuiltInCommandConflictDiagnostics(...))`
         // (interactive-mode.ts:1944): extension commands shadowing a built-in
-        // join the diagnostics block at startup and reload. A configuration
-        // without conflicts appends nothing, so the block stays
-        // byte-identical for existing snapshots.
+        // join the `[Extension issues]` block at startup and reload. A
+        // configuration without conflicts appends nothing.
         if show_diagnostics {
             let commands = self.session().extension_runner().registered_commands();
-            diagnostics.extend(
+            extension_diagnostics.extend(
                 crate::modes::interactive::autocomplete::get_builtin_command_conflict_diagnostics(
                     &commands,
                 )
                 .into_iter()
-                .map(|diagnostic| {
-                    (
-                        diagnostic.message,
-                        diagnostic.path.map(|path| path.display().to_string()),
-                    )
+                .map(|diagnostic| LoadedDiagnostic {
+                    kind: crate::core::skills::DiagnosticKind::Warning,
+                    message: diagnostic.message,
+                    path: diagnostic.path.map(|path| path.display().to_string()),
+                    collision: None,
                 }),
             );
         }
@@ -3636,38 +3795,42 @@ impl InteractiveUi {
         // `addLoadedSection` (interactive-mode.ts:1443-1458): an
         // ExpandableText with the header + compact body, expanded state
         // `getStartupExpansionState()` (interactive-mode.ts:1077-1079).
-        let add_loaded_section = |container: &mut Container,
-                                  name: &str,
-                                  compact_body: String,
-                                  expanded_body: Option<String>| {
-            let expanded_state = self.verbose || *lock(&self.tool_output_expanded);
-            let theme = Arc::clone(&self.theme);
-            let header_name = name.to_string();
-            let compact_body_plain = compact_body.clone();
-            let expanded_body_plain = expanded_body.unwrap_or(compact_body);
-            let build = move |body: &str| {
-                let theme = lock(&theme).clone();
-                format!(
-                    "{}\n{}",
-                    theme.fg("mdHeading", &format!("[{header_name}]")),
-                    theme.fg("dim", body)
-                )
+        // Bodies are `(color, text)` line pairs so the expanded scope-group
+        // view can color its section headers (accent/mdLink) distinctly from
+        // the dim paths (interactive-mode.ts:1661-1698).
+        let add_loaded_section =
+            |container: &mut Container,
+             name: &str,
+             compact_body: Vec<(String, String)>,
+             expanded_body: Option<Vec<(String, String)>>| {
+                let expanded_state = self.verbose || *lock(&self.tool_output_expanded);
+                let theme = Arc::clone(&self.theme);
+                let header_name = name.to_string();
+                let compact_body_plain = compact_body.clone();
+                let expanded_body_plain = expanded_body.unwrap_or(compact_body);
+                let build = move |body: &[(String, String)]| {
+                    let theme = lock(&theme).clone();
+                    let mut lines = vec![theme.fg("mdHeading", &format!("[{header_name}]"))];
+                    for (color, text) in body {
+                        lines.push(theme.fg(color, text));
+                    }
+                    lines.join("\n")
+                };
+                let collapsed_build = build.clone();
+                let collapsed_body = compact_body_plain;
+                let collapsed = move || collapsed_build(&collapsed_body);
+                let expanded_body = expanded_body_plain;
+                let expanded_text = move || build(&expanded_body);
+                let section = ExpandableText::new(
+                    Box::new(collapsed),
+                    Box::new(expanded_text),
+                    expanded_state,
+                    0,
+                    0,
+                );
+                container.add_child(Box::new(section));
+                container.add_child(Box::new(Spacer::new(1)));
             };
-            let collapsed_build = build.clone();
-            let collapsed_body = compact_body_plain;
-            let collapsed = move || collapsed_build(&collapsed_body);
-            let expanded_body = expanded_body_plain;
-            let expanded_text = move || build(&expanded_body);
-            let section = ExpandableText::new(
-                Box::new(collapsed),
-                Box::new(expanded_text),
-                expanded_state,
-                0,
-                0,
-            );
-            container.add_child(Box::new(section));
-            container.add_child(Box::new(Spacer::new(1)));
-        };
 
         if show_listing {
             // Context first, unsorted (interactive-mode.ts:1495-1506).
@@ -3676,64 +3839,70 @@ impl InteractiveUi {
                 add_loaded_section(
                     &mut container,
                     "Context",
-                    format_compact_list(context_files, false),
+                    vec![("dim".to_owned(), format_compact_list(context_files, false))],
                     None,
                 );
             }
-            if !skills.is_empty() {
+            if !skill_items.is_empty() {
                 add_loaded_section(
                     &mut container,
                     "Skills",
-                    format_compact_list(skills, true),
-                    None,
+                    vec![("dim".to_owned(), format_compact_list(skill_labels, true))],
+                    Some(scope_group_lines(&skill_items)),
                 );
             }
-            if !prompts.is_empty() {
+            if !prompt_items.is_empty() {
                 add_loaded_section(
                     &mut container,
                     "Prompts",
-                    format_compact_list(prompts, true),
-                    None,
+                    vec![("dim".to_owned(), format_compact_list(prompt_labels, true))],
+                    Some(scope_group_lines(&prompt_items)),
                 );
             }
-            if !extensions.is_empty() {
+            if !extension_items.is_empty() {
                 add_loaded_section(
                     &mut container,
                     "Extensions",
-                    format_compact_list(extensions, true),
-                    None,
+                    vec![(
+                        "dim".to_owned(),
+                        format_compact_list(extension_labels, true),
+                    )],
+                    Some(scope_group_lines(&extension_items)),
                 );
             }
         }
 
-        if show_diagnostics && !diagnostics.is_empty() {
-            // The Rust loader aggregates skill/prompt/theme diagnostics into
-            // one pipeline-ordered vec (`LoadedResources::diagnostics`), so
-            // upstream's four per-kind blocks ([Skill conflicts],
-            // [Prompt conflicts], [Extension issues], [Theme conflicts],
-            // interactive-mode.ts:1576-1625) collapse to a single block.
-            let diagnostics_snapshot = diagnostics;
-            container.add_child(Box::new(
-                crate::modes::interactive::components::ThemedText::new(
-                    Arc::clone(&self.theme),
-                    move |theme| {
-                        let mut lines = vec![theme.fg("warning", "[Resource issues]")];
-                        for (message, path) in &diagnostics_snapshot {
-                            match path {
-                                Some(path) => {
-                                    lines.push(theme.fg("warning", &format!("  {path}")));
-                                    lines.push(theme.fg("warning", &format!("    {message}")));
-                                }
-                                None => lines.push(theme.fg("warning", &format!("  {message}"))),
-                            }
-                        }
-                        lines.join("\n")
-                    },
-                    0,
-                    0,
-                ),
-            ));
-            container.add_child(Box::new(Spacer::new(1)));
+        if show_diagnostics {
+            // Four per-kind blocks, matching upstream `showLoadedResources`
+            // (interactive-mode.ts:1916-1968): [Skill conflicts], [Prompt
+            // conflicts], [Extension issues], [Theme conflicts]. The local
+            // loader keeps the three resource categories apart; extension
+            // load errors and the built-in command conflicts join the
+            // extension block.
+            let diagnostics_blocks: [(&str, Vec<LoadedDiagnostic>); 4] = [
+                ("Skill conflicts", skill_diagnostics),
+                ("Prompt conflicts", prompt_diagnostics),
+                ("Extension issues", extension_diagnostics),
+                ("Theme conflicts", theme_diagnostics),
+            ];
+            for (name, entries) in diagnostics_blocks {
+                if entries.is_empty() {
+                    continue;
+                }
+                container.add_child(Box::new(
+                    crate::modes::interactive::components::ThemedText::new(
+                        Arc::clone(&self.theme),
+                        move |theme| {
+                            let header = theme.fg("warning", &format!("[{name}]"));
+                            let body = render_loaded_diagnostics(theme, &entries);
+                            format!("{header}\n{body}")
+                        },
+                        0,
+                        0,
+                    ),
+                ));
+                container.add_child(Box::new(Spacer::new(1)));
+            }
         }
     }
 
@@ -4666,11 +4835,65 @@ impl InteractiveUi {
         });
     }
 
+    /// `resetExtensionUI` autocomplete slice (interactive-mode.ts:2452-2472,
+    /// :2469-2471): extensions re-register their autocomplete sources on the
+    /// next session bind / reload, so the outgoing session's descriptors are
+    /// dropped and the base provider rebuilt (V17-11 FR-B R4).
+    pub(crate) fn reset_extension_autocomplete(&self) {
+        lock(&self.autocomplete_providers).clear();
+        if let Some(ui) = self.upgrade_self() {
+            crate::modes::interactive::autocomplete::setup_autocomplete(&ui);
+        }
+    }
+
+    /// `flushCompactionQueue({ willRetry: false })` (interactive-mode.ts:2018,
+    /// :5671 — V17-11 FR-A R2): both explicit non-retry call sites are
+    /// session-tree navigation completions; the queued messages belong to
+    /// the navigated turn.
+    pub(crate) fn flush_compaction_queue_now(&self) {
+        let _ = self.flush_tx.send(FlushSignal {
+            generation: self.flush_generation.fetch_add(1, Ordering::Relaxed) + 1,
+            will_retry: false,
+        });
+    }
+
     /// `rebuildChatFromMessages` (interactive-mode.ts:3524-3527).
     pub(crate) fn rebuild_chat_from_messages(&self) {
         lock(&self.chat_container).clear();
         let entries = lock(&self.session().session_manager()).build_context_entries();
         self.render_session_entries(&entries, RenderOptions::default());
+    }
+
+    /// V17-11 FR-C R2 (#71 item 2): rebuild the transcript for a theme hot
+    /// reload. Upstream reads colors through the global `theme` Proxy
+    /// (theme/theme.ts:727), so a reload repaints everything; the Rust
+    /// components bake ANSI codes at construction, so the sanctioned
+    /// equivalent (02 §4.5, task §8-5) is a rebuild. A mid-stream rebuild
+    /// preserves the current-turn tail (the streaming component and the
+    /// tool components rendered after it, which are not in the persisted
+    /// entries yet) plus their pending-tool map entries; the rebuild path
+    /// is the same one the settings changes use.
+    pub(crate) fn rebuild_chat_for_theme_change(&self) {
+        let tail = {
+            let mut chat = lock(&self.chat_container);
+            match lock(&self.streaming).as_ref().and_then(|track| {
+                chat.children
+                    .iter()
+                    .position(|child| child_address(&**child) == track.entry_address)
+            }) {
+                Some(index) => chat.children.split_off(index),
+                None => Vec::new(),
+            }
+        };
+        let pending = lock(&self.pending_tools).clone();
+        self.rebuild_chat_from_messages();
+        if !pending.is_empty() {
+            lock(&self.pending_tools).extend(pending);
+        }
+        if !tail.is_empty() {
+            lock(&self.chat_container).children.extend(tail);
+        }
+        self.render_handle.request_render();
     }
 
     /// `updateEditorBorderColor` (interactive-mode.ts:3768-3775).
@@ -4694,6 +4917,16 @@ impl InteractiveUi {
             markdown_theme_with_settings(&current, &code_block_indent)
         };
         *lock(&self.markdown_theme) = markdown;
+        // V17-11 FR-C R2 (#71 item 2): the transcript and footer bake the
+        // previous palette; rebuild the history with the new theme and
+        // re-inject the footer's theme snapshot so the whole UI repaints
+        // (the lazy global-proxy equivalent, task §8-5).
+        self.rebuild_chat_for_theme_change();
+        {
+            let mut footer = lock(&self.footer);
+            footer.set_theme(Arc::clone(&theme));
+            Component::invalidate(&mut *footer);
+        }
         // Rebuild the pending-messages block from the queue with the new
         // theme (the notice lines bake colors at build time; bf8e4b953).
         self.update_pending_messages_display();
@@ -5170,6 +5403,174 @@ impl InteractiveUi {
     }
 }
 
+/// One loaded-resources diagnostic normalized for the four upstream blocks
+/// (V17-11 FR-C R4). The loader keeps skill/prompt/theme diagnostics in
+/// separate pipelines (`skill_diagnostics` / `prompt_diagnostics` /
+/// `theme_diagnostics`) and extension load errors live on
+/// `LoadedExtensions::errors`; this shape carries the category and the
+/// collision detail across the `ThemedText` render boundary.
+#[derive(Debug, Clone)]
+struct LoadedDiagnostic {
+    kind: crate::core::skills::DiagnosticKind,
+    message: String,
+    path: Option<String>,
+    collision: Option<crate::core::skills::ResourceCollision>,
+}
+
+impl LoadedDiagnostic {
+    fn from_resource(diagnostic: crate::core::skills::ResourceDiagnostic) -> Self {
+        Self {
+            kind: diagnostic.kind,
+            message: diagnostic.message,
+            path: diagnostic.path.map(|path| path.display().to_string()),
+            collision: diagnostic.collision,
+        }
+    }
+}
+
+/// `formatDiagnostics` (interactive-mode.ts:1719-1764): collision diagnostics
+/// group by resource name (winner marked with the success glyph, losers with
+/// the warning glyph + `(skipped)`), the rest render as `path` + optional
+/// message colored by kind (error vs warning).
+fn render_loaded_diagnostics(
+    theme: &crate::core::themes::Theme,
+    entries: &[LoadedDiagnostic],
+) -> String {
+    use crate::core::skills::DiagnosticKind;
+
+    let mut collisions: Vec<(String, Vec<&LoadedDiagnostic>)> = Vec::new();
+    let mut others: Vec<&LoadedDiagnostic> = Vec::new();
+    for diagnostic in entries {
+        if diagnostic.kind == DiagnosticKind::Collision
+            && let Some(collision) = &diagnostic.collision
+        {
+            match collisions
+                .iter_mut()
+                .find(|(name, _)| name == &collision.name)
+            {
+                Some((_, list)) => list.push(diagnostic),
+                None => collisions.push((collision.name.clone(), vec![diagnostic])),
+            }
+        } else {
+            others.push(diagnostic);
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for (name, list) in collisions {
+        let Some(first) = list
+            .first()
+            .and_then(|diagnostic| diagnostic.collision.as_ref())
+        else {
+            continue;
+        };
+        lines.push(theme.fg("warning", &format!("  \"{name}\" collision:")));
+        lines.push(theme.fg(
+            "dim",
+            &format!(
+                "    {} {}",
+                theme.fg("success", "✓"),
+                first.winner_path.display()
+            ),
+        ));
+        for diagnostic in list {
+            if let Some(collision) = &diagnostic.collision {
+                lines.push(theme.fg(
+                    "dim",
+                    &format!(
+                        "    {} {} (skipped)",
+                        theme.fg("warning", "✗"),
+                        collision.loser_path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    for diagnostic in others {
+        let color = if diagnostic.kind == DiagnosticKind::Error {
+            "error"
+        } else {
+            "warning"
+        };
+        match &diagnostic.path {
+            Some(path) => {
+                lines.push(theme.fg(color, &format!("  {path}")));
+                lines.push(theme.fg(color, &format!("    {}", diagnostic.message)));
+            }
+            None => lines.push(theme.fg(color, &format!("  {}", diagnostic.message))),
+        }
+    }
+    lines.join("\n")
+}
+
+/// `buildScopeGroups` + `formatScopeGroups` (interactive-mode.ts:1624-1698):
+/// group items into project → user → path (empty groups dropped), splitting
+/// `npm:`/`git:` package sources into a `source` sub-group. Returns themed
+/// `(color, text)` line pairs for the expandable section body.
+fn scope_group_lines(
+    items: &[(String, Option<crate::core::skills::SourceInfo>)],
+) -> Vec<(String, String)> {
+    use crate::core::skills::SourceScope;
+
+    #[derive(Default)]
+    struct Group {
+        paths: Vec<String>,
+        packages: Vec<(String, Vec<String>)>,
+    }
+
+    let mut project = Group::default();
+    let mut user = Group::default();
+    let mut path_group = Group::default();
+    for (path, info) in items {
+        let source = info
+            .as_ref()
+            .map(|info| info.source.as_str())
+            .unwrap_or("local");
+        let scope = info.as_ref().map(|info| info.scope);
+        // `getScopeGroup` (interactive-mode.ts:1601-1615): a missing source
+        // info defaults to `{ source: "local", scope: "project" }`.
+        let group = if source == "cli" || scope == Some(SourceScope::Temporary) {
+            &mut path_group
+        } else if scope == Some(SourceScope::User) {
+            &mut user
+        } else if scope == Some(SourceScope::Project) || scope.is_none() {
+            &mut project
+        } else {
+            &mut path_group
+        };
+        // `isPackageSource` (interactive-mode.ts:1617-1620).
+        if source.starts_with("npm:") || source.starts_with("git:") {
+            match group.packages.iter_mut().find(|(name, _)| name == source) {
+                Some((_, paths)) => paths.push(path.clone()),
+                None => group.packages.push((source.to_owned(), vec![path.clone()])),
+            }
+        } else {
+            group.paths.push(path.clone());
+        }
+    }
+
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for (scope, mut group) in [("project", project), ("user", user), ("path", path_group)] {
+        if group.paths.is_empty() && group.packages.is_empty() {
+            continue;
+        }
+        lines.push(("accent".to_owned(), format!("  {scope}")));
+        group.paths.sort();
+        for path in group.paths {
+            lines.push(("dim".to_owned(), format!("    {path}")));
+        }
+        group.packages.sort_by(|left, right| left.0.cmp(&right.0));
+        for (source, mut paths) in group.packages {
+            lines.push(("mdLink".to_owned(), format!("    {source}")));
+            paths.sort();
+            for path in paths {
+                lines.push(("dim".to_owned(), format!("      {path}")));
+            }
+        }
+    }
+    lines
+}
+
 /// `isExtensionCommand` (interactive-mode.ts:4017-4027).
 fn is_extension_command(runner: &Arc<dyn ExtensionRunner>, text: &str) -> bool {
     if !text.starts_with('/') {
@@ -5207,7 +5608,7 @@ pub struct InteractiveMode {
     pub(crate) ui_state: Arc<InteractiveUi>,
     input_rx: UnboundedReceiver<EditorInput>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
-    flush_rx: watch::Receiver<u64>,
+    flush_rx: watch::Receiver<FlushSignal>,
     driver_stop: Arc<AtomicBool>,
     driver: Option<std::thread::JoinHandle<()>>,
     /// Theme watcher stop flag + handle (T12-S6; joined in `shutdown`).
@@ -5339,7 +5740,7 @@ impl InteractiveMode {
         )));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (flush_tx, flush_rx) = watch::channel(0u64);
+        let (flush_tx, flush_rx) = watch::channel(FlushSignal::default());
         let (input_tx, input_rx) = unbounded_channel();
 
         // The editor region is the focus identity; it lives inside the
@@ -5466,6 +5867,7 @@ impl InteractiveMode {
             flush_generation: AtomicU64::new(0),
             input_tx,
             skill_commands: Mutex::new(HashMap::new()),
+            autocomplete_providers: Mutex::new(Vec::new()),
             main_screen_render_state: Mutex::new(None),
             fullscreen_layout_root: Mutex::new(None),
             fullscreen_transcript_scroll_view: Mutex::new(None),
@@ -5538,6 +5940,14 @@ impl InteractiveMode {
                 let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&self.ui_state));
                 *lock(&self.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
                 host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
+                // `bindCommandContext` (agent-session.ts:3338): interactive
+                // `ctx.command.*` actions (V17-11 FR-B R2). The actions hold a
+                // Weak UI and queue on the input inbox; the run loop owns the
+                // actual mutation.
+                host.runtime()
+                    .set_command_actions(Some(Arc::new(InteractiveCommandActions::new(
+                        &self.ui_state,
+                    ))));
             }
         }
 
@@ -6009,7 +6419,13 @@ impl InteractiveMode {
                 Some(RunCommand::FollowUp) => self.handle_follow_up().await,
                 Some(RunCommand::ResumeSession(path)) => self.handle_resume_command(&path).await,
                 Some(RunCommand::ForkFrom(entry_id)) => self.handle_fork_command(&entry_id).await,
-                Some(RunCommand::FlushCompactionQueue) => self.flush_compaction_queue().await,
+                Some(RunCommand::FlushCompactionQueue) => {
+                    let will_retry = self.flush_rx.borrow_and_update().will_retry;
+                    self.flush_compaction_queue(will_retry).await
+                }
+                Some(RunCommand::ExtensionCommand(command)) => {
+                    self.handle_extension_session_command(*command).await
+                }
             }
         }
 
@@ -6099,6 +6515,9 @@ impl InteractiveMode {
                     // (interactive-mode.ts:4779-4781, 4589-4602).
                     EditorInput::ResumeSession(path) => RunCommand::ResumeSession(path),
                     EditorInput::ForkFrom(entry_id) => RunCommand::ForkFrom(entry_id),
+                    EditorInput::ExtensionCommand(command) => {
+                        RunCommand::ExtensionCommand(command)
+                    }
                 })
             }
             _ = self.flush_rx.changed() => Some(RunCommand::FlushCompactionQueue),
@@ -6150,9 +6569,14 @@ impl InteractiveMode {
         lock(&self.ui_state.editor).add_to_history(&text);
 
         // Queue input during compaction; extension commands execute
-        // immediately upstream — a T15 hook (`is_extension_command`)
-        // (interactive-mode.ts:2807-2817).
+        // immediately (interactive-mode.ts:3366-3373, `is_extension_command`
+        // is now reachable via the live runner).
         if self.session.is_compacting() {
+            if is_extension_command(&self.session.extension_runner(), &text) {
+                self.prompt_or_shutdown(&text, PromptOptions::default())
+                    .await;
+                return;
+            }
             self.ui_state
                 .queue_compaction_message(text, StreamingBehavior::Steer);
             return;
@@ -6325,9 +6749,14 @@ impl InteractiveMode {
             return;
         }
         // Queue input during compaction; extension commands execute
-        // immediately upstream — a T15 hook (`is_extension_command`)
-        // (interactive-mode.ts:3732-3741).
+        // immediately (interactive-mode.ts:4481-4488).
         if self.session.is_compacting() {
+            if is_extension_command(&self.session.extension_runner(), &text) {
+                lock(&self.ui_state.editor).set_text("");
+                self.prompt_or_shutdown(&text, PromptOptions::default())
+                    .await;
+                return;
+            }
             self.ui_state
                 .queue_compaction_message(text, StreamingBehavior::FollowUp);
             return;
@@ -6365,13 +6794,13 @@ impl InteractiveMode {
         }
     }
 
-    /// `flushCompactionQueue` (interactive-mode.ts:4041-4095) — the priority
-    /// chain: willRetry re-queues everything into the retry turn;
-    /// otherwise extension commands run immediately (T15 hook — currently
-    /// never), the first non-extension message becomes the prompt (with its
-    /// mode), and the rest are queued by mode. On failure the queue is
-    /// restored and the error shown.
-    async fn flush_compaction_queue(&mut self) {
+    /// `flushCompactionQueue(options)` (interactive-mode.ts:4781-4858 @ abe508e1b) — the
+    /// priority chain: `will_retry` re-queues everything into the retry
+    /// turn; otherwise extension commands run immediately, the first
+    /// non-extension message becomes the prompt (with its mode), and the
+    /// rest are queued by mode. On failure the queue is restored and the
+    /// error shown.
+    async fn flush_compaction_queue(&mut self, will_retry: bool) {
         let messages: Vec<CompactionQueuedMessage> =
             std::mem::take(&mut *lock(&self.ui_state.compaction_queue));
         if messages.is_empty() {
@@ -6379,12 +6808,9 @@ impl InteractiveMode {
         }
         self.ui_state.update_pending_messages_display();
 
-        // Known gap (unassigned — no v0.1 task claims it, D-019): the
-        // compaction_end event carries `willRetry`; the run loop currently
-        // flushes unconditionally. The willRetry branch re-queues every
-        // message into the retry turn (prompt for extension commands,
-        // followUp/steer otherwise) — interactive-mode.ts:4061-4071.
-        let will_retry = false;
+        // When a retry is pending, queue every message for the retry turn
+        // instead of flushing them into the aborted run
+        // (interactive-mode.ts:4801-4814).
         if will_retry {
             for message in messages {
                 if is_extension_command(&self.session.extension_runner(), &message.text) {
@@ -6406,13 +6832,14 @@ impl InteractiveMode {
             return;
         }
 
-        // `isExtensionCommand` (interactive-mode.ts:4017-4027): the no-op
-        // extension runner never has commands — T15 hook.
+        // `isExtensionCommand` (interactive-mode.ts:4771-4779): registered
+        // extension slash commands execute through the extension path
+        // instead of becoming a prompt.
         let first_prompt_index = messages.iter().position(|message| {
             !is_extension_command(&self.session.extension_runner(), &message.text)
         });
         let Some(first_prompt_index) = first_prompt_index else {
-            // All extension commands — execute them all (currently never).
+            // All extension commands — execute them all.
             for message in messages {
                 self.prompt_or_shutdown(&message.text, PromptOptions::default())
                     .await;
@@ -6424,8 +6851,7 @@ impl InteractiveMode {
         let first_prompt = messages[first_prompt_index].clone();
         let rest = &messages[first_prompt_index + 1..];
 
-        // Execute extension commands before the first prompt (currently
-        // never reached).
+        // Execute extension commands before the first prompt.
         for message in pre_commands {
             self.prompt_or_shutdown(&message.text, PromptOptions::default())
                 .await;
@@ -6509,6 +6935,155 @@ impl InteractiveMode {
         }
         self.ui_state.update_pending_messages_display();
         self.ui_state.render_handle.request_render();
+    }
+
+    /// Run one queued `ctx.command.*` session-control action (V17-11 FR-B
+    /// R2): the interactive-mode versions of upstream's
+    /// `ExtensionCommandContextActions` handlers (interactive-mode.ts:
+    /// 2000-2030). Session replacement rebinds the UI/host exactly like the
+    /// user-facing commands do; `navigateTree` follows the `/tree` selector's
+    /// post-navigation path including the explicit non-retry compaction
+    /// flush (interactive-mode.ts:2018).
+    async fn handle_extension_session_command(&mut self, command: ExtensionSessionCommand) {
+        match command {
+            ExtensionSessionCommand::NewSession {
+                parent_session,
+                with_session,
+            } => {
+                let with_session = crate::core::extension_context::map_with_session(with_session)
+                    .map(|callback| Box::new(callback) as _);
+                match self
+                    .runtime
+                    .new_session(parent_session.as_deref(), None, with_session)
+                    .await
+                {
+                    Ok(cancelled) => {
+                        if cancelled {
+                            return;
+                        }
+                        self.rebind_session_ui().await;
+                        self.ui_state.show_status("✓ New session started");
+                    }
+                    Err(error) => {
+                        self.handle_fatal_runtime_error(
+                            "Failed to create session",
+                            &error.raw_message(),
+                        )
+                        .await
+                    }
+                }
+            }
+            ExtensionSessionCommand::Fork {
+                entry_id,
+                position,
+                with_session,
+            } => {
+                let position = match position.as_deref() {
+                    Some("at") => crate::core::agent_session_runtime::ForkPosition::At,
+                    _ => crate::core::agent_session_runtime::ForkPosition::Before,
+                };
+                let with_session = crate::core::extension_context::map_with_session(with_session)
+                    .map(|callback| Box::new(callback) as _);
+                match self.runtime.fork(&entry_id, position, with_session).await {
+                    Ok(result) => {
+                        if result.cancelled {
+                            return;
+                        }
+                        self.rebind_session_ui().await;
+                        lock(&self.ui_state.editor)
+                            .set_text(result.selected_text.as_deref().unwrap_or(""));
+                        self.ui_state.show_status("Forked to new session");
+                    }
+                    Err(error) => {
+                        self.handle_fatal_runtime_error(
+                            "Failed to fork session",
+                            &error.raw_message(),
+                        )
+                        .await
+                    }
+                }
+            }
+            ExtensionSessionCommand::NavigateTree { target_id, options } => {
+                let navigate = self
+                    .session
+                    .navigate_tree(
+                        &target_id,
+                        crate::core::agent_session::NavigateTreeOptions {
+                            summarize: options.summarize.unwrap_or(false),
+                            custom_instructions: options.custom_instructions,
+                            replace_instructions: options.replace_instructions.unwrap_or(false),
+                            label: options.label,
+                        },
+                    )
+                    .await;
+                match navigate {
+                    Ok(result) => {
+                        if result.aborted || result.cancelled {
+                            return;
+                        }
+                        lock(&self.ui_state.chat_container).clear();
+                        self.ui_state.render_initial_messages();
+                        if let Some(editor_text) = result.editor_text
+                            && lock(&self.ui_state.editor).get_text().trim().is_empty()
+                        {
+                            lock(&self.ui_state.editor).set_text(&editor_text);
+                        }
+                        self.ui_state.show_status("Navigated to selected point");
+                        self.ui_state.flush_compaction_queue_now();
+                    }
+                    Err(error) => self.ui_state.show_error(&error.raw_message()),
+                }
+            }
+            ExtensionSessionCommand::SwitchSession {
+                session_path,
+                with_session,
+            } => {
+                // Same cross-cwd trust prompt as `/resume`
+                // (ADR-0006/D-044 closure).
+                let ui_weak = Arc::downgrade(&self.ui_state);
+                let trust_factory = Arc::new(move |_cwd: &std::path::Path| {
+                    let ui_weak = ui_weak.clone();
+                    crate::core::trust_manager::ProjectTrustContext {
+                        has_ui: true,
+                        select: None,
+                        select_async: Some(Arc::new(move |title: String, options: Vec<String>| {
+                            let ui_weak = ui_weak.clone();
+                            Box::pin(async move {
+                                use rpi_ext_host::api::UiBridge;
+                                let ui = ui_weak.upgrade()?;
+                                ui_bridge::InteractiveUiBridge::new(&ui)
+                                    .select(&title, &options, None)
+                                    .await
+                            })
+                                as futures::future::BoxFuture<'static, Option<String>>
+                        })),
+                    }
+                });
+                let with_session = crate::core::extension_context::map_with_session(with_session)
+                    .map(|callback| Box::new(callback) as _);
+                match self
+                    .runtime
+                    .switch_session(&session_path, None, with_session, Some(trust_factory))
+                    .await
+                {
+                    Ok(cancelled) => {
+                        if cancelled {
+                            return;
+                        }
+                        self.rebind_session_ui().await;
+                        self.ui_state.show_status("Resumed session");
+                    }
+                    Err(error) => {
+                        self.handle_fatal_runtime_error(
+                            "Failed to resume session",
+                            &error.raw_message(),
+                        )
+                        .await
+                    }
+                }
+            }
+            ExtensionSessionCommand::Reload => self.ui_state.handle_reload_command(),
+        }
     }
 
     /// `switchTuiMode` (interactive-mode.ts:788-837 @ b103937d3): swap the
@@ -6684,6 +7259,99 @@ enum RunCommand {
     ResumeSession(String),
     ForkFrom(String),
     FlushCompactionQueue,
+    ExtensionCommand(Box<ExtensionSessionCommand>),
+}
+
+/// `ExtensionCommandContextActions` implementation for interactive mode
+/// (V17-11 FR-B R2). The upstream handlers run the session mutation inline
+/// (interactive-mode.ts:2000-2030); the rpi form queues an
+/// [`ExtensionSessionCommand`] on the input inbox so the run loop — not the
+/// extension command handler, which may run inside a session dispatch — owns
+/// the mutation. The trait's `cancelled` return is `false` (accepted): the
+/// action completes asynchronously on the run loop and reports through the
+/// usual status/error surfaces (a documented form difference; the previous
+/// behavior was a silent no-op).
+pub(crate) struct InteractiveCommandActions {
+    ui: Weak<InteractiveUi>,
+}
+
+impl InteractiveCommandActions {
+    pub(crate) fn new(ui: &Arc<InteractiveUi>) -> Self {
+        Self {
+            ui: Arc::downgrade(ui),
+        }
+    }
+
+    fn queue(&self, command: ExtensionSessionCommand) {
+        if let Some(ui) = self.ui.upgrade() {
+            let _ = ui
+                .input_tx
+                .send(EditorInput::ExtensionCommand(Box::new(command)));
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl rpi_ext_host::api::CommandContextActions for InteractiveCommandActions {
+    async fn wait_for_idle(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.session().wait_for_idle().await;
+        }
+    }
+
+    async fn new_session(
+        &self,
+        parent_session: Option<String>,
+        with_session: Option<rpi_ext_host::api::WithSessionFn>,
+    ) -> bool {
+        self.queue(ExtensionSessionCommand::NewSession {
+            parent_session,
+            with_session,
+        });
+        false
+    }
+
+    async fn fork(
+        &self,
+        entry_id: &str,
+        position: Option<String>,
+        with_session: Option<rpi_ext_host::api::WithSessionFn>,
+    ) -> bool {
+        self.queue(ExtensionSessionCommand::Fork {
+            entry_id: entry_id.to_owned(),
+            position,
+            with_session,
+        });
+        false
+    }
+
+    async fn navigate_tree(
+        &self,
+        target_id: &str,
+        options: rpi_ext_host::api::NavigateTreeOptions,
+    ) -> bool {
+        self.queue(ExtensionSessionCommand::NavigateTree {
+            target_id: target_id.to_owned(),
+            options,
+        });
+        false
+    }
+
+    async fn switch_session(
+        &self,
+        session_path: &str,
+        with_session: Option<rpi_ext_host::api::WithSessionFn>,
+    ) -> bool {
+        self.queue(ExtensionSessionCommand::SwitchSession {
+            session_path: session_path.to_owned(),
+            with_session,
+        });
+        false
+    }
+
+    async fn reload(&self) {
+        self.queue(ExtensionSessionCommand::Reload);
+    }
 }
 
 #[cfg(test)]
@@ -8021,7 +8689,11 @@ mod tests {
         assert!(marker.load(AtomicOrdering::SeqCst), "sentinel restored");
         assert!(matches!(*lock(&ui.status), ActiveStatus::Idle));
         // The run loop was signalled to flush the compaction queue.
-        assert!(*mode.flush_rx.borrow() == 1, "flush signal sent");
+        assert_eq!(mode.flush_rx.borrow().generation, 1, "flush signal sent");
+        assert!(
+            !mode.flush_rx.borrow().will_retry,
+            "no retry pending: will_retry false"
+        );
     }
 
     #[tokio::test]
@@ -9463,7 +10135,7 @@ mod tests {
         }
         // The test session has no auth: the first prompt fails and the whole
         // queue is restored with an error status (interactive-mode.ts:4081-4083).
-        mode.flush_compaction_queue().await;
+        mode.flush_compaction_queue(false).await;
         assert_eq!(
             lock(&mode.ui_state.compaction_queue).len(),
             2,
@@ -9489,10 +10161,150 @@ mod tests {
         // (biased) race and the taken messages must be put back — without
         // the restore they would be dropped silently.
         let _ = mode.ui_state.shutdown_tx.send(true);
-        mode.flush_compaction_queue().await;
+        mode.flush_compaction_queue(false).await;
         let queue = lock(&mode.ui_state.compaction_queue);
         let texts: Vec<&str> = queue.iter().map(|message| message.text.as_str()).collect();
         assert_eq!(texts, ["first msg", "second msg"], "queue restored");
+    }
+
+    /// Stub extension exposing one slash command plus an `input` handler that
+    /// consumes "consume me" (so the non-retry prompt branch can succeed
+    /// without model auth). Returns the host and the command-run counter.
+    async fn flush_stub_host() -> (
+        Arc<rpi_ext_host::host::NativeExtensionHost>,
+        Arc<AtomicUsize>,
+    ) {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+        use serde_json::json;
+
+        let command_runs = Arc::new(AtomicUsize::new(0));
+        let factory_runs = Arc::clone(&command_runs);
+        let factory: ExtensionFactory = Arc::new(move |api: ExtensionApi| {
+            let runs = Arc::clone(&factory_runs);
+            api.register_command(
+                "ext-cmd",
+                Some("stub".to_owned()),
+                Arc::new(move |_args, _ctx| {
+                    let runs = Arc::clone(&runs);
+                    Box::pin(async move {
+                        runs.fetch_add(1, AtomicOrdering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            )
+            .expect("register command");
+            api.on(
+                "input",
+                Arc::new(move |payload: serde_json::Value, _ctx| {
+                    Box::pin(async move {
+                        let text = payload
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        if text == "consume me" {
+                            Ok(json!({"action": "handled"}))
+                        } else {
+                            Ok(json!({"action": "continue"}))
+                        }
+                    })
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<Output = Result<serde_json::Value, String>>
+                                    + Send,
+                            >,
+                        >
+                }),
+            )
+            .expect("register input handler");
+            Box::pin(async { Ok(()) })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/w3-cwd"));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+        (host, command_runs)
+    }
+
+    /// V17-11 FR-A #61: `willRetry: true` re-queues every message into the
+    /// retry turn — extension commands through the extension path,
+    /// followUp/steer by mode (interactive-mode.ts:4801-4814).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_compaction_queue_will_retry_requeues_every_message() {
+        let (host, command_runs) = flush_stub_host().await;
+        let (mut mode, _terminal, session, _tmp) = mode_harness_with_host(host).await;
+        mode.init().await;
+        {
+            let ui = &mode.ui_state;
+            ui.queue_compaction_message("/ext-cmd".to_string(), StreamingBehavior::Steer);
+            ui.queue_compaction_message("steer me".to_string(), StreamingBehavior::Steer);
+            ui.queue_compaction_message("follow me".to_string(), StreamingBehavior::FollowUp);
+        }
+        mode.flush_compaction_queue(true).await;
+        assert_eq!(
+            command_runs.load(AtomicOrdering::SeqCst),
+            1,
+            "queued extension command executed through the extension path"
+        );
+        assert!(
+            lock(&mode.ui_state.compaction_queue).is_empty(),
+            "willRetry consumed the queue"
+        );
+        let (steering, follow_up) = session.clear_queue();
+        assert_eq!(steering, ["steer me"], "steer queued into the retry turn");
+        assert_eq!(
+            follow_up,
+            ["follow me"],
+            "follow-up queued into the retry turn"
+        );
+    }
+
+    /// V17-11 FR-A #61: the non-retry `is_extension_command` branches are
+    /// reachable with a stub runner exposing one command — all-commands,
+    /// commands before the first prompt, and commands in the rest queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_compaction_queue_runs_extension_commands_through_the_extension_path() {
+        // All extension commands: every message executes as a command.
+        let (host, command_runs) = flush_stub_host().await;
+        let (mut mode, _terminal, _session, _tmp) = mode_harness_with_host(host).await;
+        mode.init().await;
+        {
+            let ui = &mode.ui_state;
+            ui.queue_compaction_message("/ext-cmd".to_string(), StreamingBehavior::Steer);
+            ui.queue_compaction_message("/ext-cmd".to_string(), StreamingBehavior::FollowUp);
+        }
+        mode.flush_compaction_queue(false).await;
+        assert_eq!(
+            command_runs.load(AtomicOrdering::SeqCst),
+            2,
+            "all-extension-commands branch executes every command"
+        );
+        assert!(lock(&mode.ui_state.compaction_queue).is_empty());
+
+        // Commands before the first prompt, and commands in the rest queue:
+        // "/ext-cmd" (pre) executes first, "consume me" is handled by the
+        // stub input handler (no model call), then "/ext-cmd" (rest)
+        // executes through the extension path instead of becoming a prompt.
+        let (host, command_runs) = flush_stub_host().await;
+        let (mut mode, _terminal, _session, _tmp) = mode_harness_with_host(host).await;
+        mode.init().await;
+        {
+            let ui = &mode.ui_state;
+            ui.queue_compaction_message("/ext-cmd".to_string(), StreamingBehavior::Steer);
+            ui.queue_compaction_message("consume me".to_string(), StreamingBehavior::Steer);
+            ui.queue_compaction_message("/ext-cmd".to_string(), StreamingBehavior::FollowUp);
+        }
+        mode.flush_compaction_queue(false).await;
+        assert_eq!(
+            command_runs.load(AtomicOrdering::SeqCst),
+            2,
+            "pre-command and rest-queue command both executed"
+        );
+        assert!(
+            lock(&mode.ui_state.compaction_queue).is_empty(),
+            "successful flush leaves no restored queue"
+        );
     }
 
     #[tokio::test]
@@ -9614,10 +10426,16 @@ mod tests {
         assert!(rendered.contains("/review"), "rendered: {rendered}");
         // 2b0a123de: the [Themes] section is not part of the startup banner.
         assert!(!rendered.contains("[Themes]"), "rendered: {rendered}");
-        // The broken theme produced a diagnostic block (warning color).
+        // The broken theme produced a diagnostics block (warning color).
+        // V17-11 FR-C R4: upstream's four per-kind blocks replaced the
+        // collapsed `[Resource issues]` block.
         assert!(
-            rendered.contains("[Resource issues]"),
+            rendered.contains("[Theme conflicts]"),
             "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("[Resource issues]"),
+            "single merged block is gone: {rendered}"
         );
         // The diagnostic path may wrap across 80-column lines depending on
         // the temp-dir name length — assert the message, not the path.
@@ -9661,9 +10479,109 @@ mod tests {
             "quiet hides listings: {rendered}"
         );
         assert!(
-            rendered.contains("[Resource issues]"),
+            rendered.contains("[Theme conflicts]"),
             "showDiagnosticsWhenQuiet keeps diagnostics: {rendered}"
         );
+    }
+
+    /// V17-11 FR-C R4 (#71 item 4): the expanded view groups items into the
+    /// upstream scope buckets (`buildScopeGroups`/`formatScopeGroups`,
+    /// interactive-mode.ts:1624-1698) instead of the compact joined list.
+    #[tokio::test]
+    async fn show_loaded_resources_expanded_scope_groups() {
+        let (mode, _terminal, _tmp_keep) = loaded_resources_harness(false).await;
+        let ui = &mode.ui_state;
+        *lock(&ui.tool_output_expanded) = true;
+        ui.show_loaded_resources();
+
+        let rendered = lock(&ui.loaded_resources_container).render(200).join("\n");
+        // Skills live under the agent dir → user scope bucket.
+        assert!(rendered.contains("  user"), "rendered: {rendered}");
+        // Prompts carry no source info → the upstream default project bucket.
+        assert!(rendered.contains("  project"), "rendered: {rendered}");
+        // The expanded body lists paths, not the compact name list.
+        assert!(
+            rendered.contains("SKILL.md"),
+            "expanded skill path: {rendered}"
+        );
+        assert!(
+            rendered.contains("review.md"),
+            "expanded prompt path: {rendered}"
+        );
+    }
+
+    /// V17-11 FR-C R4: the diagnostic renderer groups collisions by name and
+    /// colors errors/warnings like upstream `formatDiagnostics`.
+    #[test]
+    fn loaded_diagnostics_render_collisions_and_severity() {
+        use crate::core::skills::{DiagnosticKind, DiagnosticResourceType, ResourceCollision};
+        let theme = crate::core::themes::load_theme("dark", None).expect("dark theme");
+        let entries = vec![
+            LoadedDiagnostic {
+                kind: DiagnosticKind::Collision,
+                message: "collision".to_owned(),
+                path: None,
+                collision: Some(ResourceCollision {
+                    resource_type: DiagnosticResourceType::Skill,
+                    name: "dup".to_owned(),
+                    winner_path: std::path::PathBuf::from("/winner/SKILL.md"),
+                    loser_path: std::path::PathBuf::from("/loser/SKILL.md"),
+                    winner_source: None,
+                    loser_source: None,
+                }),
+            },
+            LoadedDiagnostic {
+                kind: DiagnosticKind::Error,
+                message: "broken prompt".to_owned(),
+                path: Some("/prompts/bad.md".to_owned()),
+                collision: None,
+            },
+            LoadedDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: "theme warning".to_owned(),
+                path: None,
+                collision: None,
+            },
+        ];
+        let rendered = render_loaded_diagnostics(&theme, &entries);
+        assert!(rendered.contains("\"dup\" collision:"), "{rendered}");
+        assert!(rendered.contains("/winner/SKILL.md"), "{rendered}");
+        assert!(rendered.contains("(skipped)"), "{rendered}");
+        assert!(rendered.contains("/prompts/bad.md"), "{rendered}");
+        assert!(rendered.contains("broken prompt"), "{rendered}");
+        assert!(rendered.contains("theme warning"), "{rendered}");
+    }
+
+    /// V17-11 FR-C R4: `scope_group_lines` splits package sources into their
+    /// own `source` sub-group and drops empty scope buckets.
+    #[test]
+    fn scope_group_lines_split_packages() {
+        use crate::core::skills::{SourceInfo, SourceOrigin, SourceScope};
+        let info = |scope: SourceScope, source: &str| SourceInfo {
+            path: std::path::PathBuf::from("/x"),
+            source: source.to_owned(),
+            scope,
+            origin: SourceOrigin::TopLevel,
+            base_dir: None,
+        };
+        let items = vec![
+            (
+                "/user/a.md".to_owned(),
+                Some(info(SourceScope::User, "local")),
+            ),
+            (
+                "/pkg/a.md".to_owned(),
+                Some(info(SourceScope::User, "npm:@scope/pkg")),
+            ),
+            ("/proj/b.md".to_owned(), None),
+        ];
+        let lines = scope_group_lines(&items);
+        let text: Vec<&str> = lines.iter().map(|(_, text)| text.as_str()).collect();
+        assert!(text.contains(&"  project"), "{text:?}");
+        assert!(text.contains(&"  user"), "{text:?}");
+        assert!(text.contains(&"    npm:@scope/pkg"), "{text:?}");
+        assert!(text.contains(&"      /pkg/a.md"), "{text:?}");
+        assert!(!text.contains(&"  path"), "empty buckets dropped: {text:?}");
     }
 
     #[tokio::test]
@@ -10417,6 +11335,52 @@ mod tests {
             lock(&ui.theme).name.as_deref(),
             Some("draintest"),
             "last good theme retained after parse failure"
+        );
+    }
+
+    /// V17-11 FR-C R2 (#71 item 2): a theme swap repaints the already-rendered
+    /// history and footer with the new palette (the lazy global-proxy
+    /// equivalent), and a mid-stream swap preserves the streaming component.
+    #[tokio::test]
+    async fn theme_swap_repaints_history_and_preserves_streaming() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+        lock(&session.session_manager())
+            .append_message(user_message("theme history"))
+            .expect("append user");
+        ui.render_initial_messages();
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("streaming partial")],
+            rpi_ai::types::StopReason::Pending,
+        )));
+        ui.drain_events();
+        assert!(lock(&ui.streaming).is_some(), "streaming component mounted");
+
+        let before_chat = lock(&ui.chat_container).render(120).join("\n");
+        let before_footer = lock(&ui.footer).render(120).join("\n");
+        let light =
+            Arc::new(crate::core::themes::load_theme("light", None).expect("builtin light theme"));
+        ui.apply_theme(light);
+        let after_chat = lock(&ui.chat_container).render(120).join("\n");
+        let after_footer = lock(&ui.footer).render(120).join("\n");
+
+        assert!(
+            after_chat.contains("theme history"),
+            "history survives the rebuild: {after_chat}"
+        );
+        assert!(
+            after_chat.contains("streaming partial"),
+            "streaming tail preserved mid-stream: {after_chat}"
+        );
+        assert!(
+            lock(&ui.streaming).is_some(),
+            "streaming track still mounted"
+        );
+        assert_ne!(before_chat, after_chat, "history bytes use the new palette");
+        assert_ne!(
+            before_footer, after_footer,
+            "footer repaints with the new palette"
         );
     }
 
@@ -12784,5 +13748,221 @@ mod tests {
             "a persisted error must rebuild as an error card"
         );
         assert_eq!(failed.details.as_ref().unwrap()["mode"], "parallel");
+    }
+
+    /// V17-11 FR-B R4: `addAutocompleteProvider` stores the declarative
+    /// source and rebuilds the base provider; the session reset path clears
+    /// it (upstream `resetExtensionUI`, interactive-mode.ts:2452-2472).
+    #[tokio::test]
+    async fn add_autocomplete_provider_registers_declarative_source() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_tui::autocomplete::GetSuggestionsOptions;
+
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let bridge =
+            crate::modes::interactive::interactive_mode::ui_bridge::InteractiveUiBridge::new(ui);
+        bridge.add_autocomplete_provider(serde_json::json!({
+            "trigger": "!",
+            "items": [{"value": "task", "label": "Task"}],
+        }));
+        assert_eq!(lock(&ui.autocomplete_providers).len(), 1);
+
+        let provider =
+            crate::modes::interactive::autocomplete::create_base_autocomplete_provider(ui);
+        let suggestions = provider
+            .get_suggestions(
+                &["!ta".to_string()],
+                0,
+                3,
+                &GetSuggestionsOptions {
+                    abort: Arc::new(AtomicBool::new(false)),
+                    force: false,
+                },
+            )
+            .expect("declarative source suggestions");
+        assert_eq!(suggestions.items[0].value, "task");
+        assert_eq!(suggestions.items[0].label, "Task");
+
+        // Session replacement / reload drops the outgoing descriptors.
+        ui.reset_extension_autocomplete();
+        assert!(lock(&ui.autocomplete_providers).is_empty());
+    }
+
+    /// V17-11 FR-B R2: `ctx.command.*` actions are bound in interactive
+    /// mode, queue on the input inbox (no synchronous session mutation, no
+    /// TUI event-pump re-entry), and the run loop applies them. Session
+    /// replacement cannot run in this harness (the test runtime's session
+    /// factory is a deliberate `unreachable!`), so the apply half covers
+    /// `navigateTree` (no session replacement) and `reload` (synchronous box
+    /// mount); fork/newSession are pinned at the queue boundary and by the
+    /// runtime-level action tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn extension_command_actions_queue_and_apply_in_interactive_mode() {
+        // A real host is required: the command-action binding lives on the
+        // session's extension host (the no-op runner has no runtime).
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/w3-cwd"));
+        let (mut mode, _terminal, session, _tmp) = mode_harness_with_host(host).await;
+        mode.init().await;
+        lock(&session.session_manager())
+            .append_message(user_message("first message"))
+            .expect("append user");
+        session.refresh_context();
+        let target_id = lock(&session.session_manager())
+            .get_entries()
+            .first()
+            .map(|entry| entry.id().to_string())
+            .expect("entry id");
+        let original_leaf = lock(&session.session_manager())
+            .get_leaf_id()
+            .map(str::to_owned)
+            .expect("leaf id");
+
+        let host =
+            crate::core::extension_host_adapter::host_of_runner(&mode.session.extension_runner())
+                .expect("session host");
+        let actions = host
+            .runtime()
+            .command_actions()
+            .expect("ctx.command actions bound in interactive mode");
+
+        // The actions queue instead of mutating synchronously (the previous
+        // behavior was an inert no-op).
+        assert!(!actions.fork(&original_leaf, None, None).await);
+        assert!(!actions.new_session(None, None).await);
+        actions.reload().await;
+        assert_eq!(
+            lock(&mode.session.session_manager())
+                .get_leaf_id()
+                .map(str::to_owned),
+            Some(original_leaf),
+            "no synchronous session mutation"
+        );
+
+        // The run loop picks the actions up from the inbox in order.
+        let mut queued = Vec::new();
+        for _ in 0..3 {
+            match mode.next_command().await {
+                Some(RunCommand::ExtensionCommand(command)) => queued.push(command),
+                other => panic!("expected queued extension command, got {other:?}"),
+            }
+        }
+        assert!(matches!(*queued[0], ExtensionSessionCommand::Fork { .. }));
+        assert!(matches!(
+            *queued[1],
+            ExtensionSessionCommand::NewSession { .. }
+        ));
+        assert!(matches!(*queued[2], ExtensionSessionCommand::Reload));
+
+        // Reload dispatches synchronously into the reload-box flow.
+        mode.handle_extension_session_command(*queued.pop().expect("reload queued"))
+            .await;
+        let editor = lock(&mode.ui_state.editor_container).render(80).join("\n");
+        assert!(
+            editor.contains("Reloading keybindings"),
+            "reload box mounted: {editor}"
+        );
+
+        // `navigateTree` applies through the same handler (no session
+        // replacement) and issues the explicit non-retry compaction flush
+        // (interactive-mode.ts:2018).
+        let before = mode.flush_rx.borrow().generation;
+        mode.handle_extension_session_command(ExtensionSessionCommand::NavigateTree {
+            target_id: target_id.clone(),
+            options: rpi_ext_host::api::NavigateTreeOptions::default(),
+        })
+        .await;
+        assert_eq!(
+            lock(&mode.session.session_manager())
+                .get_leaf_id()
+                .map(str::to_owned),
+            Some(target_id),
+            "navigateTree moved the session leaf"
+        );
+        let signal = *mode.flush_rx.borrow();
+        assert_eq!(signal.generation, before + 1, "navigation flush signalled");
+        assert!(!signal.will_retry, "navigation flush is non-retry");
+    }
+
+    /// V17-11 FR-B R1: `custom()` mounts the declarative tree with focus,
+    /// resolves through `done` on Enter and `undefined` on Escape, and
+    /// restores the editor afterwards.
+    #[tokio::test]
+    async fn custom_mounts_tree_with_focus_and_resolves_done() {
+        use rpi_ext_host::api::UiBridge;
+
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = Arc::clone(&mode.ui_state);
+        let bridge = Arc::new(
+            crate::modes::interactive::interactive_mode::ui_bridge::InteractiveUiBridge::new(&ui),
+        );
+        let tree = serde_json::json!({
+            "type": "box",
+            "children": [
+                {"type": "text", "props": {"text": "choose", "done": {"value": "a"}}},
+                {"type": "text", "props": {"text": "other", "done": "b"}},
+            ]
+        });
+        let mounted = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move { bridge.custom(tree, None).await })
+        };
+        tokio::task::yield_now().await;
+        let rendered = ui.editor_region_render(60).join("\n");
+        assert!(rendered.contains("choose"), "tree mounted: {rendered}");
+
+        let focused = ui.ui.get_focused_component().expect("focused dialog");
+        lock(&focused).handle_input("\x1b[B");
+        lock(&focused).handle_input("\r");
+        let result = mounted.await.expect("join").expect("done value");
+        assert_eq!(result, serde_json::json!("b"));
+
+        // Guarded close restored the default editor.
+        let after = lock(&ui.active_selector);
+        assert!(after.is_none(), "selector cleared after done");
+    }
+
+    /// V17-11 FR-B R1/R3: `custom()` resolves `undefined` on Escape and
+    /// `setEditorComponent` mounts/restores the editor region.
+    #[tokio::test]
+    async fn custom_escape_and_set_editor_component_mount_roundtrip() {
+        use rpi_ext_host::api::UiBridge;
+
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = Arc::clone(&mode.ui_state);
+        let bridge = Arc::new(
+            crate::modes::interactive::interactive_mode::ui_bridge::InteractiveUiBridge::new(&ui),
+        );
+
+        // Escape → None.
+        let tree = serde_json::json!({"type": "text", "props": {"text": "dismiss me"}});
+        let mounted = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move { bridge.custom(tree, None).await })
+        };
+        tokio::task::yield_now().await;
+        let focused = ui.ui.get_focused_component().expect("focused dialog");
+        lock(&focused).handle_input("\x1b");
+        assert!(
+            mounted.await.expect("join").is_none(),
+            "Escape resolves None"
+        );
+
+        // setEditorComponent mounts the descriptor; None restores the editor.
+        let editor_tree = serde_json::json!({"type": "text", "props": {"text": "custom editor"}});
+        bridge.set_editor_component(Some(editor_tree.clone()));
+        assert_eq!(bridge.get_editor_component(), Some(editor_tree));
+        let rendered = ui.editor_region_render(60).join("\n");
+        assert!(
+            rendered.contains("custom editor"),
+            "editor mounted: {rendered}"
+        );
+        bridge.set_editor_component(None);
+        assert_eq!(bridge.get_editor_component(), None);
+        let restored = ui.editor_region_render(60).join("\n");
+        assert!(
+            !restored.contains("custom editor"),
+            "editor restored: {restored}"
+        );
     }
 }

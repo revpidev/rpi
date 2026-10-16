@@ -24,6 +24,7 @@ use crate::tools::sanitize::{sanitize_binary_output, split_incomplete_ansi_suffi
 use crate::tools::truncate::{self, DEFAULT_MAX_BYTES, TruncateOptions};
 
 /// Result of a user bash execution (bash-executor.ts:29-40).
+#[derive(Debug)]
 pub struct BashResult {
     /// Combined stdout + stderr output (sanitized, possibly truncated).
     pub output: String,

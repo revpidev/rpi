@@ -128,11 +128,10 @@ struct BuiltinKeybinding {
 
 /// `isUserBashEventResult` (runner.ts:124-149 @ pin, `509ee2bd0` / #9068): a
 /// valid defined result carries **exactly one** of `operations` / `result`.
-/// - `operations` must be an object whose `exec` is a function — functions
-///   cannot cross the JSON dispatch boundary, so no JSON value satisfies
-///   this arm and any `operations`-shaped result is invalid here (ADR-0007
-///   gap 1: custom execution backends are not supported; since #9068 they
-///   fail closed instead of falling back to the local shell).
+/// - `operations` is the declarative V17-11 [`UserBashOperations`] policy
+///   (`{ rules: [...] }`) — the JSON-boundary replacement for the upstream
+///   `exec`-backed closure bundle. A malformed policy is still invalid and
+///   fails closed.
 /// - `result` must be the full [`BashResult`] shape: string `output`, a
 ///   present `exitCode` (number or null-as-undefined), boolean
 ///   `cancelled`/`truncated`, and optional string `fullOutputPath`.
@@ -149,9 +148,15 @@ fn is_user_bash_event_result(value: &Value) -> bool {
         return false;
     }
     if has_operations {
-        // `typeof operations.exec === "function"` — unrepresentable as
-        // JSON; over this boundary the arm always rejects.
-        return false;
+        // V17-11 FR-B R5: a declarative `{ rules: [...] }` policy is the
+        // only `operations` shape that can cross the boundary; anything
+        // else (including the upstream closure bundle) is invalid.
+        return candidate
+            .get("operations")
+            .and_then(|operations| {
+                serde_json::from_value::<crate::types::UserBashOperations>(operations.clone()).ok()
+            })
+            .is_some();
     }
 
     let Some(result) = candidate.get("result") else {
@@ -1108,7 +1113,6 @@ impl ExtensionRunnerCore {
         }
         Ok(None)
     }
-
     /// `emitContext` (runner.ts:1247-1355 @ abe508e1b): the two-phase
     /// request-time transform. `context` handlers see the conversation only
     /// and pi restores the prompt/tool state after each; then
@@ -1550,4 +1554,38 @@ fn build_builtin_keybindings(
         }
     }
     builtins
+}
+
+#[cfg(test)]
+mod user_bash_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn declarative_operations_are_valid_and_bundles_fail_closed() {
+        // V17-11 FR-B R5: the declarative policy crosses the boundary.
+        assert!(is_user_bash_event_result(&json!({
+            "operations": {"rules": [{"pattern": "git *", "action": "allow"}]}
+        })));
+        assert!(is_user_bash_event_result(
+            &json!({"operations": {"rules": []}})
+        ));
+        // The upstream closure bundle cannot.
+        assert!(!is_user_bash_event_result(
+            &json!({"operations": {"exec": "fn"}})
+        ));
+        assert!(!is_user_bash_event_result(
+            &json!({"operations": "not-an-object"})
+        ));
+        assert!(!is_user_bash_event_result(
+            &json!({"operations": {"rules": [{"pattern": "x"}]}})
+        ));
+        // Exactly one arm; the result shape is unchanged.
+        assert!(!is_user_bash_event_result(
+            &json!({"operations": {"rules": []}, "result": {"output": "x", "exitCode": 0, "cancelled": false, "truncated": false}})
+        ));
+        assert!(is_user_bash_event_result(&json!({
+            "result": {"output": "x", "exitCode": 0, "cancelled": false, "truncated": false}
+        })));
+    }
 }

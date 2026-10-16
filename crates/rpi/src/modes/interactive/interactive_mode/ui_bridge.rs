@@ -8,16 +8,17 @@
 //! the components' countdown.
 //!
 //! Declarative-component v1 notes (candidate deviations):
-//! - `custom()` mounts the component tree in the editor region and resolves
-//!   `undefined` immediately — the declarative tree has no interaction
-//!   channel in v1 (the `uiEvent` round-trip is W6 ABI), and overlay
-//!   positioning (`OverlayOptions`/`OverlayHandle`) is not yet supported by
-//!   rpi-tui.
-//! - `setEditorComponent` stores the descriptor (readable via
-//!   `getEditorComponent`) but does not mount it — a declarative tree
-//!   cannot handle input.
-//! - `addAutocompleteProvider` is a no-op: upstream composes closure
-//!   factories, which have no declarative form.
+//! - `custom()` mounts the tree in the editor region with focus and resolves
+//!   through the declarative `props.done` interaction form (V17-11 FR-B R1:
+//!   top-level children with a `done` prop are selectable; Enter resolves with
+//!   the selected value, Escape resolves `undefined`). Overlay positioning
+//!   (`OverlayOptions`/`OverlayHandle`) is still not supported by rpi-tui; the
+//!   full interactive-channel path is the ADR-0024 `ui.mountComponent` family.
+//! - `setEditorComponent` mounts the descriptor tree in the editor region
+//!   (V17-11 FR-B R3) until a `None` un-set or a superseding dialog; a
+//!   declarative tree cannot handle input.
+//! - `addAutocompleteProvider` takes the declarative `{ trigger, items }`
+//!   descriptor (V17-11 FR-B R4) and rebuilds the editor's provider.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +41,7 @@ use tokio::sync::oneshot;
 
 use super::{InteractiveUi, lock};
 use crate::modes::interactive::component_tree::component_from_tree;
+use crate::modes::interactive::components::ExtensionCustomComponent;
 use crate::modes::interactive::components::extension_editor::ExtensionEditorComponent;
 use crate::modes::interactive::components::extension_input::ExtensionInputComponent;
 use crate::modes::interactive::components::extension_selector::{
@@ -89,6 +91,9 @@ pub struct InteractiveUiBridge {
     /// rebuild them from the archived trees.
     widget_archive: Mutex<HashMap<String, (WidgetContent, Option<ExtensionWidgetOptions>)>>,
     editor_component: Mutex<Option<ComponentTree>>,
+    /// The component currently mounted by `set_editor_component` (the
+    /// guarded-close identity for the un-set path, V17-11 FR-B R3).
+    editor_component_entry: Mutex<Option<super::SharedComponent>>,
     working_indicator: Mutex<Option<WorkingIndicatorOptions>>,
     next_input_listener: AtomicU64,
 }
@@ -100,6 +105,7 @@ impl InteractiveUiBridge {
             widgets: Mutex::new(HashMap::new()),
             widget_archive: Mutex::new(HashMap::new()),
             editor_component: Mutex::new(None),
+            editor_component_entry: Mutex::new(None),
             working_indicator: Mutex::new(None),
             next_input_listener: AtomicU64::new(0),
         }
@@ -682,19 +688,40 @@ impl UiBridge for InteractiveUiBridge {
         }
     }
 
-    /// `custom` — declarative v1: mount the tree in the editor region and
-    /// resolve `undefined` (see module header for the deviation).
+    /// `custom` (interactive-mode.ts:2966 `showExtensionCustom`): mount the
+    /// declarative tree with keyboard focus and resolve through the
+    /// `props.done` interaction form (V17-11 FR-B R1). A tree without
+    /// selectable rows stays mounted until Escape; the caller's `done` value
+    /// is the JSON carried by the selected row's `done` prop.
     async fn custom(&self, component: ComponentTree, _options: Option<Value>) -> Option<Value> {
         let ui = self.ui()?;
-        let tree = component_from_tree(&component, &Arc::clone(&lock(&ui.theme)));
-        let entry = super::shared_component_from_boxed(tree);
-        ui.show_selector(entry);
-        // No interaction channel in declarative v1: the component displays
-        // until the next dialog/restore; resolve immediately.
-        if let Some(ui) = self.ui() {
-            ui.hide_selector();
+        let (tx, rx) = oneshot::channel();
+        let dialog = Arc::new(Mutex::new(ExtensionCustomComponent::new(
+            Arc::clone(&lock(&ui.theme)),
+            &component,
+            tx,
+        )));
+        let entry = super::shared_component_from_boxed(Box::new(DialogRegion(dialog)));
+        ui.component_registry.dialog_opened();
+        ui.show_selector(entry.clone());
+        ui.set_program_status_blocked(
+            "extension-dialog",
+            Some(BlockedStatus {
+                kind: ProgramStatusKind::Question,
+                message: "extension custom UI".to_owned(),
+            }),
+        );
+        let result = rx.await.ok().flatten();
+        // Guarded close (the `mount_dialog` identity rule): a superseding
+        // selector owns the editor region by the time the dialog resolves.
+        if let Some(ui) = self.ui()
+            && ui.selector_is_current(&entry)
+        {
+            ui.hide_selector_if_current(&entry);
+            ui.set_program_status_blocked("extension-dialog", None);
+            ui.component_registry.dialog_closed();
         }
-        None
+        result
     }
 
     /// `pasteToEditor` — full paste handling (large-content collapse).
@@ -718,12 +745,57 @@ impl UiBridge for InteractiveUiBridge {
             .unwrap_or_default()
     }
 
-    /// No-op (see module header).
-    fn add_autocomplete_provider(&self, _provider: Value) {}
+    /// `addAutocompleteProvider` (types.ts:224, interactive-mode.ts:2659-2662):
+    /// V17-11 FR-B R4 — the opaque descriptor is the declarative
+    /// `{ trigger, items }` source; registering it rebuilds the editor's
+    /// autocomplete provider (upstream `setupAutocompleteProvider()`).
+    fn add_autocomplete_provider(&self, provider: Value) {
+        let Some(ui) = self.ui() else {
+            return;
+        };
+        match serde_json::from_value::<rpi_ext_host::types::AutocompleteProviderDescriptor>(
+            provider,
+        ) {
+            Ok(descriptor) if !descriptor.trigger.is_empty() => {
+                lock(&ui.autocomplete_providers).push(descriptor);
+                super::super::autocomplete::setup_autocomplete(&ui);
+            }
+            // A descriptor without a trigger character cannot ever match;
+            // extensions must be able to detect the no-op (ADR-0007: gaps
+            // are not silent).
+            Ok(_) => tracing::warn!(
+                "extension addAutocompleteProvider: descriptor needs a non-empty trigger; ignored"
+            ),
+            Err(error) => tracing::warn!(
+                "extension addAutocompleteProvider: invalid declarative descriptor: {error}"
+            ),
+        }
+    }
 
-    /// Stores the descriptor only (see module header).
+    /// `setEditorComponent` (types.ts:259-262, interactive-mode.ts:2663 →
+    /// :2875 `setCustomEditorComponent`): mount the descriptor tree in the
+    /// editor region until un-set (V17-11 FR-B R3). The declarative tree does
+    /// not handle input; extensions that need a functional editor use the
+    /// ADR-0024 interactive UI ABI.
     fn set_editor_component(&self, component: Option<ComponentTree>) {
-        *lock(&self.editor_component) = component;
+        let Some(ui) = self.ui() else {
+            return;
+        };
+        *lock(&self.editor_component) = component.clone();
+        let previous = lock(&self.editor_component_entry).take();
+        match component {
+            Some(tree) => {
+                let built = component_from_tree(&tree, &Arc::clone(&lock(&ui.theme)));
+                let entry = super::shared_component_from_boxed(built);
+                ui.show_selector(entry.clone());
+                *lock(&self.editor_component_entry) = Some(entry);
+            }
+            None => {
+                if let Some(previous) = previous {
+                    ui.hide_selector_if_current(&previous);
+                }
+            }
+        }
     }
 
     fn get_editor_component(&self) -> Option<ComponentTree> {

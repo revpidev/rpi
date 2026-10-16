@@ -18,9 +18,11 @@
 //!   never error — and the upstream 10-way read concurrency is a plain
 //!   sequential read order here (candidates are pre-sorted, so partial
 //!   orderings match).
-//! - The header status-message auto-hide timer (`setTimeout`, 116-126) is not
-//!   ported: messages persist until the next status change (unassigned — no
-//!   v0.1 task claims the timer).
+//! - The header status-message auto-hide timer (`setTimeout`, 116-126) is
+//!   ported as a deadline checked at render time plus a timer thread that
+//!   requests the render at the deadline (the Rust replacement for the JS
+//!   `setTimeout` callback; a superseded timer is a no-op via a generation
+//!   counter).
 //! - Actual session deletion follows upstream: the component performs the
 //!   delete itself ([`delete_session_file`], session-selector.ts:654-688 —
 //!   trash CLI first, unlink fallback) and shows the method-dependent status
@@ -62,9 +64,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpi_tui::components::input::Input;
 use rpi_tui::components::text::Text;
@@ -329,8 +331,19 @@ struct SessionSelectorHeader {
     show_path: bool,
     confirming_delete_path: Option<String>,
     status_message: Option<(StatusKind, String)>,
+    /// Auto-hide deadline (`setTimeout` replacement, upstream
+    /// session-selector.ts:116-126): `render` treats an expired status as
+    /// cleared, so the deadline is evaluated on the driver thread.
+    status_deadline: Option<Instant>,
+    /// Timer generation (the `clearStatusTimeout` counterpart): every set
+    /// bumps it, and a superseded timer thread does not request a render.
+    status_generation: Arc<AtomicU64>,
     show_rename_hint: bool,
     theme: Arc<Theme>,
+    /// Renderer handle used by the auto-hide timer to wake the driver at the
+    /// deadline (the Rust replacement for the upstream `requestRender()` in
+    /// the `setTimeout` callback).
+    tui: TuiHandle,
 }
 
 impl SessionSelectorHeader {
@@ -339,6 +352,7 @@ impl SessionSelectorHeader {
         sort_mode: SortMode,
         name_filter: NameFilter,
         theme: Arc<Theme>,
+        tui: TuiHandle,
     ) -> Self {
         Self {
             scope,
@@ -349,8 +363,11 @@ impl SessionSelectorHeader {
             show_path: false,
             confirming_delete_path: None,
             status_message: None,
+            status_deadline: None,
+            status_generation: Arc::new(AtomicU64::new(0)),
             show_rename_hint: false,
             theme,
+            tui,
         }
     }
 
@@ -389,10 +406,42 @@ impl SessionSelectorHeader {
         self.confirming_delete_path = path;
     }
 
-    /// `setStatusMessage` (session-selector.ts:116-126). The upstream
-    /// `autoHideMs` timer is not ported (see module header).
-    fn set_status_message(&mut self, message: Option<(StatusKind, String)>) {
+    /// `setStatusMessage` (session-selector.ts:116-126): a new message
+    /// cancels the previous auto-hide timer (the generation bumps, so the
+    /// stale thread is a no-op); `auto_hide_ms` schedules a render request
+    /// at the deadline, and an expired deadline hides the message on the
+    /// next render.
+    fn set_status_message(
+        &mut self,
+        message: Option<(StatusKind, String)>,
+        auto_hide_ms: Option<u64>,
+    ) {
+        let generation = self.status_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.status_message = message;
+        self.status_deadline = auto_hide_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        if let Some(auto_hide_ms) = auto_hide_ms
+            && self.status_message.is_some()
+        {
+            let tui = self.tui.clone();
+            let generations = Arc::clone(&self.status_generation);
+            let _ = std::thread::Builder::new()
+                .name("rpi-status-autohide".to_owned())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_millis(auto_hide_ms));
+                    if generations.load(Ordering::SeqCst) == generation {
+                        tui.request_render(true);
+                    }
+                });
+        }
+    }
+
+    /// The visible status message: an expired auto-hide deadline reads as
+    /// cleared (the `setTimeout` body).
+    fn visible_status_message(&self) -> Option<&(StatusKind, String)> {
+        match (&self.status_message, self.status_deadline) {
+            (Some(_), Some(deadline)) if Instant::now() >= deadline => None,
+            (message, _) => message.as_ref(),
+        }
     }
 
     fn render(&self, width: usize) -> Vec<String> {
@@ -476,7 +525,7 @@ impl SessionSelectorHeader {
                 ),
                 String::new(),
             )
-        } else if let Some((kind, message)) = &self.status_message {
+        } else if let Some((kind, message)) = self.visible_status_message() {
             let color = if *kind == StatusKind::Error {
                 "error"
             } else {
@@ -1209,6 +1258,7 @@ impl SessionSelectorComponent {
             SortMode::Threaded,
             NameFilter::All,
             Arc::clone(&theme),
+            tui.clone(),
         );
         // `options.showRenameHint ?? this.canRename` (session-selector.ts:772);
         // the hint is derived from the rename hook being present.
@@ -1465,10 +1515,15 @@ impl SessionSelectorComponent {
                 *self.load_slot(scope) = None;
                 if self.scope == scope {
                     self.header.set_loading(false);
-                    self.header.set_status_message(Some((
-                        StatusKind::Error,
-                        "Failed to load sessions: could not spawn loader thread".to_owned(),
-                    )));
+                    // `Failed to load sessions: {message}` (session-selector.ts
+                    // :1003) auto-hides after 4000ms.
+                    self.header.set_status_message(
+                        Some((
+                            StatusKind::Error,
+                            "Failed to load sessions: could not spawn loader thread".to_owned(),
+                        )),
+                        Some(4000),
+                    );
                 }
                 return;
             }
@@ -1538,10 +1593,15 @@ impl SessionSelectorComponent {
         let result = delete_session_file(&self.trash_bin, path);
         if !result.ok {
             let error_message = result.error.unwrap_or_else(|| "Unknown error".to_string());
-            self.header.set_status_message(Some((
-                StatusKind::Error,
-                format!("Failed to delete: {error_message}"),
-            )));
+            // `Failed to delete: {error}` (session-selector.ts:862) auto-hides
+            // after 3000ms.
+            self.header.set_status_message(
+                Some((
+                    StatusKind::Error,
+                    format!("Failed to delete: {error_message}"),
+                )),
+                Some(3000),
+            );
             self.tui.request_render(false);
             return;
         }
@@ -1564,8 +1624,10 @@ impl SessionSelectorComponent {
             DeleteMethod::Trash => "Session moved to trash",
             DeleteMethod::Unlink => "Session deleted",
         };
+        // "Session moved to trash"/"Session deleted" (session-selector.ts:858)
+        // auto-hides after 2000ms.
         self.header
-            .set_status_message(Some((StatusKind::Info, message.to_string())));
+            .set_status_message(Some((StatusKind::Info, message.to_string())), Some(2000));
 
         if let Some(on_delete) = self.on_delete.as_mut() {
             on_delete(path);
@@ -1648,7 +1710,7 @@ impl SessionSelectorComponent {
     fn apply_event(&mut self, event: SessionListEvent) {
         match event {
             SessionListEvent::Select(path) => {
-                self.header.set_status_message(None);
+                self.header.set_status_message(None, None);
                 // `sessionList.onSelect` (session-selector.ts:801-805 @
                 // 19451accd): cancel in-flight loads before handing control
                 // back — selected, the picker closes and the remaining
@@ -1657,7 +1719,7 @@ impl SessionSelectorComponent {
                 (self.on_select)(&path);
             }
             SessionListEvent::Cancel => {
-                self.header.set_status_message(None);
+                self.header.set_status_message(None, None);
                 // `sessionList.onCancel` (session-selector.ts:806-810).
                 self.cancel_loads();
                 (self.on_cancel)();
@@ -1679,8 +1741,10 @@ impl SessionSelectorComponent {
             }
             SessionListEvent::Rename(path) => self.enter_rename_mode(&path),
             SessionListEvent::Error(message) => {
+                // The list's `onError` (session-selector.ts:837) auto-hides
+                // after 3000ms.
                 self.header
-                    .set_status_message(Some((StatusKind::Error, message)));
+                    .set_status_message(Some((StatusKind::Error, message)), Some(3000));
                 self.tui.request_render(false);
             }
         }
@@ -3259,5 +3323,64 @@ mod tests {
         component.drain_load_events();
         let joined = body_lines(&component, 200).join("\n");
         assert!(joined.contains("msg other"), "original load still delivers");
+    }
+
+    // V17-11 FR-C R1 (#71 item 1): the header status message auto-hides after
+    // the `autoHideMs` deadline (session-selector.ts:116-126).
+    #[test]
+    fn status_message_auto_hides_after_the_deadline() {
+        install_global_keybindings();
+        let harness = Harness::new();
+        let callbacks = Callbacks::new();
+        let mut component = build(&harness, &callbacks, false, false, None);
+
+        component.header.set_status_message(
+            Some((StatusKind::Info, "transient status".to_string())),
+            Some(20),
+        );
+        assert!(
+            rendered(&component, 120)
+                .join("\n")
+                .contains("transient status"),
+            "status visible before the deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let after = rendered(&component, 120).join("\n");
+        assert!(
+            !after.contains("transient status"),
+            "expired status hidden at render: {after}"
+        );
+        assert_eq!(component.header.visible_status_message(), None);
+    }
+
+    // V17-11 FR-C R1: a replacement message bumps the generation, so the
+    // previous timer cannot clear the new message (`clearStatusTimeout`).
+    #[test]
+    fn status_message_replacement_cancels_the_previous_timer() {
+        install_global_keybindings();
+        let harness = Harness::new();
+        let callbacks = Callbacks::new();
+        let mut component = build(&harness, &callbacks, false, false, None);
+
+        component.header.set_status_message(
+            Some((StatusKind::Info, "first status".to_string())),
+            Some(20),
+        );
+        component.header.set_status_message(
+            Some((StatusKind::Info, "replacement status".to_string())),
+            Some(60_000),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let joined = rendered(&component, 120).join("\n");
+        assert!(
+            joined.contains("replacement status"),
+            "replacement survives the stale timer: {joined}"
+        );
+        assert!(!joined.contains("first status"));
+
+        // Explicit clear (Select/Cancel, session-selector.ts:799).
+        component.header.set_status_message(None, None);
+        let cleared = rendered(&component, 120).join("\n");
+        assert!(!cleared.contains("replacement status"));
     }
 }

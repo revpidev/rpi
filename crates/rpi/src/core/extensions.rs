@@ -339,6 +339,21 @@ pub struct ExtensionToolEntry {
 /// Error listener registered through [`ExtensionRunner::on_error`].
 pub type ExtensionErrorListener = Arc<dyn Fn(ExtensionErrorInfo) + Send + Sync>;
 
+/// `user_bash` interception decision (V17-11 FR-B R5), the internal,
+/// executor-aware projection of the runner's `{ operations }` / `{ result }`
+/// answer.
+#[derive(Debug)]
+pub enum UserBashDecision {
+    /// No handler (or an `allow` rule): run the command with the local shell.
+    RunLocal,
+    /// A `rewrite` rule replaced the command before local execution.
+    Rewrite(String),
+    /// Full result replacement — never execute locally.
+    Replace(crate::tools::bash_executor::BashResult),
+    /// A `deny` rule blocked execution; the message is surfaced to the user.
+    Deny(String),
+}
+
 /// The session-facing extension surface. Default method bodies are the
 /// no-extension behavior; the T15 host overrides them.
 #[async_trait::async_trait]
@@ -444,21 +459,23 @@ pub trait ExtensionRunner: Send + Sync {
         None
     }
 
-    /// `user_bash` interception (interactive-mode.ts:6509-6524):
-    /// `Ok(Some(result))` is the full-replacement result (skips local
-    /// execution); `Ok(None)` continues to local execution. **Fail-closed**
-    /// (`509ee2bd0` / #9068): `Err` aborts the command — the caller must
-    /// not fall back to the local shell; the runner already reported the
-    /// error through the extension error surface. A handler's custom
-    /// `operations` backend cannot cross the JSON dispatch boundary
-    /// (ADR-0007 gap 1) and is rejected by the runner as an invalid result.
+    /// `user_bash` interception (interactive-mode.ts:6509-6524): `Replace` is
+    /// the full-replacement result (skips local execution); `RunLocal` continues
+    /// to local execution; `Rewrite` replaces the command text before local
+    /// execution; `Deny` aborts with the rule's message. **Fail-closed**
+    /// (`509ee2bd0` / #9068): `Err` aborts the command — the caller must not
+    /// fall back to the local shell; the runner already reported the error
+    /// through the extension error surface. The upstream closure-bundle
+    /// `operations` backend cannot cross the JSON dispatch boundary; since
+    /// V17-11 the runner accepts the declarative allow/deny/rewrite policy
+    /// (ADR-0007 gap 1) and rejects malformed policies as invalid.
     async fn emit_user_bash(
         &self,
         _command: &str,
         _exclude_from_context: bool,
         _cwd: &str,
-    ) -> Result<Option<crate::tools::bash_executor::BashResult>, String> {
-        Ok(None)
+    ) -> Result<UserBashDecision, String> {
+        Ok(UserBashDecision::RunLocal)
     }
 
     async fn emit_session_before_tree(&self) -> Option<SessionBeforeTreeResult> {

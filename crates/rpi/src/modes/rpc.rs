@@ -1022,11 +1022,38 @@ async fn dispatch(
             let result = if runner.has_handlers("user_bash") {
                 let cwd = session.cwd().to_owned();
                 match runner.emit_user_bash(&bash_command, exclude, &cwd).await {
-                    Ok(Some(replacement)) => {
+                    Ok(crate::core::extensions::UserBashDecision::Replace(replacement)) => {
                         session.record_bash_result(&bash_command, &replacement, exclude);
                         replacement
                     }
-                    Ok(None) => session
+                    // Declarative policy denied the command: no local
+                    // execution, the rule's message is the failure output
+                    // (V17-11 FR-B R5).
+                    Ok(crate::core::extensions::UserBashDecision::Deny(message)) => {
+                        let result = crate::tools::bash_executor::BashResult {
+                            output: message,
+                            exit_code: Some(1),
+                            cancelled: false,
+                            truncated: false,
+                            full_output_path: None,
+                        };
+                        session.record_bash_result(&bash_command, &result, exclude);
+                        result
+                    }
+                    // Declarative `rewrite` rule: execute the replacement
+                    // command with the local shell.
+                    Ok(crate::core::extensions::UserBashDecision::Rewrite(rewritten)) => session
+                        .execute_bash(
+                            &rewritten,
+                            crate::core::agent_session::ExecuteBashOptions {
+                                exclude_from_context: exclude,
+                                id,
+                                on_chunk: None,
+                            },
+                        )
+                        .await
+                        .map_err(|error| error_message(&error))?,
+                    Ok(crate::core::extensions::UserBashDecision::RunLocal) => session
                         .execute_bash(
                             &bash_command,
                             crate::core::agent_session::ExecuteBashOptions {

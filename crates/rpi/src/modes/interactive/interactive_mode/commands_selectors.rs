@@ -2586,6 +2586,10 @@ impl InteractiveUi {
             self.show_warning("Wait for compaction to finish before reloading.");
             return;
         }
+        // `resetExtensionUI()` (interactive-mode.ts:6440): the reload
+        // re-runs extension factories, which re-register their declarative
+        // autocomplete sources (V17-11 FR-B R4).
+        self.reset_extension_autocomplete();
         let Some(ui) = self.upgrade_self() else {
             return;
         };
@@ -2711,13 +2715,16 @@ impl InteractiveUi {
             // (the runner already reported the error; upstream returns
             // silently from the catch arm). Only `Ok(None)` falls through.
             let runner = session.extension_runner();
+            // Owned so a declarative `rewrite` rule can replace it before
+            // local execution (V17-11 FR-B R5).
+            let mut command = command.clone();
             if runner.has_handlers("user_bash") {
                 let cwd = session.cwd().to_owned();
                 match runner
                     .emit_user_bash(&command, exclude_from_context, &cwd)
                     .await
                 {
-                    Ok(Some(result)) => {
+                    Ok(crate::core::extensions::UserBashDecision::Replace(result)) => {
                         if !result.output.is_empty() {
                             lock(&component).append_output(&result.output);
                         }
@@ -2749,7 +2756,30 @@ impl InteractiveUi {
                         }
                         return;
                     }
-                    Ok(None) => {}
+                    // Declarative policy denied the command: no local
+                    // execution, the rule's message is the failure output
+                    // (V17-11 FR-B R5).
+                    Ok(crate::core::extensions::UserBashDecision::Deny(message)) => {
+                        lock(&component).append_output(&message);
+                        lock(&component).set_complete(Some(1), false, None, None);
+                        let result = crate::tools::bash_executor::BashResult {
+                            output: message,
+                            exit_code: Some(1),
+                            cancelled: false,
+                            truncated: false,
+                            full_output_path: None,
+                        };
+                        session.record_bash_result(&command, &result, exclude_from_context);
+                        if let Some(ui) = &ui {
+                            *lock(&ui.bash_component) = None;
+                            ui.render_handle.request_render();
+                        }
+                        return;
+                    }
+                    Ok(crate::core::extensions::UserBashDecision::Rewrite(rewritten)) => {
+                        command = rewritten;
+                    }
+                    Ok(crate::core::extensions::UserBashDecision::RunLocal) => {}
                     Err(_) => {
                         // Fail-closed: complete the mounted component with no
                         // result and stop — never execute locally. The error
@@ -3012,6 +3042,11 @@ impl InteractiveMode {
         lock(&self.ui_state.compaction_queue).clear();
         *lock(&self.ui_state.streaming) = None;
         lock(&self.ui_state.pending_tools).clear();
+        // `resetExtensionUI` (interactive-mode.ts:2452-2472): drop the
+        // outgoing session's declarative autocomplete sources and rebuild the
+        // provider before the fresh session's extensions re-register
+        // (V17-11 FR-B R4).
+        self.ui_state.reset_extension_autocomplete();
         self.ui_state.update_pending_messages_display();
         self.ui_state.render_initial_messages();
 
@@ -3055,6 +3090,12 @@ impl InteractiveMode {
                         bridge
                     });
                 host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
+                // `bindCommandContext` (agent-session.ts:3338): the fresh
+                // session's host needs the interactive `ctx.command.*`
+                // actions too (V17-11 FR-B R2).
+                host.runtime().set_command_actions(Some(Arc::new(
+                    super::InteractiveCommandActions::new(&self.ui_state),
+                )));
             }
         }
 

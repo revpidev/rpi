@@ -462,7 +462,10 @@ impl ExtensionRunner for ExtensionHostAdapter {
         command: &str,
         exclude_from_context: bool,
         cwd: &str,
-    ) -> Result<Option<crate::tools::bash_executor::BashResult>, String> {
+    ) -> Result<crate::core::extensions::UserBashDecision, String> {
+        use crate::core::extensions::UserBashDecision;
+        use rpi_ext_host::types::{UserBashAction, UserBashOperations};
+
         let payload = serde_json::json!({
             "type": ext::EVENT_USER_BASH,
             "command": command,
@@ -477,39 +480,66 @@ impl ExtensionRunner for ExtensionHostAdapter {
             .emit_user_bash(payload)
             .await
             .map_err(|error| error.error)?;
-        // Runner validation guarantees a defined result is the `result`
-        // branch: the `operations` closure bundle can never be valid over
-        // the JSON boundary (ADR-0007 gap 1), so the old drop-with-warning
-        // fallback is unreachable — such results now fail closed upstream
-        // of here.
-        let replacement =
-            result.and_then(|value| value.get("result").cloned().filter(|r| !r.is_null()));
-        let Some(replacement) = replacement else {
-            return Ok(None);
+        // Runner validation guarantees a defined result is exactly one of
+        // the declarative `{ operations: { rules } }` policy or the full
+        // `{ result }` replacement (ADR-0007 gap 1: the closure bundle and
+        // any malformed policy fail closed upstream of here).
+        let Some(value) = result else {
+            return Ok(UserBashDecision::RunLocal);
         };
-        Ok(Some(crate::tools::bash_executor::BashResult {
-            output: replacement
-                .get("output")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            exit_code: replacement
-                .get("exitCode")
-                .and_then(Value::as_i64)
-                .map(|code| code as i32),
-            cancelled: replacement
-                .get("cancelled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            truncated: replacement
-                .get("truncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            full_output_path: replacement
-                .get("fullOutputPath")
-                .and_then(Value::as_str)
-                .map(std::path::PathBuf::from),
-        }))
+
+        // V17-11 FR-B R5: the declarative operations policy (first matching
+        // rule wins; no match denies, because the extension returned a policy
+        // and unlisted commands are unapproved — fail closed).
+        if let Some(operations) = value.get("operations").filter(|value| !value.is_null()) {
+            let policy: UserBashOperations = serde_json::from_value(operations.clone())
+                .map_err(|error| format!("Invalid user_bash operations policy: {error}"))?;
+            return Ok(match policy.first_match(command) {
+                Some(rule) => match &rule.action {
+                    UserBashAction::Allow => UserBashDecision::RunLocal,
+                    UserBashAction::Deny { message } => {
+                        UserBashDecision::Deny(message.clone().unwrap_or_else(|| {
+                            format!("Command denied by extension policy: {command}")
+                        }))
+                    }
+                    UserBashAction::Rewrite { command: rewritten } => {
+                        UserBashDecision::Rewrite(rewritten.replace("{command}", command))
+                    }
+                },
+                None => UserBashDecision::Deny(format!(
+                    "Command not allowed by extension policy: {command}"
+                )),
+            });
+        }
+
+        let Some(replacement) = value.get("result").cloned().filter(|r| !r.is_null()) else {
+            return Ok(UserBashDecision::RunLocal);
+        };
+        Ok(UserBashDecision::Replace(
+            crate::tools::bash_executor::BashResult {
+                output: replacement
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                exit_code: replacement
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .map(|code| code as i32),
+                cancelled: replacement
+                    .get("cancelled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                truncated: replacement
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                full_output_path: replacement
+                    .get("fullOutputPath")
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from),
+            },
+        ))
     }
 
     async fn emit_session_before_tree(&self) -> Option<SessionBeforeTreeResult> {

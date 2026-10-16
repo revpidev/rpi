@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use rpi::core::extension_host_adapter::ExtensionHostAdapter;
 use rpi::core::extensions::{
-    ExtensionRunner, extension_on_response_callback, new_extension_runner_ref,
+    ExtensionRunner, UserBashDecision, extension_on_response_callback, new_extension_runner_ref,
 };
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
@@ -778,11 +778,13 @@ async fn w2_user_bash_full_result_replacement() {
     })])
     .await;
 
-    let result = runner
+    let decision = runner
         .emit_user_bash("ls -la", true, "/w2-cwd")
         .await
-        .expect("replacement")
-        .expect("full result");
+        .expect("replacement");
+    let UserBashDecision::Replace(result) = decision else {
+        panic!("full result, got {decision:?}");
+    };
     assert_eq!(result.output, "extension output");
     assert_eq!(result.exit_code, Some(0));
     assert!(!result.cancelled);
@@ -824,14 +826,76 @@ async fn w2_user_bash_fail_closed_and_no_handler_fall_back() {
         "got: {error}"
     );
 
-    // No handler → Ok(None): the caller runs default bash execution.
+    // No handler → RunLocal: the caller runs default bash execution.
     let empty = runner_with(Vec::new()).await;
-    assert!(
-        empty
-            .emit_user_bash("x", false, "/w2-cwd")
+    assert!(matches!(
+        empty.emit_user_bash("x", false, "/w2-cwd").await.unwrap(),
+        UserBashDecision::RunLocal
+    ));
+}
+
+/// V17-11 FR-B R5: the declarative `operations` policy replaces the
+/// closure bundle — allow/deny/rewrite rules evaluate in order against the
+/// command (first match wins); no match denies (unlisted commands are
+/// unapproved); a malformed policy still fails closed.
+#[tokio::test]
+async fn w2_user_bash_declarative_operations_policy() {
+    let runner = runner_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_USER_BASH, |event| {
+            let command = event["command"].as_str().unwrap_or_default();
+            Ok(json!({
+                "operations": {
+                    "rules": [
+                        {"pattern": "git *", "action": "allow"},
+                        {"pattern": "rm *", "action": "deny", "message": "rm is blocked"},
+                        {"pattern": "cat *", "action": "rewrite", "command": "bat --paging=never {command}"},
+                    ]
+                },
+                "_observed": command,
+            }))
+        });
+    })])
+    .await;
+
+    // Matching allow → local execution.
+    assert!(matches!(
+        runner
+            .emit_user_bash("git status", false, "/w2-cwd")
             .await
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        UserBashDecision::RunLocal
+    ));
+    // Matching deny → blocked with the rule's message.
+    assert!(matches!(
+        runner.emit_user_bash("rm -rf /tmp/x", false, "/w2-cwd").await.unwrap(),
+        UserBashDecision::Deny(message) if message == "rm is blocked"
+    ));
+    // Matching rewrite → the replacement command with `{command}` expanded.
+    assert!(matches!(
+        runner.emit_user_bash("cat notes.txt", false, "/w2-cwd").await.unwrap(),
+        UserBashDecision::Rewrite(rewritten)
+            if rewritten == "bat --paging=never cat notes.txt"
+    ));
+    // No match → denied (the policy owns the command set).
+    assert!(matches!(
+        runner.emit_user_bash("ls -la", false, "/w2-cwd").await.unwrap(),
+        UserBashDecision::Deny(message) if message.contains("not allowed")
+    ));
+
+    // A malformed policy is invalid and aborts (fail closed, #9068).
+    let malformed = runner_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_USER_BASH, |_| {
+            Ok(json!({"operations": {"rules": "not-a-list"}}))
+        });
+    })])
+    .await;
+    let error = match malformed.emit_user_bash("x", false, "/w2-cwd").await {
+        Err(error) => error,
+        Ok(decision) => panic!("malformed policy must abort, got {decision:?}"),
+    };
+    assert!(
+        error.starts_with("Invalid user_bash handler result"),
+        "got: {error}"
     );
 }
 

@@ -1111,8 +1111,10 @@ pub struct UserBashEvent {
     pub cwd: String,
 }
 
-/// `UserBashEventResult` (types.ts:1072-1077). `operations` /
-/// `result` are the upstream `BashOperations` / `BashResult` JSON.
+/// `UserBashEventResult` (types.ts:1072-1077). `operations` / `result` are
+/// the upstream `BashOperations` / `BashResult` JSON. Since V17-11 the
+/// `operations` arm carries a declarative [`UserBashOperations`] policy
+/// (the closure bundle cannot cross the JSON boundary).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserBashEventResult {
@@ -1120,6 +1122,91 @@ pub struct UserBashEventResult {
     pub operations: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+}
+
+/// Declarative `user_bash` execution policy (V17-11 FR-B R5): the
+/// serializable replacement for the upstream `BashOperations` closure bundle
+/// (`extensions/types.ts:1437-1448`; the closure-bearing arm cannot cross
+/// the JSON boundary, ADR-0007 gap 1). Rules are evaluated in order against
+/// the full command string; the first matching rule wins and a command with
+/// no match is denied (the extension returned a policy, so unlisted commands
+/// are unapproved — fail closed, #9068 semantics).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserBashOperations {
+    pub rules: Vec<UserBashRule>,
+}
+
+impl UserBashOperations {
+    /// First rule whose `pattern` matches `command` (see
+    /// [`glob_matches`]), or `None` when no rule matches.
+    pub fn first_match(&self, command: &str) -> Option<&UserBashRule> {
+        self.rules
+            .iter()
+            .find(|rule| glob_matches(&rule.pattern, command))
+    }
+}
+
+/// One declarative `user_bash` rule. `pattern` is matched against the whole
+/// command with `*`/`?` wildcards; the action decides what happens on a
+/// match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserBashRule {
+    pub pattern: String,
+    #[serde(flatten)]
+    pub action: UserBashAction,
+}
+
+/// `UserBashRule` action (the declarative allow/deny/rewrite subset of the
+/// upstream execution backend).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+pub enum UserBashAction {
+    /// Run the command with the local shell.
+    Allow,
+    /// Do not run the command; `message` is surfaced to the user.
+    #[serde(rename_all = "camelCase")]
+    Deny {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// Run `command` instead of the original command (the local shell still
+    /// executes it; `{command}` is replaced by the original text).
+    #[serde(rename_all = "camelCase")]
+    Rewrite { command: String },
+}
+
+/// `*` matches any sequence (including empty), `?` matches exactly one
+/// character; every other character matches literally. Used by the
+/// declarative `user_bash` rule matcher.
+pub fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    // Iterative wildcard match (backtracking on the last `*`) — linear in
+    // practice and stack-free for untrusted patterns.
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_text = 0usize;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            star_text = t;
+            p += 1;
+        } else if let Some(star_index) = star {
+            p = star_index + 1;
+            star_text += 1;
+            t = star_text;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 // ============================================================================
@@ -1970,6 +2057,35 @@ pub struct AuthOperationOptions {
 }
 
 // ============================================================================
+// Declarative autocomplete sources (V17-11 FR-B R4)
+// ============================================================================
+
+/// `addAutocompleteProvider` declarative descriptor (V17-11 FR-B R4): the
+/// serializable replacement for upstream's closure-factory composition
+/// (`interactive-mode.ts:2659-2662`; closure providers cannot cross the
+/// JSON boundary). Suggestions appear when the text before the cursor
+/// contains `trigger`; the fragment typed after it filters `items`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutocompleteProviderDescriptor {
+    /// Trigger text (its first character is the trigger character; the
+    /// empty string is invalid and ignored by the host).
+    pub trigger: String,
+    pub items: Vec<AutocompleteItemDescriptor>,
+}
+
+/// One declarative completion item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutocompleteItemDescriptor {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+// ============================================================================
 // TUI type placeholders (types.ts @ 4181f66; wiring deferred to T28/T32)
 // ============================================================================
 
@@ -1990,3 +2106,63 @@ pub struct TuiStopOptions {
 /// define. Extensions receive `ctx.ui.theme()` etc.; the TUI type surface
 /// is not directly callable from extensions yet (T28/T32).
 pub type TuiMainScreenRef = Value;
+
+#[cfg(test)]
+mod user_bash_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn glob_matches_wildcards_and_literals() {
+        assert!(glob_matches("git *", "git status"));
+        assert!(glob_matches("git *", "git "));
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("cat ?.txt", "cat a.txt"));
+        assert!(glob_matches("a*b*c", "aXXbYYc"));
+        assert!(!glob_matches("git *", "gist status"));
+        assert!(!glob_matches("cat ?.txt", "cat ab.txt"));
+        assert!(!glob_matches("exact", "exact match"));
+        assert!(glob_matches("exact", "exact"));
+        assert!(glob_matches("**", "a\nb"));
+    }
+
+    #[test]
+    fn user_bash_operations_deserialize_rule_actions() {
+        let policy: UserBashOperations = serde_json::from_value(json!({
+            "rules": [
+                {"pattern": "git *", "action": "allow"},
+                {"pattern": "rm *", "action": "deny", "message": "blocked"},
+                {"pattern": "cat *", "action": "rewrite", "command": "bat {command}"},
+            ]
+        }))
+        .expect("declarative policy");
+        assert_eq!(policy.rules.len(), 3);
+        assert_eq!(
+            policy
+                .first_match("git status")
+                .map(|rule| rule.action.clone()),
+            Some(UserBashAction::Allow)
+        );
+        assert_eq!(
+            policy
+                .first_match("rm -rf x")
+                .map(|rule| rule.action.clone()),
+            Some(UserBashAction::Deny {
+                message: Some("blocked".to_owned())
+            })
+        );
+        assert_eq!(
+            policy
+                .first_match("cat f.txt")
+                .map(|rule| rule.action.clone()),
+            Some(UserBashAction::Rewrite {
+                command: "bat {command}".to_owned()
+            })
+        );
+        assert!(policy.first_match("ls -la").is_none());
+
+        // A missing `rules` key (the old closure-bundle shape) is invalid.
+        assert!(serde_json::from_value::<UserBashOperations>(json!({"note": "custom"})).is_err());
+        assert!(serde_json::from_value::<UserBashOperations>(json!({"rules": "no"})).is_err());
+    }
+}

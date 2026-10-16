@@ -372,8 +372,9 @@ impl RuntimeCommandActions {
 }
 
 /// Adapt an extension `withSession` closure into the runtime's internal
-/// callback shape (a borrow over the call).
-fn map_with_session(
+/// callback shape (a borrow over the call). Shared with the interactive
+/// `ctx.command.*` bridge (V17-11 FR-B R2).
+pub(crate) fn map_with_session(
     with_session: Option<WithSessionFn>,
 ) -> Option<
     impl Fn(
