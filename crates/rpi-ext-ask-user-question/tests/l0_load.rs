@@ -296,7 +296,7 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
         "{input_title}"
     );
     assert!(input_title.contains("1. red — r"));
-    assert_eq!(placeholder.as_deref(), Some("1,3"));
+    assert_eq!(placeholder.as_deref(), Some("1,3; custom answer"));
 
     // 7. TE30 TUI component path: the mount/poll/render loop runs through
     //    the real host-call chain (mountComponent -> pollComponent ->
@@ -334,7 +334,8 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
     assert_eq!(result.details["answers"][0]["kind"], "option");
     let mounts = component_bridge.mounts();
     assert_eq!(mounts.len(), 1, "one mounted component per tool call");
-    assert!(mounts[0].overlay);
+    // v2.13.0 (#253): inline editor-slot presentation.
+    assert!(!mounts[0].overlay);
     assert_eq!(mounts[0].tick_ms, 0, "the dialog subscribes to no ticks");
     assert_eq!(mounts[0].keys_when_hidden, vec!["ctrl+]".to_owned()]);
     assert_eq!(mounts[0].label.as_deref(), Some("ask_user_question"));
