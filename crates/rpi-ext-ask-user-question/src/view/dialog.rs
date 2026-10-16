@@ -44,6 +44,9 @@ pub const REVIEW_GLOBAL_HINT: &str = "n to add a note";
 pub const COLLAPSE_KEY_OFF: &str = "off";
 /// `notes.header` canonical English.
 pub const NOTES_HEADER: &str = "Notes:";
+/// `notes.saved_label` canonical English (v2.13.7, #197): the saved-note row
+/// on the question tab and the Submit-tab review line.
+pub const NOTES_SAVED_LABEL: &str = "Note for this answer:";
 /// `notes.global_header` canonical English.
 pub const NOTES_GLOBAL_HEADER: &str = "Global note:";
 
@@ -461,6 +464,17 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             focused_range = Some(range);
         }
         cursor = cursor.or(notes_cursor);
+    } else if let Some(note) = saved_note(model.state) {
+        // v2.13.7 (#197): a saved note stays visible once its editor closes —
+        // one clipped row, so a long or multi-line note cannot crowd the
+        // options; `n` reopens it in full.
+        let (first_line, rest) = note.split_once('\n').unwrap_or((note.as_str(), ""));
+        let text = format!(
+            "{} {first_line}{}",
+            model.i18n.t("notes.saved_label", NOTES_SAVED_LABEL),
+            if rest.is_empty() { "" } else { " …" }
+        );
+        lines.push(truncate_line(&model.theme.dim(&text), model.width));
     }
     let footer_start = lines.len();
     lines.push(String::new());
@@ -487,6 +501,25 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
     );
 
     finish(model, lines, cursor, focused_range, body_start)
+}
+
+/// `selectSavedNote` (derivations.ts @ v2.13.8, #197): the tab's committed
+/// note — the in-flight side-band first, the answer mirror second; `None`
+/// when absent or empty.
+fn saved_note(state: &QuestionnaireState) -> Option<String> {
+    let tab = state.current_tab;
+    state
+        .notes_by_tab
+        .get(&tab)
+        .filter(|note| !note.is_empty())
+        .cloned()
+        .or_else(|| {
+            state
+                .answers
+                .get(&tab)
+                .and_then(|answer| answer.notes.clone())
+                .filter(|note| !note.is_empty())
+        })
 }
 
 /// Append the notes editor (header + wrapped buffer + cursor) below the
@@ -688,6 +721,43 @@ mod tests {
             terminal_width: width,
             height: None,
         }
+    }
+
+    /// v2.13.7 (#197): a committed note renders one clipped row while the
+    /// editor is closed, and yields to the editor header while it is open.
+    #[test]
+    fn saved_note_row_shows_after_the_editor_closes() {
+        let i18n = I18n::for_locale("en");
+        let theme = Theme::dark();
+        let questions = vec![question(false)];
+        let items = vec![build_items_for_question(&questions[0], &i18n)];
+        let mut state = QuestionnaireState::initial();
+        state
+            .notes_by_tab
+            .insert(0, "first line\nsecond line".to_owned());
+        let frame = render(&model(
+            &state, &questions, &items, &i18n, &theme, "", "ctrl+]", 80,
+        ));
+        let plain: Vec<String> = frame.lines.iter().map(|line| strip_ansi(line)).collect();
+        assert!(
+            plain
+                .iter()
+                .any(|line| line == "Note for this answer: first line …"),
+            "{plain:?}"
+        );
+        // While the editor is open the mid row yields to the editor header.
+        state.notes_visible = true;
+        let frame = render(&model(
+            &state, &questions, &items, &i18n, &theme, "", "ctrl+]", 80,
+        ));
+        let plain: Vec<String> = frame.lines.iter().map(|line| strip_ansi(line)).collect();
+        assert!(plain.iter().any(|line| line == "Notes:"), "{plain:?}");
+        assert!(
+            !plain
+                .iter()
+                .any(|line| line.starts_with("Note for this answer:")),
+            "{plain:?}"
+        );
     }
 
     /// Preview-bearing fixture whose worst-case preview body is clearly

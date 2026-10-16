@@ -22,6 +22,13 @@ pub const TOOL_NAME: &str = "todo";
 pub const TOOL_LABEL: &str = "Todo";
 pub const COMMAND_NAME: &str = "todos";
 
+/// Custom-entry type carrying the task snapshot on the session branch
+/// (upstream `STATE_ENTRY_TYPE`, `tool/types.ts` @ v2.13.8). Every
+/// state-changing `todo` call appends one, so a call reached through another
+/// tool (`ctx.executeTool`, e.g. codemode) survives replay even though it
+/// never lands as a standalone `toolResult` (#290).
+pub const STATE_ENTRY_TYPE: &str = "rpiv-todo-state";
+
 // ---------------------------------------------------------------------------
 // Public domain types
 // ---------------------------------------------------------------------------

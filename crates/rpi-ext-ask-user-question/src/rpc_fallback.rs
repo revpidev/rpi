@@ -37,15 +37,16 @@ use crate::tool::types::{
 use crate::{HostCall, HostError};
 
 /// `MULTI_SELECT_INSTRUCTIONS` (canonical-English fallback of the
-/// `rpc.multi_instructions` locale key).
-pub const MULTI_SELECT_INSTRUCTIONS: &str = "Enter the numbers of all that apply, comma-separated (e.g. \"1,3\"), or type a custom answer as plain text.";
+/// `rpc.multi_instructions` locale key). v2.13.6 (#188): the input accepts
+/// selected numbers and custom text together.
+pub const MULTI_SELECT_INSTRUCTIONS: &str = "Enter the numbers of all that apply, comma-separated (e.g. \"1,3\"). Add \"; custom answer\" to include your own text, or type only custom text.";
 
 /// `CUSTOM_ANSWER_TITLE` (canonical-English fallback of the
 /// `rpc.custom_answer_title` locale key).
 pub const CUSTOM_ANSWER_TITLE: &str = "Type your answer:";
 
 /// `MULTI_SELECT_PLACEHOLDER`.
-pub const MULTI_SELECT_PLACEHOLDER: &str = "1,3";
+pub const MULTI_SELECT_PLACEHOLDER: &str = "1,3; custom answer";
 
 /// `MAX_PREVIEW_CHARS` — longest preview slice folded into a select title.
 pub const MAX_PREVIEW_CHARS: usize = 600;
@@ -230,6 +231,15 @@ pub fn run_rpc_questionnaire(
 }
 
 /// `askSingleSelect` — `None` means the user dismissed the dialog (cancel).
+///
+/// v2.13.4 (#299/#142/#194): hosts return the chosen option line, but some
+/// also let the user type a reply in place of picking. A reply is read as an
+/// offered line → that option; a bare number → that option; a reply equal to
+/// an option label → that option; any other non-empty text → the user's own
+/// answer, verbatim — never a dismissal, and never "option N plus discarded
+/// text". Cancelling the "Type something." follow-up returns to the options
+/// instead of cancelling the whole questionnaire, and that input repeats the
+/// option list so the user can refer to it while typing.
 fn ask_single_select(
     ui: &mut dyn DialogUi,
     question: &QuestionData,
@@ -248,60 +258,111 @@ fn ask_single_select(
         question.options.len() + 1,
         i18n.display_label(RowKind::Other)
     ));
-    let chosen = ui.select(
-        &format!(
-            "{header}{}{}",
-            question.question,
-            build_preview_block(question)
-        ),
-        &options,
-    )?;
-    // A host returning something outside the offered list (null included —
-    // the bridge maps it to `None`, and a non-string value parses to no
-    // index) is indistinguishable from a dismissal — treat it as one rather
-    // than fabricate an answer.
-    let index = parse_index(chosen.as_deref().unwrap_or(""), options.len());
-    let Some(index) = index else {
-        return Ok(None);
-    };
-    if index < question.options.len() {
-        let option = &question.options[index];
-        return Ok(Some(QuestionAnswer {
-            question_index,
-            question: question.question.clone(),
-            kind: AnswerKind::Option,
-            answer: Some(option.label.clone()),
-            // `preview: o.preview && o.preview.length > 0 ? o.preview : undefined`
-            preview: option
-                .preview
-                .as_ref()
-                .filter(|preview| !preview.is_empty())
-                .cloned(),
-            selected: None,
-            notes: None,
-        }));
+    let title = format!(
+        "{header}{}{}",
+        question.question,
+        build_preview_block(question)
+    );
+    loop {
+        let chosen = ui.select(&title, &options)?;
+        let Some(chosen) = chosen else {
+            return Ok(None);
+        };
+        let reply = chosen.trim_matches(is_js_whitespace).to_owned();
+        if reply.is_empty() {
+            return Ok(None);
+        }
+        match resolve_single_select_reply(&chosen, &reply, &options, question) {
+            Some(index) if index < question.options.len() => {
+                let option = &question.options[index];
+                return Ok(Some(QuestionAnswer {
+                    question_index,
+                    question: question.question.clone(),
+                    kind: AnswerKind::Option,
+                    answer: Some(option.label.clone()),
+                    // `preview: o.preview && o.preview.length > 0 ? o.preview : undefined`
+                    preview: option
+                        .preview
+                        .as_ref()
+                        .filter(|preview| !preview.is_empty())
+                        .cloned(),
+                    selected: None,
+                    notes: None,
+                }));
+            }
+            Some(_) => {
+                // "Type something." sentinel → free-text follow-up; the input
+                // repeats the option list (#194) and cancelling it goes back
+                // to the options (#142).
+                let list = question
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, option)| format_option_line(option, index))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let typed = ui.input(
+                    &format!(
+                        "{header}{}\n\n{list}\n\n{}",
+                        question.question,
+                        i18n.t("rpc.custom_answer_title", CUSTOM_ANSWER_TITLE)
+                    ),
+                    Some(""),
+                )?;
+                match typed {
+                    None => continue,
+                    Some(typed) => {
+                        return Ok(Some(QuestionAnswer {
+                            question_index,
+                            question: question.question.clone(),
+                            kind: AnswerKind::Custom,
+                            answer: Some(typed),
+                            selected: None,
+                            notes: None,
+                            preview: None,
+                        }));
+                    }
+                }
+            }
+            None => {
+                return Ok(Some(QuestionAnswer {
+                    question_index,
+                    question: question.question.clone(),
+                    kind: AnswerKind::Custom,
+                    answer: Some(reply),
+                    selected: None,
+                    notes: None,
+                    preview: None,
+                }));
+            }
+        }
     }
-    // "Type something." sentinel → free-text follow-up (empty placeholder).
-    let typed = ui.input(
-        &format!(
-            "{header}{}\n\n{}",
-            question.question,
-            i18n.t("rpc.custom_answer_title", CUSTOM_ANSWER_TITLE)
-        ),
-        Some(""),
-    )?;
-    let Some(typed) = typed else {
-        return Ok(None);
-    };
-    Ok(Some(QuestionAnswer {
-        question_index,
-        question: question.question.clone(),
-        kind: AnswerKind::Custom,
-        answer: Some(typed),
-        selected: None,
-        notes: None,
-        preview: None,
-    }))
+}
+
+/// Option index for a select reply, or `None` when the reply is the user's
+/// own text (`resolveSingleSelectReply`, rpc-fallback.ts @ v2.13.8).
+fn resolve_single_select_reply(
+    chosen: &str,
+    reply: &str,
+    lines: &[String],
+    question: &QuestionData,
+) -> Option<usize> {
+    if let Some(line) = lines.iter().position(|line| line == chosen) {
+        return Some(line);
+    }
+    if is_bare_number(reply) {
+        return parse_index(reply, lines.len());
+    }
+    question
+        .options
+        .iter()
+        .position(|option| option.label == reply)
+}
+
+/// `/^\d+\.?$/` — a bare option number (with an optional trailing dot).
+fn is_bare_number(token: &str) -> bool {
+    let token = token.strip_suffix('.').unwrap_or(token);
+    !token.is_empty() && token.chars().all(|character| character.is_ascii_digit())
 }
 
 /// `askMultiSelect` — `None` means the user dismissed the dialog (cancel).
@@ -344,13 +405,22 @@ fn ask_multi_select(
             preview: None,
         }));
     }
-    let tokens: Vec<&str> = trimmed
+    let mut split = trimmed.split(';');
+    let selection_part = split.next().unwrap_or("");
+    let selection = selection_part.trim_matches(is_js_whitespace);
+    let custom = split
+        .collect::<Vec<_>>()
+        .join(";")
+        .trim_matches(is_js_whitespace)
+        .to_owned();
+    let tokens: Vec<&str> = selection
         .split(|character: char| character == ',' || is_js_whitespace(character))
         .filter(|token| !token.is_empty())
         .collect();
     // `/^\d+\.?$/` tokens go through parseIndex (out-of-range numbers
-    // become null there); anything else is null → custom answer.
-    let indices: Option<Vec<usize>> = tokens
+    // become null there); anything else is null → the whole input is custom
+    // text.
+    let indices: Vec<Option<usize>> = tokens
         .iter()
         .map(|token| {
             if is_index_token(token) {
@@ -360,9 +430,9 @@ fn ask_multi_select(
             }
         })
         .collect();
-    if let Some(indices) = indices {
+    if selection.is_empty() || indices.iter().all(Option::is_some) {
         let mut selected: Vec<String> = Vec::new();
-        for index in indices {
+        for index in indices.into_iter().flatten() {
             let label = &question.options[index].label;
             if !selected.contains(label) {
                 selected.push(label.clone());
@@ -372,22 +442,21 @@ fn ask_multi_select(
             question_index,
             question: question.question.clone(),
             kind: AnswerKind::Multi,
-            answer: None,
+            answer: (!custom.is_empty()).then_some(custom),
             selected: Some(selected),
             notes: None,
             preview: None,
         }));
     }
     // Any non-index token (words, or an out-of-range number like "13" for
-    // three options) means the user typed an answer, not a selection.
-    // Preserve it verbatim as a custom answer instead of silently dropping
-    // their input — this is also the multi-select "Type something." escape.
+    // three options) means the user typed text, not a selection. Preserve
+    // the whole input verbatim as a multi answer's custom value (#188).
     Ok(Some(QuestionAnswer {
         question_index,
         question: question.question.clone(),
-        kind: AnswerKind::Custom,
+        kind: AnswerKind::Multi,
         answer: Some(trimmed.to_owned()),
-        selected: None,
+        selected: Some(Vec::new()),
         notes: None,
         preview: None,
     }))
@@ -728,27 +797,35 @@ mod tests {
         assert_eq!(answer.preview, None);
         let (_, title, _, placeholder) = &ui.calls[1];
         assert_eq!(
-            title, "[Pick] Which?\n\nType your answer:",
-            "custom title = header + question + localized prompt"
+            title, "[Pick] Which?\n\n1. A — a\n2. B — b\n\nType your answer:",
+            "custom title = header + question + option list (#194) + localized prompt"
         );
         assert_eq!(placeholder.as_deref(), Some(""), "upstream passes \"\"");
     }
 
     #[test]
-    fn select_out_of_range_treated_as_cancel() {
-        for reply in ["9. weird", "banana", ""] {
+    fn select_out_of_range_reply_becomes_custom_or_cancel() {
+        // v2.13.4 (#299): a reply outside the offered list is the user's own
+        // answer, verbatim — only an empty/dismissed reply cancels.
+        for reply in ["9. weird", "banana"] {
             let params = single_params(None);
             let mut ui = ScriptUi::default();
-            ui.push(Ok(if reply.is_empty() {
-                None
-            } else {
-                Some(reply.to_owned())
-            }));
+            ui.push(Ok(Some(reply.to_owned())));
             let result = run_rpc_questionnaire(&mut ui, &params, &english())
                 .expect("scripted ui cannot fail");
-            assert!(result.cancelled, "{reply} must cancel, not fabricate");
-            assert!(result.answers.is_empty());
+            assert!(!result.cancelled, "{reply} is the user's own answer");
+            let answer = &result.answers[0];
+            assert_eq!(answer.kind, AnswerKind::Custom, "{reply}");
+            assert_eq!(answer.answer.as_deref(), Some(reply), "verbatim");
         }
+        // A cancelled/dismissed dialog still cancels the questionnaire.
+        let params = single_params(None);
+        let mut ui = ScriptUi::default();
+        ui.push(Ok(None));
+        let result =
+            run_rpc_questionnaire(&mut ui, &params, &english()).expect("scripted ui cannot fail");
+        assert!(result.cancelled);
+        assert!(result.answers.is_empty());
     }
 
     #[test]
@@ -777,9 +854,9 @@ mod tests {
         let (_, title, _, placeholder) = &ui.calls[0];
         assert_eq!(
             title,
-            "[Colors] Pick colors?\n\n1. red — r\n2. green — g\n3. blue — b\n\nEnter the numbers of all that apply, comma-separated (e.g. \"1,3\"), or type a custom answer as plain text."
+            "[Colors] Pick colors?\n\n1. red — r\n2. green — g\n3. blue — b\n\nEnter the numbers of all that apply, comma-separated (e.g. \"1,3\"). Add \"; custom answer\" to include your own text, or type only custom text."
         );
-        assert_eq!(placeholder.as_deref(), Some("1,3"));
+        assert_eq!(placeholder.as_deref(), Some("1,3; custom answer"));
     }
 
     #[test]
@@ -797,7 +874,10 @@ mod tests {
     }
 
     #[test]
-    fn multi_select_non_index_token_is_custom() {
+    fn multi_select_non_index_token_is_custom_multi_answer() {
+        // v2.13.8: unparseable input is preserved verbatim as the multi
+        // answer's custom value with no checked labels (upstream returns
+        // `kind: "multi"`, not a single-select custom answer).
         for input in ["red, something else entirely", "13", "2.5"] {
             let params = multi_params();
             let mut ui = ScriptUi::default();
@@ -805,10 +885,32 @@ mod tests {
             let result = run_rpc_questionnaire(&mut ui, &params, &english())
                 .expect("scripted ui cannot fail");
             let answer = &result.answers[0];
-            assert_eq!(answer.kind, AnswerKind::Custom, "{input}");
+            assert_eq!(answer.kind, AnswerKind::Multi, "{input}");
             assert_eq!(answer.answer.as_deref(), Some(input), "verbatim");
-            assert_eq!(answer.selected, None);
+            assert_eq!(answer.selected, Some(Vec::new()));
         }
+        // `;`-separated custom text rides the selection.
+        let params = multi_params();
+        let mut ui = ScriptUi::default();
+        ui.push(Ok(Some("1,3; my own text".to_owned())));
+        let result =
+            run_rpc_questionnaire(&mut ui, &params, &english()).expect("scripted ui cannot fail");
+        let answer = &result.answers[0];
+        assert_eq!(answer.kind, AnswerKind::Multi);
+        assert_eq!(
+            answer.selected,
+            Some(vec!["red".to_owned(), "blue".to_owned()])
+        );
+        assert_eq!(answer.answer.as_deref(), Some("my own text"));
+        // Custom text only: no checked labels.
+        let params = multi_params();
+        let mut ui = ScriptUi::default();
+        ui.push(Ok(Some("; only text".to_owned())));
+        let result =
+            run_rpc_questionnaire(&mut ui, &params, &english()).expect("scripted ui cannot fail");
+        let answer = &result.answers[0];
+        assert_eq!(answer.answer.as_deref(), Some("only text"));
+        assert_eq!(answer.selected, Some(Vec::new()));
     }
 
     #[test]

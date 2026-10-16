@@ -1,26 +1,26 @@
 # ask-user-question parity report (TE28/TE29/TE30/TE31 G3/G12 — preview group added by TE31)
 
-generated: 2026-09-25T23:00:45.944Z
+generated: 2026-10-16T07:21:54.110Z
 upstream submodule: external/rpiv-mono/packages/rpiv-ask-user-question
-submodule HEAD: 0fdf4f813980d380e826b84d1280a4960e5d088e (pinned 0fdf4f813980d380e826b84d1280a4960e5d088e)
+submodule HEAD: afc21bc25f7d07cae9fb3103dc309240a16b9f49 (pinned afc21bc25f7d07cae9fb3103dc309240a16b9f49)
 typebox: 1.3.6
 
 ## snapshot (sha256 of the driven upstream modules)
 
-- tool/types.ts: f6e4ca589d8c8f11726c6d93313fe8907752140915f62aea2055cca691fc49e6
-- tool/normalize-params.ts: 660b75bff74b97aa49767c31b201dec527bed60c8602751e0e5560038643c22f
+- tool/types.ts: d41fe638fdc2af67038e5a514ff3896628772620a5d07a513de9d876e45e7c8e
+- tool/normalize-params.ts: 97adf84ebd4a82eac70c5eff3a4905054029ec56ce6e1dfe654c9b8abee1ade5
 - tool/validate-questionnaire.ts: 5baf8e418756ce8420909c2ad5bea5f4cc6fb4ac315f625c85e26f6ae99b8edd
-- tool/response-envelope.ts: 299971663030c4f7eee5798d698f41679ecb27664738006ceabd27a83ac9b473
-- tool/format-answer.ts: aa382c244d9230c08dbf1788c2510f0dc07cc347550ee50d7407ec26bb919b06
+- tool/response-envelope.ts: 406335512b5be540d9854bc0193ed4900f1ad316881cda38cb736bf46ef97d87
+- tool/format-answer.ts: d4504470ccdbdad60127a8f49a09d21cfd8b8a788f00ac250eb07586d889b41a
 - state/row-intent.ts: dbb44959cffb56fd031ea751d28f7c5647ef117051ec6edc5a96bb877f64ca16
 - state/i18n-bridge.ts: c2921835574265924e0a96a1d10b010d6edd78b07b7ee14e4a4b92cc2287a809
-- rpc-fallback.ts: 14997c0b37294a466665b9661529522112de56891bf380dae81346d299396a29
-- state/state-reducer.ts: 8ed9bdf4596c884fdf36d4411f6c1852ca236d5d9f161c1252961fed5dc18145
-- state/key-router.ts: c77a98c1435e1c3bcb0a658079ccd1e4e54968f2bb7631f7057ed2be05b4ee6e
+- rpc-fallback.ts: 6df56c7d890d8ba9fa841e33c77839b25875edfeb1c8b19a7f9e86c0d59d63b6
+- state/state-reducer.ts: f6045ea83dae832176db0dab5bbb52f424577011aedbbd73bde50f5ae434d3fe
+- state/key-router.ts: 9f4ad8bf7ead9afb50fa09b1143c5864a2da7f4cacb9f2ceef733eaad3216782
 - view/components/preview/preview-layout-decider.ts: 7baf9ecd1db8af8383d2f792d69d4fd9b22623a7cbd29e1a95bc9fd480796a3b
 - view/components/preview/preview-box-renderer.ts: 20b900ead8a0e71f005aadb18c00103b2dff87391ec8c8011ebd3c47540a8c33
 - external/pi/packages/tui/src/keys.ts (pi-tui stub): b972facce4233a4623239fc38029e28cae15d0fb326558c0c09dc02cf4345fa7
-- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 8cda2d53e2361ac5aaf6d7345b2fee058c8df5743eae4e4e90c89a7072c026c3
+- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 258ff73a0ff4d2b05f8a60515a9cc37eb96c9fc03a4072ac6db2906cad1862d9
 
 ## schema
 
@@ -76,8 +76,9 @@ typebox: 1.3.6
 - cancelled_with_global_note: MATCH
 - null_result: MATCH
 - empty_answers_not_cancelled_declines: MATCH
-- partial_submission_skips_unanswered: MATCH
+- partial_submission_names_unanswered: MATCH
 - out_of_order_answers_follow_question_order: MATCH
+- multi_answer_with_custom_text: MATCH
 
 ## row-intent
 
@@ -128,7 +129,7 @@ typebox: 1.3.6
 - confirm_makes_the_confirmed_custom_answer_authoritative_by_removing_its_draft: MATCH
 - confirm_regular_option_matching_a_preview_bearing_option_augments_answer_preview: MATCH
 - confirm_merges_pending_notes_from_notes_by_tab: MATCH
-- confirm_custom_on_multi_clears_the_checked_set: MATCH
+- confirm_custom_on_multi_becomes_a_multi_answer: MATCH
 - confirm_with_auto_advance_switches_tab_instead_of_done: MATCH
 - toggle_persists_the_multi_answer: MATCH
 - toggle_an_empty_selection_deletes_the_answer: MATCH
@@ -150,6 +151,8 @@ typebox: 1.3.6
 - submit_nav_moves_the_picker_choice: MATCH
 - toggle_collapsed_emits_overlay_hidden_and_back: MATCH
 - ignore_is_a_noop: MATCH
+- multi_confirm_carries_custom_text: MATCH
+- nav_away_from_multi_input_persists_the_answer: MATCH
 
 ## keys
 
@@ -169,6 +172,7 @@ typebox: 1.3.6
 - collapse_key_off: MATCH
 - answered_option_confirmed: MATCH
 - empty_questions: MATCH
+- multi_select_input_mode_enter_commits_with_text: MATCH
 
 ## preview
 
@@ -280,15 +284,15 @@ typebox: 1.3.6
 
 ## locales
 
-- de.json: MATCH (d6d4491504bd)
-- en.json: MATCH (49d142c22c26)
-- es.json: MATCH (31312a491a58)
-- fr.json: MATCH (d6dfc6a162bf)
-- pt-BR.json: MATCH (f9c79ae849eb)
-- pt.json: MATCH (69687a3d97ec)
-- ru.json: MATCH (9702bc2b55f6)
-- uk.json: MATCH (81c3c2762bc8)
-- zh.json: MATCH (b07a54cbad95)
+- de.json: MATCH (181e3180d74d)
+- en.json: MATCH (092978b2c966)
+- es.json: MATCH (2f92505d4e03)
+- fr.json: MATCH (303fb2f2d3eb)
+- pt-BR.json: MATCH (1a37815ff03d)
+- pt.json: MATCH (3125153e8617)
+- ru.json: MATCH (9eceb410c5df)
+- uk.json: MATCH (4e4738bd9623)
+- zh.json: MATCH (1eb029b481e7)
 
 
 ## RESULT: MATCH

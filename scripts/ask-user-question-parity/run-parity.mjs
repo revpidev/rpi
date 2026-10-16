@@ -2,7 +2,7 @@
 //
 //   node scripts/ask-user-question-parity/run-parity.mjs
 //
-// 1. Verifies the pinned submodule HEAD (external/rpiv-mono @ 0fdf4f8) and
+// 1. Verifies the pinned submodule HEAD (external/rpiv-mono @ afc21bc2) and
 //    materializes a read-only snapshot of the six upstream pure-function
 //    modules into the deps dir (external/ is never written).
 // 2. Builds this crate's `ask_user_question_parity_runner` example. All
@@ -40,7 +40,7 @@ const TSX = resolve(DEPS, "node_modules/.bin/tsx");
 const RUST_RUNNER = resolve(REPO, "target/debug/examples/ask_user_question_parity_runner");
 const VENDORED_LOCALES = resolve(REPO, "crates/rpi-ext-ask-user-question/locales");
 const GENERATED = resolve(REPO, "fixtures/generated/ask-user-question-parity");
-const PINNED_COMMIT = "0fdf4f813980d380e826b84d1280a4960e5d088e";
+const PINNED_COMMIT = "afc21bc25f7d07cae9fb3103dc309240a16b9f49";
 const GROUPS = ["schema", "normalize", "validate", "envelope", "row-intent", "rpc", "state", "keys", "preview"];
 const UPSTREAM_MODULES = [
 	"tool/types.ts",

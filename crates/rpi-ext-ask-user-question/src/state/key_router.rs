@@ -156,6 +156,10 @@ pub enum Action {
     MultiConfirm {
         /// Selected labels (declaration order; empty = empty selection).
         selected: Vec<String>,
+        /// Custom text from the multi-select input row, `null` when empty
+        /// (v2.13.6, #188).
+        #[serde(default)]
+        answer: Option<String>,
         /// Multi-question auto-advance target.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auto_advance_tab: Option<usize>,
@@ -335,6 +339,19 @@ fn build_multi_selected(
     out
 }
 
+/// `buildMultiConfirmAction` (key-router.ts @ v2.13.8): the commit carries
+/// the live input buffer as custom text when non-empty (#188).
+fn build_multi_confirm_action(
+    state: &QuestionnaireState,
+    runtime: &QuestionnaireRuntime<'_>,
+) -> Action {
+    Action::MultiConfirm {
+        selected: build_multi_selected(state, runtime),
+        answer: (!runtime.input_buffer.trim().is_empty()).then(|| runtime.input_buffer.clone()),
+        auto_advance_tab: compute_auto_advance_tab(state, runtime),
+    }
+}
+
 /// `tabSwitchAction` — `Tab`/`→` forward, `Shift+Tab`/`←` backward.
 fn tab_switch_action(
     data: &str,
@@ -413,6 +430,16 @@ fn route_input_mode(
         return Action::Ignore;
     }
     if is_confirm(kb, data) {
+        // Enter while the multi-select custom row is focused commits the
+        // question with the checks and the typed text together (v2.13.6,
+        // #188).
+        if runtime
+            .questions
+            .get(state.current_tab)
+            .is_some_and(|question| question.multi_select == Some(true))
+        {
+            return build_multi_confirm_action(state, runtime);
+        }
         let Some(answer) = build_single_select_answer(state, runtime) else {
             return Action::Ignore;
         };
@@ -510,10 +537,7 @@ fn route_multi_select_tab(
                 index: state.option_index,
             };
         }
-        return Action::MultiConfirm {
-            selected: build_multi_selected(state, runtime),
-            auto_advance_tab: compute_auto_advance_tab(state, runtime),
-        };
+        return build_multi_confirm_action(state, runtime);
     }
     if kb.matches(data, KEYBIND_CANCEL) {
         return Action::Cancel;
@@ -788,6 +812,7 @@ mod tests {
             fixture.route_at("\r", &state, 0, 3),
             Action::MultiConfirm {
                 selected: Vec::new(),
+                answer: None,
                 auto_advance_tab: None
             },
             "empty selection is a valid commit"

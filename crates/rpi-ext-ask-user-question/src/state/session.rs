@@ -28,9 +28,8 @@ use std::collections::VecDeque;
 
 use rpi_ext_host::interactive_ui::{
     Component, ComponentCursor, ComponentEvent, ComponentFrame, DisposeReason, DoneValue,
-    HostCall as AbiHostCall, InteractiveUiError, MountOptions, OverlayAnchor, OverlayOptions,
-    SizeValue, edit_external, mount_component, poll_component, render_component,
-    set_component_hidden,
+    HostCall as AbiHostCall, InteractiveUiError, MountOptions, edit_external, mount_component,
+    poll_component, render_component, set_component_hidden,
 };
 use serde_json::{Value, json};
 
@@ -525,7 +524,9 @@ impl Component for QuestionnaireComponent {
 
     fn on_resize(&mut self, width: usize, height: usize) {
         self.width = width;
-        self.height = Some(height);
+        // v2.13.0 (#253): the inline (editor-slot) presentation caps its row
+        // budget so the host's bottom clip never cuts the dialog chrome.
+        self.height = Some(inline_row_budget(height));
     }
 
     fn on_theme(&mut self, theme: &Value) {
@@ -559,22 +560,33 @@ impl AbiHostCall for AbiHostAdapter<'_> {
     }
 }
 
-/// Mount options for the questionnaire overlay (`ui.custom` equivalent).
+/// Inline row budget (presentation.ts @ v2.13.8, #253): a component in Pi's
+/// editor slot caps itself so the host's bottom clip never cuts the dialog
+/// chrome. `min(rows, max(12, floor(rows * 0.7)))`.
+pub const INLINE_ROW_RATIO: f64 = 0.7;
+/// `INLINE_MIN_ROWS`.
+pub const INLINE_MIN_ROWS: usize = 12;
+
+/// The rows an inline (editor-slot) mount may render for a terminal of
+/// `rows` rows.
+pub fn inline_row_budget(rows: usize) -> usize {
+    let capped = ((rows as f64) * INLINE_ROW_RATIO).floor() as usize;
+    rows.min(capped.max(INLINE_MIN_ROWS))
+}
+
+/// Mount options for the questionnaire (`ui.mountComponent` payload; the
+/// `ctx.ui.custom` equivalent).
+///
+/// v2.13.0 (#253): the questionnaire opens **inline** in the editor slot by
+/// default — overlays hide the message the question refers to and swallow
+/// transcript scrolling. Upstream falls back to an overlay when another
+/// overlay is already open (`mustYieldInlineSlot` reads `tui.hasOverlay()`);
+/// the rpi interactive-UI ABI exposes no overlay query, so the inline mount
+/// is unconditional (documented divergence, TE48 §7.3).
 pub fn mount_options(collapse_key: &str) -> MountOptions {
     MountOptions {
-        overlay: true,
-        overlay_options: Some(OverlayOptions {
-            anchor: Some(OverlayAnchor::BottomCenter),
-            width: Some(SizeValue::Percent(100.0)),
-            max_height: Some(SizeValue::Percent(100.0)),
-            margin: Some(rpi_ext_host::interactive_ui::Margin {
-                left: 0,
-                right: 0,
-                bottom: 0,
-                top: 0,
-            }),
-            ..OverlayOptions::default()
-        }),
+        overlay: false,
+        overlay_options: None,
         // The questionnaire has no animation; it never subscribes to ticks.
         tick_ms: 0,
         keys_when_hidden: if collapse_key == "off" || collapse_key.is_empty() {
@@ -1253,17 +1265,19 @@ mod tests {
     }
 
     #[test]
-    fn mount_options_carry_overlay_geometry_and_collapse_channel() {
+    fn mount_options_carry_inline_presentation_and_collapse_channel() {
         let options = mount_options("ctrl+]");
-        let overlay = options.overlay_options.expect("overlay options");
-        assert_eq!(overlay.anchor, Some(OverlayAnchor::BottomCenter));
-        assert_eq!(overlay.width, Some(SizeValue::Percent(100.0)));
-        assert_eq!(overlay.max_height, Some(SizeValue::Percent(100.0)));
+        assert!(!options.overlay, "v2.13.0: inline editor-slot mount");
+        assert!(options.overlay_options.is_none());
         assert_eq!(options.tick_ms, 0);
         assert_eq!(options.keys_when_hidden, vec!["ctrl+]".to_owned()]);
         assert!(options.cursor);
         assert_eq!(options.label.as_deref(), Some("ask_user_question"));
         assert!(mount_options("off").keys_when_hidden.is_empty());
+        // Row budget: 70% with a 12-row floor, never above the terminal.
+        assert_eq!(inline_row_budget(30), 21);
+        assert_eq!(inline_row_budget(10), 10);
+        assert_eq!(inline_row_budget(100), 70);
     }
 
     #[test]

@@ -266,8 +266,21 @@ fn sync_multi_select_from_answers(
         .collect()
 }
 
-/// `persistMultiSelectAnswer` — mirror the live checkbox set into `answers`
-/// (an empty selection deletes the entry).
+/// `selectedLabels` (state-reducer.ts @ v2.13.8): labels of the checked
+/// options in declaration order.
+fn selected_labels(state: &QuestionnaireState, question: &QuestionData) -> Vec<String> {
+    let mut selected = Vec::new();
+    for (index, option) in question.options.iter().enumerate() {
+        if state.multi_select_checked.contains(&index) {
+            selected.push(option.label.clone());
+        }
+    }
+    selected
+}
+
+/// `persistMultiSelectAnswer` — mirror the live checkbox set and the custom
+/// draft into `answers` (empty selection and empty text delete the entry;
+/// v2.13.6, #188).
 fn persist_multi_select_answer(
     state: &QuestionnaireState,
     ctx: &ApplyContext<'_>,
@@ -278,15 +291,11 @@ fn persist_multi_select_answer(
     if question.multi_select != Some(true) {
         return state.answers.clone();
     }
-    let selected: Vec<String> = question
-        .options
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| state.multi_select_checked.contains(index))
-        .map(|(_, option)| option.label.clone())
-        .collect();
+    let selected = selected_labels(state, question);
+    let custom = custom_draft_value_for(state, state.current_tab);
+    let has_custom = !custom.trim().is_empty();
     let mut out = state.answers.clone();
-    if selected.is_empty() {
+    if selected.is_empty() && !has_custom {
         out.remove(&state.current_tab);
         return out;
     }
@@ -294,7 +303,7 @@ fn persist_multi_select_answer(
         question_index: state.current_tab,
         question: question.question.clone(),
         kind: AnswerKind::Multi,
-        answer: None,
+        answer: has_custom.then_some(custom),
         selected: Some(selected),
         notes: None,
         preview: None,
@@ -325,7 +334,8 @@ fn notes_value_for(state: &QuestionnaireState, tab: usize) -> String {
         .unwrap_or_default()
 }
 
-/// `customDraftValueFor` — in-flight draft first, confirmed custom answer second.
+/// `customDraftValueFor` — in-flight draft first, confirmed custom or
+/// multi custom text second (v2.13.6, #188).
 fn custom_draft_value_for(state: &QuestionnaireState, tab: usize) -> String {
     if let Some(draft) = state.custom_drafts_by_tab.get(&tab) {
         return draft.clone();
@@ -333,7 +343,7 @@ fn custom_draft_value_for(state: &QuestionnaireState, tab: usize) -> String {
     state
         .answers
         .get(&tab)
-        .filter(|answer| answer.kind == AnswerKind::Custom)
+        .filter(|answer| answer.kind == AnswerKind::Custom || answer.kind == AnswerKind::Multi)
         .and_then(|answer| answer.answer.clone())
         .unwrap_or_default()
 }
@@ -437,12 +447,23 @@ fn nav_handler(state: &QuestionnaireState, action: &Action, ctx: &ApplyContext<'
     } else {
         state.custom_drafts_by_tab.clone()
     };
-    let next = QuestionnaireState {
+    let mut next = QuestionnaireState {
         option_index: *next_index,
         input_mode,
         custom_drafts_by_tab,
         ..state.clone()
     };
+    // Leaving the custom-input row on a multi-select question persists the
+    // answer (checks + typed text) so it survives navigation (v2.13.6, #188).
+    if state.input_mode
+        && !input_mode
+        && ctx
+            .questions
+            .get(state.current_tab)
+            .is_some_and(|question| question.multi_select == Some(true))
+    {
+        next.answers = persist_multi_select_answer(&next, ctx);
+    }
     let effects = if input_mode {
         vec![Effect::SetInputBuffer {
             value: custom_draft_value_for(&next, state.current_tab),
@@ -541,9 +562,18 @@ fn confirm_handler(
         };
     };
     let mut answer = answer.clone();
-    if answer.kind == AnswerKind::Option
+    // A custom free-text answer on a multi-select question becomes a multi
+    // answer carrying the current checked labels (v2.13.6, #188).
+    let question = ctx.questions.get(answer.question_index);
+    if answer.kind == AnswerKind::Custom
+        && question.is_some_and(|question| question.multi_select == Some(true))
+    {
+        let selected = question.map(|question| selected_labels(state, question));
+        answer.kind = AnswerKind::Multi;
+        answer.selected = selected;
+    } else if answer.kind == AnswerKind::Option
         && let Some(labels) = answer.answer.as_ref()
-        && let Some(question) = ctx.questions.get(answer.question_index)
+        && let Some(question) = question
         && let Some(matched) = question
             .options
             .iter()
@@ -561,14 +591,11 @@ fn confirm_handler(
     }
     let mut answers = state.answers.clone();
     answers.insert(answer.question_index, answer.clone());
-    // Custom free-text on a multi-select tab is mutually exclusive with
-    // checkbox selections: clear the checked set so the boxes vanish on Enter.
-    let is_custom_multi = answer.kind == AnswerKind::Custom
-        && ctx
-            .questions
-            .get(answer.question_index)
-            .is_some_and(|question| question.multi_select == Some(true));
-    let custom_drafts_by_tab = if answer.kind == AnswerKind::Custom {
+    // A custom answer (single or multi) clears its draft; a plain option
+    // answer leaves drafts alone.
+    let has_custom_answer = answer.kind == AnswerKind::Custom
+        || (answer.kind == AnswerKind::Multi && answer.answer.is_some());
+    let custom_drafts_by_tab = if has_custom_answer {
         without_custom_draft(state, answer.question_index)
     } else {
         state.custom_drafts_by_tab.clone()
@@ -576,11 +603,6 @@ fn confirm_handler(
     let next = QuestionnaireState {
         answers,
         custom_drafts_by_tab,
-        multi_select_checked: if is_custom_multi {
-            BTreeSet::new()
-        } else {
-            state.multi_select_checked.clone()
-        },
         ..state.clone()
     };
     if let Some(auto_advance) = auto_advance_tab {
@@ -625,6 +647,7 @@ fn multi_confirm_handler(
 ) -> ApplyResult {
     let Action::MultiConfirm {
         selected,
+        answer,
         auto_advance_tab,
     } = action
     else {
@@ -643,7 +666,7 @@ fn multi_confirm_handler(
         question_index: state.current_tab,
         question: question.question.clone(),
         kind: AnswerKind::Multi,
-        answer: None,
+        answer: answer.clone(),
         selected: Some(selected.clone()),
         notes: None,
         preview: None,
@@ -659,6 +682,7 @@ fn multi_confirm_handler(
     answers.insert(state.current_tab, answer);
     let synced = QuestionnaireState {
         answers: answers.clone(),
+        custom_drafts_by_tab: without_custom_draft(state, state.current_tab),
         multi_select_checked: sync_multi_select_from_answers(
             &answers,
             ctx.questions,
@@ -1071,7 +1095,10 @@ mod tests {
     }
 
     #[test]
-    fn confirm_custom_on_multi_clears_checkboxes_and_draft() {
+    fn confirm_custom_on_multi_keeps_checkboxes_and_clears_draft() {
+        // v2.13.6 (#188): custom free-text on a multi-select question is no
+        // longer mutually exclusive with the checked labels — the answer
+        // becomes a multi answer carrying both, and the boxes stay.
         let (questions, items) = fixture(true, 1);
         let mut state = QuestionnaireState::initial();
         state.multi_select_checked.insert(0);
@@ -1092,8 +1119,58 @@ mod tests {
             },
             &context(&questions, &items),
         );
-        assert!(result.state.multi_select_checked.is_empty());
+        let answer = result.state.answers.get(&0).expect("answer");
+        assert_eq!(answer.kind, AnswerKind::Multi);
+        assert_eq!(answer.answer.as_deref(), Some("typed"));
+        assert_eq!(answer.selected.as_deref(), Some(&["A".to_owned()][..]));
+        assert!(!result.state.multi_select_checked.is_empty());
         assert!(!result.state.custom_drafts_by_tab.contains_key(&0));
+    }
+
+    /// v2.13.6 (#188): Enter while the multi-select input row is focused
+    /// commits a multi answer with the live text and the checked labels.
+    #[test]
+    fn multi_confirm_with_custom_text_keeps_selection() {
+        let (questions, items) = fixture(true, 1);
+        let mut state = QuestionnaireState::initial();
+        state.multi_select_checked.insert(1);
+        state.custom_drafts_by_tab.insert(0, "extra".to_owned());
+        let result = apply(
+            &state,
+            &Action::MultiConfirm {
+                selected: vec!["B".to_owned()],
+                answer: Some("extra".to_owned()),
+                auto_advance_tab: None,
+            },
+            &context(&questions, &items),
+        );
+        let answer = result.state.answers.get(&0).expect("answer");
+        assert_eq!(answer.kind, AnswerKind::Multi);
+        assert_eq!(answer.selected.as_deref(), Some(&["B".to_owned()][..]));
+        assert_eq!(answer.answer.as_deref(), Some("extra"));
+        assert!(!result.state.custom_drafts_by_tab.contains_key(&0));
+    }
+
+    /// v2.13.6 (#188): leaving the input row persists the multi answer so a
+    /// later tab return restores the checks and the text.
+    #[test]
+    fn nav_away_from_multi_input_persists_custom_answer() {
+        let (questions, items) = fixture(true, 1);
+        let mut state = QuestionnaireState::initial();
+        state.multi_select_checked.insert(0);
+        state.input_mode = true;
+        let result = apply(
+            &state,
+            &Action::Nav {
+                next_index: 0,
+                input_value: "kept".to_owned(),
+            },
+            &context(&questions, &items),
+        );
+        let answer = result.state.answers.get(&0).expect("persisted answer");
+        assert_eq!(answer.kind, AnswerKind::Multi);
+        assert_eq!(answer.answer.as_deref(), Some("kept"));
+        assert_eq!(answer.selected.as_deref(), Some(&["A".to_owned()][..]));
     }
 
     #[test]
@@ -1104,6 +1181,7 @@ mod tests {
             &state,
             &Action::MultiConfirm {
                 selected: Vec::new(),
+                answer: None,
                 auto_advance_tab: None,
             },
             &context(&questions, &items),

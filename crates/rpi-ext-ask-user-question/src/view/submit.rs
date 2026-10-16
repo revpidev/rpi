@@ -53,7 +53,7 @@ pub fn render_answers(
     theme: &Theme,
     width: usize,
 ) -> Vec<String> {
-    let mut lines = render_answer_rows(&state.answers, questions, theme, width);
+    let mut lines = render_answer_rows(&state.answers, questions, i18n, theme, width);
     let global_note = state
         .notes_by_tab
         .get(&questions.len())
@@ -79,6 +79,7 @@ pub fn render_answers(
 fn render_answer_rows(
     answers: &BTreeMap<usize, QuestionAnswer>,
     questions: &[QuestionData],
+    i18n: &I18n,
     theme: &Theme,
     width: usize,
 ) -> Vec<String> {
@@ -97,7 +98,15 @@ fn render_answer_rows(
             width,
         ));
         if let Some(notes) = answer.notes.as_deref().filter(|notes| !notes.is_empty()) {
-            lines.push(truncate_line(&format!("     notes: {notes}"), width));
+            // v2.13.7 (#197): the review uses the same saved-note label as
+            // the question tab instead of a dim `notes:` line.
+            lines.push(truncate_line(
+                &theme.dim(&format!(
+                    "     {} {notes}",
+                    i18n.t("notes.saved_label", super::dialog::NOTES_SAVED_LABEL)
+                )),
+                width,
+            ));
         }
     }
     lines
@@ -231,7 +240,8 @@ mod tests {
             .collect();
         assert_eq!(plain[0], " ● H1");
         assert_eq!(plain[1], "   → A");
-        assert_eq!(plain[2], "     notes: my note");
+        // v2.13.7 (#197): the review uses the shared saved-note label.
+        assert_eq!(plain[2], "     Note for this answer: my note");
         assert_eq!(plain[3], " ● Q2");
         assert_eq!(plain[4], "   → B");
     }

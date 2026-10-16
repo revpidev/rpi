@@ -17,7 +17,7 @@
 use serde_json::Value;
 
 use crate::state::TaskState;
-use crate::tool::types::{TOOL_NAME, Task};
+use crate::tool::types::{STATE_ENTRY_TYPE, TOOL_NAME, Task};
 
 /// Discriminator for `details` envelopes that match the persisted
 /// `TaskDetails` shape. Defensive — branch entries from older or corrupt
@@ -70,11 +70,45 @@ pub fn replay_from_entries(entries: &[Value]) -> TaskState {
     result
 }
 
-/// Host-call wrapper: read the current branch's filtered toolResults and
-/// replay. Host transport failures surface to the caller (the event
-/// wiring keeps current state on stale contexts — upstream
-/// `isStaleCtxError` semantics).
+/// Walk filtered `custom` entries (root → leaf as returned by
+/// `ctx.sessionEntries`) and return the last valid `TaskDetails` snapshot.
+/// `None` when the branch carries none — a malformed state entry does not
+/// count, and the caller then falls back to `toolResult` snapshots
+/// (upstream `replayFromBranch` @ v2.13.8 treats only a valid
+/// `rpiv-todo-state` entry as authoritative; #290).
+pub fn replay_from_session_entries(entries: &[Value]) -> Option<TaskState> {
+    let mut result: Option<TaskState> = None;
+    for entry in entries {
+        if entry.get("customType").and_then(Value::as_str) != Some(STATE_ENTRY_TYPE) {
+            continue;
+        }
+        let Some(data) = entry.get("data") else {
+            continue;
+        };
+        if !is_task_details(data) {
+            continue;
+        }
+        if let Some(state) = decode_snapshot(data) {
+            result = Some(state);
+        }
+    }
+    result
+}
+
+/// Host-call wrapper: the branch's `rpiv-todo-state` custom entries are read
+/// first and, when any valid snapshot exists, are authoritative; otherwise
+/// the pre-entry [`replay_from_entries`] toolResult walk still serves
+/// sessions written before this change. Read failures surface to the callers
+/// (upstream `replayAndRefresh` semantics).
 pub fn replay_via_host(host: &dyn crate::HostCall) -> Result<TaskState, crate::HostError> {
+    let entries_response = host.call(
+        "ctx.sessionEntries",
+        serde_json::json!({ "customType": STATE_ENTRY_TYPE }),
+    )?;
+    let entries = entries_response.as_array().cloned().unwrap_or_default();
+    if let Some(state) = replay_from_session_entries(&entries) {
+        return Ok(state);
+    }
     let response = host.call(
         "ctx.sessionToolResults",
         serde_json::json!({ "toolName": TOOL_NAME }),
@@ -108,6 +142,17 @@ mod tests {
 
     fn task_fixture(id: i64, subject: &str) -> Value {
         json!({ "id": id, "subject": subject, "status": "pending" })
+    }
+
+    /// `ctx.sessionEntries` projection builder (ADR-0027 shape).
+    fn state_entry(data: Value) -> Value {
+        json!({
+            "id": "c1",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "customType": "rpiv-todo-state",
+            "data": data,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -168,6 +213,32 @@ mod tests {
         let state = replay_from_entries(&entries);
         assert_eq!(state.tasks.len(), 2);
         assert_eq!(state.next_id, 3);
+    }
+
+    /// #290 (v2.13.5): the branch's `rpiv-todo-state` custom entries replay
+    /// last-write-wins and take precedence over toolResult snapshots.
+    #[test]
+    fn session_entries_are_authoritative_and_last_write_wins() {
+        let entries = vec![
+            state_entry(json!({"tasks": [task_fixture(1, "entry")], "nextId": 2})),
+            state_entry(json!({
+                "tasks": [task_fixture(1, "entry"), task_fixture(2, "newer")], "nextId": 3
+            })),
+        ];
+        let state = replay_from_session_entries(&entries).expect("valid state entries");
+        assert_eq!(state.tasks.len(), 2);
+        assert_eq!(state.next_id, 3);
+    }
+
+    /// A malformed or foreign custom entry never counts as a state entry —
+    /// the caller falls back to toolResult snapshots.
+    #[test]
+    fn malformed_state_entries_do_not_count() {
+        let entries = vec![
+            state_entry(json!({"tasks": "not-an-array", "nextId": 1})),
+            json!({"id": "c2", "customType": "other", "data": {"tasks": [], "nextId": 1}}),
+        ];
+        assert!(replay_from_session_entries(&entries).is_none());
     }
 
     #[test]

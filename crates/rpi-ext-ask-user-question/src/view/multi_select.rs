@@ -110,6 +110,13 @@ pub fn render(
     } else {
         INACTIVE_POINTER
     };
+    // v2.13.6 (#188): the custom row shows a checked box while it holds text.
+    let other_checked = !input_text.trim().is_empty();
+    let other_box = if other_checked {
+        theme.accent(CHECKED)
+    } else {
+        theme.muted(UNCHECKED)
+    };
     let other_prefix = format!(
         "{}{}{NUMBER_SEPARATOR}{}{BOX_LABEL_GAP}",
         if other_active {
@@ -118,7 +125,7 @@ pub fn render(
             other_pointer.to_owned()
         },
         pad_number(other_index + 1, number_width),
-        theme.muted(UNCHECKED),
+        other_box,
     );
     let other_prefix_width = visible_columns(&format!(
         "{other_pointer}{}{NUMBER_SEPARATOR}{UNCHECKED}{BOX_LABEL_GAP}",

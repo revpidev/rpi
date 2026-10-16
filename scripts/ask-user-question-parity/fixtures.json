@@ -1243,7 +1243,7 @@
 				}
 			},
 			{
-				"name": "partial_submission_skips_unanswered",
+				"name": "partial_submission_names_unanswered",
 				"input": {
 					"params": {
 						"questions": [
@@ -1338,6 +1338,44 @@
 								"question": "Q1?",
 								"kind": "option",
 								"answer": "A"
+							}
+						],
+						"cancelled": false
+					}
+				}
+			},
+			{
+				"name": "multi_answer_with_custom_text",
+				"input": {
+					"params": {
+						"questions": [
+							{
+								"question": "Q?",
+								"header": "H",
+								"options": [
+									{
+										"label": "A",
+										"description": "a"
+									},
+									{
+										"label": "B",
+										"description": "b"
+									}
+								],
+								"multiSelect": true
+							}
+						]
+					},
+					"result": {
+						"answers": [
+							{
+								"questionIndex": 0,
+								"question": "Q?",
+								"kind": "multi",
+								"selected": [
+									"A"
+								],
+								"answer": "custom text"
 							}
 						],
 						"cancelled": false
@@ -2543,7 +2581,7 @@
 				}
 			},
 			{
-				"name": "confirm_custom_on_multi_clears_the_checked_set",
+				"name": "confirm_custom_on_multi_becomes_a_multi_answer",
 				"input": {
 					"questions": [
 						{
@@ -2802,7 +2840,8 @@
 							"selected": [
 								"A",
 								"B"
-							]
+							],
+							"answer": null
 						}
 					]
 				}
@@ -2830,7 +2869,8 @@
 					"actions": [
 						{
 							"kind": "multi_confirm",
-							"selected": []
+							"selected": [],
+							"answer": null
 						}
 					]
 				}
@@ -2878,7 +2918,8 @@
 							"selected": [
 								"A"
 							],
-							"autoAdvanceTab": 2
+							"autoAdvanceTab": 2,
+							"answer": null
 						}
 					]
 				}
@@ -2908,7 +2949,8 @@
 					"actions": [
 						{
 							"kind": "multi_confirm",
-							"selected": []
+							"selected": [],
+							"answer": null
 						}
 					]
 				}
@@ -3328,6 +3370,72 @@
 					"actions": [
 						{
 							"kind": "ignore"
+						}
+					]
+				}
+			},
+			{
+				"name": "multi_confirm_carries_custom_text",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick many",
+							"header": "HM",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							],
+							"multiSelect": true
+						}
+					],
+					"actions": [
+						{
+							"kind": "multi_confirm",
+							"selected": [
+								"A"
+							],
+							"answer": "typed"
+						}
+					]
+				}
+			},
+			{
+				"name": "nav_away_from_multi_input_persists_the_answer",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick many",
+							"header": "HM",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							],
+							"multiSelect": true
+						}
+					],
+					"setup": {
+						"multiSelectChecked": [
+							0
+						],
+						"inputMode": true
+					},
+					"actions": [
+						{
+							"kind": "nav",
+							"nextIndex": 0,
+							"inputValue": "kept"
 						}
 					]
 				}
@@ -3803,6 +3911,41 @@
 				"name": "empty_questions",
 				"input": {
 					"questions": []
+				}
+			},
+			{
+				"name": "multi_select_input_mode_enter_commits_with_text",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick many",
+							"header": "HM",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							],
+							"multiSelect": true
+						}
+					],
+					"setup": {
+						"optionIndex": 2,
+						"inputMode": true,
+						"multiSelectChecked": [
+							0
+						]
+					},
+					"runtime": {
+						"inputBuffer": "typed"
+					},
+					"keys": [
+						"\r"
+					]
 				}
 			}
 		]

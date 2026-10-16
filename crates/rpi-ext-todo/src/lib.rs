@@ -586,6 +586,7 @@ mod tests {
     struct MockHost {
         session_id: &'static str,
         session_results: Vec<Value>,
+        session_entries: Vec<Value>,
         has_ui: bool,
         stale: bool,
         /// ctx.sessionToolResults fails with a NON-stale error (a real
@@ -600,6 +601,7 @@ mod tests {
             MockHost {
                 session_id,
                 session_results: Vec::new(),
+                session_entries: Vec::new(),
                 has_ui: true,
                 stale: false,
                 replay_error: false,
@@ -610,6 +612,13 @@ mod tests {
         fn with_results(session_id: &'static str, results: Vec<Value>) -> Self {
             MockHost {
                 session_results: results,
+                ..MockHost::new(session_id)
+            }
+        }
+
+        fn with_state_entries(session_id: &'static str, entries: Vec<Value>) -> Self {
+            MockHost {
+                session_entries: entries,
                 ..MockHost::new(session_id)
             }
         }
@@ -656,6 +665,21 @@ mod tests {
                         });
                     }
                     Ok(json!(self.session_results))
+                }
+                "ctx.sessionEntries" => {
+                    if self.stale {
+                        return Err(HostError {
+                            kind: "stale".to_owned(),
+                            message: "stale ctx".to_owned(),
+                        });
+                    }
+                    if self.replay_error {
+                        return Err(HostError {
+                            kind: "internal".to_owned(),
+                            message: "boom: real replay bug".to_owned(),
+                        });
+                    }
+                    Ok(json!(self.session_entries))
                 }
                 "registerTool" | "on" => Ok(Value::Null),
                 _ => Ok(Value::Null),
@@ -747,6 +771,47 @@ mod tests {
         assert_eq!(state.tasks[0].subject, "from-branch");
         // First UI-bearing start claims the foreground.
         assert_eq!(store().active_render_session(), "parent");
+    }
+
+    #[test]
+    fn replay_prefers_state_entries_over_tool_results() {
+        let _guard = serialized();
+        __reset_state();
+        let mut host = MockHost::with_state_entries(
+            "parent",
+            vec![json!({
+                "id": "c1", "parentId": null, "timestamp": "t",
+                "customType": "rpiv-todo-state",
+                "data": {"action": "create", "params": {},
+                    "tasks": [{"id": 1, "subject": "from-entry", "status": "pending"}], "nextId": 2}
+            })],
+        );
+        // A stale toolResult snapshot is present: entries are authoritative.
+        host.session_results = vec![todo_result(json!({
+            "action": "create", "params": {},
+            "tasks": [{"id": 1, "subject": "from-tool-result", "status": "pending"}],
+            "nextId": 2
+        }))];
+        handle_event(&host, "session_start", &json!({}));
+        let state = store().state_for("parent");
+        assert_eq!(state.tasks[0].subject, "from-entry");
+    }
+
+    #[test]
+    fn replay_falls_back_to_tool_results_without_state_entries() {
+        let _guard = serialized();
+        __reset_state();
+        let host = MockHost::with_results(
+            "parent",
+            vec![todo_result(json!({
+                "action": "create", "params": {},
+                "tasks": [{"id": 1, "subject": "fallback", "status": "pending"}],
+                "nextId": 2
+            }))],
+        );
+        handle_event(&host, "session_start", &json!({}));
+        let state = store().state_for("parent");
+        assert_eq!(state.tasks[0].subject, "fallback");
     }
 
     #[test]
@@ -1024,6 +1089,35 @@ mod tests {
         let state = store().state_for("s1");
         assert_eq!(state.tasks.len(), 1);
         assert_eq!(state.next_id, 2);
+    }
+
+    #[test]
+    fn execute_appends_a_state_entry_for_changes_only() {
+        // #290 (v2.13.5): state-changing calls append `rpiv-todo-state` to
+        // the branch; reads and no-effect updates do not.
+        let _guard = serialized();
+        __reset_state();
+        let host = MockHost::new("s1");
+        crate::tool::execute(&host, &json!({"action": "create", "subject": "first"}));
+        let appends = host.recorded("appendEntry");
+        assert_eq!(appends.len(), 1);
+        assert_eq!(appends[0]["customType"], json!("rpiv-todo-state"));
+        assert_eq!(appends[0]["data"]["nextId"], json!(2));
+        // Read: no append.
+        crate::tool::execute(&host, &json!({"action": "list"}));
+        assert_eq!(host.recorded("appendEntry").len(), 1);
+        // No-effect update: no append.
+        crate::tool::execute(
+            &host,
+            &json!({"action": "update", "id": 1, "subject": "first"}),
+        );
+        assert_eq!(host.recorded("appendEntry").len(), 1);
+        // Real update: append.
+        crate::tool::execute(
+            &host,
+            &json!({"action": "update", "id": 1, "status": "in_progress"}),
+        );
+        assert_eq!(host.recorded("appendEntry").len(), 2);
     }
 
     #[test]

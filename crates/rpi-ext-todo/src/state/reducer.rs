@@ -77,6 +77,19 @@ pub struct ApplyResult {
     pub op: Op,
 }
 
+/// True when `op` changed the task state — the calls whose post-commit
+/// snapshot must be persisted for replay (upstream `changesState`,
+/// `state-reducer.ts:29-48` @ v2.13.8, #290). Reads (`List`/`Get`), failures
+/// (`Error`), and a no-effect `Update` leave state untouched. Exhaustive over
+/// `Op`, so a new action must decide here whether it persists.
+pub fn changes_state(op: &Op) -> bool {
+    match op {
+        Op::Create { .. } | Op::Delete { .. } | Op::Clear { .. } => true,
+        Op::Update { changed, .. } => *changed,
+        Op::List { .. } | Op::Get { .. } | Op::Error { .. } => false,
+    }
+}
+
 fn error_result(state: TaskState, message: impl Into<String>) -> ApplyResult {
     ApplyResult {
         state,

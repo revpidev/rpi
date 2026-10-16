@@ -22,6 +22,78 @@
 //! carry the same clean text. Pure: the input is never mutated.
 
 use crate::tool::types::{OptionData, QuestionData, QuestionParams};
+use serde_json::Value;
+
+/// Pi's `prepareArguments` hook: undo double-encoded tool arguments before
+/// schema validation (`prepareQuestionArguments`, normalize-params.ts
+/// @ v2.13.8, #244). Some tool-call parsers (vLLM/LiteLLM-served models)
+/// intermittently emit nested structures as JSON strings — `questions`
+/// itself, or its elements. Only a string at an array/object position is
+/// decoded, and only when it parses to the expected shape; anything else is
+/// passed through untouched so validation still reports the real problem.
+/// The same applies one level down to `options`. Well-formed arguments are
+/// returned as-is.
+pub fn prepare_question_arguments(args: Value) -> Value {
+    let Some(object) = args.as_object() else {
+        return args;
+    };
+    let Some(questions) = object.get("questions").cloned().and_then(decode_array) else {
+        return args;
+    };
+    let decoded: Vec<Value> = questions
+        .into_iter()
+        .map(|question| {
+            let question = decode_object(question);
+            let Some(question_object) = question.as_object() else {
+                return question;
+            };
+            match question_object
+                .get("options")
+                .cloned()
+                .and_then(decode_array)
+            {
+                Some(options) => {
+                    let mut question = question;
+                    if let Some(map) = question.as_object_mut() {
+                        map.insert(
+                            "options".to_owned(),
+                            Value::Array(options.into_iter().map(decode_object).collect()),
+                        );
+                    }
+                    question
+                }
+                None => question,
+            }
+        })
+        .collect();
+    let mut out = object.clone();
+    out.insert("questions".to_owned(), Value::Array(decoded));
+    Value::Object(out)
+}
+
+/// A JSON string holding an array → that array; anything else unchanged.
+fn decode_array(value: Value) -> Option<Vec<Value>> {
+    let parsed = parse_json(&value).unwrap_or(value);
+    match parsed {
+        Value::Array(items) => Some(items),
+        _ => None,
+    }
+}
+
+/// A JSON string holding an object → that object; anything else unchanged.
+fn decode_object(value: Value) -> Value {
+    match parse_json(&value) {
+        Some(parsed) if parsed.is_object() => parsed,
+        _ => value,
+    }
+}
+
+fn parse_json(value: &Value) -> Option<Value> {
+    let Value::String(text) = value else {
+        return None;
+    };
+    serde_json::from_str(text).ok()
+}
 
 /// Normalize line terminators in one model-supplied text field.
 pub fn normalize_line_terminators(text: &str) -> String {
@@ -60,6 +132,38 @@ pub fn normalize_question_params(params: &QuestionParams) -> QuestionParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn prepare_question_arguments_decodes_double_encoded_params() {
+        // Well-formed arguments are returned as-is.
+        let well_formed = json!({
+            "questions": [{
+                "question": "Q?", "header": "H",
+                "options": [{"label": "A", "description": "a"}]
+            }]
+        });
+        assert_eq!(prepare_question_arguments(well_formed.clone()), well_formed);
+        // `questions` itself arrives JSON-encoded as a string.
+        let encoded = json!({
+            "questions": "[{\"question\": \"Q?\", \"header\": \"H\", \"options\": [{\"label\": \"A\", \"description\": \"a\"}]}]"
+        });
+        let decoded = prepare_question_arguments(encoded);
+        assert_eq!(decoded["questions"][0]["question"], json!("Q?"));
+        // One element and its `options` arrive JSON-encoded as strings.
+        let nested = json!({
+            "questions": ["{\"question\": \"Q?\", \"header\": \"H\", \"options\": \"[{\\\"label\\\": \\\"A\\\", \\\"description\\\": \\\"a\\\"}]\"}"]
+        });
+        let decoded = prepare_question_arguments(nested);
+        assert_eq!(decoded["questions"][0]["question"], json!("Q?"));
+        assert_eq!(decoded["questions"][0]["options"][0]["label"], json!("A"));
+        // Non-JSON strings and non-object args pass through untouched, so
+        // validation still reports the real problem.
+        let invalid = json!({"questions": ["not json"]});
+        assert_eq!(prepare_question_arguments(invalid.clone()), invalid);
+        assert_eq!(prepare_question_arguments(json!("plain")), json!("plain"));
+        assert_eq!(prepare_question_arguments(json!(null)), json!(null));
+    }
 
     #[test]
     fn normalize_line_terminators_matches_upstream() {

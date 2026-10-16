@@ -347,6 +347,9 @@ pub const NOTES_AFFORDANCE_OVERHEAD: usize = 2;
 
 /// `preview.notes_affordance` canonical English.
 pub const NOTES_AFFORDANCE_TEXT: &str = "Notes: press n to add notes";
+/// `preview.notes_edit_affordance` canonical English: the affordance once the
+/// question carries a saved note (v2.13.7, #197).
+pub const NOTES_EDIT_AFFORDANCE_TEXT: &str = "Note saved: press n to edit";
 
 /// Content row budget for a layout mode: preview cap minus border +
 /// affordance overhead.
@@ -484,7 +487,9 @@ impl PreviewBlockRenderer {
         BORDER_VERTICAL_OVERHEAD + content_rows + NOTES_AFFORDANCE_OVERHEAD
     }
 
-    /// Render the full preview block at `width`.
+    /// Render the full preview block at `width`. `has_note` selects the
+    /// notes affordance: `add` without a saved note, `edit` with one
+    /// (v2.13.7, #197).
     #[allow(clippy::too_many_arguments)] // mirrors the upstream signature
     pub fn render_block(
         &mut self,
@@ -493,6 +498,7 @@ impl PreviewBlockRenderer {
         mode: PreviewLayoutMode,
         focused: bool,
         notes_visible: bool,
+        has_note: bool,
     ) -> Vec<String> {
         let content_budget = content_budget_for(mode);
         let max_inner_width = inner_width_for(width);
@@ -516,10 +522,12 @@ impl PreviewBlockRenderer {
 
         let show_affordance = focused && !notes_visible && self.cache.has(option_index);
         let affordance = if show_affordance {
-            self.theme.muted(
-                self.i18n
-                    .t("preview.notes_affordance", NOTES_AFFORDANCE_TEXT),
-            )
+            let (key, fallback) = if has_note {
+                ("preview.notes_edit_affordance", NOTES_EDIT_AFFORDANCE_TEXT)
+            } else {
+                ("preview.notes_affordance", NOTES_AFFORDANCE_TEXT)
+            };
+            self.theme.muted(self.i18n.t(key, fallback))
         } else {
             String::new()
         };
@@ -585,6 +593,17 @@ pub fn compose(
         );
     };
     let mut block = PreviewBlockRenderer::new(question, *theme, i18n.clone());
+    // v2.13.7 (#197): a saved note switches the preview affordance to
+    // `preview.notes_edit_affordance` so the key stays discoverable.
+    let has_note = state
+        .notes_by_tab
+        .get(&state.current_tab)
+        .is_some_and(|note| !note.is_empty())
+        || state
+            .answers
+            .get(&state.current_tab)
+            .and_then(|answer| answer.notes.as_ref())
+            .is_some_and(|note| !note.is_empty());
     let focused = !state.notes_visible;
     match mode {
         PreviewLayoutMode::Stacked => {
@@ -610,6 +629,7 @@ pub fn compose(
                 mode,
                 focused,
                 state.notes_visible,
+                has_note,
             ));
             BodyRender {
                 lines,
@@ -640,6 +660,7 @@ pub fn compose(
                 mode,
                 focused,
                 state.notes_visible,
+                has_note,
             );
             let rows = left.lines.len().max(right.len());
             let gap_str = spaces(gap);
@@ -671,9 +692,17 @@ fn render_padded_preview_lines(
     mode: PreviewLayoutMode,
     focused: bool,
     notes_visible: bool,
+    has_note: bool,
 ) -> Vec<String> {
     let inner = col_width.saturating_sub(PREVIEW_PADDING_LEFT).max(1);
-    let content_lines = block.render_block(inner, selected_index, mode, focused, notes_visible);
+    let content_lines = block.render_block(
+        inner,
+        selected_index,
+        mode,
+        focused,
+        notes_visible,
+        has_note,
+    );
     let box_width = content_lines
         .first()
         .map(|line| visible_width(line))
@@ -806,7 +835,7 @@ mod tests {
             multi_select: None,
         };
         let mut block = PreviewBlockRenderer::new(&question, theme, i18n);
-        let stacked = block.render_block(60, 0, PreviewLayoutMode::Stacked, true, false);
+        let stacked = block.render_block(60, 0, PreviewLayoutMode::Stacked, true, false, false);
         // Cap 15 - borders 2 - affordance 2 = 11 content rows + chrome 4.
         assert_eq!(stacked.len(), 15);
         let bottom = strip_ansi(stacked.get(12).expect("bottom border"));
@@ -814,10 +843,20 @@ mod tests {
         let affordance = stacked.last().expect("affordance row");
         assert!(affordance.contains("Notes: press n to add notes"));
 
-        let gated = block.render_block(60, 0, PreviewLayoutMode::Stacked, true, true);
+        // v2.13.7 (#197): a saved note switches the affordance to the edit
+        // hint (the gated variant still yields no text).
+        let with_note = block.render_block(60, 0, PreviewLayoutMode::Stacked, true, false, true);
+        let edit = with_note.last().expect("affordance row");
+        assert!(
+            strip_ansi(edit).contains("Note saved: press n to edit"),
+            "{}",
+            strip_ansi(edit)
+        );
+
+        let gated = block.render_block(60, 0, PreviewLayoutMode::Stacked, true, true, false);
         assert_eq!(gated.last().map(String::as_str), Some(""));
 
-        let placeholder = block.render_block(60, 1, PreviewLayoutMode::Stacked, true, false);
+        let placeholder = block.render_block(60, 1, PreviewLayoutMode::Stacked, true, false, false);
         assert!(
             placeholder
                 .iter()

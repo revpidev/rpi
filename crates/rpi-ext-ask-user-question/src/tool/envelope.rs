@@ -33,12 +33,19 @@ pub enum FormatAnswerVariant {
 /// every variant is handled.
 pub fn format_answer_scalar(answer: &QuestionAnswer, _variant: FormatAnswerVariant) -> String {
     match answer.kind {
-        AnswerKind::Multi => answer
-            .selected
-            .as_ref()
-            .filter(|selected| !selected.is_empty())
-            .map(|selected| selected.join(", "))
-            .unwrap_or_else(|| NO_INPUT_PLACEHOLDER.to_owned()),
+        // v2.13.6 (#188): a multi answer carries optional custom text, joined
+        // after the checked labels.
+        AnswerKind::Multi => {
+            let mut values: Vec<String> = answer.selected.clone().unwrap_or_default();
+            if let Some(text) = answer.answer.as_ref().filter(|text| !text.is_empty()) {
+                values.push(text.clone());
+            }
+            if values.is_empty() {
+                NO_INPUT_PLACEHOLDER.to_owned()
+            } else {
+                values.join(", ")
+            }
+        }
         AnswerKind::Custom => answer
             .answer
             .as_ref()
@@ -99,12 +106,36 @@ fn decline_envelope(result: Option<&QuestionnaireResult>) -> Value {
     build_tool_result(DECLINE_MESSAGE, details)
 }
 
+/// `unanswered: "<question>", "<question>".` — the questions shown but left
+/// blank on a partial submit (`buildUnansweredSegment`, response-envelope.ts
+/// @ v2.13.8, #291).
+pub fn build_unanswered_segment(indexes: &[usize], params: &QuestionParams) -> String {
+    let names: Vec<String> = indexes
+        .iter()
+        .map(|index| {
+            format!(
+                "\"{}\"",
+                params
+                    .questions
+                    .get(*index)
+                    .map(|question| question.question.as_str())
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    format!("unanswered: {}.", names.join(", "))
+}
+
 /// Map a `QuestionnaireResult` (or `None`/cancelled) to the LLM-facing tool
 /// envelope (`buildQuestionnaireResponse`). Cancelled and "no segments" both
 /// fall to [`DECLINE_MESSAGE`] so the model sees a single canonical "didn't
-/// answer" signal regardless of why. The `global note:` segment is pushed
-/// before the zero-segments check, so a note-bearing submit with zero answers
-/// still yields the answered envelope.
+/// answer" signal regardless of why. A partial submit names the questions
+/// left blank in an `unanswered:` segment (and `details.unanswered`, their
+/// indexes) so the model can tell "not decided yet" from "settled" (#291);
+/// it never counts as an answer, and a fully answered result stays
+/// byte-identical. The `global note:` segment is pushed before the
+/// zero-segments check, so a note-bearing submit with zero answers still
+/// yields the answered envelope.
 pub fn build_questionnaire_response(
     result: Option<&QuestionnaireResult>,
     params: &QuestionParams,
@@ -120,21 +151,22 @@ pub fn build_questionnaire_response(
     }
 
     let mut segments: Vec<String> = Vec::new();
+    let mut unanswered: Vec<usize> = Vec::new();
     for (index, _question) in params.questions.iter().enumerate() {
-        if let Some(answer) = result
+        match result
             .answers
             .iter()
             .find(|answer| answer.question_index == index)
         {
-            segments.push(build_answer_segment(answer));
+            Some(answer) => segments.push(build_answer_segment(answer)),
+            None => unanswered.push(index),
         }
     }
-    // Global note rides after the per-question segments: raw multiline echo
-    // (no reformatting), trailing period mirroring `buildAnswerSegment`.
-    if let Some(global_note) = result.global_note.as_ref().filter(|note| !note.is_empty()) {
-        segments.push(format!("global note: {global_note}."));
-    }
-    if segments.is_empty() {
+    let has_global_note = result
+        .global_note
+        .as_ref()
+        .is_some_and(|note| !note.is_empty());
+    if segments.is_empty() && !has_global_note {
         return build_tool_result(
             DECLINE_MESSAGE,
             json!({
@@ -143,8 +175,24 @@ pub fn build_questionnaire_response(
             }),
         );
     }
+    if !unanswered.is_empty() {
+        segments.push(build_unanswered_segment(&unanswered, params));
+    }
+    // Global note rides after the per-question and unanswered segments: raw
+    // multiline echo (no reformatting), trailing period mirroring
+    // `buildAnswerSegment`.
+    if has_global_note {
+        segments.push(format!(
+            "global note: {}.",
+            result.global_note.as_deref().unwrap_or_default()
+        ));
+    }
     let text = format!("{ENVELOPE_PREFIX} {} {ENVELOPE_SUFFIX}", segments.join(" "));
-    build_tool_result(text, serde_json::to_value(result).unwrap_or(Value::Null))
+    let mut details = serde_json::to_value(result).unwrap_or(Value::Null);
+    if !unanswered.is_empty() {
+        details["unanswered"] = json!(unanswered);
+    }
+    build_tool_result(text, details)
 }
 
 #[cfg(test)]
@@ -204,11 +252,12 @@ mod tests {
         assert_eq!(
             value["content"][0]["text"],
             json!(
-                "User has answered your questions: \"Q1?\"=\"A\". You can now continue with the user's answers in mind."
+                "User has answered your questions: \"Q1?\"=\"A\". unanswered: \"Q2?\". You can now continue with the user's answers in mind."
             )
         );
         assert_eq!(value["details"]["cancelled"], json!(false));
         assert_eq!(value["details"]["answers"][0]["kind"], json!("option"));
+        assert_eq!(value["details"]["unanswered"], json!([1]));
 
         // Cancelled / absent / no segments -> canonical decline.
         for result in [
@@ -243,7 +292,7 @@ mod tests {
         assert_eq!(
             value["content"][0]["text"],
             json!(format!(
-                "{ENVELOPE_PREFIX} global note: hello\nworld. {ENVELOPE_SUFFIX}"
+                "{ENVELOPE_PREFIX} unanswered: \"Q1?\", \"Q2?\". global note: hello\nworld. {ENVELOPE_SUFFIX}"
             ))
         );
 
@@ -304,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_partial_submission_skips_unanswered_questions() {
+    fn envelope_partial_submission_names_unanswered_questions() {
         let params = params(&[("Q1?", false), ("Q2?", false)]);
         let result = QuestionnaireResult {
             answers: vec![option_answer(1, "Q2?", Some("B"))],
@@ -316,8 +365,51 @@ mod tests {
         assert_eq!(
             value["content"][0]["text"],
             json!(
-                "User has answered your questions: \"Q2?\"=\"B\". You can now continue with the user's answers in mind."
+                "User has answered your questions: \"Q2?\"=\"B\". unanswered: \"Q1?\". You can now continue with the user's answers in mind."
             )
+        );
+        assert_eq!(value["details"]["unanswered"], json!([0]));
+        // A fully answered result stays byte-identical: no `unanswered` key.
+        let full = QuestionnaireResult {
+            answers: vec![
+                option_answer(0, "Q1?", Some("A")),
+                option_answer(1, "Q2?", Some("B")),
+            ],
+            cancelled: false,
+            global_note: None,
+            error: None,
+        };
+        let value = build_questionnaire_response(Some(&full), &params);
+        assert_eq!(
+            value["content"][0]["text"],
+            json!(
+                "User has answered your questions: \"Q1?\"=\"A\". \"Q2?\"=\"B\". You can now continue with the user's answers in mind."
+            )
+        );
+        assert!(value["details"].get("unanswered").is_none());
+    }
+
+    /// v2.13.6 (#188): a multi answer renders the checked labels and the
+    /// custom text, joined with `, `.
+    #[test]
+    fn multi_answer_scalar_includes_custom_text() {
+        let mut answer = option_answer(0, "Q1?", None);
+        answer.kind = AnswerKind::Multi;
+        answer.selected = Some(vec!["A".to_owned()]);
+        answer.answer = Some("custom text".to_owned());
+        assert_eq!(
+            format_answer_scalar(&answer, FormatAnswerVariant::Envelope),
+            "A, custom text"
+        );
+        answer.selected = Some(vec![]);
+        assert_eq!(
+            format_answer_scalar(&answer, FormatAnswerVariant::Envelope),
+            "custom text"
+        );
+        answer.answer = None;
+        assert_eq!(
+            format_answer_scalar(&answer, FormatAnswerVariant::Envelope),
+            NO_INPUT_PLACEHOLDER
         );
     }
 }

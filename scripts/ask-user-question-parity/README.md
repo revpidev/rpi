@@ -1,8 +1,7 @@
 # ask-user-question parity harness (TE28/TE29 G3/G12)
 
 Drives the **pinned upstream pure-function modules** (`juicesharp/rpiv-mono` →
-`packages/rpiv-ask-user-question/` @ `0fdf4f8` = v2.10.1+1 (the `338b264..0fdf4f8` span is comment-level for the driven modules — TE41 FR-F), the #192
-line-terminator fix) against the Rust port in `crates/rpi-ext-ask-user-question`
+`packages/rpiv-ask-user-question/` @ `afc21bc2` = v2.13.8 (the TE48 rebase commit; prior pin `0fdf4f8` = v2.10.1+1) against the Rust port in `crates/rpi-ext-ask-user-question`
 and diffs the two legs case by case. **Non-zero exit = any difference.**
 
 ```bash
@@ -40,7 +39,7 @@ file, so running the upstream modules **in place** would require writing a
 driven modules into `$RPI_ASKQ_PARITY_DEPS/snapshot/` (fresh every run) and
 records each file's sha256 in the report. The deps dir carries `tsx` + the
 `typebox` version from the upstream `package-lock.json` (1.3.6). The submodule
-HEAD is asserted against `0fdf4f813980d380e826b84d1280a4960e5d088e`.
+HEAD is asserted against `afc21bc25f7d07cae9fb3103dc309240a16b9f49`.
 
 Driven modules: `tool/{types,normalize-params,validate-questionnaire,response-envelope,format-answer}.ts`,
 `state/{row-intent,i18n-bridge,state-reducer,key-router}.ts` + `rpc-fallback.ts` (type-only imports into

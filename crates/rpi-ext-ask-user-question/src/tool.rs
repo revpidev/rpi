@@ -142,10 +142,13 @@ fn invalid_params_result(error: &serde_json::Error) -> Value {
 /// Execute the tool against a host (`execute`). Returns the tool result JSON
 /// (`{content, details, isError?}`).
 pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
-    // Line-terminator normalization runs once here, ahead of validation, so
-    // every downstream consumer — validator, TUI, RPC walker, envelope,
-    // prompt event — sees the same clean text (#192).
-    let typed: QuestionParams = match serde_json::from_value(params.clone()) {
+    // Pi's `prepareArguments` hook (#244) runs before schema validation:
+    // JSON-encoded `questions`/elements/`options` are decoded when they parse
+    // to the expected shape. Then line-terminator normalization runs (#192),
+    // so every downstream consumer — validator, TUI, RPC walker, envelope,
+    // prompt event — sees the same clean text.
+    let prepared = crate::tool::normalize::prepare_question_arguments(params.clone());
+    let typed: QuestionParams = match serde_json::from_value(prepared) {
         Ok(typed) => typed,
         Err(error) => return invalid_params_result(&error),
     };
@@ -731,12 +734,10 @@ mod tests {
             "no walker on the component path"
         );
         assert!(!methods.contains(&"ui.custom"));
-        // Mount options: bottom-center overlay, tickMs 0, cursor on.
-        assert_eq!(calls[4].1["options"]["overlay"], json!(true));
-        assert_eq!(
-            calls[4].1["options"]["overlayOptions"]["anchor"],
-            json!("bottom-center")
-        );
+        // Mount options: inline editor-slot presentation (v2.13.0, #253),
+        // tickMs 0, cursor on.
+        assert_eq!(calls[4].1["options"]["overlay"], json!(false));
+        assert!(calls[4].1["options"].get("overlayOptions").is_none());
         assert_eq!(calls[4].1["options"]["tickMs"], json!(0));
         assert_eq!(calls[4].1["options"]["cursor"], json!(true));
         assert_eq!(calls[4].1["options"]["keysWhenHidden"], json!(["ctrl+]"]));

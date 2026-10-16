@@ -17,12 +17,12 @@ pub mod types;
 
 use crate::config;
 use crate::i18n::I18n;
-use crate::state::reducer::apply_task_mutation;
+use crate::state::reducer::{apply_task_mutation, changes_state};
 use crate::state::selectors;
 use crate::state::store;
 use crate::tool::types::{
-    COMMAND_NAME, DEFAULT_PROMPT_SNIPPET, DEFAULT_TOOL_DESCRIPTION, TOOL_LABEL, TOOL_NAME,
-    TaskAction, todo_params_schema,
+    COMMAND_NAME, DEFAULT_PROMPT_SNIPPET, DEFAULT_TOOL_DESCRIPTION, STATE_ENTRY_TYPE, TOOL_LABEL,
+    TOOL_NAME, TaskAction, todo_params_schema,
 };
 
 /// Build the `registerTool` payload (upstream `registerTodoTool`): the
@@ -93,7 +93,22 @@ pub fn execute(host: &dyn crate::HostCall, params: &Value) -> Value {
 
     let result = apply_task_mutation(store::store().state_for(&sid), action, map);
     store::store().commit_state(&sid, result.state.clone());
-    envelope::build_tool_result(action, params, &result.state, &result.op)
+    let tool_result = envelope::build_tool_result(action, params, &result.state, &result.op);
+    // #290 (v2.13.5): every state-changing call also saves its snapshot as a
+    // custom entry on the calling session's branch. A call reached through
+    // another tool (`ctx.executeTool`, e.g. codemode) never lands as a
+    // standalone `toolResult`, so its `details` alone would not survive
+    // replay. Best-effort: a rejected append leaves the tool result intact.
+    if changes_state(&result.op)
+        && let Some(details) = tool_result.get("details")
+        && let Err(error) = host.call(
+            "appendEntry",
+            json!({ "customType": STATE_ENTRY_TYPE, "data": details }),
+        )
+    {
+        tracing::warn!(%error, "rpi-todo: appendEntry(rpiv-todo-state) rejected");
+    }
+    tool_result
 }
 
 // ---------------------------------------------------------------------------
