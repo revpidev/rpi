@@ -7,8 +7,8 @@
 //! (found installing all three rpi plugins together). The per-path loader
 //! in `native::load_native_plugin` fixed it; this test pins it.
 //!
-//! Packaging mirrors l0_load.rs: copies each cdylib from target/debug into
-//! a throwaway package dir with its crate manifest. The cdylibs are built
+//! Packaging follows the `l0_load.rs` pattern used by the plugin crates:
+//! copies each cdylib from target/debug into a throwaway package dir with its crate manifest. The cdylibs are built
 //! by `cargo build` (G1) before the test gate (G2); a missing artifact is
 //! a hard failure, never a silent skip (TE49 FR-A: no skip path).
 //!
@@ -85,6 +85,7 @@ async fn each_native_plugin_gets_its_own_module_table() {
         "RPI_SUBAGENT_MAX_DEPTH",
         "RPI_SUBAGENT_CHILD_AGENT",
         "RPI_SUBAGENT_CHILD_INDEX",
+        "RPI_SUBAGENT_WAIT_TOOL_ENABLED",
     ] {
         rpi_test_env::remove_var(name);
     }
