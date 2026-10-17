@@ -5,6 +5,8 @@ Contract (host framework, V16-05 §7.2):
 - stdin:  {"provider", "baseUrl"?, "apiKeyEnv"?, "model"?}
 - stdout: the schemaVersion=1 usage envelope (single JSON object)
 - errors: a message on stderr + non-zero exit (the host degrades silently)
+- displayText (TE50): compact balance "<currency> <total>" entries joined by
+  " / ", no provider prefix
 
 Endpoint (public docs): GET https://api.deepseek.com/user/balance with
 `Authorization: Bearer <key>`; response:
@@ -209,7 +211,7 @@ def main():
         return 1
 
     available = data.get("is_available")
-    display = f"{PROVIDER}: " + " · ".join(labels)
+    display = " / ".join(labels)
     if available is False:
         display += " (unavailable)"
 

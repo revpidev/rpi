@@ -5,6 +5,9 @@ Contract (host framework, V16-05 §7.2):
 - stdin:  {"provider", "baseUrl"?, "apiKeyEnv"?, "model"?}
 - stdout: the schemaVersion=1 usage envelope (single JSON object)
 - errors: a message on stderr + non-zero exit (the host degrades silently)
+- displayText (TE50): compact windows "<label> <pct>%(~<reset-in>)" joined
+  by " / ", no provider prefix; RPI_USAGE_NOW_MS overrides the fetch-time
+  clock for the contract tests only (unset in production)
 
 Endpoint (pinned from the TE44 live capture, 2026-10-05):
 - international: GET https://api.minimax.io/v1/token_plan/remains
@@ -154,13 +157,45 @@ def remains_url(base, source):
     return (CN_BASE if "cn" in (source or "").lower() else INTL_BASE) + REMAINS_PATH
 
 
-def iso_reset(value):
+def epoch_seconds(value):
+    """Epoch seconds from a milliseconds (>1e11) or seconds timestamp."""
     if not isinstance(value, (int, float)):
         return None
-    seconds = value / 1000.0 if value > 1e11 else float(value)
+    return value / 1000.0 if value > 1e11 else float(value)
+
+
+def iso_reset(value):
+    seconds = epoch_seconds(value)
+    if seconds is None:
+        return None
     return datetime.datetime.fromtimestamp(
         seconds, tz=datetime.timezone.utc
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def now_epoch():
+    """Fetch-time clock; the contract tests pin RPI_USAGE_NOW_MS."""
+    raw = os.environ.get("RPI_USAGE_NOW_MS")
+    if raw:
+        try:
+            return int(raw) / 1000.0
+        except ValueError:
+            pass
+    return datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+
+def countdown_annotation(reset_epoch, now):
+    """TE50 R17.2: "(~<reset-in>)" at fetch time, at most two units."""
+    if reset_epoch is None:
+        return ""
+    delta = reset_epoch - now
+    if delta >= 86400:
+        days, hours = int(delta // 86400), int(delta % 86400 // 3600)
+        return f"(~{days}d{hours}h)" if hours else f"(~{days}d)"
+    if delta >= 3600:
+        hours, minutes = int(delta // 3600), int(delta % 3600 // 60)
+        return f"(~{hours}h{minutes}m)" if minutes else f"(~{hours}h)"
+    return f"(~{max(1, int(delta // 60))}m)"
 
 
 def window(bucket, prefix):
@@ -257,9 +292,26 @@ def main():
     weekly_pct, weekly_unlimited = window(bucket, "weekly")
     label = interval_label(bucket)
 
-    interval_text = "unlimited" if interval_unlimited else f"{fmt(interval_pct)}% used"
-    weekly_text = "unlimited" if weekly_unlimited else f"{fmt(weekly_pct)}% used"
-    display = f"{PROVIDER}: {label} {interval_text} · 7d {weekly_text}"
+    now = now_epoch()
+    parts = []
+    if interval_unlimited:
+        parts.append(f"{label} unlimited")
+    elif interval_pct is not None:
+        parts.append(
+            f"{label} {fmt(interval_pct)}%"
+            + countdown_annotation(epoch_seconds(bucket.get("end_time")), now)
+        )
+    if weekly_unlimited:
+        parts.append("7d unlimited")
+    elif weekly_pct is not None:
+        parts.append(
+            f"7d {fmt(weekly_pct)}%"
+            + countdown_annotation(epoch_seconds(bucket.get("weekly_end_time")), now)
+        )
+    if not parts:
+        print(f"{PROVIDER}: response carries no recognized windows", file=sys.stderr)
+        return 1
+    display = " / ".join(parts)
 
     envelope = {
         "schemaVersion": 1,

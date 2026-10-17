@@ -5,6 +5,9 @@ Contract (host framework, V16-05 §7.2):
 - stdin:  {"provider", "baseUrl"?, "apiKeyEnv"?, "model"?}
 - stdout: the schemaVersion=1 usage envelope (single JSON object)
 - errors: a message on stderr + non-zero exit (the host degrades silently)
+- displayText (TE50): compact windows "<label> <pct>%(~<reset-in>)" joined
+  by " / ", no provider prefix; RPI_USAGE_NOW_MS overrides the fetch-time
+  clock for the contract tests only (unset in production)
 
 Endpoint (pinned from the TE44 live capture, 2026-10-05):
   GET https://api.kimi.com/coding/v1/usages
@@ -33,6 +36,7 @@ Tests: crates/rpi-ext-usage/tests/scripts_contract.rs drives this script
 against a local stub HTTP server with recorded fixtures (no network).
 """
 
+import datetime
 import json
 import os
 import ssl
@@ -218,6 +222,45 @@ def fmt(value):
     return f"{value:.0f}" if abs(value - round(value)) < 0.05 else f"{value:.1f}"
 
 
+def iso_epoch(value):
+    """Epoch seconds from an ISO-8601 reset timestamp (TE50)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+def now_epoch():
+    """Fetch-time clock; the contract tests pin RPI_USAGE_NOW_MS."""
+    raw = os.environ.get("RPI_USAGE_NOW_MS")
+    if raw:
+        try:
+            return int(raw) / 1000.0
+        except ValueError:
+            pass
+    return datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+
+def countdown_annotation(reset_epoch, now):
+    """TE50 R17.2: "(~<reset-in>)" at fetch time, at most two units."""
+    if reset_epoch is None:
+        return ""
+    delta = reset_epoch - now
+    if delta >= 86400:
+        days, hours = int(delta // 86400), int(delta % 86400 // 3600)
+        return f"(~{days}d{hours}h)" if hours else f"(~{days}d)"
+    if delta >= 3600:
+        hours, minutes = int(delta // 3600), int(delta % 3600 // 60)
+        return f"(~{hours}h{minutes}m)" if minutes else f"(~{hours}h)"
+    return f"(~{max(1, int(delta // 60))}m)"
+
+
 def main():
     context = read_context()
     key, _source = resolve_key(context)
@@ -262,33 +305,37 @@ def main():
     usages = data.get("usages") if isinstance(data.get("usages"), dict) else {}
     weekly_detail = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     weekly_pct = count_percent(weekly_detail)
+    weekly_reset = iso_epoch(weekly_detail.get("resetTime"))
+    limit_7d = usages.get("limit_7d") if isinstance(usages.get("limit_7d"), dict) else {}
     if weekly_pct is None:
-        limit_7d = usages.get("limit_7d")
-        weekly_pct = ratio(
-            limit_7d.get("used_ratio") if isinstance(limit_7d, dict) else None
-        )
+        weekly_pct = ratio(limit_7d.get("used_ratio"))
+    if weekly_reset is None:
+        weekly_reset = iso_epoch(limit_7d.get("reset_time"))
 
     limits = data.get("limits") if isinstance(data.get("limits"), list) else []
     first = limits[0] if limits and isinstance(limits[0], dict) else {}
     five_label = window_label(first.get("window"))
     five_detail = first.get("detail") if isinstance(first.get("detail"), dict) else {}
     five_pct = count_percent(five_detail)
+    five_reset = iso_epoch(five_detail.get("resetTime"))
+    limit_5h = usages.get("limit_5h") if isinstance(usages.get("limit_5h"), dict) else {}
     if five_pct is None:
-        limit_5h = usages.get("limit_5h")
-        five_pct = ratio(
-            limit_5h.get("used_ratio") if isinstance(limit_5h, dict) else None
-        )
+        five_pct = ratio(limit_5h.get("used_ratio"))
+    if five_reset is None:
+        five_reset = iso_epoch(limit_5h.get("reset_time"))
 
-    if five_pct is None and weekly_pct is None:
-        print(f"{PROVIDER}: response carries no recognized windows", file=sys.stderr)
-        return 1
-
+    now = now_epoch()
     parts = []
     if five_pct is not None:
-        parts.append(f"{five_label} {fmt(five_pct)}% used")
+        parts.append(
+            f"{five_label} {fmt(five_pct)}%" + countdown_annotation(five_reset, now)
+        )
     if weekly_pct is not None:
-        parts.append(f"7d {fmt(weekly_pct)}% used")
-    display = f"{PROVIDER}: " + " · ".join(parts)
+        parts.append(f"7d {fmt(weekly_pct)}%" + countdown_annotation(weekly_reset, now))
+    if not parts:
+        print(f"{PROVIDER}: response carries no recognized windows", file=sys.stderr)
+        return 1
+    display = " / ".join(parts)
 
     envelope = {
         "schemaVersion": 1,
