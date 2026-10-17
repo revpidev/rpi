@@ -982,21 +982,19 @@ mod tests {
     /// TE44 FR-D/G14: the `rpi-usage` entry coexists with the statusline
     /// plugin's `status` entry on the same extension row; removing one leaves
     /// the other untouched (`usage.footer=false` clears only its own key).
-    /// New frame — the existing frames are unchanged.
+    /// TE50 re-record: the built-in scripts now emit the compact display form
+    /// (no provider prefix), which the host passes through unchanged.
     #[tokio::test]
     async fn usage_status_coexists_with_the_statusline_entry() {
         let harness = crate::modes::interactive::test_support::build_test_session().await;
         let footer_data = Arc::new(FooterDataProvider::new(&harness.cwd));
-        footer_data.set_extension_status("rpi-usage", "deepseek: CNY 9.99");
+        footer_data.set_extension_status("rpi-usage", "CNY 9.99");
         footer_data.set_extension_status("status", "repo:main");
         let footer = FooterComponent::new(harness.session.clone(), footer_data.clone(), theme());
         let lines = footer.render(80);
         assert_eq!(lines.len(), 3);
         let status_line = strip_ansi(&lines[2]);
-        assert_eq!(
-            status_line, "deepseek: CNY 9.99 repo:main",
-            "status: {status_line}"
-        );
+        assert_eq!(status_line, "CNY 9.99 repo:main", "status: {status_line}");
         // Cleared independently: the statusline entry survives.
         footer_data.remove_extension_status("rpi-usage");
         let lines = footer.render(80);
