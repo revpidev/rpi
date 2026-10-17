@@ -119,11 +119,11 @@ mod tests {
             "quota": {"used": 12.5, "total": 30, "remaining": 17.5, "unit": "%"},
             "used": 12.5,
             "resetAt": "2026-10-08T00:00:00Z",
-            "displayText": "deepseek: CNY 12.50"
+            "displayText": "CNY 12.50"
         });
         assert_eq!(
             format_envelope(&envelope),
-            "deepseek: CNY 12.50\n\
+            "CNY 12.50\n\
              plan: Coding Plan\n\
              balance: CNY 12.5 (granted 10, topped up 2.5)\n\
              balance: USD 3\n\

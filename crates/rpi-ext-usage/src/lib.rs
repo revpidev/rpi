@@ -499,14 +499,14 @@ mod tests {
         host.set_providers(vec!["deepseek".to_owned()]);
         host.set_envelope(
             "deepseek",
-            json!({"schemaVersion": 1, "provider": "deepseek", "displayText": "deepseek: CNY 1"}),
+            json!({"schemaVersion": 1, "provider": "deepseek", "displayText": "CNY 1"}),
         );
         dispatch_for_test(
             &host,
             None,
             &json!({"kind": "command", "name": "usage", "args": "deepseek"}),
         );
-        assert_eq!(host.notifications(), vec!["deepseek: CNY 1".to_owned()]);
+        assert_eq!(host.notifications(), vec!["CNY 1".to_owned()]);
     }
 
     #[test]

@@ -336,8 +336,8 @@ struct Fixture {
     _sandbox: Sandbox,
 }
 
-const DEEPSEEK_ENVELOPE: &str = r#"printf '%s' '{"schemaVersion":1,"provider":"deepseek","displayText":"deepseek: CNY 9.99","balance":[{"currency":"CNY","total":9.99}]}'"#;
-const GLM_ENVELOPE: &str = r#"printf '%s' '{"schemaVersion":1,"provider":"glm-coding-plan","plan":"pro","displayText":"glm-coding-plan: 5h 22% used","quota":{"used":22,"total":100,"unit":"%"},"resetAt":"2026-10-08T00:00:00Z"}'"#;
+const DEEPSEEK_ENVELOPE: &str = r#"printf '%s' '{"schemaVersion":1,"provider":"deepseek","displayText":"CNY 9.99","balance":[{"currency":"CNY","total":9.99}]}'"#;
+const GLM_ENVELOPE: &str = r#"printf '%s' '{"schemaVersion":1,"provider":"glm-coding-plan","plan":"pro","displayText":"5h 22%(~48m)","quota":{"used":22,"total":100,"unit":"%"},"resetAt":"2026-10-08T00:00:00Z"}'"#;
 
 async fn build_model_runtime(
     agent_dir: &Path,
@@ -499,7 +499,7 @@ async fn usage_command_reports_the_current_provider_and_updates_the_footer() {
                 .bridge
                 .notifications()
                 .iter()
-                .any(|message| message.contains("deepseek: CNY 9.99"))
+                .any(|message| message.contains("CNY 9.99"))
         })
         .await,
         "command report: {:?}",
@@ -509,12 +509,12 @@ async fn usage_command_reports_the_current_provider_and_updates_the_footer() {
         .bridge
         .notifications()
         .into_iter()
-        .find(|message| message.contains("deepseek: CNY 9.99"))
+        .find(|message| message.contains("CNY 9.99"))
         .expect("report");
     assert!(report.contains("balance: CNY 9.99"), "{report}");
     assert!(
         wait_until(Duration::from_secs(5), || {
-            fixture.bridge.last_status("rpi-usage") == Some(Some("deepseek: CNY 9.99".to_owned()))
+            fixture.bridge.last_status("rpi-usage") == Some(Some("CNY 9.99".to_owned()))
         })
         .await,
         "footer status: {:?}",
@@ -568,8 +568,8 @@ async fn usage_all_isolates_a_failing_provider() {
         .into_iter()
         .find(|message| message.contains("no data: kimi-code"))
         .expect("report");
-    assert!(report.contains("deepseek: CNY 9.99"), "{report}");
-    assert!(report.contains("glm-coding-plan: 5h 22% used"), "{report}");
+    assert!(report.contains("CNY 9.99"), "{report}");
+    assert!(report.contains("5h 22%(~48m)"), "{report}");
     assert!(report.contains("plan: pro"), "{report}");
 }
 
@@ -610,7 +610,7 @@ async fn provider_failure_without_a_success_reports_no_data_and_success_is_retai
     run_usage(&fixture, "deepseek").await;
     assert!(
         wait_until(Duration::from_secs(5), || {
-            fixture.bridge.last_status("rpi-usage") == Some(Some("deepseek: CNY 9.99".to_owned()))
+            fixture.bridge.last_status("rpi-usage") == Some(Some("CNY 9.99".to_owned()))
         })
         .await,
         "status: {:?}",
@@ -628,7 +628,7 @@ async fn provider_failure_without_a_success_reports_no_data_and_success_is_retai
                 .bridge
                 .notifications()
                 .iter()
-                .filter(|message| message.contains("deepseek: CNY 9.99"))
+                .filter(|message| message.contains("CNY 9.99"))
                 .count()
                 >= 2
         })
@@ -638,12 +638,12 @@ async fn provider_failure_without_a_success_reports_no_data_and_success_is_retai
     );
     assert_eq!(
         fixture.bridge.status_writes("rpi-usage"),
-        vec![Some("deepseek: CNY 9.99".to_owned())],
+        vec![Some("CNY 9.99".to_owned())],
         "no flicker write on failure"
     );
     assert_eq!(
         fixture.bridge.last_status("rpi-usage"),
-        Some(Some("deepseek: CNY 9.99".to_owned()))
+        Some(Some("CNY 9.99".to_owned()))
     );
 }
 
@@ -687,7 +687,7 @@ async fn statusline_entry_coexists_and_the_plugin_writes_its_own_key_only() {
         .await;
     assert!(
         wait_until(Duration::from_secs(5), || {
-            fixture.bridge.last_status("rpi-usage") == Some(Some("deepseek: CNY 9.99".to_owned()))
+            fixture.bridge.last_status("rpi-usage") == Some(Some("CNY 9.99".to_owned()))
                 && fixture.bridge.last_status("status") == Some(Some("repo:main".to_owned()))
         })
         .await,
@@ -705,7 +705,7 @@ async fn statusline_entry_coexists_and_the_plugin_writes_its_own_key_only() {
             .bridge
             .status_writes("rpi-usage")
             .iter()
-            .all(|text| text.as_deref() == Some("deepseek: CNY 9.99")),
+            .all(|text| text.as_deref() == Some("CNY 9.99")),
         "{:?}",
         fixture.bridge.statuses()
     );

@@ -336,25 +336,19 @@ mod tests {
 
     #[test]
     fn refresh_publishes_and_keeps_the_line_on_failure() {
-        let host = host_with(
-            "zai",
-            envelope("glm-coding-plan", "glm-coding-plan: 5h 1% used"),
-        );
+        let host = host_with("zai", envelope("glm-coding-plan", "5h 1%"));
         let mut state = FooterState::default();
         let now = Instant::now();
         assert_eq!(
             refresh(&host, &config(), &mut state, false, false, now),
             RefreshOutcome::Updated {
                 provider: "glm-coding-plan".to_owned(),
-                text: "glm-coding-plan: 5h 1% used".to_owned(),
+                text: "5h 1%".to_owned(),
             }
         );
         assert_eq!(
             host.statuses(),
-            vec![(
-                "rpi-usage".to_owned(),
-                Some("glm-coding-plan: 5h 1% used".to_owned())
-            )]
+            vec![("rpi-usage".to_owned(), Some("5h 1%".to_owned()))]
         );
         // Failure for the same provider: the previous line stays (no second
         // status write).
@@ -370,7 +364,7 @@ mod tests {
 
     #[test]
     fn failure_without_a_previous_success_clears_and_provider_switch_clears() {
-        let host = host_with("deepseek", envelope("deepseek", "deepseek: CNY 1"));
+        let host = host_with("deepseek", envelope("deepseek", "CNY 1"));
         host.fail_fetch("deepseek");
         let mut state = FooterState::default();
         assert_eq!(
@@ -379,7 +373,7 @@ mod tests {
         );
         // A successful line, then a model switch to an unsupported provider
         // removes it (stale data from another provider must not remain).
-        let host = host_with("deepseek", envelope("deepseek", "deepseek: CNY 1"));
+        let host = host_with("deepseek", envelope("deepseek", "CNY 1"));
         let mut state = FooterState::default();
         refresh(&host, &config(), &mut state, false, false, Instant::now());
         host.set_model(json!({"id": "m", "provider": "dgx-spark"}));
@@ -395,7 +389,7 @@ mod tests {
 
     #[test]
     fn throttle_disabled_and_no_ui_paths_skip_fetches() {
-        let host = host_with("deepseek", envelope("deepseek", "deepseek: CNY 1"));
+        let host = host_with("deepseek", envelope("deepseek", "CNY 1"));
         let mut state = FooterState::default();
         let now = Instant::now();
         refresh(&host, &config(), &mut state, false, false, now);
@@ -423,7 +417,7 @@ mod tests {
             refresh(&host, &disabled, &mut state, false, false, Instant::now()),
             RefreshOutcome::Cleared
         );
-        let no_ui = host_with("deepseek", envelope("deepseek", "deepseek: CNY 1"));
+        let no_ui = host_with("deepseek", envelope("deepseek", "CNY 1"));
         no_ui.set_has_ui(false);
         let mut state = FooterState::default();
         assert_eq!(

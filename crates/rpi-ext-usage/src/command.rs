@@ -178,12 +178,12 @@ mod tests {
                 "schemaVersion": 1,
                 "provider": "glm-coding-plan",
                 "plan": "max",
-                "displayText": "glm-coding-plan: 5h 1% used",
+                "displayText": "5h 1%",
                 "quota": {"used": 1, "total": 100, "unit": "%"}
             }),
         );
         let (message, state) = handle(&host, "");
-        assert!(message.contains("glm-coding-plan: 5h 1% used"), "{message}");
+        assert!(message.contains("5h 1%"), "{message}");
         assert!(message.contains("plan: max"), "{message}");
         assert!(message.contains("quota: used 1 total 100 %"), "{message}");
         assert_eq!(
@@ -195,10 +195,7 @@ mod tests {
         // The trailing footer refresh re-reads the (fresh) cache.
         assert_eq!(
             host.statuses().last(),
-            Some(&(
-                "rpi-usage".to_owned(),
-                Some("glm-coding-plan: 5h 1% used".to_owned())
-            ))
+            Some(&("rpi-usage".to_owned(), Some("5h 1%".to_owned())))
         );
     }
 
@@ -224,9 +221,9 @@ mod tests {
     fn explicit_provider_and_unknown_provider_paths() {
         let host = UsageFakeHost::new();
         host.set_providers(vec!["deepseek".to_owned()]);
-        host.set_envelope("deepseek", envelope("deepseek", "deepseek: CNY 1"));
+        host.set_envelope("deepseek", envelope("deepseek", "CNY 1"));
         let (message, _) = handle(&host, "deepseek");
-        assert_eq!(message, "deepseek: CNY 1");
+        assert_eq!(message, "CNY 1");
         let (message, _) = handle(&host, "nope");
         assert!(message.contains("no script matches `nope`"), "{message}");
         let (message, _) = handle(&host, "a b");
@@ -237,10 +234,10 @@ mod tests {
     fn all_queries_every_provider_and_isolates_failures() {
         let host = UsageFakeHost::new();
         host.set_providers(vec!["deepseek".to_owned(), "kimi-code".to_owned()]);
-        host.set_envelope("deepseek", envelope("deepseek", "deepseek: CNY 1"));
+        host.set_envelope("deepseek", envelope("deepseek", "CNY 1"));
         host.fail_fetch("kimi-code");
         let (message, _) = handle(&host, "all");
-        assert!(message.contains("deepseek: CNY 1"), "{message}");
+        assert!(message.contains("CNY 1"), "{message}");
         assert!(
             message.contains("no data: kimi-code (script failed or no API key)"),
             "{message}"
@@ -263,7 +260,7 @@ mod tests {
         host.set_providers(vec!["deepseek".to_owned()]);
         let mut state = FooterState {
             provider: Some("deepseek".to_owned()),
-            text: Some("deepseek: CNY 1".to_owned()),
+            text: Some("CNY 1".to_owned()),
             last_fetch: None,
         };
         handle_now(&host, &disabled, &mut state, "", Instant::now());
