@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.7] - 2026-10-17
+
+### Main line
+
+- **Upstream parity to v1.1.0** (V17-00…V17-16, ADR-0036): the behavioral gold standard moves from v1.0.0 (`a13d35a74`) to `abe508e1b` (v1.1.0; the v1.0.1–v1.1.0 windows folded in — the Azure Foundry provider face, codemode hardening, the built-in MCP OAuth family, the CLI/tool-selection governance, the TUI fix family, and the OpenAI Decisions classifier). Per-domain summaries live in `changes/v0.1.7.md` (the release changelog single source of truth); key user-observable surfaces:
+  - **Providers, auth & catalog**: **[BREAKING]** the Azure provider id is now `azure` (from `azure-openai-responses`; the api id and the `AZURE_OPENAI_*` environment variables are unchanged) with a diagnostic-only migration face — old keys are reported with their file and key position, never rewritten or aliased; Azure Foundry Chat Completions deployments alongside the Responses API; the OpenAI Decisions classifier (`openai/gpt-6-luna`, structured `choice`/`score`/`bool` questions, optional images); `samplingParamsByThinkingLevel`; Anthropic inline tools; and the Bedrock / Cloudflare / Radius / Codex fix family plus retried `server_busy` / "at capacity" / HTTP-2 pending-stream failures.
+  - **Tools & CLI**: **[BREAKING]** `--tools` accepts `*` patterns and `+name`/`-name` adjustments and **keeps MCP tools unless one of its entries starts with `mcp__`** (use `--no-mcp` or `--exclude-tools 'mcp__*'` to drop them); `--models` empty entries no longer match every model; context estimates use 3.5 characters per token.
+  - **Extension API (additive)**: `pi.registerToolRenderer()` (including an MCP resolver for resumed sessions), render-context `durationMs`/`outputPad`, `tool_execution_end.durationMs`, `agent_settled.aborted`, and `ToolLoadout.getPromptGuidelines()`; `rpiAbi` stays `1`, the event table is unchanged, and the version-level ABI bump is recorded in `extension-abi.md` §8.4.
+  - **TUI**: program status over OSC 7501 (with `RPI_PROGRAM_STATUS`); `outputPad` applies to every transcript block; **[BREAKING] Home/End belong to the editor, `Ctrl+Home`/`Ctrl+End` to the transcript**; the Kitty / WezTerm / Herdr / Termux fix family and the fullscreen selection reset.
+  - **Codemode & MCP**: frozen built-ins with 16M-character / 100000-item output limits, saved `image()` output files and async lookup helpers; project `mcp.json` overrides, CIMD, cancellable sign-ins with 15-second request timeouts, and the `/mcp` manager that stays responsive while servers connect.
+- **Issue line #57–#71** (V17-07…V17-11): fifteen fixes — cache-miss notices and the startup changelog notice, `markdown.codeBlockIndent`, the Anthropic subscription warning; `/tree` branch summarization and labels, the interactive command-surface gaps, the session-picker deletion chain; live settings toggles and the autocomplete gaps (git scope, conflict diagnostics, `/login` completions, `fd`); the tmux keyboard check, the clipboard paste chain and the platform native helpers; `flushCompactionQueue` `willRetry`, the ADR-0007 extension-API gaps, and the diagnostics/theme fix family.
+- **Durable stack** (`rpi-durable`, experimental; V17-13…V17-15): the storage stack (an async SQLite facade, Memory/JSONL/SQLite backends, and the ported 24-case conformance suite), the runtime core (transactions, forks, documents, per-conversation agents, submissions/scheduler/task graph) and the tool chain (the local execution environment plus `read`/`write`/`edit`/`bash`/`powershell`) land as a new workspace crate. It is off the default CLI path (`crates/rpi` does not depend on it; no command or host session code is touched), and **the API changes without notice between releases**.
+
+### Plugin line (seven-plugin lockstep)
+
+- **Rebased**: `rpi-subagents` → pi-subagents v0.76.1 (TE48 — child boundary instructions follow Pi's base prompt, partial child output on timeout/error, atomic settings writes with a cross-session lease, multiline agent descriptions); `rpi-ask-user-question` / `rpi-todo` → rpiv-mono v2.13.8 (TE48 — inline questionnaire, typed RPC replies with `unanswered`, multi-select custom text, saved notes, and `todo` snapshots persisted through codemode).
+- **Usage footer**: the built-in `rpi-usage` scripts render compact quota windows (`5h 39%(~48m) / 7d 31%(~3d22h)`) without the provider prefix; `/usage` repeats the same first line and keeps its detail.
+- **Removed (BREAKING, ADR-0037)**: `rpi-mcp-adapter` — `rpi install rpi-mcp-adapter` now fails with a registry 404 and its update chain is gone; already-installed copies keep loading while startup and `rpi update` recommend `rpi remove rpi-mcp-adapter`; the supported path is the built-in `builtin:mcp` extension over the unchanged `mcp.json` layout.
+- **Distribution**: seven `.rpix` archives ride this Release (native carrier only, `minHostVersion` = the lockstep version injected at pack time).
+
+### Internal
+
+- workspace version bumped to 0.1.7-rc.1 with Cargo.lock synced (seven lockstep extensions propagate via `version.workspace`).
+- deviation D-106 promoted (clipboard reader mechanism, `[RPI-OWN]`, V17-10); the plugin-side TE-D47+ range stays reserved and unused.
+
 ## [0.1.6] - 2026-10-09
 
 ### Main line
