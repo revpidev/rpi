@@ -292,7 +292,7 @@ pub enum PromptDisposition {
 
 /// Outcome of the `prompt` preflight: whether a run starts, and what the
 /// preflight observer reports before it does.
-enum PromptOutcome {
+pub(crate) enum PromptOutcome {
     Handled,
     Queued,
     Started(Vec<AgentMessage>),
@@ -3803,7 +3803,7 @@ impl AgentSession {
     /// Boxed entry point for the recursive prompt loop: the concrete
     /// `BoxFuture` type gives the compiler a `Send` obligation to check
     /// against, which an `async fn` calling itself cannot provide.
-    fn run_agent_prompt(
+    pub(crate) fn run_agent_prompt(
         &self,
         messages: Vec<AgentMessage>,
     ) -> BoxFuture<'static, Result<(), RpiError>> {
@@ -4028,8 +4028,15 @@ impl AgentSession {
         (normalized_images, hints)
     }
 
-    /// `prompt` (agent-session.ts:1114-1265).
-    pub async fn prompt(&self, text: &str, options: PromptOptions) -> Result<(), RpiError> {
+    /// Preflight half of `prompt` (agent-session.ts:1114-1265): everything up
+    /// to and including the message batch. The caller decides when to await
+    /// [`Self::run_agent_prompt`], which lets the compaction flush queue the
+    /// remaining messages into the run that is about to start.
+    pub(crate) async fn begin_prompt(
+        &self,
+        text: &str,
+        options: PromptOptions,
+    ) -> Result<PromptOutcome, RpiError> {
         let expand_prompt_templates = options.expand_prompt_templates.unwrap_or(true);
         let mut preflight_result = options.preflight_result;
         let images = options.images;
@@ -4249,15 +4256,22 @@ impl AgentSession {
                 if let Some(preflight) = preflight_result.take() {
                     preflight(disposition);
                 }
-                match outcome {
-                    PromptOutcome::Handled | PromptOutcome::Queued => Ok(()),
-                    PromptOutcome::Started(messages) => self.run_agent_prompt(messages).await,
-                }
+                Ok(outcome)
             }
             // Errors never call the preflight observer (upstream throws
             // before `preflightResult`; the RPC layer emits the error
             // response instead).
             Err(error) => Err(error),
+        }
+    }
+
+    /// `prompt` (agent-session.ts:1114-1265): preflight followed by the agent
+    /// run. Callers that need to inject messages into the run itself use
+    /// [`Self::begin_prompt`] + [`Self::run_agent_prompt`].
+    pub async fn prompt(&self, text: &str, options: PromptOptions) -> Result<(), RpiError> {
+        match self.begin_prompt(text, options).await? {
+            PromptOutcome::Handled | PromptOutcome::Queued => Ok(()),
+            PromptOutcome::Started(messages) => self.run_agent_prompt(messages).await,
         }
     }
 

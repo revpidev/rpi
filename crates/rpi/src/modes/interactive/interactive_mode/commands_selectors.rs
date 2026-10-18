@@ -40,9 +40,9 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rpi_ai::auth::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
 use rpi_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType, LoginOptions};
@@ -54,8 +54,8 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    EditorInput, FocusableRegion, InteractiveMode, InteractiveUi, SharedChild, UiCommand,
-    child_address, install_global_keybindings, lock, remove_child_by_address,
+    ClipboardPaste, EditorInput, FocusableRegion, InteractiveMode, InteractiveUi, SharedChild,
+    UiCommand, child_address, install_global_keybindings, lock, remove_child_by_address,
 };
 use crate::core::agent_session::{
     AgentSession, BashChunkCallback, CycleDirection, ExecuteBashOptions, ExtensionBindings,
@@ -3336,60 +3336,77 @@ impl InteractiveUi {
         self.handle_paste_image_impl();
     }
 
-    /// `handleClipboardPaste` (interactive-mode.ts:3152-3192) — runs from
-    /// the drain (UiCommand::PasteImage). Each stage that finds nothing
-    /// falls through to the next; failures never bubble (upstream's
-    /// catch → `showError` is mapped to the existing `show_status` form).
+    /// `handleClipboardPaste` (interactive-mode.ts:3152-3192) — synchronous
+    /// form used by tests and direct callers. Production dispatch reads on a
+    /// background thread and applies the payload via `ClipboardPasteReady`.
     pub(crate) fn handle_paste_image_impl(&self) {
-        if let Some(file_paths) = read_clipboard_file_paths() {
-            if file_paths
-                .iter()
-                .any(|path| path.chars().any(char::is_control))
-            {
-                self.show_status(
-                    "Failed to paste from clipboard: Clipboard file path contains control characters",
-                );
-                return;
-            }
-            // `paths = isBashMode ? filePaths.map(quoteIfNeeded).join(" ")
-            // : filePaths.join("\n")` (interactive-mode.ts:3159).
-            let text = if *lock(&self.is_bash_mode) {
-                file_paths
+        self.apply_clipboard_paste(read_clipboard_paste());
+    }
+
+    /// Dispatch-side entry: read the clipboard off the TUI thread. The read
+    /// can block for seconds (PowerShell cold start, xclip selection wait), so
+    /// it must not run in the drain. The resulting payload is queued as a
+    /// normal `UiCommand`; insertion stays on the drain thread.
+    pub(crate) fn start_clipboard_paste(&self) {
+        if self.clipboard_paste_in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let queue = Arc::clone(&self.event_queue);
+        let render_handle = self.render_handle.clone();
+        let in_flight = Arc::clone(&self.clipboard_paste_in_flight);
+        std::thread::spawn(move || {
+            let paste = read_clipboard_paste();
+            lock(&queue).push_back(UiCommand::ClipboardPasteReady(paste));
+            render_handle.request_render();
+            in_flight.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Apply an already-read payload to the editor. Runs on the drain thread.
+    pub(crate) fn apply_clipboard_paste(&self, paste: ClipboardPaste) {
+        match paste {
+            ClipboardPaste::Files(file_paths) => {
+                if file_paths
                     .iter()
-                    .map(|path| super::quote_if_needed(path))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            } else {
-                file_paths.join("\n")
-            };
-            let text = self.with_cursor_spacing(&text);
-            lock(&self.editor).insert_text_at_cursor(&text);
-            self.render_handle.request_render();
-            return;
-        }
-
-        if let Some(image) = read_clipboard_image() {
-            // `extensionForImageMimeType(image.mimeType) ?? "png"`
-            // (interactive-mode.ts:3174).
-            let extension = extension_for_image_mime_type(&image.mime_type).unwrap_or("png");
-            let file_path = std::env::temp_dir()
-                .join(format!("rpi-clipboard-{}.{extension}", clipboard_uuid()));
-            if std::fs::write(&file_path, image.bytes).is_ok() {
-                lock(&self.editor).insert_text_at_cursor(&file_path.display().to_string());
-                self.render_handle.request_render();
-                return;
-            }
-            self.show_status("Failed to write clipboard image");
-            return;
-        }
-
-        match read_clipboard_text() {
-            Some(text) if !text.is_empty() => {
+                    .any(|path| path.chars().any(char::is_control))
+                {
+                    self.show_status(
+                        "Failed to paste from clipboard: Clipboard file path contains control characters",
+                    );
+                    return;
+                }
+                // `paths = isBashMode ? filePaths.map(quoteIfNeeded).join(" ")
+                // : filePaths.join("\n")` (interactive-mode.ts:3159).
+                let text = if *lock(&self.is_bash_mode) {
+                    file_paths
+                        .iter()
+                        .map(|path| super::quote_if_needed(path))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    file_paths.join("\n")
+                };
+                let text = self.with_cursor_spacing(&text);
                 lock(&self.editor).insert_text_at_cursor(&text);
                 self.render_handle.request_render();
             }
-            _ => self.show_status(
-                "Clipboard is empty or no clipboard tool found (xclip / wl-paste / pbpaste)",
+            ClipboardPaste::Image { bytes, mime_type } => {
+                // `extensionForImageMimeType(image.mimeType) ?? "png"`
+                // (interactive-mode.ts:3174).
+                let extension = extension_for_image_mime_type(&mime_type).unwrap_or("png");
+                if let Ok(file_path) = write_clipboard_image(&bytes, extension) {
+                    lock(&self.editor).insert_text_at_cursor(&file_path.display().to_string());
+                    self.render_handle.request_render();
+                } else {
+                    self.show_status("Failed to write clipboard image");
+                }
+            }
+            ClipboardPaste::Text(text) => {
+                lock(&self.editor).insert_text_at_cursor(&text);
+                self.render_handle.request_render();
+            }
+            ClipboardPaste::Empty => self.show_status(
+                "Clipboard is empty or no clipboard tool found (xclip / wl-paste / xsel / pbpaste / Get-Clipboard)",
             ),
         }
     }
@@ -3473,7 +3490,12 @@ fn run_clipboard_command_with_cap(
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (reader_tx, reader_rx) = std::sync::mpsc::channel();
+    // Detached on purpose: a command that leaves a descendant holding the
+    // pipe must not block the caller forever. The bounded receive below
+    // keeps the UI responsive; a truly stuck reader thread is abandoned
+    // rather than joined.
+    let _reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 8192];
         let mut overflow = false;
@@ -3490,7 +3512,7 @@ fn run_clipboard_command_with_cap(
                 Err(_) => break,
             }
         }
-        if overflow { None } else { Some(bytes) }
+        let _ = reader_tx.send(if overflow { None } else { Some(bytes) });
     });
 
     let deadline = Instant::now() + timeout;
@@ -3507,7 +3529,10 @@ fn run_clipboard_command_with_cap(
             }
         }
     };
-    let bytes = reader.join().unwrap_or(None);
+    let bytes = reader_rx
+        .recv_timeout(Duration::from_millis(500))
+        .ok()
+        .flatten();
     status.filter(|status| status.success()).and(bytes)
 }
 
@@ -3760,6 +3785,13 @@ end repeat
 return output
 "#;
 
+/// Windows clipboard scripts. `[Console]::Out` avoids PowerShell's table
+/// formatter (a bare `FileInfo` object would print Mode/LastWriteTime/Length/
+/// Name columns) and `-Raw` keeps the clipboard text byte-for-byte instead of
+/// letting the formatter append a newline.
+const WINDOWS_CLIPBOARD_TEXT_SCRIPT: &str = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::Out.Write((Get-Clipboard -Raw))";
+const WINDOWS_CLIPBOARD_FILE_PATHS_SCRIPT: &str = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-Clipboard -Format FileDropList | ForEach-Object { [Console]::Out.WriteLine($_.FullName) }";
+
 /// Windows file-path stage: `Get-Clipboard -Format FileDropList` (the
 /// native `getFilePaths()` equivalent).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -3768,19 +3800,31 @@ fn read_clipboard_file_paths_windows() -> Option<Vec<String>> {
         "powershell.exe",
         &[
             "-NoProfile",
+            "-NonInteractive",
             "-Command",
-            "Get-Clipboard -Format FileDropList | ForEach-Object { $_ }",
+            WINDOWS_CLIPBOARD_FILE_PATHS_SCRIPT,
         ],
         CLIPBOARD_READ_TIMEOUT,
     )?;
     let text = String::from_utf8_lossy(&bytes);
     let paths: Vec<String> = text
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty() && looks_like_windows_absolute_path(line))
+        .map(str::to_owned)
         .collect();
     if paths.is_empty() { None } else { Some(paths) }
+}
+
+/// `FileInfo.FullName` is always absolute. Filtering here keeps PowerShell
+/// headers or error text from reaching the editor if the command regresses.
+fn looks_like_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || path.starts_with("\\\\")
 }
 
 /// `readClipboardImage` (clipboard-image.ts:200-239) — the reader
@@ -3932,7 +3976,8 @@ fn read_clipboard_image_via_power_shell() -> Option<ClipboardImage> {
 /// stub `osascript` can exercise it on the test host.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn read_clipboard_image_via_osascript() -> Option<ClipboardImage> {
-    let path = std::env::temp_dir().join(format!("rpi-clipboard-{}.img", clipboard_uuid()));
+    let (path, file) = create_private_temp_file("img").ok()?;
+    drop(file);
     let script = format!(
         r#"set outPath to "{}"
 try
@@ -4001,9 +4046,27 @@ fn convert_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
+/// The three-stage read (`handleClipboardPaste`): files → image → text.
+/// Runs off the drain thread; the caller never sees partial failures.
+fn read_clipboard_paste() -> ClipboardPaste {
+    if let Some(file_paths) = read_clipboard_file_paths() {
+        return ClipboardPaste::Files(file_paths);
+    }
+    if let Some(image) = read_clipboard_image() {
+        return ClipboardPaste::Image {
+            bytes: image.bytes,
+            mime_type: image.mime_type,
+        };
+    }
+    match read_clipboard_text() {
+        Some(text) if !text.is_empty() => ClipboardPaste::Text(text),
+        _ => ClipboardPaste::Empty,
+    }
+}
+
 /// `readClipboardText` (clipboard.ts:36-47) — the native clipboard addon is
-/// replaced by the platform tools: `wl-paste` on Wayland, `xclip` on X11,
-/// `pbpaste` on macOS.
+/// replaced by the platform tools: `wl-paste` / `xclip` / `xsel` on Linux,
+/// `Get-Clipboard -Raw` on Windows, `pbpaste` on macOS.
 fn read_clipboard_text() -> Option<String> {
     // #10391 (592fb57b7): Termux reports platform "android", not "linux",
     // so `termux-clipboard-get` runs before the Linux-only branch. An empty
@@ -4018,47 +4081,90 @@ fn read_clipboard_text() -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var("XDG_SESSION_TYPE")
-                .map(|session| session == "wayland")
-                .unwrap_or(false);
-        let bytes = if is_wayland {
-            run_clipboard_command("wl-paste", &[], CLIPBOARD_READ_TIMEOUT).or_else(|| {
-                run_clipboard_command(
-                    "xclip",
-                    &["-selection", "clipboard", "-o"],
-                    CLIPBOARD_READ_TIMEOUT,
-                )
-            })
-        } else {
-            run_clipboard_command(
-                "xclip",
-                &["-selection", "clipboard", "-o"],
-                CLIPBOARD_READ_TIMEOUT,
-            )
-        };
-        bytes.and_then(|bytes| String::from_utf8(bytes).ok())
+        read_clipboard_text_linux()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        read_clipboard_text_windows()
     }
     #[cfg(target_os = "macos")]
     {
         run_clipboard_command("pbpaste", &[], CLIPBOARD_READ_TIMEOUT)
             .and_then(|bytes| String::from_utf8(bytes).ok())
+            .filter(|text| !text.is_empty())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         None
     }
 }
 
-/// `crypto.randomUUID()` stand-in: monotonic time + per-process counter (no
-/// `uuid` dependency in the workspace).
-fn clipboard_uuid() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{nanos:x}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+/// Linux text read. Upstream tries `wl-paste`, then `xclip`, then `xsel`;
+/// an empty result falls through to the next command.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_clipboard_text_linux() -> Option<String> {
+    let mut commands: Vec<(&str, Vec<&str>)> = Vec::new();
+    if is_wayland_session() {
+        commands.push(("wl-paste", vec!["--no-newline", "--type", "text"]));
+    }
+    commands.push(("xclip", vec!["-selection", "clipboard", "-o"]));
+    commands.push(("xsel", vec!["--clipboard", "--output"]));
+    for (program, args) in commands {
+        if let Some(bytes) = run_clipboard_command(program, &args, CLIPBOARD_READ_TIMEOUT) {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// Windows text read. `-Raw` preserves embedded newlines; `[Console]::Out.Write`
+/// avoids the formatter's trailing newline.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn read_clipboard_text_windows() -> Option<String> {
+    let bytes = run_clipboard_command(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_CLIPBOARD_TEXT_SCRIPT,
+        ],
+        CLIPBOARD_READ_TIMEOUT,
+    )?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Create a private, randomly named temp file. `create_new` refuses to follow
+/// a pre-planted symlink; mode 0600 keeps clipboard images (screenshots) out of
+/// other local users' reach even though the file outlives the paste, as
+/// upstream does.
+fn create_private_temp_file(
+    extension: &str,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    let path = std::env::temp_dir().join(format!(
+        "rpi-clipboard-{}.{extension}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    Ok((path, file))
+}
+
+fn write_clipboard_image(bytes: &[u8], extension: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let (path, mut file) = create_private_temp_file(extension)?;
+    file.write_all(bytes)?;
+    Ok(path)
 }
 
 // Tests
@@ -5610,6 +5716,33 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn background_paste_reads_off_thread_and_applies_on_drain() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bin = fake_clipboard_tools(&tmp, false);
+        let _path_restore = prepend_path(&bin);
+
+        let (mode, _terminal, _session, _tmp_keep) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.start_clipboard_paste();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            ui.drain_events();
+            if !lock(&ui.editor).get_text().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lock(&ui.editor).get_text(), "pasted-text");
+        assert!(
+            !ui.clipboard_paste_in_flight.load(Ordering::SeqCst),
+            "the in-flight flag must be released after the read"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
     async fn paste_with_clipboard_image_inserts_temp_path() {
         let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _paste_env = clear_paste_env();
@@ -5636,6 +5769,16 @@ mod tests {
         );
         let bytes = std::fs::read(&inserted).expect("clipboard image file must exist");
         assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&inserted)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "clipboard images must not be world-readable");
+        }
         let _ = std::fs::remove_file(&inserted);
     }
 
@@ -6242,6 +6385,104 @@ mod tests {
                 "C:\\b.txt".to_string()
             ])
         );
+        assert!(
+            WINDOWS_CLIPBOARD_FILE_PATHS_SCRIPT.contains("$_.FullName"),
+            "the PowerShell projection must emit full paths, not FileInfo objects"
+        );
+        assert!(WINDOWS_CLIPBOARD_TEXT_SCRIPT.contains("Get-Clipboard -Raw"));
+    }
+
+    #[test]
+    fn windows_file_paths_reader_rejects_powershell_table_output() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("powershell.exe");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' 'Mode LastWriteTime Length Name' '---- ------------- ------ ----' '-a--- 2026-01-01 0 a.txt'\n",
+        )
+        .expect("write fake powershell");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let _path_restore = prepend_path(&bin);
+        assert_eq!(read_clipboard_file_paths_windows(), None);
+    }
+
+    #[test]
+    fn windows_text_reader_reads_raw_multiline_output() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let script = bin.join("powershell.exe");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'line one\\nline two'\n")
+            .expect("write fake powershell");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let _path_restore = prepend_path(&bin);
+        assert_eq!(
+            read_clipboard_text_windows(),
+            Some("line one\nline two".to_string())
+        );
+    }
+
+    #[test]
+    fn linux_text_reader_falls_back_to_xsel() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let xclip = bin.join("xclip");
+        std::fs::write(&xclip, "#!/bin/sh\nexit 1\n").expect("write fake xclip");
+        let xsel = bin.join("xsel");
+        std::fs::write(&xsel, "#!/bin/sh\nprintf 'xsel text'\n").expect("write fake xsel");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for script in [&xclip, &xsel] {
+                std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        let _path_restore = prepend_path(&bin);
+        assert_eq!(read_clipboard_text_linux(), Some("xsel text".to_string()));
+    }
+
+    #[test]
+    fn linux_text_reader_continues_after_an_empty_wayland_read() {
+        let _env_guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _paste_env = clear_paste_env();
+        rpi_test_env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        let tmp = TempDir::new();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin dir");
+        let wl = bin.join("wl-paste");
+        std::fs::write(&wl, "#!/bin/sh\n: > /dev/null\n").expect("write fake wl-paste");
+        let xclip = bin.join("xclip");
+        std::fs::write(&xclip, "#!/bin/sh\nprintf 'from xclip'\n").expect("write fake xclip");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for script in [&wl, &xclip] {
+                std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        let _path_restore = prepend_path(&bin);
+        assert_eq!(read_clipboard_text_linux(), Some("from xclip".to_string()));
     }
 
     #[test]

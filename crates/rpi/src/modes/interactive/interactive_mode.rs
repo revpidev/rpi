@@ -96,7 +96,7 @@ use tokio::sync::watch;
 
 use crate::config::{APP_NAME, VERSION};
 use crate::core::agent_session::{
-    AgentSession, AgentSessionEvent, ExtensionBindings, PromptOptions,
+    AgentSession, AgentSessionEvent, ExtensionBindings, PromptOptions, PromptOutcome,
 };
 use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::compaction_runner::{CompactionEvent, CompactionReason, RetrySource};
@@ -357,6 +357,17 @@ pub async fn run_interactive_mode(
 // Event commands
 // =============================================================================
 
+/// A clipboard payload read off the driver thread. The drain applies it on
+/// the TUI thread, so the read (subprocess + image decode, up to several
+/// seconds) never freezes input handling.
+#[derive(Debug, Clone)]
+pub(crate) enum ClipboardPaste {
+    Files(Vec<String>),
+    Image { bytes: Vec<u8>, mime_type: String },
+    Text(String),
+    Empty,
+}
+
 /// A queued session event (or mode-internal UI command), applied by
 /// [`InteractiveUi::drain_events`]. Variants mirror the 24
 /// `AgentSessionEvent` variants (10 `AgentEvent` + 9 `SessionEvent` + 5
@@ -509,6 +520,9 @@ pub(crate) enum UiCommand {
     /// Mode-internal: clipboard paste (deferred — insertion touches the
     /// editor and clipboard reads block).
     PasteImage,
+    /// Mode-internal: the background clipboard reader finished; the drain
+    /// applies the payload without touching the clipboard/subprocess APIs.
+    ClipboardPasteReady(ClipboardPaste),
     /// Mode-internal: a progressive session-list loader published events
     /// (dfbf793b7 @ 19451accd, V15-04 FR-A). The drain applies them to the
     /// mounted session selector via its typed slot; the loader threads
@@ -1466,6 +1480,9 @@ pub(crate) struct InteractiveUi {
     pub(crate) markdown_theme: Mutex<Arc<MarkdownTheme>>,
     pub(crate) render_handle: RenderHandle,
     event_queue: Arc<Mutex<VecDeque<UiCommand>>>,
+    /// One clipboard read at a time; repeated Alt+V presses while a slow
+    /// PowerShell probe is in flight are ignored.
+    clipboard_paste_in_flight: Arc<AtomicBool>,
 
     // Tree regions (wrapped into the Tui's child list at init).
     header_container: Arc<Mutex<Container>>,
@@ -2882,9 +2899,13 @@ impl InteractiveUi {
                 self.handle_copy_command(prefer_selection);
             }
             UiCommand::PasteImage => {
-                // `handleClipboardPaste` (interactive-mode.ts:2629-2652)
-                // from the drain (insertion touches the editor).
-                self.handle_paste_image_impl();
+                // `handleClipboardPaste` (interactive-mode.ts:2629-2652) from
+                // the drain. The blocking read runs on a background thread;
+                // insertion happens when `ClipboardPasteReady` is drained.
+                self.start_clipboard_paste();
+            }
+            UiCommand::ClipboardPasteReady(paste) => {
+                self.apply_clipboard_paste(paste);
             }
             UiCommand::SessionListEvent => {
                 // Progressive session-list publish (dfbf793b7 @ 19451accd,
@@ -5781,6 +5802,7 @@ impl InteractiveMode {
             markdown_theme: Mutex::new(markdown_theme),
             render_handle,
             event_queue: Arc::new(Mutex::new(VecDeque::new())),
+            clipboard_paste_in_flight: Arc::new(AtomicBool::new(false)),
             header_container: Arc::new(Mutex::new(Container::new())),
             loaded_resources_container: Arc::new(Mutex::new(Container::new())),
             chat_container: Arc::new(Mutex::new(Container::new())),
@@ -6824,6 +6846,10 @@ impl InteractiveMode {
                 error.raw_message()
             ));
         };
+        let restore_all = |ui_state: &InteractiveUi| {
+            ui_state.session().clear_queue();
+            restore_messages(ui_state, &messages);
+        };
 
         // When a retry is pending, queue every message for the retry turn
         // instead of flushing them into the aborted run
@@ -6913,15 +6939,20 @@ impl InteractiveMode {
         // they are not lost (the mode's shutdown path reports them via the
         // resume hint, and a subsequent `/resume` re-enqueues nothing — the
         // queue simply survives in memory until then).
-        let prompt_result = tokio::select! {
+        // Run the preflight first (upstream calls the async prompt method,
+        // which executes synchronously up to its first await), then queue the
+        // remaining messages BEFORE awaiting the run. The old code awaited
+        // the whole first run, so `rest` landed after it finished and stayed
+        // pending until the next user input.
+        let first_outcome = tokio::select! {
             // `biased`: an in-flight shutdown wins over a simultaneously
-            // ready prompt result, so the queue restore below always runs.
+            // ready preflight, so the queue restore below always runs.
             biased;
             _ = self.shutdown_rx.changed() => {
-                restore_messages(&self.ui_state, &messages);
+                restore_all(&self.ui_state);
                 return;
             }
-            result = self.session.prompt(
+            result = self.session.begin_prompt(
                 &first_prompt.text,
                 PromptOptions {
                     streaming_behavior: Some(first_prompt.mode),
@@ -6929,15 +6960,20 @@ impl InteractiveMode {
                 },
             ) => result,
         };
-        if let Err(error) = prompt_result {
-            restore_queue(&self.ui_state, &error);
-            return;
-        }
+        let first_run = match first_outcome {
+            Err(error) => {
+                restore_queue(&self.ui_state, &error);
+                return;
+            }
+            Ok(PromptOutcome::Handled | PromptOutcome::Queued) => None,
+            Ok(PromptOutcome::Started(run_messages)) => {
+                Some(self.session.run_agent_prompt(run_messages))
+            }
+        };
 
         // Queue the remaining messages by mode
         // (interactive-mode.ts:4088-4092).
-        for index in 0..rest.len() {
-            let message = &rest[index];
+        for message in rest {
             let queue_future = async {
                 if is_extension_command(&self.session.extension_runner(), &message.text) {
                     self.session
@@ -6958,12 +6994,27 @@ impl InteractiveMode {
             let result = tokio::select! {
                 biased;
                 _ = self.shutdown_rx.changed() => {
-                    restore_messages(&self.ui_state, &rest[index..]);
+                    restore_all(&self.ui_state);
                     return;
                 }
                 result = queue_future => result,
             };
             if let Err(error) = result {
+                restore_queue(&self.ui_state, &error);
+                return;
+            }
+        }
+
+        if let Some(run) = first_run {
+            let run_result = tokio::select! {
+                biased;
+                _ = self.shutdown_rx.changed() => {
+                    restore_all(&self.ui_state);
+                    return;
+                }
+                result = run => result,
+            };
+            if let Err(error) = run_result {
                 restore_queue(&self.ui_state, &error);
                 return;
             }
@@ -7834,6 +7885,7 @@ mod tests {
             UiCommand::Dequeue => "dequeue",
             UiCommand::CopyMessage { .. } => "copy_message",
             UiCommand::PasteImage => "paste_image",
+            UiCommand::ClipboardPasteReady(_) => "clipboard_paste_ready",
             UiCommand::SessionListEvent => "session_list_event",
         }
     }
@@ -10181,6 +10233,57 @@ mod tests {
             rendered.contains("Failed to send queued messages"),
             "rendered: {rendered}"
         );
+    }
+
+    /// The rest of the compaction queue must join the first run, not wait for
+    /// the next user input (upstream starts the prompt promise without
+    /// awaiting it, then queues the remaining messages).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_compaction_queue_queues_rest_into_the_first_run() {
+        use rpi_test_support::faux::{
+            FauxAiProvider, FauxAssistantOptions, FauxProvider, FauxProviderOptions,
+            faux_assistant_message,
+        };
+
+        let provider = FauxProvider::new(FauxProviderOptions::default());
+        provider.set_responses(vec![
+            faux_assistant_message("first answer", FauxAssistantOptions::default()).into(),
+        ]);
+        let tmp = TempDir::new();
+        let runtime = crate::core::model_runtime::ModelRuntime::create(
+            crate::core::model_runtime::CreateModelRuntimeOptions {
+                credentials: None,
+                auth_path: Some(tmp.path().join("auth.json")),
+                models_path: crate::core::model_runtime::ModelsPathInput::Disabled,
+                ..Default::default()
+            },
+        )
+        .await;
+        runtime
+            .register_native_provider(Arc::new(FauxAiProvider::new(provider)))
+            .await
+            .expect("register faux provider");
+        let model = runtime
+            .get_available(None)
+            .await
+            .expect("available models")
+            .into_iter()
+            .next()
+            .expect("faux model");
+        let (mut mode, _terminal, session) = mode_harness_with_model_runtime(runtime, model).await;
+        mode.init().await;
+        {
+            let ui = &mode.ui_state;
+            ui.queue_compaction_message("first msg".to_string(), StreamingBehavior::Steer);
+            ui.queue_compaction_message("second msg".to_string(), StreamingBehavior::Steer);
+        }
+        mode.flush_compaction_queue(false).await;
+        let (steering, follow_up) = session.clear_queue();
+        assert!(
+            steering.is_empty() && follow_up.is_empty(),
+            "rest must be consumed by the first run, got steering={steering:?} follow_up={follow_up:?}"
+        );
+        assert!(lock(&mode.ui_state.compaction_queue).is_empty());
     }
 
     #[tokio::test]
