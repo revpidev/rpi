@@ -495,14 +495,10 @@ pub struct TestDir(PathBuf);
 impl TestDir {
     /// Create a unique directory under the system temp root.
     pub fn new(tag: &str) -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "rpi-plan-mode-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("rpi-plan-mode-{tag}-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("test dir");
         TestDir(dir)
     }

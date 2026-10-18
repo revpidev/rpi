@@ -389,17 +389,39 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A temp HOME with a process-wide atomic suffix. `SystemTime::now()`
+    /// nanoseconds are not unique under concurrent test threads, so this must
+    /// not be the sole name source (the v0.1.7 review reproduced a collision).
+    struct TempHome(PathBuf);
+
+    impl TempHome {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("rpi-todo-config-{tag}-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp home");
+            Self(dir)
+        }
+    }
+
+    impl std::ops::Deref for TempHome {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// One temp HOME with an optional XDG value; returns (home, xdg).
     /// `write` populates the config file under the resolved location.
-    fn scratch(write: Option<(Option<&str>, &Value)>) -> (PathBuf, Option<String>) {
-        let home = std::env::temp_dir().join(format!(
-            "rpi-todo-config-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+    fn scratch(write: Option<(Option<&str>, &Value)>) -> (TempHome, Option<String>) {
+        let home = TempHome::new("test");
         let xdg = home.join("xdg");
         std::fs::create_dir_all(&xdg).expect("scratch dirs");
         let xdg_value = Some(xdg.to_str().expect("utf8 path").to_owned());
@@ -416,6 +438,19 @@ mod tests {
                 .expect("write config");
         }
         (home, xdg_value)
+    }
+
+    #[test]
+    fn temp_home_names_are_unique_under_concurrency() {
+        use std::collections::HashSet;
+        let handles: Vec<_> = (0..32)
+            .map(|_| std::thread::spawn(|| TempHome::new("race").0.clone()))
+            .collect();
+        let paths: HashSet<PathBuf> = handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect();
+        assert_eq!(paths.len(), 32, "temp HOME names must not collide");
     }
 
     // ------------------------------------------------------------------
@@ -515,36 +550,27 @@ mod tests {
 
     #[test]
     fn load_config_malformed_json_falls_back_to_an_empty_object() {
-        let home = std::env::temp_dir().join(format!("rpi-todo-config-bad-{}", std::process::id()));
+        let home = TempHome::new("bad");
         let path = legacy_config_path(&home);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(&path, "{not json").expect("write");
         let raw = load_config_from(None, &home);
         assert!(raw.as_object().is_some_and(|map| map.is_empty()));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn load_config_non_object_json_falls_back_to_an_empty_object() {
-        let home = std::env::temp_dir().join(format!("rpi-todo-config-arr-{}", std::process::id()));
+        let home = TempHome::new("arr");
         let path = legacy_config_path(&home);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(&path, "[1,2]").expect("write");
         let raw = load_config_from(None, &home);
         assert!(raw.as_object().is_some_and(|map| map.is_empty()));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn xdg_file_wins_over_legacy_even_when_malformed() {
-        let home = std::env::temp_dir().join(format!(
-            "rpi-todo-config-xdg-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let home = TempHome::new("xdg");
         let xdg_dir = home.join("xdg");
         std::fs::create_dir_all(xdg_dir.join(CONFIG_DIR_NAME)).expect("dirs");
         std::fs::create_dir_all(home.join(".config").join(CONFIG_DIR_NAME)).expect("dirs");
@@ -561,19 +587,11 @@ mod tests {
         // Malformed XDG warns and yields {} — it does NOT fall back to the
         // legacy file (corruption is surfaced, not masked).
         assert!(raw.as_object().is_some_and(|map| map.is_empty()));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn missing_xdg_falls_back_to_the_legacy_path() {
-        let home = std::env::temp_dir().join(format!(
-            "rpi-todo-config-legacy-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let home = TempHome::new("legacy");
         let path = legacy_config_path(&home);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(
@@ -583,19 +601,11 @@ mod tests {
         .expect("write");
         let raw = load_config_from(Some("/nonexistent-xdg"), &home);
         assert_eq!(raw.get("collapseKey"), Some(&json!("alt+o")));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn relative_xdg_value_falls_back_to_the_default_config_dir() {
-        let home = std::env::temp_dir().join(format!(
-            "rpi-todo-config-rel-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let home = TempHome::new("rel");
         let path = legacy_config_path(&home);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(
@@ -605,19 +615,11 @@ mod tests {
         .expect("write");
         let raw = load_config_from(Some("relative/path"), &home);
         assert_eq!(raw.get("maxWidgetLines"), Some(&json!(7)));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn tilde_xdg_value_expands_to_home() {
-        let home = std::env::temp_dir().join(format!(
-            "rpi-todo-config-tilde-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let home = TempHome::new("tilde");
         let xdg_dir = home.join("xdg");
         std::fs::create_dir_all(xdg_dir.join(CONFIG_DIR_NAME)).expect("dirs");
         std::fs::write(
@@ -627,7 +629,6 @@ mod tests {
         .expect("write");
         let raw = load_config_from(Some("~/xdg"), &home);
         assert_eq!(raw.get("maxWidgetLines"), Some(&json!(5)));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     // ------------------------------------------------------------------

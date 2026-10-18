@@ -39,6 +39,12 @@ pub const PATH_PLACEHOLDER: &str = "<path>";
 /// JSON object keys whose values are timestamps.
 const TIMESTAMP_KEYS: &[&str] = &["timestamp"];
 
+/// Wall-clock measurements of tool execution. The fixture records a fast run
+/// as `0.0`; a loaded CI machine can round the same command to `0.1`, so the
+/// byte comparison must not depend on it (the field presence is still part of
+/// the contract because the key itself remains).
+const WALL_TIME_KEYS: &[&str] = &["wall_time_seconds"];
+
 /// JSON object keys whose values are volatile ids. `null` values are kept.
 const ID_KEYS: &[&str] = &[
     "id",
@@ -120,6 +126,10 @@ impl Normalizer {
                             Value::Number(_) => Value::from(0),
                             _ => Value::String(TS_PLACEHOLDER.to_owned()),
                         };
+                        continue;
+                    }
+                    if WALL_TIME_KEYS.contains(&key.as_str()) && val.is_number() {
+                        *val = Value::from(0.0);
                         continue;
                     }
                     if CWD_KEYS.contains(&key.as_str()) && val.is_string() {
@@ -330,6 +340,23 @@ mod tests {
         assert_eq!(v["timestamp"], serde_json::json!(TS_PLACEHOLDER));
         assert_eq!(v["message"]["timestamp"], serde_json::json!(0));
         assert_eq!(v["message"]["content"], serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn test_normalize_json_wall_time_is_fixed() {
+        let mut n = Normalizer::new();
+        let mut v = serde_json::json!({
+            "result": {"structuredContent": {"wall_time_seconds": 0.1, "exit_code": 0}}
+        });
+        n.normalize_json(&mut v);
+        assert_eq!(
+            v["result"]["structuredContent"]["wall_time_seconds"],
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            v["result"]["structuredContent"]["exit_code"],
+            serde_json::json!(0)
+        );
     }
 
     #[test]

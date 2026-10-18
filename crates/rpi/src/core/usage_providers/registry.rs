@@ -518,8 +518,10 @@ mod tests {
         // re-registering (which would be a different resolution tier).
         let slot = Arc::new(Mutex::new(UsageSettings {
             providers: BTreeMap::from([("p".to_owned(), explicit(ok_script.to_str().unwrap()))]),
-            // 500ms lower bound keeps the timeout test fast.
-            timeout_ms: Some(500),
+            // Generous lower bound: the full workspace suite runs many
+            // processes concurrently, and a 500ms budget made the fast
+            // control fetch itself time out under load.
+            timeout_ms: Some(3000),
         }));
         let settings_fn: SettingsFn = {
             let slot = slot.clone();
@@ -537,7 +539,7 @@ mod tests {
         // fetches.
         *slot.lock().unwrap_or_else(|error| error.into_inner()) = UsageSettings {
             providers: BTreeMap::from([("p".to_owned(), explicit(slow_script.to_str().unwrap()))]),
-            timeout_ms: Some(500),
+            timeout_ms: Some(3000),
         };
         let result = registry.fetch("p", true).await.expect("kept success");
         assert_eq!(result.get("displayText"), Some(&Value::from("p: good")));
@@ -545,7 +547,7 @@ mod tests {
         // Oversize stdout: same keep-last-success behavior.
         *slot.lock().unwrap_or_else(|error| error.into_inner()) = UsageSettings {
             providers: BTreeMap::from([("p".to_owned(), explicit(big_script.to_str().unwrap()))]),
-            timeout_ms: Some(500),
+            timeout_ms: Some(3000),
         };
         let result = registry.fetch("p", true).await.expect("kept success");
         assert_eq!(result.get("displayText"), Some(&Value::from("p: good")));
