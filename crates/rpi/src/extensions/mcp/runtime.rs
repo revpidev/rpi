@@ -837,6 +837,9 @@ impl McpServerConnection {
             }
             *guard = None;
             drop(guard);
+            if connection.is_closed() {
+                return;
+            }
             *lock(&connection.state) = ServerState::Disconnected;
             let stderr = lock(&connection.stderr_tail).clone();
             *lock(&connection.error) = Some(match stderr {
@@ -862,6 +865,12 @@ impl McpServerConnection {
         if let Some(client) = client {
             let _ = client.close().await;
         }
+        // The setup task may have installed its client and written Connected
+        // in the window between its is_closed() check and close() taking the
+        // opening lock. The client is gone now, so restore the terminal state
+        // and notify observers.
+        *lock(&self.state) = ServerState::Closed;
+        self.changed();
         // A refresh the server already answered may have rotated the refresh
         // token; exiting before the new tokens are saved would lose the
         // grant.

@@ -20,6 +20,12 @@ use crate::extensions::mcp::resources::{
 /// The same algorithm backs the MCP `toolExposure` patterns; the previous
 /// local copy in `extensions/mcp/config.rs` now delegates here.
 pub fn tool_pattern_matches(pattern: &str, value: &str) -> bool {
+    // No wildcard: the documented literal/anchored case. Without this early
+    // return the split below always yields at least one part, so the scan
+    // would accept a literal that is only a prefix+suffix of `value`.
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
     let mut parts = pattern.split('*');
     let Some(first) = parts.next() else {
         return pattern == value;
@@ -153,6 +159,10 @@ mod tests {
     fn pattern_matches_literal_and_star_forms() {
         assert!(tool_pattern_matches("read", "read"));
         assert!(!tool_pattern_matches("read", "readx"));
+        assert!(!tool_pattern_matches("read", "xread"));
+        assert!(!tool_pattern_matches("aa", "aaa"));
+        assert!(!tool_pattern_matches("", "abc"));
+        assert!(tool_pattern_matches("", ""));
         assert!(tool_pattern_matches(
             "mcp__radius__*",
             "mcp__radius__search"
