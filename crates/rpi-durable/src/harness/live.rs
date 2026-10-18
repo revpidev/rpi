@@ -205,11 +205,11 @@ pub async fn end_run(
     settlement: SubmissionSettlement,
 ) -> SessionResult<()> {
     let mut state: LiveState = read_state(live)?;
-    if state.run.as_ref().map(|run| run.task_id) == Some(task_id) {
-        if let Some(run) = state.run.take() {
-            for id in run.inputs {
-                tx.settle_submission(id, settlement.clone())?;
-            }
+    if state.run.as_ref().map(|run| run.task_id) == Some(task_id)
+        && let Some(run) = state.run.take()
+    {
+        for id in run.inputs {
+            tx.settle_submission(id, settlement.clone())?;
         }
     }
     state.generation = None;
@@ -312,14 +312,13 @@ pub async fn settle_scheduler_outcome(
     if record.kind == TOOL_TASK_KIND {
         let live = tx.doc(&LIVE_DOC, conversation_owner(record), None).await?;
         let mut state: LiveState = read_state(&live)?;
-        if let Some(tools) = state.tools.as_mut() {
-            if let Some(slot) = tools
+        if let Some(tools) = state.tools.as_mut()
+            && let Some(slot) = tools
                 .iter_mut()
                 .find(|slot| slot.task_id == Some(record.id))
-            {
-                finish_slot(slot, None);
-                write_state(&live, &state)?;
-            }
+        {
+            finish_slot(slot, None);
+            write_state(&live, &state)?;
         }
         return Ok(());
     }

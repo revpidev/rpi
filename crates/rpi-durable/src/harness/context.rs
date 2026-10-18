@@ -346,10 +346,10 @@ fn lead_with_system(messages: Vec<Message>) -> Vec<Message> {
 /// One active entry's model messages after its edit and excluded stop reasons,
 /// before tool result ordering.
 fn contribute(entry: &EntryRecord, edit: Option<&ContextEdit>) -> Vec<Message> {
-    if let Some(edit) = edit {
-        if matches!(edit.action, ContextEditAction::Omit) {
-            return Vec::new();
-        }
+    if let Some(edit) = edit
+        && matches!(edit.action, ContextEditAction::Omit)
+    {
+        return Vec::new();
     }
     let contributed: Vec<Message> = match edit {
         Some(ContextEdit {

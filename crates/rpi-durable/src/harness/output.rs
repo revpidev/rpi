@@ -542,7 +542,11 @@ impl Progress {
     /// Schedule a commit.
     pub fn mark(&self) {
         {
-            let mut state = self.inner.state.lock().expect("progress state");
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.stopped {
                 return;
             }
@@ -556,7 +560,11 @@ impl Progress {
     pub fn mark_and_wait(&self) -> oneshot::Receiver<Result<(), String>> {
         let (sender, receiver) = oneshot::channel();
         {
-            let mut state = self.inner.state.lock().expect("progress state");
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.stopped {
                 let _ = sender.send(Ok(()));
                 return receiver;
@@ -572,20 +580,32 @@ impl Progress {
     /// the final commit must settle.
     pub async fn stop(&self) -> Vec<ProgressWaiter> {
         {
-            let mut state = self.inner.state.lock().expect("progress state");
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.stopped = true;
         }
         loop {
             let notified = self.inner.idle.notified();
             {
-                let state = self.inner.state.lock().expect("progress state");
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if !state.in_flight {
                     break;
                 }
             }
             notified.await;
         }
-        let mut state = self.inner.state.lock().expect("progress state");
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::mem::take(&mut state.waiters)
             .into_iter()
             .map(|sender| ProgressWaiter { sender })
@@ -594,7 +614,10 @@ impl Progress {
 
     fn schedule(&self) {
         let inner = Arc::clone(&self.inner);
-        let mut state = inner.state.lock().expect("progress state");
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.stopped || state.timer_scheduled || state.in_flight || !state.dirty {
             return;
         }
@@ -613,7 +636,10 @@ impl Progress {
             tokio::spawn(async move {
                 tokio::time::sleep_until(deadline).await;
                 let inner = Arc::clone(&inner);
-                let mut state = inner.state.lock().expect("progress state");
+                let mut state = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.timer_scheduled = false;
                 drop(state);
                 Progress { inner }.schedule();
@@ -634,7 +660,10 @@ async fn run_write(
     };
     let dirty;
     {
-        let mut state = inner.state.lock().expect("progress state");
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.in_flight = false;
         let paced = Duration::from_millis(bytes.saturating_mul(1000) / PROGRESS_BYTES_PER_SECOND);
         state.next_at = started + inner.min_interval.max(paced);

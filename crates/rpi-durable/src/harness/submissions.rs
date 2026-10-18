@@ -244,10 +244,9 @@ impl Submissions {
             if let crate::session::CommitChange::Table(crate::types::StorageWrite::Submission {
                 value,
             }) = change
+                && is_settled(value)
             {
-                if is_settled(value) {
-                    self.waiters.resolve(value.id(), value.clone());
-                }
+                self.waiters.resolve(value.id(), value.clone());
             }
         }
     }
@@ -320,33 +319,31 @@ pub async fn admit_submission(
         SubmissionDraft::Input(input) => (input.request_id.as_deref(), false),
         SubmissionDraft::Write(write) => (write.request_id.as_deref(), true),
     };
-    if let Some(request_id) = request_id {
-        if let Some(existing) = tx
+    if let Some(request_id) = request_id
+        && let Some(existing) = tx
             .submission_by_request(conversation_id, request_id)
             .await?
-        {
-            let existing_is_write = matches!(existing, SubmissionRecord::Write { .. });
-            if existing_is_write != is_write {
-                let existing_type = if existing_is_write { "write" } else { "input" };
-                return Err(SessionError::message(format!(
-                    "Request {request_id} already identifies a submission of type {existing_type}"
-                )));
-            }
-            return Ok(existing.id());
+    {
+        let existing_is_write = matches!(existing, SubmissionRecord::Write { .. });
+        if existing_is_write != is_write {
+            let existing_type = if existing_is_write { "write" } else { "input" };
+            return Err(SessionError::message(format!(
+                "Request {request_id} already identifies a submission of type {existing_type}"
+            )));
         }
+        return Ok(existing.id());
     }
     let live = tx
         .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
         .await?;
     let busy = live_is_busy(&live)?;
-    if busy {
-        if let SubmissionDraft::Input(InputSubmissionDraft {
+    if busy
+        && let SubmissionDraft::Input(InputSubmissionDraft {
             when_busy: Some(WhenBusy::Reject),
             ..
         }) = draft
-        {
-            return Err(StorageError::ConversationBusy(conversation_id).into());
-        }
+    {
+        return Err(StorageError::ConversationBusy(conversation_id).into());
     }
     // A boundary reads the table, so it is prepared before the first table write;
     // a busy one needs none.

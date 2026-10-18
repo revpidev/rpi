@@ -356,10 +356,10 @@ impl SqliteStorage {
                 break;
             };
             upper = Some(upper.map_or(parent.at.get(), |upper| upper.min(parent.at.get())));
-            if let Some(min) = query.min_entry_id {
-                if upper.expect("set") < min.get() {
-                    break;
-                }
+            if let Some(min) = query.min_entry_id
+                && upper.expect("set") < min.get()
+            {
+                break;
             }
             conversation = self
                 .read_conversation(parent.conversation_id)
@@ -394,10 +394,10 @@ impl SqliteStorage {
                 break;
             };
             upper = Some(upper.map_or(parent.at.get(), |upper| upper.min(parent.at.get())));
-            if let Some(min) = query.min_entry_id {
-                if upper.expect("set") < min.get() {
-                    break;
-                }
+            if let Some(min) = query.min_entry_id
+                && upper.expect("set") < min.get()
+            {
+                break;
             }
             conversation = self
                 .read_conversation(parent.conversation_id)
@@ -480,19 +480,19 @@ impl SqliteStorage {
                     )));
                 }
             } else {
-                if let Some(existing) = existing {
-                    if existing != table {
-                        return Err(StorageError::message(format!(
-                            "ID {id} already belongs to {existing}"
-                        )));
-                    }
+                if let Some(existing) = existing
+                    && existing != table
+                {
+                    return Err(StorageError::message(format!(
+                        "ID {id} already belongs to {existing}"
+                    )));
                 }
-                if let Some(earlier) = earlier {
-                    if earlier != table {
-                        return Err(StorageError::message(format!(
-                            "ID {id} is written as two record types"
-                        )));
-                    }
+                if let Some(earlier) = earlier
+                    && earlier != table
+                {
+                    return Err(StorageError::message(format!(
+                        "ID {id} is written as two record types"
+                    )));
                 }
             }
             claimed.insert(id, table);
@@ -557,7 +557,11 @@ impl SqliteStorage {
                     }
                     action.retire = true;
                 }
-                _ => unreachable!(),
+                _ => {
+                    return Err(StorageError::message(
+                        "unsupported write variant in the document-action branch",
+                    ));
+                }
             }
         }
         Ok(actions)
@@ -591,12 +595,12 @@ impl SqliteStorage {
         let mut live_counts: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
         for (id, action) in actions {
-            if let Some(copy) = &action.copy {
-                if actions.iter().any(|(other, _)| other == &copy.id) {
-                    return Err(StorageError::Rejected(format!(
-                        "Document copy {id} source is changed in the copy batch"
-                    )));
-                }
+            if let Some(copy) = &action.copy
+                && actions.iter().any(|(other, _)| other == &copy.id)
+            {
+                return Err(StorageError::Rejected(format!(
+                    "Document copy {id} source is changed in the copy batch"
+                )));
             }
             let existing: Option<DocumentRecord> = tx
                 .get(
@@ -612,10 +616,10 @@ impl SqliteStorage {
                     "Document {id} already exists"
                 )));
             }
-            if let Some(existing) = &existing {
-                if existing.retired_at.is_some() {
-                    return Err(StorageError::message(format!("Document {id} is retired")));
-                }
+            if let Some(existing) = &existing
+                && existing.retired_at.is_some()
+            {
+                return Err(StorageError::message(format!("Document {id} is retired")));
             }
             if let Some(DocumentContent::Delta { version, .. }) = &action.content {
                 let previous: Option<i64> = tx
@@ -642,7 +646,11 @@ impl SqliteStorage {
                 (None, Some(existing)) => {
                     address_parts(&existing.kind, &existing.scope, existing.key.as_deref())
                 }
-                (None, None) => unreachable!("checked above"),
+                (None, None) => {
+                    return Err(StorageError::message(format!(
+                        "Document {id} has neither a create record nor an existing version"
+                    )));
+                }
             };
             let key = serde_json::to_string(&[
                 parts.kind.as_str(),

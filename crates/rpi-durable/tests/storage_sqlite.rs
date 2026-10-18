@@ -369,6 +369,60 @@ async fn document_reads_observe_one_committed_state_across_replacements() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_transaction_rolls_back_and_the_next_transaction_starts() {
+    let dir = TempDir::new("rpi-durable-sqlite-facade-cancel");
+    let path = dir.path().join("db.sqlite").to_string_lossy().into_owned();
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open");
+    database
+        .exec("CREATE TABLE probe (value INTEGER)")
+        .await
+        .expect("table");
+
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(25),
+        database.transaction(|tx| async move {
+            tx.run(
+                "INSERT INTO probe (value) VALUES (?)",
+                vec![SqliteValue::Integer(1)],
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok(())
+        }),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the transaction must be cancelled");
+
+    // The uncommitted INSERT must not be visible after the rollback guard ran.
+    let count = database
+        .get_i64("SELECT count(*) FROM probe", vec![])
+        .await
+        .expect("read after cancel")
+        .expect("row");
+    assert_eq!(count, 0, "uncommitted write leaked after cancellation");
+
+    let count: i64 = database
+        .transaction(|tx| async move {
+            tx.run(
+                "INSERT INTO probe (value) VALUES (?)",
+                vec![SqliteValue::Integer(2)],
+            )
+            .await?;
+            tx.get_i64("SELECT count(*) FROM probe", vec![])
+                .await?
+                .ok_or_else(|| StorageError::message("missing row"))
+        })
+        .await
+        .expect("next transaction must start cleanly");
+    assert_eq!(count, 1);
+
+    database.close().await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-facade-cancel");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn facade_transaction_handle_expires_and_rolls_back_on_callback_error() {
     let dir = TempDir::new("rpi-durable-sqlite-facade-rollback");
     let path = dir.path().join("db.sqlite").to_string_lossy().into_owned();

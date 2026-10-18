@@ -102,31 +102,30 @@ pub fn plan_system_entries(
     tools: &[Tool],
     timestamp: i64,
 ) -> Vec<EntryDraft> {
-    if let Some(head) = &view.head {
-        if !view
+    if let Some(head) = &view.head
+        && !view
             .entries
             .iter()
             .any(|entry| entry.kind == SYSTEM_ENTRY && entry.id > head.id)
-        {
-            let edits: Vec<ContextEdit> = view
-                .entries
-                .iter()
-                .filter(|entry| entry.kind == SYSTEM_ENTRY)
-                .map(|entry| ContextEdit {
-                    target: entry.id,
-                    action: ContextEditAction::Omit,
-                })
-                .collect();
-            let changes = ToolChanges {
-                tools_removed: Vec::new(),
-                tools_added: tools.iter().map(to_tool_declaration).collect(),
-            };
-            let mut baseline = system_entry(Some(desired.clone()), Some(&changes), timestamp);
-            if !edits.is_empty() {
-                baseline.edits = Some(edits);
-            }
-            return vec![baseline];
+    {
+        let edits: Vec<ContextEdit> = view
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == SYSTEM_ENTRY)
+            .map(|entry| ContextEdit {
+                target: entry.id,
+                action: ContextEditAction::Omit,
+            })
+            .collect();
+        let changes = ToolChanges {
+            tools_removed: Vec::new(),
+            tools_added: tools.iter().map(to_tool_declaration).collect(),
+        };
+        let mut baseline = system_entry(Some(desired.clone()), Some(&changes), timestamp);
+        if !edits.is_empty() {
+            baseline.edits = Some(edits);
         }
+        return vec![baseline];
     }
     let sections = plan_sections(&replay_sections(&view.messages), desired);
     let changes = plan_tools(&get_current_tools(&view.messages), tools);

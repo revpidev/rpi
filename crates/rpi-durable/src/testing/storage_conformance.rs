@@ -2374,10 +2374,10 @@ fn case_16_long_tails(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let value_key = crate::chord::delta::PathSegment::Key("value".to_string());
         for revision in 1..=24i64 {
             let index = ((revision * 17) % 512) as u64;
-            if let Some(JsonValue::Array(rows)) = before_replacement.get_mut("rows") {
-                if let Some(JsonValue::Object(row)) = rows.get_mut(index as usize) {
-                    row.insert("value".to_string(), serde_json::json!(-revision));
-                }
+            if let Some(JsonValue::Array(rows)) = before_replacement.get_mut("rows")
+                && let Some(JsonValue::Object(row)) = rows.get_mut(index as usize)
+            {
+                row.insert("value".to_string(), serde_json::json!(-revision));
             }
             before_replacement.insert("revision".to_string(), serde_json::json!(revision));
             before_replacement_at = storage
@@ -2431,10 +2431,10 @@ fn case_16_long_tails(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let mut current = replacement.clone();
         for revision in 101..=124i64 {
             let index = ((revision * 19) % 512) as u64;
-            if let Some(JsonValue::Array(rows)) = current.get_mut("rows") {
-                if let Some(JsonValue::Object(row)) = rows.get_mut(index as usize) {
-                    row.insert("value".to_string(), serde_json::json!(-revision));
-                }
+            if let Some(JsonValue::Array(rows)) = current.get_mut("rows")
+                && let Some(JsonValue::Object(row)) = rows.get_mut(index as usize)
+            {
+                row.insert("value".to_string(), serde_json::json!(-revision));
             }
             current.insert("revision".to_string(), serde_json::json!(revision));
             storage

@@ -629,14 +629,14 @@ impl NodeExecutionEnv {
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let mut child = command.spawn()?;
-        if let Some(stdin_command) = stdin_command {
-            if let Some(mut stdin) = child.stdin.take() {
-                let command = stdin_command.to_string();
-                tokio::spawn(async move {
-                    let _ = stdin.write_all(command.as_bytes()).await;
-                    let _ = stdin.shutdown().await;
-                });
-            }
+        if let Some(stdin_command) = stdin_command
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let command = stdin_command.to_string();
+            tokio::spawn(async move {
+                let _ = stdin.write_all(command.as_bytes()).await;
+                let _ = stdin.shutdown().await;
+            });
         }
         Ok(child)
     }
@@ -922,14 +922,7 @@ async fn open_binary_file(path: &str, no_follow: bool) -> Result<tokio::fs::File
 }
 
 fn random_token() -> String {
-    use std::sync::atomic::AtomicU64;
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{nanos:x}-{:x}-{count:x}", std::process::id())
+    uuid::Uuid::new_v4().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -956,7 +949,10 @@ impl TextLineReader for NodeTextLineReader {
         let mut buffer = vec![0u8; STREAM_CHUNK];
         loop {
             {
-                let mut buffered = self.buffered.lock().expect("line buffer");
+                let mut buffered = self
+                    .buffered
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(index) = buffered.find('\n') {
                     let mut text = buffered.drain(..index + 1).collect::<String>();
                     text.pop();
@@ -984,7 +980,10 @@ impl TextLineReader for NodeTextLineReader {
             abort_result(context, Some(&self.path))?;
             let decoded = if read == 0 {
                 self.ended.store(true, Ordering::SeqCst);
-                self.decoder.lock().expect("decoder").finish()
+                self.decoder
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .finish()
             } else {
                 self.decoder
                     .lock()
@@ -1525,11 +1524,26 @@ impl FileSystem for NodeExecutionEnv {
     ) -> Result<String, FileError> {
         abort_result(context, None)?;
         let prefix = prefix.unwrap_or("tmp-");
-        let path = std::env::temp_dir().join(format!("{prefix}{}", random_token()));
-        tokio::fs::create_dir_all(&path)
-            .await
-            .map_err(|error| to_file_error(&error, Some(&path.to_string_lossy())))?;
-        Ok(path.to_string_lossy().into_owned())
+        for _ in 0..8 {
+            let path = std::env::temp_dir().join(format!("{prefix}{}", random_token()));
+            let mut builder = tokio::fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&path).await {
+                Ok(()) => return Ok(path.to_string_lossy().into_owned()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(to_file_error(&error, Some(&path.to_string_lossy())));
+                }
+            }
+        }
+        Err(to_file_error(
+            &std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique temp directory",
+            ),
+            None,
+        ))
     }
 
     async fn create_temp_file(
@@ -1539,16 +1553,32 @@ impl FileSystem for NodeExecutionEnv {
     ) -> Result<String, FileError> {
         let directory = self.create_temp_dir(Some("tmp-"), context).await?;
         let options = options.unwrap_or_default();
-        let path = Path::new(&directory).join(format!(
-            "{}{}{}",
-            options.prefix.unwrap_or_default(),
-            random_token(),
-            options.suffix.unwrap_or_default()
-        ));
-        tokio::fs::write(&path, b"")
-            .await
-            .map_err(|error| to_file_error(&error, Some(&path.to_string_lossy())))?;
-        Ok(path.to_string_lossy().into_owned())
+        for _ in 0..8 {
+            let path = Path::new(&directory).join(format!(
+                "{}{}{}",
+                options.prefix.as_deref().unwrap_or_default(),
+                random_token(),
+                options.suffix.as_deref().unwrap_or_default()
+            ));
+            let mut open = tokio::fs::OpenOptions::new();
+            open.write(true).create_new(true);
+            #[cfg(unix)]
+            open.mode(0o600);
+            match open.open(&path).await {
+                Ok(_) => return Ok(path.to_string_lossy().into_owned()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(to_file_error(&error, Some(&path.to_string_lossy())));
+                }
+            }
+        }
+        Err(to_file_error(
+            &std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique temp file",
+            ),
+            None,
+        ))
     }
 
     async fn cleanup(&self, _context: &Context) {

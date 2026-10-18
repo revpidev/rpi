@@ -76,6 +76,7 @@ pub struct ControlledStorage {
     commit_gate: Mutex<Option<Arc<Held>>>,
     find_gate: Mutex<Option<Arc<Held>>>,
     commit_failure: Mutex<Option<StorageError>>,
+    close_failure: Mutex<Option<StorageError>>,
 }
 
 impl Default for ControlledStorage {
@@ -95,6 +96,7 @@ impl ControlledStorage {
             commit_gate: Mutex::new(None),
             find_gate: Mutex::new(None),
             commit_failure: Mutex::new(None),
+            close_failure: Mutex::new(None),
         }
     }
 
@@ -115,6 +117,11 @@ impl ControlledStorage {
     /// Inject one commit failure.
     pub fn fail_next_commit(&self, error: StorageError) {
         *self.commit_failure.lock().expect("failure") = Some(error);
+    }
+
+    /// Inject one close failure.
+    pub fn fail_next_close(&self, error: StorageError) {
+        *self.close_failure.lock().expect("close failure") = Some(error);
     }
 
     /// Every committed batch, most recent last.
@@ -288,6 +295,9 @@ impl Storage for ControlledStorage {
     }
 
     async fn close(&self, context: &Context) -> StorageResult<()> {
+        if let Some(error) = self.close_failure.lock().expect("close failure").take() {
+            return Err(error);
+        }
         self.inner.close(context).await
     }
 }

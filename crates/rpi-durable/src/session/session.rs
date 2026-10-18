@@ -66,6 +66,31 @@ fn error_future<'a, T>(error: SessionError) -> SessionFuture<'a, T> {
     Box::pin(async move { Err(error) })
 }
 
+/// Reset an atomic flag when dropped unless disarmed. Close paths use this so a
+/// cancelled or failed await leaves the resource retryable.
+struct ResetOnDrop<'a> {
+    flag: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> ResetOnDrop<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        Self { flag, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResetOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 /// A conversation document's current incarnation and value, resolved on the line
 /// (upstream `conversation_document_on_line`).
 #[derive(Debug, Clone)]
@@ -145,14 +170,13 @@ impl SessionImpl {
     }
 
     pub(crate) fn evict(&self, address_id: &str, record_id: DocumentId) {
-        if let Ok(mut documents) = self.documents.lock() {
-            if documents
+        if let Ok(mut documents) = self.documents.lock()
+            && documents
                 .get(address_id)
                 .map(|document| document.record.id == record_id)
                 .unwrap_or(false)
-            {
-                documents.remove(address_id);
-            }
+        {
+            documents.remove(address_id);
         }
     }
 
@@ -164,15 +188,15 @@ impl SessionImpl {
         context: &Context,
     ) -> SessionResult<Option<Arc<LoadedDocument>>> {
         let cached = self.cached(address_id);
-        if let Some(cached) = &cached {
-            if cached.value_version == definition.version {
-                return Ok(Some(Arc::clone(cached)));
-            }
+        if let Some(cached) = &cached
+            && cached.value_version == definition.version
+        {
+            return Ok(Some(Arc::clone(cached)));
         }
-        if cached.is_some() {
-            if let Ok(mut documents) = self.documents.lock() {
-                documents.remove(address_id);
-            }
+        if cached.is_some()
+            && let Ok(mut documents) = self.documents.lock()
+        {
+            documents.remove(address_id);
         }
         let record = self
             .storage
@@ -391,12 +415,12 @@ impl SessionImpl {
         address: DocumentAddress,
         context: &Context,
     ) -> SessionResult<Option<JsonObject>> {
-        if let Some(cached) = self.cached(&address_id) {
-            if cached.value_version == definition.version {
-                check_record_scope_record(definition, &cached.record)?;
-                check_record_version_record(definition, &cached.record, cached.stored_version())?;
-                return Ok(cached.tracker.value().as_object().cloned());
-            }
+        if let Some(cached) = self.cached(&address_id)
+            && cached.value_version == definition.version
+        {
+            check_record_scope_record(definition, &cached.record)?;
+            check_record_version_record(definition, &cached.record, cached.stored_version())?;
+            return Ok(cached.tracker.value().as_object().cloned());
         }
         let _guard = self.line.lock().await;
         self.assert_healthy()?;
@@ -706,15 +730,21 @@ impl SessionImpl {
         let context = without_abort_signal(context);
         Box::pin(async move {
             let _guard = this.line.lock().await;
-            if !this.cleanup_done.swap(true, Ordering::SeqCst) {
-                if let Ok(mut documents) = this.documents.lock() {
-                    documents.clear();
-                }
-                if let Ok(mut listeners) = this.commit_listeners.lock() {
-                    listeners.clear();
-                }
-                this.storage.close(&context).await?;
+            if this.cleanup_done.swap(true, Ordering::SeqCst) {
+                return Ok(());
             }
+            // If closing is cancelled or fails, the flag must go back to
+            // false so a later close can retry (the old code left the
+            // session permanently "cleaned up" without a closed storage).
+            let mut reset = ResetOnDrop::new(&this.cleanup_done);
+            if let Ok(mut documents) = this.documents.lock() {
+                documents.clear();
+            }
+            if let Ok(mut listeners) = this.commit_listeners.lock() {
+                listeners.clear();
+            }
+            this.storage.close(&context).await?;
+            reset.disarm();
             Ok(())
         })
     }

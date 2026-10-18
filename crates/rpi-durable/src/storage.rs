@@ -53,10 +53,10 @@ pub(crate) fn page_values<T>(
 /// Validate a caller cursor against the safe-integer ID space (upstream
 /// `cursorId`); document scans apply it directly instead of `scan_start`.
 pub(crate) fn validate_cursor(cursor: Option<&Cursor>) -> Result<(), crate::errors::StorageError> {
-    if let Some(cursor) = cursor {
-        if cursor.after > MAX_SAFE_INTEGER {
-            return Err(crate::errors::StorageError::InvalidCursor);
-        }
+    if let Some(cursor) = cursor
+        && cursor.after > MAX_SAFE_INTEGER
+    {
+        return Err(crate::errors::StorageError::InvalidCursor);
     }
     Ok(())
 }

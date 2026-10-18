@@ -1174,6 +1174,26 @@ async fn watch_close_is_terminal() {
     assert_eq!(watch.closed().await, WatchEnd::SessionClosed);
 }
 
+/// A failed Session::close must leave the cleanup flag retryable.
+#[tokio::test]
+async fn close_retries_after_a_storage_failure() {
+    let harness = open_test_session();
+    harness
+        .storage
+        .fail_next_close(StorageError::message("close failed once"));
+    let error = harness
+        .session
+        .close(&BACKGROUND_CONTEXT)
+        .await
+        .expect_err("first close must surface the storage error");
+    assert_eq!(error.to_string(), "close failed once");
+    harness
+        .session
+        .close(&BACKGROUND_CONTEXT)
+        .await
+        .expect("second close must retry and succeed");
+}
+
 /// session-watches.test.ts:353 cancellation is terminal.
 #[tokio::test]
 async fn watch_cancellation_is_terminal() {

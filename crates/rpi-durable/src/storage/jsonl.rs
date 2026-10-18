@@ -353,7 +353,11 @@ impl JsonlStorage {
                     StorageWrite::DocumentRetire { id } => {
                         MainOperation::DocumentRetire { id: *id }
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(StorageError::message(
+                            "unsupported write variant in the main-record branch",
+                        ));
+                    }
                 }),
                 StorageWrite::Task { value } => {
                     if matches!(value.state, crate::types::TaskState::Terminal { .. }) {
@@ -625,15 +629,14 @@ impl JsonlStorage {
                 .await?;
             let mut previous: Option<&SidecarRecord> = None;
             for line in &parsed.lines {
-                if let Some(previous) = previous {
-                    if line.value.seq < previous.seq
+                if let Some(previous) = previous
+                    && (line.value.seq < previous.seq
                         || (line.value.seq == previous.seq
-                            && line.value.ordinal <= previous.ordinal)
-                    {
-                        return Err(corruption(format!(
-                            "Sidecar records are out of order in {file}"
-                        )));
-                    }
+                            && line.value.ordinal <= previous.ordinal))
+                {
+                    return Err(corruption(format!(
+                        "Sidecar records are out of order in {file}"
+                    )));
                 }
                 previous = Some(&line.value);
                 record_by_key.insert(
@@ -810,13 +813,13 @@ impl JsonlStorage {
                             }
                             content = Some(payload_content.clone());
                         }
-                        if let Some(content) = &content {
-                            if !content.is_base() {
-                                return Err(corruption(format!(
-                                    "Document creation lacks a confirmed base in commit {}",
-                                    marker.seq
-                                )));
-                            }
+                        if let Some(content) = &content
+                            && !content.is_base()
+                        {
+                            return Err(corruption(format!(
+                                "Document creation lacks a confirmed base in commit {}",
+                                marker.seq
+                            )));
                         }
                         let content = match (reclaimed, content) {
                             (false, Some(content)) => content,
@@ -861,10 +864,8 @@ impl JsonlStorage {
                             }
                             content = Some(payload_content.clone());
                         }
-                        if !reclaimed {
-                            if let Some(content) = content {
-                                writes.push(StorageWrite::DocumentChange { id: *id, content });
-                            }
+                        if !reclaimed && let Some(content) = content {
+                            writes.push(StorageWrite::DocumentChange { id: *id, content });
                         }
                     }
                 }
@@ -960,14 +961,14 @@ impl JsonlStorage {
                     );
                 }
             }
-            if let Some(retained) = retained {
-                if retained.len() < confirmed_lines.len() || retained.is_empty() {
-                    let mut content = String::new();
-                    for line in &retained {
-                        content.push_str(&json_line(&line.value)?);
-                    }
-                    reclamations.push((file, content));
+            if let Some(retained) = retained
+                && (retained.len() < confirmed_lines.len() || retained.is_empty())
+            {
+                let mut content = String::new();
+                for line in &retained {
+                    content.push_str(&json_line(&line.value)?);
                 }
+                reclamations.push((file, content));
             }
         }
         self.reclaim_sidecars(&reclamations, context).await;

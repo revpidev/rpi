@@ -251,10 +251,10 @@ impl TaskGraphView {
     }
 
     async fn mount_value(self: &Arc<Self>, context: &Context) -> SessionResult<TaskGraph> {
-        if let Ok(guard) = self.mount.lock() {
-            if let Some(mount) = guard.as_ref() {
-                return Ok(mount.value.clone());
-            }
+        if let Ok(guard) = self.mount.lock()
+            && let Some(mount) = guard.as_ref()
+        {
+            return Ok(mount.value.clone());
         }
         let value = self.build(context).await?;
         let mut guard = self
@@ -411,15 +411,15 @@ fn advance(mount: &mut Mount, publication: &CommitPublication, context: &Context
     // commit finds the owner's node. Change order within a publication is
     // unspecified, so each owner's list is sorted again.
     for change in &publication.changes {
-        if let CommitChange::Table(StorageWrite::Conversation { value }) = change {
-            if let Some(owner) = &value.owner {
-                let key = owner.task_id.get().to_string();
-                if let Some(node) = next.tasks.get_mut(&key) {
-                    if !node.conversations.contains(&value.id) {
-                        node.conversations.push(value.id);
-                        node.conversations.sort();
-                    }
-                }
+        if let CommitChange::Table(StorageWrite::Conversation { value }) = change
+            && let Some(owner) = &value.owner
+        {
+            let key = owner.task_id.get().to_string();
+            if let Some(node) = next.tasks.get_mut(&key)
+                && !node.conversations.contains(&value.id)
+            {
+                node.conversations.push(value.id);
+                node.conversations.sort();
             }
         }
     }

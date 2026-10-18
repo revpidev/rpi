@@ -74,10 +74,10 @@ pub async fn ensure_provider_session_id(
             context,
         )
         .await?;
-    if let Some(value) = existing {
-        if let Some(session_id) = value.get("sessionId").and_then(JsonValue::as_str) {
-            return Ok(session_id.to_string());
-        }
+    if let Some(value) = existing
+        && let Some(session_id) = value.get("sessionId").and_then(JsonValue::as_str)
+    {
+        return Ok(session_id.to_string());
     }
     let change: crate::session::CommitFn<Option<String>> =
         commit_fn(move |tx| -> SessionFuture<'_, Option<String>> {

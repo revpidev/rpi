@@ -564,10 +564,9 @@ impl SchedulerInner {
                     policy: JoinPolicy::FailFast,
                     ..
                 } = &record.state
+                    && let Ok(mut set) = self.fail_fast_checks.lock()
                 {
-                    if let Ok(mut set) = self.fail_fast_checks.lock() {
-                        set.insert(record.id);
-                    }
+                    set.insert(record.id);
                 }
             }
         }
@@ -780,10 +779,10 @@ impl SchedulerInner {
 
     fn seal(self: &Arc<Self>) {
         self.closing.store(true, Ordering::SeqCst);
-        if let Ok(mut slot) = self.unsubscribe_registry.lock() {
-            if let Some(subscription) = slot.take() {
-                subscription.unsubscribe();
-            }
+        if let Ok(mut slot) = self.unsubscribe_registry.lock()
+            && let Some(subscription) = slot.take()
+        {
+            subscription.unsubscribe();
         }
         self.task_waiters.reject_all(closed_error());
         self.idle_waiters.reject_all(closed_error());
@@ -835,10 +834,8 @@ impl SchedulerInner {
                     .lock()
                     .map(|owners| owners.contains(&record.id))
                     .unwrap_or(false);
-                if is_owner {
-                    if let Ok(mut settled) = self.settled.lock() {
-                        settled.insert(record.id, node_of(record));
-                    }
+                if is_owner && let Ok(mut settled) = self.settled.lock() {
+                    settled.insert(record.id, node_of(record));
                 }
                 self.task_waiters
                     .resolve(record.id, settled_task(record.clone()));
@@ -857,10 +854,9 @@ impl SchedulerInner {
                     .lock()
                     .ok()
                     .and_then(|map| map.get(&record.id).cloned())
+                    && invocation.mode == InvocationMode::Run
                 {
-                    if invocation.mode == InvocationMode::Run {
-                        invocation.controller.cancel();
-                    }
+                    invocation.controller.cancel();
                 }
             }
             let was_completing = previous
@@ -881,13 +877,12 @@ impl SchedulerInner {
                 policy: JoinPolicy::FailFast,
                 ..
             } = &record.state
+                && !was_waiting
             {
-                if !was_waiting {
-                    if let Ok(mut set) = self.fail_fast_checks.lock() {
-                        set.insert(record.id);
-                    }
-                    self.schedule_reconcile();
+                if let Ok(mut set) = self.fail_fast_checks.lock() {
+                    set.insert(record.id);
                 }
+                self.schedule_reconcile();
             }
             if let Ok(mut live) = self.live.lock() {
                 live.insert(record.id, record.clone());
@@ -906,13 +901,12 @@ impl SchedulerInner {
                     policy: JoinPolicy::FailFast,
                     ..
                 } = &record.state
+                    && on.contains(&id)
                 {
-                    if on.contains(&id) {
-                        if let Ok(mut set) = self.fail_fast_checks.lock() {
-                            set.insert(record.id);
-                        }
-                        self.schedule_reconcile();
+                    if let Ok(mut set) = self.fail_fast_checks.lock() {
+                        set.insert(record.id);
                     }
+                    self.schedule_reconcile();
                 }
             }
         }
@@ -987,10 +981,10 @@ impl SchedulerInner {
                     kept.idle_since = None;
                 }
             } else if retention > 0.0 {
-                if let Some(kept) = contexts.get_mut(&id) {
-                    if kept.idle_since.is_none() {
-                        kept.idle_since = Some(now);
-                    }
+                if let Some(kept) = contexts.get_mut(&id)
+                    && kept.idle_since.is_none()
+                {
+                    kept.idle_since = Some(now);
                 }
             } else {
                 contexts.remove(&id);
@@ -1097,13 +1091,12 @@ impl SchedulerInner {
                     .lock()
                     .ok()
                     .and_then(|live| live.get(&member).cloned());
-                if let Some(record) = member {
-                    if !failed_outcome(&record)
-                        && !record.abort_requested
-                        && marked.insert(record.id)
-                    {
-                        marks.push(record);
-                    }
+                if let Some(record) = member
+                    && !failed_outcome(&record)
+                    && !record.abort_requested
+                    && marked.insert(record.id)
+                {
+                    marks.push(record);
                 }
             }
         }
@@ -1232,10 +1225,10 @@ impl SchedulerInner {
                                 return Ok(());
                             };
                             let node = node_of(&record);
-                            if matches!(record.state, TaskState::Terminal { .. }) {
-                                if let Ok(mut settled) = self.settled.lock() {
-                                    settled.insert(record.id, node.clone());
-                                }
+                            if matches!(record.state, TaskState::Terminal { .. })
+                                && let Ok(mut settled) = self.settled.lock()
+                            {
+                                settled.insert(record.id, node.clone());
                             }
                             node
                         }
@@ -1264,10 +1257,10 @@ impl SchedulerInner {
         if let Ok(mut edges) = self.edges.lock() {
             edges.insert(conversation_id, owner);
         }
-        if let Some(owner) = owner {
-            if let Ok(mut owners) = self.conversation_owners.lock() {
-                owners.insert(owner);
-            }
+        if let Some(owner) = owner
+            && let Ok(mut owners) = self.conversation_owners.lock()
+        {
+            owners.insert(owner);
         }
     }
 
@@ -1276,10 +1269,10 @@ impl SchedulerInner {
         id: ConversationId,
         overlay: Option<&Overlay>,
     ) -> Option<Option<TaskId>> {
-        if let Some(overlay) = overlay {
-            if let Some(edge) = overlay.edges.get(&id) {
-                return Some(*edge);
-            }
+        if let Some(overlay) = overlay
+            && let Some(edge) = overlay.edges.get(&id)
+        {
+            return Some(*edge);
         }
         self.edges
             .lock()
@@ -1288,10 +1281,10 @@ impl SchedulerInner {
     }
 
     fn node(self: &Arc<Self>, id: TaskId, overlay: Option<&Overlay>) -> Option<TaskNode> {
-        if let Some(overlay) = overlay {
-            if let Some(record) = overlay.tasks.get(&id) {
-                return Some(node_of(record));
-            }
+        if let Some(overlay) = overlay
+            && let Some(record) = overlay.tasks.get(&id)
+        {
+            return Some(node_of(record));
         }
         if let Some(record) = self
             .live
@@ -1406,10 +1399,10 @@ impl SchedulerInner {
             match step {
                 Step::Unknown => return None,
                 Step::Conversation(id) => {
-                    if let Scope::Conversation(wanted) = scope {
-                        if id == *wanted {
-                            return Some(true);
-                        }
+                    if let Scope::Conversation(wanted) = scope
+                        && id == *wanted
+                    {
+                        return Some(true);
                     }
                 }
                 Step::Task(_, node) => {
@@ -1500,10 +1493,10 @@ impl SchedulerInner {
             Ok(())
         }
         .await;
-        if let Err(error) = result {
-            if !self.closing.load(Ordering::SeqCst) {
-                (self.report)(error.to_string());
-            }
+        if let Err(error) = result
+            && !self.closing.load(Ordering::SeqCst)
+        {
+            (self.report)(error.to_string());
         }
         self.draining.store(false, Ordering::SeqCst);
         // A wakeup that arrived during a failed pass still needs its pass.
@@ -1719,13 +1712,13 @@ impl SchedulerInner {
             .lock()
             .ok()
             .and_then(|map| map.get(&record.id).cloned());
-        if let Some((failed_task, error)) = failed {
-            if Arc::ptr_eq(&failed_task, &task) {
-                return Fit::Blocked {
-                    reason: BlockedReason::MigrationFailed,
-                    error: Some(error),
-                };
-            }
+        if let Some((failed_task, error)) = failed
+            && Arc::ptr_eq(&failed_task, &task)
+        {
+            return Fit::Blocked {
+                reason: BlockedReason::MigrationFailed,
+                error: Some(error),
+            };
         }
         Fit::Ready {
             task,
@@ -1897,15 +1890,13 @@ impl SchedulerInner {
                     .map(|next| Arc::ptr_eq(next, task))
                     .unwrap_or(false);
                 if !same {
-                    if let Some(next) = &next {
-                        if can_reserve(next, &current.record) {
-                            if let Some(checkpoint) = current.checkpoint().cloned() {
-                                let next =
-                                    with_state(&current.record, TaskState::Pending { checkpoint });
-                                tx.set_task(next)?;
-                                return Ok(Decision::End);
-                            }
-                        }
+                    if let Some(next) = &next
+                        && can_reserve(next, &current.record)
+                        && let Some(checkpoint) = current.checkpoint().cloned()
+                    {
+                        let next = with_state(&current.record, TaskState::Pending { checkpoint });
+                        tx.set_task(next)?;
+                        return Ok(Decision::End);
                     }
                     let already = {
                         let reported = reported.lock().map_err(|_| {
@@ -1971,20 +1962,20 @@ impl SchedulerInner {
                             return Ok(current);
                         }
                         this.end(&inv);
-                        if let Decision::Fault(message) = decision {
-                            if let Some(current) = &current {
-                                this.terminate(
-                                    tx,
-                                    &current.record,
-                                    TaskOutcome::Faulted {
-                                        error: TaskOutcomeError {
-                                            message,
-                                            detail: None,
-                                        },
+                        if let Decision::Fault(message) = decision
+                            && let Some(current) = &current
+                        {
+                            this.terminate(
+                                tx,
+                                &current.record,
+                                TaskOutcome::Faulted {
+                                    error: TaskOutcomeError {
+                                        message,
+                                        detail: None,
                                     },
-                                )
-                                .await?;
-                            }
+                                },
+                            )
+                            .await?;
                         }
                         Ok(None)
                     })
@@ -2699,42 +2690,43 @@ impl TaskRuntime for InvocationRuntime {
             previous,
         )
         .await?;
-        if let Some(range) = range {
-            if !inner.closing.load(Ordering::SeqCst) && !invocation.ended.load(Ordering::SeqCst) {
-                let should_keep = inner
-                    .contexts
-                    .lock()
-                    .ok()
-                    .map(|contexts| {
-                        contexts
-                            .get(&conversation_id)
-                            .map(|kept| kept.range.bounds.tail <= range.bounds.tail)
-                            .unwrap_or(true)
-                    })
-                    .unwrap_or(false);
-                if should_keep {
-                    let idle = inner.idle(Some(conversation_id));
-                    if !idle {
-                        if let Ok(mut contexts) = inner.contexts.lock() {
-                            contexts.insert(
-                                conversation_id,
-                                KeptContext {
-                                    range,
-                                    idle_since: None,
-                                },
-                            );
-                        }
-                    } else if inner.settings.context_retention_ms > 0 {
-                        let now = (inner.now)();
-                        if let Ok(mut contexts) = inner.contexts.lock() {
-                            contexts.insert(
-                                conversation_id,
-                                KeptContext {
-                                    range,
-                                    idle_since: Some(now),
-                                },
-                            );
-                        }
+        if let Some(range) = range
+            && !inner.closing.load(Ordering::SeqCst)
+            && !invocation.ended.load(Ordering::SeqCst)
+        {
+            let should_keep = inner
+                .contexts
+                .lock()
+                .ok()
+                .map(|contexts| {
+                    contexts
+                        .get(&conversation_id)
+                        .map(|kept| kept.range.bounds.tail <= range.bounds.tail)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(false);
+            if should_keep {
+                let idle = inner.idle(Some(conversation_id));
+                if !idle {
+                    if let Ok(mut contexts) = inner.contexts.lock() {
+                        contexts.insert(
+                            conversation_id,
+                            KeptContext {
+                                range,
+                                idle_since: None,
+                            },
+                        );
+                    }
+                } else if inner.settings.context_retention_ms > 0 {
+                    let now = (inner.now)();
+                    if let Ok(mut contexts) = inner.contexts.lock() {
+                        contexts.insert(
+                            conversation_id,
+                            KeptContext {
+                                range,
+                                idle_since: Some(now),
+                            },
+                        );
                     }
                 }
             }

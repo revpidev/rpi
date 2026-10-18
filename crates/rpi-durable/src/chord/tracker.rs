@@ -195,7 +195,10 @@ impl Tracker {
 
     /// Open a change over the current value.
     pub fn begin_change(&self) -> Change {
-        let inner = self.inner.lock().expect("tracker lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Change {
             base: inner.value.clone(),
             base_revision: inner.revision,
@@ -206,7 +209,10 @@ impl Tracker {
 
     /// Prepare a root replacement (upstream `prepareReplace`).
     pub fn prepare_replace(&self, value: JsonValue) -> Prepared {
-        let inner = self.inner.lock().expect("tracker lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Prepared {
             base: inner.value.clone(),
             value: value.clone(),
@@ -219,7 +225,10 @@ impl Tracker {
     /// Adopt one prepared change. Fails when the change is stale or belongs to
     /// a revision the tracker has already moved past.
     pub fn adopt(&self, prepared: Prepared) -> Result<(), DeltaError> {
-        let mut inner = self.inner.lock().expect("tracker lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if prepared.base_revision != inner.revision || prepared.base != inner.value {
             prepared.cell.revoke();
             return Err(DeltaError::Invalid("Prepared change is stale".to_string()));

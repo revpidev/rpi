@@ -32,13 +32,13 @@ pub fn scan_start(
         return Err(StorageError::InvalidCursor);
     }
     let order = cursor.order.unwrap_or(fallback);
-    if let Some(requested) = requested {
-        if requested != order {
-            return Err(StorageError::CursorOrder {
-                stored: scan_order_text(order).to_string(),
-                requested: scan_order_text(requested).to_string(),
-            });
-        }
+    if let Some(requested) = requested
+        && requested != order
+    {
+        return Err(StorageError::CursorOrder {
+            stored: scan_order_text(order).to_string(),
+            requested: scan_order_text(requested).to_string(),
+        });
     }
     Ok(ScanStart {
         order,

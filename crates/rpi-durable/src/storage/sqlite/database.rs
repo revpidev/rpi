@@ -181,10 +181,10 @@ impl Worker {
         if self.sender.send(Job::Close(ack)).is_ok() {
             let _ = wait.blocking_recv();
         }
-        if let Ok(mut handle) = self.handle.lock() {
-            if let Some(handle) = handle.take() {
-                let _ = handle.join();
-            }
+        if let Ok(mut handle) = self.handle.lock()
+            && let Some(handle) = handle.take()
+        {
+            let _ = handle.join();
         }
     }
 
@@ -198,6 +198,88 @@ impl Worker {
         })))?;
         rx.recv()
             .map_err(|_| StorageError::Closed("SQLite database"))?
+    }
+
+    /// Queue a ROLLBACK without waiting for it. Used by [`RollbackGuard`] when
+    /// a transaction future is dropped before COMMIT/ROLLBACK. The worker is
+    /// FIFO, so the rollback runs after every statement the callback already
+    /// queued and before the next operation can acquire the access mutex.
+    fn rollback_now(&self, broken: Arc<AtomicBool>) {
+        let broken_for_job = Arc::clone(&broken);
+        let sent = self.sender.send(Job::Run(Box::new(move |conn| {
+            let failed = conn.execute_batch("ROLLBACK").is_err();
+            // "no transaction is active" after a callback escaped with its
+            // own COMMIT is benign: the connection is still usable.
+            if failed && !conn.is_autocommit() {
+                broken_for_job.store(true, Ordering::SeqCst);
+            }
+        })));
+        if sent.is_err() {
+            broken.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Reset an atomic flag when dropped unless disarmed. Close paths use this so
+/// a cancelled or failed await leaves the resource retryable instead of
+/// permanently marked done.
+struct ResetOnDrop<'a> {
+    flag: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> ResetOnDrop<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        Self { flag, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResetOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// RAII rollback for `SqliteDatabase::transaction`.
+///
+/// Declared after the access-mutex guard so its `Drop` runs first: the
+/// ROLLBACK job is queued while the access mutex is still held, therefore no
+/// later operation can observe/continue the open transaction.
+struct RollbackGuard {
+    worker: Arc<Worker>,
+    active: Arc<AtomicBool>,
+    broken: Arc<AtomicBool>,
+    settled: bool,
+}
+
+impl RollbackGuard {
+    fn new(worker: Arc<Worker>, active: Arc<AtomicBool>, broken: Arc<AtomicBool>) -> Self {
+        Self {
+            worker,
+            active,
+            broken,
+            settled: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for RollbackGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.active.store(false, Ordering::SeqCst);
+        self.worker.rollback_now(Arc::clone(&self.broken));
     }
 }
 
@@ -239,6 +321,11 @@ impl SqliteExecutor {
             }
         })
         .await
+    }
+
+    /// Whether the connection is outside an explicit transaction.
+    pub async fn is_autocommit(&self) -> StorageResult<bool> {
+        self.with_connection(|conn| Ok(conn.is_autocommit())).await
     }
 
     /// Execute one statement with positional bindings.
@@ -398,6 +485,9 @@ struct DbInner {
     executor: SqliteExecutor,
     access: tokio::sync::Mutex<()>,
     closed: AtomicBool,
+    /// Set when a transaction could not be rolled back. The connection state
+    /// is unknown, so every later operation must be rejected until reopen.
+    broken: Arc<AtomicBool>,
 }
 
 impl SqliteDatabase {
@@ -407,12 +497,11 @@ impl SqliteDatabase {
             .wal_auto_checkpoint_pages
             .unwrap_or(DEFAULT_WAL_AUTO_CHECKPOINT_PAGES);
         let timeout = options.busy_timeout_ms.unwrap_or(DEFAULT_BUSY_TIMEOUT_MS);
-        if path != ":memory:" {
-            if let Some(parent) = Path::new(path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
+        if path != ":memory:"
+            && let Some(parent) = Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let path = path.to_string();
         let (sender, receiver) = std::sync::mpsc::channel::<Job>();
@@ -469,6 +558,7 @@ impl SqliteDatabase {
                 executor: SqliteExecutor { worker },
                 access: tokio::sync::Mutex::new(()),
                 closed: AtomicBool::new(false),
+                broken: Arc::new(AtomicBool::new(false)),
             }),
         })
     }
@@ -483,6 +573,12 @@ impl SqliteDatabase {
     fn assert_open(&self) -> StorageResult<()> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(StorageError::Closed("SQLite database"));
+        }
+        if self.inner.broken.load(Ordering::SeqCst) {
+            return Err(StorageError::Message(
+                "SQLite database is poisoned after a failed transaction rollback; reopen it"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -602,6 +698,13 @@ impl SqliteDatabase {
             },
             active: Arc::clone(&active),
         };
+        // Declared after `_guard`: on cancellation this guard drops before the
+        // access mutex, so ROLLBACK is queued before another operation runs.
+        let mut rollback = RollbackGuard::new(
+            Arc::clone(&self.inner.executor.worker),
+            Arc::clone(&active),
+            Arc::clone(&self.inner.broken),
+        );
         let outcome = IN_TRANSACTION
             .scope(std::cell::Cell::new(true), async move {
                 callback(transaction).await
@@ -612,21 +715,40 @@ impl SqliteDatabase {
             Ok(value) => {
                 if let Err(commit_error) = self.inner.executor.exec("COMMIT").await {
                     return match self.inner.executor.exec("ROLLBACK").await {
-                        Ok(()) => Err(commit_error),
-                        Err(rollback_error) => Err(StorageError::RollbackFailed {
-                            callback: Box::new(commit_error),
-                            rollback: Box::new(rollback_error),
-                        }),
+                        Ok(()) => {
+                            rollback.disarm();
+                            Err(commit_error)
+                        }
+                        Err(rollback_error) => {
+                            rollback.disarm();
+                            if !self.inner.executor.is_autocommit().await.unwrap_or(false) {
+                                self.inner.broken.store(true, Ordering::SeqCst);
+                            }
+                            Err(StorageError::RollbackFailed {
+                                callback: Box::new(commit_error),
+                                rollback: Box::new(rollback_error),
+                            })
+                        }
                     };
                 }
+                rollback.disarm();
                 Ok(value)
             }
             Err(callback_error) => match self.inner.executor.exec("ROLLBACK").await {
-                Ok(()) => Err(callback_error),
-                Err(rollback_error) => Err(StorageError::RollbackFailed {
-                    callback: Box::new(callback_error),
-                    rollback: Box::new(rollback_error),
-                }),
+                Ok(()) => {
+                    rollback.disarm();
+                    Err(callback_error)
+                }
+                Err(rollback_error) => {
+                    rollback.disarm();
+                    if !self.inner.executor.is_autocommit().await.unwrap_or(false) {
+                        self.inner.broken.store(true, Ordering::SeqCst);
+                    }
+                    Err(StorageError::RollbackFailed {
+                        callback: Box::new(callback_error),
+                        rollback: Box::new(rollback_error),
+                    })
+                }
             },
         }
     }
@@ -642,10 +764,13 @@ impl SqliteDatabase {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // A cancelled/failed shutdown must leave close retryable.
+        let mut reset = ResetOnDrop::new(&self.inner.closed);
         let worker = Arc::clone(&self.inner.executor.worker);
         tokio::task::spawn_blocking(move || worker.shutdown())
             .await
             .map_err(|error| StorageError::message(format!("SQLite close failed: {error}")))?;
+        reset.disarm();
         Ok(())
     }
 }

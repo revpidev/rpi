@@ -26,7 +26,7 @@ fn cargo_metadata() -> Value {
 }
 
 #[test]
-fn crate_is_a_workspace_member_with_edition_2024_and_msrv_185() {
+fn crate_is_a_workspace_member_with_edition_2024_and_msrv_195() {
     let metadata = cargo_metadata();
     let packages = metadata["packages"].as_array().expect("packages");
     let durable = packages
@@ -34,7 +34,7 @@ fn crate_is_a_workspace_member_with_edition_2024_and_msrv_185() {
         .find(|package| package["name"] == "rpi-durable")
         .expect("rpi-durable package");
     assert_eq!(durable["edition"], "2024");
-    assert_eq!(durable["rust_version"], "1.85");
+    assert_eq!(durable["rust_version"], "1.95");
 }
 
 #[test]

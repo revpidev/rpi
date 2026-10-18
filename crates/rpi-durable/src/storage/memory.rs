@@ -264,10 +264,10 @@ fn apply_prepared_inner(
                         value.id,
                     );
                 } else if previous != Some(value.status()) {
-                    if let Some(previous) = previous {
-                        if let Some(ids) = inner.state.task_ids_by_status.get_mut(&previous) {
-                            remove_sorted(ids, value.id);
-                        }
+                    if let Some(previous) = previous
+                        && let Some(ids) = inner.state.task_ids_by_status.get_mut(&previous)
+                    {
+                        remove_sorted(ids, value.id);
                     }
                     insert_sorted(
                         inner
@@ -290,14 +290,13 @@ fn apply_prepared_inner(
                 let current_status = submission_status(value);
                 if let Some(previous) = &previous {
                     let previous_status = submission_status(previous);
-                    if previous_status != current_status {
-                        if let Some(ids) = inner
+                    if previous_status != current_status
+                        && let Some(ids) = inner
                             .state
                             .submission_ids_by_status
                             .get_mut(&previous_status)
-                        {
-                            remove_sorted(ids, value.id());
-                        }
+                    {
+                        remove_sorted(ids, value.id());
                     }
                 } else {
                     insert_sorted(&mut inner.state.submission_ids, value.id());
@@ -310,22 +309,22 @@ fn apply_prepared_inner(
                         .or_default(),
                     value.id(),
                 );
-                if let Some(previous) = &previous {
-                    if let Some(request_id) = previous.request_id() {
-                        let conversation = previous.conversation_id();
-                        let remove_conversation = if let Some(requests) =
-                            inner.state.submission_ids_by_request.get_mut(&conversation)
-                        {
-                            if requests.get(request_id) == Some(&value.id()) {
-                                requests.remove(request_id);
-                            }
-                            requests.is_empty()
-                        } else {
-                            false
-                        };
-                        if remove_conversation {
-                            inner.state.submission_ids_by_request.remove(&conversation);
+                if let Some(previous) = &previous
+                    && let Some(request_id) = previous.request_id()
+                {
+                    let conversation = previous.conversation_id();
+                    let remove_conversation = if let Some(requests) =
+                        inner.state.submission_ids_by_request.get_mut(&conversation)
+                    {
+                        if requests.get(request_id) == Some(&value.id()) {
+                            requests.remove(request_id);
                         }
+                        requests.is_empty()
+                    } else {
+                        false
+                    };
+                    if remove_conversation {
+                        inner.state.submission_ids_by_request.remove(&conversation);
                     }
                 }
                 inner.state.submissions.insert(value.id(), value.clone());
@@ -470,19 +469,19 @@ fn check_global_ids(state: &State, writes: &[StorageWrite]) -> StorageResult<()>
                 )));
             }
         } else {
-            if let Some(existing) = existing {
-                if existing != table {
-                    return Err(StorageError::message(format!(
-                        "ID {id} already belongs to {existing}"
-                    )));
-                }
+            if let Some(existing) = existing
+                && existing != table
+            {
+                return Err(StorageError::message(format!(
+                    "ID {id} already belongs to {existing}"
+                )));
             }
-            if let Some(earlier) = earlier {
-                if earlier != table {
-                    return Err(StorageError::message(format!(
-                        "ID {id} is written as two record types"
-                    )));
-                }
+            if let Some(earlier) = earlier
+                && earlier != table
+            {
+                return Err(StorageError::message(format!(
+                    "ID {id} is written as two record types"
+                )));
             }
         }
         claimed.insert(id, table);
@@ -541,7 +540,11 @@ fn prepare_document_actions(
                 }
                 action.retire = true;
             }
-            _ => unreachable!(),
+            _ => {
+                return Err(StorageError::message(
+                    "unsupported write variant in the document-action branch",
+                ));
+            }
         }
     }
     Ok(actions)
@@ -562,10 +565,10 @@ fn check_document_actions(
                 "Document {id} already exists"
             )));
         }
-        if let Some(existing) = existing {
-            if existing.record.retired_at.is_some() {
-                return Err(StorageError::message(format!("Document {id} is retired")));
-            }
+        if let Some(existing) = existing
+            && existing.record.retired_at.is_some()
+        {
+            return Err(StorageError::message(format!("Document {id} is retired")));
         }
         let previous = existing.and_then(|stored| stored.revisions.last());
         if let Some(DocumentContent::Delta { version, .. }) = &action.content {
@@ -669,11 +672,12 @@ fn apply_document_actions(state: &mut State, actions: &[(DocumentId, DocumentAct
                 stored.revisions.clear();
             }
         }
-        if let Some(create) = &action.create {
-            if action.retire && is_current_only_create(create) {
-                let stored = state.documents.get_mut(&id).expect("checked above");
-                stored.revisions.clear();
-            }
+        if let Some(create) = &action.create
+            && action.retire
+            && is_current_only_create(create)
+        {
+            let stored = state.documents.get_mut(&id).expect("checked above");
+            stored.revisions.clear();
         }
         if action.create.is_some() || action.retire {
             let stored = state.documents.get(&id).expect("checked above");
@@ -726,10 +730,15 @@ fn materialize_document(
     };
     let base = revisions[base_index];
     let version = base.content.version();
-    let base_value = match &base.content {
-        DocumentContent::Base { value, .. } => value.clone(),
-        DocumentContent::Delta { .. } => unreachable!("rposition base"),
+    let DocumentContent::Base {
+        value: base_value, ..
+    } = &base.content
+    else {
+        return Err(StorageError::message(format!(
+            "Document {id} base revision is not a base"
+        )));
     };
+    let base_value = base_value.clone();
     let mut batches: Vec<&[Op]> = Vec::new();
     let mut owned: Vec<Vec<Op>> = Vec::new();
     for revision in &revisions[base_index + 1..] {
@@ -785,10 +794,10 @@ fn visible_entries(
         let end = ids.partition_point(|id| id.get() <= upper);
         for index in (0..end).rev() {
             let id = ids[index];
-            if let Some(min) = min_entry_id {
-                if id.get() < min {
-                    break;
-                }
+            if let Some(min) = min_entry_id
+                && id.get() < min
+            {
+                break;
             }
             values.push(state.entries.get(&id).expect("indexed entry").clone());
         }
@@ -797,10 +806,10 @@ fn visible_entries(
             break;
         };
         upper = upper.min(parent.at.get());
-        if let Some(min) = min_entry_id {
-            if upper < min {
-                break;
-            }
+        if let Some(min) = min_entry_id
+            && upper < min
+        {
+            break;
         }
         current_id = parent.conversation_id;
     }
@@ -826,10 +835,10 @@ fn visible_entries_ascending(
             break;
         };
         upper = upper.min(parent.at.get());
-        if let Some(min) = min_entry_id {
-            if upper < min {
-                break;
-            }
+        if let Some(min) = min_entry_id
+            && upper < min
+        {
+            break;
         }
         current_id = parent.conversation_id;
     }
@@ -917,10 +926,10 @@ impl Storage for MemoryStorage {
                 .conversations
                 .get(&ids[index])
                 .expect("indexed conversation");
-            if let Some(owner) = query.owner_conversation_id {
-                if value.owner.as_ref().map(|edge| edge.conversation_id) != Some(owner) {
-                    continue;
-                }
+            if let Some(owner) = query.owner_conversation_id
+                && value.owner.as_ref().map(|edge| edge.conversation_id) != Some(owner)
+            {
+                continue;
             }
             values.push(value.clone());
         }
@@ -1102,25 +1111,25 @@ impl Storage for MemoryStorage {
                 break;
             }
             let value = inner.state.tasks.get(&ids[index]).expect("indexed task");
-            if let Some(conversation) = query.conversation_id {
-                if value.conversation_id != conversation {
-                    continue;
-                }
+            if let Some(conversation) = query.conversation_id
+                && value.conversation_id != conversation
+            {
+                continue;
             }
-            if let Some(kind) = &query.kind {
-                if &value.kind != kind {
-                    continue;
-                }
+            if let Some(kind) = &query.kind
+                && &value.kind != kind
+            {
+                continue;
             }
-            if let Some(abort_requested) = query.abort_requested {
-                if value.abort_requested != abort_requested {
-                    continue;
-                }
+            if let Some(abort_requested) = query.abort_requested
+                && value.abort_requested != abort_requested
+            {
+                continue;
             }
-            if let Some(background) = query.background {
-                if value.background != background {
-                    continue;
-                }
+            if let Some(background) = query.background
+                && value.background != background
+            {
+                continue;
             }
             values.push(value.clone());
         }
@@ -1171,10 +1180,10 @@ impl Storage for MemoryStorage {
                 .submissions
                 .get(&ids[index])
                 .expect("indexed submission");
-            if let Some(conversation) = query.conversation_id {
-                if value.conversation_id() != conversation {
-                    continue;
-                }
+            if let Some(conversation) = query.conversation_id
+                && value.conversation_id() != conversation
+            {
+                continue;
             }
             values.push(value.clone());
         }
@@ -1280,10 +1289,10 @@ impl Storage for MemoryStorage {
                 .expect("indexed document")
                 .record;
             index += 1;
-            if let Some(kind) = &query.kind {
-                if &record.kind != kind {
-                    continue;
-                }
+            if let Some(kind) = &query.kind
+                && &record.kind != kind
+            {
+                continue;
             }
             if is_alive_at(record, query.at) {
                 values.push(record.clone());

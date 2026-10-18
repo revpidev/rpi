@@ -320,10 +320,10 @@ pub fn resolve_agent(
             let mut selected = Vec::new();
             let mut seen: HashSet<&String> = HashSet::new();
             for name in list {
-                if seen.insert(name) {
-                    if let Some((_, tool)) = composed.iter().find(|(key, _)| key == name) {
-                        selected.push(tool.clone());
-                    }
+                if seen.insert(name)
+                    && let Some((_, tool)) = composed.iter().find(|(key, _)| key == name)
+                {
+                    selected.push(tool.clone());
                 }
             }
             selected
@@ -404,10 +404,10 @@ pub fn select_extensions(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut extensions = Vec::new();
     for name in selected {
-        if seen.insert(name.clone()) {
-            if let Some(extension) = snapshot.extension(&name) {
-                extensions.push(extension);
-            }
+        if seen.insert(name.clone())
+            && let Some(extension) = snapshot.extension(&name)
+        {
+            extensions.push(extension);
         }
     }
     extensions

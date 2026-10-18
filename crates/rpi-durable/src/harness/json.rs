@@ -58,17 +58,16 @@ fn assign_slot(current: &mut JsonValue, value: JsonValue) {
     }
     if let (JsonValue::Array(current_items), JsonValue::Array(value_items)) =
         (&mut *current, &value)
+        && current_items.len() <= value_items.len()
     {
-        if current_items.len() <= value_items.len() {
-            for (index, child) in value_items.iter().enumerate() {
-                if index < current_items.len() {
-                    assign_slot(&mut current_items[index], child.clone());
-                } else {
-                    current_items.push(child.clone());
-                }
+        for (index, child) in value_items.iter().enumerate() {
+            if index < current_items.len() {
+                assign_slot(&mut current_items[index], child.clone());
+            } else {
+                current_items.push(child.clone());
             }
-            return;
         }
+        return;
     }
     if *current != value {
         *current = value;

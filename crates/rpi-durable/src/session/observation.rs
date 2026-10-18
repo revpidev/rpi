@@ -180,10 +180,10 @@ impl CommittedWatch {
         loop {
             let notified = self.notify.notified();
             {
-                if let Ok(state) = self.inner.lock() {
-                    if let Some(end) = state.end.clone() {
-                        return end;
-                    }
+                if let Ok(state) = self.inner.lock()
+                    && let Some(end) = state.end.clone()
+                {
+                    return end;
                 }
             }
             notified.await;
@@ -481,10 +481,10 @@ impl ReplicatedStateSource for CommittedStateSource {
         }
         let this = self.clone();
         let activate = Box::new(move |listener: FrameListener| {
-            if let Ok(mut attachments) = this.inner.attachments.lock() {
-                if let Some(slot) = attachments.iter_mut().find(|slot| slot.id == id) {
-                    slot.listener = Some(listener);
-                }
+            if let Ok(mut attachments) = this.inner.attachments.lock()
+                && let Some(slot) = attachments.iter_mut().find(|slot| slot.id == id)
+            {
+                slot.listener = Some(listener);
             }
         });
         let this = self.clone();

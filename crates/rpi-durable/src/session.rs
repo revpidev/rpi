@@ -64,10 +64,10 @@ impl Subscription {
 
     /// Stop future callbacks. Idempotent.
     pub fn unsubscribe(&self) {
-        if let Ok(mut slot) = self.unsubscribe.lock() {
-            if let Some(unsubscribe) = slot.take() {
-                unsubscribe();
-            }
+        if let Ok(mut slot) = self.unsubscribe.lock()
+            && let Some(unsubscribe) = slot.take()
+        {
+            unsubscribe();
         }
     }
 }

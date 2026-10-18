@@ -714,13 +714,13 @@ impl Transaction {
             if create.background {
                 return Err(SessionError::message("A child task cannot be background"));
             }
-            if let Some(conversation_id) = create.conversation_id {
-                if conversation_id != owner.conversation_id {
-                    return Err(SessionError::message(format!(
-                        "A child task lives in its owner's conversation {}",
-                        owner.conversation_id
-                    )));
-                }
+            if let Some(conversation_id) = create.conversation_id
+                && conversation_id != owner.conversation_id
+            {
+                return Err(SessionError::message(format!(
+                    "A child task lives in its owner's conversation {}",
+                    owner.conversation_id
+                )));
             }
             owner_record = Some(owner);
         }
@@ -874,17 +874,17 @@ impl Transaction {
             .latest_index(&resolved.id)
             .map(|index| self.documents[index].retire_on_commit)
             .unwrap_or(false);
-        if let Some(index) = self.latest_index(&resolved.id) {
-            if !self.documents[index].retire_on_commit {
-                if let Some(draft) = &self.documents[index].draft {
-                    return Ok(draft.clone());
-                }
-                if matches!(
-                    self.documents[index].target,
-                    Some(DocumentTarget::ForkCopy { .. })
-                ) {
-                    return self.acquire_fork_copy(index, Arc::clone(&definition)).await;
-                }
+        if let Some(index) = self.latest_index(&resolved.id)
+            && !self.documents[index].retire_on_commit
+        {
+            if let Some(draft) = &self.documents[index].draft {
+                return Ok(draft.clone());
+            }
+            if matches!(
+                self.documents[index].target,
+                Some(DocumentTarget::ForkCopy { .. })
+            ) {
+                return self.acquire_fork_copy(index, Arc::clone(&definition)).await;
             }
         }
         let seed = if definition.family {
@@ -1202,22 +1202,22 @@ impl Transaction {
                     conversation_id: plan.conversation_id.unwrap_or(ROOT_CONVERSATION_ID),
                     source: source.clone(),
                 }));
-            } else if let Some(change) = &plan.change {
-                if publishes(plan) {
-                    let ops = if change.loaded.is_none() {
-                        Vec::new()
-                    } else {
-                        change.prepared.ops().to_vec()
-                    };
-                    let value = change.prepared.value().as_object().cloned();
-                    publications.push(CommitChange::Document(DocumentChange {
-                        record,
-                        conversation_id: plan.conversation_id,
-                        version: Some(change.version),
-                        value,
-                        ops,
-                    }));
-                }
+            } else if let Some(change) = &plan.change
+                && publishes(plan)
+            {
+                let ops = if change.loaded.is_none() {
+                    Vec::new()
+                } else {
+                    change.prepared.ops().to_vec()
+                };
+                let value = change.prepared.value().as_object().cloned();
+                publications.push(CommitChange::Document(DocumentChange {
+                    record,
+                    conversation_id: plan.conversation_id,
+                    version: Some(change.version),
+                    value,
+                    ops,
+                }));
             }
         }
         Ok(publications)
@@ -1259,37 +1259,32 @@ impl Transaction {
         for plan in &mut plans {
             if let Some(StorageWrite::DocumentChange { content, .. }) = &plan.content {
                 let is_delta = !content.is_base();
-                if is_delta {
-                    if let Some(change) = &plan.change {
-                        if let Some(loaded) = &change.loaded {
-                            if let Some(definition) = &change.definition {
-                                if let Some(predicate) = &definition.checkpoint_when {
-                                    let deltas_since_base = loaded.deltas_since_base();
-                                    if predicate(
-                                        change.prepared.value(),
-                                        change.prepared.ops(),
-                                        deltas_since_base,
-                                    ) {
-                                        // Replace the delta with a full base of the prepared value.
-                                        if let Some(StorageWrite::DocumentChange { id, .. }) =
-                                            plan.content.take()
-                                        {
-                                            plan.content = Some(StorageWrite::DocumentChange {
-                                                id,
-                                                content: crate::types::DocumentContent::Base {
-                                                    version: change.version,
-                                                    value: change
-                                                        .prepared
-                                                        .value()
-                                                        .as_object()
-                                                        .cloned()
-                                                        .unwrap_or_default(),
-                                                },
-                                            });
-                                        }
-                                    }
-                                }
-                            }
+                if is_delta
+                    && let Some(change) = &plan.change
+                    && let Some(loaded) = &change.loaded
+                    && let Some(definition) = &change.definition
+                    && let Some(predicate) = &definition.checkpoint_when
+                {
+                    let deltas_since_base = loaded.deltas_since_base();
+                    if predicate(
+                        change.prepared.value(),
+                        change.prepared.ops(),
+                        deltas_since_base,
+                    ) {
+                        // Replace the delta with a full base of the prepared value.
+                        if let Some(StorageWrite::DocumentChange { id, .. }) = plan.content.take() {
+                            plan.content = Some(StorageWrite::DocumentChange {
+                                id,
+                                content: crate::types::DocumentContent::Base {
+                                    version: change.version,
+                                    value: change
+                                        .prepared
+                                        .value()
+                                        .as_object()
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                },
+                            });
                         }
                     }
                 }
@@ -1311,19 +1306,18 @@ impl Transaction {
     async fn validate_owners(&mut self) -> SessionResult<()> {
         let mut owners: Vec<(&'static str, TaskId)> = Vec::new();
         for write in &self.writes {
-            if let StorageWrite::Conversation { value } = write {
-                if let Some(owner) = &value.owner {
-                    owners.push(("Conversation owner task", owner.task_id));
-                }
+            if let StorageWrite::Conversation { value } = write
+                && let Some(owner) = &value.owner
+            {
+                owners.push(("Conversation owner task", owner.task_id));
             }
         }
         for task in self.tasks.values() {
-            if let Some(write) = &task.write {
-                if write.kind == TaskWriteKind::Create {
-                    if let Some(owner) = write.record.owner {
-                        owners.push(("Task owner", owner));
-                    }
-                }
+            if let Some(write) = &task.write
+                && write.kind == TaskWriteKind::Create
+                && let Some(owner) = write.record.owner
+            {
+                owners.push(("Task owner", owner));
             }
         }
         for (what, task_id) in owners {
@@ -1384,10 +1378,10 @@ impl Transaction {
     ) -> SessionResult<()> {
         let mut terminal_task_ids = std::collections::BTreeSet::new();
         for task in self.tasks.values() {
-            if let Some(write) = &task.write {
-                if is_terminal(&write.record.state) {
-                    terminal_task_ids.insert(write.record.id);
-                }
+            if let Some(write) = &task.write
+                && is_terminal(&write.record.state)
+            {
+                terminal_task_ids.insert(write.record.id);
             }
         }
         if terminal_task_ids.is_empty() {
@@ -1395,11 +1389,11 @@ impl Transaction {
         }
         let mut retiring = std::collections::BTreeSet::new();
         for plan in plans.iter_mut() {
-            if let DocumentScope::Task { task_id } = plan.scope() {
-                if terminal_task_ids.contains(&task_id) {
-                    plan.retire = true;
-                    retiring.insert(plan.record_id());
-                }
+            if let DocumentScope::Task { task_id } = plan.scope()
+                && terminal_task_ids.contains(&task_id)
+            {
+                plan.retire = true;
+                retiring.insert(plan.record_id());
             }
         }
         for task_id in terminal_task_ids {
@@ -1800,14 +1794,13 @@ fn reject_fork_source_writes(
                 "Cannot change fork source document {record_id} in the fork transaction"
             )));
         }
-        if let DocumentScope::Conversation { conversation_id } = plan.scope() {
-            if source_conversations.contains(&conversation_id)
-                && plan.fork() == Some(crate::types::DocumentFork::Current)
-            {
-                return Err(SessionError::message(format!(
-                    "Cannot fork conversation {conversation_id} while changing its current-policy documents"
-                )));
-            }
+        if let DocumentScope::Conversation { conversation_id } = plan.scope()
+            && source_conversations.contains(&conversation_id)
+            && plan.fork() == Some(crate::types::DocumentFork::Current)
+        {
+            return Err(SessionError::message(format!(
+                "Cannot fork conversation {conversation_id} while changing its current-policy documents"
+            )));
         }
     }
     Ok(())
