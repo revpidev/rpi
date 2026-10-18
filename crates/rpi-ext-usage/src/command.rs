@@ -93,7 +93,13 @@ fn all_report(host: &dyn HostCall, known: &[String]) -> String {
     let mut failures: Vec<String> = Vec::new();
     for provider in known {
         match host::usage_fetch(host, provider, true) {
-            Some(envelope) => sections.push(format_envelope(&envelope)),
+            // TE50 removed the provider prefix from displayText for the
+            // single-line footer. `/usage all` still needs it: several
+            // sections with only "5h 39% ..." / "CNY 12.50" are not
+            // attributable to a provider.
+            Some(envelope) => {
+                sections.push(format!("{provider}:\n{}", format_envelope(&envelope)));
+            }
             None => failures.push(provider.clone()),
         }
     }
@@ -242,6 +248,17 @@ mod tests {
             message.contains("no data: kimi-code (script failed or no API key)"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn all_labels_each_successful_provider() {
+        let host = UsageFakeHost::new();
+        host.set_providers(vec!["deepseek".to_owned(), "kimi-code".to_owned()]);
+        host.set_envelope("deepseek", envelope("deepseek", "CNY 12.50"));
+        host.set_envelope("kimi-code", envelope("kimi-code", "5h 39%(~48m)"));
+        let (message, _) = handle(&host, "all");
+        assert!(message.contains("deepseek:\nCNY 12.50"), "{message}");
+        assert!(message.contains("kimi-code:\n5h 39%(~48m)"), "{message}");
     }
 
     #[test]
