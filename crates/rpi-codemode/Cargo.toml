@@ -18,7 +18,7 @@ chrono.workspace = true
 # ADR-0034 decision 3 / ADR-0035: the single JS execution engine is a
 # vendored quickjs.wasm instance driven through wasmtime (never a second JS
 # engine, never a native QuickJS build). Same major line as rpi-ext-host.
-wasmtime = "47"
+wasmtime = "48.0.6"
 
 [dev-dependencies]
 rpi-test-env.workspace = true

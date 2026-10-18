@@ -36,6 +36,7 @@ unicode-normalization.workspace = true
 # (`node-watch.ts` consumes `fs.watch` + snapshot rescans).
 notify = "8.2"
 sha2.workspace = true
+uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

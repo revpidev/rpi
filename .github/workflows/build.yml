@@ -22,6 +22,25 @@ permissions:
   contents: write # required for GitHub Release uploads
 
 jobs:
+  # MSRV is a promise: `rust-version` is metadata, so compile the workspace
+  # with the declared toolchain instead of only grepping Cargo.toml.
+  msrv:
+    name: MSRV 1.95
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: . -> target
+          key: msrv-1.95
+
+      - name: Check workspace with MSRV
+        run: cargo check --workspace --all-targets --locked
+
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -103,9 +122,9 @@ jobs:
           set -e
           cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys; eds=sorted({p["edition"] for p in json.load(sys.stdin)["packages"]}); assert eds==["2024"], eds'
-          grep -q '^rust-version = "1.85"' Cargo.toml
+          grep -q '^rust-version = "1.95"' Cargo.toml
           test -z "$(find . -name mod.rs -type f -not -path './target/*' -not -path './vendor/*' -not -path './external/*')"
-          echo "G15: edition 2024 + MSRV 1.85 + no mod.rs — OK"
+          echo "G15: edition 2024 + MSRV 1.95 + no mod.rs — OK"
         shell: bash
 
       # ---- Build ----
