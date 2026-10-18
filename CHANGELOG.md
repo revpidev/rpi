@@ -22,7 +22,7 @@
 
 ### Internal
 
-- workspace version bumped to 0.1.7-rc.1 with Cargo.lock synced (seven lockstep extensions propagate via `version.workspace`).
+- workspace version bumped through 0.1.7-rc.1 → 0.1.7-rc.2 with Cargo.lock synced (seven lockstep extensions propagate via `version.workspace`).
 - deviation D-106 promoted (clipboard reader mechanism, `[RPI-OWN]`, V17-10); the plugin-side TE-D47+ range stays reserved and unused.
 - Review hardening: Windows clipboard text/file-drop fixes, off-thread paste reads and private clipboard temp files, durable SQLite cancellation/close safety and `0700`/`0600` temp files, compaction-queue timing, `/usage all` provider labels, MCP close state, and MSRV 1.95; wasmtime 48.0.6 / rustls 0.23.46 / quinn-proto 0.11.18 close the RustSec findings.
 
