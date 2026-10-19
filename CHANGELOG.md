@@ -1,11 +1,11 @@
 # Changelog
 
-## [0.1.7] - 2026-10-17
+## [0.1.7] - 2026-10-19
 
 ### Main line
 
 - **Upstream parity to v1.1.0** (V17-00…V17-16, ADR-0036): the behavioral gold standard moves from v1.0.0 (`a13d35a74`) to `abe508e1b` (v1.1.0; the v1.0.1–v1.1.0 windows folded in — the Azure Foundry provider face, codemode hardening, the built-in MCP OAuth family, the CLI/tool-selection governance, the TUI fix family, and the OpenAI Decisions classifier). Per-domain summaries live in `changes/v0.1.7.md` (the release changelog single source of truth); key user-observable surfaces:
-  - **Providers, auth & catalog**: **[BREAKING]** the Azure provider id is now `azure` (from `azure-openai-responses`; the api id and the `AZURE_OPENAI_*` environment variables are unchanged) with a diagnostic-only migration face — old keys are reported with their file and key position, never rewritten or aliased; Azure Foundry Chat Completions deployments alongside the Responses API; the OpenAI Decisions classifier (`openai/gpt-6-luna`, structured `choice`/`score`/`bool` questions, optional images); `samplingParamsByThinkingLevel`; Anthropic inline tools; and the Bedrock / Cloudflare / Radius / Codex fix family plus retried `server_busy` / "at capacity" / HTTP-2 pending-stream failures.
+  - **Providers, auth & catalog**: **[BREAKING]** the Azure provider id is now `azure` (from `azure-openai-responses`; the api id and the `AZURE_OPENAI_*` environment variables are unchanged) with a diagnostic-only migration face — old keys are reported with their file and key position, never rewritten or aliased; Azure Foundry Chat Completions deployments alongside the Responses API; the OpenAI Decisions classifier (`openai/gpt-6-luna`, structured `choice`/`score`/`bool` questions, optional images); `samplingParamsByThinkingLevel`; Anthropic inline tools; the built-in catalog refreshed to the 2026-10-19 snapshot (42 providers, 1644 → 1731 models: chat 1551 → 1622, image 61 → 63, classifier 32 → 46, including Gemini 4 Argon, Claude Haiku 5.5 on Cloudflare AI Gateway, DeepSeek V4.1 Flash 1017, Muse Wonder / Muse Spark Open, the Vercel AI Gateway batch line, the Xiaomi `mimo-v2.6` default, and `opencode-go` Google dispatch); and the Bedrock / Cloudflare / Radius / Codex fix family plus retried `server_busy` / "at capacity" / HTTP-2 pending-stream failures.
   - **Tools & CLI**: **[BREAKING]** `--tools` accepts `*` patterns and `+name`/`-name` adjustments and **keeps MCP tools unless one of its entries starts with `mcp__`** (use `--no-mcp` or `--exclude-tools 'mcp__*'` to drop them); `--models` empty entries no longer match every model; context estimates use 3.5 characters per token.
   - **Extension API (additive)**: `pi.registerToolRenderer()` (including an MCP resolver for resumed sessions), render-context `durationMs`/`outputPad`, `tool_execution_end.durationMs`, `agent_settled.aborted`, and `ToolLoadout.getPromptGuidelines()`; `rpiAbi` stays `1`, the event table is unchanged, and the version-level ABI bump is recorded in `extension-abi.md` §8.4.
   - **TUI**: program status over OSC 7501 (with `RPI_PROGRAM_STATUS`); `outputPad` applies to every transcript block; **[BREAKING] Home/End belong to the editor, `Ctrl+Home`/`Ctrl+End` to the transcript**; the Kitty / WezTerm / Herdr / Termux fix family and the fullscreen selection reset.
@@ -22,10 +22,10 @@
 
 ### Internal
 
-- workspace version bumped through 0.1.7-rc.1 → 0.1.7-rc.3 with Cargo.lock synced (seven lockstep extensions propagate via `version.workspace`).
+- workspace version bumped through 0.1.7-rc.1 → 0.1.7 with Cargo.lock synced (seven lockstep extensions propagate via `version.workspace`).
 - deviation D-106 promoted (clipboard reader mechanism, `[RPI-OWN]`, V17-10); the plugin-side TE-D47+ range stays reserved and unused.
 - Review hardening: Windows clipboard text/file-drop fixes, off-thread paste reads and private clipboard temp files, durable SQLite cancellation/close safety and `0700`/`0600` temp files, compaction-queue timing, `/usage all` provider labels, MCP close state, and MSRV 1.95; wasmtime 48.0.6 / rustls 0.23.46 / quinn-proto 0.11.18 close the RustSec findings.
-- Installer/uninstall hardening: profile-preserving idempotent PATH blocks, automation-safe prompts, explicit shell detection, registry-kind-preserving Windows PATH updates, and `self-uninstall` PATH-block cleanup; the installer suites (95 POSIX checks, 45-46 PowerShell checks) run in CI.
+- Installer/uninstall hardening: in-place profile rewrites that preserve symlinks/mode, idempotent PATH guards, automation-safe prompting with `RPI_NONINTERACTIVE`/`RPI_INSTALL_PROMPT_TIMEOUT`/`RPI_INSTALL_ADD_PATH`, explicit shell detection, registry-kind-preserving Windows PATH updates with `%VAR%` dedupe and machine-PATH warnings, and `self-uninstall` PATH-block cleanup; the installer suites (95 POSIX checks, 45-46 PowerShell checks) run in CI, and README/README.zh-CN plus the site quickstart document the behavior.
 
 ## [0.1.6] - 2026-10-09
 

@@ -11,7 +11,7 @@
 
 Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding agent](https://github.com/earendil-works/pi). It inherits Pi's architecture, and behavior is continuously verified against a pinned upstream release — the current behavioral baseline is **Pi v1.1.0** (`abe508e1b`, see [`UPSTREAM.md`](./UPSTREAM.md)). Rpi is an independent project and may diverge from Pi as both evolve. It compiles to a single static binary with no Node, Python, or other runtime dependency.
 
-The current release line is **v0.1.7**. The stable install channel currently serves v0.1.6; v0.1.7 is available on the pre-release channel via `rpi update --rc`, and the release-candidate tag is `v0.1.7-rc.3` (see [Status](#status)).
+The current release line is **v0.1.7**, the latest stable release (2026-10-19). Install with the script below, or update an existing install with `rpi update` (see [Status](#status)).
 
 ## Highlights
 
@@ -79,7 +79,7 @@ Set your API key via the standard environment variable for your provider (e.g. `
 
 ```bash
 rpi update              # update rpi itself (stable channel)
-rpi update --rc         # update to the latest v0.1.7 release candidate
+rpi update --rc         # update to the latest release candidate (pre-release channel)
 rpi update --all        # rpi + installed extensions
 rpi update --models     # refresh the remote model catalog
 ```
@@ -236,7 +236,7 @@ The workspace uses edition 2024 and MSRV 1.95. CI builds release artifacts; the 
 | v0.1.6 | 2026-10 | Pi v1.0.0 parity; built-in `codemode` and MCP; `rpi-plan-mode` / `rpi-usage`; permission modes and usage-provider framework |
 | **v0.1.7** | **2026-10** | **Pi v1.1.0 parity; issues #57–#71; `rpi-mcp-adapter` removal; experimental `rpi-durable` stack; `rpi-subagents` v0.76.1** |
 
-**Current line: v0.1.7.** The latest published stable release is v0.1.6; the v0.1.7 line is currently on the RC channel (`v0.1.7-rc.3`). Use `rpi update --rc` (or the `--rc` flag on `install`/`update --extensions`) to opt in. Release notes for every version are in [`changes/`](./changes) and [`CHANGELOG.md`](./CHANGELOG.md).
+**Current line: v0.1.7.** The latest published stable release is v0.1.7. Use `rpi update` (or `rpi update --all` to also update the seven lockstep extensions); `rpi update --rc` opts into the pre-release channel. Release notes for every version are in [`changes/`](./changes) and [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## License
 
