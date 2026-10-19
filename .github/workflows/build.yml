@@ -41,8 +41,37 @@ jobs:
       - name: Check workspace with MSRV
         run: cargo check --workspace --all-targets --locked
 
+  # Installer scripts are user-facing and carry PATH/profile/registry logic
+  # that the Rust suite does not cover. The shell suite also exercises the
+  # interactive prompt through a pty; the PowerShell suite runs on Linux pwsh
+  # (string/mock coverage) and Windows PowerShell 5.1 (compatibility).
+  installers:
+    name: installer scripts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - name: Shell installer tests
+        if: runner.os == 'Linux'
+        run: sh scripts/test-install-sh.sh
+
+      - name: PowerShell installer tests (Linux pwsh)
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-install-ps1.ps1
+
+      - name: PowerShell installer tests (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-install-ps1.ps1
+
   build:
     name: ${{ matrix.target }}
+    needs: [msrv, installers]
     runs-on: ${{ matrix.os }}
     env:
       # First-party L0 extension crates shipped as .rpix archives in the same

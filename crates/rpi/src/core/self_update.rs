@@ -433,6 +433,10 @@ pub struct SelfUninstallRequest<'a> {
     pub data_dir: &'a Path,
     pub purge: bool,
     pub confirm_delete_data: Option<&'a dyn Fn(&Path) -> bool>,
+    /// Best-effort removal of a PATH block written by `install.sh` (Unix)
+    /// or a note about the Windows user PATH entry. Tests pass `false` so
+    /// they never touch the real user profile.
+    pub cleanup_path: bool,
 }
 
 /// Phase-1 platform gate (ADR-0011 §5): Windows cannot delete a running
@@ -466,14 +470,226 @@ pub fn leftover_paths(data_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Remove the exact `# rpi` + `export PATH=` / `fish_add_path` / case-guard
+/// block that install.sh writes, but only when the command mentions this
+/// installation directory. Pure helper so the matching rules are unit-tested.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn remove_path_block_text(text: &str, spellings: &[String]) -> Option<String> {
+    let crlf = text.contains("\r\n");
+    let trailing_newline = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "# rpi" && i + 1 < lines.len() {
+            let next = lines[i + 1].trim_start();
+            let is_path_line = next.starts_with("export PATH=")
+                || next.starts_with("fish_add_path ")
+                || next.starts_with("case \":$PATH:\" in ");
+            if is_path_line
+                && spellings
+                    .iter()
+                    .any(|spelling| contains_path_token(next, spelling))
+            {
+                // Drop the blank separator line older installers wrote.
+                if out.last().is_some_and(|line| line.trim().is_empty()) {
+                    out.pop();
+                }
+                i += 2;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(lines[i]);
+        i += 1;
+    }
+    if !changed {
+        return None;
+    }
+    let mut result = out.join("\n");
+    if trailing_newline {
+        result.push('\n');
+    }
+    if crlf {
+        result = result.replace('\n', "\r\n");
+    }
+    Some(result)
+}
+
+/// Match a path spelling as a whole PATH token: shell profiles write it inside
+/// quotes and follow it with `:`, a quote, or whitespace. This avoids matching
+/// `/home/me/.local/bin` inside `/home/me/.local/bin-extra`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn contains_path_token(line: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(index) = line[start..].find(token) {
+        let absolute = start + index;
+        let before = line[..absolute].chars().next_back();
+        let after = line[absolute + token.len()..].chars().next();
+        let left_ok = before
+            .is_none_or(|ch| matches!(ch, '"' | '\'' | '=' | ':' | ';' | ' ' | '\t' | '(' | '*'));
+        let right_ok =
+            after.is_none_or(|ch| matches!(ch, '"' | '\'' | ':' | ';' | ' ' | '\t' | ')' | '*'));
+        if left_ok && right_ok {
+            return true;
+        }
+        start = absolute + token.len();
+    }
+    false
+}
+
+/// Escape a path exactly like install.sh's `profile_double_quote`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn escape_profile_double_quotes(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            '`' => out.push_str("\\`"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Add the `$HOME/...` and escaped `$HOME` spellings for a directory under
+/// `home`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn push_home_spellings(out: &mut Vec<String>, dir: &Path, home: &Path) {
+    if let Ok(relative) = dir.strip_prefix(home) {
+        let home_form = format!("$HOME/{}", relative.display());
+        out.push(home_form.clone());
+        out.push(escape_profile_double_quotes(&home_form));
+    }
+}
+
+/// The spellings install.sh may have written for the given directories. The
+/// default install dir is emitted as `$HOME/.local/bin` so the profile stays
+/// portable; custom paths are emitted escaped inside double quotes. Both the
+/// executable's resolved parent and the manifest's logical `installPath` are
+/// passed on symlinked installs. The canonical home is also tried so a
+/// symlinked HOME still matches when no manifest is available.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn path_dir_spellings_for(dirs: &[&Path], home: Option<&Path>) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let absolute = dir.display().to_string();
+        out.push(absolute.clone());
+        out.push(escape_profile_double_quotes(&absolute));
+        if let Some(home) = home {
+            push_home_spellings(&mut out, dir, home);
+            if let Ok(canonical_home) = std::fs::canonicalize(home)
+                && canonical_home.as_path() != home
+            {
+                push_home_spellings(&mut out, dir, &canonical_home);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Candidate shell profiles install.sh can write. Missing files are skipped.
+/// Both the default and the env-selected ZDOTDIR/XDG_CONFIG_HOME locations are
+/// scanned: the installer may have used either, and an empty variable means
+/// "unset" (matching the shell's `${VAR:-default}`).
+#[cfg(unix)]
+fn installer_path_config_files() -> Vec<PathBuf> {
+    let Some(home) = crate::config::user_home_dir() else {
+        return Vec::new();
+    };
+    let mut files = vec![
+        home.join(".profile"),
+        home.join(".bashrc"),
+        home.join(".bash_profile"),
+        home.join(".bash_login"),
+        home.join(".zshrc"),
+        home.join(".config").join("fish").join("config.fish"),
+    ];
+    if let Some(zdotdir) = std::env::var_os("ZDOTDIR").filter(|value| !value.is_empty()) {
+        files.push(PathBuf::from(zdotdir).join(".zshrc"));
+    }
+    if let Some(xdg_config) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+    {
+        files.push(PathBuf::from(xdg_config).join("fish").join("config.fish"));
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Best-effort PATH cleanup after uninstalling. Unix removes the marked shell
+/// block; other platforms print a manual note because Windows owns the user
+/// PATH in the registry and its binary removal is already manual.
+fn cleanup_installer_path(exe_path: &Path, manifest_install_path: Option<&Path>) {
+    #[cfg(unix)]
+    {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = exe_path.parent() {
+            dirs.push(dir.to_path_buf());
+        }
+        if let Some(path) = manifest_install_path
+            && let Some(dir) = path.parent()
+        {
+            dirs.push(dir.to_path_buf());
+        }
+        let dir_refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let spellings =
+            path_dir_spellings_for(&dir_refs, crate::config::user_home_dir().as_deref());
+
+        for file in installer_path_config_files() {
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
+                eprintln!(
+                    "Warning: {} is not valid UTF-8; leaving any installer PATH entry in place.",
+                    file.display()
+                );
+                continue;
+            };
+            let Some(updated) = remove_path_block_text(&text, &spellings) else {
+                continue;
+            };
+            match std::fs::write(&file, updated) {
+                Ok(()) => println!("Removed installer PATH entry from {}", file.display()),
+                Err(error) => eprintln!(
+                    "Warning: could not update {} to remove the PATH entry: {error}",
+                    file.display()
+                ),
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = manifest_install_path;
+        if let Some(dir) = exe_path.parent() {
+            println!(
+                "If the installer added {} to your user PATH, remove it in Settings > System > Environment Variables.",
+                dir.display()
+            );
+        }
+    }
+}
+
 /// `rpi self-uninstall [--purge]` (ADR-0011 §5). Returns the exit code.
 /// Order: read the manifest → delete the binary (Windows: skip + manual
-/// commands) → keep/delete the data root (default keep; `--purge` deletes;
-/// non-interactive never asks and keeps) → delete the manifest → report
-/// leftovers and the manual removal instructions.
+/// commands) → remove the installer PATH block → keep/delete the data root
+/// (default keep; `--purge` deletes; non-interactive never asks and keeps) →
+/// delete the manifest → report leftovers and the manual removal instructions.
 pub fn run_self_uninstall_in(request: &SelfUninstallRequest<'_>) -> i32 {
     let manifest_path = crate::config::install_manifest_path_for(request.exe_path);
-    match crate::config::read_install_manifest_for(request.exe_path) {
+    let manifest = crate::config::read_install_manifest_for(request.exe_path);
+    match &manifest {
         Some(manifest) => println!(
             "Install manifest: {} (version {}, method {})",
             manifest_path.display(),
@@ -486,7 +702,9 @@ pub fn run_self_uninstall_in(request: &SelfUninstallRequest<'_>) -> i32 {
         ),
     }
 
-    // 1. Binary (skipped on Windows, phase 1).
+    // 1. Binary (skipped on Windows, phase 1). Do this before touching the
+    // shell profile: if the binary cannot be removed, keep the PATH entry so
+    // the user can retry `self-uninstall` with the still-installed binary.
     if binary_delete_supported() {
         match std::fs::remove_file(request.exe_path) {
             Ok(()) => println!("Removed {}", request.exe_path.display()),
@@ -509,7 +727,18 @@ pub fn run_self_uninstall_in(request: &SelfUninstallRequest<'_>) -> i32 {
         );
     }
 
-    // 2. Data root (default: keep).
+    // 2. Installer-managed PATH entry (best effort; never fatal). The
+    // manifest's `installPath` is the logical path the installer recorded; on
+    // symlinked homes/install dirs it differs from `current_exe()`, so pass
+    // both to the matcher.
+    if request.cleanup_path {
+        let manifest_install_path = manifest
+            .as_ref()
+            .map(|manifest| Path::new(&manifest.install_path));
+        cleanup_installer_path(request.exe_path, manifest_install_path);
+    }
+
+    // 3. Data root (default: keep).
     let mut deleted_data = false;
     if request.data_dir.exists() {
         let delete = request.purge
@@ -535,7 +764,7 @@ pub fn run_self_uninstall_in(request: &SelfUninstallRequest<'_>) -> i32 {
         }
     }
 
-    // 3. Manifest.
+    // 4. Manifest.
     if binary_delete_supported() {
         match std::fs::remove_file(&manifest_path) {
             Ok(()) => println!("Removed {}", manifest_path.display()),
@@ -547,7 +776,7 @@ pub fn run_self_uninstall_in(request: &SelfUninstallRequest<'_>) -> i32 {
         }
     }
 
-    // 4. Leftovers + manual instructions.
+    // 5. Leftovers + manual instructions.
     let leftovers = leftover_paths(request.data_dir);
     if leftovers.is_empty() {
         if deleted_data {
@@ -1200,8 +1429,68 @@ mod tests {
                 data_dir: &self.data_dir,
                 purge,
                 confirm_delete_data: confirm,
+                cleanup_path: false,
             })
         }
+    }
+
+    #[test]
+    fn test_remove_path_block_text_matches_the_install_dir() {
+        let spellings = vec![
+            "/home/me/.local/bin".to_string(),
+            "$HOME/.local/bin".to_string(),
+            "/home/me/bin$money".to_string(),
+            "/home/me/bin\\$money".to_string(),
+        ];
+
+        // The current case-guard form.
+        let text = "before\n# rpi\ncase \":$PATH:\" in *\":$HOME/.local/bin:\"*) ;; *) export PATH=\"$HOME/.local/bin:$PATH\" ;; esac\nafter\n";
+        let updated = remove_path_block_text(text, &spellings).expect("case block removed");
+        assert_eq!(updated, "before\nafter\n");
+
+        // A block for a different install directory is left alone.
+        let other = "before\n# rpi\nexport PATH=\"/opt/other/bin:$PATH\"\nafter\n";
+        assert_eq!(remove_path_block_text(other, &spellings), None);
+
+        // The fish spelling is recognized too.
+        let fish = "before\n# rpi\nfish_add_path \"/home/me/.local/bin\"\nafter\n";
+        let updated = remove_path_block_text(fish, &spellings).expect("fish block removed");
+        assert_eq!(updated, "before\nafter\n");
+
+        // install.sh escapes $, ", ` and \ in custom paths.
+        let escaped = "before\n# rpi\ncase \":$PATH:\" in *\":/home/me/bin\\$money:\"*) ;; *) export PATH=\"/home/me/bin\\$money:$PATH\" ;; esac\nafter\n";
+        let updated = remove_path_block_text(escaped, &spellings).expect("escaped block removed");
+        assert_eq!(updated, "before\nafter\n");
+
+        // A path that merely starts with the install dir is not matched.
+        let prefix = "before\n# rpi\nexport PATH=\"/home/me/.local/bin-extra:$PATH\"\nafter\n";
+        assert_eq!(remove_path_block_text(prefix, &spellings), None);
+
+        // CRLF profiles keep their line endings.
+        let crlf = "before\r\n# rpi\r\nexport PATH=\"$HOME/.local/bin:$PATH\"\r\nafter\r\n";
+        let updated = remove_path_block_text(crlf, &spellings).expect("CRLF block removed");
+        assert_eq!(updated, "before\r\nafter\r\n");
+
+        // The installer's separating blank line is dropped with the block.
+        let blank = "before\n\n# rpi\nexport PATH=\"$HOME/.local/bin:$PATH\"\nafter\n";
+        let updated = remove_path_block_text(blank, &spellings).expect("block removed");
+        assert_eq!(updated, "before\nafter\n");
+    }
+
+    #[test]
+    fn test_path_dir_spellings_include_logical_and_escaped_forms() {
+        let home = Path::new("/home/me");
+        let real = Path::new("/mnt/data/bin");
+        let logical = Path::new("/home/me/.local/bin");
+        let spellings = path_dir_spellings_for(&[real, logical], Some(home));
+        assert!(spellings.iter().any(|value| value == "/mnt/data/bin"));
+        assert!(spellings.iter().any(|value| value == "/home/me/.local/bin"));
+        assert!(spellings.iter().any(|value| value == "$HOME/.local/bin"));
+        assert!(spellings.iter().any(|value| value == "\\$HOME/.local/bin"));
+
+        let escaped = path_dir_spellings_for(&[Path::new("/home/me/bin$money")], Some(home));
+        assert!(escaped.iter().any(|value| value == "/home/me/bin\\$money"));
+        assert!(escaped.iter().any(|value| value == "\\$HOME/bin\\$money"));
     }
 
     #[test]

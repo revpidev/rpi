@@ -792,6 +792,12 @@ Options:
              extensions). Without --purge the data is kept; an interactive
              run asks first (default: keep), a non-interactive run always
              keeps.
+
+An installer-written PATH block in the detected shell profile (the marked
+`# rpi` line on Unix) is removed when possible, including symlinked profiles
+and symlinked install directories matched through the manifest's logical
+`installPath`. Manual PATH lines without the marker are left alone. On
+Windows, remove the user PATH entry manually if the installer added it.
 "#
     )
 }
@@ -845,6 +851,7 @@ pub fn run_self_uninstall(args: &[String]) -> i32 {
             data_dir: &data_dir,
             purge: parsed.purge,
             confirm_delete_data: confirm,
+            cleanup_path: true,
         },
     )
 }

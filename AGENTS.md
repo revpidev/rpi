@@ -44,16 +44,20 @@ it is in scope.
 |---|---|
 | `crates/rpi` | Main binary: CLI, interactive TUI, core services, packaging/updater |
 | `crates/rpi-agent` | Agent loop, tools, session management |
-| `crates/rpi-ai` | Provider adapters, model catalog (`providers/data`), streaming |
-| `crates/rpi-tui` | Terminal UI library (rendering, widgets, mouse, theming) |
-| `crates/rpi-ext-*` | First-party L0 extension crates shipped as `.rpix` — **lockstep** with the workspace version (`version.workspace = true`) |
-| `crates/rpi-ext-host` / `rpi-ext-sdk` | Extension host ABI and SDK used by plugins |
+| `crates/rpi-ai` | Provider adapters, model catalog (`providers/data`), streaming, auth/OAuth |
+| `crates/rpi-tui` | Terminal UI library (rendering, widgets, mouse, theming, regular/fullscreen) |
+| `crates/rpi-codemode` | QuickJS-via-wasmtime sandbox for the built-in `codemode` tool |
+| `crates/rpi-mcp` | MCP protocol client used by the built-in `mcp` extension (stdio, streamable HTTP, OAuth) |
+| `crates/rpi-durable` | Experimental durable storage/runtime stack; **not** on the default CLI path (no dependency from `crates/rpi`) |
+| `crates/rpi-ext-*` | Seven first-party L0 extension crates shipped as `.rpix` — **lockstep** with the workspace version (`version.workspace = true`) |
+| `crates/rpi-ext-host` / `rpi-ext-sdk` | Extension host ABI and SDK used by plugins (L1 Wasm + L0 native dynamic libraries) |
+| `crates/rpi-test-*` | Faux provider, test-environment helpers, and the native-plugin fixture |
 | `external/` | **Pinned, read-only upstream references** (git submodules): `pi` (gold standard), `pi-subagents`, `agent-smart-fetch`, `rpiv-mono`. Never commit changes inside `external/`. |
 | `vendor/syntect` | Patched fork of syntect (visibility patches for the build-time grammar rewrite, issue #47). Any new patch must be documented in `vendor/syntect/PATCHES.md`. |
 | `fixtures/` | Recorded golden data (sessions, themes, upstream snapshots). Re-recording follows the documented runbooks. |
 | `scripts/` | Parity harnesses (`subagents-parity`, `mcp-parity`, `interactive-ui-parity`, …) and release tooling (`unwrap-release-notes.py`). |
 | `changes/` | Per-version release notes — the changelog single source of truth. |
-| `docs/` | Public protocol contracts (e.g. `json-rpc.md`). |
+| `docs/` | Public protocol/reference contracts (`json-rpc.md`, `codemode.md`). |
 
 ## Non-negotiable rules
 
@@ -70,6 +74,10 @@ it is in scope.
    - `cargo fmt --check`
    - `cargo clippy --workspace --all-targets -- -D warnings`
    - `cargo test --workspace`
+   - `sh scripts/test-install-sh.sh` (POSIX installer; also exercises the
+     profile/pty paths)
+   - `pwsh -NoProfile -File scripts/test-install-ps1.ps1` (PowerShell
+     installer helpers; runs on Linux pwsh and Windows PowerShell 5.1)
    Before a release, double-run the full test suite. A handful of tests are
    environment-sensitive (fixed ports, timing under load); if one flakes,
    verify it in isolation before drawing conclusions.
@@ -88,6 +96,11 @@ it is in scope.
    bump together; update `Cargo.lock` in the same commit (v0.1.2 lesson).
    RC versions follow `<stable>-rc.<N>` (lowercase, dotted, no leading
    zeros, baseline = the candidate stable).
+6. **Docs travel with behavior.** User-visible surfaces update
+   `README.md` / `README.zh-CN.md` in the same change set; wire-protocol
+   changes update `docs/json-rpc.md`, and codemode surface changes update
+   `docs/codemode.md`. Every relative link you add must resolve in the
+   repository.
 
 ## Commit conventions
 
@@ -104,9 +117,10 @@ it is in scope.
 ## Release essentials (full checklist in RELEASING.md)
 
 - Order is pinned by ADR-0011: **assets before endpoints** — tag push
-  triggers `build.yml` (six targets + `.rpix` extension assets + `.sha256`
-  sidecars); only after the 12 core files plus extension assets appear do
-  you refresh `revpi.dev/api/latest-version.json` via
+  triggers `build.yml` (six targets + seven lockstep `.rpix` extensions on
+  the four non-musl targets + `.sha256` sidecars); only after the 12 core
+  files and the extension assets appear do you refresh
+  `revpi.dev/api/latest-version.json` via
   `rpi-pages/scripts/generate-site.py --version <version>`.
 - Re-pushing a tag refreshes both assets and release notes — it is the
   documented remedy for release-note fixes, but it rebuilds everything

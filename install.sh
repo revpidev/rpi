@@ -4,14 +4,38 @@
 # Usage:
 #   curl -fsSL https://revpi.dev/install.sh | sh
 #   sh install.sh --prefix /usr/local/bin
+#   sh install.sh --add-path
 #   sh install.sh --musl
 #
 # Options:
 #   --prefix <dir>   Install directory (default: ~/.local/bin)
+#   --add-path       Add the install directory to the detected shell profile
+#                    without prompting (user-scoped installs and supported
+#                    shells only; also honors RPI_INSTALL_ADD_PATH=1)
+#   --no-add-path    Never modify a shell profile (also honors
+#                    RPI_INSTALL_ADD_PATH=0)
 #   --musl           Force the musl target on Linux (auto-detected via ldd otherwise)
 #   -h, --help       Show usage
 #
+# PATH behavior: when the install directory is not already the active `rpi`
+# on PATH, an interactive run asks once (default: yes) before writing a marked
+# `# rpi` block to the detected shell profile (fish/zsh/bash/POSIX profile).
+# The prompt requires stdout to be a terminal, a usable /dev/tty, and no
+# CI/RPI_NONINTERACTIVE marker; it is skipped when TERM=dumb or stdout is
+# redirected. If the shell supports `read -t`, an unanswered prompt times out
+# (default 60s) and leaves the profile unchanged. --add-path (or
+# RPI_INSTALL_ADD_PATH=1) writes without prompting. --no-add-path, root
+# installs, installs outside $HOME, and unsupported shells never modify a
+# profile; they print manual guidance (the exact command when the shell is
+# supported). CI/pty automation should set RPI_INSTALL_ADD_PATH=0 explicitly.
+#
 # Environment overrides (for mirrors and tests):
+#   RPI_INSTALL_ADD_PATH   1/true/yes = add without prompting;
+#                          0/false/no = never add; unset = prompt when possible
+#   RPI_NONINTERACTIVE     1/true/yes = never prompt (explicit --add-path or
+#                          RPI_INSTALL_ADD_PATH=1 still writes)
+#   RPI_INSTALL_PROMPT_TIMEOUT  Seconds before an unanswered prompt is treated
+#                          as "no" (default 60; shells without read -t ignore)
 #   RPI_GITHUB_API_URL     GitHub API URL for the latest release
 #                          (default: https://api.github.com/repos/revpidev/rpi/releases/latest)
 #   RPI_VERSION_CHECK_URL  Fallback version endpoint, same contract as the CLI's
@@ -44,7 +68,12 @@ SITE_BASE_URL=${RPI_SITE_BASE_URL:-"https://revpi.dev"}
 
 PREFIX=""
 FORCE_MUSL=0
+PATH_ACTION=prompt
+ADD_PATH_FLAG=0
+NO_ADD_PATH_FLAG=0
 TMPDIR_RPI=""
+READ_TIMEOUT_SUPPORTED=0
+PROMPT_TIMEOUT=${RPI_INSTALL_PROMPT_TIMEOUT:-60}
 
 info() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -53,18 +82,36 @@ die() {
     exit 1
 }
 
+# Strip trailing slashes (except the root itself) so HOME/ZDOTDIR/XDG values
+# compare and join consistently.
+normalize_dir() {
+    _dir=$1
+    while [ "${_dir%/}" != "$_dir" ] && [ "$_dir" != "/" ]; do
+        _dir=${_dir%/}
+    done
+    printf '%s' "$_dir"
+}
+
 usage() {
     cat <<'EOF'
-Usage: install.sh [--prefix <dir>] [--musl]
+Usage: install.sh [--prefix <dir>] [--add-path|--no-add-path] [--musl]
 
 Options:
   --prefix <dir>   Install directory (default: ~/.local/bin)
+  --add-path       Add the install directory to the detected shell profile
+                   without prompting (user-scoped installs and supported
+                   shells only)
+  --no-add-path    Never modify a shell profile
   --musl           Force the musl target on Linux (auto-detected otherwise)
   -h, --help       Show this help
 
-Environment overrides (mirrors/tests): RPI_GITHUB_API_URL,
-RPI_VERSION_CHECK_URL, RPI_RELEASE_BASE_URL, RPI_SITE_BASE_URL — see the
-script header.
+Environment overrides (mirrors/tests): RPI_INSTALL_ADD_PATH=1|0,
+RPI_NONINTERACTIVE=1, RPI_INSTALL_PROMPT_TIMEOUT=<seconds>,
+RPI_GITHUB_API_URL, RPI_VERSION_CHECK_URL, RPI_RELEASE_BASE_URL,
+RPI_SITE_BASE_URL — see the script header.
+
+CI/pty automation should set RPI_INSTALL_ADD_PATH=0 so an install never waits
+for terminal input.
 EOF
 }
 
@@ -83,6 +130,16 @@ while [ $# -gt 0 ]; do
             FORCE_MUSL=1
             shift
             ;;
+        --add-path)
+            ADD_PATH_FLAG=1
+            PATH_ACTION=add
+            shift
+            ;;
+        --no-add-path)
+            NO_ADD_PATH_FLAG=1
+            PATH_ACTION=skip
+            shift
+            ;;
         -h | --help)
             usage
             exit 0
@@ -93,10 +150,42 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ "$ADD_PATH_FLAG" = 1 ] && [ "$NO_ADD_PATH_FLAG" = 1 ]; then
+    die "--add-path and --no-add-path are mutually exclusive"
+fi
+
 if [ -z "$PREFIX" ]; then
     [ -n "${HOME:-}" ] || die "\$HOME is not set; pass --prefix explicitly"
     PREFIX=$HOME/.local/bin
 fi
+
+HOME_DIR=""
+if [ -n "${HOME:-}" ]; then
+    HOME_DIR=$(normalize_dir "$HOME")
+    [ "$HOME_DIR" != "/" ] || HOME_DIR=""
+fi
+
+# Flags win over the environment; the environment only supplies a default
+# when neither --add-path nor --no-add-path was passed.
+if [ "$PATH_ACTION" = prompt ]; then
+    add_path_env=$(printf '%s' "${RPI_INSTALL_ADD_PATH:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case $add_path_env in
+        1 | true | yes | on) PATH_ACTION=add ;;
+        0 | false | no | off) PATH_ACTION=skip ;;
+    esac
+fi
+
+# Feature-probe `read -t` once: bash/ksh/zsh support it, dash/POSIX sh does
+# not. The prompt falls back to a normal blocking read on shells without it.
+if (IFS= read -r -t 0 _ <<EOF
+x
+EOF
+) 2>/dev/null; then
+    READ_TIMEOUT_SUPPORTED=1
+fi
+case $PROMPT_TIMEOUT in
+    '' | *[!0-9]*) PROMPT_TIMEOUT=60 ;;
+esac
 
 cleanup() {
     [ -z "$TMPDIR_RPI" ] || rm -rf "$TMPDIR_RPI"
@@ -356,6 +445,292 @@ cat >"$MANIFEST" <<EOF
 }
 EOF
 
+# ---- PATH integration -------------------------------------------------------
+
+is_rpi_active_on_path() {
+    active=$(command -v rpi 2>/dev/null || true)
+    [ -n "$active" ] && [ "$active" = "$INSTALL_PATH" ]
+}
+
+is_user_scoped_install() {
+    [ -n "${HOME_DIR:-}" ] || return 1
+    [ "$(id -u 2>/dev/null || printf '1')" != 0 ] || return 1
+    case "$PREFIX_ABS" in
+        "$HOME_DIR"/*) return 0 ;;
+    esac
+    return 1
+}
+
+shell_config_file() {
+    [ -n "${HOME_DIR:-}" ] || return 1
+    shell_name=$(basename "${SHELL:-sh}")
+    case $shell_name in
+        fish)
+            config_home=${XDG_CONFIG_HOME:-$HOME_DIR/.config}
+            config_home=$(normalize_dir "$config_home")
+            printf '%s' "$config_home/fish/config.fish"
+            ;;
+        zsh)
+            zsh_home=${ZDOTDIR:-$HOME_DIR}
+            zsh_home=$(normalize_dir "$zsh_home")
+            printf '%s' "$zsh_home/.zshrc"
+            ;;
+        bash)
+            if [ -f "$HOME_DIR/.bashrc" ]; then
+                printf '%s' "$HOME_DIR/.bashrc"
+            elif [ -f "$HOME_DIR/.bash_profile" ]; then
+                printf '%s' "$HOME_DIR/.bash_profile"
+            elif [ -f "$HOME_DIR/.bash_login" ]; then
+                printf '%s' "$HOME_DIR/.bash_login"
+            else
+                printf '%s' "$HOME_DIR/.profile"
+            fi
+            ;;
+        sh | dash | ash | ksh | mksh | pdksh | posh | yash)
+            printf '%s' "$HOME_DIR/.profile"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Escape a custom path for use inside double quotes in a shell profile.
+# The default ~/.local/bin is emitted as $HOME/.local/bin instead, so the
+# profile stays portable across machines.
+profile_double_quote() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/\\$/g; s/`/\\`/g'
+}
+
+path_update_command() {
+    bin_dir=$1
+    shell_name=$(basename "${SHELL:-sh}")
+    if [ -n "${HOME_DIR:-}" ] && [ "$bin_dir" = "$HOME_DIR/.local/bin" ]; then
+        bin_expr='$HOME/.local/bin'
+    else
+        bin_expr=$(profile_double_quote "$bin_dir")
+    fi
+    case $shell_name in
+        fish)
+            printf 'fish_add_path "%s"' "$bin_expr"
+            ;;
+        sh | dash | ash | ksh | mksh | pdksh | posh | yash | bash | zsh)
+            # Keep the whole guard on one line so the installer block stays a
+            # two-line unit; the guard prevents nested shells from appending
+            # the same entry on every source.
+            printf 'case ":$PATH:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac' "$bin_expr" "$bin_expr"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+config_file_mentions_path() {
+    file=$1
+    command=$2
+    dir=$3
+    [ -f "$file" ] || return 1
+    grep -Fxq "$command" "$file" && return 0
+    # Recognize the simple export form written by older installers/manual
+    # guidance (absolute path) and by pre-guard versions of this installer
+    # ($HOME form for the default prefix).
+    legacy_abs=$(printf 'export PATH="%s:$PATH"' "$(profile_double_quote "$dir")")
+    if [ "$legacy_abs" != "$command" ] && grep -Fxq "$legacy_abs" "$file"; then
+        return 0
+    fi
+    if [ -n "${HOME_DIR:-}" ] && [ "$dir" = "$HOME_DIR/.local/bin" ]; then
+        grep -Fxq 'export PATH="$HOME/.local/bin:$PATH"' "$file" && return 0
+    fi
+    return 1
+}
+
+# Remove a previous install.sh-written block: a `# rpi` marker followed by an
+# export/fish_add_path/case line. Unrelated lines are preserved. The file is
+# rewritten in place (cat >), which keeps symlinks, permissions and ownership
+# intact; `mv` would replace a dotfiles symlink with a regular file.
+remove_rpi_path_block() {
+    config_file=$1
+    tmp="${config_file}.rpi-tmp.$$"
+    if ! awk '
+        $0 == "# rpi" {
+            skip = 1
+            # Drop the separating blank line together with the block so
+            # repeated prefix changes do not accumulate blank lines.
+            if (out_count > 0 && out[out_count] == "") {
+                out_count--
+            }
+            next
+        }
+        skip == 1 {
+            if ($0 ~ /^export PATH=/ || $0 ~ /^fish_add_path / || $0 ~ /^case ":\$PATH:" in /) {
+                skip = 0
+                next
+            }
+            skip = 0
+        }
+        { out[++out_count] = $0 }
+        END { for (i = 1; i <= out_count; i++) print out[i] }
+    ' "$config_file" >"$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! cat "$tmp" >"$config_file"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+append_path_to_profile() {
+    config_file=$1
+    command=$2
+    mkdir -p "${config_file%/*}" 2>/dev/null || return 1
+    [ -e "$config_file" ] || : >"$config_file" || return 1
+    if grep -Fxq '# rpi' "$config_file" 2>/dev/null; then
+        remove_rpi_path_block "$config_file" || return 1
+    fi
+    if [ -s "$config_file" ]; then
+        last_byte=$(tail -c 1 "$config_file" 2>/dev/null || true)
+        if [ -n "$last_byte" ]; then
+            printf '\n' >>"$config_file" || return 1
+        fi
+    fi
+    printf '# rpi\n%s\n' "$command" >>"$config_file" || return 1
+    return 0
+}
+
+# Prompting is only safe when a human can answer. CI/pty runners often expose
+# /dev/tty without ever writing to it, so a plain readiness check is not
+# enough; honor the standard CI marker and RPI_NONINTERACTIVE as well.
+can_prompt_for_path() {
+    [ -t 1 ] || return 1
+    [ -z "${CI:-}" ] || return 1
+    noninteractive=$(printf '%s' "${RPI_NONINTERACTIVE:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case $noninteractive in
+        1 | true | yes | on) return 1 ;;
+    esac
+    case ${TERM:-} in
+        dumb) return 1 ;;
+    esac
+    ( : <>/dev/tty ) 2>/dev/null || return 1
+    return 0
+}
+
+prompt_add_path_to_profile() {
+    bin_dir=$1
+    if ! config_file=$(shell_config_file); then
+        return 1
+    fi
+    if ! command=$(path_update_command "$bin_dir"); then
+        return 1
+    fi
+
+    if config_file_mentions_path "$config_file" "$command" "$bin_dir"; then
+        info "A PATH update for $bin_dir already exists in $config_file."
+        return 0
+    fi
+
+    if ! can_prompt_for_path; then
+        return 1
+    fi
+
+    # curl | sh means stdin is the installer script itself; ask on /dev/tty.
+    exec 3<>/dev/tty || return 1
+    if ! printf 'Add %s to your PATH in %s now? [Y/n] ' "$bin_dir" "$config_file" >&3; then
+        exec 3>&-
+        return 1
+    fi
+    if [ "$READ_TIMEOUT_SUPPORTED" = 1 ]; then
+        if ! IFS= read -r -t "$PROMPT_TIMEOUT" answer <&3; then
+            answer=N
+        fi
+    else
+        if ! IFS= read -r answer <&3; then
+            answer=N
+        fi
+    fi
+    exec 3>&-
+    answer=$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case $answer in
+        n | no) return 1 ;;
+    esac
+
+    if append_path_to_profile "$config_file" "$command"; then
+        info "Added $bin_dir to $config_file."
+        return 0
+    fi
+    warn "could not update $config_file"
+    return 1
+}
+
+print_path_guidance() {
+    info ""
+    info "note: $PREFIX_ABS is not the active rpi on PATH; add it with:"
+    if command=$(path_update_command "$PREFIX_ABS"); then
+        info "  $command"
+        if [ -n "${HOME_DIR:-}" ]; then
+            if config_file=$(shell_config_file); then
+                info "(append that line to $config_file to make it permanent)"
+            fi
+        fi
+    else
+        info "  add $PREFIX_ABS to PATH in your shell configuration manually."
+        info "  (automatic profile update is not supported for shell $(basename "${SHELL:-sh}"))"
+    fi
+}
+
+maybe_update_path() {
+    if is_rpi_active_on_path; then
+        info ""
+        info "rpi is already on PATH."
+        return 0
+    fi
+
+    if ! is_user_scoped_install; then
+        print_path_guidance
+        info "note: not modifying a shell profile for a root, system-wide, or outside-\$HOME install."
+        return 0
+    fi
+
+    case $PATH_ACTION in
+        add)
+            if ! config_file=$(shell_config_file); then
+                print_path_guidance
+                return 0
+            fi
+            if ! command=$(path_update_command "$PREFIX_ABS"); then
+                print_path_guidance
+                return 0
+            fi
+            if config_file_mentions_path "$config_file" "$command" "$PREFIX_ABS"; then
+                info ""
+                info "A PATH update for $PREFIX_ABS already exists in $config_file."
+            elif append_path_to_profile "$config_file" "$command"; then
+                info ""
+                info "Added $PREFIX_ABS to $config_file."
+            else
+                print_path_guidance
+                return 0
+            fi
+            info "Restart your shell or run:"
+            info "  $command"
+            ;;
+        skip)
+            print_path_guidance
+            ;;
+        *)
+            if prompt_add_path_to_profile "$PREFIX_ABS"; then
+                info "Restart your shell or run:"
+                info "  $(path_update_command "$PREFIX_ABS")"
+            else
+                print_path_guidance
+            fi
+            ;;
+    esac
+}
+
 # ---- guidance ---------------------------------------------------------------
 
 info ""
@@ -367,12 +742,4 @@ info "next steps:"
 info "  update:    rpi update --self"
 info "  uninstall: rpi self-uninstall   (add --purge to also delete ~/.rpi)"
 
-case :$PATH: in
-    *":$PREFIX_ABS:"*) ;;
-    *)
-        info ""
-        info "note: $PREFIX_ABS is not in your PATH; add it with:"
-        info "  export PATH=\"$PREFIX_ABS:\$PATH\""
-        info "(append that line to ~/.profile, ~/.bashrc or ~/.zshrc to make it permanent)"
-        ;;
-esac
+maybe_update_path

@@ -1,6 +1,6 @@
 # rpi JSON / RPC wire protocol contract
 
-> This document is the user-facing contract for rpi's own stdout wire protocol in `--mode json` (print mode) and `--mode rpc` (RPC mode). rpi is byte-compared against upstream Pi v0.85.0+ (`9841914`, ADR-0023); the full 33-command RPC table and per-field documentation live in the upstream docs `external/pi/packages/coding-agent/docs/rpc.md` and `docs/json.md` — this document only pins the contract points verified on the rpi side (each has a corresponding test anchor).
+> This document is the user-facing contract for rpi's own stdout wire protocol in `--mode json` (print mode) and `--mode rpc` (RPC mode). rpi is byte-compared against upstream Pi v1.1.0 (`abe508e1b`, ADR-0036; the earlier v0.85.0+ pin `9841914` was the v0.1.4 baseline); the full 33-command RPC table and per-field documentation live in the upstream docs `external/pi/packages/coding-agent/docs/rpc.md` and `docs/json.md` — this document only pins the contract points verified on the rpi side (each has a corresponding test anchor).
 
 ## Both modes share one conversion point
 

@@ -11,11 +11,26 @@
 # resolution paths (fake GitHub API via RPI_GITHUB_API_URL, endpoint fallback
 # via RPI_VERSION_CHECK_URL + RPI_RELEASE_BASE_URL); --musl asset selection;
 # non-writable prefix -> sudo hint branch; mirror fallback (GitHub candidate
-# 404 -> RPI_SITE_BASE_URL succeeds; all candidates failing -> error exit).
+# 404 -> RPI_SITE_BASE_URL succeeds; all candidates failing -> error exit);
+# PATH handling (--add-path writes a marked shell-profile block, --no-add-path
+# does not, writes are idempotent, zsh/fish/custom-prefix detection,
+# symlink/mode preservation across prefix changes, HOME trailing slash,
+# special-character paths, legacy absolute lines, mixed-case env,
+# mutual-exclusion flags, unsupported shells, bash .bash_profile, and the
+# interactive pty prompt plus its read -t timeout).
 # The fake server plays both GitHub and the site mirror: assets live under
 # /releases/download/... only, so a GitHub base pointing elsewhere 404s.
 
 set -eu
+
+# Keep the installer non-interactive by default; individual PATH tests below
+# override this with --add-path or RPI_INSTALL_ADD_PATH=1. Clear the shell
+# profile overrides so tests never touch a developer's real dotfiles.
+export RPI_INSTALL_ADD_PATH=0
+unset ZDOTDIR XDG_CONFIG_HOME RPI_NONINTERACTIVE RPI_INSTALL_PROMPT_TIMEOUT
+
+# The default profile block is an idempotent case guard (one line).
+DEFAULT_PATH_LINE='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
 
 HERE=$(CDPATH= cd "$(dirname "$0")" && pwd)
 INSTALL_SH=$HERE/../install.sh
@@ -37,6 +52,15 @@ command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || {
     exit 1
 }
 command -v tar >/dev/null 2>&1 || { echo "tar missing" >&2; exit 1; }
+
+# Portable file-mode read: GNU stat first, BSD stat second.
+file_mode() {
+    if stat -c %a "$1" >/dev/null 2>&1; then
+        stat -c %a "$1"
+    else
+        stat -f %Lp "$1"
+    fi
+}
 
 # ---- host target (mirrors install.sh detection) ------------------------------
 
@@ -224,7 +248,7 @@ check "manifest installPath is absolute" \
     grep -q "\"installPath\": \"$H1/.local/bin/rpi\"" "$H1/.local/bin/rpi.install.json"
 check "output prints update guidance" grep -q 'rpi update --self' "$TMP/last-out"
 check "output prints uninstall guidance" grep -q 'rpi self-uninstall' "$TMP/last-out"
-check "output prints PATH hint for default prefix" grep -q 'not in your PATH' "$TMP/last-out"
+check "output prints PATH hint for default prefix" grep -q 'not the active rpi on PATH' "$TMP/last-out"
 check "installed binary runs" "$H1/.local/bin/rpi"
 
 # ---- 3. --prefix override --------------------------------------------------------
@@ -329,7 +353,224 @@ check "all-candidates-failed error printed" \
 check "no binary left behind (mirror case)" test ! -e "$H9/.local/bin/rpi"
 check "no manifest left behind (mirror case)" test ! -e "$H9/.local/bin/rpi.install.json"
 
+# ---- 10. PATH integration -------------------------------------------------------
+
+if [ "$(id -u)" = 0 ]; then
+    skip "PATH profile tests (running as root; installer refuses to edit profiles)"
+else
+    H10=$TMP/home10
+    expect_ok "install --add-path writes the default shell profile" \
+        env HOME="$H10" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --add-path
+    check "profile has the rpi marker" grep -Fxq '# rpi' "$H10/.profile"
+    check "profile has the default PATH line" \
+        grep -Fxq "$DEFAULT_PATH_LINE" "$H10/.profile"
+    check "output reports the added profile" grep -q "Added $H10/.local/bin" "$TMP/last-out"
+
+    expect_ok "second --add-path is idempotent" \
+        env HOME="$H10" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --add-path
+    check "exactly one rpi marker remains" \
+        test "$(grep -Fxc '# rpi' "$H10/.profile")" -eq 1
+
+    H11=$TMP/home11
+    expect_ok "zsh profile is detected via SHELL" \
+        env HOME="$H11" SHELL=/bin/zsh RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --add-path
+    check "zsh PATH line written to .zshrc" \
+        grep -Fxq "$DEFAULT_PATH_LINE" "$H11/.zshrc"
+
+    H12=$TMP/home12
+    CUSTOM_BIN=$H12/tools/rpi
+    expect_ok "custom prefix under HOME writes an absolute PATH line" \
+        env HOME="$H12" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --prefix "$CUSTOM_BIN" --add-path
+    CUSTOM_PATH_LINE=$(printf 'case ":$PATH:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac' "$CUSTOM_BIN" "$CUSTOM_BIN")
+    check "custom prefix PATH line in profile" \
+        grep -Fxq "$CUSTOM_PATH_LINE" "$H12/.profile"
+
+    H13=$TMP/home13
+    OUTSIDE_BIN=$TMP/outside-bin
+    expect_ok "outside-HOME prefix with --add-path falls back to guidance" \
+        env HOME="$H13" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --prefix "$OUTSIDE_BIN" --add-path
+    check "no profile written for an outside-HOME prefix" test ! -e "$H13/.profile"
+    check "outside-HOME install prints PATH guidance" grep -q 'not the active rpi on PATH' "$TMP/last-out"
+    check "outside-HOME install explains the refusal" \
+        grep -q 'not modifying a shell profile' "$TMP/last-out"
+
+    H14=$TMP/home14
+    expect_ok "RPI_INSTALL_ADD_PATH=1 writes without a flag" \
+        env HOME="$H14" SHELL=/bin/bash RPI_INSTALL_ADD_PATH=1 \
+        RPI_GITHUB_API_URL="$API_URL" RPI_VERSION_CHECK_URL="$ENDPOINT_URL" \
+        RPI_RELEASE_BASE_URL="$BASE/releases" sh "$INSTALL_SH"
+    check "env-driven PATH line written" \
+        grep -Fxq "$DEFAULT_PATH_LINE" "$H14/.profile"
+
+    H15=$TMP/home15
+    expect_ok "fish config is detected via SHELL" \
+        env HOME="$H15" SHELL=/usr/bin/fish RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --add-path
+    check "fish_add_path written to config.fish" \
+        grep -Fxq 'fish_add_path "$HOME/.local/bin"' "$H15/.config/fish/config.fish"
+
+    H16=$TMP/home16
+    expect_ok "--no-add-path never writes a profile" \
+        env HOME="$H16" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --no-add-path
+    check "no profile written with --no-add-path" test ! -e "$H16/.profile"
+    check "--no-add-path still prints PATH guidance" grep -q 'not the active rpi on PATH' "$TMP/last-out"
+
+    # ---- legacy / edge-case PATH behavior --------------------------------
+
+    check "sourced default profile resolves the installed rpi" \
+        env HOME="$H10" sh -c '. "$HOME/.profile"; [ "$(command -v rpi)" = "$HOME/.local/bin/rpi" ]'
+    check "sourced default profile is idempotent" \
+        env HOME="$H10" sh -c '. "$HOME/.profile"; first=$PATH; . "$HOME/.profile"; [ "$first" = "$PATH" ]'
+
+    H17=$TMP/home17
+    mkdir -p "$H17"
+    printf 'export PATH="%s/.local/bin:$PATH"\n' "$H17" >"$H17/.profile"
+    expect_ok "legacy absolute default PATH line is recognized" \
+        env HOME="$H17" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --add-path
+    check "legacy absolute line is not duplicated with a marker" \
+        test "$(grep -Fxc '# rpi' "$H17/.profile")" -eq 0
+
+    H18=$TMP/home18
+    expect_ok "HOME with a trailing slash is user-scoped" \
+        env HOME="$H18/" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --add-path
+    check "trailing-slash HOME writes the profile" test -f "$H18/.profile"
+    check "trailing-slash HOME does not print a doubled profile path" \
+        sh -c '! grep -q "//.profile" "$1"' _ "$TMP/last-out"
+
+    H19=$TMP/home19
+    SPECIAL_BIN="$H19/bin with space/\$dollar/\"quote\"/\`tick\`"
+    expect_ok "special-character prefix installs with --add-path" \
+        env HOME="$H19" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --prefix "$SPECIAL_BIN" --add-path
+    check "special-character profile sources in sh" \
+        env HOME="$H19" sh -c '. "$HOME/.profile"; [ "${PATH%%:*}" = "$1" ]' _ "$SPECIAL_BIN"
+    check "special-character profile keeps a single marker" \
+        test "$(grep -Fxc '# rpi' "$H19/.profile")" -eq 1
+
+    H20=$TMP/home20
+    mkdir -p "$H20/dotfiles"
+    printf 'before\n' >"$H20/dotfiles/zshrc"
+    chmod 600 "$H20/dotfiles/zshrc"
+    ln -s dotfiles/zshrc "$H20/.zshrc"
+    expect_ok "first --add-path through a symlinked profile" \
+        env HOME="$H20" SHELL=/bin/zsh RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --prefix "$H20/binA" --add-path
+    expect_ok "second --add-path rewrites the symlinked profile" \
+        env HOME="$H20" SHELL=/bin/zsh RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --prefix "$H20/binB" --add-path
+    check "symlinked profile stays a symlink" test -L "$H20/.zshrc"
+    check "symlinked profile target keeps mode 600" test "$(file_mode "$H20/dotfiles/zshrc")" = 600
+    check "symlinked profile target has one block" \
+        test "$(grep -Fxc '# rpi' "$H20/dotfiles/zshrc")" -eq 1
+    check "symlinked profile target names the new prefix" grep -q "$H20/binB" "$H20/dotfiles/zshrc"
+
+    H21=$TMP/home21
+    mkdir -p "$H21"
+    printf '# bash profile\n' >"$H21/.bash_profile"
+    expect_ok "bash .bash_profile is preferred when .bashrc is absent" \
+        env HOME="$H21" SHELL=/bin/bash RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --add-path
+    check "block written to .bash_profile" \
+        grep -Fxq "$DEFAULT_PATH_LINE" "$H21/.bash_profile"
+    check "no .profile is created when .bash_profile exists" test ! -e "$H21/.profile"
+
+    H22=$TMP/home22
+    expect_ok "unsupported shell falls back to guidance" \
+        env HOME="$H22" SHELL=/bin/csh RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --add-path
+    check "unsupported shell writes no profile" test ! -e "$H22/.profile"
+    check "unsupported shell note is printed" \
+        grep -q 'not supported for shell csh' "$TMP/last-out"
+
+    H23=$TMP/home23
+    expect_ok "RPI_INSTALL_ADD_PATH=True is normalized" \
+        env HOME="$H23" SHELL=/bin/bash RPI_INSTALL_ADD_PATH=True \
+        RPI_GITHUB_API_URL="$API_URL" RPI_VERSION_CHECK_URL="$ENDPOINT_URL" \
+        RPI_RELEASE_BASE_URL="$BASE/releases" sh "$INSTALL_SH"
+    check "mixed-case env writes the profile" \
+        grep -Fxq "$DEFAULT_PATH_LINE" "$H23/.profile"
+
+    H24=$TMP/home24
+    expect_fail "--add-path and --no-add-path are rejected" \
+        env HOME="$H24" sh "$INSTALL_SH" --add-path --no-add-path
+    check "mutual-exclusion message is printed" \
+        grep -q 'mutually exclusive' "$TMP/last-out"
+
+    # ---- interactive prompt (pty) ---------------------------------------
+
+    if command -v script >/dev/null 2>&1 &&
+        command -v timeout >/dev/null 2>&1 &&
+        command -v bash >/dev/null 2>&1 &&
+        script --help 2>&1 | grep -q -- '-e'; then
+        cat >"$TMP/pty-install-sh.sh" <<EOF
+#!/bin/sh
+cat "$INSTALL_SH" | sh
+EOF
+        chmod 755 "$TMP/pty-install-sh.sh"
+        cat >"$TMP/pty-install-bash.sh" <<EOF
+#!/bin/bash
+cat "$INSTALL_SH" | bash
+EOF
+        chmod 755 "$TMP/pty-install-bash.sh"
+
+        H25=$TMP/home25
+        if printf 'n\n' | timeout 60 script -qec "env HOME=$H25 SHELL=/bin/bash CI= TERM=xterm RPI_INSTALL_ADD_PATH= RPI_NONINTERACTIVE= RPI_GITHUB_API_URL=$API_URL RPI_VERSION_CHECK_URL=$ENDPOINT_URL RPI_RELEASE_BASE_URL=$BASE/releases sh $TMP/pty-install-sh.sh" /dev/null >"$TMP/pty-n-out" 2>&1; then
+            pass "pty prompt n exits 0"
+        else
+            fail "pty prompt n exits 0"
+            sed 's/^/    | /' "$TMP/pty-n-out"
+        fi
+        check "pty prompt n leaves the profile untouched" test ! -e "$H25/.profile"
+        check "pty prompt n prints guidance" grep -q 'not the active rpi on PATH' "$TMP/pty-n-out"
+
+        H26=$TMP/home26
+        if printf 'y\n' | timeout 60 script -qec "env HOME=$H26 SHELL=/bin/bash CI= TERM=xterm RPI_INSTALL_ADD_PATH= RPI_NONINTERACTIVE= RPI_GITHUB_API_URL=$API_URL RPI_VERSION_CHECK_URL=$ENDPOINT_URL RPI_RELEASE_BASE_URL=$BASE/releases sh $TMP/pty-install-sh.sh" /dev/null >"$TMP/pty-y-out" 2>&1; then
+            pass "pty prompt y exits 0"
+        else
+            fail "pty prompt y exits 0"
+            sed 's/^/    | /' "$TMP/pty-y-out"
+        fi
+        check "pty prompt y writes the profile" test -f "$H26/.profile"
+        check "pty prompt y writes the block" grep -Fxq "$DEFAULT_PATH_LINE" "$H26/.profile"
+
+        H27=$TMP/home27
+        if (sleep 5) | timeout 25 script -qec "env HOME=$H27 SHELL=/bin/bash CI= TERM=xterm RPI_INSTALL_ADD_PATH= RPI_NONINTERACTIVE= RPI_INSTALL_PROMPT_TIMEOUT=1 RPI_GITHUB_API_URL=$API_URL RPI_VERSION_CHECK_URL=$ENDPOINT_URL RPI_RELEASE_BASE_URL=$BASE/releases bash $TMP/pty-install-bash.sh" /dev/null >"$TMP/pty-timeout-out" 2>&1; then
+            pass "pty timeout prompt exits 0"
+        else
+            fail "pty timeout prompt exits 0"
+            sed 's/^/    | /' "$TMP/pty-timeout-out"
+        fi
+        check "pty timeout leaves the profile untouched" test ! -e "$H27/.profile"
+        check "pty timeout prints guidance" grep -q 'not the active rpi on PATH' "$TMP/pty-timeout-out"
+    else
+        skip "pty prompt tests (script -e/timeout/bash unavailable)"
+    fi
+fi
+
 # ---- summary ------------------------------------------------------------------------
+
 
 echo
 echo "ran $TESTS_RUN checks, $TESTS_FAILED failed"
