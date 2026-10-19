@@ -48,15 +48,16 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
 # ---- syntax gate + load only the function definitions ------------------------
 
 $tokens = $null
-$errors = $null
+$parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-    (Resolve-Path -LiteralPath $installer).Path, [ref]$tokens, [ref]$errors)
-Check-Equal '0' ([string]$errors.Count) 'install.ps1 parses without errors'
-if ($errors.Count -gt 0) {
-    foreach ($error in $errors) {
-        Write-Host "    parse error at line $($error.Extent.StartLineNumber): $($error.Message)"
+    (Resolve-Path -LiteralPath $installer).Path, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    # Print before the assertion so the diagnostics survive a failed check.
+    foreach ($parseError in $parseErrors) {
+        Write-Host "    parse error at line $($parseError.Extent.StartLineNumber): $($parseError.Message)"
     }
 }
+Check-Equal '0' ([string]$parseErrors.Count) 'install.ps1 parses without errors'
 
 $functions = $ast.FindAll(
     { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] },
