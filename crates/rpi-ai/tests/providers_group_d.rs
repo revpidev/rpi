@@ -93,7 +93,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.fireworks.ai/inference",
         "Fireworks API key",
         "FIREWORKS_API_KEY",
-        22, // 2026-10-01 v6 regen (models.dev + OpenRouter snapshot)
+        24, // 2026-10-19 snapshot (+DeepSeek V4.1 Flash 1017, +Muse Spark Open)
     ),
     spec(
         groq_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        17, // 2026-10-08 catalog refresh (DeepSeek-V4-Pro → -0813; models.dev snapshot)
+        20, // 2026-10-19 snapshot (+Muse Spark Open, +Nemotron 3.5 Super VL, +Beam 1.0)
     ),
     spec(
         xai_provider,
@@ -147,7 +147,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.xiaomimimo.com/v1",
         "Xiaomi API key",
         "XIAOMI_API_KEY",
-        6, // 19451accd rules regen: +mimo-v2.6 family (snapshot 2026-09-23)
+        3, // 2026-10-19 snapshot: the mimo-v2.5 family retired (v2.6 only)
     ),
     spec(
         xiaomi_token_plan_ams_provider,
@@ -156,7 +156,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-ams.xiaomimimo.com/v1",
         "Xiaomi Token Plan AMS API key",
         "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
-        4, // 19451accd rules regen: +mimo-v2.6 family (snapshot 2026-09-23)
+        2, // 2026-10-19 snapshot: the mimo-v2.5 family retired (v2.6 only)
     ),
     spec(
         xiaomi_token_plan_cn_provider,
@@ -165,7 +165,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-cn.xiaomimimo.com/v1",
         "Xiaomi Token Plan CN API key",
         "XIAOMI_TOKEN_PLAN_CN_API_KEY",
-        4, // 19451accd rules regen: +mimo-v2.6 family (snapshot 2026-09-23)
+        2, // 2026-10-19 snapshot: the mimo-v2.5 family retired (v2.6 only)
     ),
     spec(
         xiaomi_token_plan_sgp_provider,
@@ -174,7 +174,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-sgp.xiaomimimo.com/v1",
         "Xiaomi Token Plan SGP API key",
         "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
-        4, // 19451accd rules regen: +mimo-v2.6 family (snapshot 2026-09-23)
+        2, // 2026-10-19 snapshot: the mimo-v2.5 family retired (v2.6 only)
     ),
 ];
 
@@ -310,7 +310,7 @@ fn xiaomi_catalog_splits_api_billing_only_models() {
             .collect();
         assert!(!ids.contains(&id), "xiaomi deprecated {id} leaked");
     }
-    let replacement = get_model(&xiaomi, "mimo-v2.5");
+    let replacement = get_model(&xiaomi, "mimo-v2.6-flash");
     assert_eq!(replacement.api.as_str(), ApiKind::OPENAI_COMPLETIONS);
     assert_eq!(replacement.base_url, "https://api.xiaomimimo.com/v1");
 
@@ -325,7 +325,7 @@ fn xiaomi_catalog_splits_api_billing_only_models() {
         assert!(!ids.contains(&"mimo-v2-flash"), "{} flash", provider.id());
         assert!(!ids.contains(&"mimo-v2-omni"), "{} omni", provider.id());
         assert!(!ids.contains(&"mimo-v2-pro"), "{} v2-pro", provider.id());
-        assert!(ids.contains(&"mimo-v2.5-pro"), "{} v2.5-pro", provider.id());
+        assert!(ids.contains(&"mimo-v2.6-pro"), "{} v2.6-pro", provider.id());
         assert!(
             models
                 .iter()

@@ -2787,28 +2787,6 @@
           }
         },
         {
-          "id": "apodex/apodex-1.1-mini:free",
-          "name": "Apodex: Apodex 1.1 Mini (free)",
-          "reasoning": true,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "contextWindow": 262144,
-          "maxTokens": 235929,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
           "id": "arcee-ai/trinity-large-thinking",
           "name": "Arcee AI: Trinity Large Thinking",
           "reasoning": true,
@@ -3301,13 +3279,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.259,
-            "output": 0.8,
-            "cacheRead": 0.14,
+            "input": 0.28,
+            "output": 0.42,
+            "cacheRead": 0.028,
             "cacheWrite": 0
           },
-          "contextWindow": 163840,
-          "maxTokens": 147456,
+          "contextWindow": 131072,
+          "maxTokens": 65536,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -3354,13 +3332,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.03,
-            "output": 1.28,
-            "cacheRead": 0.03,
+            "input": 0.091,
+            "output": 0.182,
+            "cacheRead": 0.0182,
             "cacheWrite": 0
           },
-          "contextWindow": 1048576,
-          "maxTokens": 943718,
+          "contextWindow": 1048575,
+          "maxTokens": 943717,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -3386,9 +3364,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.016,
-            "output": 0.64,
-            "cacheRead": 0.016,
+            "input": 0.15,
+            "output": 0.15,
+            "cacheRead": 0.042,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -3488,8 +3466,8 @@
             "cacheRead": 0.022,
             "cacheWrite": 0
           },
-          "contextWindow": 1048576,
-          "maxTokens": 393216,
+          "contextWindow": 1024000,
+          "maxTokens": 384000,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -3516,9 +3494,42 @@
             "image"
           ],
           "cost": {
-            "input": 0.15,
-            "output": 0.6,
-            "cacheRead": 0.003,
+            "input": 0.0448,
+            "output": 0.08,
+            "cacheRead": 0.0016,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1048576,
+          "maxTokens": 943718,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true,
+            "requiresReasoningContentOnAssistantMessages": true
+          }
+        },
+        {
+          "id": "deepseek/deepseek-v4.1-flash-1017",
+          "name": "DeepSeek: DeepSeek V4.1 Flash 1017",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0.3,
+            "output": 1.2,
+            "cacheRead": 0.006,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -3549,13 +3560,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.112,
-            "output": 0.336,
-            "cacheRead": 0.00336,
+            "input": 0.05,
+            "output": 0.15,
+            "cacheRead": 0.004,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
-          "maxTokens": 131072,
+          "maxTokens": 384000,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -3580,6 +3591,29 @@
           },
           "contextWindow": 512000,
           "maxTokens": 460800,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "elorian/glimpse",
+          "name": "Elorian: Glimpse",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0.6,
+            "output": 3,
+            "cacheRead": 0.06,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 256000,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -4399,9 +4433,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.75,
-            "output": 3.75,
-            "cacheRead": 0.075,
+            "input": 0.825,
+            "output": 4.125,
+            "cacheRead": 0.0825,
             "cacheWrite": 0.041667
           },
           "contextWindow": 1048576,
@@ -4438,6 +4472,70 @@
           },
           "contextWindow": 1048576,
           "maxTokens": 65536,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "google/gemini-4-argon",
+          "name": "Google: Gemini 4 Argon",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.1,
+            "cacheWrite": 0.1875
+          },
+          "contextWindow": 1048576,
+          "maxTokens": 943718,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "google/gemini-4-argon:batch",
+          "name": "Google: Gemini 4 Argon (batch)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 1,
+            "output": 5,
+            "cacheRead": 0.05,
+            "cacheWrite": 0.1875
+          },
+          "contextWindow": 1048576,
+          "maxTokens": 943718,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -4510,7 +4608,7 @@
           ],
           "cost": {
             "input": 0.08,
-            "output": 0.45,
+            "output": 0.35,
             "cacheRead": 0.04,
             "cacheWrite": 0
           },
@@ -4578,9 +4676,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.09,
-            "output": 0.34,
-            "cacheRead": 0.05,
+            "input": 0.2,
+            "output": 0.4,
+            "cacheRead": 0,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -4731,50 +4829,6 @@
           }
         },
         {
-          "id": "inclusionai/ling-3.0-flash-fin",
-          "name": "inclusionAI: Ling 3.0 Flash Fin",
-          "reasoning": true,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.042,
-            "output": 0.1232,
-            "cacheRead": 0.0084,
-            "cacheWrite": 0
-          },
-          "contextWindow": 262144,
-          "maxTokens": 32768,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "inclusionai/ling-3.0-flash-sante",
-          "name": "inclusionAI: Ling 3.0 Flash Sante",
-          "reasoning": true,
-          "input": [
-            "text"
-          ],
-          "cost": {
-            "input": 0.042,
-            "output": 0.1232,
-            "cacheRead": 0.0084,
-            "cacheWrite": 0
-          },
-          "contextWindow": 262144,
-          "maxTokens": 32768,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
           "id": "inclusionai/ling-3.0-flash-vl",
           "name": "inclusionAI: Ling 3.0 Flash VL",
           "reasoning": true,
@@ -4783,12 +4837,12 @@
             "image"
           ],
           "cost": {
-            "input": 0.021,
-            "output": 0.0616,
-            "cacheRead": 0.0042,
+            "input": 0.06,
+            "output": 0.18,
+            "cacheRead": 0.012,
             "cacheWrite": 0
           },
-          "contextWindow": 262144,
+          "contextWindow": 131072,
           "maxTokens": 32768,
           "compat": {
             "supportsDeveloperRole": false,
@@ -4805,9 +4859,9 @@
             "text"
           ],
           "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
+            "input": 0.075,
+            "output": 0.225,
+            "cacheRead": 0.015,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -4836,6 +4890,31 @@
             "cacheWrite": 0
           },
           "contextWindow": 65536,
+          "maxTokens": 8192,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "liquid/lfm-2.5-24b-a2b",
+          "name": "LiquidAI: LFM2.5-24B-A2B",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0.05,
+            "output": 0.7,
+            "cacheRead": 0.025,
+            "cacheWrite": 0
+          },
+          "contextWindow": 128000,
           "maxTokens": 8192,
           "compat": {
             "supportsDeveloperRole": false,
@@ -4918,9 +4997,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.22,
-            "output": 0.5,
-            "cacheRead": 0.11,
+            "input": 0.1,
+            "output": 0.32,
+            "cacheRead": 0,
             "cacheWrite": 0
           },
           "contextWindow": 131072,
@@ -5171,6 +5250,70 @@
           }
         },
         {
+          "id": "meta/muse-spark-open",
+          "name": "Meta: Muse Spark Open",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 1.25,
+            "output": 4.25,
+            "cacheRead": 0.15,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1048576,
+          "maxTokens": 943718,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "meta/muse-wonder",
+          "name": "Meta: Muse Wonder",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.2,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1048576,
+          "maxTokens": 943718,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
           "id": "minimax/minimax-m1",
           "name": "MiniMax: MiniMax M1",
           "reasoning": true,
@@ -5203,13 +5346,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.3,
-            "output": 1.2,
+            "input": 0.255,
+            "output": 1.02,
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "contextWindow": 196608,
-          "maxTokens": 176947,
+          "contextWindow": 204800,
+          "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -5254,12 +5397,12 @@
           ],
           "cost": {
             "input": 0.27,
-            "output": 1.08,
-            "cacheRead": 0.027,
+            "output": 0.95,
+            "cacheRead": 0.03,
             "cacheWrite": 0
           },
-          "contextWindow": 200000,
-          "maxTokens": 128000,
+          "contextWindow": 198000,
+          "maxTokens": 32768,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -5278,13 +5421,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.21,
-            "output": 0.84,
-            "cacheRead": 0.042,
+            "input": 0.3,
+            "output": 1.2,
+            "cacheRead": 0.06,
             "cacheWrite": 0
           },
-          "contextWindow": 196608,
-          "maxTokens": 176947,
+          "contextWindow": 204800,
+          "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -6086,9 +6229,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.73,
-            "output": 10,
-            "cacheRead": 0.55,
+            "input": 0.239,
+            "output": 11.936,
+            "cacheRead": 0.21,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -6370,6 +6513,52 @@
           },
           "contextWindow": 1000000,
           "maxTokens": 65536,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "nvidia/nemotron-3.5-super-vl",
+          "name": "NVIDIA: Nemotron 3.5 Super VL",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0.1,
+            "output": 0.4,
+            "cacheRead": 0.08,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 235929,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "nvidia/nemotron-3.5-super-vl:free",
+          "name": "NVIDIA: Nemotron 3.5 Super VL (free)",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -7149,7 +7338,7 @@
           "name": "OpenAI: GPT-5.1-Codex-Mini",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": "none",
+            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
@@ -8044,17 +8233,17 @@
             "image"
           ],
           "cost": {
-            "input": 2,
-            "output": 10,
-            "cacheRead": 0.2,
-            "cacheWrite": 2.5,
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.4,
+            "cacheWrite": 5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 4,
-                "output": 15,
-                "cacheRead": 0.4,
-                "cacheWrite": 5
+                "input": 8,
+                "output": 30,
+                "cacheRead": 0.8,
+                "cacheWrite": 10
               }
             ]
           },
@@ -8085,17 +8274,17 @@
             "image"
           ],
           "cost": {
-            "input": 2,
-            "output": 10,
-            "cacheRead": 0.2,
-            "cacheWrite": 2.5,
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.4,
+            "cacheWrite": 5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 4,
-                "output": 15,
-                "cacheRead": 0.4,
-                "cacheWrite": 5
+                "input": 8,
+                "output": 30,
+                "cacheRead": 0.8,
+                "cacheWrite": 10
               }
             ]
           },
@@ -8125,17 +8314,17 @@
             "image"
           ],
           "cost": {
-            "input": 1,
-            "output": 5,
-            "cacheRead": 0.1,
-            "cacheWrite": 1.25,
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.2,
+            "cacheWrite": 2.5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 2,
-                "output": 7.5,
-                "cacheRead": 0.2,
-                "cacheWrite": 2.5
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
               }
             ]
           },
@@ -8165,17 +8354,17 @@
             "image"
           ],
           "cost": {
-            "input": 1,
-            "output": 5,
-            "cacheRead": 0.1,
-            "cacheWrite": 1.25,
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.2,
+            "cacheWrite": 2.5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 2,
-                "output": 7.5,
-                "cacheRead": 0.2,
-                "cacheWrite": 2.5
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.4,
+                "cacheWrite": 5
               }
             ]
           },
@@ -9104,13 +9293,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.037,
-            "output": 0.17,
-            "cacheRead": 0,
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.075,
             "cacheWrite": 0
           },
           "contextWindow": 131072,
-          "maxTokens": 117964,
+          "maxTokens": 65536,
           "compat": {
             "thinkingFormat": "openrouter",
             "supportsStrictMode": true,
@@ -9235,6 +9424,9 @@
           "id": "openai/o1",
           "name": "OpenAI: o1",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
           "input": [
             "text",
             "image"
@@ -9257,6 +9449,9 @@
           "id": "openai/o3",
           "name": "OpenAI: o3",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
           "input": [
             "text",
             "image"
@@ -9279,6 +9474,9 @@
           "id": "openai/o3-mini",
           "name": "OpenAI: o3 Mini",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
           "input": [
             "text"
           ],
@@ -9330,6 +9528,9 @@
           "id": "openai/o3-mini:batch",
           "name": "OpenAI: o3 Mini (batch)",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
           "input": [
             "text"
           ],
@@ -9351,6 +9552,9 @@
           "id": "openai/o3-pro",
           "name": "OpenAI: o3 Pro",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
           "input": [
             "text",
             "image"
@@ -9373,6 +9577,9 @@
           "id": "openai/o3:batch",
           "name": "OpenAI: o3 (batch)",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
           "input": [
             "text",
             "image"
@@ -9395,6 +9602,9 @@
           "id": "openai/o4-mini",
           "name": "OpenAI: o4 Mini",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
           "input": [
             "text",
             "image"
@@ -9448,6 +9658,9 @@
           "id": "openai/o4-mini:batch",
           "name": "OpenAI: o4 Mini (batch)",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null
+          },
           "input": [
             "text",
             "image"
@@ -9550,6 +9763,28 @@
           },
           "contextWindow": 1000000,
           "maxTokens": 30000,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "openrouter/pareto-code",
+          "name": "Pareto Code Router",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": -1000000,
+            "output": -1000000,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 2000000,
+          "maxTokens": 4096,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -9883,7 +10118,7 @@
             "text"
           ],
           "cost": {
-            "input": 0.1,
+            "input": 0.09,
             "output": 0.3,
             "cacheRead": 0,
             "cacheWrite": 0
@@ -10031,13 +10266,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.1,
+            "input": 0.09,
             "output": 1.1,
-            "cacheRead": 0.07,
+            "cacheRead": 0,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 235929,
+          "maxTokens": 16384,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10197,13 +10432,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.26,
-            "output": 2.6,
-            "cacheRead": 0,
+            "input": 0.27,
+            "output": 2.16,
+            "cacheRead": 0.27,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 81920,
+          "maxTokens": 65536,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10220,13 +10455,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.08,
-            "output": 0.75,
-            "cacheRead": 0.04,
+            "input": 0.15,
+            "output": 1,
+            "cacheRead": 0.05,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 32768,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10243,9 +10478,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.55,
-            "output": 3.5,
-            "cacheRead": 0.225,
+            "input": 0.5,
+            "output": 3.6,
+            "cacheRead": 0.3,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -10376,13 +10611,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.32,
-            "output": 3.2,
-            "cacheRead": 0,
+            "input": 0.25,
+            "output": 2,
+            "cacheRead": 0.025,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 81920,
+          "maxTokens": 65536,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10399,13 +10634,13 @@
             "image"
           ],
           "cost": {
-            "input": 0.1,
-            "output": 0.95,
-            "cacheRead": 0.1,
+            "input": 0.15,
+            "output": 1,
+            "cacheRead": 0.05,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
-          "maxTokens": 65536,
+          "maxTokens": 235929,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -10571,6 +10806,29 @@
           }
         },
         {
+          "id": "qwen/qwen3.7-plus:batch",
+          "name": "Qwen: Qwen3.7 Plus (batch)",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0.23,
+            "output": 0.92,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 131072,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
           "id": "qwen/qwen3.8-2.4t-a95b",
           "name": "Qwen: Qwen3.8 2.4T A95B",
           "reasoning": true,
@@ -10592,7 +10850,7 @@
             "cacheRead": 0.25,
             "cacheWrite": 0
           },
-          "contextWindow": 1048576,
+          "contextWindow": 1000000,
           "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
@@ -10619,9 +10877,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.04,
-            "output": 2.3,
-            "cacheRead": 0.0198,
+            "input": 0.24,
+            "output": 2.2,
+            "cacheRead": 0.05,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -10736,6 +10994,37 @@
           },
           "contextWindow": 1000000,
           "maxTokens": 131072,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "reflection/beam-1.0-501b-a23b",
+          "name": "Reflection: Beam 1.0 501B A23B",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 1,
+            "output": 3,
+            "cacheRead": 0.1,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1048576,
+          "maxTokens": 943718,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -11011,7 +11300,7 @@
           "cost": {
             "input": 1,
             "output": 2.7,
-            "cacheRead": 0.05,
+            "cacheRead": 0.1,
             "cacheWrite": 0
           },
           "contextWindow": 1000000,
@@ -11268,31 +11557,8 @@
           }
         },
         {
-          "id": "unbiased/pareto",
-          "name": "Pareto",
-          "reasoning": false,
-          "input": [
-            "text",
-            "image"
-          ],
-          "cost": {
-            "input": 2.5,
-            "output": 7.5,
-            "cacheRead": 0.25,
-            "cacheWrite": 0
-          },
-          "contextWindow": 262144,
-          "maxTokens": 131072,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "thinkingFormat": "openrouter",
-            "supportsStrictMode": true,
-            "sendSessionAffinityHeaders": true
-          }
-        },
-        {
-          "id": "unbiased/pareto-26.10-preview",
-          "name": "Pareto 26.10 Preview",
+          "id": "unbiased/pareto-26.10",
+          "name": "Pareto 26.10",
           "reasoning": false,
           "input": [
             "text",
@@ -11305,6 +11571,29 @@
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
+          "maxTokens": 131072,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
+          "id": "unbiased/pareto-26.9",
+          "name": "Pareto 26.9",
+          "reasoning": false,
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 2.5,
+            "output": 7.5,
+            "cacheRead": 0.25,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
           "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
@@ -11793,6 +12082,28 @@
           }
         },
         {
+          "id": "xingchen-agi/xing4.0-29b-a4b:free",
+          "name": "XingChen: Xing4.0 29B A4B (free)",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 235929,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
           "id": "z-ai/glm-4.5",
           "name": "Z.ai: GLM 4.5",
           "reasoning": true,
@@ -11867,12 +12178,12 @@
             "text"
           ],
           "cost": {
-            "input": 0.5,
-            "output": 2,
-            "cacheRead": 0.1,
+            "input": 0.55,
+            "output": 2.2,
+            "cacheRead": 0.11,
             "cacheWrite": 0
           },
-          "contextWindow": 202752,
+          "contextWindow": 204800,
           "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
@@ -11892,7 +12203,7 @@
           "cost": {
             "input": 0.3,
             "output": 0.9,
-            "cacheRead": 0.05,
+            "cacheRead": 0.055,
             "cacheWrite": 0
           },
           "contextWindow": 131072,
@@ -11912,12 +12223,12 @@
             "text"
           ],
           "cost": {
-            "input": 0.6,
-            "output": 2.2,
-            "cacheRead": 0.11,
+            "input": 0.54,
+            "output": 1.98,
+            "cacheRead": 0.099,
             "cacheWrite": 0
           },
-          "contextWindow": 202752,
+          "contextWindow": 204800,
           "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
@@ -11961,8 +12272,8 @@
             "cacheRead": 0.119,
             "cacheWrite": 0
           },
-          "contextWindow": 198000,
-          "maxTokens": 128000,
+          "contextWindow": 202752,
+          "maxTokens": 131072,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -12031,9 +12342,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.06,
-            "output": 7,
-            "cacheRead": 0.059,
+            "input": 0.62,
+            "output": 2.42,
+            "cacheRead": 0.14,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12063,8 +12374,8 @@
           ],
           "cost": {
             "input": 0.079,
-            "output": 4.8,
-            "cacheRead": 0.059,
+            "output": 1.4,
+            "cacheRead": 0.078,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12094,9 +12405,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.0232,
-            "output": 1.2,
-            "cacheRead": 0.0232,
+            "input": 0.048,
+            "output": 0.2,
+            "cacheRead": 0.006,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12126,9 +12437,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.06,
-            "output": 0.2,
-            "cacheRead": 0.012,
+            "input": 0.05,
+            "output": 0.18,
+            "cacheRead": 0.01,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12416,9 +12727,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.0336,
-            "output": 1.188,
-            "cacheRead": 0.0336,
+            "input": 0.05,
+            "output": 0.15,
+            "cacheRead": 0.012,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12447,13 +12758,13 @@
             "text"
           ],
           "cost": {
-            "input": 0.25,
-            "output": 5,
-            "cacheRead": 0.2,
+            "input": 0.225,
+            "output": 8,
+            "cacheRead": 0.23,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
-          "maxTokens": 943718,
+          "maxTokens": 393216,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -12478,9 +12789,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.0128,
-            "output": 0.768,
-            "cacheRead": 0.0128,
+            "input": 0.0114,
+            "output": 0.45,
+            "cacheRead": 0.0114,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12544,21 +12855,12 @@
           ],
           "cost": {
             "input": 2,
-            "output": 12,
-            "cacheRead": 0.2,
-            "cacheWrite": 0.375,
-            "tiers": [
-              {
-                "inputTokensAbove": 200000,
-                "input": 4,
-                "output": 18,
-                "cacheRead": 0.4,
-                "cacheWrite": 0.375
-              }
-            ]
+            "output": 10,
+            "cacheRead": 0.1,
+            "cacheWrite": 0.1875
           },
           "contextWindow": 1048576,
-          "maxTokens": 65536,
+          "maxTokens": 943718,
           "compat": {
             "supportsDeveloperRole": false,
             "thinkingFormat": "openrouter",
@@ -12584,9 +12886,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.72,
-            "output": 24,
-            "cacheRead": 0.3,
+            "input": 0.238,
+            "output": 16,
+            "cacheRead": 0.228,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12795,6 +13097,29 @@
           }
         },
         {
+          "id": "~unbiased/pareto-latest",
+          "name": "Pareto Latest",
+          "reasoning": false,
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0.8,
+            "output": 3.2,
+            "cacheRead": 0.03,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1048576,
+          "maxTokens": 131072,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "thinkingFormat": "openrouter",
+            "supportsStrictMode": true,
+            "sendSessionAffinityHeaders": true
+          }
+        },
+        {
           "id": "~x-ai/grok-latest",
           "name": "xAI: Grok Latest",
           "reasoning": true,
@@ -12853,9 +13178,9 @@
             "image"
           ],
           "cost": {
-            "input": 0.0232,
-            "output": 1.2,
-            "cacheRead": 0.0232,
+            "input": 0.048,
+            "output": 0.2,
+            "cacheRead": 0.006,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -12884,9 +13209,9 @@
             "text"
           ],
           "cost": {
-            "input": 0.055,
-            "output": 5,
-            "cacheRead": 0.06,
+            "input": 0.04,
+            "output": 6,
+            "cacheRead": 0.025,
             "cacheWrite": 0
           },
           "contextWindow": 1048576,
@@ -13662,6 +13987,39 @@
         {
           "id": "deepseek-v4.1-flash",
           "name": "DeepSeek V4.1 Flash",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "compat": {
+            "supportsStrictMode": true,
+            "thinkingFormat": "qwen",
+            "supportsDeveloperRole": false,
+            "supportsStore": false,
+            "supportsReasoningEffort": true
+          }
+        },
+        {
+          "id": "deepseek-v4.1-flash-1017",
+          "name": "DeepSeek V4.1 Flash 1017",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": null,

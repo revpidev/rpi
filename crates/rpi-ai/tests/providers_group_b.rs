@@ -440,6 +440,7 @@ async fn test_opencode_go_factory_config_and_auth() {
         None,
         &[
             ApiKind::ANTHROPIC_MESSAGES,
+            ApiKind::GOOGLE_GENERATIVE_AI,
             ApiKind::OPENAI_COMPLETIONS,
             ApiKind::OPENAI_RESPONSES,
         ],

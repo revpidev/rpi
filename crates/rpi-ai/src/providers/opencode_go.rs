@@ -1,13 +1,20 @@
 //! Port of `packages/ai/src/providers/opencode-go.ts` @ pi `05558a792` / `4181f66`
-//! — OpenCode Go: mixed 3-API dispatch on `model.api`
-//! (`anthropic-messages` / `openai-completions` / `openai-responses`).
-//! Display name changed from "OpenCode Zen Go" to "OpenCode Go" in
-//! `05558a792` (#7157).
+//! — OpenCode Go: mixed-API dispatch on `model.api`
+//! (`anthropic-messages` / `google-generative-ai` / `openai-completions` /
+//! `openai-responses`). Display name changed from "OpenCode Zen Go" to
+//! "OpenCode Go" in `05558a792` (#7157).
+//!
+//! The 2026-10-19 catalog snapshot added `gemini-4-argon-contributor` on
+//! `google-generative-ai` (models.dev now reports `@ai-sdk/google` for the
+//! Go gateway); the upstream provider at this pin still types only three
+//! APIs, so the Google adapter is dispatched here to keep every vendored
+//! model selectable (same `x-opencode-session` wrapper as the other three).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::api::anthropic_messages::AnthropicMessages;
+use crate::api::google_generative_ai::GoogleGenerativeAi;
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::openai_responses::OpenAiResponses;
 use crate::api::session_affinity::with_opencode_session_header;
@@ -47,6 +54,10 @@ fn api_map() -> HashMap<String, Arc<dyn ProviderStreams>> {
             with_opencode_session_header(Arc::new(AnthropicMessages) as Arc<dyn ProviderStreams>),
         ),
         (
+            ApiKind::GOOGLE_GENERATIVE_AI.to_owned(),
+            with_opencode_session_header(Arc::new(GoogleGenerativeAi) as Arc<dyn ProviderStreams>),
+        ),
+        (
             ApiKind::OPENAI_COMPLETIONS.to_owned(),
             with_opencode_session_header(Arc::new(OpenAiCompletions) as Arc<dyn ProviderStreams>),
         ),
@@ -62,16 +73,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_map_covers_the_three_catalog_apis() {
+    fn api_map_covers_the_four_catalog_apis() {
         let map = api_map();
         for key in [
             ApiKind::ANTHROPIC_MESSAGES,
+            ApiKind::GOOGLE_GENERATIVE_AI,
             ApiKind::OPENAI_COMPLETIONS,
             ApiKind::OPENAI_RESPONSES,
         ] {
             assert!(map.contains_key(key), "missing dispatch key {key}");
         }
-        assert_eq!(map.len(), 3);
+        assert_eq!(map.len(), 4);
         for model in get_builtin_models("opencode-go") {
             assert!(
                 map.contains_key(model.api.as_str()),

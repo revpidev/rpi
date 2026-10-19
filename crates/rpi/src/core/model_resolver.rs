@@ -62,10 +62,10 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("qwen-token-plan", "qwen3.7-max"),
     ("qwen-token-plan-cn", "qwen3.7-max"),
     ("qwen-token-plan-individual", "qwen3.8-max"),
-    ("xiaomi", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
+    ("xiaomi", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-cn", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-ams", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-sgp", "mimo-v2.6-pro"),
 ];
 
 /// `defaultModelPerProvider` lookup (`hasDefaultModelProvider` /

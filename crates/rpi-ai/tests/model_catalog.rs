@@ -201,7 +201,7 @@ fn test_catalog_field_by_field_roundtrip() {
             total += 1;
         }
     }
-    assert_eq!(total, 1644);
+    assert_eq!(total, 1731);
 }
 
 /// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
@@ -255,10 +255,10 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-10-12T10:07:36.841Z); update on catalog refresh.
+    // (2026-10-19T09:55:38.636Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_791_799_656_841)
+        Some(1_792_403_738_636)
     );
 }
 
@@ -367,13 +367,12 @@ fn test_baseten_env_key_resolution() {
 #[test]
 fn test_baseten_deprecated_models_filtered() {
     let models = get_builtin_models("baseten");
-    // 22 models = upstream catalog after deprecated filtering (2026-10-01
-    // v6 regen; models.dev added one model since the previous vendored
-    // snapshot).
+    // 24 models = upstream catalog after deprecated filtering (2026-10-19
+    // snapshot; models.dev added the DeepSeek V4.1 Flash 1017 pair).
     assert_eq!(
         models.len(),
-        22,
-        "Baseten should have 22 non-deprecated models"
+        24,
+        "Baseten should have 24 non-deprecated models"
     );
     // No model name or id contains "deprecated".
     for model in models.iter() {
