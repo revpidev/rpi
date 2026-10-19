@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# test-install-ps1.ps1 — self-contained tests for install.ps1's PATH helpers.
+# test-install-ps1.ps1 - self-contained tests for install.ps1's PATH helpers.
 #
 # Parses install.ps1 (syntax gate), loads only its function definitions, and
 # exercises the pure/string/registry-mocked PATH logic. No registry writes and
@@ -58,6 +58,14 @@ if ($parseErrors.Count -gt 0) {
     }
 }
 Check-Equal '0' ([string]$parseErrors.Count) 'install.ps1 parses without errors'
+
+# Windows PowerShell 5.1 decodes a BOM-less script as ANSI. A non-ASCII byte
+# sequence can then contain a smart quote (U+201C/U+201D), which the parser
+# treats as a string delimiter and which breaks an otherwise valid string.
+# Keep the installer ASCII-only.
+$installerBytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $installer).Path)
+$nonAsciiBytes = @($installerBytes | Where-Object { $_ -gt 0x7F })
+Check-Equal '0' ([string]$nonAsciiBytes.Count) 'install.ps1 is ASCII-only (PS 5.1 ANSI decoding)'
 
 $functions = $ast.FindAll(
     { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] },

@@ -5,7 +5,7 @@
 .DESCRIPTION
     Downloads the latest rpi release asset for x86_64-pc-windows-msvc from
     GitHub Releases, verifies its SHA-256 (an integrity check against
-    corrupted downloads — it does NOT protect against tampered release
+    corrupted downloads - it does NOT protect against tampered release
     assets; signing is a planned follow-up, see ADR-0011), installs the
     binary, and writes the install manifest (rpi.install.json) next to it.
 
@@ -536,7 +536,7 @@ $Version = $null
 $ArchiveUrl = $null
 $ChecksumUrl = $null
 
-# Preferred path: GitHub API — tag_name gives the version, assets give the
+# Preferred path: GitHub API - tag_name gives the version, assets give the
 # exact browser_download_url (no name construction).
 try {
     $release = Invoke-RestMethod -Uri $GitHubApiUrl -Headers @{ 'User-Agent' = 'rpi-installer' }
@@ -557,7 +557,7 @@ if ($ArchiveUrl) {
     Write-Host "latest release: v$Version (via GitHub API)"
 } else {
     # Fallback path: version endpoint ({"version": ...}) + URL construction by
-    # naming rule. Fatal on failure — there is no further fallback.
+    # naming rule. Fatal on failure - there is no further fallback.
     Write-Warning "GitHub API unavailable; falling back to version endpoint"
     try {
         $infoDoc = Invoke-RestMethod -Uri $VersionCheckUrl
@@ -575,7 +575,7 @@ $ArchiveName = "rpi-$Version-$Target.zip"
 
 # Ordered download candidates (see the script header for the fallback
 # order): the API's browser_download_url first (API path), then the
-# naming-rule GitHub URL, then the official-site mirror — deduplicated.
+# naming-rule GitHub URL, then the official-site mirror - deduplicated.
 $Candidates = New-Object System.Collections.Generic.List[string]
 foreach ($u in @(
         $ArchiveUrl,
@@ -598,7 +598,7 @@ try {
         Write-Host "downloading $candidate"
         try {
             Invoke-WebRequest -Uri $candidate -OutFile $ZipPath
-            # The sidecar URL is <archive>.sha256 by construction — on
+            # The sidecar URL is <archive>.sha256 by construction - on
             # GitHub and on the site mirror alike.
             Invoke-WebRequest -Uri "$candidate.sha256" -OutFile $ShaPath
         } catch {
@@ -609,7 +609,7 @@ try {
         $expected = ((Get-Content $ShaPath -Raw).Trim() -split '\s+')[0].ToLower()
         $actual = (Get-FileHash $ZipPath -Algorithm SHA256).Hash.ToLower()
         if ($expected -ne $actual) {
-            # An integrity failure is fatal — never switch mirrors on a bad
+            # An integrity failure is fatal - never switch mirrors on a bad
             # checksum.
             Fail "sha256 integrity check failed for $ArchiveName; aborting"
         }
@@ -636,7 +636,7 @@ try {
         New-Item -ItemType File -Path $probe | Out-Null
         Remove-Item $probe
     } catch {
-        Fail "install directory $Prefix is not writable — re-run from an elevated PowerShell (Run as administrator)"
+        Fail "install directory $Prefix is not writable - re-run from an elevated PowerShell (Run as administrator)"
     }
 
     $InstallPath = Join-Path $Prefix 'rpi.exe'
