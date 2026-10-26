@@ -8,14 +8,10 @@ name: build
 #   - Linux arm64 musl   aarch64-unknown-linux-musl  cross-rs container (ghcr.io image); binary only
 #   - Linux arm64 glibc  aarch64-unknown-linux-gnu   apt gcc/g++-aarch64-linux-gnu
 #
-# Triggers: tag v* builds and publishes to GitHub Release; branch pushes no longer
-# trigger builds. workflow_dispatch remains for manual runs (e.g. packaging smoke
-# tests without cutting a tag).
+# Triggers: distribution builds run only via workflow_dispatch (ADR-0042).
+# Tag pushes never start packaging automatically; a human starts every build.
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -81,9 +77,9 @@ jobs:
       # rpi-extension.json at pack time.
       # rpi-ext-mcp-adapter was removed from the workspace entirely in
       # v0.1.7 (ADR-0037): MCP lives in the host, and the extension is
-      # retired — no .rpix artifacts are published for it. Installed copies
-      # still get the removal guidance
-      # (crates/rpi/src/core/deprecated_extensions.rs).
+      # retired — no .rpix artifacts are published for it. Its startup/update
+      # removal guidance is removed in v0.1.8 (ADR-0038), without deleting
+      # files already present on user machines.
       EXT_CRATES: rpi-ext-subagents rpi-ext-smart-fetch rpi-ext-statusline rpi-ext-ask-user-question rpi-ext-todo rpi-ext-plan-mode rpi-ext-usage
     strategy:
       fail-fast: false

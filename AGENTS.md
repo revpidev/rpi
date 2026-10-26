@@ -116,15 +116,20 @@ it is in scope.
 
 ## Release essentials (full checklist in RELEASING.md)
 
-- Order is pinned by ADR-0011: **assets before endpoints** — tag push
-  triggers `build.yml` (six targets + seven lockstep `.rpix` extensions on
-  the four non-musl targets + `.sha256` sidecars); only after the 12 core
-  files and the extension assets appear do you refresh
+- **Every distribution packaging and publishing action must be initiated by
+  a human** (ADR-0042): `.rpix` dry-runs, release builds, tags, GitHub
+  Releases, registry/site updates and issue closing. Agents may prepare files,
+  commands and evidence but must not perform those actions autonomously.
+  Ordinary development builds and tests are not distribution packaging.
+- `.github/workflows/build.yml` now supports only `workflow_dispatch`
+  distribution builds; tag pushes never start packaging automatically. A
+  human must start each build through the GitHub UI or `gh workflow run`.
+  Do not treat pushing a tag as authorization to package or publish.
+- Order remains **assets before endpoints**: only after the 12 core files and
+  the extension assets appear may a human refresh
   `revpi.dev/api/latest-version.json` via
-  `rpi-pages/scripts/generate-site.py --version <version>`.
-- Re-pushing a tag refreshes both assets and release notes — it is the
-  documented remedy for release-note fixes, but it rebuilds everything
-  (~35 min); use it deliberately.
+  `rpi-pages/scripts/generate-site.py --version <version>`. Re-running builds
+  or site generation after a tag re-push is also a human-initiated action.
 - Stable releases never touch the RC endpoint; RC releases never touch the
   stable endpoint (the generator enforces both).
 
