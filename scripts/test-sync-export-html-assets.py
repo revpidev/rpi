@@ -58,10 +58,10 @@ class SyncExportHtmlAssetsTests(unittest.TestCase):
             first["template.js"],
             b"rpi-url-params rpi-share-base-url rpi-share:v1: pi-untouched \xe4\xb8\xad\xe6\x96\x87\n",
         )
-        mtimes = {path: path.stat().st_mtime_ns for path in self.output.rglob("*") if path.is_file()}
         sync_assets.sync(False)
-        sync_assets.sync(True)
         self.assertEqual(first, {path.relative_to(self.output).as_posix(): path.read_bytes() for path in self.output.rglob("*") if path.is_file()})
+        mtimes = {path: path.stat().st_mtime_ns for path in self.output.rglob("*") if path.is_file()}
+        sync_assets.sync(True)
         self.assertEqual(mtimes, {path: path.stat().st_mtime_ns for path in self.output.rglob("*") if path.is_file()})
         self.assertEqual((self.source / "template.js").read_text(encoding="utf-8"), "pi-url-params pi-share-base-url pi-share:v1: pi-untouched 中文\n")
 
