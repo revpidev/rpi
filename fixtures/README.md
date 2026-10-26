@@ -235,3 +235,37 @@ block with its note for images. The committed golden was recorded against
 shape (same approach as the V16-07 note above); the value is pin-stable and
 byte-checked during the V17-02 codemode end-to-end test
 (`crates/rpi/tests/codemode_test.rs::codemode_read_resolves_images_to_image_blocks`).
+
+## V18-00 export HTML asset synchronization (2026-10-26)
+
+The six embedded assets under `crates/rpi/src/core/export_html/` are generated
+from `external/pi/packages/coding-agent/src/core/export-html/` at Pi v1.4.0
+`4a080252f06caf63a525d7873c5d94d3c23887e0`. Do not edit them by hand. From the
+repository root, run:
+
+```bash
+python3 scripts/sync-export-html-assets.py --pin 4a080252f06caf63a525d7873c5d94d3c23887e0
+python3 scripts/sync-export-html-assets.py --pin 4a080252f06caf63a525d7873c5d94d3c23887e0 --check
+```
+
+The declared outputs are `template.html`, `template.css`, `template.js`,
+`vendor/marked.min.js`, `vendor/marked-cjk-friendly.min.js`, and
+`vendor/highlight.min.js`. Everything except `template.js` is copied byte for
+byte. `template.js` permits only these three brand renames:
+`pi-url-params` → `rpi-url-params`,
+`pi-share-base-url` → `rpi-share-base-url`, and
+`pi-share:v1:` → `rpi-share:v1:`. The script asserts the exact checkout pin and
+fails on missing inputs, undeclared outputs, missing brand tokens, or any diff
+in check mode. It never writes under `external/`; `--check` computes expected
+bytes in memory without writing. Repeating generation must produce identical
+bytes.
+
+`export_html.rs` embeds and substitutes the CJK asset between `MARKED_JS` and
+`HIGHLIGHT_JS`, matching upstream `index.ts`. The M0 tests are
+`python3 -B scripts/test-sync-export-html-assets.py` for deterministic
+synchronization and `export_to_html_writes_placeholder_free_document` for a
+real SessionManager → HTML file smoke, including session-data decoding and a
+generic placeholder scan. Review of the five behavior-changing upstream files
+(`index.ts`, `template.html`, `template.js`, `marked.min.js`, and the new CJK
+asset) belongs to V18-04; M0 only restores the deterministic asset baseline and
+its consumption path.
