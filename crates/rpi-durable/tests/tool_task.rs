@@ -144,7 +144,8 @@ fn tool_result(entries: &[EntryRecord]) -> (bool, String, serde_json::Value, Opt
     panic!("tool result message missing");
 }
 
-/// upstream: "an executed tool appends its result entry with output and diagnostics".
+/// upstream: "runs input, tool call, tool result, and answer, and settles the input";
+/// related result projection: "uses retained output and the last details when the result omits them, with diagnostics in order".
 #[tokio::test]
 async fn execute_appends_result_with_output_and_diagnostics() {
     let opened: Opened = open(
@@ -196,7 +197,7 @@ async fn execute_appends_result_with_output_and_diagnostics() {
     assert!(entries.iter().any(|entry| entry.kind == ASSISTANT_ENTRY));
 }
 
-/// upstream: "invalid arguments complete with an invalid_arguments result".
+/// upstream: "validates arguments before and after beforeTool and applies blocks and replacements".
 #[tokio::test]
 async fn validation_failure_result() {
     let opened = open(
