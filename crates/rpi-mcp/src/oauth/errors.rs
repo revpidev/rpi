@@ -1,4 +1,4 @@
-//! OAuth errors (port of `packages/mcp/src/oauth/errors.ts` @ abe508e1b).
+//! OAuth errors (port of `packages/mcp/src/oauth/errors.ts` @ 4a080252f).
 
 /// `OAuthError` (errors.ts:1): an OAuth error response (`error` +
 /// `error_description`), or a generic flow failure.

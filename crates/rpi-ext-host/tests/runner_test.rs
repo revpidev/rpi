@@ -431,7 +431,7 @@ async fn runner_entry_renderer_first_registration_wins_silently() {
 }
 
 // ---------------------------------------------------------------------------
-// Tool renderer resolvers (runner.ts:790-796 @ abe508e1b, #10285)
+// Tool renderer resolvers (runner.ts:790-796 @ 4a080252f, #10285)
 // ---------------------------------------------------------------------------
 
 fn caller_text(text: &str) -> ext::RenderCallFn {
@@ -457,7 +457,7 @@ fn render_context() -> ext::ToolRenderContext {
 }
 
 /// Port of `extensions-runner.test.ts` "resolves tool renderers in extension
-/// load order, each able to defer to the next" (:894-913 @ abe508e1b).
+/// load order, each able to defer to the next" (:894-913 @ 4a080252f).
 #[tokio::test]
 async fn runner_resolves_tool_renderers_in_load_order() {
     let host = host_with(vec![
@@ -577,7 +577,7 @@ async fn runner_tool_renderer_resolver_matches_unregistered_tools() {
     );
 }
 
-/// `ToolRenderContext` additive fields (types.ts:494-498 @ abe508e1b):
+/// `ToolRenderContext` additive fields (types.ts:494-498 @ 4a080252f):
 /// camelCase, `durationMs` omitted when absent, `outputPad` defaulted.
 #[test]
 fn tool_render_context_duration_and_output_pad_wire_shape() {
@@ -1395,7 +1395,7 @@ fn user_message_json(content: &str, timestamp: i64) -> Value {
 
 /// V16-03 FR-C R1: `context` handlers never see system messages; when they
 /// change the conversation the replayed prompt/tool checkpoint is re-attached
-/// as one leading system message (runner.ts:1187-1317 @ abe508e1b).
+/// as one leading system message (runner.ts:1187-1317 @ 4a080252f).
 #[tokio::test]
 async fn runner_context_hides_system_messages_and_restores_prompt() {
     let host = host_with(vec![inline_ext("ext-a", |api| {
@@ -1489,7 +1489,7 @@ async fn runner_context_keeps_system_messages_added_by_a_handler() {
 
 /// V16-03 FR-B R2: `context_with_system` runs after every `context` handler
 /// on the restored transcript and its output is sent verbatim
-/// (runner.ts:1320-1354 @ abe508e1b).
+/// (runner.ts:1320-1354 @ 4a080252f).
 #[tokio::test]
 async fn runner_context_with_system_runs_after_context_verbatim() {
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -2705,7 +2705,7 @@ fn all_events_is_additive_42_in_order() {
     assert_eq!(index("input"), events.len() - 2);
     // V16-06: `mcp_servers_change` after `session_shutdown`,
     // `provider_stream_event` after `after_provider_response` (upstream
-    // `on()` overload order, types.ts:1545-1625 @ abe508e1b).
+    // `on()` overload order, types.ts:1545-1625 @ 4a080252f).
     assert_eq!(index("mcp_servers_change"), index("session_shutdown") + 1);
     assert_eq!(
         index("session_before_tree"),
@@ -2852,7 +2852,7 @@ fn tool_event_payloads_carry_parent_and_structured_fields() {
 #[tokio::test]
 async fn runner_tool_result_drops_structured_content_on_content_replace() {
     // A handler that replaces `content` without restating `structuredContent`
-    // drops it (runner.ts:1185-1196 @ abe508e1b).
+    // drops it (runner.ts:1185-1196 @ 4a080252f).
     let host = host_with(vec![inline_ext("ext-a", |api| {
         api.on(
             ext::EVENT_TOOL_RESULT,

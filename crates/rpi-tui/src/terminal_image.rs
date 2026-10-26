@@ -9,7 +9,7 @@
 //! `set_capability_overrides`, e86823096 / #8665) and the Zed branch
 //! (`649214477` / #8828) tracking 9841914. The `-direct` TERM truecolor hint
 //! (terminal-image.ts:75) and `get_terminal_color_mode`
-//! (terminal-image.ts:170-172) track abe508e1b / pi v1.1.0. The Kitty image
+//! (terminal-image.ts:170-172) track 4a080252f / pi v1.4.0. The Kitty image
 //! metadata registry
 //! (`register_kitty_image_metadata` / `get_kitty_image_metadata` /
 //! `crop_kitty_image_line` / `get_kitty_image_placement`) and the
@@ -296,7 +296,7 @@ fn detect_capabilities_inner(
     let terminal_emulator = env_var("TERMINAL_EMULATOR").to_lowercase();
     let term = env_var("TERM").to_lowercase();
     let color_term = env_var("COLORTERM").to_lowercase();
-    // terminal-image.ts:75 @ abe508e1b also treats a `-direct` TERM suffix as a
+    // terminal-image.ts:75 @ 4a080252f also treats a `-direct` TERM suffix as a
     // truecolor hint (e.g. `xterm-direct`).
     let has_true_color_hint =
         color_term == "truecolor" || color_term == "24bit" || term.ends_with("-direct");
@@ -452,7 +452,7 @@ pub fn get_capabilities() -> TerminalCapabilities {
     })
 }
 
-/// `getTerminalColorMode` (terminal-image.ts:170-172 @ abe508e1b): truecolor
+/// `getTerminalColorMode` (terminal-image.ts:170-172 @ 4a080252f): truecolor
 /// when the detected capabilities advertise it, otherwise 256-color.
 pub fn get_terminal_color_mode() -> crate::colors::TerminalColorMode {
     if get_capabilities().true_color {
@@ -1543,7 +1543,7 @@ mod tests {
 
     #[test]
     fn test_detect_capabilities_enables_truecolor_from_direct_color_term() {
-        // terminal-image.ts:75 @ abe508e1b: a `-direct` TERM suffix is a
+        // terminal-image.ts:75 @ 4a080252f: a `-direct` TERM suffix is a
         // truecolor hint (terminal-image.test.ts:446-450, `xterm-direct`).
         with_env(&[("TERM", Some("xterm-direct"))], || {
             let caps = detect_capabilities_with(|| false);

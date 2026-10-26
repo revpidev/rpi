@@ -1,5 +1,5 @@
 //! The built-in `codemode` extension (port of
-//! `packages/coding-agent/src/extensions/codemode/index.ts` @ abe508e1b).
+//! `packages/coding-agent/src/extensions/codemode/index.ts` @ 4a080252f).
 //!
 //! Registered inactive (`exposure: model-only`, `defaultActive: false`);
 //! activation is the `defaultTools`/`--tools` governance surface (V16-13).

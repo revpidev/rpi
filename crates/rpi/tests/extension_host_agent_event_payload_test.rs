@@ -398,7 +398,7 @@ async fn agent_event_payloads_match_upstream_shapes() {
 
     // tool_execution_end: {type, toolCallId, toolName, result, isError,
     // durationMs} — the tool ran, so the V17-06 duration is present
-    // (types.ts:1085-1094 @ abe508e1b, #10549).
+    // (types.ts:1085-1094 @ 4a080252f, #10549).
     let tool_ends = records_of(&records, "tool_execution_end");
     assert_eq!(tool_ends.len(), 1);
     assert_eq!(tool_ends[0]["type"], "tool_execution_end");
@@ -431,7 +431,7 @@ async fn agent_event_payloads_match_upstream_shapes() {
     );
 }
 
-/// V17-06 FR-B R3 (types.ts:1092-1094 @ abe508e1b): `durationMs` is absent
+/// V17-06 FR-B R3 (types.ts:1092-1094 @ 4a080252f): `durationMs` is absent
 /// (not zero) when the tool did not run — here an unknown tool name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tool_execution_end_omits_duration_when_the_tool_did_not_run() {
@@ -469,7 +469,7 @@ async fn tool_execution_end_omits_duration_when_the_tool_did_not_run() {
     );
 }
 
-/// V17-06 FR-C (types.ts:1005-1009 @ abe508e1b, #10607): the extension
+/// V17-06 FR-C (types.ts:1005-1009 @ 4a080252f, #10607): the extension
 /// `agent_settled` payload carries `aborted` for both a cancelled run and a
 /// normal completion (the session/JSON faces assert the same value in
 /// `agent_session_test.rs`).
@@ -955,13 +955,13 @@ async fn session_compact_failed_emits_only_with_handlers() {
 
 // ---------------------------------------------------------------------------
 // V16-03 FR-B/FR-C: context pipeline and system messages
-// (9789-context-handler-system-messages.test.ts intents @ abe508e1b)
+// (9789-context-handler-system-messages.test.ts intents @ 4a080252f)
 // ---------------------------------------------------------------------------
 
 /// #9789/#9822: a `context` handler that slices the conversation must not
 /// drop the prompt/tool checkpoint — the restored system message leads the
 /// request and the tool declarations survive
-/// (runner.ts:1187-1317 @ abe508e1b).
+/// (runner.ts:1187-1317 @ 4a080252f).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn context_handler_slice_keeps_prompt_and_tools() {
     let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1030,7 +1030,7 @@ async fn context_handler_slice_keeps_prompt_and_tools() {
 
 /// `context_with_system` runs after `context` on the restored transcript and
 /// its output is sent verbatim — stripping a tool from `toolsAdded` removes
-/// it from the provider request (runner.ts:1320-1354 @ abe508e1b).
+/// it from the provider request (runner.ts:1320-1354 @ 4a080252f).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn context_with_system_output_is_sent_verbatim() {
     let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1103,7 +1103,7 @@ async fn context_with_system_output_is_sent_verbatim() {
 
 /// FR-D R3/R4: a `turn_end` handler returning `{entries, continue: true}`
 /// persists the structural entry and forces one next provider request
-/// (agent-session.ts:840-856, runner.ts:1020-1078 @ abe508e1b).
+/// (agent-session.ts:840-856, runner.ts:1020-1078 @ 4a080252f).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn turn_end_boundary_persists_entries_and_continues() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1173,7 +1173,7 @@ async fn turn_end_boundary_persists_entries_and_continues() {
 
 /// FR-D R4: an `agent_before_settle` handler appends a draft and the entry
 /// lands in the session before settlement
-/// (agent-session.ts:1846-1869 @ abe508e1b).
+/// (agent-session.ts:1846-1869 @ 4a080252f).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_before_settle_boundary_persists_entries() {
     let factory: ExtensionFactory = Arc::new(|api| {

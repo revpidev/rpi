@@ -1,5 +1,5 @@
 //! Transaction staging (port of `packages/durable/src/session/transaction.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! A [`Transaction`] stages table writes and document incarnations while the
 //! session mutation line is held. The callback settles once; `settle_success`

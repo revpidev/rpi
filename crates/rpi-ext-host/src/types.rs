@@ -90,7 +90,7 @@ pub const EVENT_TOOL_RESULT: &str = "tool_result";
 pub const EVENT_MODE_CHANGE: &str = "mode_change";
 
 /// All 42 event names, in the upstream `ExtensionAPI.on()` overload order
-/// (types.ts:1545-1625 @ abe508e1b + #9668 `cache_warming_decision` —
+/// (types.ts:1545-1625 @ 4a080252f + #9668 `cache_warming_decision` —
 /// inserted between `context_with_system` and `before_provider_request`).
 /// V16-03 added `context_with_system` and `agent_before_settle`; V16-06 added
 /// the remaining two (`provider_stream_event` after `after_provider_response`,
@@ -610,7 +610,7 @@ impl McpServerRegistry {
     }
 }
 
-/// `McpServersChangeEvent` (types.ts:710-714 @ abe508e1b): fired when an
+/// `McpServersChangeEvent` (types.ts:710-714 @ 4a080252f): fired when an
 /// extension registers or unregisters an MCP server after the extensions are
 /// bound. Registered while loading → read with `pi.getMcpServers()` on
 /// `session_start`.
@@ -674,7 +674,7 @@ pub struct SessionTreeEvent {
 // Agent events (types.ts:659-779)
 // ============================================================================
 
-/// `ContextEvent` (types.ts:664-669 @ abe508e1b).
+/// `ContextEvent` (types.ts:664-669 @ 4a080252f).
 ///
 /// `messages` holds the conversation without system messages. The prompt
 /// and tool state belong to pi: it restores them after each handler, so a
@@ -685,7 +685,7 @@ pub struct ContextEvent {
     pub messages: Vec<AgentMessage>,
 }
 
-/// `ContextWithSystemEvent` (types.ts:671-677 @ abe508e1b): fired before
+/// `ContextWithSystemEvent` (types.ts:671-677 @ 4a080252f): fired before
 /// each LLM call, after every `context` handler has run and pi has restored
 /// the prompt and tool state. `messages` is the full transcript including
 /// system messages, and the result is sent as returned: the handler owns
@@ -768,7 +768,7 @@ pub struct AfterProviderResponseEvent {
     pub headers: HashMap<String, String>,
 }
 
-/// `ProviderStreamEvent` (types.ts:890-896 @ abe508e1b): a parsed provider
+/// `ProviderStreamEvent` (types.ts:890-896 @ 4a080252f): a parsed provider
 /// stream event before Pi normalizes it. Notification only — never
 /// persisted; handlers run in stream order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -837,7 +837,7 @@ pub struct AgentEndEvent {
     pub messages: Vec<AgentMessage>,
 }
 
-/// `AgentSettledEvent` (types.ts:1005-1009 @ abe508e1b, #10607): fired
+/// `AgentSettledEvent` (types.ts:1005-1009 @ 4a080252f, #10607): fired
 /// after an agent run has fully settled and no automatic retry,
 /// compaction, or queued continuation will run. `aborted` distinguishes
 /// a cancelled run (for example Escape) from a finished one.
@@ -855,7 +855,7 @@ pub struct TurnStartEvent {
     pub timestamp: i64,
 }
 
-/// `AgentActivityOutcome` (types.ts:922 @ abe508e1b).
+/// `AgentActivityOutcome` (types.ts:922 @ 4a080252f).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentActivityOutcome {
@@ -864,7 +864,7 @@ pub enum AgentActivityOutcome {
     Error,
 }
 
-/// `SessionBoundaryDraft` (types.ts:924-957 @ abe508e1b): the structural
+/// `SessionBoundaryDraft` (types.ts:924-957 @ 4a080252f): the structural
 /// entries an `{entries, continue}` boundary result may append. Drafts cross
 /// the JSON ABI untyped; the host parses this shape when applying them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -905,7 +905,7 @@ pub enum SessionBoundaryDraft {
     },
 }
 
-/// `BoundaryResult` (types.ts:975-978 @ abe508e1b): what a `turn_end` /
+/// `BoundaryResult` (types.ts:975-978 @ 4a080252f): what a `turn_end` /
 /// `agent_before_settle` handler may return. Entries stay raw JSON until the
 /// host applies them (invalid previews are repaired, not silently dropped).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -917,7 +917,7 @@ pub struct BoundaryResult {
     pub continue_: Option<bool>,
 }
 
-/// `BoundaryDispatchResult` (runner.ts:214-219 @ abe508e1b). `valid` is
+/// `BoundaryDispatchResult` (runner.ts:214-219 @ 4a080252f). `valid` is
 /// false when the final preview request failed: the caller then discards
 /// the drafts and the continuation.
 #[derive(Debug, Clone, PartialEq)]
@@ -928,7 +928,7 @@ pub struct BoundaryDispatchResult {
     pub valid: bool,
 }
 
-/// `TurnEndEvent` (types.ts:1015-1022 @ abe508e1b, `BoundaryState` included
+/// `TurnEndEvent` (types.ts:1015-1022 @ 4a080252f, `BoundaryState` included
 /// at dispatch time).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -941,7 +941,7 @@ pub struct TurnEndEvent {
     pub outcome: AgentActivityOutcome,
 }
 
-/// `AgentBeforeSettleEvent` (types.ts:980-983 @ abe508e1b): fired before
+/// `AgentBeforeSettleEvent` (types.ts:980-983 @ 4a080252f): fired before
 /// final settlement. May append entries and ensure one next provider request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1032,7 +1032,7 @@ pub struct MessageEndEventResult {
     pub message: Option<AgentMessage>,
 }
 
-/// `ToolExecutionStartEvent` (types.ts:1044-1050 @ abe508e1b).
+/// `ToolExecutionStartEvent` (types.ts:1044-1050 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionStartEvent {
@@ -1044,7 +1044,7 @@ pub struct ToolExecutionStartEvent {
     pub parent_tool_call_id: Option<String>,
 }
 
-/// `ToolExecutionUpdateEvent` (types.ts:1054-1061 @ abe508e1b).
+/// `ToolExecutionUpdateEvent` (types.ts:1054-1061 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionUpdateEvent {
@@ -1057,7 +1057,7 @@ pub struct ToolExecutionUpdateEvent {
     pub parent_tool_call_id: Option<String>,
 }
 
-/// `ToolExecutionEndEvent` (types.ts:1087-1094 @ abe508e1b).
+/// `ToolExecutionEndEvent` (types.ts:1087-1094 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionEndEvent {
@@ -1066,7 +1066,7 @@ pub struct ToolExecutionEndEvent {
     pub result: Value,
     pub is_error: bool,
     /// Milliseconds `execute()` took, measured with a monotonic clock;
-    /// absent when the tool did not run (types.ts:1087-1094 @ abe508e1b,
+    /// absent when the tool did not run (types.ts:1087-1094 @ 4a080252f,
     /// #10549).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -1099,10 +1099,10 @@ pub struct ThinkingLevelSelectEvent {
 }
 
 // ============================================================================
-// User bash events (types.ts:1121-1148 @ abe508e1b)
+// User bash events (types.ts:1121-1148 @ 4a080252f)
 // ============================================================================
 
-/// `UserBashEvent` (types.ts:1125-1133 @ abe508e1b).
+/// `UserBashEvent` (types.ts:1125-1133 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserBashEvent {
@@ -1111,7 +1111,7 @@ pub struct UserBashEvent {
     pub cwd: String,
 }
 
-/// `UserBashEventResult` (types.ts:1438-1448 @ abe508e1b). `operations` /
+/// `UserBashEventResult` (types.ts:1438-1448 @ 4a080252f). `operations` /
 /// `result` are the upstream `BashOperations` / `BashResult` JSON. Since
 /// V17-11 the `operations` arm carries a declarative [`UserBashOperations`]
 /// policy (the closure bundle cannot cross the JSON boundary).
@@ -1256,7 +1256,7 @@ pub struct ToolCallEvent {
     pub input: Value,
     /// Set when another tool (for example a codemode script) issued this
     /// call. Nested ids are `<parent id>/<n>` and never appear as tool calls
-    /// or tool results in the transcript (types.ts:1141-1151 @ abe508e1b).
+    /// or tool results in the transcript (types.ts:1141-1151 @ 4a080252f).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
 }
@@ -1290,13 +1290,13 @@ pub struct ToolResultEvent {
     pub details: Option<Value>,
     /// Machine-readable result for tools that declare an `outputSchema`.
     /// Handlers that redact `content` should also replace this; replacing
-    /// `content` alone drops it (runner.ts:1185-1193 @ abe508e1b).
+    /// `content` alone drops it (runner.ts:1185-1193 @ 4a080252f).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
     /// Set when another tool (for example a codemode script) issued this
-    /// call (types.ts:1215-1230 @ abe508e1b).
+    /// call (types.ts:1215-1230 @ 4a080252f).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
 }
@@ -1311,7 +1311,7 @@ pub struct ToolResultEventResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
     /// Replacing `content` without this field drops the structured content
-    /// (types.ts:1425-1437 @ abe508e1b).
+    /// (types.ts:1425-1437 @ 4a080252f).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1394,13 +1394,13 @@ pub struct ToolRenderContext {
     pub is_error: bool,
     /// Milliseconds the tool's execution took, from the final result;
     /// `None` while it runs, when it did not run, or for results stored
-    /// before durations were recorded (types.ts:494-496 @ abe508e1b,
+    /// before durations were recorded (types.ts:494-496 @ 4a080252f,
     /// #10549).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     /// Horizontal padding configured by the outputPad setting; renderers
     /// with `renderShell: "self"` apply it themselves (types.ts:497-498
-    /// @ abe508e1b, #10557).
+    /// @ 4a080252f, #10557).
     #[serde(default)]
     pub output_pad: u32,
     /// Viewport width in terminal columns (rpi extension over upstream's
@@ -1435,7 +1435,7 @@ pub struct ToolRenderResultOptions {
     pub is_partial: bool,
 }
 
-/// `ToolRenderers` (types.ts:658 @ abe508e1b, #10285): the render slice
+/// `ToolRenderers` (types.ts:658 @ 4a080252f, #10285): the render slice
 /// a [`ToolRendererResolver`] picks — the same three fields a
 /// [`ToolDefinition`] carries. A resolver may return the base unchanged,
 /// replace any subset, or return `None` (no renderers).
@@ -1454,7 +1454,7 @@ impl ToolRenderers {
     }
 }
 
-/// `ToolRendererResolver` (types.ts:664-667 @ abe508e1b, #10285): chooses
+/// `ToolRendererResolver` (types.ts:664-667 @ 4a080252f, #10285): chooses
 /// how calls to a tool are drawn, including tools that are not registered.
 /// `next()` returns the renderers the remaining resolvers, then the
 /// registered tool, would use. Resolvers run in extension load order
@@ -1488,7 +1488,7 @@ pub type ToolExecuteFn = Arc<
 /// `prepareArguments` shim (types.ts:462).
 pub type PrepareArgumentsFn = Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
 
-/// `ToolExposure` (types.ts:494-509 @ abe508e1b): how the model reaches a
+/// `ToolExposure` (types.ts:494-509 @ 4a080252f): how the model reaches a
 /// tool. Default: `direct`.
 ///
 /// `direct` and `model-only` tools are activated when registered; the others
@@ -1517,7 +1517,7 @@ pub enum ToolExposure {
     Hidden,
 }
 
-/// `ToolAnnotations` (types.ts:511-525 @ abe508e1b): MCP-style hints from
+/// `ToolAnnotations` (types.ts:511-525 @ 4a080252f): MCP-style hints from
 /// the tool author, not verified. Permission extensions may use them to
 /// decide which calls to confirm.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1537,7 +1537,7 @@ pub struct ToolAnnotations {
     pub open_world_hint: Option<bool>,
 }
 
-/// `ToolNamespace` (types.ts:527-537 @ abe508e1b): a group of related tools,
+/// `ToolNamespace` (types.ts:527-537 @ 4a080252f): a group of related tools,
 /// such as the tools of one MCP server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1568,7 +1568,7 @@ pub struct ToolLoadoutEntry {
     pub output_schema: Option<Value>,
 }
 
-/// `ToolLoadout` (types.ts:539-550 @ abe508e1b): the tools of a session as a
+/// `ToolLoadout` (types.ts:539-550 @ 4a080252f): the tools of a session as a
 /// `prepareLoadout` hook sees them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1615,7 +1615,7 @@ impl ToolLoadout {
     }
 }
 
-/// `ToolLoadoutChanges` (types.ts:551-562 @ abe508e1b): what a
+/// `ToolLoadoutChanges` (types.ts:551-562 @ 4a080252f): what a
 /// `prepareLoadout` hook changes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1629,7 +1629,7 @@ pub struct ToolLoadoutChanges {
     pub hidden_declarations: Option<Vec<String>>,
 }
 
-/// `ToolDefinition.prepareLoadout` (types.ts:613-615 @ abe508e1b): called
+/// `ToolDefinition.prepareLoadout` (types.ts:613-615 @ 4a080252f): called
 /// whenever the active tool set changes; returns replacement descriptions
 /// and hidden declarations. A `Err` is reported like an upstream handler
 /// throw (extension error, loadout keeps the previous values).

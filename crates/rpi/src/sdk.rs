@@ -193,7 +193,7 @@ pub async fn create_agent_session(
 
     // Extension-registered providers and virtual models flush into the model
     // runtime before the session restores its model
-    // (agent-session-services.ts:159-184 @ abe508e1b): a resumed virtual
+    // (agent-session-services.ts:159-184 @ 4a080252f): a resumed virtual
     // selection has to resolve against the freshly registered catalog. The
     // session's `bindCore` flush then drains an empty queue (post-bind
     // registrations go direct).
@@ -1022,7 +1022,7 @@ fn after_tool_call_with_image_normalization(
 
                 // `structuredContent: hookResult ? hookResult.structuredContent
                 // : result.structuredContent` (agent-session.ts:692 @
-                // abe508e1b): without a hook patch the executed result's
+                // 4a080252f): without a hook patch the executed result's
                 // structured content survives image normalization; with one,
                 // the patch decides (null when a handler replaced `content`
                 // without restating it).

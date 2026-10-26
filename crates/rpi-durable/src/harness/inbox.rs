@@ -1,5 +1,5 @@
 //! Submission inbox and boundary placement (port of
-//! `packages/durable/src/harness/inbox.ts` @ `abe508e1b`).
+//! `packages/durable/src/harness/inbox.ts` @ `4a080252f`).
 //!
 //! The `pi.inbox` document is one conversation's ordered queue of submissions
 //! waiting for a boundary. A *boundary* is prepared (table reads) at the start

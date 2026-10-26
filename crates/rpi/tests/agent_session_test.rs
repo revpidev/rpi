@@ -2397,7 +2397,7 @@ async fn second_navigation_while_first_pending_is_rejected_9179() {
 /// `_installAgentRequestProjection` is in place, a direct
 /// `agent.setState(messages)` assignment no longer reaches the provider
 /// request — the SessionManager projection is rebuilt at request time.
-/// Upstream basis: agent-session.ts:760-806 @ abe508e1b.
+/// Upstream basis: agent-session.ts:760-806 @ 4a080252f.
 #[tokio::test]
 async fn prepare_request_projection_overrides_direct_state_messages() {
     let fixture =

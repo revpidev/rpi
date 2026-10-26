@@ -1,5 +1,5 @@
 //! Integration tests for `core::prompt_templates` (port of
-//! `prompt-templates.ts` @ pi v1.1.0 (abe508e1b)): template discovery,
+//! `prompt-templates.ts` @ pi v1.4.0 (4a080252f)): template discovery,
 //! frontmatter handling, resource diagnostics (#9830), and the expansion
 //! entry point against a real filesystem. The argument-expansion DSL itself
 //! is covered by the module unit tests.

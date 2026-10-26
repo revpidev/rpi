@@ -2,7 +2,7 @@
 //! hooks carried by the upstream tool definitions in
 //! `packages/coding-agent/src/core/tools/*.ts` @ pi 0.82.1 (2efa728), plus
 //! the `codemode` definition from
-//! `packages/coding-agent/src/extensions/codemode/renderer.ts` @ abe508e1b
+//! `packages/coding-agent/src/extensions/codemode/renderer.ts` @ 4a080252f
 //! (the built-in extension registers no hooks itself).
 //!
 //! [`builtin_tool_definition`] is the render-only port of

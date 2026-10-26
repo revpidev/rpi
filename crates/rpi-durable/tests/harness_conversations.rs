@@ -1,5 +1,5 @@
 //! Harness conversation and lifecycle integration tests (port of
-//! `packages/durable/test/harness-conversations.test.ts` @ `abe508e1b`).
+//! `packages/durable/test/harness-conversations.test.ts` @ `4a080252f`).
 //!
 //! Scoped to what does not need the task scheduler: lazy root creation, the
 //! built-in creation hook, agent edits, Tx-created conversations, and close

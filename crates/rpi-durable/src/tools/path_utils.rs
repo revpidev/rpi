@@ -1,5 +1,5 @@
 //! Tool path resolution (port of `packages/durable/src/tools/path-utils.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 
 use unicode_normalization::UnicodeNormalization;
 

@@ -1,6 +1,6 @@
 //! Tool orchestration (`exposure` / `prepareLoadout` / `ctx.executeTool`),
 //! ported from `packages/coding-agent/test/suite/agent-session-tool-orchestration.test.ts`
-//! @ abe508e1b (V16-06 FR-A/D/E).
+//! @ 4a080252f (V16-06 FR-A/D/E).
 //!
 //! An orchestrator extension built only on the extension API: its own name,
 //! exposure, loadout hook, and `ctx.executeTool()`. Codemode and tool search

@@ -1,5 +1,5 @@
 //! Image MIME detection (port of `packages/durable/src/tools/image.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! The durable version detects supported image types only; image content reads
 //! belong to the post-v1.1.0 overflow and are out of this window.

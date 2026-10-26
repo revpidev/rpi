@@ -9,7 +9,7 @@
 [![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%C2%B7macOS%C2%B7Windows-lightgrey)]()
 [![Build](https://img.shields.io/github/actions/workflow/status/revpidev/rpi/build.yml)](https://github.com/revpidev/rpi/actions/workflows/build.yml)
 
-Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent](https://github.com/earendil-works/pi)：继承了 Pi 的架构，行为持续与钉死的上游版本对拍验证——当前行为基线为 **Pi v1.1.0**（`abe508e1b`，见 [`UPSTREAM.md`](./UPSTREAM.md)）。rpi 是独立项目，随着两者演进可能出现偏差。编译产出为单个静态二进制，不依赖 Node、Python 或任何运行时。
+Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent](https://github.com/earendil-works/pi)：继承了 Pi 的架构，行为持续与钉死的上游版本对拍验证——当前行为基线为 **Pi v1.4.0**（`4a080252f`，见 [`UPSTREAM.md`](./UPSTREAM.md)）。rpi 是独立项目，随着两者演进可能出现偏差。编译产出为单个静态二进制，不依赖 Node、Python 或任何运行时。
 
 当前发布线为 **v0.1.7**，即最新稳定版（2026-10-19）。使用下方脚本安装，已有安装用 `rpi update` 更新（见[状态](#状态)）。
 
@@ -203,7 +203,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `crates/rpi-test-*` | Faux provider、测试环境辅助与原生插件 fixture |
 | `fixtures/` | 契约/对拍测试 fixtures（生成脚本 + golden 数据） |
 | `scripts/` | 开发脚本（上游 pin 校验、对拍 harness、catalog 刷新、发布工具） |
-| `external/` | 钉死的上游 submodule：`pi`（v1.1.0）、`pi-subagents`（v0.76.1）、`rpiv-mono`（v2.13.8）、`agent-smart-fetch`（v0.3.17）——见 `UPSTREAM.md` |
+| `external/` | 钉死的上游 submodule：`pi`（v1.4.0）、`pi-subagents`（v0.76.1）、`rpiv-mono`（v2.13.8）、`agent-smart-fetch`（v0.3.17）——见 `UPSTREAM.md` |
 | `vendor/syntect` | 构建期文法重写使用的 syntect 补丁 fork（见 `vendor/syntect/PATCHES.md`） |
 | `changes/` | 各版本发布说明（changelog 单一事实源） |
 | `docs/` | 公开协议/参考文档（`json-rpc.md`、`codemode.md`） |

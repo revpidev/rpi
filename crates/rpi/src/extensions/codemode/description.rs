@@ -1,5 +1,5 @@
 //! Model-facing codemode description (port of the description helpers in
-//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ abe508e1b,
+//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ 4a080252f,
 //! v1.0.0 slimmed form). The rendered text is a byte-parity surface.
 
 use std::collections::{HashMap, HashSet};
@@ -14,12 +14,12 @@ use crate::config::get_docs_path;
 use crate::extensions::codemode::tool::{ToolInfo, to_codemode_declaration};
 
 /// Characters per token when estimating the cost of a tool section
-/// (tool.ts:158).
+/// (tool.ts:139).
 const CHARS_PER_TOKEN: usize = 4;
 
 const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. Calls still running when the script ends are cancelled.\n- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`";
 
-/// `CODEMODE_DOCS_PATH` (tool.ts:135): the reference model-facing doc.
+/// `CODEMODE_DOCS_PATH` (tool.ts:116): the reference model-facing doc.
 pub fn codemode_docs_path() -> String {
     get_docs_path()
         .join("codemode.md")
@@ -27,7 +27,7 @@ pub fn codemode_docs_path() -> String {
         .into_owned()
 }
 
-/// One line per global; the details live in the docs path (tool.ts:140-151).
+/// One line per global; the details live in the docs path (tool.ts:123-136).
 fn describe_globals(models: bool) -> String {
     let mut lines = vec![
         "Globals:".to_owned(),
@@ -44,7 +44,7 @@ fn describe_globals(models: bool) -> String {
     lines.join("\n")
 }
 
-/// `CodemodeDescriptionOptions` (tool.ts:173-185).
+/// `CodemodeDescriptionOptions` (tool.ts:163-179).
 #[derive(Default)]
 pub struct CodemodeDescriptionOptions {
     pub models: bool,
@@ -61,7 +61,7 @@ pub struct CodemodeDescriptionOptions {
 }
 
 /// `### \`id\` (\`raw name\`)` followed by the tool's description and
-/// declaration (tool.ts:198-203).
+/// declaration (tool.ts:180-185).
 fn render_tool_section(declaration: &rpi_codemode::CodemodeToolInfo) -> String {
     let id = to_codemode_identifier(&declaration.name);
     let heading = if id == declaration.name {
@@ -83,7 +83,7 @@ struct CatalogGroup {
     entries: Vec<CatalogEntry>,
 }
 
-/// Pick the tool sections that fit the budget (tool.ts:211-235).
+/// Pick the tool sections that fit the budget (tool.ts:203-227).
 fn select_catalog(groups: &[CatalogGroup], budget: Option<usize>) -> HashSet<String> {
     let Some(budget) = budget else {
         return groups
@@ -135,7 +135,7 @@ fn select_catalog(groups: &[CatalogGroup], budget: Option<usize>) -> HashSet<Str
     shown
 }
 
-/// `createCodemodeDescription` (tool.ts:237-291).
+/// `createCodemodeDescription` (tool.ts:228-276).
 pub fn create_codemode_description(
     tools: &[ToolInfo],
     options: &CodemodeDescriptionOptions,
@@ -243,7 +243,7 @@ pub fn create_codemode_description(
     sections.join("\n\n")
 }
 
-/// What a script call resolves to, in one line (tool.ts:315-327).
+/// What a script call resolves to, in one line (tool.ts:304-319).
 pub fn describe_output(schema: Option<&serde_json::Value>) -> String {
     let rendered = render_tool_output_type(schema);
     if rendered == "string" {

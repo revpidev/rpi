@@ -1,5 +1,5 @@
 //! Local execution environment (port of `packages/durable/src/env/node.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! The environment resolves paths against its `cwd`, runs commands through the
 //! system shell (or directly from an argv), streams decoded output to the

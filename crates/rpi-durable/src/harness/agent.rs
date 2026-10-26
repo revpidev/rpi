@@ -1,5 +1,5 @@
 //! Per-conversation agent document and resolution
-//! (port of `packages/durable/src/harness/agent.ts` @ `abe508e1b`).
+//! (port of `packages/durable/src/harness/agent.ts` @ `4a080252f`).
 //!
 //! The `pi.agent` document stores a conversation's *choices*: model, thinking
 //! level, extension selection, tool filter, instructions, and working directory.

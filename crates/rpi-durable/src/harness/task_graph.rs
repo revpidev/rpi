@@ -1,5 +1,5 @@
 //! Live task graph mount (port of `packages/durable/src/harness/task-graph.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! The task graph is a Chord replicated state over every live (non-terminal)
 //! task: its durable status without checkpoint/outcome payloads, its owner edge,

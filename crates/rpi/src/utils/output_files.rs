@@ -1,7 +1,7 @@
 //! Output files: files rpi writes so the model can use output it was not
 //! shown in full, such as the full text of truncated tool output, binary MCP
 //! resources, and images shown by codemode scripts (port of
-//! `packages/coding-agent/src/utils/output-files.ts` @ abe508e1b).
+//! `packages/coding-agent/src/utils/output-files.ts` @ 4a080252f).
 //!
 //! Every output file is created here, so where they are stored can change in
 //! one place. Today they go to the OS temp directory.

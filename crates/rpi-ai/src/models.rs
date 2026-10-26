@@ -136,7 +136,7 @@ pub trait Provider: Send + Sync {
     /// implementation as having no models.
     fn get_models(&self) -> Vec<Model>;
 
-    /// `getAllModels?` (models.ts:174 @ abe508e1b / schema v6): every model
+    /// `getAllModels?` (models.ts:174 @ 4a080252f / schema v6): every model
     /// type known to the provider (chat + image + classifier). Defaults to
     /// the chat-only [`Provider::get_models`] wrapped as [`AnyModel::Chat`],
     /// so existing providers need no change and chat reads keep their
@@ -208,7 +208,7 @@ pub trait Provider: Send + Sync {
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String>;
 
-    /// `generateImages?` (models.ts:221-226 @ abe508e1b): present when the
+    /// `generateImages?` (models.ts:221-226 @ 4a080252f): present when the
     /// provider supports dedicated image models. Never rejects: the
     /// implementation returns an error `AssistantImages` itself; a `None`
     /// here is wrapped by [`Models::generate_images`] as a provider error.
@@ -507,7 +507,7 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
 }
 
 /// `mergeModels` for schema v6 (`remote-catalog-provider.ts:31-35 @
-/// abe508e1b`): the merge key is `type\0id`, so the same upstream id may
+/// 4a080252f`): the merge key is `type\0id`, so the same upstream id may
 /// appear once per type. Same-key models replace the baseline entry in
 /// place; new keys append. A map index keeps the merge linear (@ c34f2d6ad).
 pub fn merge_any_models(baseline: &[AnyModel], dynamic: &[AnyModel]) -> Vec<AnyModel> {
@@ -695,7 +695,7 @@ impl Provider for CreatedProvider {
         merge_models(&self.models, &dynamic)
     }
 
-    /// Schema-v6 all-type read (`getAllModels?`, models.ts:174 @ abe508e1b):
+    /// Schema-v6 all-type read (`getAllModels?`, models.ts:174 @ 4a080252f):
     /// the static all-type baseline when the provider declared one, with the
     /// dynamic chat overlay merged on top; chat-only providers keep the
     /// legacy default.
@@ -1146,7 +1146,7 @@ impl Models {
         }
     }
 
-    /// `getAllModels` (models.ts:446 @ abe508e1b / schema v6) — every model
+    /// `getAllModels` (models.ts:446 @ 4a080252f / schema v6) — every model
     /// type from one provider or all. `get_models` stays chat-only (red
     /// line).
     pub fn get_all_models(&self, provider: Option<&str>) -> Vec<AnyModel> {
@@ -1163,7 +1163,7 @@ impl Models {
         }
     }
 
-    /// `getModelsOfType` (models.ts:446-477 @ abe508e1b): every model of
+    /// `getModelsOfType` (models.ts:446-477 @ 4a080252f): every model of
     /// one type from one provider or all.
     pub fn get_models_of_type(
         &self,
@@ -1176,7 +1176,7 @@ impl Models {
             .collect()
     }
 
-    /// `getModelOfType` (models.ts:446-477 @ abe508e1b): sync runtime
+    /// `getModelOfType` (models.ts:446-477 @ 4a080252f): sync runtime
     /// lookup of one model of one type against last-known lists.
     pub fn get_model_of_type(
         &self,
@@ -1196,7 +1196,7 @@ impl Models {
             .find(|model| model.id == id)
     }
 
-    /// `getAuthenticatedProviders` (models.ts:678-691 @ abe508e1b): the
+    /// `getAuthenticatedProviders` (models.ts:678-691 @ 4a080252f): the
     /// providers with complete auth configuration, plus the credential the
     /// availability filter needs.
     async fn get_authenticated_providers(
@@ -1227,7 +1227,7 @@ impl Models {
         Ok(authenticated)
     }
 
-    /// `getAvailableOfType` (models.ts:708-717 @ abe508e1b): models of one
+    /// `getAvailableOfType` (models.ts:708-717 @ 4a080252f): models of one
     /// type whose providers have complete auth configuration.
     pub async fn get_available_of_type(
         &self,
@@ -1242,7 +1242,7 @@ impl Models {
             .collect())
     }
 
-    /// `getAllAvailable` (models.ts:719-735 @ abe508e1b): models of every
+    /// `getAllAvailable` (models.ts:719-735 @ 4a080252f): models of every
     /// type whose providers have complete auth configuration. Providers
     /// without a `filterAllModels` hook apply `filterModels` to their chat
     /// models and pass the other types through (upstream fallback).
@@ -1264,7 +1264,7 @@ impl Models {
     /// the resulting credential through the store's serialized `modify` path.
     ///
     /// `options` is the upstream `LoginOptions` slot (auth/types.ts:202-208
-    /// @ abe508e1b): app-supplied context such as the stable installation ID
+    /// @ 4a080252f): app-supplied context such as the stable installation ID
     /// for Sign in with ChatGPT.
     ///
     /// **Write race** (models.ts:576-608): the credential write is queued in
@@ -1924,7 +1924,7 @@ impl Models {
         })
     }
 
-    /// `generateImages` (models.ts:948-965 @ abe508e1b): resolve the model
+    /// `generateImages` (models.ts:948-965 @ 4a080252f): resolve the model
     /// through its owning provider with request-time authentication. Never
     /// rejects: unknown providers, unconfigured auth, and providers without
     /// an image implementation return an error `AssistantImages`.
@@ -1989,7 +1989,7 @@ impl Models {
             .await)
     }
 
-    /// `classify` (models.ts:966-983 @ abe508e1b): resolve the classifier
+    /// `classify` (models.ts:966-983 @ 4a080252f): resolve the classifier
     /// through its owning provider with request-time authentication. Never
     /// rejects.
     pub async fn classify(
@@ -2141,7 +2141,7 @@ impl Models {
     }
 }
 
-/// `assertChatModel` (utils/model-operations.ts:26-30 @ abe508e1b): reject
+/// `assertChatModel` (utils/model-operations.ts:26-30 @ 4a080252f): reject
 /// non-chat models at the chat stream entry with a `ModelsError`.
 pub fn assert_chat_model(model: &AnyModel) -> Result<&Model, ModelsError> {
     match model {

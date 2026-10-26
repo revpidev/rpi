@@ -1,5 +1,5 @@
 //! Built-in tool task (port of `packages/durable/src/harness/tool.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! A tool task resolves the called tool among its phase agent's tools, validates
 //! the arguments, records the intent, executes the tool, and appends the result

@@ -1,6 +1,6 @@
 //! MCP server configuration (port of
 //! `packages/coding-agent/src/extensions/mcp/config.ts` and the config half
-//! of `core/mcp-servers.ts` @ abe508e1b).
+//! of `core/mcp-servers.ts` @ 4a080252f).
 //!
 //! Servers are read from `mcp.json` in the agent directory and, for trusted
 //! projects, from `<project>/.rpi/mcp.json`. Both use the `mcpServers`

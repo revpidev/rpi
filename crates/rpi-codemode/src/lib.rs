@@ -1,5 +1,5 @@
 //! Sandboxed JavaScript execution where the only capability is calling
-//! injected tools (port of `packages/codemode` @ abe508e1b).
+//! injected tools (port of `packages/codemode` @ 4a080252f).
 //!
 //! The engine is the vendored `quickjs.wasm` (quickjs-wasi 3.6.2) driven
 //! through wasmtime (ADR-0034 decision 3 / ADR-0035): one OS thread and a

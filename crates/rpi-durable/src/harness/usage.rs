@@ -1,5 +1,5 @@
 //! Per-conversation usage ledger (port of `packages/durable/src/harness/usage.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! The `pi.usage` document records a conversation's own spend: assistant entries
 //! and summarization attempts under `models`, keyed `provider/modelId`, and tool

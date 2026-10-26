@@ -1,7 +1,7 @@
 //! `ctx.ui.custom()` declarative dialog (V17-11 FR-B R1), the interaction
 //! round-trip for `ComponentTree` factories.
 //!
-//! Upstream `showExtensionCustom` (interactive-mode.ts:2966 @ abe508e1b) mounts the
+//! Upstream `showExtensionCustom` (interactive-mode.ts:2966 @ 4a080252f) mounts the
 //! factory's component with keyboard focus and resolves the returned promise
 //! through the `done(result)` callback. Factories cannot cross the JSON ABI
 //! (ADR-0007 gap 3), so the additive approximation here interprets a

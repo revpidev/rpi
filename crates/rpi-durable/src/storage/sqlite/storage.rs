@@ -1,5 +1,5 @@
 //! Portable SQLite implementation of the storage contract
-//! (port of `src/storage/sqlite/storage.ts` @ `abe508e1b`).
+//! (port of `src/storage/sqlite/storage.ts` @ `4a080252f`).
 
 use async_trait::async_trait;
 use std::sync::Mutex;

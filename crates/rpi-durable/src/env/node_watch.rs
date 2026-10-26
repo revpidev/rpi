@@ -1,5 +1,5 @@
 //! Snapshot-scanning file watcher (port of
-//! `packages/durable/src/env/node-watch.ts` @ `abe508e1b`).
+//! `packages/durable/src/env/node-watch.ts` @ `4a080252f`).
 //!
 //! Watches by snapshots: native events (from the `notify` crate) only trigger
 //! a debounced rescan, and changes are the difference between snapshots plus

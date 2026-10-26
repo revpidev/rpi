@@ -1,4 +1,4 @@
-//! Edit tool (port of `packages/durable/src/tools/edit.ts` @ `abe508e1b`).
+//! Edit tool (port of `packages/durable/src/tools/edit.ts` @ `4a080252f`).
 
 use std::sync::Arc;
 

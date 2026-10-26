@@ -1,7 +1,7 @@
 //! OSC 10/11/4 color replies and color-scheme report parsing
-//! (terminal-colors.ts @ abe508e1b).
+//! (terminal-colors.ts @ 4a080252f).
 //!
-//! Port of `packages/tui/src/terminal-colors.ts` @ pi v1.1.0 (abe508e1b),
+//! Port of `packages/tui/src/terminal-colors.ts` @ pi v1.4.0 (4a080252f),
 //! plus the `RgbColor` / `TerminalColors` / `OscColorTarget` types consumed by
 //! the single-pass `queryTerminalColors()` query (tui.ts:1470). The two
 //! legacy query faces (`parseOsc11BackgroundColor` and the per-face query

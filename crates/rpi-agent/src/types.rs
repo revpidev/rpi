@@ -92,7 +92,7 @@ pub struct AgentToolResult {
     #[serde(default)]
     pub details: Value,
     /// Machine-readable result matching the tool's `outputSchema`, for
-    /// programmatic callers (types.ts:424-440 @ abe508e1b). Not sent to the
+    /// programmatic callers (types.ts:424-440 @ 4a080252f). Not sent to the
     /// model; `content` remains the model-facing result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
@@ -132,7 +132,7 @@ pub trait AgentTool: Send + Sync {
     /// JSON Schema of the tool parameters (TypeBox upstream).
     fn parameters(&self) -> &Value;
     /// JSON Schema of `structuredContent` in successful results
-    /// (types.ts:590 @ abe508e1b). Default: no structured output.
+    /// (types.ts:590 @ 4a080252f). Default: no structured output.
     fn output_schema(&self) -> Option<&Value> {
         None
     }
@@ -217,7 +217,7 @@ pub enum AgentEvent {
         tool_name: String,
         args: Value,
         /// Set when another tool (for example a codemode script) made this
-        /// call (types.ts:1044-1051 @ abe508e1b; `parentToolCallId` at :1050).
+        /// call (types.ts:1044-1051 @ 4a080252f; `parentToolCallId` at :1050).
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_tool_call_id: Option<String>,
     },
@@ -238,7 +238,7 @@ pub enum AgentEvent {
         is_error: bool,
         /// Milliseconds `execute()` took, measured with a monotonic clock;
         /// absent when the tool did not run (types.ts:1087-1094
-        /// @ abe508e1b, #10549).
+        /// @ 4a080252f, #10549).
         #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
         /// Set when another tool (for example a codemode script) made this
@@ -438,7 +438,7 @@ mod tests {
             r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[]},"isError":true}"#
         );
         // `durationMs` rides the wire when the tool ran and stays absent
-        // (not null) when it did not (types.ts:1093-1094 @ abe508e1b).
+        // (not null) when it did not (types.ts:1093-1094 @ 4a080252f).
         let ran = AgentEvent::ToolExecutionEnd {
             tool_call_id: "c1".to_owned(),
             tool_name: "bash".to_owned(),

@@ -1,7 +1,7 @@
 //! Worker-thread entry: one worker runs one script inside a fresh QuickJS VM
 //! (a separate wasm instance), relays tool calls and output to the host, and
 //! reports the result (port of `packages/codemode/src/runtime/worker.ts` and
-//! the host-side `Execution` lifecycle @ abe508e1b).
+//! the host-side `Execution` lifecycle @ 4a080252f).
 //!
 //! The host side terminates the worker when the script settles, times out,
 //! or is aborted; the worker exists so that a spinning script never blocks
@@ -313,7 +313,7 @@ fn replenish_fuel(vm: &mut QuickJsVm<WorkerHost>) {
 }
 
 /// Run queued jobs, then fail a script that waits on nothing that can ever
-/// resume it (`drain` in worker.ts:118-122).
+/// resume it (`drain` in vm.ts:242-250).
 fn drain(vm: &mut QuickJsVm<WorkerHost>, api: u32, stalled: u32) -> Result<(), Thrown> {
     replenish_fuel(vm);
     vm.execute_pending_jobs()?;
@@ -339,7 +339,7 @@ fn crash_from(vm: &mut QuickJsVm<WorkerHost>, thrown: Thrown) -> Result<(), Stri
 
 // ---------------------------------------------------------------------------
 // Imports: `env.*` (QuickJS host hooks) and a minimal `wasi_snapshot_preview1`
-// (the worker discards engine output, worker.ts:32-44).
+// (the worker discards engine output, vm.ts:133-145).
 // ---------------------------------------------------------------------------
 
 fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
@@ -419,7 +419,7 @@ fn define_imports(linker: &mut Linker<WorkerHost>) -> Result<(), String> {
              -> i32 {
                 // Engine diagnostics belong to the host application (a TUI):
                 // discard every byte but report it as written so libc does not
-                // retry (worker.ts:32-44).
+                // retry (vm.ts:133-145).
                 if fd != 1 && fd != 2 {
                     return 8; // BADF
                 }
@@ -576,7 +576,7 @@ fn caller_memory<W>(caller: &mut Caller<'_, W>) -> Option<Memory> {
     }
 }
 
-/// The generic `bridge` host function (worker.ts:65-100).
+/// The generic `bridge` host function (vm.ts:254-296).
 fn host_call(
     mut caller: Caller<'_, WorkerHost>,
     name_ptr: u32,

@@ -1,5 +1,5 @@
 //! Auth provider seam for the streamable HTTP transport (port of
-//! `packages/mcp/src/auth-provider.ts` @ abe508e1b).
+//! `packages/mcp/src/auth-provider.ts` @ 4a080252f).
 
 use async_trait::async_trait;
 use url::Url;

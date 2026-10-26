@@ -1,5 +1,5 @@
 //! Port of `packages/ai/src/providers/azure.ts` @ pi 0.82.1 (2efa728; provider
-//! rename + Foundry Chat Completions follow `a37306d43` / #9714 @ abe508e1b).
+//! rename + Foundry Chat Completions follow `a37306d43` / #9714 @ 4a080252f).
 //!
 //! No `baseUrl` upstream — the azure adapters derive it from the
 //! `AZURE_OPENAI_RESOURCE_NAME`/base-URL env at request time. The provider

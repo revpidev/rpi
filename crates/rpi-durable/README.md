@@ -3,7 +3,7 @@
 **Experimental.** The API changes without notice between releases.
 
 A port of the upstream `@earendil-works/pi-durable` package
-(`packages/durable` @ `abe508e1b` / v1.1.0): the durable task runtime —
+(`packages/durable` @ `4a080252f` / v1.4.0): the durable task runtime —
 storage stack, session kernel, harness/scheduler — plus the tool chain and the
 local execution environment.
 

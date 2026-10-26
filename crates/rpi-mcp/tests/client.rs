@@ -1,5 +1,5 @@
 //! Client session tests, ported from
-//! `packages/mcp/test/client.test.ts` @ abe508e1b.
+//! `packages/mcp/test/client.test.ts` @ 4a080252f.
 
 use std::collections::HashMap;
 use std::collections::HashSet;

@@ -575,7 +575,7 @@ impl NativeExtensionHost {
     }
 
     /// `resolveToolRenderers(toolName, base)` (runner.ts:790-796 @
-    /// abe508e1b, #10285): the registered tool's renderers resolved through
+    /// 4a080252f, #10285): the registered tool's renderers resolved through
     /// the extension resolver chain in load order. The TUI's
     /// `getRegisteredToolDefinition` consumes this.
     pub fn resolve_tool_renderers(

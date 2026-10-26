@@ -1,5 +1,5 @@
 //! Content blocks and the LLM-facing conversion (port of
-//! `packages/mcp/src/protocol/content.ts` @ abe508e1b).
+//! `packages/mcp/src/protocol/content.ts` @ 4a080252f).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

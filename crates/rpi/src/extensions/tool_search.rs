@@ -1,6 +1,6 @@
 //! `tool_search`: BM25 tool discovery over the tools that are not declared to
 //! the model (`codemode`/`deferred` exposure). Port of
-//! `packages/coding-agent/src/extensions/tool-search/tool.ts` @ abe508e1b.
+//! `packages/coding-agent/src/extensions/tool-search/tool.ts` @ 4a080252f.
 //!
 //! The same ranker backs `searchTools()` in codemode scripts.
 
@@ -250,10 +250,10 @@ pub fn tool_search_schema() -> Value {
     })
 }
 
-/// `TOOL_SEARCH_DESCRIPTION` (tool.ts:220).
+/// `TOOL_SEARCH_DESCRIPTION` (tool.ts:215).
 pub const TOOL_SEARCH_DESCRIPTION: &str = "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nSome of the tools, such as tools of MCP servers, may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search`.";
 
-/// `isSearchable` (tool.ts:192-194).
+/// `isSearchable` (tool.ts:187-189).
 fn is_searchable(exposure: ToolExposure) -> bool {
     matches!(exposure, ToolExposure::Codemode | ToolExposure::Deferred)
 }
@@ -299,7 +299,7 @@ fn parse_searchable_tools(api: &ExtensionApi) -> Vec<SearchableTool> {
 }
 
 /// Rank the searchable tools that are not active yet and activate the
-/// matches, so the next model call declares them (tool.ts:196-214).
+/// matches, so the next model call declares them (tool.ts:195-209).
 pub fn search_and_load(api: &ExtensionApi, query: &str, limit: usize) -> Vec<(String, String)> {
     let active = api.get_active_tools().unwrap_or_default();
     let active_set: HashSet<&str> = active.iter().map(String::as_str).collect();
@@ -337,7 +337,7 @@ pub fn search_and_load(api: &ExtensionApi, query: &str, limit: usize) -> Vec<(St
         .collect()
 }
 
-/// `createToolSearchToolDefinition` (tool.ts:222-247).
+/// `createToolSearchToolDefinition` (tool.ts:217-244).
 pub fn create_tool_search_tool_definition(api: ExtensionApi) -> ToolDefinition {
     ToolDefinition {
         name: TOOL_SEARCH_TOOL_NAME.to_owned(),
@@ -351,7 +351,7 @@ pub fn create_tool_search_tool_definition(api: ExtensionApi) -> ToolDefinition {
         constrained_sampling: None,
         output_schema: None,
         // Searching is not something scripts need; it changes what the model
-        // sees (tool.ts:233).
+        // sees (tool.ts:230).
         exposure: ToolExposure::ModelOnly,
         namespace: None,
         annotations: None,
@@ -440,7 +440,7 @@ pub fn inline_extension() -> InlineExtension {
 
 #[cfg(test)]
 mod tests {
-    //! Ports `test/tool-search.test.ts` @ abe508e1b (ranker cases).
+    //! Ports `test/tool-search.test.ts` @ 4a080252f (ranker cases).
 
     use super::*;
 

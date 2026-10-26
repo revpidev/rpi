@@ -63,7 +63,7 @@ pub fn host_entry_renderer(session: &AgentSession, custom_type: &str) -> Option<
 }
 
 /// `getRegisteredToolDefinition` (interactive-mode.ts:2223-2232 @
-/// abe508e1b): the render hooks of the (possibly extension-overridden) tool
+/// 4a080252f): the render hooks of the (possibly extension-overridden) tool
 /// definition, resolved through the extension resolver chain in load order
 /// (`resolveToolRenderers(toolName, () => withBuiltInRenderers(...))`,
 /// #10285). Resolvers may render tools that are not registered, such as
@@ -113,7 +113,7 @@ fn to_render_context(
         show_images: context.show_images,
         is_error: context.is_error,
         // `durationMs` / `outputPad` (extensions/types.ts:494-498
-        // @ abe508e1b): the TUI component carries both internally since
+        // @ 4a080252f): the TUI component carries both internally since
         // V17-05; this bridge opens them to the extension ABI (V17-06).
         duration_ms: context.duration_ms,
         output_pad: context.output_pad as u32,
@@ -228,7 +228,7 @@ mod tests {
         );
     }
 
-    /// V17-06 FR-B (types.ts:494-498 @ abe508e1b): the TUI render context's
+    /// V17-06 FR-B (types.ts:494-498 @ 4a080252f): the TUI render context's
     /// internal `duration_ms`/`output_pad` reach extension renderers through
     /// the bridge — and only then does the extension ABI expose them.
     #[test]

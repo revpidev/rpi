@@ -1,5 +1,5 @@
 //! Durable agent harness core (port of the `packages/durable/src/harness/*`
-//! modules @ `abe508e1b`: `types.ts`, `define.ts`, `registry.ts`, `agent.ts`,
+//! modules @ `4a080252f`: `types.ts`, `define.ts`, `registry.ts`, `agent.ts`,
 //! `live.ts`, `usage.ts`, `provider.ts`, `json.ts`, `util.ts`, `submissions.ts`,
 //! `inbox.ts`, `context.ts`, `prompt.ts`, `generation.ts`, `tool.ts`,
 //! `compaction.ts`, `task-graph.ts`, and the `harness.ts` composition).

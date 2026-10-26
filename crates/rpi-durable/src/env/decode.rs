@@ -1,5 +1,5 @@
 //! Streaming UTF-8 decoding (port of `packages/durable/src/env/decode.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! Decoding matches `new TextDecoder().decode(bytes)` of the whole input when
 //! the input arrives in pieces. Node's streaming decoder with BOM handling can

@@ -1,5 +1,5 @@
 //! Document draft tracker (port of the consumed surface of
-//! `chord/src/delta/tracker.ts` + `draft.ts` @ `abe508e1b`).
+//! `chord/src/delta/tracker.ts` + `draft.ts` @ `4a080252f`).
 //!
 //! Upstream records fine-grained proxy mutations and replays the recorded
 //! operation list. The Rust port keeps the same transaction contract

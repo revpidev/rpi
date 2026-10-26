@@ -1,5 +1,5 @@
 //! Session-to-Chord observation bridge (port of
-//! `packages/durable/src/session/observation.ts` @ `abe508e1b`).
+//! `packages/durable/src/session/observation.ts` @ `4a080252f`).
 //!
 //! Upstream attaches one `CommittedStateSource` (for a read-only replicated
 //! state) or one `CommittedWatch` (for a serialized async frame watch) to a

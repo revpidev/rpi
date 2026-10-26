@@ -591,7 +591,7 @@ impl HostActions for SessionHostActions {
     }
 
     /// `ctx.modelRegistry.findOfType(type, provider, modelId)`
-    /// (model-registry.ts:76-77 @ abe508e1b): non-chat catalog lookup over
+    /// (model-registry.ts:76-77 @ 4a080252f): non-chat catalog lookup over
     /// the runtime's typed accessors (V16-06 R2.5.2).
     fn model_registry_find_of_type(
         &self,
@@ -613,7 +613,7 @@ impl HostActions for SessionHostActions {
     }
 
     /// `ctx.modelRegistry.classify(model, context, options?)`
-    /// (model-registry.ts:173-179 @ abe508e1b): structured classification
+    /// (model-registry.ts:173-179 @ 4a080252f): structured classification
     /// with request-time authentication. Never rejects — parse failures and
     /// an unbound session produce an error `ClassifierResult`. The
     /// callback-bearing option fields (`signal`/`fetch`/`onPayload`/
@@ -788,7 +788,7 @@ impl HostActions for SessionHostActions {
     }
 
     /// Backs `ExtensionToolContext.executeTool()` (types.ts:390-394 @
-    /// abe508e1b; V16-06 FR-E): run a nested tool call through the session's
+    /// 4a080252f; V16-06 FR-E): run a nested tool call through the session's
     /// nested-call runner (same validation, hooks, and permission checks as
     /// model-issued calls). Tool failures come back as `is_error: true`.
     async fn execute_tool(

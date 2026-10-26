@@ -1,5 +1,5 @@
 //! Stateful OAuth provider backed by a store (port of
-//! `packages/mcp/src/oauth/provider.ts` @ abe508e1b).
+//! `packages/mcp/src/oauth/provider.ts` @ 4a080252f).
 
 use std::sync::Arc;
 

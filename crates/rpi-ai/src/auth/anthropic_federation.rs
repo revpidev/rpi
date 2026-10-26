@@ -2,7 +2,7 @@
 //! (`@anthropic-ai/sdk` `lib/credentials/oidc-federation.js` +
 //! `lib/credentials/token-cache.js` + `lib/credentials/types.js`), wired into
 //! the provider auth chain by `packages/ai/src/providers/anthropic.ts` @ pi
-//! abe508e1b (v1.0.0, `a9424cd43`).
+//! 4a080252f (v1.0.0, `a9424cd43`).
 //!
 //! rpi has no Anthropic SDK, so the RFC 7523 jwt-bearer exchange, the
 //! two-tier token cache (120s advisory / 30s mandatory) and the 401
@@ -554,7 +554,7 @@ pub async fn invalidate_access_token(config: &AnthropicFederationConfig) {
 mod tests {
     //! Test intents ported from the Anthropic SDK credentials tests and the
     //! pi federation suite (`packages/ai/test/anthropic-federation.test.ts` /
-    //! `anthropic-federation-sdk.test.ts` @ pi abe508e1b), same names in
+    //! `anthropic-federation-sdk.test.ts` @ pi 4a080252f), same names in
     //! snake_case where the surface overlaps. The SDK's mocked `fetch`
     //! becomes a scripted loopback token endpoint.
 

@@ -1,4 +1,4 @@
-//! Port of `packages/coding-agent/src/core/radius.ts` @ pi abe508e1b
+//! Port of `packages/coding-agent/src/core/radius.ts` @ pi 4a080252f
 //! (v1.0.0, `ed8b3bcc1`) — the gateway constants the top-level `/login`
 //! Radius entry and the MCP one-click setup use.
 

@@ -1,5 +1,5 @@
 //! Durable storage stack: port of `packages/durable` (`@earendil-works/pi-durable`
-//! @ abe508e1b / v1.1.0) — the M4 storage foundation.
+//! @ 4a080252f / v1.4.0) — the M4 storage foundation.
 //!
 //! **Experimental.** The API changes without notice between releases.
 //!

@@ -1,5 +1,5 @@
 //! TypeScript declaration rendering for the script-visible API (port of
-//! `packages/codemode/src/declarations.ts` @ abe508e1b).
+//! `packages/codemode/src/declarations.ts` @ 4a080252f).
 //!
 //! Tools become members of `declare const tools`, globals become
 //! `declare function` statements, and `ns.member` globals members of
@@ -20,7 +20,7 @@ const MAX_REF_EXPANSIONS: usize = 32;
 
 /// TypeScript types for MCP results, from the MCP `CallToolResult` schema,
 /// so `CallToolResult<T>` declarations can refer to them
-/// (declarations.ts:18-93).
+/// (declarations.ts:18-93 @ abe508e1b; removed in 4a080252f and assigned to V18-03).
 pub const MCP_TYPESCRIPT_PREAMBLE: &str = r#"type Role = "user" | "assistant";
 type MetaObject = Record<string, unknown>;
 type Annotations = {
@@ -98,7 +98,7 @@ type CallToolResult<TStructured = { [key: string]: unknown }> = {
   [key: string]: unknown;
 };"#;
 
-/// `RenderDeclarationsOptions` (declarations.ts:95-98) collapsed to the two
+/// `RenderDeclarationsOptions` (declarations.ts:35-44) collapsed to the two
 /// slices.
 #[derive(Default)]
 pub struct RenderDeclarationsOptions<'a> {
@@ -180,7 +180,7 @@ pub fn render_tool_signature(tool: &CodemodeToolInfo, input_max_chars: Option<us
 }
 
 /// A tool's sample: the description followed by the tool's declaration
-/// (declarations.ts:149-159).
+/// (declarations.ts:91-99).
 pub fn render_tool_sample(tool: &CodemodeToolInfo) -> String {
     let declaration = format!(
         "declare const tools: {{ {} }};",
@@ -195,7 +195,8 @@ pub fn render_tool_sample(tool: &CodemodeToolInfo) -> String {
 /// The `structuredContent` schema of an MCP `CallToolResult` output schema
 /// (detected by a `content` array of objects, boolean `isError`, and object
 /// `_meta`), `Some(true)` when it declares none, or `None` when the schema
-/// is not a `CallToolResult` (declarations.ts:161-175).
+/// is not a `CallToolResult` (declarations.ts:161-175 @ abe508e1b; removed in
+/// 4a080252f and assigned to V18-03).
 pub fn mcp_structured_content_schema(schema: Option<&Value>) -> Option<Value> {
     let schema = schema?;
     let schema = schema.as_object()?;
@@ -336,7 +337,7 @@ fn union(types: Vec<String>) -> String {
 }
 
 /// Convert a JSON Schema to a TypeScript type expression
-/// (declarations.ts:221-308).
+/// (declarations.ts:139-146).
 pub fn schema_to_type(schema: &Value, max_chars: Option<usize>) -> String {
     let mut context = SchemaContext {
         root: schema,
@@ -603,7 +604,7 @@ pub fn is_plain_object(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! Ports `packages/codemode/test/declarations.test.ts` @ abe508e1b.
+    //! Ports `packages/codemode/test/declarations.test.ts` @ 4a080252f.
 
     use super::*;
     use serde_json::json;

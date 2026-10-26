@@ -1,5 +1,5 @@
 //! Portable JSONL implementation of the storage contract
-//! (port of `src/storage/jsonl/storage.ts` @ `abe508e1b`).
+//! (port of `src/storage/jsonl/storage.ts` @ `4a080252f`).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

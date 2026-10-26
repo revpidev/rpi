@@ -1,5 +1,5 @@
 //! Durable submission admission, waits, and withdrawal (port of
-//! `packages/durable/src/harness/submissions.ts` @ `abe508e1b`).
+//! `packages/durable/src/harness/submissions.ts` @ `4a080252f`).
 //!
 //! A submission is the durable hand-off between a host and a conversation: an
 //! *input* may start a run, a *write* appends a passive entry. Admission is one

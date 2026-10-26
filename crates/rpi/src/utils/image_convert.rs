@@ -1,5 +1,5 @@
-//! Port of `packages/coding-agent/src/utils/image-convert.ts` @ pi 1.1.0
-//! (abe508e1b, a276dabe5 / #10292).
+//! Port of `packages/coding-agent/src/utils/image-convert.ts` @ pi 1.4.0
+//! (4a080252f, a276dabe5 / #10292).
 //!
 //! Kitty-protocol terminals only accept PNG, so the interactive mode
 //! registers the PNG transcoder exposed by `rpi-tui`'s `Image` component.

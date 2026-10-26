@@ -2,10 +2,10 @@
 //! `packages/coding-agent/src/modes/interactive/interactive-mode.ts` @ pi
 //! 0.82.1 (2efa728):
 //! - `getAutocompleteSourceTag` / `prefixAutocompleteDescription`
-//!   (interactive-mode.ts:676-708 @ abe508e1b)
-//! - `getBuiltInCommandConflictDiagnostics` (interactive-mode.ts:710-723 @ abe508e1b)
-//! - `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ abe508e1b)
-//! - `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ abe508e1b)
+//!   (interactive-mode.ts:676-708 @ 4a080252f)
+//! - `getBuiltInCommandConflictDiagnostics` (interactive-mode.ts:710-723 @ 4a080252f)
+//! - `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ 4a080252f)
+//! - `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ 4a080252f)
 //!
 //! The provider combines four command sources: the built-in slash commands
 //! (`core::slash_commands::BUILTIN_SLASH_COMMANDS`), prompt templates
@@ -266,7 +266,7 @@ pub(crate) fn format_login_provider_completion_description(
 // Base provider (interactive-mode.ts:545-629)
 // ---------------------------------------------------------------------------
 
-/// `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ abe508e1b): the
+/// `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ 4a080252f): the
 /// combined slash-command provider — built-ins (+ `/model` and `/login`
 /// argument completions), prompt templates, extension commands and skills.
 pub(crate) fn create_base_autocomplete_provider(
@@ -673,10 +673,10 @@ impl AutocompleteProvider for ExtensionAutocompleteProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Setup (interactive-mode.ts:825-841 @ abe508e1b)
+// Setup (interactive-mode.ts:825-841 @ 4a080252f)
 // ---------------------------------------------------------------------------
 
-/// `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ abe508e1b):
+/// `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ 4a080252f):
 /// build the base provider and install it on the editor. Upstream also sets
 /// it on a secondary editor when one is active; the mode has a single
 /// editor.

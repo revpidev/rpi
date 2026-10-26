@@ -1,5 +1,5 @@
 //! Shared System One classification transport (port of
-//! `packages/ai/src/api/system-one-shared.ts` @ abe508e1b).
+//! `packages/ai/src/api/system-one-shared.ts` @ 4a080252f).
 //!
 //! TypeSafe's System One protocol is served by several providers
 //! (typesafe / openrouter / vercel-ai-gateway / opencode) and by Cloudflare

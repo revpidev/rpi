@@ -1,5 +1,5 @@
 //! OAuth discovery (port of `packages/mcp/src/oauth/discovery.ts` @
-//! abe508e1b): protected-resource metadata, authorization-server metadata,
+//! 4a080252f): protected-resource metadata, authorization-server metadata,
 //! `WWW-Authenticate` challenges and resource selection.
 
 use serde_json::Value;

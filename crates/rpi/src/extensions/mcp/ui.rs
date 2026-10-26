@@ -1,6 +1,6 @@
 //! The built-in `mcp` extension (port of
 //! `packages/coding-agent/src/extensions/mcp/index.ts` and `ui.ts` @
-//! abe508e1b): connects `mcp.json` and extension-registered servers when a
+//! 4a080252f): connects `mcp.json` and extension-registered servers when a
 //! session starts, registers their tools, renders the `mcp_servers` system
 //! prompt section and drives `/mcp`.
 //!
@@ -250,7 +250,7 @@ fn find_replacer(own_path: &str, tools: &[Value], commands: &[Value]) -> Option<
 
 /// The active `mcp__*` names a resumed/reloaded loadout references that no
 /// server has registered yet (`_restoreToolsFromTranscript` pending set,
-/// agent-session.ts:1763-1768 @ abe508e1b, v1.0.0 `c662ec7e3`).
+/// agent-session.ts:1763-1768 @ 4a080252f, v1.0.0 `c662ec7e3`).
 pub fn pending_mcp_tools(active_tools: &[String], registered: &HashSet<String>) -> HashSet<String> {
     active_tools
         .iter()
@@ -1619,7 +1619,7 @@ impl McpBuiltinState {
     fn install(self: Arc<Self>, api: &ExtensionApi) -> Result<(), String> {
         // `pi.registerToolRenderer((toolName, next) => next() ?? (match ?
         // createMcpToolRenderers(...) : undefined))` (index.ts:383-385
-        // @ abe508e1b, #10285): a resumed session renders calls to MCP tools
+        // @ 4a080252f, #10285): a resumed session renders calls to MCP tools
         // before their server connected, if it ever does. Registered tools
         // keep their own renderers (the `next()` result wins).
         api.register_tool_renderer(Arc::new(|tool_name, next| {

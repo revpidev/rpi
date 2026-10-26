@@ -1,5 +1,5 @@
 //! Async host side of the sandbox (port of `CodemodeSandbox` / `Execution`
-//! in `packages/codemode/src/runtime/host.ts` @ abe508e1b).
+//! in `packages/codemode/src/runtime/host.ts` @ 4a080252f).
 //!
 //! One script run gets its own worker thread, fresh wasmtime `Store`, and
 //! fresh QuickJS VM. A runaway script, including one that only spins the
@@ -39,7 +39,7 @@ impl Drop for WorkerThreadGuard {
     }
 }
 
-/// One in-flight call as the host tracks it (`PendingCall`, host.ts:102-106).
+/// One in-flight call as the host tracks it (`PendingCall`, execution.ts:145-149).
 struct PendingCall {
     /// Tool calls get a record; globals are tracked for the reply only.
     index: Option<usize>,
@@ -478,12 +478,12 @@ impl CodemodeSandbox {
             let _ = replies_tx.send(HostToWorker::Abort);
         }
         // The interrupt flag is set for every outcome, like upstream
-        // `finish()` (`Atomics.store`, host.ts:332): a script that reported
+        // `finish()` (`Atomics.store`, host.ts:60): a script that reported
         // `done` and kept looping (for example `try { text(x) } catch {}`
         // after the output limit failed it) must not spin its worker thread.
         interrupt.store(true, Ordering::SeqCst);
         // Already cancelled by finish(): the record keeps "cancelled" and the
-        // worker is gone or going (host.ts:297-308).
+        // worker is gone or going (execution.ts:410-448).
         abort.cancel();
         drop(replies_tx);
         drop(handle);
@@ -519,7 +519,7 @@ fn serialize_store(store: Option<&Value>) -> serde_json::Map<String, Value> {
     serialized
 }
 
-/// `parseStoreWrites` (host.ts:64-81): entries of `[key, json]` (set) and
+/// `parseStoreWrites` (execution.ts:112-129): entries of `[key, json]` (set) and
 /// `[key]` (delete). Returns a warning when a value could not be decoded
 /// (deep nesting), so the loss is visible instead of silent (v0.1.6 review
 /// P3).
@@ -615,7 +615,7 @@ fn parse_deep_value(text: &str) -> Result<Value, serde_json::Error> {
     Ok(value)
 }
 
-/// `handleDone` error branch (host.ts:255-263): `{name?, message, stack?}`.
+/// `handleDone` error branch (execution.ts:357-365): `{name?, message, stack?}`.
 fn parse_script_error(error: Option<&str>) -> CodemodeError {
     let parsed = error
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
@@ -690,7 +690,7 @@ fn complete_call(
                     table.records[index].duration_ms = duration;
                     // A call cut off by finish() keeps `cancelled`, even when
                     // the tool surfaces its own cancellation as an error
-                    // (host.ts:297-308).
+                    // (execution.ts:410-448).
                     match result {
                         Ok(value) if !execution.is_cancelled() => {
                             table.records[index].status = CodemodeCallStatus::Ok;
@@ -726,7 +726,7 @@ fn complete_call(
                     }
                 }
             }
-            // After finish(), no reply is needed (host.ts:297-308).
+            // After finish(), no reply is needed (execution.ts:410-448).
             None => return,
         }
     }

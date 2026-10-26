@@ -320,7 +320,7 @@ mod tests {
 
     /// V17-10 #66 FR-B R5: the clipboard hints match the shipped chain
     /// (files → images → text) after the V17-10 port; the upstream wording
-    /// is restored (interactive-mode.ts:1046-1047 @ abe508e1b).
+    /// is restored (interactive-mode.ts:1046-1047 @ 4a080252f).
     #[test]
     fn clipboard_hints_match_the_shipped_paste_subset() {
         let (expanded, _) = startup_instructions(&theme());

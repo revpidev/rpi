@@ -1,6 +1,6 @@
 //! tmux keyboard-setup check — port of `checkTmuxKeyboardSetup`
 //! (`packages/coding-agent/src/modes/interactive/interactive-mode.ts:
-//! 1281-1326` @ `abe508e1b`, call site `:1180-1185`).
+//! 1281-1326` @ `4a080252f`, call site `:1180-1185`).
 //!
 //! Upstream runs the check asynchronously at interactive startup and warns
 //! once per startup when the tmux configuration mangles modified Enter keys.
@@ -15,13 +15,13 @@ use std::time::Duration;
 /// Upstream `setTimeout(..., 2000)` (interactive-mode.ts:1290-1293).
 pub(crate) const TMUX_CHECK_TIMEOUT: Duration = Duration::from_millis(2000);
 
-/// Verbatim upstream warning (`interactive-mode.ts:1318` @ `abe508e1b`).
+/// Verbatim upstream warning (`interactive-mode.ts:1318` @ `4a080252f`).
 pub(crate) const EXTENDED_KEYS_OFF_WARNING: &str = "tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.";
 
-/// Verbatim upstream warning (`interactive-mode.ts:1322` @ `abe508e1b`).
+/// Verbatim upstream warning (`interactive-mode.ts:1322` @ `4a080252f`).
 pub(crate) const EXTENDED_KEYS_FORMAT_WARNING: &str = "tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
 
-/// `checkTmuxKeyboardSetup` (interactive-mode.ts:1281-1326 @ `abe508e1b`):
+/// `checkTmuxKeyboardSetup` (interactive-mode.ts:1281-1326 @ `4a080252f`):
 /// `TMUX` gate, the two `tmux show -gv` queries in parallel, and the
 /// misconfiguration warnings. `None` = don't warn (no tmux, timeout,
 /// spawn failure, non-zero exit, or a correct configuration). A successful
@@ -145,9 +145,9 @@ mod tests {
     /// anchors; the constants must never drift from them.
     #[test]
     fn warnings_match_upstream_verbatim() {
-        // interactive-mode.ts:1318 @ abe508e1b.
+        // interactive-mode.ts:1318 @ 4a080252f.
         let off = "tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.";
-        // interactive-mode.ts:1322 @ abe508e1b.
+        // interactive-mode.ts:1322 @ 4a080252f.
         let format = "tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
         assert_eq!(EXTENDED_KEYS_OFF_WARNING, off);
         assert_eq!(EXTENDED_KEYS_FORMAT_WARNING, format);

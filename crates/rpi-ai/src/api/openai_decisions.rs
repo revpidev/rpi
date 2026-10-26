@@ -1,5 +1,5 @@
 //! OpenAI Decisions classification (port of
-//! `packages/ai/src/api/openai-decisions.ts` @ `abe508e1b`, `ce8972a0e`).
+//! `packages/ai/src/api/openai-decisions.ts` @ `4a080252f`, `ce8972a0e`).
 //!
 //! `POST /v1/decisions` with `{ model, input, questions }`. The state is sent
 //! as JSON text; with images the input becomes one user message with the

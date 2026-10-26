@@ -2,7 +2,7 @@
 //! router state, limits, and restore.
 //!
 //! Port of `packages/coding-agent/test/virtual-models.test.ts` and
-//! `test/suite/virtual-models.test.ts` @ abe508e1b (the router is a native
+//! `test/suite/virtual-models.test.ts` @ 4a080252f (the router is a native
 //! inline extension; the wasm carrier is covered by the `rpi-ext-host` /
 //! `rpi-ext-sdk` host-call tests).
 

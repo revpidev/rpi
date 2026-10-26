@@ -1,5 +1,5 @@
 //! Shared classifier HTTP plumbing (port of
-//! `packages/ai/src/api/classifier-shared.ts` @ `abe508e1b`, `ce8972a0e`).
+//! `packages/ai/src/api/classifier-shared.ts` @ `4a080252f`, `ce8972a0e`).
 //!
 //! Owns the request shape, headers, per-attempt timeout, retry/cancel
 //! semantics, usage parsing, and response parsing helpers shared by the

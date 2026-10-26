@@ -1,5 +1,5 @@
 //! Bounded tool output and throttled progress commits (port of
-//! `packages/durable/src/harness/output.ts` @ `abe508e1b`).
+//! `packages/durable/src/harness/output.ts` @ `4a080252f`).
 //!
 //! [`bound_output`] slices text to whole lines within the limits;
 //! [`OutputBuffer`] keeps exact totals across chunks while storing only the

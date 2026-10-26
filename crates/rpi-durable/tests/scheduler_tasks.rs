@@ -1,5 +1,5 @@
 //! Scheduler task lifecycle tests (port of
-//! `packages/durable/test/harness-tasks.test.ts` @ `abe508e1b`).
+//! `packages/durable/test/harness-tasks.test.ts` @ `4a080252f`).
 //!
 //! Every case drives the real [`rpi_durable::harness::TaskScheduler`] through a
 //! Harness opened over memory storage. Upstream `describe`/`it` anchors are

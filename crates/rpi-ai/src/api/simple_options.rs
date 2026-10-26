@@ -55,7 +55,7 @@ pub fn build_base_options(
     stream
 }
 
-/// `resolveSamplingParams` (simple-options.ts:26-34 @ abe508e1b, #9776):
+/// `resolveSamplingParams` (simple-options.ts:26-34 @ 4a080252f, #9776):
 /// merge `Model.samplingParams` → the effective (clamped) thinking level's
 /// `samplingParamsByThinkingLevel` entry → the request's own map, last key
 /// wins. `None` when all three are unset (request body unchanged).

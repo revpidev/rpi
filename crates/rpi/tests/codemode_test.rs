@@ -1,6 +1,6 @@
 //! End-to-end codemode tests (V16-07 FR-C/E/H), ported from
 //! `packages/coding-agent/test/suite/agent-session-codemode.test.ts`
-//! @ abe508e1b.
+//! @ 4a080252f.
 
 use base64::Engine as _;
 use std::path::{Path, PathBuf};

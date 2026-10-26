@@ -1,5 +1,5 @@
 //! Harness inbox / boundary placement integration tests (port of
-//! `packages/durable/test/harness-inbox.test.ts` @ `abe508e1b`).
+//! `packages/durable/test/harness-inbox.test.ts` @ `4a080252f`).
 //!
 //! The boundary matrix is exercised directly on the Session line: queued
 //! submissions and inbox items are seeded in one commit, and the boundary is

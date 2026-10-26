@@ -69,7 +69,7 @@ pub(crate) fn thinking_level_from_model_level(level: ModelThinkingLevel) -> Opti
 }
 
 /// `config.reasoning ?? "off"` recorded on every finalized assistant message
-/// (agent-loop.ts:409 @ abe508e1b; R2.7.1).
+/// (agent-loop.ts:409 @ 4a080252f; R2.7.1).
 fn recorded_thinking_level(reasoning: Option<ThinkingLevel>) -> ModelThinkingLevel {
     reasoning
         .map(ThinkingLevel::to_model_level)
@@ -124,7 +124,7 @@ pub struct AfterToolCallResult {
     pub details: Option<Value>,
     /// Replaces the machine-readable `structuredContent`; `Some(None)`-style
     /// clearing follows `content` replacement (see
-    /// `finalize_executed_tool_call`, agent-loop.ts:878-888 @ abe508e1b).
+    /// `finalize_executed_tool_call`, agent-loop.ts:878-888 @ 4a080252f).
     pub structured_content: Option<Value>,
     /// Replaces the tool result error flag.
     pub is_error: Option<bool>,
@@ -165,7 +165,7 @@ pub struct AfterToolCallContext {
     pub context: AgentContext,
 }
 
-/// `AgentTurnContext` (types.ts:135-144 @ abe508e1b): context passed to the
+/// `AgentTurnContext` (types.ts:135-144 @ 4a080252f): context passed to the
 /// completed-turn `finishTurn` callback.
 #[derive(Clone)]
 pub struct AgentTurnContext {
@@ -181,7 +181,7 @@ pub struct AgentTurnContext {
     pub new_messages: Vec<AgentMessage>,
 }
 
-/// `AgentTurnDecision` (types.ts:147 @ abe508e1b): decision returned by
+/// `AgentTurnDecision` (types.ts:147 @ 4a080252f): decision returned by
 /// [`FinishTurnFn`]. `None` preserves normal scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentTurnDecision {
@@ -235,7 +235,7 @@ pub type TransformContextFn = Arc<
 /// available.
 pub type GetApiKeyFn = Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
-/// `PrepareRequestContext` (types.ts:173-177 @ abe508e1b): runtime state
+/// `PrepareRequestContext` (types.ts:173-177 @ 4a080252f): runtime state
 /// available immediately before a conversational provider request.
 #[derive(Clone)]
 pub struct PrepareRequestContext {
@@ -247,7 +247,7 @@ pub struct PrepareRequestContext {
     pub thinking_level: ModelThinkingLevel,
 }
 
-/// `AgentRequestUpdate` (types.ts:180 @ abe508e1b): replacement runtime
+/// `AgentRequestUpdate` (types.ts:180 @ 4a080252f): replacement runtime
 /// state for the provider request being prepared (`messages` excluded).
 #[derive(Clone, Default)]
 pub struct AgentRequestUpdate {
@@ -260,7 +260,7 @@ pub struct AgentRequestUpdate {
     pub thinking_level: Option<ModelThinkingLevel>,
 }
 
-/// `prepareRequest` (types.ts:271 @ abe508e1b): called immediately before
+/// `prepareRequest` (types.ts:271 @ 4a080252f): called immediately before
 /// every conversational provider request, including the first. Pending
 /// messages have already been appended and emitted when this callback runs.
 /// The returned context/model/thinking level replaces the runtime values for
@@ -272,7 +272,7 @@ pub type PrepareRequestFn = Arc<
 
 /// `finish_turn` — returning `Some(End)` makes the loop emit `agent_end`
 /// and exit before polling steering/follow-up queues.
-/// `FinishTurn` (types.ts:155-158 @ abe508e1b): called after a completed
+/// `FinishTurn` (types.ts:155-158 @ 4a080252f): called after a completed
 /// assistant turn and all of its tool-result messages, but before
 /// `turn_end`. On a normal turn, [`AgentTurnDecision::Continue`] ensures one
 /// next provider request; [`AgentTurnDecision::End`] ends the run. Returning
@@ -355,7 +355,7 @@ pub struct AgentLoopConfig {
     pub transform_context: Option<TransformContextFn>,
     pub get_api_key: Option<GetApiKeyFn>,
     pub finish_turn: Option<FinishTurnFn>,
-    /// `prepareRequest` (agent-loop.ts:218-235 @ abe508e1b).
+    /// `prepareRequest` (agent-loop.ts:218-235 @ 4a080252f).
     pub prepare_request: Option<PrepareRequestFn>,
     pub prepare_next_turn: Option<PrepareNextTurnFn>,
     pub get_steering_messages: Option<GetQueuedMessagesFn>,
@@ -731,7 +731,7 @@ async fn run_loop(
                 new_messages.push(message);
             }
 
-            // `prepareRequest` (agent-loop.ts:218-235 @ abe508e1b): called
+            // `prepareRequest` (agent-loop.ts:218-235 @ 4a080252f): called
             // immediately before every conversational provider request,
             // including the first. The replacement context/model/thinking
             // level applies to this and later requests in the run. This hook
@@ -768,7 +768,7 @@ async fn run_loop(
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
                 // Error and aborted responses remain hard exits; `finishTurn`
                 // still runs (extension boundaries observe the turn) but its
-                // decision is ignored (agent-loop.ts:245-252 @ abe508e1b).
+                // decision is ignored (agent-loop.ts:245-252 @ 4a080252f).
                 if let Some(finish_turn) = &config.finish_turn {
                     let turn = AgentTurnContext {
                         message: message.clone(),
@@ -886,7 +886,7 @@ async fn run_loop(
 
         // No natural request was selected, so fulfill the continuation
         // decision with one context-only turn (agent-loop.ts:309-314 @
-        // abe508e1b).
+        // 4a080252f).
         if explicit_continuation {
             explicit_continuation = false;
             continue;
@@ -1283,7 +1283,7 @@ struct FinalizedToolCallOutcome {
 }
 
 /// `AgentToolCallOutcome` (packages/agent/src/types.ts:449-453 @
-/// abe508e1b): the final outcome
+/// 4a080252f): the final outcome
 /// of a tool call after hooks ran. Nested calls (`ctx.executeTool()`) return
 /// this shape too.
 #[derive(Debug, Clone)]
@@ -1292,13 +1292,13 @@ pub struct AgentToolCallOutcome {
     pub result: AgentToolResult,
     pub is_error: bool,
     /// Milliseconds `execute()` took, measured with a monotonic clock;
-    /// absent when the tool did not run (types.ts:449-454 @ abe508e1b,
+    /// absent when the tool did not run (types.ts:449-454 @ 4a080252f,
     /// #10549).
     pub duration_ms: Option<u64>,
 }
 
 /// Options for [`run_tool_call`] (`RunToolCallOptions`,
-/// agent-loop.ts:790-802 @ abe508e1b).
+/// agent-loop.ts:790-802 @ 4a080252f).
 pub struct RunToolCallOptions {
     /// Tools the call resolves against.
     pub tools: Vec<Arc<dyn AgentTool>>,
@@ -1314,7 +1314,7 @@ pub struct RunToolCallOptions {
     pub on_update: Option<AgentToolUpdateCallback>,
 }
 
-/// `runToolCall` (agent-loop.ts:810-820 @ abe508e1b): run one tool call
+/// `runToolCall` (agent-loop.ts:810-820 @ 4a080252f): run one tool call
 /// through the full pipeline (schema validation, `beforeToolCall`,
 /// execution, `afterToolCall`). Used by the loop's batch runners and by the
 /// session for nested `ctx.executeTool()` calls; callers emit the
@@ -2044,7 +2044,7 @@ fn create_tool_result_message(
     finalized: &FinalizedToolCallOutcome,
     nested: Option<&crate::nested_tool_calls::NestedCallSummary>,
 ) -> ToolResultMessage {
-    // `_handleAgentEvent` (agent-session.ts:1074-1086 @ abe508e1b): the
+    // `_handleAgentEvent` (agent-session.ts:1074-1086 @ 4a080252f): the
     // bounded nested-call record rides the message, and the nested usage is
     // combined into the message usage. Nested results never enter the
     // transcript themselves.

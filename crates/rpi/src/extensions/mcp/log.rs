@@ -1,5 +1,5 @@
 //! MCP server log messages (port of
-//! `packages/coding-agent/src/extensions/mcp/log.ts` @ abe508e1b).
+//! `packages/coding-agent/src/extensions/mcp/log.ts` @ 4a080252f).
 //!
 //! `notifications/message` lines are appended to `mcp.log` in the agent
 //! directory; several processes may write to the same file, so every

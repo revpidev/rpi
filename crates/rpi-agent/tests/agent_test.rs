@@ -1257,7 +1257,7 @@ fn role_str(message: &AgentMessage) -> &'static str {
     }
 }
 
-/// V16-03 FR-D R5: `peekQueuedMessages` (agent.ts:327-333 @ abe508e1b)
+/// V16-03 FR-D R5: `peekQueuedMessages` (agent.ts:327-333 @ 4a080252f)
 /// previews the next queued batch without consuming it; steering first,
 /// then follow-up.
 #[tokio::test]

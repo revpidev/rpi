@@ -1,5 +1,5 @@
 //! Public types of the codemode sandbox (port of
-//! `packages/codemode/src/types.ts` @ abe508e1b).
+//! `packages/codemode/src/types.ts` @ 4a080252f).
 
 use std::sync::Arc;
 
@@ -80,14 +80,14 @@ pub struct CodemodeToolInfo {
     pub description: Option<String>,
     pub input_schema: Option<CodemodeJsonSchema>,
     pub output_schema: Option<CodemodeJsonSchema>,
-    /// Globals only: explicit TypeScript signature (declarations.ts:132-147).
+    /// Globals only: explicit TypeScript signature (declarations.ts:76-90).
     pub signature: Option<String>,
 }
 
 /// One item of the script's output, in the order the script produced it:
 /// `text()` and `console.*` produce text items (`console` true for
 /// `console.*`), `image()` produces image items. Image `data` is base64
-/// (types.ts:43-50 @ abe508e1b).
+/// (types.ts:43-50 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum CodemodeOutputItem {
@@ -95,7 +95,7 @@ pub enum CodemodeOutputItem {
     Text {
         text: String,
         /// `console.*` items are marked so the caller can group them
-        /// (`console: true`, types.ts:45-50 @ abe508e1b).
+        /// (`console: true`, types.ts:45-50 @ 4a080252f).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         console: bool,
     },
@@ -137,7 +137,7 @@ pub enum CodemodeErrorKind {
     Sandbox,
 }
 
-/// `CodemodeError` (types.ts:67-73).
+/// `CodemodeError` (types.ts:75-80).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
 #[error("{message}")]
 pub struct CodemodeError {
@@ -158,7 +158,7 @@ pub struct CodemodeStoreWrites {
     pub delete: Vec<String>,
 }
 
-/// `CodemodeResult` (types.ts:82-90). `output` is kept for failed
+/// `CodemodeResult` (types.ts:94-109). `output` is kept for failed
 /// executions too, up to the failure. `value: None` is the script's
 /// `undefined` (no `return`, or `exit()`); `Some(Value::Null)` is an explicit
 /// `return null`.
@@ -200,7 +200,7 @@ impl CodemodeTimeout {
     }
 }
 
-/// `CodemodeSandboxOptions` (types.ts:92-125).
+/// `CodemodeSandboxOptions` (types.ts:135-163).
 #[derive(Default)]
 pub struct CodemodeSandboxOptions {
     pub tools: Vec<CodemodeTool>,
@@ -217,7 +217,7 @@ pub struct CodemodeSandboxOptions {
     pub memory_limit_bytes: Option<u64>,
 }
 
-/// `CodemodeExecuteOptions` (types.ts:127-136).
+/// `CodemodeExecuteOptions` (types.ts:245-254).
 #[derive(Default)]
 pub struct CodemodeExecuteOptions {
     pub signal: Option<CancellationToken>,
@@ -229,7 +229,7 @@ pub struct CodemodeExecuteOptions {
     pub store: Option<Value>,
 }
 
-/// Default overall deadline (`DEFAULT_TIMEOUT_MS`, host.ts:22).
+/// Default overall deadline (`DEFAULT_TIMEOUT_MS`, execution.ts:49).
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 
 /// Store limits (prelude-source.ts MAX_STORE_VALUE_CHARS /
@@ -245,7 +245,7 @@ pub const MAX_STORE_TOTAL_CHARS: usize = 1024 * 1024;
 pub const MAX_OUTPUT_CHARS: usize = 16 * 1024 * 1024;
 pub const MAX_OUTPUT_ITEMS: usize = 100_000;
 
-/// Globals a host may not shadow (`RESERVED_GLOBALS`, host.ts:24-35).
+/// Globals a host may not shadow (`RESERVED_GLOBALS`, execution.ts:51-61).
 pub const RESERVED_GLOBALS: [&str; 9] = [
     "tools",
     "ALL_TOOLS",

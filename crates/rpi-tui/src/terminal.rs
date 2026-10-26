@@ -4,7 +4,7 @@
 //! (upstream `ProcessTerminal`): raw mode, stdin reading, Kitty keyboard
 //! protocol negotiation with modifyOtherKeys fallback (DA response without a
 //! Kitty answer falls back immediately, no startup timeout), bracketed paste,
-//! OSC 9;4 taskbar progress, OSC 7501 program status (V17-05, `@ abe508e1b`),
+//! OSC 9;4 taskbar progress, OSC 7501 program status (V17-05, `@ 4a080252f`),
 //! and terminal state restore on `stop()`.
 //!
 //! Intentional differences:
@@ -473,7 +473,7 @@ fn default_query_size() -> io::Result<(u16, u16)> {
 }
 
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT` (wincon.h, 0x0200; terminal.ts:420-427
-/// @ `abe508e1b`): without it Windows consoles lose modifier state and
+/// @ `4a080252f`): without it Windows consoles lose modifier state and
 /// Shift+Tab arrives as plain `\t` instead of `\x1b[Z`.
 #[cfg(any(windows, test))]
 const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;

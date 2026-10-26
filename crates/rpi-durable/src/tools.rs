@@ -1,4 +1,4 @@
-//! Durable tool set (port of `packages/durable/src/tools/*` @ `abe508e1b`).
+//! Durable tool set (port of `packages/durable/src/tools/*` @ `4a080252f`).
 //!
 //! The module carries the upstream `read`/`write`/`edit`/`bash` tools and the
 //! `powershell` tool, the environment injection point, the file-mutation queue

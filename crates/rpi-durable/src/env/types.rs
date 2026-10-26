@@ -1,5 +1,5 @@
 //! Execution-environment interfaces (port of `packages/durable/src/env/index.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! Operations on the environment return failures instead of throwing
 //! (upstream result-shaped `Result<T, E>`); the Rust port uses

@@ -1,5 +1,5 @@
 //! streamable HTTP transport tests, ported from
-//! `packages/mcp/test/streamable-http.test.ts` @ abe508e1b.
+//! `packages/mcp/test/streamable-http.test.ts` @ 4a080252f.
 
 use std::future::Future;
 use std::pin::Pin;

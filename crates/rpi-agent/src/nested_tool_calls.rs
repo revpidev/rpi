@@ -1,5 +1,5 @@
 //! Nested tool calls (`ctx.executeTool()`), ported from
-//! `packages/coding-agent/src/core/nested-tool-calls.ts` @ abe508e1b
+//! `packages/coding-agent/src/core/nested-tool-calls.ts` @ 4a080252f
 //! (V16-06 FR-E).
 //!
 //! A tool may run other tools through the extension API (`ctx.executeTool`);

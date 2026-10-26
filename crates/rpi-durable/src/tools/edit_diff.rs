@@ -1,6 +1,6 @@
 //! Shared diff computation, fuzzy matching and text-replacement utilities for
 //! the durable edit tool (port of `packages/durable/src/tools/edit-diff.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! The upstream durable module is the same core as the coding-agent one minus
 //! `computeEditsDiff`; the jsdiff-compatible Myers diff and unified-patch

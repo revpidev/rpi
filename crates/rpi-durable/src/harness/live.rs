@@ -1,5 +1,5 @@
 //! Built-in live conversation state (port of `packages/durable/src/harness/live.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! The `pi.live` document carries run control (`run`), the current generation's
 //! presentation, the current tool round, and live compaction statuses. Its

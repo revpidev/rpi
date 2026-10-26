@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/utils/oauth-page.ts` @ pi abe508e1b (v1.0.0,
+//! Port of `packages/ai/src/utils/oauth-page.ts` @ pi 4a080252f (v1.0.0,
 //! moved from `auth/oauth/oauth-page.ts` by `4df157433`) — the shared browser
 //! page rendered by the loopback OAuth callback servers.
 //!

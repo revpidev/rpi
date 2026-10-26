@@ -1,5 +1,5 @@
 //! Port of `packages/coding-agent/src/modes/interactive/program-status-reporter.ts`
-//! @ pi 1.1.0 (abe508e1b).
+//! @ pi 1.4.0 (4a080252f).
 //!
 //! Reports interactive-mode state to the terminal (OSC 7501): `working`
 //! during agent runs and compaction, `blocked` while a dialog waits for the

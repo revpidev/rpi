@@ -1,5 +1,5 @@
 //! Cloudflare Workers AI System One classification (port of
-//! `packages/ai/src/api/cloudflare-workers-ai-system-one.ts` @ abe508e1b).
+//! `packages/ai/src/api/cloudflare-workers-ai-system-one.ts` @ 4a080252f).
 //!
 //! System One models on the Workers AI REST endpoint: `POST
 //! /accounts/{account}/ai/run` with `{ model, input }`. The REST API wraps

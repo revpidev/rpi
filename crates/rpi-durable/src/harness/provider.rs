@@ -1,5 +1,5 @@
 //! Stable provider-facing conversation identity
-//! (port of `packages/durable/src/harness/provider.ts` @ `abe508e1b`).
+//! (port of `packages/durable/src/harness/provider.ts` @ `4a080252f`).
 //!
 //! Every conversation carries a `pi.provider` document with a fresh identity;
 //! forks start with a new one instead of copying their parent.

@@ -1,5 +1,5 @@
 //! Positional system prompt planning (port of
-//! `packages/durable/src/harness/prompt.ts` @ `abe508e1b`).
+//! `packages/durable/src/harness/prompt.ts` @ `4a080252f`).
 //!
 //! A conversation's system prompt is positional: `pi.system` entries patch the
 //! replayed sections and tools rather than restating the whole prompt. This

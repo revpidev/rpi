@@ -1,5 +1,5 @@
 //! Harness utilities: keyed waiters and paginated scans
-//! (port of `packages/durable/src/harness/util.ts` @ `abe508e1b`).
+//! (port of `packages/durable/src/harness/util.ts` @ `4a080252f`).
 //!
 //! Upstream `Waiters<K, T>` stores `Promise.withResolvers` entries and detaches
 //! them when their context aborts. The Rust port stores `tokio::sync::oneshot`

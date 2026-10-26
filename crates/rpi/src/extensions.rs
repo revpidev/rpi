@@ -22,7 +22,7 @@ pub mod mcp;
 pub mod tool_search;
 
 /// Names of the built-in extensions (`extensions/index.ts:7-14` @
-/// abe508e1b: `llama.cpp`, `codemode`, `tool-search`, `mcp`), in the
+/// 4a080252f: `llama.cpp`, `codemode`, `tool-search`, `mcp`), in the
 /// upstream registration order. The package manager resolves each as a
 /// `builtin:<name>` extension resource (V16-13 FR-A); keep in sync with the
 /// factories app.rs builds.

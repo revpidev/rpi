@@ -1,5 +1,5 @@
 //! Asynchronous SQLite facade (port of `src/storage/sqlite/database.ts` and
-//! `node.ts` @ `abe508e1b`).
+//! `node.ts` @ `4a080252f`).
 //!
 //! Selected stack (FR-C R4): `rusqlite` + `bundled` + a dedicated blocking
 //! worker thread. All operations are serialized in call order; a transaction

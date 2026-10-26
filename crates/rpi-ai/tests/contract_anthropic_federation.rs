@@ -1,7 +1,7 @@
 //! Contract tests for Anthropic workload identity federation (`a9424cd43`)
 //! at the anthropic-messages adapter and Models layers. Mirrors
 //! `packages/ai/test/anthropic-federation.test.ts` /
-//! `anthropic-federation-sdk.test.ts` @ pi abe508e1b (v1.1.0): the mocked
+//! `anthropic-federation-sdk.test.ts` @ pi 4a080252f (v1.4.0): the mocked
 //! SDK fetch becomes a scripted loopback server that serves the token
 //! endpoint and the Messages SSE stream, and captures every request.
 

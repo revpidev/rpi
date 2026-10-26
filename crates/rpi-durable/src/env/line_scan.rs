@@ -1,5 +1,5 @@
 //! Bounded line scanning over streamed file bytes (port of
-//! `packages/durable/src/env/line-scan.ts` @ `abe508e1b`).
+//! `packages/durable/src/env/line-scan.ts` @ `4a080252f`).
 //!
 //! Computes a [`LineScan`] from a file's bytes fed in order, so an environment
 //! can scan any size in bounded memory. Decoded sizes use the same streaming

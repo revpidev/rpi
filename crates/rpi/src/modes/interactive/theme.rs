@@ -28,7 +28,7 @@ pub fn markdown_theme(theme: &Theme) -> Arc<MarkdownTheme> {
 }
 
 /// `getMarkdownThemeWithSettings` (interactive-mode.ts:1378-1383 @
-/// abe508e1b): the base theme with `markdown.codeBlockIndent` applied.
+/// 4a080252f): the base theme with `markdown.codeBlockIndent` applied.
 /// `snapshots.rs` and `MarkdownTheme::identity()` keep the explicit `None`
 /// fallback (byte-stable default extraction).
 pub fn markdown_theme_with_settings(theme: &Theme, code_block_indent: &str) -> Arc<MarkdownTheme> {

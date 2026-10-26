@@ -1,7 +1,7 @@
 //! The `system` theme: pi's colors derived from the terminal's own theme.
 //!
 //! Port of `packages/coding-agent/src/modes/interactive/theme/system-theme.ts`
-//! @ pi v1.1.0 (abe508e1b).
+//! @ pi v1.4.0 (4a080252f).
 //!
 //! Every token belongs to a color family (its hue) and has contrast rules: it
 //! must reach a contrast level on the background and on the panels it is drawn

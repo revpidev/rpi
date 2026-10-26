@@ -1,5 +1,5 @@
 //! MCP tool adaptation (port of
-//! `packages/coding-agent/src/extensions/mcp/tools.ts` @ abe508e1b).
+//! `packages/coding-agent/src/extensions/mcp/tools.ts` @ 4a080252f).
 //!
 //! Results map onto the model-facing content (text and images). Text over
 //! 20 KB keeps its start and end with the middle cut out, and the full text
@@ -474,7 +474,7 @@ fn text_component(text: String) -> ComponentTree {
     json!({"type": "text", "props": {"text": text}})
 }
 
-/// `createMcpToolRenderers` (tools.ts:298 @ abe508e1b, #10285): the
+/// `createMcpToolRenderers` (tools.ts:298 @ 4a080252f, #10285): the
 /// render slice of one MCP tool. Used both as the registered tool's own
 /// renderers and by the extension's `registerToolRenderer` resolver, so a
 /// resumed session renders calls to `mcp__<server>__<tool>` before the

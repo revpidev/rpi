@@ -1,5 +1,5 @@
 //! Environment injection point (port of `packages/durable/src/tools/env.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 
 use std::sync::Arc;
 

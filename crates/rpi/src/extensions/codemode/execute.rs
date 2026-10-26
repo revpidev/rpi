@@ -1,5 +1,5 @@
 //! Runs one codemode script (port of
-//! `packages/coding-agent/src/extensions/codemode/execute.ts` @ abe508e1b).
+//! `packages/coding-agent/src/extensions/codemode/execute.ts` @ 4a080252f).
 //! Split from `tool.rs` so the sandbox runtime only loads when a script runs.
 
 use std::collections::HashMap;
@@ -47,7 +47,7 @@ pub struct CodemodeToolOptions {
     pub get_inline_budget: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 }
 
-/// `CodemodeNestedCall` (tool.ts:105-117): the renderer-facing call row.
+/// `CodemodeNestedCall` (tool.ts:88-101): the renderer-facing call row.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedCall {
@@ -124,7 +124,7 @@ fn to_provider(value: Option<&Value>) -> Result<Option<String>, String> {
 }
 
 /// Catalog entry for scripts; `headers` is dropped because models.json
-/// headers can carry credentials (execute.ts:91-96).
+/// headers can carry credentials (execute.ts:146-152).
 fn to_model_info(model: &rpi_ai::types::AnyModel) -> Value {
     let mut info = serde_json::to_value(model).unwrap_or(Value::Null);
     if let Some(object) = info.as_object_mut() {
@@ -144,7 +144,7 @@ fn with_article(word: &str) -> String {
 }
 
 /// A script value in an error message: `null`, `a string`, `an array`, or
-/// its keys (`{ prompt }`) (`describeValue`, execute.ts:107-116 @ abe508e1b).
+/// its keys (`{ prompt }`) (`describeValue`, execute.ts:107-116 @ 4a080252f).
 fn describe_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),
@@ -181,7 +181,7 @@ fn describe_option(value: Option<&Value>) -> String {
 
 const CLASSIFIER_CONTEXT_SHAPE: &str = "{ state: { ... }, images?: [{ type: \"image\", data: <base64>, mimeType }], questions: { <id>: { type: \"choice\", instructions, criteria: { <label>: <meaning> } } | { type: \"score\", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: \"bool\", instructions, criteria: { true: <meaning>, false: <meaning> } } } }";
 
-/// Check a script's classifier context (execute.ts:122-170).
+/// Check a script's classifier context (execute.ts:176-237).
 fn check_classifier_context(
     value: Option<&Value>,
 ) -> Result<rpi_ai::types::ClassifierContext, String> {
@@ -351,7 +351,7 @@ fn check_classifier_context(
     })
 }
 
-/// Check a script's image context (execute.ts:173-196).
+/// Check a script's image context (execute.ts:238-258).
 fn check_images_context(value: Option<&Value>) -> Result<rpi_ai::types::ImagesContext, String> {
     let docs = crate::extensions::codemode::description::codemode_docs_path();
     let fail = |problem: &str| {
@@ -477,7 +477,7 @@ fn spill_output(text: &str) -> Result<std::path::PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
-/// `truncateOutput` (execute.ts:373-396).
+/// `truncateOutput` (execute.ts:449-479).
 fn truncate_output(
     items: Vec<ToolResultContent>,
     max_tokens: usize,
@@ -691,7 +691,7 @@ fn save_images(items: Vec<ToolResultContent>) -> Vec<ToolResultContent> {
 }
 
 /// Values of `load()`: the `codemode-store` entries on the branch, applied
-/// from the root (execute.ts:232-243).
+/// from the root (execute.ts:293-305).
 fn read_codemode_store(entries: &[SessionEntryInfo]) -> Value {
     let mut store: serde_json::Map<String, Value> = serde_json::Map::new();
     for entry in entries {
@@ -715,7 +715,7 @@ fn read_codemode_store(entries: &[SessionEntryInfo]) -> Value {
     Value::Object(store)
 }
 
-/// `isNamespaceName` (execute.ts:539-548).
+/// `isNamespaceName` (execute.ts:658-668).
 fn namespace_suffix(name: &str) -> Option<&str> {
     name.rfind("__")
         .map(|index| &name[index + 2..])
@@ -744,7 +744,7 @@ fn sample_map(tools: &[ToolInfo]) -> HashMap<String, String> {
 }
 
 /// `searchTools()`, `describeTool()`, and `describeNamespace()`
-/// (execute.ts:550-620).
+/// (execute.ts:669-741).
 fn create_discovery_globals(
     tools: &[ToolInfo],
     samples: &HashMap<String, String>,

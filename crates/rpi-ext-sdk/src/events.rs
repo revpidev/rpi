@@ -501,7 +501,7 @@ pub struct AgentEndEvent {
     pub messages: Value,
 }
 
-/// `agent_settled` payload (types.ts:1005-1009 @ abe508e1b, #10607):
+/// `agent_settled` payload (types.ts:1005-1009 @ 4a080252f, #10607):
 /// `aborted` distinguishes a cancelled run (for example Escape) from a
 /// finished one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,7 +519,7 @@ pub struct TurnStartEvent {
 }
 
 /// `turn_end` payload (`message`/`toolResults` as JSON) plus the boundary
-/// state added at dispatch time (V16-03; types.ts:1015-1022 @ abe508e1b).
+/// state added at dispatch time (V16-03; types.ts:1015-1022 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnEndEvent {
@@ -535,7 +535,7 @@ pub struct TurnEndEvent {
     pub context: Value,
 }
 
-/// `agent_before_settle` payload (V16-03; types.ts:980-983 @ abe508e1b).
+/// `agent_before_settle` payload (V16-03; types.ts:980-983 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentBeforeSettleEvent {
@@ -546,7 +546,7 @@ pub struct AgentBeforeSettleEvent {
     pub context: Value,
 }
 
-/// `AgentActivityOutcome` (types.ts:922 @ abe508e1b).
+/// `AgentActivityOutcome` (types.ts:922 @ 4a080252f).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentActivityOutcome {
@@ -555,7 +555,7 @@ pub enum AgentActivityOutcome {
     Error,
 }
 
-/// `BoundaryResult` (types.ts:975-978 @ abe508e1b): what a boundary handler
+/// `BoundaryResult` (types.ts:975-978 @ 4a080252f): what a boundary handler
 /// may return. Entries stay raw JSON until the host applies them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -625,7 +625,7 @@ pub struct ToolExecutionEndEvent {
     pub result: Value,
     pub is_error: bool,
     /// Milliseconds `execute()` took, measured with a monotonic clock;
-    /// absent when the tool did not run (types.ts:1087-1094 @ abe508e1b).
+    /// absent when the tool did not run (types.ts:1087-1094 @ 4a080252f).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

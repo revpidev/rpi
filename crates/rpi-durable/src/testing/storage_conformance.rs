@@ -1,5 +1,5 @@
 //! Shared storage conformance suite, ported from
-//! `src/testing/storage-conformance.ts` @ `abe508e1b` (runner-independent
+//! `src/testing/storage-conformance.ts` @ `4a080252f` (runner-independent
 //! cases).
 //!
 //! The upstream `describe`/`expect`/`it` runner injection maps to a Rust case

@@ -1,5 +1,5 @@
 //! Shared truncation utilities for tool outputs (port of
-//! `packages/durable/src/truncate.ts` @ `abe508e1b`).
+//! `packages/durable/src/truncate.ts` @ `4a080252f`).
 //!
 //! Truncation is based on two independent limits — whichever is hit first
 //! wins: a line limit (default 2000) and a byte limit (default 50KB). It never

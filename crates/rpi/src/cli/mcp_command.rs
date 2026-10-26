@@ -1,6 +1,6 @@
 //! `rpi mcp`: add, remove, and check MCP servers and sign in to them outside
 //! a session (port of `packages/coding-agent/src/extensions/mcp/cli.ts` @
-//! abe508e1b). Agents run it through bash to configure servers, verify an
+//! 4a080252f). Agents run it through bash to configure servers, verify an
 //! `mcp.json` they wrote, and start an OAuth sign-in; the user only approves
 //! access in the browser. Running sessions pick up new credentials on their
 //! next turn.

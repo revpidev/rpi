@@ -1,5 +1,5 @@
 //! Immutable, ordered SQLite schema history (port of
-//! `src/storage/sqlite/migrations.ts` @ `abe508e1b`).
+//! `src/storage/sqlite/migrations.ts` @ `4a080252f`).
 
 use crate::errors::{StorageError, StorageResult};
 use crate::storage::sqlite::database::SqliteDatabase;

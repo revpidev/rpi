@@ -3,7 +3,7 @@
 //! Port of `packages/coding-agent/src/utils/ansi.ts` (`stripAnsi`,
 //! `splitIncompleteAnsiSuffix`) and
 //! `packages/coding-agent/src/utils/shell.ts` (`sanitizeBinaryOutput`)
-//! @ `abe508e1b` (v1.1.0, `27c7b6ff4`).
+//! @ `4a080252f` (v1.4.0, `27c7b6ff4`).
 //!
 //! Intentional differences: none.
 

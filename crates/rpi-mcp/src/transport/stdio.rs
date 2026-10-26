@@ -1,5 +1,5 @@
 //! stdio transport: child-process management with LF-delimited JSON-RPC
-//! framing (port of `packages/mcp/src/transports/stdio.ts` @ abe508e1b).
+//! framing (port of `packages/mcp/src/transports/stdio.ts` @ 4a080252f).
 //!
 //! Shutdown follows the spec: close stdin and let the server exit, then
 //! SIGTERM the process group, then SIGKILL after `close_timeout_ms`. The

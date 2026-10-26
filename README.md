@@ -9,7 +9,7 @@
 [![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%C2%B7macOS%C2%B7Windows-lightgrey)]()
 [![Build](https://img.shields.io/github/actions/workflow/status/revpidev/rpi/build.yml)](https://github.com/revpidev/rpi/actions/workflows/build.yml)
 
-Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding agent](https://github.com/earendil-works/pi). It inherits Pi's architecture, and behavior is continuously verified against a pinned upstream release — the current behavioral baseline is **Pi v1.1.0** (`abe508e1b`, see [`UPSTREAM.md`](./UPSTREAM.md)). Rpi is an independent project and may diverge from Pi as both evolve. It compiles to a single static binary with no Node, Python, or other runtime dependency.
+Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding agent](https://github.com/earendil-works/pi). It inherits Pi's architecture, and behavior is continuously verified against a pinned upstream release — the current behavioral baseline is **Pi v1.4.0** (`4a080252f`, see [`UPSTREAM.md`](./UPSTREAM.md)). Rpi is an independent project and may diverge from Pi as both evolve. It compiles to a single static binary with no Node, Python, or other runtime dependency.
 
 The current release line is **v0.1.7**, the latest stable release (2026-10-19). Install with the script below, or update an existing install with `rpi update` (see [Status](#status)).
 
@@ -203,7 +203,7 @@ The site is deployed from the [rpi-pages](https://github.com/revpidev/rpi-pages)
 | `crates/rpi-test-*` | Faux provider, test environment helpers, and a native-plugin fixture |
 | `fixtures/` | Contract/parity test fixtures (generator scripts + golden data) |
 | `scripts/` | Dev scripts (upstream pin verification, parity harnesses, catalog refresh, release tooling) |
-| `external/` | Pinned upstream submodules: `pi` (v1.1.0), `pi-subagents` (v0.76.1), `rpiv-mono` (v2.13.8), `agent-smart-fetch` (v0.3.17) — see `UPSTREAM.md` |
+| `external/` | Pinned upstream submodules: `pi` (v1.4.0), `pi-subagents` (v0.76.1), `rpiv-mono` (v2.13.8), `agent-smart-fetch` (v0.3.17) — see `UPSTREAM.md` |
 | `vendor/syntect` | Patched syntect fork used by the build-time grammar rewrite (see `vendor/syntect/PATCHES.md`) |
 | `changes/` | Per-version release notes (the changelog single source of truth) |
 | `docs/` | Public protocol/reference docs (`json-rpc.md`, `codemode.md`) |

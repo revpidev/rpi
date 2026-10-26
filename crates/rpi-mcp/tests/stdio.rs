@@ -1,5 +1,5 @@
 //! stdio transport tests, ported from `packages/mcp/test/stdio.test.ts`
-//! @ abe508e1b. The fixture server is `tests/fixtures/mcp-test-server.rs`.
+//! @ 4a080252f. The fixture server is `tests/fixtures/mcp-test-server.rs`.
 
 use std::time::Duration;
 

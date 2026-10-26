@@ -1393,7 +1393,7 @@ async fn finish_authentication(
             auth_path.display()
         ));
         // `void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel)`
-        // (interactive-mode.ts:6120-6126 @ abe508e1b). The login flow no
+        // (interactive-mode.ts:6120-6126 @ 4a080252f). The login flow no
         // longer carries the removed upstream `checkDaxnutsEasterEgg`
         // (ADR-0036 decision 5; upstream deleted it in v1.0.1).
         ui.maybe_warn_about_anthropic_subscription_auth(Some(selected.clone()))

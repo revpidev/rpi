@@ -1,4 +1,4 @@
-//! Write tool (port of `packages/durable/src/tools/write.ts` @ `abe508e1b`).
+//! Write tool (port of `packages/durable/src/tools/write.ts` @ `4a080252f`).
 
 use std::sync::Arc;
 

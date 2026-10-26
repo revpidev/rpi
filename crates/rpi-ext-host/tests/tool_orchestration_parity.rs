@@ -100,7 +100,7 @@ fn tool_execution_events_wire_shape_matches() {
 }
 
 /// V17-06 FR-C: `agent_settled.aborted` payload parity
-/// (types.ts:1005-1009 @ abe508e1b, #10607).
+/// (types.ts:1005-1009 @ 4a080252f, #10607).
 #[test]
 fn agent_settled_wire_shape_matches() {
     let host_event = host::AgentSettledEvent { aborted: true };

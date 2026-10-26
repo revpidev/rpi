@@ -1,5 +1,5 @@
 //! The transport interface and shared listener bookkeeping (port of
-//! `packages/mcp/src/transports/transport.ts` @ abe508e1b).
+//! `packages/mcp/src/transports/transport.ts` @ 4a080252f).
 
 pub mod in_memory;
 pub mod stdio;

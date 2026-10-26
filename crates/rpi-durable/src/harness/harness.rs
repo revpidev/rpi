@@ -1,6 +1,6 @@
 //! Harness composition: conversations, the open/close lifecycle, and the
 //! conversation handles (port of `packages/durable/src/harness/harness.ts`
-//! @ `abe508e1b`).
+//! @ `4a080252f`).
 //!
 //! [`HarnessImpl`] owns a Session kernel and composes the registry, submissions,
 //! task graph, and (injected) scheduler. Upstream `Harness extends Session`; the

@@ -1,6 +1,6 @@
 //! Delta operation subset: `Op`, path safety, immutable application, and a
 //! structural diff (port of `chord/src/delta/draft.ts` and the `Op`/`apply`
-//! surfaces of `chord/src/delta/index.ts` @ `abe508e1b`).
+//! surfaces of `chord/src/delta/index.ts` @ `4a080252f`).
 //!
 //! The full tracker family (2205 lines of `tracker.ts` + `diff.ts`) stays out
 //! of scope (FR-B R3: "完整 delta 算法族按消费收编"). Ops are serialized in the

@@ -84,7 +84,7 @@ impl AssistantMessageEventStream {
         }
     }
 
-    /// `#time` (event-stream.ts:120-123 @ abe508e1b): set `durationMs` with a
+    /// `#time` (event-stream.ts:120-123 @ 4a080252f): set `durationMs` with a
     /// monotonic clock unless the stream already completed, the message
     /// already carries a duration (a forwarding stream keeps the inner
     /// measurement), or its `timestamp` predates the stream (a fetched

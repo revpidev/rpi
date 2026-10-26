@@ -1,5 +1,5 @@
 //! Session kernel of the durable runtime (port of the session domain of
-//! `packages/durable/src/session/*` @ `abe508e1b`: `session.ts`, `transaction.ts`,
+//! `packages/durable/src/session/*` @ `4a080252f`: `session.ts`, `transaction.ts`,
 //! `observation.ts`, `forks.ts`).
 //!
 //! The kernel owns one **mutation line**: every commit callback, storage

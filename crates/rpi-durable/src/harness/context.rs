@@ -1,5 +1,5 @@
 //! Committed transcript derivation for model context (port of
-//! `packages/durable/src/harness/context.ts` @ `abe508e1b`).
+//! `packages/durable/src/harness/context.ts` @ `4a080252f`).
 //!
 //! The active context is fixed by a *head marker*: the newest visible entry that
 //! carries a `head`, or the transcript start. Within that range, per target the

@@ -138,7 +138,7 @@ const APP_TITLE: &str = "rpi";
 /// the event loop is always awake; here the driver polls with this cap).
 const DRIVER_PUMP_CAP: Duration = Duration::from_millis(50);
 
-/// `TERMINAL_QUERY_TIMEOUT_MS` (theme-controller.ts:25 @ abe508e1b): how long
+/// `TERMINAL_QUERY_TIMEOUT_MS` (theme-controller.ts:25 @ 4a080252f): how long
 /// the system theme stays grayscale before falling back to palette indices.
 const TERMINAL_QUERY_TIMEOUT_MS: u64 = 100;
 /// Tokio backstop for the first color result; the Tui's own deadline is the
@@ -398,7 +398,7 @@ pub(crate) enum UiCommand {
         result: serde_json::Value,
         is_error: bool,
         /// `durationMs` from the event (agent-loop.ts `tool_execution_end`
-        /// @ abe508e1b): rides the event, not the result payload.
+        /// @ 4a080252f): rides the event, not the result payload.
         duration_ms: Option<u64>,
     },
     QueueUpdate {
@@ -1628,10 +1628,10 @@ pub(crate) struct InteractiveUi {
     last_sigint_time: AtomicU64,
     last_escape_time: AtomicU64,
     /// `anthropicSubscriptionWarningShown` (interactive-mode.ts:328 @
-    /// abe508e1b): the Anthropic extra-usage warning fires at most once per
+    /// 4a080252f): the Anthropic extra-usage warning fires at most once per
     /// session, no matter which call site reaches it first.
     anthropic_subscription_warning_shown: AtomicBool,
-    /// `startupNoticesShown` (interactive-mode.ts:494 @ abe508e1b):
+    /// `startupNoticesShown` (interactive-mode.ts:494 @ 4a080252f):
     /// `show_startup_notices_if_needed` renders the changelog block only
     /// once per mode instance.
     startup_notices_shown: AtomicBool,
@@ -1846,7 +1846,7 @@ pub(crate) struct ShareState {
 }
 
 /// `ANTHROPIC_SUBSCRIPTION_AUTH_WARNING` (interactive-mode.ts:321-322 @
-/// abe508e1b), verbatim.
+/// 4a080252f), verbatim.
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str = "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.";
 
 /// `isAnthropicSubscriptionAuthKey` (interactive-mode.ts:324-326): the key
@@ -1856,7 +1856,7 @@ fn is_anthropic_subscription_auth_key(api_key: Option<&str>) -> bool {
 }
 
 /// The `showStartupNoticesIfNeeded` body (interactive-mode.ts:856-870 @
-/// abe508e1b): the bordered condensed line or the full "What's New" block.
+/// 4a080252f): the bordered condensed line or the full "What's New" block.
 /// A free function so the golden-frame snapshot tests can render the exact
 /// block without a full mode.
 pub(crate) fn startup_notice_components(
@@ -1915,7 +1915,7 @@ impl InteractiveUi {
     }
 
     /// `maybeWarnAboutAnthropicSubscriptionAuth` (interactive-mode.ts:
-    /// 5261-5289 @ abe508e1b): warn once per session when the selected
+    /// 5261-5289 @ 4a080252f): warn once per session when the selected
     /// anthropic model authenticates through a Claude subscription (OAuth or
     /// an `sk-ant-oat…` key). Auth lookup failures are swallowed
     /// (warning-only); `warnings.anthropicExtraUsage === false` disables it.
@@ -2600,7 +2600,7 @@ impl InteractiveUi {
                 if let Some(component) = pending_tools.remove(&tool_call_id) {
                     // `component.updateResult({ ...event.result, isError:
                     // event.isError, durationMs: event.durationMs })`
-                    // (interactive-mode.ts:3646 @ abe508e1b): `durationMs`
+                    // (interactive-mode.ts:3646 @ 4a080252f): `durationMs`
                     // is a sibling of the tool result on the event.
                     let mut result = result;
                     if let Some(duration_ms) = duration_ms
@@ -3598,7 +3598,7 @@ impl InteractiveUi {
     }
 
     /// `showStartupNoticesIfNeeded` (interactive-mode.ts:843-871 @
-    /// abe508e1b): render the new-entry changelog block once per mode
+    /// 4a080252f): render the new-entry changelog block once per mode
     /// instance. Resumed sessions never have `changelog_markdown`
     /// (`getChangelogForDisplay` skips sessions with messages), so the
     /// early return keeps the restore path unchanged.
@@ -3928,7 +3928,7 @@ impl InteractiveUi {
     }
 
     /// `maybeShowCacheMissNotice` (interactive-mode.ts:4185-4191 @
-    /// abe508e1b): behind the `showCacheMissNotices` gate, detect a cache
+    /// 4a080252f): behind the `showCacheMissNotices` gate, detect a cache
     /// miss on the just-completed assistant message and render the notice.
     /// rpi's session listener may have already persisted the message before
     /// the UI drain; the detector skips the message itself either way.
@@ -3948,7 +3948,7 @@ impl InteractiveUi {
         }
     }
 
-    /// `addCacheMissNotice` (interactive-mode.ts:4193-4206 @ abe508e1b):
+    /// `addCacheMissNotice` (interactive-mode.ts:4193-4206 @ 4a080252f):
     /// display thresholds (20k tokens or $0.10), label priority
     /// model-switch > idle > generic, `{tokens} tokens re-billed (~$x.xx)`.
     /// The notice is derived state and is never persisted.
@@ -5592,7 +5592,7 @@ pub(crate) fn scope_group_lines(
     lines
 }
 
-/// `isExtensionCommand` (interactive-mode.ts:4771-4779 @ abe508e1b).
+/// `isExtensionCommand` (interactive-mode.ts:4771-4779 @ 4a080252f).
 fn is_extension_command(runner: &Arc<dyn ExtensionRunner>, text: &str) -> bool {
     if !text.starts_with('/') {
         return false;
@@ -6384,7 +6384,7 @@ impl InteractiveMode {
         }
 
         // `void this.maybeWarnAboutAnthropicSubscriptionAuth()`
-        // (interactive-mode.ts:1228 @ abe508e1b): fire-and-forget before the
+        // (interactive-mode.ts:1228 @ 4a080252f): fire-and-forget before the
         // initial-message processing (rpi has no crash-notification face to
         // sit after; the startup sequence position is the correspondence).
         {
@@ -6816,7 +6816,7 @@ impl InteractiveMode {
         }
     }
 
-    /// `flushCompactionQueue(options)` (interactive-mode.ts:4781-4858 @ abe508e1b) — the
+    /// `flushCompactionQueue(options)` (interactive-mode.ts:4781-4858 @ 4a080252f) — the
     /// priority chain: `will_retry` re-queues everything into the retry
     /// turn; otherwise extension commands run immediately, the first
     /// non-extension message becomes the prompt (with its mode), and the

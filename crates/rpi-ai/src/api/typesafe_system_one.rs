@@ -1,5 +1,5 @@
 //! TypeSafe's native System One protocol (port of
-//! `packages/ai/src/api/typesafe-system-one.ts` @ abe508e1b). OpenRouter
+//! `packages/ai/src/api/typesafe-system-one.ts` @ 4a080252f). OpenRouter
 //! serves the same protocol, so both providers use this API with different
 //! base URLs.
 
