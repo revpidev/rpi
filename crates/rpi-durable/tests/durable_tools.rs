@@ -575,6 +575,7 @@ fn tool_parameters_validate_and_are_described() {
         arguments: arguments.as_object().cloned().unwrap_or_default(),
         thought_signature: None,
         namespace: None,
+        arguments_error: None,
     };
     assert!(
         rpi_ai::utils::validation::validate_tool_arguments(&read.tool, &call(json!({}))).is_err(),

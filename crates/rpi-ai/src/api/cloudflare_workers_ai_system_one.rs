@@ -13,13 +13,25 @@ use url::Url;
 
 use crate::api::classifier_shared::is_record;
 use crate::api::system_one_shared::{
-    SystemOneTransport, SystemOneWireRequest, classify_system_one,
+    ResolvedSystemOneCompat, SystemOneTransport, SystemOneWireRequest, classify_system_one,
 };
 use crate::types::{
     ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ProviderClassifier,
+    SystemOneImageInput,
 };
 
 pub const CLOUDFLARE_WORKERS_AI_SYSTEM_ONE_API: &str = "cloudflare-workers-ai-system-one";
+
+fn detect_compat(model: &ClassifierModel) -> ResolvedSystemOneCompat {
+    ResolvedSystemOneCompat {
+        image_input: if model.id.starts_with("@cf/cloudflare/clef") {
+            SystemOneImageInput::Images
+        } else {
+            SystemOneImageInput::Assets
+        },
+        send_image_opt_in_header: false,
+    }
+}
 
 const LABEL: &str = "Cloudflare Workers AI";
 
@@ -51,9 +63,24 @@ fn url(model: &ClassifierModel) -> Result<Url, String> {
 }
 
 fn payload(model: &ClassifierModel, request: SystemOneWireRequest) -> Value {
+    let mut input = serde_json::Map::new();
+    input.insert("state".to_owned(), request.state);
+    input.insert("questions".to_owned(), Value::Object(request.questions));
+    if let Some(assets) = request.assets {
+        input.insert(
+            "assets".to_owned(),
+            Value::Object(assets.into_iter().collect()),
+        );
+    }
+    if let Some(images) = request.images {
+        input.insert(
+            "images".to_owned(),
+            Value::Array(images.into_iter().map(Value::String).collect()),
+        );
+    }
     json!({
         "model": model.id,
-        "input": { "state": request.state, "questions": request.questions },
+        "input": input,
     })
 }
 
@@ -90,6 +117,7 @@ fn output(body: &Value) -> Result<Value, String> {
 static TRANSPORT: SystemOneTransport = SystemOneTransport {
     api: CLOUDFLARE_WORKERS_AI_SYSTEM_ONE_API,
     label: LABEL,
+    detect_compat,
     url,
     payload,
     output,

@@ -392,6 +392,12 @@ fn normalize_optional_nulls(value: &mut Value, schema: &Value) {
 }
 
 pub fn validate_tool_arguments(tool: &Tool, tool_call: &ToolCall) -> Result<Value, String> {
+    if let Some(error) = &tool_call.arguments_error {
+        return Err(format!(
+            "Invalid arguments for tool \"{}\": {error}",
+            tool_call.name
+        ));
+    }
     let mut args = Value::Object(tool_call.arguments.clone());
     normalize_optional_nulls(&mut args, &tool.parameters);
     let validator = get_validator(&tool.parameters)?;
@@ -454,7 +460,26 @@ mod tests {
             arguments: arguments.as_object().cloned().unwrap_or_default(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         }
+    }
+
+    #[test]
+    fn malformed_final_arguments_fail_before_schema_validation() {
+        let error = validate_tool_arguments(
+            &tool(json!({"type": "object"})),
+            &ToolCall {
+                arguments_error: Some(
+                    "Unexpected token\n\nReceived arguments:\n{\"x\":".to_owned(),
+                ),
+                ..call(json!({}))
+            },
+        )
+        .expect_err("malformed arguments must not execute");
+        assert_eq!(
+            error,
+            "Invalid arguments for tool \"bash\": Unexpected token\n\nReceived arguments:\n{\"x\":"
+        );
     }
 
     /// "treats null as omission for optional non-nullable properties"

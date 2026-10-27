@@ -63,6 +63,7 @@ fn tool_call(name: &str) -> AgentToolCall {
         arguments: serde_json::Map::new(),
         thought_signature: None,
         namespace: None,
+        arguments_error: None,
     }
 }
 
@@ -313,6 +314,7 @@ async fn loop_writes_nested_calls_and_combined_usage_on_the_message() {
                 arguments: serde_json::Map::new(),
                 thought_signature: None,
                 namespace: None,
+                arguments_error: None,
             })],
             StopReason::ToolUse,
         ),

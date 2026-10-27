@@ -143,6 +143,7 @@ fn decisions_model(base_url: &str) -> ClassifierModel {
         },
         context_window: 922_000,
         headers: None,
+        compat: None,
     }
 }
 

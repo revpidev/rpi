@@ -29,11 +29,9 @@
 //!   `Could not parse Mistral SSE chunk: {error}; data={data}` where upstream
 //!   would surface the raw `JSON.parse` SyntaxError text; the structural
 //!   check matches upstream's `Invalid Mistral streaming event` verbatim.
-//! - Request timeouts map reqwest's timeout to
-//!   `The operation was aborted due to timeout` — the Node `TimeoutError`
-//!   DOMException text upstream's `formatMistralError` surfaces when the
-//!   `AbortSignal.timeout` fires. The 60s default matches
-//!   `options?.timeoutMs ?? 60_000`.
+//! - The response-header timeout is `Mistral response headers timed out after
+//!   {timeoutMs}ms`. Active streams may outlive that budget; body stalls use
+//!   the existing idle timeout. The default is 60s.
 //! - `retry_provider_request` is an rpi-wide opt-in wrapper (upstream's
 //!   native transport never retries; callers set
 //!   `StreamOptions::max_retries` to enable it).
@@ -75,8 +73,8 @@ use crate::utils::custom_fetch::{SendFailure, send_provider_request};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
-    rpi_user_agent_headers,
+    headers_to_record, identity_headers, merge_headers_chain, model_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
@@ -270,7 +268,7 @@ fn build_request_headers(
     .into();
 
     let mut headers = merge_headers_chain(&[
-        rpi_user_agent_headers(),
+        identity_headers(model, options.stream.identity.as_ref()),
         Some(base),
         model_headers(model),
         options.stream.headers.clone(),
@@ -1129,6 +1127,7 @@ impl<'a> StreamProcessor<'a> {
                         arguments: Map::new(),
                         thought_signature: None,
                         namespace: None,
+                        arguments_error: None,
                     }));
                 let content_index = self.output.content.len() - 1;
                 self.tool_blocks_by_key.insert(key.clone(), content_index);
@@ -1167,11 +1166,12 @@ impl<'a> StreamProcessor<'a> {
             let Some(partial) = self.partial_args.remove(&index) else {
                 continue;
             };
-            let arguments = parse_streaming_json(Some(&partial));
+            let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(&partial));
             let AssistantContent::ToolCall(call) = &mut self.output.content[index] else {
                 continue;
             };
-            call.arguments = arguments;
+            call.arguments = parsed.arguments;
+            call.arguments_error = parsed.arguments_error;
             events.push(StreamEvent::ToolCallEnd {
                 content_index: index,
                 tool_call: call.clone(),
@@ -1255,12 +1255,8 @@ async fn run(
     let header_map = provider_headers_to_header_map(&headers)?;
     let mut client_builder =
         crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
-    // Upstream: `AbortSignal.timeout(options?.timeoutMs ?? 60_000)` — a
-    // total deadline that aborts even actively streaming bodies. rpi keeps
-    // the same budget but applies idle-timeout semantics instead (connect +
-    // headers wait + inter-chunk idle; see api::stream_timeouts), so long
-    // inferences that keep streaming are not killed by their total
-    // duration — an intentional improvement over the upstream quirk.
+    // The budget covers response headers only. Active bodies can outlive it;
+    // a separate inter-chunk idle budget still handles stalled streams.
     let timeout_ms = options
         .stream
         .timeout_ms
@@ -1277,16 +1273,40 @@ async fn run(
             let signal = options.stream.signal.clone();
             let fetch = options.stream.fetch.clone();
             async move {
-                // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
-                // keeps the reqwest default path unchanged.
-                let result = send_provider_request(
+                let send = send_provider_request(
                     request,
                     fetch.as_ref(),
                     signal.as_ref(),
                     Some(timeout_ms),
-                )
-                .await;
+                );
+                let result = if fetch.is_some() {
+                    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), send)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            return Err(ProviderErrorInfo {
+                                status: None,
+                                headers: None,
+                                message: format!(
+                                    "Mistral response headers timed out after {timeout_ms}ms"
+                                ),
+                            });
+                        }
+                    }
+                } else {
+                    send.await
+                };
                 match result {
+                    Err(crate::utils::custom_fetch::SendFailure::HeadersTimedOut(_)) => {
+                        Err(ProviderErrorInfo {
+                            status: None,
+                            headers: None,
+                            message: format!(
+                                "Mistral response headers timed out after {timeout_ms}ms"
+                            ),
+                        })
+                    }
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
@@ -1311,13 +1331,11 @@ async fn run(
                         }
                     }
                     Err(error) => Err(match error {
-                        // The timeout mapping only exists on the reqwest
-                        // default path; a custom fetch owns its own timing.
                         SendFailure::Reqwest(error) => ProviderErrorInfo {
                             status: error.status().map(|status| status.as_u16()),
                             headers: None,
                             message: if error.is_timeout() {
-                                MISTRAL_TIMEOUT_MESSAGE.to_owned()
+                                format!("Mistral response headers timed out after {timeout_ms}ms")
                             } else {
                                 format_mistral_error(
                                     error.status().map(|status| status.as_u16()),
@@ -2246,6 +2264,7 @@ mod tests {
                     arguments: serde_json::from_value(json!({"cmd": "ls"})).expect("map"),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 }),
             ],
             api: ApiKind::from(ApiKind::MISTRAL_CONVERSATIONS),

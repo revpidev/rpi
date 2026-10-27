@@ -200,12 +200,16 @@ impl CredentialStore for RuntimeCredentials {
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderConfigModel {
     pub id: String,
+    #[serde(rename = "type")]
+    pub model_type: rpi_ai::types::ModelType,
     pub name: Option<String>,
     pub api: Option<String>,
     pub base_url: Option<String>,
     pub reasoning: bool,
     pub thinking_level_map: Option<rpi_ai::types::ThinkingLevelMap>,
     pub input: Vec<rpi_ai::types::InputModality>,
+    pub input_limits: Option<rpi_ai::types::ModelInputLimits>,
+    pub output: Option<Vec<rpi_ai::types::InputModality>>,
     pub cost: Option<rpi_ai::types::ModelCost>,
     pub context_window: u32,
     pub max_tokens: u32,
@@ -373,6 +377,7 @@ pub struct CreateModelRuntimeOptions {
     /// Timeout for the create-time network model refresh (ms). Default:
     /// 15_000 (model-runtime.ts:67-68).
     pub model_refresh_timeout_ms: Option<u64>,
+    pub identity: Option<rpi_ai::utils::identity::ClientIdentity>,
 }
 
 /// `ModelRuntimeAuthOverrides` (model-runtime.ts:72-75 + 84-89 @ 4181f66).
@@ -823,6 +828,10 @@ impl Provider for ModelOverridingProvider {
         self.base_url.as_deref().or_else(|| self.base.base_url())
     }
 
+    fn native_base_url(&self) -> Option<&str> {
+        self.base.native_base_url()
+    }
+
     fn headers(&self) -> Option<&ProviderHeaders> {
         self.base.headers()
     }
@@ -835,13 +844,17 @@ impl Provider for ModelOverridingProvider {
         self.composed.get_models()
     }
 
-    /// `filterModels` forwards to the base (provider-composer.ts:493-494).
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        self.composed.get_all_models()
+    }
+
+    /// `filterModels` forwards to the base (provider-composer.ts:641-643).
     fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
         self.base.filter_models(models, credential)
     }
 
     /// `filterAllModels` forwards to the base when it defines one
-    /// (provider-composer.ts:639-641).
+    /// (provider-composer.ts:644-646).
     fn filter_all_models(
         &self,
         models: Vec<AnyModel>,
@@ -851,7 +864,7 @@ impl Provider for ModelOverridingProvider {
     }
 
     /// Overlays keep the base's dynamic catalog refresh
-    /// (provider-composer.ts:475-478).
+    /// (provider-composer.ts:618-640).
     fn refresh_models(
         &self,
         context: RefreshModelsContext,
@@ -890,6 +903,32 @@ impl Provider for ModelOverridingProvider {
                 model.api.as_str()
             )),
         }
+    }
+
+    fn generate_images(
+        &self,
+        model: &rpi_ai::types::ImageModel,
+        context: &rpi_ai::types::ImagesContext,
+        options: Option<&rpi_ai::types::ImagesOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::AssistantImages>> {
+        self.base.generate_images(model, context, options)
+    }
+
+    fn classify(
+        &self,
+        model: &rpi_ai::types::ClassifierModel,
+        context: &rpi_ai::types::ClassifierContext,
+        options: Option<&rpi_ai::types::ClassifierOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::ClassifierResult>> {
+        self.base.classify(model, context, options)
+    }
+
+    fn image_generator(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderImageGenerator>> {
+        self.base.image_generator(api)
+    }
+
+    fn classifier(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderClassifier>> {
+        self.base.classifier(api)
     }
 }
 
@@ -927,6 +966,10 @@ impl Provider for RefreshDelegatingProvider {
         self.inner.base_url()
     }
 
+    fn native_base_url(&self) -> Option<&str> {
+        self.base.native_base_url()
+    }
+
     fn headers(&self) -> Option<&ProviderHeaders> {
         self.inner.headers()
     }
@@ -939,14 +982,18 @@ impl Provider for RefreshDelegatingProvider {
         self.composed.get_models()
     }
 
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        self.composed.get_all_models()
+    }
+
     /// `filterModels` comes from the native base provider only
-    /// (provider-composer.ts:492-494).
+    /// (provider-composer.ts:641-643).
     fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
         self.base.filter_models(models, credential)
     }
 
     /// `filterAllModels` comes from the native base provider only
-    /// (provider-composer.ts:639-641).
+    /// (provider-composer.ts:644-646).
     fn filter_all_models(
         &self,
         models: Vec<AnyModel>,
@@ -968,7 +1015,7 @@ impl Provider for RefreshDelegatingProvider {
         context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
-        // `streamWith` (provider-composer.ts:469-494): the base serves every
+        // `streamWith` (provider-composer.ts:588-608): the base serves every
         // model whose api it declares; otherwise the api provider for the
         // MODEL's api handles it (not the entry's declared api default).
         if self.base_supports(model) {
@@ -996,6 +1043,32 @@ impl Provider for RefreshDelegatingProvider {
                 model.api.as_str()
             )),
         }
+    }
+
+    fn generate_images(
+        &self,
+        model: &rpi_ai::types::ImageModel,
+        context: &rpi_ai::types::ImagesContext,
+        options: Option<&rpi_ai::types::ImagesOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::AssistantImages>> {
+        self.base.generate_images(model, context, options)
+    }
+
+    fn classify(
+        &self,
+        model: &rpi_ai::types::ClassifierModel,
+        context: &rpi_ai::types::ClassifierContext,
+        options: Option<&rpi_ai::types::ClassifierOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::ClassifierResult>> {
+        self.base.classify(model, context, options)
+    }
+
+    fn image_generator(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderImageGenerator>> {
+        self.base.image_generator(api)
+    }
+
+    fn classifier(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderClassifier>> {
+        self.base.classifier(api)
     }
 }
 
@@ -1194,6 +1267,10 @@ impl Provider for VirtualModelProvider {
 
     fn base_url(&self) -> Option<&str> {
         self.base.as_ref().and_then(|base| base.base_url())
+    }
+
+    fn native_base_url(&self) -> Option<&str> {
+        self.base.as_ref().and_then(|base| base.native_base_url())
     }
 
     fn headers(&self) -> Option<&ProviderHeaders> {
@@ -1574,42 +1651,133 @@ fn extension_overlay_changes(extension: Option<&ProviderConfigInput>) -> bool {
     })
 }
 
-/// `findModelDefaults` (provider-composer.ts:171-179): the model a custom
-/// definition inherits an omitted `api`/`baseUrl` from — same id first, then
-/// the requested api, then openai-completions, then the first model.
+/// `findModelDefaults` (provider-composer.ts:253-261): chat-only defaults for
+/// a models.json definition — same id, requested api, OpenAI completions,
+/// then the first chat model.
 fn find_model_defaults<'a>(
-    models: &'a [Model],
+    models: &'a [AnyModel],
     model_id: &str,
     api: Option<&str>,
 ) -> Option<&'a Model> {
-    if let Some(model) = models.iter().find(|model| model.id == model_id) {
+    if let Some(model) = models
+        .iter()
+        .filter_map(AnyModel::as_chat)
+        .find(|model| model.id == model_id)
+    {
         return Some(model);
     }
     if let Some(api) = api.filter(|api| !api.is_empty()) {
         let kind = ApiKind::from(api);
-        if let Some(model) = models.iter().find(|model| model.api == kind) {
+        if let Some(model) = models
+            .iter()
+            .filter_map(AnyModel::as_chat)
+            .find(|model| model.api == kind)
+        {
             return Some(model);
         }
     }
     models
         .iter()
+        .filter_map(AnyModel::as_chat)
         .find(|model| model.api == ApiKind::from(ApiKind::OPENAI_COMPLETIONS))
-        .or_else(|| models.first())
+        .or_else(|| models.iter().find_map(AnyModel::as_chat))
 }
 
-/// `applyModelsJson` (provider-composer.ts:184-216): base-model
-/// `baseUrl`/`compat` mapping plus the `config.models` upsert (replace by
-/// id, append otherwise; an omitted `api`/`baseUrl` inherits through
-/// [`find_model_defaults`]). The structural validations throw upstream;
-/// they return `Err` here.
+/// `findExtensionModelDefaults` (provider-composer.ts:263-275): extension
+/// defaults never cross the chat/image/classifier operation boundary.
+fn find_extension_model_defaults<'a>(
+    models: &'a [AnyModel],
+    definition: &ProviderConfigModel,
+) -> Option<&'a AnyModel> {
+    let matches = |model: &&AnyModel| model.model_type() == definition.model_type;
+    if let Some(model) = models
+        .iter()
+        .filter(matches)
+        .find(|model| model.id() == definition.id)
+    {
+        return Some(model);
+    }
+    if let Some(api) = definition.api.as_deref().filter(|api| !api.is_empty()) {
+        let kind = ApiKind::from(api);
+        if let Some(model) = models
+            .iter()
+            .filter(matches)
+            .find(|model| *model.api() == kind)
+        {
+            return Some(model);
+        }
+    }
+    if definition.model_type == rpi_ai::types::ModelType::Chat
+        && let Some(model) = models
+            .iter()
+            .filter(matches)
+            .find(|model| *model.api() == ApiKind::from(ApiKind::OPENAI_COMPLETIONS))
+    {
+        return Some(model);
+    }
+    models.iter().find(matches)
+}
+
+fn any_base_url(model: &AnyModel) -> &str {
+    match model {
+        AnyModel::Chat(model) => &model.base_url,
+        AnyModel::Image(model) => &model.base_url,
+        AnyModel::Classifier(model) => &model.base_url,
+    }
+}
+
+fn set_any_base_url(model: &mut AnyModel, base_url: String) {
+    match model {
+        AnyModel::Chat(model) => model.base_url = base_url,
+        AnyModel::Image(model) => model.base_url = base_url,
+        AnyModel::Classifier(model) => model.base_url = base_url,
+    }
+}
+
+/// Kimi Code's Chat Completions migration requires an explicit `/v1` path
+/// segment. Never append or rewrite the configured URL (a3f265b1c / R2.2).
+fn validate_kimi_coding_base_url(
+    provider_id: &str,
+    model_id: &str,
+    config_key: &str,
+    base_url: &str,
+) -> Result<(), String> {
+    if provider_id != "kimi-coding" {
+        return Ok(());
+    }
+    let valid = url::Url::parse(base_url).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url
+                .path_segments()
+                .is_some_and(|mut segments| segments.any(|segment| segment == "v1"))
+    });
+    if valid {
+        return Ok(());
+    }
+    Err(format!(
+        "Provider {provider_id}, model {model_id}: invalid baseUrl {base_url:?} at models.json {config_key}. Kimi Code now uses OpenAI Chat Completions and requires a URL path containing \"/v1\". Migration example: set \"baseUrl\": \"https://api.kimi.com/coding/v1\" (or your proxy's \"/v1\" path). No suffix is added automatically."
+    ))
+}
+
+/// `applyModelsJson` (provider-composer.ts:302-344): provider config maps over
+/// every model type. Chat and classifier compat inherit through the same
+/// merge function; model definitions and modelOverrides remain chat-only.
 fn apply_models_json(
     provider_id: &str,
-    base_models: Vec<Model>,
+    base_models: Vec<AnyModel>,
     config: Option<&ModelsJsonProvider>,
-) -> Result<Vec<Model>, String> {
+) -> Result<Vec<AnyModel>, String> {
     let Some(config) = config else {
         return Ok(base_models);
     };
+    if let Some(base_url) = &config.base_url {
+        validate_kimi_coding_base_url(
+            provider_id,
+            "<provider-wide>",
+            "providers.kimi-coding.baseUrl",
+            base_url,
+        )?;
+    }
     if config.oauth.is_some() && config.base_url.is_none() {
         return Err(format!(
             "Provider {provider_id}: \"baseUrl\" is required when \"oauth\" is set."
@@ -1637,23 +1805,39 @@ fn apply_models_json(
         ));
     }
     // `config.oauth === "radius"` keeps every base model's own gateway URL
-    // (provider-composer.ts:210).
+    // (provider-composer.ts:328).
     let radius_oauth = config.oauth.as_deref() == Some("radius");
-    let mut models: Vec<Model> = base_models
+    let mut models: Vec<AnyModel> = base_models
         .into_iter()
         .map(|mut model| {
             if !radius_oauth
                 && let Some(base_url) = config.base_url.as_ref().filter(|url| !url.is_empty())
             {
-                model.base_url = base_url.clone();
+                set_any_base_url(&mut model, base_url.clone());
             }
             if let Some(compat) = config.compat.as_ref() {
-                model.compat = Some(merge_compat(model.compat.as_ref(), compat));
+                match &mut model {
+                    AnyModel::Chat(model) => {
+                        model.compat = Some(merge_compat(model.compat.as_ref(), compat));
+                    }
+                    AnyModel::Classifier(model) => {
+                        model.compat = Some(merge_compat(model.compat.as_ref(), compat));
+                    }
+                    AnyModel::Image(_) => {}
+                }
             }
             model
         })
         .collect();
-    for definition in config.models.iter().flatten() {
+    for (index, definition) in config.models.iter().flatten().enumerate() {
+        if let Some(base_url) = &definition.base_url {
+            validate_kimi_coding_base_url(
+                provider_id,
+                &definition.id,
+                &format!("providers.kimi-coding.models.{index}.baseUrl"),
+                base_url,
+            )?;
+        }
         let api = definition.api.clone().or_else(|| config.api.clone());
         let defaults = find_model_defaults(&models, &definition.id, api.as_deref());
         let model = json_model_to_model(
@@ -1664,30 +1848,40 @@ fn apply_models_json(
             definition.clone(),
             defaults,
         )?;
-        match models.iter().position(|model| model.id == definition.id) {
-            Some(index) => models[index] = model,
-            None => models.push(model),
+        match models.iter().position(|model| {
+            model.model_type() == rpi_ai::types::ModelType::Chat && model.id() == definition.id
+        }) {
+            Some(index) => models[index] = AnyModel::Chat(model),
+            None => models.push(AnyModel::Chat(model)),
         }
     }
     Ok(models)
 }
 
-/// `applyExtension` (provider-composer.ts:218-243): a provided model list
+/// `applyExtension` (provider-composer.ts:346-356): a provided model list
 /// replaces the set; a bare `baseUrl` rewrites every model's baseUrl.
 fn apply_extension_models(
     provider_id: &str,
-    models: Vec<Model>,
+    models: Vec<AnyModel>,
     extension: Option<&ProviderConfigInput>,
-) -> Result<Vec<Model>, String> {
+) -> Result<Vec<AnyModel>, String> {
     let Some(extension) = extension else {
         return Ok(models);
     };
+    if let Some(base_url) = extension.base_url.as_ref().filter(|url| !url.is_empty()) {
+        validate_kimi_coding_base_url(
+            provider_id,
+            "<provider-wide>",
+            "extensions.kimi-coding.baseUrl",
+            base_url,
+        )?;
+    }
     let Some(definitions) = extension.models.as_ref() else {
         if let Some(base_url) = extension.base_url.as_ref().filter(|url| !url.is_empty()) {
             return Ok(models
                 .into_iter()
                 .map(|mut model| {
-                    model.base_url = base_url.clone();
+                    set_any_base_url(&mut model, base_url.clone());
                     model
                 })
                 .collect());
@@ -1696,10 +1890,18 @@ fn apply_extension_models(
     };
     definitions
         .iter()
-        .map(|definition| {
-            let api = definition.api.clone().or_else(|| extension.api.clone());
-            let defaults = find_model_defaults(&models, &definition.id, api.as_deref());
-            config_model_to_model(
+        .enumerate()
+        .map(|(index, definition)| {
+            if let Some(base_url) = &definition.base_url {
+                validate_kimi_coding_base_url(
+                    provider_id,
+                    &definition.id,
+                    &format!("extensions.kimi-coding.models.{index}.baseUrl"),
+                    base_url,
+                )?;
+            }
+            let defaults = find_extension_model_defaults(&models, definition);
+            config_model_to_any_model(
                 provider_id,
                 &extension.api,
                 extension.base_url.as_deref(),
@@ -1710,34 +1912,37 @@ fn apply_extension_models(
         .collect()
 }
 
-/// `modelOverrides` are the topmost user-config layer
-/// (provider-composer.ts:452-459).
-fn apply_model_overrides(models: Vec<Model>, config: Option<&ModelsJsonProvider>) -> Vec<Model> {
+/// `modelOverrides` are the topmost user-config layer and apply only to chat
+/// models (provider-composer.ts:576-579).
+fn apply_model_overrides(
+    models: Vec<AnyModel>,
+    config: Option<&ModelsJsonProvider>,
+) -> Vec<AnyModel> {
     let Some(overrides) = config.and_then(|config| config.model_overrides.as_ref()) else {
         return models;
     };
     models
         .into_iter()
-        .map(|model| match overrides.get(&model.id) {
-            Some(override_) => apply_model_override(model, override_),
-            None => model,
+        .map(|model| match model {
+            AnyModel::Chat(model) => match overrides.get(&model.id) {
+                Some(override_) => AnyModel::Chat(apply_model_override(model, override_)),
+                None => AnyModel::Chat(model),
+            },
+            other => other,
         })
         .collect()
 }
 
-/// The `getModels` closure composition (provider-composer.ts:444-461):
+/// The `getAllModels` closure composition (provider-composer.ts:560-580):
 /// applyModelsJson → applyExtension → modelOverrides, recomputed per call so
-/// dynamic base catalogs (`RemoteCatalogProvider`, the Radius gateway merge)
-/// stay live. `Provider::get_models` cannot fail, so a later recompute error
-/// falls back to the last valid list; the eager composition in
-/// [`ModelRuntime::compose_provider`] surfaces structural errors at
-/// registration/reload time.
+/// dynamic base catalogs stay live. `Provider::get_all_models` cannot fail,
+/// so a later recompute error falls back to the last valid list.
 struct ComposedModels {
     provider_id: String,
     base: Option<Arc<dyn Provider>>,
     config: Option<ModelsJsonProvider>,
     extension: Option<ProviderConfigInput>,
-    last_valid: std::sync::Mutex<Vec<Model>>,
+    last_valid: std::sync::Mutex<Vec<AnyModel>>,
 }
 
 impl ComposedModels {
@@ -1756,29 +1961,36 @@ impl ComposedModels {
         }
     }
 
-    fn compose(&self) -> Result<Vec<Model>, String> {
+    fn compose(&self) -> Result<Vec<AnyModel>, String> {
         let base_models = self
             .base
             .as_ref()
-            .map(|base| base.get_models())
+            .map(|base| base.get_all_models())
             .unwrap_or_default();
         let models = apply_models_json(&self.provider_id, base_models, self.config.as_ref())?;
         let models = apply_extension_models(&self.provider_id, models, self.extension.as_ref())?;
         Ok(apply_model_overrides(models, self.config.as_ref()))
     }
 
-    /// Eager composition (upstream calls `getModels()` at composition time).
-    fn compose_eager(&self) -> Result<Vec<Model>, String> {
+    /// Eager composition (upstream calls `getAllModels()` at composition time).
+    fn compose_eager(&self) -> Result<Vec<AnyModel>, String> {
         let models = self.compose()?;
         *lock(&self.last_valid) = models.clone();
         Ok(models)
     }
 
-    fn get_models(&self) -> Vec<Model> {
+    fn get_all_models(&self) -> Vec<AnyModel> {
         match self.compose_eager() {
             Ok(models) => models,
             Err(_) => lock(&self.last_valid).clone(),
         }
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        self.get_all_models()
+            .into_iter()
+            .filter_map(AnyModel::into_chat)
+            .collect()
     }
 }
 
@@ -1885,6 +2097,7 @@ impl ModelRuntime {
             credentials: Some(credentials.clone()),
             auth_context: None,
             models_store: Some(models_store),
+            identity: options.identity.clone(),
         }));
 
         let runtime = Arc::new(ModelRuntime {
@@ -1925,6 +2138,14 @@ impl ModelRuntime {
         for provider in rpi_ai::providers::builtin_providers() {
             let provider = if provider.id() == "radius" {
                 provider
+            } else if provider.id() == "openrouter"
+                && let Some(base_url) = &catalog_base_url
+            {
+                crate::core::remote_catalog_provider::with_openrouter_catalog(
+                    provider,
+                    Some(base_url.clone()),
+                    builtin_generated_at,
+                )
             } else if let Some(base_url) = &catalog_base_url {
                 with_remote_catalog(provider, Some(base_url.clone()), builtin_generated_at)
             } else {
@@ -2096,6 +2317,11 @@ impl ModelRuntime {
         };
 
         let headers = base.and_then(|b| b.headers().cloned());
+        let chat_models = models
+            .iter()
+            .filter_map(AnyModel::as_chat)
+            .cloned()
+            .collect();
 
         let composed_provider = create_provider(CreateProviderOptions {
             id: provider_id.to_owned(),
@@ -2103,7 +2329,8 @@ impl ModelRuntime {
             base_url,
             headers,
             auth,
-            models,
+            models: chat_models,
+            all_models: models,
             api: ProviderApi::Single(streams),
             ..Default::default()
         });
@@ -2662,6 +2889,16 @@ impl ModelRuntime {
                     signal: None,
                 }),
             )
+            .await
+    }
+
+    pub async fn get_resolved_request_auth(
+        &self,
+        model: &Model,
+        overrides: Option<&AuthResolutionOverrides>,
+    ) -> Result<Option<rpi_ai::auth::ResolvedRequestAuth>, ModelsError> {
+        self.models
+            .get_resolved_request_auth(model, overrides)
             .await
     }
 
@@ -3602,9 +3839,7 @@ fn config_model_to_model(
         } else {
             model.input.clone()
         },
-        // applyExtension (provider-composer.ts:201-228) carries no
-        // inputLimits face (#9631 did not extend it).
-        input_limits: None,
+        input_limits: model.input_limits,
         cost: model.cost.clone().unwrap_or_default(),
         prompt_cache: None,
         context_window: model.context_window,
@@ -3615,6 +3850,101 @@ fn config_model_to_model(
         id: model.id,
         compat: model.compat.clone(),
     })
+}
+
+/// Extension `ProviderConfigModel` → the matching runtime model type
+/// (`extensionModelFromDefinition`, provider-composer.ts:277-300).
+fn config_model_to_any_model(
+    provider_id: &str,
+    provider_api: &Option<String>,
+    provider_base_url: Option<&str>,
+    model: ProviderConfigModel,
+    defaults: Option<&AnyModel>,
+) -> Result<AnyModel, String> {
+    if model.model_type == rpi_ai::types::ModelType::Chat {
+        return config_model_to_model(
+            provider_id,
+            provider_api,
+            provider_base_url,
+            model,
+            defaults.and_then(AnyModel::as_chat),
+        )
+        .map(AnyModel::Chat);
+    }
+
+    let api = model
+        .api
+        .clone()
+        .or_else(|| defaults.map(|defaults| defaults.api().as_str().to_owned()))
+        .filter(|api| !api.is_empty());
+    let Some(api) = api else {
+        return Err(format!(
+            "Provider {provider_id}, model {}: no \"api\" specified. Set it at model level.",
+            model.id
+        ));
+    };
+    let base_url = model
+        .base_url
+        .clone()
+        .or_else(|| provider_base_url.map(str::to_owned))
+        .or_else(|| defaults.map(|defaults| any_base_url(defaults).to_owned()))
+        .filter(|url| !url.is_empty());
+    let Some(base_url) = base_url else {
+        return Err(format!(
+            "Provider {provider_id}: \"baseUrl\" is required when defining custom models."
+        ));
+    };
+    let input = if model.input.is_empty() {
+        default_input()
+    } else {
+        model.input.clone()
+    };
+    let name = model.name.clone().unwrap_or_else(|| model.id.clone());
+    let api = ApiKind::from(api);
+    match model.model_type {
+        rpi_ai::types::ModelType::Image => {
+            let output = model.output.clone().filter(|output| !output.is_empty());
+            let Some(output) = output else {
+                return Err(format!(
+                    "Provider {provider_id}, model {}: \"output\" is required for image models.",
+                    model.id
+                ));
+            };
+            Ok(AnyModel::Image(rpi_ai::types::ImageModel {
+                model_type: rpi_ai::types::ModelType::Image,
+                id: model.id,
+                name,
+                api,
+                provider: provider_id.to_owned(),
+                base_url,
+                input,
+                input_limits: model.input_limits,
+                cost: model.cost.unwrap_or_default(),
+                output,
+                headers: model.headers,
+            }))
+        }
+        rpi_ai::types::ModelType::Classifier => {
+            Ok(AnyModel::Classifier(rpi_ai::types::ClassifierModel {
+                model_type: rpi_ai::types::ModelType::Classifier,
+                id: model.id,
+                name,
+                api,
+                provider: provider_id.to_owned(),
+                base_url,
+                input,
+                input_limits: model.input_limits,
+                cost: model.cost.unwrap_or_default(),
+                context_window: model.context_window,
+                headers: model.headers,
+                compat: model.compat,
+            }))
+        }
+        rpi_ai::types::ModelType::Chat => Err(format!(
+            "Provider {provider_id}, model {}: invalid chat model composition.",
+            model.id
+        )),
+    }
 }
 
 // ============================================================================
@@ -3673,6 +4003,7 @@ mod tests {
             allow_network: false,
             force: None,
             signal,
+            base_url: None,
         }
     }
 
@@ -4726,6 +5057,42 @@ mod tests {
         let params = merged.sampling_params.as_ref().expect("samplingParams");
         assert_eq!(params["top_p"], serde_json::json!(0.5));
         assert_eq!(params["min_p"], serde_json::json!(0.05));
+    }
+
+    #[tokio::test]
+    async fn models_json_proxy_cannot_inherit_codex_subscription_oauth() {
+        let tmp = TempDir::new();
+        let agent_dir = tmp.0.join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let models_path = agent_dir.join("models.json");
+        let auth_path = agent_dir.join("auth.json");
+        std::fs::write(
+            &models_path,
+            r#"{"providers":{"openai-codex":{"baseUrl":"https://proxy.example.com/v1"}}}"#,
+        )
+        .expect("write models.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"openai-codex":{"type":"oauth","access":"test-codex-access","refresh":"test-codex-refresh","expires":4000000000000,"accountId":"test-account"}}"#,
+        )
+        .expect("write auth.json");
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            auth_path: Some(auth_path),
+            models_path: ModelsPathInput::Path(models_path),
+            ..Default::default()
+        })
+        .await;
+        let model = runtime
+            .get_model("openai-codex", "gpt-6.1-sol")
+            .expect("composed Codex model");
+        assert_eq!(model.base_url, "https://proxy.example.com/v1");
+        let error = runtime
+            .get_resolved_request_auth(&model, None)
+            .await
+            .expect_err("proxy must not inherit subscription OAuth");
+        assert!(error.message.contains("cannot inherit"), "{error}");
+        assert!(!error.message.contains("test-codex-access"));
+        assert!(!error.message.contains("test-account"));
     }
 
     /// Provider-level `headers` and `authHeader` wrap auth resolution, so the
@@ -6704,6 +7071,225 @@ mod virtual_model_tests {
             .await
             .expect_err("virtual target");
         assert!(error.contains("is not a physical model"), "{error}");
+    }
+
+    /// 7f225f25d: provider compat reaches classifiers through the same
+    /// composition pass as chat. Chat-only modelOverrides must not replace it.
+    #[test]
+    fn models_json_provider_compat_reaches_classifier_only_at_provider_layer() {
+        let base = rpi_ai::providers::typesafe::typesafe_provider();
+        let original = base
+            .get_all_models()
+            .into_iter()
+            .find_map(|model| match model {
+                AnyModel::Classifier(model) => Some(model),
+                _ => None,
+            })
+            .expect("built-in classifier");
+        let mut overrides = OrderedMap::default();
+        overrides.insert(
+            original.id.clone(),
+            ModelsJsonModelOverride {
+                compat: Some(ModelCompat {
+                    image_input: Some(rpi_ai::types::SystemOneImageInput::Assets),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let config = ModelsJsonProvider {
+            base_url: Some("https://proxy.example.com/v1".to_owned()),
+            compat: Some(ModelCompat {
+                image_input: Some(rpi_ai::types::SystemOneImageInput::StateImageUrls),
+                send_image_opt_in_header: Some(false),
+                ..Default::default()
+            }),
+            model_overrides: Some(overrides),
+            ..Default::default()
+        };
+        let composed = ComposedModels::new("typesafe", Some(base), Some(config), None);
+        let models = composed.compose_eager().expect("valid composition");
+        let classifier = models
+            .iter()
+            .find_map(|model| match model {
+                AnyModel::Classifier(model) => Some(model),
+                _ => None,
+            })
+            .expect("classifier survives models.json composition");
+        assert_eq!(classifier.base_url, "https://proxy.example.com/v1");
+        assert_eq!(classifier.cost, original.cost);
+        assert_eq!(classifier.context_window, original.context_window);
+        assert_eq!(classifier.input, original.input);
+        let compat = classifier.compat.as_ref().expect("classifier compat");
+        assert_eq!(
+            compat.image_input,
+            Some(rpi_ai::types::SystemOneImageInput::StateImageUrls)
+        );
+        assert_eq!(compat.send_image_opt_in_header, Some(false));
+    }
+
+    /// Extension definitions preserve the operation type, catalog fields and
+    /// their own compat instead of falling back to a chat model.
+    #[test]
+    fn extension_classifier_definition_preserves_type_and_compat() {
+        let base = rpi_ai::providers::typesafe::typesafe_provider();
+        let config = ModelsJsonProvider {
+            base_url: Some("https://proxy.example.com/v1".to_owned()),
+            ..Default::default()
+        };
+        let models = apply_models_json("typesafe", base.get_all_models(), Some(&config))
+            .expect("models.json composition");
+        let extension = ProviderConfigInput {
+            models: Some(vec![ProviderConfigModel {
+                id: "custom-jev".to_owned(),
+                model_type: rpi_ai::types::ModelType::Classifier,
+                name: Some("Custom Jev".to_owned()),
+                api: Some("typesafe-system-one".to_owned()),
+                input: vec![
+                    rpi_ai::types::InputModality::Text,
+                    rpi_ai::types::InputModality::Image,
+                ],
+                context_window: 32_000,
+                compat: Some(ModelCompat {
+                    image_input: Some(rpi_ai::types::SystemOneImageInput::Images),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let models = apply_extension_models("typesafe", models, Some(&extension))
+            .expect("extension composition");
+        assert_eq!(models.len(), 1);
+        let classifier = match &models[0] {
+            AnyModel::Classifier(model) => model,
+            other => panic!("expected classifier, got {other:?}"),
+        };
+        assert_eq!(classifier.id, "custom-jev");
+        assert_eq!(classifier.base_url, "https://proxy.example.com/v1");
+        assert_eq!(classifier.context_window, 32_000);
+        assert_eq!(classifier.cost, ModelCost::default());
+        assert_eq!(
+            classifier
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.image_input),
+            Some(rpi_ai::types::SystemOneImageInput::Images)
+        );
+    }
+
+    /// R2.2.2: the official URL and custom paths with an explicit `v1`
+    /// segment are accepted without any URL rewriting.
+    #[test]
+    fn kimi_coding_accepts_official_and_explicit_v1_base_urls() {
+        for base_url in [
+            "https://api.kimi.com/coding/v1",
+            "https://proxy.example.com/v1",
+            "https://proxy.example.com/v1/v2",
+            "https://proxy.example.com/v1/v1",
+        ] {
+            let config = ModelsJsonProvider {
+                base_url: Some(base_url.to_owned()),
+                ..Default::default()
+            };
+            let models = apply_models_json(
+                "kimi-coding",
+                rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models(),
+                Some(&config),
+            )
+            .expect("explicit /v1 URL");
+            assert!(
+                models.iter().all(|model| any_base_url(model) == base_url),
+                "the configured URL must be preserved verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_coding_extension_base_urls_require_v1() {
+        let base = rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models();
+        let extension = ProviderConfigInput {
+            base_url: Some("https://proxy.example.com/coding".to_owned()),
+            ..Default::default()
+        };
+        let error = apply_extension_models("kimi-coding", base.clone(), Some(&extension))
+            .expect_err("extension URL must contain /v1");
+        assert!(error.contains("Provider kimi-coding"), "{error}");
+        assert!(error.contains("extensions.kimi-coding.baseUrl"), "{error}");
+        assert!(error.contains("https://api.kimi.com/coding/v1"), "{error}");
+
+        let extension = ProviderConfigInput {
+            base_url: Some("https://proxy.example.com/v1/v1".to_owned()),
+            ..Default::default()
+        };
+        let models = apply_extension_models("kimi-coding", base.clone(), Some(&extension))
+            .expect("explicit repeated /v1 remains unchanged");
+        assert!(
+            models
+                .iter()
+                .all(|model| any_base_url(model) == "https://proxy.example.com/v1/v1")
+        );
+
+        let extension = ProviderConfigInput {
+            models: Some(vec![ProviderConfigModel {
+                id: base[0].id().to_owned(),
+                base_url: Some("https://proxy.example.com/chat".to_owned()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let error = apply_extension_models("kimi-coding", base, Some(&extension))
+            .expect_err("per-model extension URL must contain /v1");
+        assert!(
+            error.contains("extensions.kimi-coding.models.0.baseUrl"),
+            "{error}"
+        );
+    }
+
+    /// R2.2.2: a legacy or lookalike URL fails before provider registration,
+    /// with provider/model/config-key diagnostics and a migration example.
+    #[test]
+    fn kimi_coding_rejects_missing_v1_before_registration() {
+        for base_url in [
+            "https://api.kimi.com/coding",
+            "https://proxy.example.com/v1beta",
+        ] {
+            let config = ModelsJsonProvider {
+                base_url: Some(base_url.to_owned()),
+                ..Default::default()
+            };
+            let error = apply_models_json(
+                "kimi-coding",
+                rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models(),
+                Some(&config),
+            )
+            .expect_err("missing /v1 must fail");
+            assert!(error.contains("Provider kimi-coding"), "{error}");
+            assert!(error.contains("model <provider-wide>"), "{error}");
+            assert!(error.contains("providers.kimi-coding.baseUrl"), "{error}");
+            assert!(error.contains("https://api.kimi.com/coding/v1"), "{error}");
+        }
+
+        let config = ModelsJsonProvider {
+            base_url: Some("https://proxy.example.com/v1".to_owned()),
+            models: Some(vec![ModelsJsonModel {
+                id: "custom-kimi".to_owned(),
+                base_url: Some("https://proxy.example.com/chat".to_owned()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let error = apply_models_json(
+            "kimi-coding",
+            rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models(),
+            Some(&config),
+        )
+        .expect_err("model override missing /v1 must fail");
+        assert!(error.contains("model custom-kimi"), "{error}");
+        assert!(
+            error.contains("providers.kimi-coding.models.0.baseUrl"),
+            "{error}"
+        );
     }
 
     /// The direct `streamSimple` route caps the output budget and drops

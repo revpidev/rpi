@@ -60,6 +60,7 @@ impl AuthContext for FakeAuthContext {
 
 fn models_with_context(ctx: FakeAuthContext) -> Models {
     Models::new(Some(CreateModelsOptions {
+        identity: None,
         credentials: None,
         auth_context: Some(Arc::new(ctx)),
         models_store: None,
@@ -206,8 +207,10 @@ fn test_github_copilot_catalog_claude_models() {
         Some("vscode-chat")
     );
 
-    let opus47 = get_builtin_model("github-copilot", "claude-opus-4.7").expect("claude-opus-4.7");
-    let levels = get_supported_thinking_levels(opus47);
+    // Opus 4.7 left the public catalog; Opus 5.5 carries the same
+    // xhigh/max capability assertion in the v1.4.0 snapshot.
+    let opus55 = get_builtin_model("github-copilot", "claude-opus-5.5").expect("claude-opus-5.5");
+    let levels = get_supported_thinking_levels(opus55);
     assert!(levels.contains(&ModelThinkingLevel::Xhigh));
     assert!(levels.contains(&ModelThinkingLevel::Max));
 }

@@ -218,6 +218,7 @@ pub struct ImagesModels {
     providers: Arc<RwLock<OrderedMap<Arc<dyn ImagesProvider>>>>,
     credentials: Arc<dyn CredentialStore>,
     auth_context: Arc<dyn AuthContext>,
+    identity: Option<crate::utils::identity::ClientIdentity>,
 }
 
 impl Default for ImagesModels {
@@ -233,6 +234,7 @@ impl ImagesModels {
             credentials: None,
             auth_context: None,
             models_store: None,
+            identity: None,
         });
         Self {
             providers: Arc::new(RwLock::new(OrderedMap::default())),
@@ -242,6 +244,7 @@ impl ImagesModels {
             auth_context: options
                 .auth_context
                 .unwrap_or_else(|| Arc::new(DefaultAuthContext)),
+            identity: options.identity,
         }
     }
 
@@ -380,7 +383,18 @@ impl ImagesModels {
         context: &ImagesContext,
         options: Option<&ImagesOptions>,
     ) -> AssistantImages {
-        match self.generate_images_inner(model, context, options).await {
+        let mut merged_options = options.cloned();
+        if self.identity.is_some() || merged_options.is_some() {
+            let options = merged_options.get_or_insert_with(ImagesOptions::default);
+            options.identity = crate::utils::identity::merge_client_identity(
+                self.identity.clone(),
+                options.identity.clone(),
+            );
+        }
+        match self
+            .generate_images_inner(model, context, merged_options.as_ref())
+            .await
+        {
             Ok(images) => images,
             Err(error) => AssistantImages {
                 api: model.api.clone(),
@@ -693,6 +707,7 @@ mod tests {
     async fn resolves_auth_and_merges_it_into_requests_explicit_options_win() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let models = create_images_models(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: Some(Arc::new(FakeAuthContext {
                 env: [("TEST_KEY".to_owned(), "env-key".to_owned())].into(),
@@ -858,6 +873,7 @@ mod tests {
     #[tokio::test]
     async fn error_result_for_unknown_providers_and_unconfigured_auth() {
         let models = create_images_models(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: Some(Arc::new(FakeAuthContext {
                 env: HashMap::new(),

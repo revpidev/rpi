@@ -250,6 +250,7 @@ impl Provider for RadiusProvider {
                                         last_modified: None,
                                         checked_at: Some(now_millis()),
                                         etag: None,
+                                        credential_fingerprint: None,
                                     })),
                                     update: Some(Box::new(move || {
                                         *models_for_update
@@ -296,6 +297,7 @@ impl Provider for RadiusProvider {
                                 last_modified: None,
                                 checked_at: Some(now_millis()),
                                 etag: None,
+                                credential_fingerprint: None,
                             })),
                             update: Some(Box::new(move || {
                                 *models_clone.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -507,6 +509,7 @@ mod tests {
             allow_network,
             force: if allow_network { Some(force) } else { None },
             signal,
+            base_url: None,
         }
     }
 
@@ -522,6 +525,7 @@ mod tests {
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -568,6 +572,7 @@ mod tests {
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -616,6 +621,7 @@ mod tests {
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -724,6 +730,7 @@ mod tests {
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -763,6 +770,7 @@ mod tests {
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -792,6 +800,7 @@ mod tests {
             allow_network: false,
             force: None,
             signal,
+            base_url: None,
         };
         provider
             .refresh_models(context)
@@ -845,6 +854,7 @@ mod tests {
             allow_network: false,
             force: None,
             signal,
+            base_url: None,
         };
         provider
             .refresh_models(context)

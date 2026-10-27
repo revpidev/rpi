@@ -63,8 +63,8 @@ use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
-    rpi_user_agent_headers,
+    headers_to_record, identity_headers, merge_headers_chain, model_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
@@ -440,6 +440,7 @@ pub fn build_client_headers(
     context: &TranscriptContext,
     api_key: &str,
     options_headers: Option<&ProviderHeaders>,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
     session_id: Option<&str>,
     compat: &ResolvedOpenAICompletionsCompat,
 ) -> ProviderHeaders {
@@ -489,7 +490,7 @@ pub fn build_client_headers(
         });
 
     merge_headers_chain(&[
-        rpi_user_agent_headers(),
+        identity_headers(model, identity),
         Some(base),
         model_headers(model),
         copilot_headers,
@@ -576,7 +577,11 @@ pub fn convert_messages(
     // (Kimi-style `tools` field on a system message).
     let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
         &context.messages,
-        compat.supports_mid_convo_system_messages && compat.supports_mid_convo_tool_additions,
+        if compat.supports_mid_convo_system_messages && compat.supports_mid_convo_tool_additions {
+            crate::utils::transcript::TranscriptToolSupport::Additions
+        } else {
+            crate::utils::transcript::TranscriptToolSupport::None
+        },
     );
     let instruction_role = if model.reasoning && compat.supports_developer_role {
         "developer"
@@ -585,6 +590,7 @@ pub fn convert_messages(
     };
 
     let mut last_role: Option<Role> = None;
+    let mut system_index = 0usize;
     let mut i = 0;
     while i < transformed_messages.len() {
         let msg = &transformed_messages[i];
@@ -602,10 +608,9 @@ pub fn convert_messages(
 
         match msg {
             Message::System(system) => {
-                // #9548 (openai-completions.ts:1240-1255): later system
-                // messages carry their in-place tool additions (Kimi), the
-                // leading one renders the full prompt text.
-                if i > 0 && transcript_tools.anchors_additions {
+                let anchors_tool_changes = system_index >= transcript_tools.folded_system_messages;
+                system_index += 1;
+                if anchors_tool_changes {
                     let added: Vec<Tool> = system.tools_added.clone().unwrap_or_default();
                     if !added.is_empty() {
                         // Kimi accepts a system message with tools but omits
@@ -886,7 +891,7 @@ pub fn convert_messages(
                         .any(|block| matches!(block, ToolResultContent::Image(_)));
 
                     // Always send tool result with text (or placeholder if only images).
-                    let tool_result_text = if !text_result.is_empty() {
+                    let tool_result_text = if !text_result.trim().is_empty() {
                         text_result
                     } else if has_images {
                         "(see attached image)".to_owned()
@@ -1317,7 +1322,11 @@ pub fn build_params(
     // in-place additions.
     let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
         &context.messages,
-        compat.supports_mid_convo_system_messages && compat.supports_mid_convo_tool_additions,
+        if compat.supports_mid_convo_system_messages && compat.supports_mid_convo_tool_additions {
+            crate::utils::transcript::TranscriptToolSupport::Additions
+        } else {
+            crate::utils::transcript::TranscriptToolSupport::None
+        },
     );
     let request_tools = transcript_tools.request_tools;
     let mut tools: Option<Vec<Value>> = if !request_tools.is_empty() {
@@ -2089,6 +2098,7 @@ impl<'a> CompletionsProcessor<'a> {
                     arguments,
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 }));
             let index = self.output.content.len() - 1;
             self.scratch.insert(
@@ -2240,21 +2250,7 @@ impl<'a> CompletionsProcessor<'a> {
             return Ok(());
         };
 
-        if let Some(content) = delta.get("content").and_then(Value::as_str)
-            && !content.is_empty()
-        {
-            let content_index = self.ensure_text_block(events);
-            if let Some(AssistantContent::Text(block)) = self.output.content.get_mut(content_index)
-            {
-                block.text.push_str(content);
-            }
-            events.push(StreamEvent::TextDelta {
-                content_index,
-                delta: content.to_owned(),
-                partial: Arc::new(self.output.clone()),
-            });
-        }
-
+        // Reasoning and answer text may share one delta; reasoning comes first.
         // Some endpoints return reasoning in reasoning_content (llama.cpp), or
         // reasoning (other openai compatible endpoints). Use the first
         // non-empty reasoning field to avoid duplication (e.g., chutes.ai
@@ -2390,6 +2386,21 @@ impl<'a> CompletionsProcessor<'a> {
             }
         }
 
+        if let Some(content) = delta.get("content").and_then(Value::as_str)
+            && !content.is_empty()
+        {
+            let content_index = self.ensure_text_block(events);
+            if let Some(AssistantContent::Text(block)) = self.output.content.get_mut(content_index)
+            {
+                block.text.push_str(content);
+            }
+            events.push(StreamEvent::TextDelta {
+                content_index,
+                delta: content.to_owned(),
+                partial: Arc::new(self.output.clone()),
+            });
+        }
+
         Ok(())
     }
 
@@ -2428,7 +2439,11 @@ impl<'a> CompletionsProcessor<'a> {
                     let next_input = custom_tool_call_input(block, scratch);
                     close_delta = append_custom_tool_call_input(block, scratch, &next_input, true)?;
                 } else {
-                    block.arguments = parse_streaming_json(scratch.partial_args.as_deref());
+                    let parsed = crate::utils::json_parse::parse_tool_call_arguments(
+                        scratch.partial_args.as_deref(),
+                    );
+                    block.arguments = parsed.arguments;
+                    block.arguments_error = parsed.arguments_error;
                 }
                 Some(BlockEnd::ToolCall(block.clone()))
             }
@@ -2594,6 +2609,7 @@ async fn run(
         context,
         &api_key,
         options.stream.headers.as_ref(),
+        options.stream.identity.as_ref(),
         cache_session_id,
         &compat,
     );
@@ -3212,7 +3228,7 @@ pub(crate) mod tests {
         let model = make_model(json!({}));
         let ctx = context(vec![user_text("hi")], None);
         let compat = get_compat(&model);
-        let headers = build_client_headers(&model, &ctx, "sk-key", None, None, &compat);
+        let headers = build_client_headers(&model, &ctx, "sk-key", None, None, None, &compat);
         assert_eq!(
             headers.get("accept").and_then(|v| v.as_deref()),
             Some("application/json")
@@ -3233,6 +3249,7 @@ pub(crate) mod tests {
             "sk-key",
             Some(&options_headers),
             None,
+            None,
             &compat,
         );
         assert_eq!(headers.len(), 3, "accept + authorization + user-agent");
@@ -3242,7 +3259,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             headers.get("User-Agent").and_then(|v| v.as_deref()),
-            Some(crate::utils::rpi_user_agent::get_rpi_user_agent().as_str())
+            Some(crate::utils::identity::format_user_agent(None).as_str())
         );
 
         // A `User-Agent` in the request headers overrides the default.
@@ -3256,6 +3273,7 @@ pub(crate) mod tests {
             &ctx,
             "sk-key",
             Some(&options_headers),
+            None,
             None,
             &compat,
         );
@@ -3273,7 +3291,7 @@ pub(crate) mod tests {
                 "compat": {"sendSessionAffinityHeaders": true, "sessionAffinityFormat": format}
             }));
             let compat = get_compat(&model);
-            build_client_headers(&model, &ctx, "k", None, Some("sess-1"), &compat)
+            build_client_headers(&model, &ctx, "k", None, None, Some("sess-1"), &compat)
         };
         let openrouter = make(SessionAffinityFormat::Openrouter);
         assert_eq!(
@@ -3295,7 +3313,7 @@ pub(crate) mod tests {
         // Disabled compat drops the headers entirely.
         let model = make_model(json!({}));
         let compat = get_compat(&model);
-        let headers = build_client_headers(&model, &ctx, "k", None, Some("sess-1"), &compat);
+        let headers = build_client_headers(&model, &ctx, "k", None, None, Some("sess-1"), &compat);
         assert!(!headers.contains_key("x-session-id"));
         assert!(!headers.contains_key("x-session-affinity"));
     }
@@ -4390,6 +4408,7 @@ mod build_and_stream_tests {
                 r#"{"type":"reasoning.encrypted","id":"call_1","data":"enc-old"}"#.to_owned(),
             ),
             namespace: None,
+            arguments_error: None,
         })];
         ctx = context(vec![signed, user_text("next")], None);
         let params = build_params(
@@ -4444,6 +4463,7 @@ mod build_and_stream_tests {
             arguments: serde_json::Map::new(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })]);
         let ctx = context(
             vec![

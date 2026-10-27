@@ -91,8 +91,8 @@ use crate::types::{
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
-    rpi_user_agent_headers,
+    headers_to_record, identity_headers, merge_headers_chain, model_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::provider_retry::ProviderErrorInfo;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
@@ -517,11 +517,12 @@ fn build_request_headers(
     model: &Model,
     auth_header: (&str, String),
     options_headers: Option<&crate::types::ProviderHeaders>,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
 ) -> crate::types::ProviderHeaders {
     let mut base = crate::types::ProviderHeaders::new();
     base.insert(auth_header.0.to_owned(), Some(auth_header.1));
     merge_headers_chain(&[
-        rpi_user_agent_headers(),
+        identity_headers(model, identity),
         Some(base),
         model_headers(model),
         options_headers.cloned(),
@@ -742,6 +743,7 @@ impl<'a> StreamProcessor<'a> {
                 .filter(|signature| !signature.is_empty())
                 .map(str::to_owned),
             namespace: None,
+            arguments_error: None,
         };
 
         self.output
@@ -945,7 +947,12 @@ async fn run(
         &model_path,
     );
 
-    let headers = build_request_headers(model, auth_header, options.stream.headers.as_ref());
+    let headers = build_request_headers(
+        model,
+        auth_header,
+        options.stream.headers.as_ref(),
+        options.stream.identity.as_ref(),
+    );
     let header_map = provider_headers_to_header_map(&headers)?;
     let mut client_builder =
         crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;

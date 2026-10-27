@@ -94,6 +94,7 @@ pub fn faux_tool_call(
         arguments,
         thought_signature: None,
         namespace: None,
+        arguments_error: None,
     })
 }
 
@@ -820,6 +821,7 @@ async fn stream_with_deltas(
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 }));
                 let _ = tx.send(StreamEvent::ToolCallStart {
                     content_index: index,

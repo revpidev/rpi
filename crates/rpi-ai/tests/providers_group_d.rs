@@ -93,7 +93,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.fireworks.ai/inference",
         "Fireworks API key",
         "FIREWORKS_API_KEY",
-        24, // 2026-10-19 snapshot (+DeepSeek V4.1 Flash 1017, +Muse Spark Open)
+        29, // 2026-10-27 snapshot: expanded Fireworks public catalog
     ),
     spec(
         groq_provider,
@@ -120,7 +120,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://integrate.api.nvidia.com/v1",
         "NVIDIA API key",
         "NVIDIA_API_KEY",
-        21, // 2026-10-08 catalog refresh (deepseek-v4.1-flash + diffusiongemma-26b)
+        22, // 2026-10-27 snapshot: 85 live NVIDIA NIM ids after filtering
     ),
     spec(
         together_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        20, // 2026-10-19 snapshot (+Muse Spark Open, +Nemotron 3.5 Super VL, +Beam 1.0)
+        15, // 2026-10-27 snapshot: 15 non-deprecated tool-capable models
     ),
     spec(
         xai_provider,
@@ -252,6 +252,7 @@ async fn env_api_key_resolves_through_models_get_auth() {
         let id = expected.id;
         let env_key = expected.env_key;
         let models = create_models(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: Some(Arc::new(MapAuthContext(HashMap::from([(
                 env_key.to_owned(),
@@ -275,6 +276,7 @@ async fn env_api_key_resolves_through_models_get_auth() {
 
         // Without the env var the provider is not configured.
         let unconfigured = create_models(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: Some(Arc::new(MapAuthContext(HashMap::new()))),
             models_store: None,
@@ -417,19 +419,66 @@ fn together_reasoning_controls_match_api_surface() {
     assert_eq!(compat.supports_reasoning_effort, Some(true));
     assert_eq!(compat.thinking_format, Some(ThinkingFormat::Together));
 
-    let minimax = get_model(&provider, "MiniMaxAI/MiniMax-M2.7");
+    let minimax = get_model(&provider, "MiniMaxAI/MiniMax-M3");
     assert_eq!(
         minimax.thinking_level_map,
         Some(ThinkingLevelMap::from([
-            (ModelThinkingLevel::Off, None),
             (ModelThinkingLevel::Minimal, None),
             (ModelThinkingLevel::Low, None),
             (ModelThinkingLevel::Medium, None),
         ]))
     );
     let compat = minimax.compat.as_ref().expect("minimax compat");
-    assert_eq!(compat.thinking_format, None);
+    assert_eq!(compat.thinking_format, Some(ThinkingFormat::Together));
     assert_eq!(compat.supports_reasoning_effort, Some(false));
+}
+
+#[test]
+fn xiaomi_reasoning_is_an_off_on_toggle_without_reasoning_effort() {
+    let ctx = rpi_ai::utils::transcript::normalize_context(&rpi_ai::types::Context::default());
+    for provider in [
+        rpi_ai::providers::xiaomi::xiaomi_provider(),
+        rpi_ai::providers::xiaomi_token_plan_cn::xiaomi_token_plan_cn_provider(),
+        rpi_ai::providers::xiaomi_token_plan_ams::xiaomi_token_plan_ams_provider(),
+        rpi_ai::providers::xiaomi_token_plan_sgp::xiaomi_token_plan_sgp_provider(),
+    ] {
+        for model in provider
+            .get_models()
+            .into_iter()
+            .filter(|model| model.reasoning)
+        {
+            assert_eq!(
+                rpi_ai::models::get_supported_thinking_levels(&model),
+                vec![ModelThinkingLevel::Off, ModelThinkingLevel::High]
+            );
+            for (effort, expected) in [
+                (Some(ModelThinkingLevel::High), "enabled"),
+                (None, "disabled"),
+            ] {
+                let options = rpi_ai::api::openai_completions::OpenAICompletionsOptions {
+                    reasoning_effort: effort,
+                    ..Default::default()
+                };
+                let params = rpi_ai::api::openai_completions::build_params(
+                    &model,
+                    &ctx,
+                    &options,
+                    &rpi_ai::api::openai_completions::get_compat(&model),
+                    rpi_ai::types::CacheRetention::None,
+                    &std::collections::HashMap::new(),
+                )
+                .expect("params");
+                assert_eq!(
+                    params["thinking"]["type"],
+                    serde_json::json!(expected),
+                    "{}/{}",
+                    provider.id(),
+                    model.id
+                );
+                assert!(params.get("reasoning_effort").is_none());
+            }
+        }
+    }
 }
 
 /// Upstream `fireworks-models.test.ts`: non-GLM, non-Kimi-K3 models use the
@@ -520,6 +569,7 @@ fn xai_grok_4_5_responses_thinking_levels() {
             ModelThinkingLevel::Low,
             ModelThinkingLevel::Medium,
             ModelThinkingLevel::High,
+            ModelThinkingLevel::Xhigh,
         ]
     );
 
@@ -543,6 +593,7 @@ fn xai_grok_4_5_responses_thinking_levels() {
             ModelThinkingLevel::Low,
             ModelThinkingLevel::Medium,
             ModelThinkingLevel::High,
+            ModelThinkingLevel::Xhigh,
         ]
     );
 }

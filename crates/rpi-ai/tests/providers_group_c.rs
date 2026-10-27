@@ -90,10 +90,10 @@ const SPECS: &[FactorySpec] = &[
     FactorySpec {
         id: "kimi-coding",
         name: "Kimi For Coding",
-        base_url: "https://api.kimi.com/coding",
+        base_url: "https://api.kimi.com/coding/v1",
         auth_name: "Kimi API key",
         env_key: "KIMI_API_KEY",
-        api: ApiKind::ANTHROPIC_MESSAGES,
+        api: ApiKind::OPENAI_COMPLETIONS,
         factory: kimi_coding::kimi_coding_provider,
     },
     FactorySpec {

@@ -69,8 +69,8 @@ use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
-    rpi_user_agent_headers,
+    headers_to_record, identity_headers, merge_headers_chain, model_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
@@ -285,6 +285,7 @@ pub fn build_client_headers(
     model: &Model,
     api_key: &str,
     options_headers: Option<&ProviderHeaders>,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
 ) -> ProviderHeaders {
     let base: ProviderHeaders = [
         ("accept".to_owned(), Some("application/json".to_owned())),
@@ -292,7 +293,7 @@ pub fn build_client_headers(
     ]
     .into();
     merge_headers_chain(&[
-        rpi_user_agent_headers(),
+        identity_headers(model, identity),
         Some(base),
         model_headers(model),
         options_headers.cloned(),
@@ -331,7 +332,11 @@ pub fn build_params(
         .unwrap_or(false);
     let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
         &context.messages,
-        supports_additional_tools || supports_tool_search,
+        crate::api::openai_responses_shared::get_responses_tool_support(
+            supports_mid_convo_system_messages,
+            supports_additional_tools,
+            supports_tool_search,
+        ),
     );
     let messages = convert_responses_messages(
         model,
@@ -507,7 +512,12 @@ async fn run(
             .and_then(|compat| compat.supports_open_ai_grammar_tools)
             .unwrap_or(false),
     )?;
-    let headers = build_client_headers(model, api_key, options.stream.headers.as_ref());
+    let headers = build_client_headers(
+        model,
+        api_key,
+        options.stream.headers.as_ref(),
+        options.stream.identity.as_ref(),
+    );
     let mut params = build_params(
         model,
         context,
@@ -1117,7 +1127,7 @@ mod tests {
     #[test]
     fn test_build_client_headers() {
         let m = model(json!({}));
-        let headers = build_client_headers(&m, "key", None);
+        let headers = build_client_headers(&m, "key", None, None);
         // Azure auth header, not Authorization: Bearer.
         assert_eq!(headers.get("api-key"), Some(&Some("key".to_owned())));
         assert_eq!(
@@ -1129,7 +1139,7 @@ mod tests {
         // Options headers merge last and override.
         let options_headers: ProviderHeaders =
             [("api-key".to_owned(), Some("custom".to_owned()))].into();
-        let headers = build_client_headers(&m, "key", Some(&options_headers));
+        let headers = build_client_headers(&m, "key", Some(&options_headers), None);
         assert_eq!(headers.get("api-key"), Some(&Some("custom".to_owned())));
     }
 

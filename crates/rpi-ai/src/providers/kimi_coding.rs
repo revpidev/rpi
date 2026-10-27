@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/providers/kimi-coding.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/providers/kimi-coding.ts` @ pi 1.4.0 (4a080252f).
 //!
 //! Models come from the vendored catalog (`generated.rs`), which carries the
 //! same data as upstream `kimi-coding.models.ts` (corrections baked in —
@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use crate::api::anthropic_messages::AnthropicMessages;
+use crate::api::openai_completions::OpenAiCompletions;
 use crate::auth::oauth::kimi_coding_oauth;
 use crate::auth::{ProviderAuth, env_api_key_auth};
 use crate::generated::get_builtin_models;
@@ -23,7 +23,7 @@ pub fn kimi_coding_provider() -> Arc<dyn Provider> {
     create_provider(CreateProviderOptions {
         id: "kimi-coding".to_owned(),
         name: Some("Kimi For Coding".to_owned()),
-        base_url: Some("https://api.kimi.com/coding".to_owned()),
+        base_url: Some("https://api.kimi.com/coding/v1".to_owned()),
         headers: None,
         auth: ProviderAuth {
             api_key: Some(Arc::new(env_api_key_auth(
@@ -33,7 +33,7 @@ pub fn kimi_coding_provider() -> Arc<dyn Provider> {
             oauth: Some(kimi_coding_oauth()),
         },
         models: get_builtin_models("kimi-coding").to_vec(),
-        api: ProviderApi::Single(Arc::new(AnthropicMessages)),
+        api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
         ..Default::default()
     })
 }

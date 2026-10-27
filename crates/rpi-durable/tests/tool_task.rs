@@ -168,6 +168,7 @@ async fn execute_appends_result_with_output_and_diagnostics() {
         arguments: serde_json::Map::new(),
         thought_signature: None,
         namespace: None,
+        arguments_error: None,
     };
     let task_id = create_tool_task(&opened, conversation.id(), call).await;
     let settled = opened
@@ -224,6 +225,7 @@ async fn validation_failure_result() {
         arguments: serde_json::Map::new(),
         thought_signature: None,
         namespace: None,
+        arguments_error: None,
     };
     let task_id = create_tool_task(&opened, conversation.id(), call).await;
     let settled = opened

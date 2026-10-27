@@ -740,3 +740,137 @@ async fn test_completions_cross_provider_tool_call_id_normalization() {
     assert_eq!(body["messages"][1]["role"], json!("tool"));
     assert_eq!(body["messages"][1]["tool_call_id"], json!(normalized));
 }
+
+fn malformed_arguments() -> &'static str {
+    r#"{"a":1,"b":.5}"#
+}
+
+fn assert_malformed_tool_call(message: &rpi_ai::types::AssistantMessage) {
+    let Some(first) = message.content.first() else {
+        panic!("expected tool call, got empty content: {message:?}");
+    };
+    let rpi_ai::types::AssistantContent::ToolCall(call) = first else {
+        panic!("expected tool call: {message:?}");
+    };
+    assert!(call.arguments.is_empty());
+    let error = call
+        .arguments_error
+        .as_deref()
+        .unwrap_or_else(|| panic!("expected argumentsError in {call:?}"));
+    assert!(error.contains("Received arguments:\n"), "{error}");
+    assert!(error.ends_with(malformed_arguments()), "{error}");
+}
+
+fn data(event: Value) -> String {
+    format!("data: {event}\n\n")
+}
+
+fn anthropic_data(event: Value) -> String {
+    let kind = event["type"].as_str().expect("event type");
+    format!("event: {kind}\ndata: {event}\n\n")
+}
+
+#[tokio::test]
+async fn anthropic_final_tool_arguments_reject_malformed_json() {
+    let mut body = anthropic_data(json!({"type":"message_start","message":{"id":"m","usage":{}}}));
+    for event in [
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call1","name":"demo","input":{}}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":malformed_arguments()}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
+        json!({"type":"message_stop"}),
+    ] {
+        body.push_str(&anthropic_data(event));
+    }
+    let body = Box::leak(body.into_boxed_str());
+    let (base_url, _captured) = serve(vec![(200, body)]).await;
+    let message = AnthropicMessages
+        .stream(
+            &model(
+                ApiKind::ANTHROPIC_MESSAGES,
+                "anthropic",
+                &base_url,
+                json!({}),
+            ),
+            &context(vec![user_text("hi")]),
+            Some(options()),
+        )
+        .result()
+        .await
+        .expect("completed");
+    assert_malformed_tool_call(&message);
+}
+
+fn completions_chunks() -> String {
+    let mut body = data(
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call1","function":{"name":"demo","arguments":""}}]}}]}),
+    );
+    body.push_str(&data(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"demo","arguments":malformed_arguments()}}]}}]})));
+    body.push_str(&data(
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ));
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+#[tokio::test]
+async fn completions_final_tool_arguments_reject_malformed_json() {
+    let body = completions_chunks();
+    let body = Box::leak(body.into_boxed_str());
+    let (base_url, _captured) = serve(vec![(200, body)]).await;
+    let message = OpenAiCompletions
+        .stream(
+            &model(ApiKind::OPENAI_COMPLETIONS, "openai", &base_url, json!({})),
+            &context(vec![user_text("hi")]),
+            Some(options()),
+        )
+        .result()
+        .await
+        .expect("completed");
+    assert_malformed_tool_call(&message);
+}
+
+#[tokio::test]
+async fn mistral_final_tool_arguments_reject_malformed_json() {
+    let body = completions_chunks();
+    let body = Box::leak(body.into_boxed_str());
+    let (base_url, _captured) = serve(vec![(200, body)]).await;
+    let message = rpi_ai::api::mistral_conversations::MistralConversations
+        .stream(
+            &model("mistral-conversations", "mistral", &base_url, json!({})),
+            &context(vec![user_text("hi")]),
+            Some(options()),
+        )
+        .result()
+        .await
+        .expect("completed");
+    assert_malformed_tool_call(&message);
+}
+
+#[tokio::test]
+async fn responses_final_tool_arguments_reject_malformed_json() {
+    let mut body = data(
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call1","name":"demo","arguments":""}}),
+    );
+    body.push_str(&data(json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":1,"})));
+    body.push_str(&data(json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":malformed_arguments()})));
+    body.push_str(&data(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call1","name":"demo","arguments":malformed_arguments()}})));
+    body.push_str(&data(
+        json!({"type":"response.completed","response":{"id":"r1","status":"completed","usage":{}}}),
+    ));
+    let body = Box::leak(body.into_boxed_str());
+    let (base_url, _captured) = serve(vec![(200, body)]).await;
+    let message = OpenAiResponses
+        .stream(
+            &model(ApiKind::OPENAI_RESPONSES, "openai", &base_url, json!({})),
+            &context(vec![user_text("hi")]),
+            Some(options()),
+        )
+        .result()
+        .await
+        .expect("completed");
+    assert_malformed_tool_call(&message);
+}
+
+#[path = "contract_adapters/strict_fallback.rs"]
+mod strict_fallback;

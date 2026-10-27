@@ -13,7 +13,10 @@ use crate::types::{ClassifierModel, ClassifierOptions, ProviderHeaders, Provider
 use crate::utils::cost::calculate_cost_for;
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
-use crate::utils::headers::{headers_to_record, merge_headers, provider_headers_to_header_map};
+use crate::utils::headers::{
+    headers_to_record, merge_headers_chain, provider_headers_to_header_map,
+};
+use crate::utils::identity::{ClientIdentity, get_identity_headers};
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, RetryError, retry_provider_request,
 };
@@ -35,6 +38,7 @@ pub fn classifier_request_headers(
     model: &ClassifierModel,
     api_key: &str,
     options_headers: Option<&ProviderHeaders>,
+    identity: Option<&ClientIdentity>,
 ) -> Result<reqwest::header::HeaderMap, String> {
     let model_headers: Option<ProviderHeaders> = model.headers.as_ref().map(|headers| {
         headers
@@ -42,7 +46,11 @@ pub fn classifier_request_headers(
             .map(|(key, value)| (key.clone(), Some(value.clone())))
             .collect()
     });
-    let merged = merge_headers(model_headers.as_ref(), options_headers);
+    let merged = merge_headers_chain(&[
+        Some(get_identity_headers(model.into(), identity)),
+        model_headers,
+        options_headers.cloned(),
+    ]);
     let mut map = reqwest::header::HeaderMap::new();
     map.insert(
         reqwest::header::AUTHORIZATION,
@@ -53,8 +61,7 @@ pub fn classifier_request_headers(
         reqwest::header::CONTENT_TYPE,
         reqwest::header::HeaderValue::from_static("application/json"),
     );
-    let empty = ProviderHeaders::new();
-    let request_headers = provider_headers_to_header_map(merged.as_ref().unwrap_or(&empty))?;
+    let request_headers = provider_headers_to_header_map(&merged)?;
     for (name, value) in &request_headers {
         map.insert(name, value.clone());
     }
@@ -102,6 +109,7 @@ pub async fn post_classifier_request(
         model,
         &api_key,
         options.and_then(|options| options.headers.as_ref()),
+        options.and_then(|options| options.identity.as_ref()),
     )
     .map_err(|message| ClassifierPostError {
         status: None,

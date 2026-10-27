@@ -270,6 +270,7 @@ mod tests {
             arguments: serde_json::Map::new(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })];
         let event = message_update(StreamEvent::ToolCallStart {
             content_index: 0,

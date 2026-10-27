@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/types.ts` @ pi 0.84.1+ (4181f66).
+//! Port of `packages/ai/src/types.ts` @ pi 1.4.0 (4a080252f).
 //!
 //! Core wire types: messages, content blocks, usage, tools, models (with
 //! compat matrices), stream options and the assistant stream event protocol.
@@ -9,7 +9,8 @@
 //!   API strings like upstream).
 //! - The per-API conditional `Model.compat` type becomes the single flat
 //!   [`ModelCompat`] struct merging `OpenAICompletionsCompat`,
-//!   `OpenAIResponsesCompat`, `AnthropicMessagesCompat` and `BedrockCompat`.
+//!   `OpenAIResponsesCompat`, `AnthropicMessagesCompat`, `BedrockCompat`, and
+//!   `SystemOneCompat`.
 //!   All overlapping field names share the same type upstream, so the merged
 //!   struct is wire-compatible in both directions; which fields are meaningful
 //!   is governed by `Model.api` (enforced by the adapters, not the type).
@@ -396,6 +397,9 @@ pub struct ProviderRequestOptions {
     /// Placeholder only — the telemetry pipeline is [DEFER] (v0.11
     /// requirements §1.2).
     pub telemetry_context: Option<TelemetryContext>,
+    /// Client identity and attribution, passed to adapters after
+    /// `before_provider_headers` (`transformHeaders`).
+    pub identity: Option<crate::utils::identity::ClientIdentity>,
     pub api_key: Option<String>,
     /// Optional fetch implementation for provider HTTP requests (R2.7.4).
     /// Defaults to the built-in reqwest transport — see [`FetchFn`].
@@ -680,6 +684,10 @@ pub struct ToolCall {
     /// (`toolcall_end` frames) and replay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// Complete arguments text was not a valid JSON object. `arguments` is
+    /// then empty and validation fails before tool execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments_error: Option<String>,
 }
 
 /// Serde `with` module that serializes a [`ToolCall`] with its upstream
@@ -984,6 +992,8 @@ pub struct ImagesOptions {
     /// Custom HTTP headers, merged over provider defaults; `None` suppresses
     /// a default header.
     pub headers: Option<ProviderHeaders>,
+    /// Client identity and attribution, applied by image providers.
+    pub identity: Option<crate::utils::identity::ClientIdentity>,
     /// HTTP request timeout in milliseconds.
     pub timeout_ms: Option<u64>,
     /// Maximum client-side retry attempts.
@@ -1170,6 +1180,8 @@ pub struct ClassifierOptions {
     pub on_payload: Option<ClassifierOnPayloadCallback>,
     pub on_response: Option<ClassifierOnResponseCallback>,
     pub headers: Option<ProviderHeaders>,
+    /// Client identity and attribution, applied by classifier transports.
+    pub identity: Option<crate::utils::identity::ClientIdentity>,
     pub timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_retry_delay_ms: Option<u64>,
@@ -2030,6 +2042,10 @@ pub struct ClassifierModel {
     pub context_window: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// System One compatibility overrides. Missing fields are detected from
+    /// the provider, base URL, and model id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compat: Option<ModelCompat>,
 }
 
 /// `AnyModel` (types.ts:1167-1168 @ 4a080252f): anything a provider can
@@ -2249,10 +2265,22 @@ impl ThinkingTokenBudgetField {
     }
 }
 
+/// `SystemOneCompat.imageInput`: the wire representation used for classifier
+/// images (7f225f25d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SystemOneImageInput {
+    #[serde(rename = "assets")]
+    Assets,
+    #[serde(rename = "images")]
+    Images,
+    #[serde(rename = "state-image-urls")]
+    StateImageUrls,
+}
+
 /// Merged compat settings for OpenAI-completions / OpenAI-responses /
-/// Anthropic-messages / Bedrock APIs (see file header note for why this is one
-/// flat struct). All fields optional; absent fields are omitted on the wire,
-/// matching upstream objects.
+/// Anthropic-messages / Bedrock / System One APIs (see file header note for
+/// why this is one flat struct). All fields optional; absent fields are
+/// omitted on the wire, matching upstream objects.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCompat {
@@ -2425,6 +2453,14 @@ pub struct ModelCompat {
     /// (first-party Anthropic only; proxies reject them).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_mid_convo_tool_changes: Option<bool>,
+
+    // --- SystemOneCompat ---
+    /// How a System One service accepts classifier images.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<SystemOneImageInput>,
+    /// Whether image requests send `TypeSafe-Danger-Zone-Images: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_image_opt_in_header: Option<bool>,
 }
 
 /// `AnthropicAllowedFallbackModel` (types.ts:307-311): one server-side
@@ -2804,6 +2840,7 @@ mod tests {
             arguments,
             thought_signature: Some("sig".to_owned()),
             namespace: None,
+            arguments_error: None,
         };
         let ev = StreamEvent::ToolCallEnd {
             content_index: 2,
@@ -2862,12 +2899,14 @@ mod tests {
             arguments: Map::new(),
             thought_signature: None,
             namespace: Some("dynamic_tools".to_owned()),
+            arguments_error: None,
         };
         let v: Value = serde_json::from_str(&to_json(&call)).expect("parse");
         assert_eq!(v["namespace"], json!("dynamic_tools"));
 
         let bare = ToolCall {
             namespace: None,
+            arguments_error: None,
             ..call.clone()
         };
         let v: Value = serde_json::from_str(&to_json(&bare)).expect("parse");
@@ -3029,6 +3068,7 @@ mod tests {
                 arguments: Map::new(),
                 thought_signature: Some("s".to_owned()),
                 namespace: None,
+                arguments_error: None,
             }),
         ];
         msg.usage.cache_write1h = Some(5);

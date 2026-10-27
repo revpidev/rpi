@@ -14,7 +14,7 @@
 
 use serde_json::{Map, Value};
 
-const VALID_JSON_ESCAPES: [char; 9] = ['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'];
+const VALID_JSON_ESCAPES: [char; 8] = ['"', '\\', '/', 'b', 'f', 'n', 'r', 't'];
 
 fn is_control_character(c: char) -> bool {
     (c as u32) <= 0x1f
@@ -262,6 +262,40 @@ pub fn parse_json_with_repair(json: &str) -> Result<Value, serde_json::Error> {
             // alloc-and-compare round trip.
             Some(repaired) => json_parse_lenient(&repaired),
             None => Err(first),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedToolCallArguments {
+    pub arguments: Map<String, Value>,
+    pub arguments_error: Option<String>,
+}
+
+/// `parseToolCallArguments` (`87f9a3641`): complete arguments never use the
+/// streaming parser's prefix recovery. Repairs are limited to string escapes;
+/// malformed or non-object input becomes `{}` plus a validation diagnostic.
+pub fn parse_tool_call_arguments(json: Option<&str>) -> ParsedToolCallArguments {
+    let Some(json) = json.filter(|json| !json.trim().is_empty()) else {
+        return ParsedToolCallArguments {
+            arguments: Map::new(),
+            arguments_error: None,
+        };
+    };
+    match parse_json_with_repair(json) {
+        Ok(Value::Object(arguments)) => ParsedToolCallArguments {
+            arguments,
+            arguments_error: None,
+        },
+        Ok(_) => ParsedToolCallArguments {
+            arguments: Map::new(),
+            arguments_error: Some(format!(
+                "Tool arguments must be a JSON object\n\nReceived arguments:\n{json}"
+            )),
+        },
+        Err(error) => ParsedToolCallArguments {
+            arguments: Map::new(),
+            arguments_error: Some(format!("{error}\n\nReceived arguments:\n{json}")),
         },
     }
 }
@@ -715,6 +749,35 @@ mod tests {
         assert_eq!(parse("not json at all"), json!({}));
         assert_eq!(parse("{\"a\":@}"), json!({}));
         assert_eq!(parse_streaming_json(Some("not json at all")), Map::new());
+    }
+
+    #[test]
+    fn final_tool_arguments_require_complete_json_objects() {
+        let valid = parse_tool_call_arguments(Some(r#"{"kind":"seek","note":"\url"}"#));
+        assert_eq!(valid.arguments["note"], json!("\\url"));
+        assert_eq!(valid.arguments_error, None);
+        assert_eq!(parse_tool_call_arguments(None).arguments, Map::new());
+        assert_eq!(parse_tool_call_arguments(Some(" ")).arguments_error, None);
+
+        for raw in [
+            r#"{"action":"apply","actions":[{"kind":"seek","time":.5}]}"#,
+            r#"{"kind":"seek","clipId":"clip-fl"#,
+        ] {
+            let parsed = parse_tool_call_arguments(Some(raw));
+            assert!(parsed.arguments.is_empty(), "{raw}");
+            assert!(
+                parsed.arguments_error.as_deref().is_some_and(|error| error
+                    .contains("Received arguments:\n")
+                    && error.ends_with(raw)),
+                "{parsed:?}"
+            );
+        }
+        let parsed = parse_tool_call_arguments(Some("[1,2]"));
+        assert!(parsed.arguments.is_empty());
+        assert_eq!(
+            parsed.arguments_error.as_deref(),
+            Some("Tool arguments must be a JSON object\n\nReceived arguments:\n[1,2]")
+        );
     }
 
     #[test]

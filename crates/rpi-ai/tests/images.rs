@@ -583,6 +583,7 @@ async fn resolves_final_assistant_images_result() {
 #[tokio::test]
 async fn builtin_images_models_registers_openrouter_with_catalog() {
     let models = builtin_images_models(Some(rpi_ai::models::CreateModelsOptions {
+        identity: None,
         credentials: None,
         auth_context: Some(Arc::new(FakeAuthContext {
             env: [("OPENROUTER_API_KEY".to_owned(), "or-key".to_owned())].into(),
@@ -631,6 +632,7 @@ async fn images_models_generate_images_applies_auth_and_dispatches() {
     let (base_url, mut requests) =
         serve(vec![ScriptResponse::json(200, image_response_body())]).await;
     let models = builtin_images_models(Some(rpi_ai::models::CreateModelsOptions {
+        identity: None,
         credentials: None,
         auth_context: Some(Arc::new(FakeAuthContext {
             env: [("OPENROUTER_API_KEY".to_owned(), "or-key".to_owned())].into(),

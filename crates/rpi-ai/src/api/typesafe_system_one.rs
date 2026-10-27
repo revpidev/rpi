@@ -8,12 +8,29 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::api::classifier_shared::is_record;
-use crate::api::system_one_shared::{SystemOneTransport, classify_system_one, typesafe_payload};
+use crate::api::system_one_shared::{
+    ResolvedSystemOneCompat, SystemOneTransport, classify_system_one, typesafe_payload,
+};
 use crate::types::{
     ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ProviderClassifier,
+    SystemOneImageInput,
 };
 
 pub const TYPESAFE_SYSTEM_ONE_API: &str = "typesafe-system-one";
+
+fn detect_compat(model: &ClassifierModel) -> ResolvedSystemOneCompat {
+    if model.provider == "openrouter" || model.base_url.contains("openrouter.ai") {
+        ResolvedSystemOneCompat {
+            image_input: SystemOneImageInput::StateImageUrls,
+            send_image_opt_in_header: false,
+        }
+    } else {
+        ResolvedSystemOneCompat {
+            image_input: SystemOneImageInput::Assets,
+            send_image_opt_in_header: true,
+        }
+    }
+}
 
 fn url(model: &ClassifierModel) -> Result<Url, String> {
     Url::parse(&format!(
@@ -33,6 +50,7 @@ fn output(body: &serde_json::Value) -> Result<serde_json::Value, String> {
 static TRANSPORT: SystemOneTransport = SystemOneTransport {
     api: TYPESAFE_SYSTEM_ONE_API,
     label: "System One API",
+    detect_compat,
     url,
     payload: typesafe_payload,
     output,

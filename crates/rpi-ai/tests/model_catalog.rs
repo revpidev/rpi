@@ -16,7 +16,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use rpi_ai::auth::{find_env_keys, get_env_api_key};
-use rpi_ai::generated::{builtin_catalog, get_builtin_model_data_generated_at, get_builtin_models};
+use rpi_ai::generated::{
+    builtin_catalog, get_builtin_model, get_builtin_model_data_generated_at, get_builtin_models,
+};
 use rpi_ai::types::{InputModality, MaxTokensField, ModelCompat};
 use rpi_ai::types::{ProviderEnv, ThinkingFormat};
 use sha2::Digest;
@@ -102,14 +104,14 @@ fn normalize_numbers(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Gateway-passthrough keys the Radius public catalog carries on every
-/// entry (`enabled` / `lab` / `providers` routing metadata from
-/// `{gateway}/v1/config`). Upstream TS spreads them into the Model objects
-/// untyped (nothing consumes them); our typed [`Model`] drops them at parse
-/// time — same intentional difference as the dynamic-path sanitize
+/// Gateway-passthrough keys the Radius public catalog carries on its entries
+/// (`enabled` / `lab` / `providers` routing metadata and the newer `free`
+/// flag from `{gateway}/v1/config`). Upstream TS spreads them into the Model
+/// objects untyped (nothing consumes them); our typed [`Model`] drops them at
+/// parse time — same intentional difference as the dynamic-path sanitize
 /// (D-032, `radius_config.rs` header). Stripped here so the field-by-field
 /// comparison stays exact for every declared field.
-const RADIUS_PASSTHROUGH_KEYS: [&str; 3] = ["enabled", "lab", "providers"];
+const RADIUS_PASSTHROUGH_KEYS: [&str; 4] = ["enabled", "free", "lab", "providers"];
 
 /// Runtime shape: every model in every vendored provider JSON survives the
 /// typed parse (`builtin_catalog`) and re-serialization field-for-field.
@@ -201,7 +203,9 @@ fn test_catalog_field_by_field_roundtrip() {
             total += 1;
         }
     }
-    assert_eq!(total, 1731);
+    // v1.4.0 generator @ 4a080252f, snapshot 2026-10-27T01:36:18.091Z:
+    // 1602 chat + 63 image + 53 classifier entries.
+    assert_eq!(total, 1718);
 }
 
 /// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
@@ -255,10 +259,64 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-10-19T09:55:38.636Z); update on catalog refresh.
+    // (2026-10-27T01:36:18.091Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_792_403_738_636)
+        Some(1_793_064_978_091)
+    );
+}
+
+/// V18-01 R2.1: required v1.4.0 catalog walk. Values come from the
+/// 2026-10-27 snapshot produced by the pinned generator, not hand-edited JSON.
+#[test]
+fn test_v18_required_catalog_walk() {
+    let copilot = get_model("github-copilot", "gpt-6.1-sol");
+    assert_eq!(copilot.api.as_str(), "openai-responses");
+    assert_eq!(copilot.context_window, 1_050_000);
+    assert_eq!(copilot.max_tokens, 128_000);
+
+    let nvidia = get_model("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b");
+    assert_eq!(nvidia.context_window, 1_048_576);
+
+    let xiaomi = get_model("xiaomi", "mimo-v2.6-pro");
+    let map = xiaomi.thinking_level_map.as_ref().expect("Xiaomi map");
+    assert_eq!(
+        map.get(&rpi_ai::types::ModelThinkingLevel::Off),
+        Some(&Some("off".to_owned()))
+    );
+    assert_eq!(
+        map.get(&rpi_ai::types::ModelThinkingLevel::Minimal),
+        Some(&None)
+    );
+    assert_eq!(
+        map.get(&rpi_ai::types::ModelThinkingLevel::High),
+        Some(&Some("high".to_owned()))
+    );
+
+    let minimax = get_model("minimax", "MiniMax-M3.1-Flash");
+    assert_eq!(minimax.api.as_str(), "anthropic-messages");
+    assert_eq!(minimax.context_window, 1_000_000);
+    assert!(
+        get_builtin_model("minimax", "MiniMax-M2.5").is_none(),
+        "old MiniMax models stay hidden after d2e7d8b7c"
+    );
+
+    for id in ["grok-4.3", "grok-4.5"] {
+        let grok = get_model("xai", id);
+        let map = grok.thinking_level_map.as_ref().expect("Grok map");
+        assert_eq!(
+            map.get(&rpi_ai::types::ModelThinkingLevel::Xhigh),
+            Some(&Some("xhigh".to_owned())),
+            "{id} must expose xhigh after fbc456d82"
+        );
+    }
+
+    let codex = get_model("openai-codex", "gpt-6.1-sol");
+    assert_eq!(codex.context_window, 500_000);
+    assert_eq!(codex.max_tokens, 128_000);
+    assert!(
+        get_builtin_model("openai-codex", "gpt-5.5").is_none(),
+        "ChatGPT-rejected models stay removed after fdce48eb4"
     );
 }
 
@@ -302,7 +360,8 @@ fn test_baseten_glm52_reasoning_model_fields() {
     assert_eq!(model.max_tokens, 262144);
     assert_eq!(model.cost.rates.input, 1.4);
     assert_eq!(model.cost.rates.output, 4.4);
-    assert_eq!(model.cost.rates.cache_read, 0.3);
+    // models.dev quoted 0.14 in the 2026-10-27 snapshot (was 0.3).
+    assert_eq!(model.cost.rates.cache_read, 0.14);
     assert_eq!(model.cost.rates.cache_write, 0.0);
 
     let compat = model.compat.as_ref().expect("compat");
@@ -322,16 +381,16 @@ fn test_baseten_glm52_reasoning_model_fields() {
     assert!(cta.contains_key("enable_thinking"));
 }
 
-/// "models Kimi K2.6 reasoning as an explicit off/on toggle"
-/// (baseten-models.test.ts).
+/// GLM 5.2 combines the chat-template thinking toggle with reasoning effort.
+/// Kimi K2.6 left the public catalog in the 2026-10-27 snapshot, so the
+/// toggle-format assertion now uses the current GLM fixture.
 #[test]
-fn test_baseten_kimi_k26_toggle_thinking() {
-    let model = get_model("baseten", "moonshotai/Kimi-K2.6");
+fn test_baseten_glm52_toggle_and_effort_thinking() {
+    let model = get_model("baseten", "zai-org/GLM-5.2");
     let tlm = model.thinking_level_map.as_ref().expect("thinkingLevelMap");
-    // off→off, high→high (rest null): explicit off/on toggle
     assert_eq!(
         tlm.get(&rpi_ai::types::ModelThinkingLevel::Off),
-        Some(&Some("off".to_owned()))
+        Some(&Some("none".to_owned()))
     );
     assert_eq!(
         tlm.get(&rpi_ai::types::ModelThinkingLevel::High),
@@ -339,11 +398,11 @@ fn test_baseten_kimi_k26_toggle_thinking() {
     );
     assert_eq!(
         tlm.get(&rpi_ai::types::ModelThinkingLevel::Max),
-        Some(&None)
+        Some(&Some("max".to_owned()))
     );
 
     let compat = model.compat.as_ref().expect("compat");
-    assert_eq!(compat.supports_reasoning_effort, Some(false));
+    assert_eq!(compat.supports_reasoning_effort, Some(true));
     assert_eq!(compat.thinking_format, Some(ThinkingFormat::Baseten));
     assert!(compat.chat_template_args.is_some());
 }
@@ -367,12 +426,11 @@ fn test_baseten_env_key_resolution() {
 #[test]
 fn test_baseten_deprecated_models_filtered() {
     let models = get_builtin_models("baseten");
-    // 24 models = upstream catalog after deprecated filtering (2026-10-19
-    // snapshot; models.dev added the DeepSeek V4.1 Flash 1017 pair).
+    // 14 models remain after deprecated filtering in the 2026-10-27 snapshot.
     assert_eq!(
         models.len(),
-        24,
-        "Baseten should have 24 non-deprecated models"
+        14,
+        "Baseten should have 14 non-deprecated models"
     );
     // No model name or id contains "deprecated".
     for model in models.iter() {

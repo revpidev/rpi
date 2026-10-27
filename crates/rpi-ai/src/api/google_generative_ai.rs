@@ -52,8 +52,8 @@ use crate::types::{
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
-    rpi_user_agent_headers,
+    headers_to_record, identity_headers, merge_headers_chain, model_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::provider_retry::ProviderErrorInfo;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
@@ -296,13 +296,14 @@ fn build_request_headers(
     model: &Model,
     api_key: Option<&str>,
     options_headers: Option<&crate::types::ProviderHeaders>,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
 ) -> crate::types::ProviderHeaders {
     let mut base = crate::types::ProviderHeaders::new();
     if let Some(api_key) = api_key {
         base.insert("x-goog-api-key".to_owned(), Some(api_key.to_owned()));
     }
     merge_headers_chain(&[
-        rpi_user_agent_headers(),
+        identity_headers(model, identity),
         Some(base),
         model_headers(model),
         options_headers.cloned(),
@@ -522,6 +523,7 @@ impl<'a> StreamProcessor<'a> {
                 .filter(|signature| !signature.is_empty())
                 .map(str::to_owned),
             namespace: None,
+            arguments_error: None,
         };
 
         self.output
@@ -687,7 +689,12 @@ async fn run(
         return Err(format!("No API key for provider: {}", model.provider));
     };
 
-    let headers = build_request_headers(model, Some(api_key), options.stream.headers.as_ref());
+    let headers = build_request_headers(
+        model,
+        Some(api_key),
+        options.stream.headers.as_ref(),
+        options.stream.identity.as_ref(),
+    );
     let mut params = build_params(model, context, options)?;
     if let Some(on_payload) = &options.stream.on_payload
         && let Some(next_params) = on_payload(params.clone(), model).await

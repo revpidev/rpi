@@ -305,6 +305,7 @@ impl NestedCallRunner {
             arguments,
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         };
         self.host
             .emit(NestedToolExecutionEvent::Start {

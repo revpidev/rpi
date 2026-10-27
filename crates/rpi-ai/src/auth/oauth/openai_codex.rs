@@ -201,7 +201,7 @@ fn decode_jwt(token: &str) -> Option<Value> {
 
 /// `getAccountId` — `payload["https://api.openai.com/auth"].chatgpt_account_id`
 /// (non-empty string).
-fn get_account_id(access_token: &str) -> Option<String> {
+pub(crate) fn get_account_id(access_token: &str) -> Option<String> {
     let payload = decode_jwt(access_token)?;
     let account_id = payload.get(JWT_CLAIM_PATH)?.get("chatgpt_account_id")?;
     match account_id.as_str() {

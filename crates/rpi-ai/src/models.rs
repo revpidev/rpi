@@ -129,6 +129,13 @@ pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
     fn base_url(&self) -> Option<&str>;
+
+    /// Native endpoint before user/extension overlays. Subscription OAuth
+    /// compares the request target against this trusted origin.
+    fn native_base_url(&self) -> Option<&str> {
+        self.base_url()
+    }
+
     fn headers(&self) -> Option<&ProviderHeaders>;
     fn auth(&self) -> &ProviderAuth;
 
@@ -383,6 +390,9 @@ pub struct RefreshModelsContext {
     /// Always present — even when the caller omits its optional signal, a
     /// concrete never-cancelled token is provided (models.ts:60-62).
     pub signal: CancellationToken,
+    /// Registered provider base URL after configuration overrides. OpenRouter
+    /// uses this for regional `/models/user` filtering (ee409a85f).
+    pub base_url: Option<String>,
 }
 
 impl RefreshModelsContext {
@@ -849,6 +859,7 @@ impl Provider for CreatedProvider {
                         last_modified: None,
                         checked_at: Some(now_millis()),
                         etag: None,
+                        credential_fingerprint: None,
                     })),
                     update: Some(Box::new(move || {
                         *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) = refreshed_clone;
@@ -918,22 +929,36 @@ pub fn create_provider(input: CreateProviderOptions) -> Arc<dyn Provider> {
 }
 
 /// `CreateModelsOptions`.
+#[derive(Default)]
 pub struct CreateModelsOptions {
     pub credentials: Option<Arc<dyn CredentialStore>>,
     pub auth_context: Option<Arc<dyn AuthContext>>,
     /// Persistent model storage for dynamic provider overlays
     /// (`modelsStore`, models.ts:198-226). Defaults to in-memory.
     pub models_store: Option<Arc<dyn ModelsStore>>,
+    /// Default client identity and attribution for all provider requests.
+    pub identity: Option<crate::utils::identity::ClientIdentity>,
 }
 
 /// Resolved request auth for the non-chat model runtimes (image/classifier);
 /// the image/classifier counterpart of the `(Model, StreamOptions)` tuple
 /// `apply_auth` returns.
-struct ResolvedRequestAuth {
+struct NonChatRequestOptions {
     api_key: Option<String>,
     headers: Option<ProviderHeaders>,
     env: Option<ProviderEnv>,
     base_url: Option<String>,
+    identity: Option<crate::utils::identity::ClientIdentity>,
+}
+
+struct NonChatRequest<'a> {
+    provider_id: &'a str,
+    model_base_url: &'a str,
+    model_headers: Option<&'a std::collections::BTreeMap<String, String>>,
+    api_key: Option<String>,
+    headers: Option<ProviderHeaders>,
+    env: Option<ProviderEnv>,
+    identity: Option<crate::utils::identity::ClientIdentity>,
 }
 
 /// `Models` — runtime collection of providers plus auth application and
@@ -953,6 +978,7 @@ pub struct Models {
     refresh_controllers: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Per-provider serial publication chain (models.ts:261).
     publication_chains: Arc<Mutex<HashMap<String, PublicationChain>>>,
+    identity: Option<crate::utils::identity::ClientIdentity>,
 }
 
 /// Type alias for the per-provider serial publication chain tail.
@@ -992,6 +1018,7 @@ impl Models {
             credentials: None,
             auth_context: None,
             models_store: None,
+            identity: None,
         });
         Self {
             providers: Arc::new(RwLock::new(OrderedMap::default())),
@@ -1007,7 +1034,13 @@ impl Models {
             refresh_generations: Arc::new(RwLock::new(HashMap::new())),
             refresh_controllers: Arc::new(Mutex::new(HashMap::new())),
             publication_chains: Arc::new(Mutex::new(HashMap::new())),
+            identity: options.identity,
         }
+    }
+
+    pub fn set_identity(&mut self, identity: crate::utils::identity::ClientIdentity) {
+        self.identity =
+            crate::utils::identity::merge_client_identity(self.identity.take(), Some(identity));
     }
 
     /// `supersedeProviderRefresh` (models.ts:320-329 @ 4181f66).
@@ -1611,6 +1644,7 @@ impl Models {
             allow_network: false,
             force: None,
             signal,
+            base_url: None,
         }
     }
 
@@ -1650,6 +1684,7 @@ impl Models {
             allow_network,
             force: if allow_network { force } else { None },
             signal: signal.clone(),
+            base_url: provider.base_url().map(str::to_owned),
         };
         if let Some(refresh) = provider.refresh_models(context) {
             refresh.await?;
@@ -1767,8 +1802,90 @@ impl Models {
         model: &Model,
         overrides: Option<&AuthResolutionOverrides>,
     ) -> Result<Option<AuthResult>, ModelsError> {
-        self.get_auth_for_headers(&model.provider, model.headers.as_ref(), overrides)
-            .await
+        let result = self
+            .get_auth_for_headers(&model.provider, model.headers.as_ref(), overrides)
+            .await?;
+        if result.is_some() {
+            self.validate_auth_origin(&model.provider, &model.base_url, overrides)
+                .await?;
+        }
+        Ok(result)
+    }
+
+    async fn read_request_credential(
+        &self,
+        provider: &Arc<dyn Provider>,
+        overrides: Option<&AuthResolutionOverrides>,
+    ) -> Result<Option<Credential>, ModelsError> {
+        if provider.auth().api_key.is_some()
+            && let Some(overrides) = overrides.filter(|overrides| overrides.api_key.is_some())
+        {
+            return Ok(Some(Credential::ApiKey(crate::auth::ApiKeyCredential {
+                key: overrides.api_key.clone(),
+                env: overrides.env.clone(),
+            })));
+        }
+        let signal = overrides
+            .and_then(|overrides| overrides.signal.clone())
+            .unwrap_or_default();
+        self.read_credential(provider.id(), &signal).await
+    }
+
+    async fn validate_auth_origin(
+        &self,
+        provider_id: &str,
+        configured_base_url: &str,
+        overrides: Option<&AuthResolutionOverrides>,
+    ) -> Result<(), ModelsError> {
+        let provider = self.get_provider(provider_id).ok_or_else(|| {
+            ModelsError::new(
+                ModelsErrorCode::Provider,
+                format!("Unknown provider: {provider_id}"),
+            )
+        })?;
+        if !provider
+            .auth()
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.is_subscription())
+        {
+            return Ok(());
+        }
+        if matches!(
+            self.read_request_credential(&provider, overrides).await?,
+            Some(Credential::OAuth(_))
+        ) {
+            crate::auth::request::validate_subscription_origin(
+                provider_id,
+                provider.auth(),
+                provider.native_base_url(),
+                configured_base_url,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the process-local credential identity used by provider and
+    /// usage consumers. No secret or account id is exposed by this view.
+    pub async fn get_resolved_request_auth(
+        &self,
+        model: &Model,
+        overrides: Option<&AuthResolutionOverrides>,
+    ) -> Result<Option<crate::auth::ResolvedRequestAuth>, ModelsError> {
+        let Some(result) = self.get_auth(model, overrides).await? else {
+            return Ok(None);
+        };
+        let provider = self.require_provider(model)?;
+        let credential = self.read_request_credential(&provider, overrides).await?;
+        crate::auth::ResolvedRequestAuth::resolve(
+            &model.provider,
+            provider.auth(),
+            provider.native_base_url(),
+            &model.base_url,
+            result,
+            credential,
+        )
+        .map(Some)
     }
 
     /// `getAuth` for a non-chat model (image/classifier entries carry the
@@ -1838,8 +1955,20 @@ impl Models {
         let api_key = stream_options
             .and_then(|o| o.api_key.clone())
             .or(auth.api_key);
-        let mut headers = merge_headers(
-            auth.headers.as_ref(),
+        let request_model_for_session = Model {
+            base_url: auth
+                .base_url
+                .clone()
+                .unwrap_or_else(|| model.base_url.clone()),
+            ..model.clone()
+        };
+        let session_headers = crate::utils::identity::get_opencode_session_headers(
+            (&request_model_for_session).into(),
+            stream_options.and_then(|options| options.session_id.as_deref()),
+        );
+        let mut headers = merge_headers(Some(&session_headers), auth.headers.as_ref());
+        headers = merge_headers(
+            headers.as_ref(),
             stream_options.and_then(|o| o.headers.as_ref()),
         );
         if let Some(transform) = transform_headers {
@@ -1867,6 +1996,10 @@ impl Models {
             options.api_key = api_key;
             options.headers = headers;
             options.env = env;
+            options.identity = crate::utils::identity::merge_client_identity(
+                self.identity.clone(),
+                stream_options.and_then(|options| options.identity.clone()),
+            );
             Some(options)
         };
 
@@ -1878,28 +2011,30 @@ impl Models {
     /// API keys / `models.json` headers) plus request-option overrides.
     async fn resolve_request_auth(
         &self,
-        provider_id: &str,
-        model_headers: Option<&std::collections::BTreeMap<String, String>>,
-        api_key: Option<String>,
-        headers: Option<ProviderHeaders>,
-        env: Option<ProviderEnv>,
-    ) -> Result<ResolvedRequestAuth, ModelsError> {
+        request: NonChatRequest<'_>,
+    ) -> Result<NonChatRequestOptions, ModelsError> {
+        let NonChatRequest {
+            provider_id,
+            model_base_url,
+            model_headers,
+            api_key,
+            headers,
+            env,
+            identity,
+        } = request;
         if self.get_provider(provider_id).is_none() {
             return Err(ModelsError::new(
                 ModelsErrorCode::Provider,
                 format!("Unknown provider: {provider_id}"),
             ));
         }
+        let overrides = AuthResolutionOverrides {
+            api_key: api_key.clone(),
+            env: env.clone(),
+            ..Default::default()
+        };
         let resolution = self
-            .get_auth_for_headers(
-                provider_id,
-                model_headers,
-                Some(&AuthResolutionOverrides {
-                    api_key: api_key.clone(),
-                    env: env.clone(),
-                    ..Default::default()
-                }),
-            )
+            .get_auth_for_headers(provider_id, model_headers, Some(&overrides))
             .await?;
         let Some(resolution) = resolution else {
             return Err(ModelsError::new(
@@ -1907,6 +2042,8 @@ impl Models {
                 format!("Provider is not configured: {provider_id}"),
             ));
         };
+        self.validate_auth_origin(provider_id, model_base_url, Some(&overrides))
+            .await?;
         let auth = resolution.auth;
         let env = match (resolution.env, env) {
             (None, None) => None,
@@ -1916,11 +2053,15 @@ impl Models {
                 Some(merged)
             }
         };
-        Ok(ResolvedRequestAuth {
+        Ok(NonChatRequestOptions {
             api_key: api_key.or(auth.api_key),
             headers: merge_headers(auth.headers.as_ref(), headers.as_ref()),
             env,
             base_url: auth.base_url,
+            identity: crate::utils::identity::merge_client_identity(
+                self.identity.clone(),
+                identity,
+            ),
         })
     }
 
@@ -1961,13 +2102,15 @@ impl Models {
                 )
             })?;
         let auth = self
-            .resolve_request_auth(
-                &model.provider,
-                model.headers.as_ref(),
-                options.and_then(|options| options.api_key.clone()),
-                options.and_then(|options| options.headers.clone()),
-                options.and_then(|options| options.env.clone()),
-            )
+            .resolve_request_auth(NonChatRequest {
+                provider_id: &model.provider,
+                model_base_url: &model.base_url,
+                model_headers: model.headers.as_ref(),
+                api_key: options.and_then(|options| options.api_key.clone()),
+                headers: options.and_then(|options| options.headers.clone()),
+                env: options.and_then(|options| options.env.clone()),
+                identity: options.and_then(|options| options.identity.clone()),
+            })
             .await
             .map_err(|error| error.message.clone())?;
         let request_model = match auth.base_url {
@@ -1982,6 +2125,7 @@ impl Models {
             options.api_key = auth.api_key;
             options.headers = auth.headers;
             options.env = auth.env;
+            options.identity = auth.identity;
             options
         };
         Ok(implementation
@@ -2026,13 +2170,15 @@ impl Models {
             )
         })?;
         let auth = self
-            .resolve_request_auth(
-                &model.provider,
-                model.headers.as_ref(),
-                options.and_then(|options| options.api_key.clone()),
-                options.and_then(|options| options.headers.clone()),
-                options.and_then(|options| options.env.clone()),
-            )
+            .resolve_request_auth(NonChatRequest {
+                provider_id: &model.provider,
+                model_base_url: &model.base_url,
+                model_headers: model.headers.as_ref(),
+                api_key: options.and_then(|options| options.api_key.clone()),
+                headers: options.and_then(|options| options.headers.clone()),
+                env: options.and_then(|options| options.env.clone()),
+                identity: options.and_then(|options| options.identity.clone()),
+            })
             .await
             .map_err(|error| error.message.clone())?;
         let request_model = match auth.base_url {
@@ -2047,6 +2193,7 @@ impl Models {
             options.api_key = auth.api_key;
             options.headers = auth.headers;
             options.env = auth.env;
+            options.identity = auth.identity;
             options
         };
         Ok(implementation
@@ -2661,6 +2808,7 @@ mod tests {
     fn models_with_store() -> (Models, Arc<InMemoryCredentialStore>) {
         let store = Arc::new(InMemoryCredentialStore::new());
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: Some(store.clone()),
             auth_context: None,
             models_store: None,
@@ -3154,6 +3302,7 @@ mod tests {
                                     last_modified: None,
                                     checked_at: Some(now_millis()),
                                     etag: None,
+                                    credential_fingerprint: None,
                                 })),
                                 update: Some(Box::new(move || {
                                     *dynamic_for_update.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -3189,6 +3338,7 @@ mod tests {
     #[tokio::test]
     async fn test_models_refresh_fetches_and_persists() {
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: None,
             models_store: Some(Arc::new(InMemoryModelsStore::new())),
@@ -3231,12 +3381,14 @@ mod tests {
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
             .await
             .expect("write");
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: None,
             models_store: Some(store),
@@ -3802,6 +3954,7 @@ mod tests {
                     last_modified: None,
                     checked_at: Some(now_millis()),
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -3868,6 +4021,7 @@ mod tests {
         });
 
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: None,
             models_store: Some(store),
@@ -3912,6 +4066,7 @@ mod tests {
                 last_modified: None,
                 checked_at: Some(now_millis()),
                 etag: None,
+                credential_fingerprint: None,
             })));
         let state = Arc::new(Mutex::new("initial".to_string()));
 
@@ -3950,6 +4105,7 @@ mod tests {
             entry: entry.clone(),
         });
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: None,
             models_store: Some(store),
@@ -4050,6 +4206,7 @@ mod tests {
 
         // Online instance: fetch_models returns a model.
         let online = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: Some(credentials.clone()),
             auth_context: None,
             models_store: Some(models_store.clone()),
@@ -4075,6 +4232,7 @@ mod tests {
         // Offline instance: fetch_models would throw, but allow_network=false
         // means it never runs — the stored catalog is restored instead.
         let offline = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: Some(credentials.clone()),
             auth_context: None,
             models_store: Some(models_store.clone()),
@@ -4216,6 +4374,7 @@ mod tests {
 
         let mrc = model_refresh_credential.clone();
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: Some(credentials.clone()),
             auth_context: None,
             models_store: None,
@@ -4356,6 +4515,7 @@ mod tests {
             signals: storage_signals.clone(),
         });
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: None,
             models_store: Some(store),
@@ -4384,6 +4544,7 @@ mod tests {
                                 last_modified: None,
                                 checked_at: Some(now_millis()),
                                 etag: None,
+                                credential_fingerprint: None,
                             })),
                             update: None,
                         })
@@ -4539,6 +4700,7 @@ mod tests {
         let finish_first_rx = Arc::new(std::sync::Mutex::new(Some(finish_first_rx)));
 
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: None,
             models_store: Some(store.clone()),
@@ -4583,6 +4745,7 @@ mod tests {
                                 last_modified: None,
                                 checked_at: Some(now_millis()),
                                 etag: None,
+                                credential_fingerprint: None,
                             })),
                             update: Some(Box::new({
                                 let state = state.clone();
@@ -5342,6 +5505,7 @@ mod tests {
         }
 
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: Some(store.clone()),
             auth_context: None,
             models_store: None,
@@ -5517,6 +5681,7 @@ mod tests {
         }
 
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: Some(delayed_store.clone()),
             auth_context: None,
             models_store: None,
@@ -5745,6 +5910,7 @@ mod tests {
             Box::pin(async { Ok(()) })
         });
         let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
             credentials: None,
             auth_context: None,
             models_store: Some(Arc::new(FailingReadStore)),

@@ -75,6 +75,8 @@ The `external/` submodules (`pi`, `pi-subagents`, `rpiv-mono`, `agent-smart-fetc
 
 Set your API key via the standard environment variable for your provider (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), or in `~/.rpi/agent/settings.json` / `models.json`. Anthropic, OpenAI (ChatGPT), OpenAI Codex, GitHub Copilot, OpenRouter, Kimi, Meta, xAI, and Radius support interactive OAuth login through `/login`.
 
+Kimi Code uses OpenAI Chat Completions. Its official base URL is `https://api.kimi.com/coding/v1`; any custom `baseUrl` in `models.json` or extension provider configuration must explicitly include `/v1` as a complete path segment. Update a legacy `https://api.kimi.com/coding` override to `https://api.kimi.com/coding/v1` or your proxy's explicit `/v1` URL. rpi does not append the suffix, rewrite the URL, or fall back to the old transport.
+
 ### Updating
 
 ```bash

@@ -718,6 +718,106 @@ async fn test_tool_call_stream() {
 }
 
 #[tokio::test]
+async fn malformed_final_tool_arguments_are_an_error_not_a_parsed_prefix() {
+    let mut body = event_frame("messageStart", r#"{"role":"assistant"}"#);
+    body.extend_from_slice(&event_frame(
+        "contentBlockStart",
+        r#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"toolu_1","name":"bash"}}}"#,
+    ));
+    body.extend_from_slice(&event_frame(
+        "contentBlockDelta",
+        r#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"a\":1,"}}}"#,
+    ));
+    body.extend_from_slice(&event_frame(
+        "contentBlockDelta",
+        r#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"\"b\":.5}"}}}"#,
+    ));
+    body.extend_from_slice(&event_frame(
+        "contentBlockStop",
+        r#"{"contentBlockIndex":0}"#,
+    ));
+    body.extend_from_slice(&event_frame("messageStop", r#"{"stopReason":"tool_use"}"#));
+    let model = claude_model("http://unused");
+    let (events, _request) = drive(
+        &model,
+        &context(vec![user_text("hi")]),
+        sigv4_options(test_env()),
+        (200, "application/vnd.amazon.eventstream", body),
+    )
+    .await;
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected done event");
+    };
+    let rpi_ai::types::AssistantContent::ToolCall(call) = &message.content[0] else {
+        panic!("expected tool call");
+    };
+    assert!(call.arguments.is_empty());
+    let error = call.arguments_error.as_deref().expect("argumentsError");
+    assert!(error.contains("Received arguments:\n"));
+    assert!(error.ends_with(r#"{"a":1,"b":.5}"#));
+}
+
+#[test]
+fn claude_error_tool_images_follow_results_and_other_models_keep_them_in_place() {
+    let message = |is_error: bool, content: Value| {
+        serde_json::from_value::<Message>(json!({
+            "role": "toolResult", "toolCallId": "call-1", "toolName": "codemode",
+            "content": content, "isError": is_error, "timestamp": 0
+        }))
+        .expect("tool result")
+    };
+    let text = |text: &str| json!({"type": "text", "text": text});
+    let image = |data: &str| json!({"type": "image", "mimeType": "image/png", "data": data});
+    let context = context(vec![
+        message(
+            true,
+            json!([text("Script failed"), image("AAAA"), text("Script error")]),
+        ),
+        message(false, json!([image("BBBB")])),
+    ]);
+    let claude = claude_model("http://unused");
+    let converted = rpi_ai::api::bedrock_converse_stream::convert_messages(
+        &context,
+        &claude,
+        rpi_ai::types::CacheRetention::None,
+        None,
+    )
+    .expect("convert");
+    let content = converted[0]["content"].as_array().expect("content");
+    assert_eq!(content.len(), 4);
+    assert_eq!(content[0]["toolResult"]["status"], json!("error"));
+    assert_eq!(
+        content[0]["toolResult"]["content"][1]["text"],
+        json!("(image attached after the tool results)")
+    );
+    assert_eq!(content[1]["toolResult"]["status"], json!("success"));
+    assert_eq!(
+        content[2]["text"],
+        json!("Images from the error result of tool call call-1 (codemode):")
+    );
+    assert_eq!(content[3]["image"]["format"], json!("png"));
+
+    let mut nova = claude;
+    nova.id = "amazon.nova-test".to_owned();
+    nova.name = "Nova".to_owned();
+    let converted = rpi_ai::api::bedrock_converse_stream::convert_messages(
+        &context,
+        &nova,
+        rpi_ai::types::CacheRetention::None,
+        None,
+    )
+    .expect("convert");
+    let content = converted[0]["content"].as_array().expect("content");
+    assert_eq!(content.len(), 2);
+    assert!(
+        content[0]["toolResult"]["content"][1]
+            .get("image")
+            .is_some()
+    );
+    assert_eq!(content[1]["toolResult"]["status"], json!("success"));
+}
+
+#[tokio::test]
 async fn test_error_stream_exception_frame() {
     let mut body = event_frame("messageStart", r#"{"role":"assistant"}"#);
     body.extend_from_slice(&exception_frame(
@@ -1447,6 +1547,7 @@ async fn test_convert_messages_empty_text_placeholder() {
                 arguments: serde_json::Map::new(),
                 thought_signature: None,
                 namespace: None,
+                arguments_error: None,
             },
         )],
         api: ApiKind::from(ApiKind::BEDROCK_CONVERSE_STREAM),
@@ -1684,6 +1785,7 @@ async fn test_convert_messages_sanitizes_empty_tool_argument_keys() {
                 .collect(),
                 thought_signature: None,
                 namespace: None,
+                arguments_error: None,
             },
         )],
         api: ApiKind::from(ApiKind::BEDROCK_CONVERSE_STREAM),

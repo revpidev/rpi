@@ -2,8 +2,8 @@
 //!
 //! Ports the catalog-read side of `packages/ai/src/models.generated.ts` +
 //! `packages/ai/src/providers/all.ts` (`getBuiltinModel` / `getBuiltinProviders`
-//! / `getBuiltinModels` / `getBuiltinModelDataGeneratedAt`) @ pi 0.82.1
-//! (2efa728).
+//! / `getBuiltinModels` / `getBuiltinModelDataGeneratedAt`) @ pi 1.4.0
+//! (4a080252f).
 //!
 //! `build.rs` embeds the vendored `src/providers/data/*.json` (upstream
 //! `providers/data/`, corrections of `generate-models.ts` already baked in —
@@ -15,8 +15,8 @@
 //! Intentional differences:
 //! - Upstream generates TS literals (`models.generated.ts`); we embed the
 //!   vendored JSON and parse with serde at first access (build-time codegen of
-//!   1217 model literals was rejected as compile-time noise). Data content is
-//!   identical — verified field-by-field against the upstream JSONs in
+//!   the full model catalog was rejected as compile-time noise). Data content
+//!   is identical — verified field-by-field against the upstream JSONs in
 //!   `tests/model_catalog.rs`.
 //! - Upstream `getBuiltinModels(unknown)` returns `[]`; mirrored here as an
 //!   empty slice. Parse failures are impossible with intact vendored data and
@@ -302,10 +302,9 @@ mod tests {
             .iter()
             .map(|provider| catalog.models(provider).len())
             .sum();
-        // Schema v6 regen @ abe508e1b rules (models.dev + OpenRouter +
-        // NVIDIA + Vercel AI Gateway snapshot 2026-10-19; +typesafe.json vs
-        // the 2026-09-23 schemaVersion 3 snapshot).
-        assert_eq!(total, 1622);
+        // Schema v6 regen with the v1.4.0 generator @ 4a080252f; public
+        // catalog snapshot 2026-10-27T01:36:18.091Z.
+        assert_eq!(total, 1602);
         let images: usize = catalog
             .providers()
             .iter()
@@ -317,7 +316,7 @@ mod tests {
             .map(|provider| catalog.classifier_models(provider).len())
             .sum();
         assert_eq!(images, 63);
-        assert_eq!(classifiers, 46);
+        assert_eq!(classifiers, 53);
         // Radius ships its static public catalog since 4d38031fb; the
         // gateway overlay lives in `providers::radius`.
         assert!(catalog.providers().contains(&"radius"));

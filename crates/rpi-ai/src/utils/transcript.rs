@@ -359,37 +359,73 @@ pub fn has_non_additive_tool_changes(messages: &[Message]) -> bool {
     false
 }
 
-/// `TranscriptTools` (transcript.ts:207-216).
+/// How a transport can express tool changes after the first request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptToolSupport {
+    None,
+    Additions,
+    Changes,
+}
+
+/// `TranscriptTools` (transcript.ts:210-231 @ `caa6967b6`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptTools {
     /// Tools sent in the top-level request field.
     pub request_tools: Vec<Tool>,
-    /// Whether later system messages carry their own `toolsAdded` as
-    /// in-place additions. When false, `request_tools` already holds the
-    /// complete current tool set.
-    pub anchors_additions: bool,
+    /// Number of leading system messages already folded into `request_tools`.
+    pub folded_system_messages: usize,
 }
 
-/// `resolveTranscriptTools` (transcript.ts:218-231): split tool declarations
-/// between the top-level request field and in-place additions. Transports
-/// that can anchor additions at a system message keep the initial tools at
-/// the top and load later ones where they appear; that only works when no
-/// tool was removed or redeclared, so everything else sends the current
-/// tool list.
+/// Split declarations between the top-level field and in-place updates.
+/// `Changes` declares every tool in place, allowing later replacements without
+/// invalidating the cached prefix. `Additions` folds through the last removal
+/// or redefinition; later additions remain anchored.
 pub fn resolve_transcript_tools(
     messages: &[Message],
-    supports_tool_additions: bool,
+    support: TranscriptToolSupport,
 ) -> TranscriptTools {
-    let anchors_additions = supports_tool_additions && !has_non_additive_tool_changes(messages);
+    let system_messages: Vec<&crate::types::SystemMessage> = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::System(system) => Some(system),
+            _ => None,
+        })
+        .collect();
+    if support == TranscriptToolSupport::None {
+        return TranscriptTools {
+            request_tools: get_current_tools(messages),
+            folded_system_messages: system_messages.len(),
+        };
+    }
+    if support == TranscriptToolSupport::Changes {
+        return TranscriptTools {
+            request_tools: Vec::new(),
+            folded_system_messages: 0,
+        };
+    }
+    let mut folded = usize::from(get_initial_system_message(messages).is_some());
+    let mut declared = std::collections::HashSet::new();
+    for (index, message) in system_messages.iter().enumerate() {
+        let added = message.tools_added.as_deref().unwrap_or_default();
+        if message
+            .tools_removed
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            || added.iter().any(|tool| declared.contains(&tool.name))
+        {
+            folded = folded.max(index + 1);
+        }
+        for tool in added {
+            declared.insert(&tool.name);
+        }
+    }
+    let folded_messages: Vec<Message> = system_messages[..folded]
+        .iter()
+        .map(|message| Message::System((*message).clone()))
+        .collect();
     TranscriptTools {
-        request_tools: if anchors_additions {
-            get_initial_system_message(messages)
-                .and_then(|message| message.tools_added.clone())
-                .unwrap_or_default()
-        } else {
-            get_current_tools(messages)
-        },
-        anchors_additions,
+        request_tools: get_current_tools(&folded_messages),
+        folded_system_messages: folded,
     }
 }
 
@@ -654,8 +690,8 @@ mod tests {
                 timestamp: 1,
             }),
         ];
-        let resolved = resolve_transcript_tools(&messages, true);
-        assert!(!resolved.anchors_additions);
+        let resolved = resolve_transcript_tools(&messages, TranscriptToolSupport::Additions);
+        assert_eq!(resolved.folded_system_messages, 2);
         let names: Vec<&str> = resolved
             .request_tools
             .iter()
@@ -671,11 +707,15 @@ mod tests {
             messages: vec![system("", 1)],
             tools: Some(vec![tool("a")]),
         });
-        let anchored = resolve_transcript_tools(&context.messages, true);
-        assert!(anchored.anchors_additions);
+        let anchored =
+            resolve_transcript_tools(&context.messages, TranscriptToolSupport::Additions);
+        assert_eq!(anchored.folded_system_messages, 1);
         assert_eq!(anchored.request_tools, vec![tool("a")]);
-        let collapsed = resolve_transcript_tools(&context.messages, false);
-        assert!(!collapsed.anchors_additions);
+        let collapsed = resolve_transcript_tools(&context.messages, TranscriptToolSupport::None);
+        assert_eq!(collapsed.folded_system_messages, 2);
         assert_eq!(collapsed.request_tools, vec![tool("a")]);
+        let changes = resolve_transcript_tools(&context.messages, TranscriptToolSupport::Changes);
+        assert_eq!(changes.folded_system_messages, 0);
+        assert!(changes.request_tools.is_empty());
     }
 }

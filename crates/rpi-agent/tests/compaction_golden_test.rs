@@ -796,6 +796,7 @@ async fn summarization_tool_call_response_is_rejected() {
                             id: "call-1".to_owned(),
                             name: "bash".to_owned(),
                             namespace: None,
+                            arguments_error: None,
                             arguments: serde_json::Map::new(),
                             thought_signature: None,
                         },

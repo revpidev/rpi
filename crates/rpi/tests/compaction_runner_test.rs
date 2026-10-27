@@ -353,6 +353,71 @@ async fn check_compaction_overflow_recovery_is_attempted_only_once() {
     );
 }
 
+/// Copilot's byte-size 413 is overflow even with a large token window. The
+/// recovery compacts the image history before a retry is scheduled.
+#[tokio::test]
+async fn copilot_413_compacts_image_history_before_retry() {
+    let mut fixture = fixture(settings(), vec![scripted("SUMMARY")]);
+    fixture.seed_turn("old image review", "reviewed", 100);
+    let image_result: AgentMessage = serde_json::from_value(json!({
+        "role": "toolResult",
+        "toolCallId": "old-images",
+        "toolName": "read",
+        "content": [{"type": "image", "mimeType": "image/png", "data": "AAAA"}],
+        "isError": false,
+        "timestamp": now_ms() + 1,
+    }))
+    .expect("image result");
+    fixture
+        .runner
+        .session_mut()
+        .append_message(image_result.clone())
+        .expect("append image result");
+    let mut messages = fixture.agent.state().messages;
+    messages.push(image_result);
+    fixture.agent.set_messages(messages);
+    fixture.seed_turn(
+        &format!("recent notes: {}", "x".repeat(80_000)),
+        "ready",
+        100,
+    );
+    let mut messages = fixture.agent.state().messages;
+    let mut overflow = overflow_error();
+    overflow.error_message = Some(
+        "github-copilot API error (413): {\"message\":\"failed to parse request\",\"code\":\"\"}"
+            .to_owned(),
+    );
+    messages.push(AgentMessage::Assistant(overflow.clone()));
+    fixture.agent.set_messages(messages);
+
+    assert!(fixture.runner.check_compaction(&overflow, true).await);
+    let events = fixture.events();
+    let Some(CompactionEvent::CompactionEnd {
+        reason,
+        will_retry,
+        aborted,
+        result,
+        ..
+    }) = events.last()
+    else {
+        panic!("expected compaction end: {events:?}");
+    };
+    assert_eq!(
+        *reason,
+        rpi::core::compaction_runner::CompactionReason::Overflow
+    );
+    assert!(will_retry);
+    assert!(!aborted);
+    assert!(result.is_some());
+    let projection = fixture.runner.session().build_session_context();
+    assert!(
+        !projection.messages.iter().any(|message| {
+            matches!(message, AgentMessage::ToolResult(result) if result.content.iter().any(|block| matches!(block, rpi_ai::types::ToolResultContent::Image(_))))
+        }),
+        "the retry projection must not contain the old images"
+    );
+}
+
 /// Threshold branch: error/zero-usage messages estimate with the last valid usage
 /// (:2017-2037).
 #[tokio::test]

@@ -13,6 +13,7 @@ pub mod event_stream;
 pub mod hash;
 pub mod headers;
 pub mod http_proxy;
+pub mod identity;
 pub mod json_parse;
 pub mod overflow;
 pub mod provider_env;

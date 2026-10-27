@@ -201,6 +201,7 @@ fn to_pi_classifier_model(
         cost: rpi_ai::types::ModelCost::default(),
         context_window: context_window_of(model),
         headers: None,
+        compat: None,
     })
 }
 
@@ -451,6 +452,7 @@ impl Provider for LlamaProvider {
                             last_modified: None,
                             checked_at: Some(now_millis()),
                             etag: None,
+                            credential_fingerprint: None,
                         })),
                         update: None,
                     })
@@ -1079,6 +1081,7 @@ mod tests {
                     last_modified: None,
                     checked_at: None,
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -1105,6 +1108,7 @@ mod tests {
             allow_network: false,
             force: None,
             signal,
+            base_url: None,
         };
 
         // A network attempt would fail loudly (no credential → early Ok);
@@ -1161,6 +1165,7 @@ mod tests {
                     last_modified: None,
                     checked_at: None,
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -1186,6 +1191,7 @@ mod tests {
             allow_network: false,
             force: None,
             signal,
+            base_url: None,
         };
         provider
             .refresh_models(context)

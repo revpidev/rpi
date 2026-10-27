@@ -253,3 +253,29 @@ async fn unrelated_errors_do_not_get_the_chatgpt_usage_link() {
     let message = error_message(&events);
     assert!(!message.contains(USAGE_URL), "no hint: {message}");
 }
+
+#[tokio::test]
+async fn workspace_usage_limit_is_not_retried_and_names_the_admin_action() {
+    const BODY: &str = r#"{"error":{"code":"subscription_sharing_workplace_individual_usage_limit_exceeded","message":"Usage limit reached."}}"#;
+    let (base_url, mut captured) = serve(vec![(429, BODY)]).await;
+    let m = model(&base_url);
+    let mut options = options();
+    options.max_retries = Some(3);
+    let events: Vec<StreamEvent> = tokio::time::timeout(
+        Duration::from_secs(10),
+        OpenAiResponses
+            .stream(&m, &context(), Some(options))
+            .collect(),
+    )
+    .await
+    .expect("stream completes");
+    assert!(captured.recv().await.is_some());
+    assert!(
+        captured.try_recv().is_err(),
+        "workspace limit must not retry"
+    );
+    let message = error_message(&events);
+    assert!(message.contains("subscription_sharing_workplace_individual_usage_limit_exceeded"));
+    assert!(message.contains("workspace admin"));
+    assert!(message.contains("admin.openai.com"));
+}

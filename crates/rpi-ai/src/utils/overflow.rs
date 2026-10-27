@@ -53,6 +53,8 @@ fn overflow_patterns() -> &'static [Regex] {
             r"(?i)context[_ ]length[_ ]exceeded",
             r"(?i)too many tokens",
             r"(?i)token limit exceeded",
+            // HTTP 413 is request-size overflow regardless of provider or body.
+            r"(?i)^(?:[\w -]+ API error \(413\):|413(?:\s|:|$))",
         ]
         .iter()
         .map(|pattern| build_pattern(pattern))
@@ -62,8 +64,8 @@ fn overflow_patterns() -> &'static [Regex] {
 }
 
 /// `CEREBRAS_BODYLESS_OVERFLOW_PATTERN` (#9482, 661619e87 @ d1230ea20):
-/// bodyless 400/413 responses are only an overflow signal from Cerebras —
-/// other providers report genuine bad requests / payload limits that way.
+/// bodyless 400 responses are only an overflow signal from Cerebras. HTTP 413
+/// is handled provider-independently above.
 fn cerebras_bodyless_overflow_pattern() -> &'static Regex {
     static PATTERN: LazyLock<Regex> =
         LazyLock::new(|| build_pattern(r"(?i)^4(?:00|13)\s*(?:status code)?\s*\(no body\)"));
@@ -189,6 +191,41 @@ mod tests {
     }
 
     #[test]
+    fn http_413_is_request_size_overflow_only_on_error_and_only_at_the_start() {
+        for message in [
+            "github-copilot API error (413): {\"message\":\"failed to parse request\",\"code\":\"\"}",
+            "custom-provider API error (413): Payload Too Large",
+            "413 {\"error\":{\"message\":\"failed to parse request\"}}",
+            "413",
+        ] {
+            for provider in ["github-copilot", "custom-provider"] {
+                let message = assistant_for_provider(StopReason::Error, Some(message), provider);
+                assert!(is_context_overflow(&message, Some(1_000_000)), "{provider}");
+            }
+        }
+        for message in [
+            "github-copilot API error (400): {\"message\":\"failed to parse request\"}",
+            "custom-provider API error (429): Too many requests",
+            "github-copilot API error (400): invalid value 413",
+            "custom-provider API error (400): upstream mentioned OpenAI API error (413): invalid input",
+            "custom-provider API error (4130): invalid input",
+            "4130 failed to parse request",
+        ] {
+            let message =
+                assistant_for_provider(StopReason::Error, Some(message), "github-copilot");
+            assert!(!is_context_overflow(&message, None));
+        }
+        for stop_reason in [StopReason::Aborted, StopReason::Stop] {
+            let message = assistant_for_provider(
+                stop_reason,
+                Some("OpenAI API error (413): failed to parse request"),
+                "github-copilot",
+            );
+            assert!(!is_context_overflow(&message, None));
+        }
+    }
+
+    #[test]
     fn test_overflow_pattern_hits() {
         let cases = [
             "prompt is too long: 213462 tokens > 200000 maximum",
@@ -240,26 +277,35 @@ mod tests {
         }
     }
 
-    /// #9482 (661619e87 @ d1230ea20): bodyless 400/413 counts as overflow
-    /// only for Cerebras; other providers keep it unclassified.
+    /// Bodyless 400 is provider-scoped; 413 is universally request-size overflow.
     #[test]
     fn test_bodyless_overflow_scoped_to_cerebras() {
-        for message in ["400 status code (no body)", "413 status code (no body)"] {
-            assert!(
-                is_context_overflow(
-                    &assistant_for_provider(StopReason::Error, Some(message), "cerebras"),
-                    Some(131_072)
+        for provider in ["cerebras", "opencode-go"] {
+            assert!(is_context_overflow(
+                &assistant_for_provider(
+                    StopReason::Error,
+                    Some("413 status code (no body)"),
+                    provider
                 ),
-                "cerebras should detect: {message}"
-            );
-            assert!(
-                !is_context_overflow(
-                    &assistant_for_provider(StopReason::Error, Some(message), "opencode-go"),
-                    Some(1_000_000)
-                ),
-                "non-cerebras should not detect: {message}"
-            );
+                Some(1_000_000)
+            ));
         }
+        assert!(is_context_overflow(
+            &assistant_for_provider(
+                StopReason::Error,
+                Some("400 status code (no body)"),
+                "cerebras"
+            ),
+            Some(131_072)
+        ));
+        assert!(!is_context_overflow(
+            &assistant_for_provider(
+                StopReason::Error,
+                Some("400 status code (no body)"),
+                "opencode-go"
+            ),
+            Some(1_000_000)
+        ));
     }
 
     #[test]

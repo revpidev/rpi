@@ -707,6 +707,7 @@ fn process_proxy_event(
                     arguments: Map::new(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 }),
             )?;
             partial_jsons.insert(content_index, String::new());
@@ -953,6 +954,7 @@ mod tests {
                         arguments: Map::new(),
                         thought_signature: None,
                         namespace: None,
+                        arguments_error: None,
                     },
                 },
             ),
@@ -1058,6 +1060,7 @@ mod tests {
                 arguments: json!({"cmd": "ls"}).as_object().expect("object").clone(),
                 thought_signature: None,
                 namespace: None,
+                arguments_error: None,
             })
         );
 
@@ -1081,6 +1084,7 @@ mod tests {
                 .clone(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         };
         let end = process_proxy_event(
             ProxyAssistantMessageEvent::ToolCallEnd {

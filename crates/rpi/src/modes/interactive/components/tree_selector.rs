@@ -2676,6 +2676,7 @@ mod tests {
             arguments: arguments.as_object().cloned().unwrap_or_default(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })
     }
 

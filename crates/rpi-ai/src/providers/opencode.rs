@@ -70,6 +70,7 @@ fn api_map() -> HashMap<String, Arc<dyn ProviderStreams>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated::get_builtin_model;
 
     #[test]
     fn api_map_covers_the_four_catalog_apis() {
@@ -91,6 +92,17 @@ mod tests {
                 model.api
             );
         }
+        let gemini = get_builtin_model("opencode", "gemini-4-argon").expect("Gemini");
+        assert_eq!(gemini.api, ApiKind::GOOGLE_GENERATIVE_AI.into());
+        assert_eq!(gemini.base_url, "https://opencode.ai/inference/v1");
+        let classifier = get_builtin_all_models("opencode")
+            .iter()
+            .find_map(|model| match model {
+                crate::types::AnyModel::Classifier(model) => Some(model),
+                _ => None,
+            })
+            .expect("OpenCode classifier");
+        assert_eq!(classifier.base_url, "https://opencode.ai/inference/v1");
     }
 
     /// #9326 (561a2e066): provider dispatch wraps every adapter with the

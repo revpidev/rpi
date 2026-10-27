@@ -356,6 +356,7 @@ impl Provider for RemoteCatalogProvider {
                     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                         if let Some(stored) = &stored {
                             let entry = ModelsStoreEntry {
+                                credential_fingerprint: None,
                                 checked_at: Some(checked_at),
                                 ..stored.clone()
                             };
@@ -377,6 +378,7 @@ impl Provider for RemoteCatalogProvider {
                         // refresh re-downloads instead of 304-ing forever
                         // (remote-catalog-provider.ts:90-98).
                         let entry = ModelsStoreEntry {
+                            credential_fingerprint: None,
                             models: stored
                                 .as_ref()
                                 .map(|stored| stored.models.clone())
@@ -400,6 +402,7 @@ impl Provider for RemoteCatalogProvider {
                         // next refresh revalidate instead of downloading the
                         // catalog (remote-catalog-provider.ts:99-104).
                         let entry = ModelsStoreEntry {
+                            credential_fingerprint: None,
                             models: stored
                                 .as_ref()
                                 .map(|stored| stored.models.clone())
@@ -443,6 +446,7 @@ impl Provider for RemoteCatalogProvider {
                         return Ok(());
                     }
                     let entry = ModelsStoreEntry {
+                        credential_fingerprint: None,
                         models: refreshed,
                         last_modified: Some(last_modified),
                         checked_at: Some(checked_at),
@@ -481,6 +485,332 @@ impl Provider for RemoteCatalogProvider {
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
         self.inner.stream_simple(model, context, options)
+    }
+
+    fn generate_images(
+        &self,
+        model: &rpi_ai::types::ImageModel,
+        context: &rpi_ai::types::ImagesContext,
+        options: Option<&rpi_ai::types::ImagesOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::AssistantImages>> {
+        self.inner.generate_images(model, context, options)
+    }
+
+    fn classify(
+        &self,
+        model: &rpi_ai::types::ClassifierModel,
+        context: &rpi_ai::types::ClassifierContext,
+        options: Option<&rpi_ai::types::ClassifierOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::ClassifierResult>> {
+        self.inner.classify(model, context, options)
+    }
+
+    fn image_generator(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderImageGenerator>> {
+        self.inner.image_generator(api)
+    }
+
+    fn classifier(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderClassifier>> {
+        self.inner.classifier(api)
+    }
+}
+
+/// Observable source of the OpenRouter catalog currently exposed by a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenRouterCatalogSource {
+    BuiltIn,
+    Cache,
+    Network,
+}
+
+/// OpenRouter's personalized catalog decorator (withPersonalizedCatalog,
+/// ee409a85f). A stored entry is restored only when its irreversible
+/// credential fingerprint matches the effective key (R2.3.2).
+pub struct OpenRouterCatalogProvider {
+    inner: Arc<dyn Provider>,
+    catalog_base_url: String,
+    local_generated_at: Option<i64>,
+    personal_models: Arc<Mutex<Vec<AnyModel>>>,
+    source: Arc<Mutex<OpenRouterCatalogSource>>,
+    inflight: InflightRefresh,
+}
+
+/// Wrap the built-in OpenRouter provider with remote + per-key catalog refresh.
+pub fn with_openrouter_catalog(
+    provider: Arc<dyn Provider>,
+    catalog_base_url: Option<String>,
+    local_generated_at: Option<i64>,
+) -> Arc<OpenRouterCatalogProvider> {
+    Arc::new(OpenRouterCatalogProvider {
+        inner: provider,
+        catalog_base_url: catalog_base_url.unwrap_or_else(|| DEFAULT_CATALOG_BASE_URL.to_owned()),
+        local_generated_at,
+        personal_models: Arc::new(Mutex::new(Vec::new())),
+        source: Arc::new(Mutex::new(OpenRouterCatalogSource::BuiltIn)),
+        inflight: InflightRefresh::new(),
+    })
+}
+
+impl OpenRouterCatalogProvider {
+    pub fn inner(&self) -> &Arc<dyn Provider> {
+        &self.inner
+    }
+
+    pub fn catalog_source(&self) -> OpenRouterCatalogSource {
+        *self.source.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn current_models(&self) -> Vec<AnyModel> {
+        let personal = self
+            .personal_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if personal.is_empty() {
+            self.inner.get_all_models()
+        } else {
+            personal
+        }
+    }
+}
+
+impl Provider for OpenRouterCatalogProvider {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        self.inner.base_url()
+    }
+
+    fn headers(&self) -> Option<&ProviderHeaders> {
+        self.inner.headers()
+    }
+
+    fn auth(&self) -> &rpi_ai::auth::ProviderAuth {
+        self.inner.auth()
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        self.current_models()
+            .into_iter()
+            .filter_map(AnyModel::into_chat)
+            .collect()
+    }
+
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        self.current_models()
+    }
+
+    fn filter_models(
+        &self,
+        models: Vec<Model>,
+        credential: Option<&rpi_ai::auth::Credential>,
+    ) -> Vec<Model> {
+        self.inner.filter_models(models, credential)
+    }
+
+    fn filter_all_models(
+        &self,
+        models: Vec<AnyModel>,
+        credential: Option<&rpi_ai::auth::Credential>,
+    ) -> Vec<AnyModel> {
+        self.inner.filter_all_models(models, credential)
+    }
+
+    fn refresh_models(
+        &self,
+        context: RefreshModelsContext,
+    ) -> Option<BoxFuture<'_, Result<(), ModelsError>>> {
+        let inner = self.inner.clone();
+        let catalog_base_url = self.catalog_base_url.clone();
+        let local_generated_at = self.local_generated_at;
+        let personal_models = self.personal_models.clone();
+        let source = self.source.clone();
+        let inflight = &self.inflight;
+        Some(Box::pin(async move {
+            inflight
+                .join_or_run(async move {
+                    let fingerprint = rpi_ai::providers::openrouter::credential_fingerprint(
+                        context.credential.as_ref(),
+                    );
+                    let restored = context
+                        .stored
+                        .as_ref()
+                        .filter(|stored| {
+                            fingerprint.is_some() && stored.credential_fingerprint == fingerprint
+                        })
+                        .map(|stored| {
+                            stored
+                                .models
+                                .iter()
+                                .filter(|model| model.provider() == inner.id())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let restored_source = if restored.is_empty() {
+                        OpenRouterCatalogSource::BuiltIn
+                    } else {
+                        OpenRouterCatalogSource::Cache
+                    };
+                    let restored_for_update = restored.clone();
+                    let personal_for_update = personal_models.clone();
+                    let source_for_update = source.clone();
+                    let published = context
+                        .publish
+                        .publish(ModelsPublication {
+                            persist: None,
+                            update: Some(Box::new(move || {
+                                *personal_for_update
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = restored_for_update;
+                                *source_for_update.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    restored_source;
+                            })),
+                        })
+                        .await?;
+                    if !published || !context.allow_network || context.signal.is_cancelled() {
+                        return Ok(());
+                    }
+
+                    let url = catalog_url(&catalog_base_url, inner.id())?;
+                    let mut url = url;
+                    url.query_pairs_mut()
+                        .append_pair("types", &REMOTE_CATALOG_MODEL_TYPES.join(","));
+                    let ua = rpi_user_agent();
+                    let response = send_with_retry(
+                        move || {
+                            let url = url.clone();
+                            let ua = ua.clone();
+                            Box::pin(async move {
+                                reqwest::Client::new()
+                                    .get(url)
+                                    .header(reqwest::header::ACCEPT, "application/json")
+                                    .header(reqwest::header::USER_AGENT, ua)
+                            })
+                        },
+                        Some(&context.signal),
+                    )
+                    .await?;
+                    if context.signal.is_cancelled() {
+                        return Ok(());
+                    }
+                    let status = response.status();
+                    let mut remote = Vec::new();
+                    if status != reqwest::StatusCode::NOT_FOUND
+                        && status != reqwest::StatusCode::NOT_IMPLEMENTED
+                    {
+                        if !status.is_success() {
+                            return Err(ModelsError::new(
+                                ModelsErrorCode::ModelSource,
+                                format!(
+                                    "Model catalog request failed for {}: {status}",
+                                    inner.id()
+                                ),
+                            ));
+                        }
+                        let last_modified = parse_last_modified(&response);
+                        let body: serde_json::Value = response.json().await.map_err(|error| {
+                            ModelsError::with_cause(
+                                ModelsErrorCode::ModelSource,
+                                format!("Invalid model catalog from {catalog_base_url}"),
+                                &error.to_string(),
+                            )
+                        })?;
+                        let catalog = parse_catalog(inner.id(), &body).map_err(|message| {
+                            ModelsError::new(ModelsErrorCode::ModelSource, message)
+                        })?;
+                        if local_generated_at.is_none_or(|local| last_modified > local) {
+                            remote = catalog;
+                        }
+                    }
+                    let merged = merge_any_models(&inner.get_all_models(), &remote);
+                    let personalized =
+                        rpi_ai::providers::openrouter::personalize_openrouter_catalog(
+                            &merged, &context,
+                        )
+                        .await?;
+                    if context.signal.is_cancelled() {
+                        return Ok(());
+                    }
+                    let entry = ModelsStoreEntry {
+                        models: personalized.clone(),
+                        checked_at: Some(now_millis()),
+                        credential_fingerprint: fingerprint,
+                        ..Default::default()
+                    };
+                    let next_source = if personalized.is_empty() {
+                        OpenRouterCatalogSource::BuiltIn
+                    } else {
+                        OpenRouterCatalogSource::Network
+                    };
+                    let personal_for_update = personal_models.clone();
+                    let source_for_update = source.clone();
+                    context
+                        .publish
+                        .publish(ModelsPublication {
+                            persist: Some(Some(entry)),
+                            update: Some(Box::new(move || {
+                                *personal_for_update
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = personalized;
+                                *source_for_update.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    next_source;
+                            })),
+                        })
+                        .await?;
+                    Ok(())
+                })
+                .await
+        }))
+    }
+
+    fn stream(
+        &self,
+        model: &Model,
+        context: &TranscriptContext,
+        options: Option<StreamOptions>,
+    ) -> AssistantMessageEventStream {
+        self.inner.stream(model, context, options)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &TranscriptContext,
+        options: Option<SimpleStreamOptions>,
+    ) -> Result<AssistantMessageEventStream, String> {
+        self.inner.stream_simple(model, context, options)
+    }
+
+    fn generate_images(
+        &self,
+        model: &rpi_ai::types::ImageModel,
+        context: &rpi_ai::types::ImagesContext,
+        options: Option<&rpi_ai::types::ImagesOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::AssistantImages>> {
+        self.inner.generate_images(model, context, options)
+    }
+
+    fn classify(
+        &self,
+        model: &rpi_ai::types::ClassifierModel,
+        context: &rpi_ai::types::ClassifierContext,
+        options: Option<&rpi_ai::types::ClassifierOptions>,
+    ) -> Option<BoxFuture<'static, rpi_ai::types::ClassifierResult>> {
+        self.inner.classify(model, context, options)
+    }
+
+    fn image_generator(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderImageGenerator>> {
+        self.inner.image_generator(api)
+    }
+
+    fn classifier(&self, api: &str) -> Option<Arc<dyn rpi_ai::types::ProviderClassifier>> {
+        self.inner.classifier(api)
     }
 }
 
@@ -613,6 +943,7 @@ mod tests {
             allow_network,
             force: if allow_network { Some(force) } else { None },
             signal,
+            base_url: None,
         }
     }
 
@@ -640,6 +971,36 @@ mod tests {
             allow_network,
             force: if allow_network { Some(force) } else { None },
             signal,
+            base_url: None,
+        }
+    }
+
+    async fn make_openrouter_context(
+        store: Arc<dyn ModelsStore>,
+        credential: Option<rpi_ai::auth::Credential>,
+        allow_network: bool,
+        base_url: Option<String>,
+    ) -> RefreshModelsContext {
+        let stored = store.read("openrouter", None).await.unwrap_or(None);
+        let signal = CancellationToken::new();
+        let shared = Arc::new(PublishShared {
+            provider_id: "openrouter".to_owned(),
+            generation: 1,
+            signal: signal.clone(),
+            store: store.clone(),
+            chain: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_generations: Arc::new(std::sync::RwLock::new(std::collections::HashMap::from(
+                [("openrouter".to_owned(), 1)],
+            ))),
+        });
+        RefreshModelsContext {
+            credential,
+            stored,
+            publish: PublishHandle { shared },
+            allow_network,
+            force: if allow_network { Some(false) } else { None },
+            signal,
+            base_url,
         }
     }
 
@@ -1134,6 +1495,7 @@ mod tests {
                     last_modified: Some(now_millis()),
                     checked_at: Some(now_millis()),
                     etag: Some("\"catalog-1\"".to_owned()),
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -1147,6 +1509,154 @@ mod tests {
             .expect("offline refresh");
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["static", "cached"]);
+    }
+
+    /// R2.3.2: offline restoration is namespaced by the irreversible
+    /// credential fingerprint; another key or no key falls back to built-in.
+    #[tokio::test]
+    async fn openrouter_offline_restore_requires_the_same_credential() {
+        let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
+        let credential = rpi_ai::auth::Credential::ApiKey(rpi_ai::auth::ApiKeyCredential {
+            key: Some("sk-key-a".to_owned()),
+            env: None,
+        });
+        let fingerprint = rpi_ai::providers::openrouter::credential_fingerprint(Some(&credential));
+        let mut cached = model("cached-a");
+        cached.provider = "openrouter".to_owned();
+        store
+            .write(
+                "openrouter",
+                ModelsStoreEntry {
+                    models: vec![AnyModel::Chat(cached)],
+                    credential_fingerprint: fingerprint,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("write");
+        let provider = with_openrouter_catalog(
+            rpi_ai::providers::openrouter::openrouter_provider(),
+            Some("http://catalog.invalid".to_owned()),
+            None,
+        );
+        provider
+            .refresh_models(
+                make_openrouter_context(store.clone(), Some(credential.clone()), false, None).await,
+            )
+            .expect("refresh")
+            .await
+            .expect("offline restore");
+        assert_eq!(provider.catalog_source(), OpenRouterCatalogSource::Cache);
+        assert!(
+            provider
+                .get_models()
+                .iter()
+                .any(|model| model.id == "cached-a")
+        );
+
+        let other = rpi_ai::auth::Credential::ApiKey(rpi_ai::auth::ApiKeyCredential {
+            key: Some("sk-key-b".to_owned()),
+            env: None,
+        });
+        provider
+            .refresh_models(make_openrouter_context(store.clone(), Some(other), false, None).await)
+            .expect("refresh")
+            .await
+            .expect("other key fallback");
+        assert_eq!(provider.catalog_source(), OpenRouterCatalogSource::BuiltIn);
+        assert!(
+            !provider
+                .get_models()
+                .iter()
+                .any(|model| model.id == "cached-a")
+        );
+
+        provider
+            .refresh_models(make_openrouter_context(store, None, false, None).await)
+            .expect("refresh")
+            .await
+            .expect("no key fallback");
+        assert_eq!(provider.catalog_source(), OpenRouterCatalogSource::BuiltIn);
+        assert!(
+            !provider
+                .get_models()
+                .iter()
+                .any(|model| model.id == "cached-a")
+        );
+    }
+
+    /// R2.3.2: remote + per-key refresh persists the personalized result and
+    /// restores it offline, rather than persisting the public overlay.
+    #[tokio::test]
+    async fn openrouter_network_refresh_persists_personalized_catalog() {
+        let server = MockCatalogServer::start(vec![
+            ScriptedResponse::json(200, serde_json::json!({"models": []})),
+            ScriptedResponse::json(
+                200,
+                serde_json::json!({"data": [{
+                    "id": "auto",
+                    "top_provider": {"context_length": 123456, "max_completion_tokens": 789},
+                    "pricing": {"prompt": "-1", "completion": "-1"}
+                }]}),
+            ),
+        ])
+        .await;
+        let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
+        let credential = rpi_ai::auth::Credential::ApiKey(rpi_ai::auth::ApiKeyCredential {
+            key: Some("sk-key-a".to_owned()),
+            env: None,
+        });
+        let provider = with_openrouter_catalog(
+            rpi_ai::providers::openrouter::openrouter_provider(),
+            Some(server.url.clone()),
+            None,
+        );
+        provider
+            .refresh_models(
+                make_openrouter_context(
+                    store.clone(),
+                    Some(credential.clone()),
+                    true,
+                    Some(format!("{}/api/v1", server.url)),
+                )
+                .await,
+            )
+            .expect("refresh")
+            .await
+            .expect("network refresh");
+        assert_eq!(provider.catalog_source(), OpenRouterCatalogSource::Network);
+        let models = provider.get_models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "auto");
+        assert_eq!(models[0].context_window, 123_456);
+        assert_eq!(models[0].max_tokens, 789);
+        assert_eq!(models[0].cost.rates, Default::default());
+        assert_eq!(server.requests().len(), 2);
+        assert_eq!(server.requests()[1].path, "/api/v1/models/user");
+
+        let stored = store
+            .read("openrouter", None)
+            .await
+            .expect("read")
+            .expect("personalized entry");
+        assert_eq!(
+            stored.credential_fingerprint,
+            rpi_ai::providers::openrouter::credential_fingerprint(Some(&credential))
+        );
+        let offline = with_openrouter_catalog(
+            rpi_ai::providers::openrouter::openrouter_provider(),
+            Some("http://catalog.invalid".to_owned()),
+            None,
+        );
+        offline
+            .refresh_models(make_openrouter_context(store, Some(credential), false, None).await)
+            .expect("refresh")
+            .await
+            .expect("offline restore");
+        assert_eq!(offline.catalog_source(), OpenRouterCatalogSource::Cache);
+        assert_eq!(offline.get_models()[0].id, "auto");
+        assert_eq!(offline.get_models()[0].context_window, 123_456);
     }
 
     #[tokio::test]
@@ -1200,6 +1710,7 @@ mod tests {
                     // Outside the 4h freshness window so the fetch runs.
                     checked_at: Some(now_millis() - REMOTE_CATALOG_REFRESH_INTERVAL_MS * 2),
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -1292,6 +1803,7 @@ mod tests {
     #[test]
     fn remote_models_honors_generated_at() {
         let entry = ModelsStoreEntry {
+            credential_fingerprint: None,
             models: vec![AnyModel::Chat(model("m"))],
             last_modified: Some(100),
             checked_at: None,
@@ -1305,6 +1817,7 @@ mod tests {
         assert!(remote_models(Some(&entry), Some(200)).is_empty());
         // Missing lastModified: overlay suppressed when generatedAt is known.
         let entry = ModelsStoreEntry {
+            credential_fingerprint: None,
             last_modified: None,
             ..entry
         };

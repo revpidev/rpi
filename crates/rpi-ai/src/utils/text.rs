@@ -156,6 +156,7 @@ mod tests {
                 arguments: serde_json::Map::new(),
                 thought_signature: None,
                 namespace: None,
+                arguments_error: None,
             }),
             AssistantContent::Text(TextContent {
                 text: "y".to_owned(),

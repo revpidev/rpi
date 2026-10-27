@@ -1527,7 +1527,7 @@ mod tests {
                 { "id": "gpt-4.1", "model_picker_enabled": true },
                 { "id": unconfigured, "model_picker_enabled": true,
                   "policy": { "state": "unconfigured" } },
-                { "id": "gpt-5.4", "model_picker_enabled": true,
+                { "id": "gpt-6.1-sol", "model_picker_enabled": true,
                   "policy": { "state": "unconfigured" } },
             ]
         });
@@ -1573,7 +1573,7 @@ mod tests {
             policy_paths,
             vec![
                 format!("/api.individual.githubcopilot.com/models/{unconfigured}/policy"),
-                "/api.individual.githubcopilot.com/models/gpt-5.4/policy".to_owned(),
+                "/api.individual.githubcopilot.com/models/gpt-6.1-sol/policy".to_owned(),
             ]
         );
         for policy in &policies {
@@ -1584,7 +1584,7 @@ mod tests {
         // Availability first, freshly enabled ids appended.
         assert_eq!(
             credential.extra.get("availableModelIds"),
-            Some(&json!(["gpt-4.1", unconfigured, "gpt-5.4"]))
+            Some(&json!(["gpt-4.1", unconfigured, "gpt-6.1-sol"]))
         );
     }
 
@@ -1594,7 +1594,7 @@ mod tests {
     async fn login_policy_post_retries_429_honoring_retry_after() {
         let models_response = json!({
             "data": [
-                { "id": "gpt-5.4", "model_picker_enabled": true,
+                { "id": "gpt-6.1-sol", "model_picker_enabled": true,
                   "policy": { "state": "unconfigured" } },
             ]
         });
@@ -1629,7 +1629,7 @@ mod tests {
         let credential = oauth.login(&interaction, None).await.expect("login");
         assert_eq!(
             credential.extra.get("availableModelIds"),
-            Some(&json!(["gpt-5.4"]))
+            Some(&json!(["gpt-6.1-sol"]))
         );
         assert_eq!(mock.requests_matching("/policy").len(), 2);
     }
@@ -1641,7 +1641,7 @@ mod tests {
     async fn login_policy_post_429_past_budget_stops_enable_loop() {
         let models_response = json!({
             "data": [
-                { "id": "gpt-5.4", "model_picker_enabled": true,
+                { "id": "gpt-6.1-sol", "model_picker_enabled": true,
                   "policy": { "state": "unconfigured" } },
             ]
         });
@@ -1675,7 +1675,7 @@ mod tests {
         // No model was enabled, but the fetched availability survives.
         assert_eq!(
             credential.extra.get("availableModelIds"),
-            Some(&json!(["gpt-5.4"]))
+            Some(&json!(["gpt-6.1-sol"]))
         );
     }
 

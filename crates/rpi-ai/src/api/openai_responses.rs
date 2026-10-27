@@ -59,8 +59,8 @@ use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
-    rpi_user_agent_headers,
+    headers_to_record, identity_headers, merge_headers_chain, model_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
@@ -81,6 +81,7 @@ pub const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: u32 = 16;
 
 /// Sign in with ChatGPT: the subscription's usage page (`02eed88fd`).
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/settings/usage";
+const CHATGPT_WORKSPACE_LIMIT_HINT: &str = "You've reached your ChatGPT workspace's usage limit. Ask your workspace admin to increase it at admin.openai.com → Workspace → Usage limits.";
 
 /// OpenAI API keys start with `sk-`; a different credential sent directly to
 /// OpenAI is a Sign in with ChatGPT access token (`02eed88fd`).
@@ -95,6 +96,8 @@ fn is_chatgpt_sign_in(model: &Model, api_key: Option<&str>) -> bool {
 fn append_chatgpt_usage_hint(message: String) -> String {
     if message.contains("subscription_sharing_usage_limit_exceeded") {
         format!("{message}\nCheck your ChatGPT usage: {CHATGPT_USAGE_URL}")
+    } else if message.contains("subscription_sharing_workplace_individual_usage_limit_exceeded") {
+        format!("{message}\n{CHATGPT_WORKSPACE_LIMIT_HINT}")
     } else {
         message
     }
@@ -150,6 +153,7 @@ pub struct ResolvedOpenAIResponsesCompat {
     /// b8b873b98 (#8941): whether `max_output_tokens` is accepted. Default:
     /// true; some Codex-protocol gateways reject the field.
     pub supports_max_output_tokens: bool,
+    pub supports_mid_convo_effort: bool,
 }
 
 /// `getCompat` (openai-responses).
@@ -186,7 +190,26 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAIResponsesCompat {
         supports_max_output_tokens: compat
             .and_then(|compat| compat.supports_max_output_tokens)
             .unwrap_or(true),
+        supports_mid_convo_effort: compat
+            .and_then(|compat| compat.supports_mid_convo_effort)
+            .unwrap_or(false),
     }
+}
+
+fn get_configuration_update_effort(
+    model: &Model,
+    options: &OpenAIResponsesOptions,
+    compat: &ResolvedOpenAIResponsesCompat,
+) -> Option<String> {
+    if !compat.supports_mid_convo_effort
+        || options.reasoning_effort.is_none()
+        || is_chatgpt_sign_in(model, options.stream.api_key.as_deref())
+    {
+        return None;
+    }
+    options
+        .reasoning_effort
+        .map(|level| mapped_or_level_name(model, level))
 }
 
 /// `getPromptCacheRetention` (17de82d7b): long retention opts into the 24h
@@ -236,6 +259,7 @@ pub fn build_client_headers(
     context: &TranscriptContext,
     api_key: &str,
     options_headers: Option<&ProviderHeaders>,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
     session_id: Option<&str>,
     compat: &ResolvedOpenAIResponsesCompat,
 ) -> ProviderHeaders {
@@ -281,7 +305,7 @@ pub fn build_client_headers(
     });
 
     merge_headers_chain(&[
-        rpi_user_agent_headers(),
+        identity_headers(model, identity),
         Some(base),
         model_headers(model),
         copilot_headers,
@@ -304,10 +328,15 @@ pub fn build_params(
     compat: &ResolvedOpenAIResponsesCompat,
     grammar_tool_input_properties: &HashMap<String, String>,
 ) -> Result<Value, String> {
+    let configuration_update_effort = get_configuration_update_effort(model, options, compat);
     // #9548: tools split between the request field and in-place additions.
     let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
         &context.messages,
-        compat.supports_additional_tools || compat.supports_tool_search,
+        crate::api::openai_responses_shared::get_responses_tool_support(
+            compat.supports_mid_convo_system_messages,
+            compat.supports_additional_tools,
+            compat.supports_tool_search,
+        ),
     );
     let tool_options = ConvertResponsesToolsOptions {
         supports_strict_mode: Some(compat.supports_strict_mode),
@@ -324,6 +353,7 @@ pub fn build_params(
             supports_additional_tools: compat.supports_additional_tools,
             supports_tool_search: compat.supports_tool_search,
             tool_options: tool_options.clone(),
+            configuration_update_effort: configuration_update_effort.as_deref(),
             ..ConvertResponsesMessagesOptions::default()
         },
     )?;
@@ -385,10 +415,14 @@ pub fn build_params(
 
     if model.reasoning {
         if options.reasoning_effort.is_some() || options.reasoning_summary.is_some() {
-            let effort = options
-                .reasoning_effort
-                .map(|level| mapped_or_level_name(model, level))
-                .unwrap_or_else(|| "medium".to_owned());
+            let effort = if configuration_update_effort.is_some() {
+                "medium".to_owned()
+            } else {
+                options
+                    .reasoning_effort
+                    .map(|level| mapped_or_level_name(model, level))
+                    .unwrap_or_else(|| "medium".to_owned())
+            };
             // JS `options?.reasoningSummary || "auto"`: empty string counts
             // as unset.
             let summary = options
@@ -528,6 +562,7 @@ async fn run(
         options.stream.session_id.as_deref()
     };
     let compat = get_compat(model);
+    output.provider_thinking_level = get_configuration_update_effort(model, options, &compat);
     let grammar_tool_input_properties = create_grammar_tool_input_properties(
         Some(crate::utils::transcript::get_declared_tools(&context.messages).as_slice()),
         compat.supports_open_ai_grammar_tools,
@@ -537,6 +572,7 @@ async fn run(
         context,
         &api_key,
         options.stream.headers.as_ref(),
+        options.stream.identity.as_ref(),
         cache_session_id,
         &compat,
     );
@@ -981,6 +1017,11 @@ mod tests {
             "subscription_sharing_usage_limit_exceeded: usage limit reached".to_owned(),
         );
         assert!(hinted.ends_with("Check your ChatGPT usage: https://chatgpt.com/settings/usage"));
+        let workspace = append_chatgpt_usage_hint(
+            "subscription_sharing_workplace_individual_usage_limit_exceeded: limit reached"
+                .to_owned(),
+        );
+        assert!(workspace.ends_with(CHATGPT_WORKSPACE_LIMIT_HINT));
         assert_eq!(
             append_chatgpt_usage_hint("other error".to_owned()),
             "other error"
@@ -1232,16 +1273,18 @@ mod tests {
             json!({"compat": {"supportsMidConvoSystemMessages": true, "supportsAdditionalTools": true}}),
         );
         let params = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
-        assert_eq!(top_level_tool_names(&params), vec!["base_tool"]);
+        assert!(params.get("tools").is_none());
         let input = params["input"].as_array().expect("input");
-        let additional = input
+        let additional: Vec<&Value> = input
             .iter()
-            .find(|item| item["type"] == json!("additional_tools"))
-            .expect("additional_tools");
-        assert_eq!(additional["role"], json!("developer"));
-        assert_eq!(additional["tools"][0]["type"], json!("function"));
-        assert_eq!(additional["tools"][0]["name"], json!("late_tool"));
-        assert!(additional["tools"][0].get("defer_loading").is_none());
+            .filter(|item| item["type"] == json!("additional_tools"))
+            .collect();
+        assert_eq!(additional.len(), 2);
+        assert_eq!(additional[0]["role"], json!("developer"));
+        assert_eq!(additional[0]["tools"][0]["type"], json!("function"));
+        assert_eq!(additional[0]["tools"][0]["name"], json!("base_tool"));
+        assert_eq!(additional[1]["tools"][0]["name"], json!("late_tool"));
+        assert!(additional[0]["tools"][0].get("defer_loading").is_none());
         assert!(
             input
                 .iter()
@@ -1347,26 +1390,32 @@ mod tests {
             json!({"compat": {"supportsMidConvoSystemMessages": true, "supportsAdditionalTools": true}}),
         );
         let params = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
-        // Complete current state in the request field.
-        assert_eq!(top_level_tool_names(&params), vec!["late_tool"]);
+        assert!(params.get("tools").is_none());
         let input = params["input"].as_array().expect("input");
-        // No anchored additions.
-        assert!(
-            input
-                .iter()
-                .all(|item| item["type"] != json!("additional_tools"))
-        );
+        let names: Vec<&str> = input
+            .iter()
+            .filter(|item| item["type"] == json!("additional_tools"))
+            .filter_map(|item| item["tools"][0]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["base_tool", "late_tool"]);
         assert!(
             input
                 .iter()
                 .all(|item| item["type"] != json!("tool_search_call"))
         );
-        // Leading prompt + folded update = exactly two developer messages.
         let developer_count = input
             .iter()
             .filter(|item| item["role"] == json!("developer") && item.get("type").is_none())
             .count();
-        assert_eq!(developer_count, 2, "input: {input:?}");
+        assert_eq!(developer_count, 3, "input: {input:?}");
+        assert!(
+            input
+                .last()
+                .and_then(|item| item["content"].as_str())
+                .is_some_and(
+                    |text| text.contains("no longer available. Do not call them:\n- base_tool")
+                )
+        );
     }
 
     // -- client headers ---------------------------------------------------------
@@ -1375,7 +1424,8 @@ mod tests {
     fn test_build_client_headers_openai_session() {
         let m = model(json!({}));
         let ctx = common::context(vec![common::user_text("hi")], None);
-        let headers = build_client_headers(&m, &ctx, "key", None, Some("sess"), &get_compat(&m));
+        let headers =
+            build_client_headers(&m, &ctx, "key", None, None, Some("sess"), &get_compat(&m));
         assert_eq!(
             headers.get("authorization"),
             Some(&Some("Bearer key".to_owned()))
@@ -1399,7 +1449,8 @@ mod tests {
     fn test_build_client_headers_openrouter_session() {
         let m = model(json!({"provider": "openrouter"}));
         let ctx = common::context(vec![common::user_text("hi")], None);
-        let headers = build_client_headers(&m, &ctx, "key", None, Some("sess"), &get_compat(&m));
+        let headers =
+            build_client_headers(&m, &ctx, "key", None, None, Some("sess"), &get_compat(&m));
         assert_eq!(headers.get("x-session-id"), Some(&Some("sess".to_owned())));
         assert!(!headers.contains_key("session_id"));
         assert!(!headers.contains_key("x-client-request-id"));
@@ -1409,7 +1460,8 @@ mod tests {
     fn test_build_client_headers_nosession_and_override() {
         let m = model(json!({"compat": {"sessionAffinityFormat": "openai-nosession"}}));
         let ctx = common::context(vec![common::user_text("hi")], None);
-        let headers = build_client_headers(&m, &ctx, "key", None, Some("sess"), &get_compat(&m));
+        let headers =
+            build_client_headers(&m, &ctx, "key", None, None, Some("sess"), &get_compat(&m));
         assert!(!headers.contains_key("session_id"));
         assert_eq!(
             headers.get("x-client-request-id"),
@@ -1424,6 +1476,7 @@ mod tests {
             &ctx,
             "key",
             Some(&options_headers),
+            None,
             None,
             &get_compat(&m),
         );
@@ -1447,6 +1500,81 @@ mod tests {
         assert_eq!(params["model"], json!("gpt-4o"));
         assert_eq!(params["stream"], json!(true));
         assert_eq!(params["store"], json!(false));
+    }
+
+    #[test]
+    fn configuration_update_preserves_prefix_and_skips_chatgpt_sign_in() {
+        let mut m = model(json!({
+            "reasoning": true,
+            "compat": {"supportsMidConvoEffort": true},
+            "thinkingLevelMap": {"high": "high", "low": "low"}
+        }));
+        m.base_url = "https://api.openai.com/v1".to_owned();
+        let ctx = common::context(vec![common::user_text("one")], None);
+        let options = OpenAIResponsesOptions {
+            reasoning_effort: Some(ModelThinkingLevel::High),
+            ..Default::default()
+        };
+        let first = params_for(&m, &ctx, &options);
+        assert_eq!(first["reasoning"]["effort"], json!("medium"));
+        let first_input = first["input"].as_array().expect("input");
+        assert_eq!(
+            first_input.last().unwrap()["type"],
+            json!("configuration_update")
+        );
+        assert_eq!(
+            first_input.last().unwrap()["reasoning"]["effort"],
+            json!("high")
+        );
+
+        let previous: crate::types::Message = serde_json::from_value(json!({
+            "role": "assistant", "content": [{"type": "text", "text": "answer"}],
+            "api": m.api, "provider": m.provider, "model": m.id,
+            "providerThinkingLevel": "high",
+            "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                      "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}},
+            "stopReason": "stop", "timestamp": 0
+        }))
+        .expect("assistant");
+        let ctx = common::context(
+            vec![common::user_text("one"), previous, common::user_text("two")],
+            None,
+        );
+        let options = OpenAIResponsesOptions {
+            reasoning_effort: Some(ModelThinkingLevel::Low),
+            ..Default::default()
+        };
+        let second = params_for(&m, &ctx, &options);
+        let second_input = second["input"].as_array().expect("input");
+        assert_eq!(&second_input[..first_input.len()], first_input.as_slice());
+        let efforts: Vec<&str> = second_input
+            .iter()
+            .filter(|item| item["type"] == json!("configuration_update"))
+            .filter_map(|item| item["reasoning"]["effort"].as_str())
+            .collect();
+        assert_eq!(efforts, vec!["high", "low"]);
+        assert_eq!(second["reasoning"]["effort"], json!("medium"));
+
+        let options = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    api_key: Some("chatgpt-access-token".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            reasoning_effort: Some(ModelThinkingLevel::Low),
+            ..Default::default()
+        };
+        let chatgpt = params_for(&m, &ctx, &options);
+        assert_eq!(chatgpt["reasoning"]["effort"], json!("low"));
+        assert!(
+            !chatgpt["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .any(|item| item["type"] == json!("configuration_update"))
+        );
     }
 
     #[test]

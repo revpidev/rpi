@@ -15,9 +15,9 @@ use rpi_ai::types::{
     AnyModel, ApiKind, AssistantImages, ClassifierAnswer, ClassifierBoolCriteria,
     ClassifierBoolQuestion, ClassifierChoiceQuestion, ClassifierContext, ClassifierModel,
     ClassifierOptions, ClassifierQuestion, ClassifierResult, ClassifierScoreQuestion,
-    ClassifierStopReason, ImageModel, ImagesContext, ImagesInputContent, InputModality, ModelCost,
-    ModelCostRates, ProviderImageGenerator, TextContent, assert_classifier_model,
-    assert_image_model,
+    ClassifierStopReason, ImageContent, ImageModel, ImagesContext, ImagesInputContent,
+    InputModality, ModelCost, ModelCostRates, ProviderImageGenerator, TextContent,
+    assert_classifier_model, assert_image_model,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -163,6 +163,7 @@ fn classifier_model(base_url: &str, api: &str) -> ClassifierModel {
         },
         context_window: 64_000,
         headers: None,
+        compat: None,
     }
 }
 
@@ -300,6 +301,160 @@ async fn classify_maps_bool_to_noul_prices_usage_and_applies_auth() {
     // `temperature` is accepted but the shared System One transport does not
     // put it on the wire (system-one-shared.ts only documents the knob).
     assert!(body.get("temperature").is_none(), "{body}");
+}
+
+fn system_one_success() -> Value {
+    json!({
+        "answers": {
+            "q1": { "type": "choice", "choice": "a", "probabilities": { "a": 0.7, "b": 0.3 }, "confidence": 0.7 },
+            "q2": { "type": "score", "score": 2, "confidence": 0.5 },
+            "q3": { "type": "noul", "noul": 0.9 }
+        }
+    })
+}
+
+fn png_image() -> ImageContent {
+    ImageContent {
+        data: "cG5n".to_owned(),
+        mime_type: "image/png".to_owned(),
+    }
+}
+
+/// 7f225f25d: TypeSafe accepts System One assets and sends the experimental
+/// image opt-in header with the asset names referenced from state.
+#[tokio::test]
+async fn typesafe_classifier_sends_image_assets_and_opt_in_header() {
+    let (base_url, mut requests) =
+        serve(vec![ScriptResponse::json(200, system_one_success())]).await;
+    let models = models_with_classifier(&base_url);
+    let mut model = classifier_model(&base_url, "typesafe-system-one");
+    model.input.push(InputModality::Image);
+    let mut context = classifier_context();
+    context.images = Some(vec![png_image()]);
+    let result = models.classify(&model, &context, None).await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop);
+
+    let request = requests.recv().await.expect("request");
+    assert_eq!(request.header("typesafe-danger-zone-images"), Some("true"));
+    let body: Value = serde_json::from_str(&request.body).expect("json");
+    assert_eq!(body["state"], json!(["<image-1>", { "files": 2 }]));
+    assert_eq!(
+        body["assets"]["<image-1>"],
+        json!({"type": "image", "format": "png", "data_base64": "cG5n"})
+    );
+}
+
+/// 7f225f25d: OpenRouter uses image_url parts in state, never assets or the
+/// TypeSafe opt-in header, including when its base URL is a proxy.
+#[tokio::test]
+async fn openrouter_classifier_sends_state_image_urls_without_assets() {
+    let (base_url, mut requests) =
+        serve(vec![ScriptResponse::json(200, system_one_success())]).await;
+    let models = Models::new(None);
+    models.set_provider(create_provider(CreateProviderOptions {
+        id: "openrouter".to_owned(),
+        auth: ProviderAuth {
+            api_key: Some(Arc::new(StaticKeyAuth)),
+            oauth: None,
+        },
+        classifiers: std::collections::HashMap::from([(
+            "typesafe-system-one".to_owned(),
+            typesafe_system_one_api(),
+        )]),
+        models: Vec::new(),
+        all_models: Vec::new(),
+        images: std::collections::HashMap::new(),
+        base_url: None,
+        headers: None,
+        name: None,
+        api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+        filter_models_fn: None,
+        filter_all_models_fn: None,
+        fetch_models: None,
+    }));
+    let mut model = classifier_model(&base_url, "typesafe-system-one");
+    model.provider = "openrouter".to_owned();
+    model.input.push(InputModality::Image);
+    let mut context = classifier_context();
+    context.images = Some(vec![png_image()]);
+    let result = models.classify(&model, &context, None).await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop);
+
+    let request = requests.recv().await.expect("request");
+    assert_eq!(request.header("typesafe-danger-zone-images"), None);
+    let body: Value = serde_json::from_str(&request.body).expect("json");
+    assert_eq!(
+        body["state"],
+        json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
+            { "files": 2 }
+        ])
+    );
+    assert!(body.get("assets").is_none(), "{body}");
+}
+
+/// 7f225f25d: Cloudflare Clef takes data URLs in `input.images` and does not
+/// send TypeSafe's opt-in header.
+#[tokio::test]
+async fn cloudflare_clef_classifier_sends_images_list() {
+    let (base_url, mut requests) = serve(vec![ScriptResponse::json(
+        200,
+        json!({
+            "success": true,
+            "result": {
+                "state": "Completed",
+                "result": {
+                    "answers": {
+                        "q1": { "type": "choice", "choice": "a", "probabilities": { "a": 0.7, "b": 0.3 }, "confidence": 0.7 }
+                    }
+                }
+            }
+        }),
+    )])
+    .await;
+    let models = Models::new(None);
+    models.set_provider(create_provider(CreateProviderOptions {
+        id: "cloudflare-workers-ai".to_owned(),
+        auth: ProviderAuth {
+            api_key: Some(Arc::new(StaticKeyAuth)),
+            oauth: None,
+        },
+        classifiers: std::collections::HashMap::from([(
+            "cloudflare-workers-ai-system-one".to_owned(),
+            cloudflare_workers_ai_system_one_api(),
+        )]),
+        models: Vec::new(),
+        all_models: Vec::new(),
+        images: std::collections::HashMap::new(),
+        base_url: None,
+        headers: None,
+        name: None,
+        api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+        filter_models_fn: None,
+        filter_all_models_fn: None,
+        fetch_models: None,
+    }));
+    let mut model = classifier_model(&base_url, "cloudflare-workers-ai-system-one");
+    model.id = "@cf/cloudflare/clef".to_owned();
+    model.provider = "cloudflare-workers-ai".to_owned();
+    model.input.push(InputModality::Image);
+    let mut context = classifier_context();
+    context.questions.retain(|id, _| id == "q1");
+    context.images = Some(vec![ImageContent {
+        data: "d2VicA".to_owned(),
+        mime_type: "image/webp".to_owned(),
+    }]);
+    let result = models.classify(&model, &context, None).await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop);
+
+    let request = requests.recv().await.expect("request");
+    assert_eq!(request.header("typesafe-danger-zone-images"), None);
+    let body: Value = serde_json::from_str(&request.body).expect("json");
+    assert_eq!(
+        body["input"]["images"],
+        json!(["data:image/webp;base64,d2VicA"])
+    );
+    assert!(body["input"].get("assets").is_none(), "{body}");
 }
 
 #[tokio::test]
@@ -755,20 +910,23 @@ async fn classifier_images_require_an_image_capable_model() {
     );
 }
 
-/// APIs that cannot send images fail in the transport with their own
-/// message once the model entry accepts image input (ce8972a0e).
+/// An image-capable model still rejects an unsupported asset MIME type before
+/// any HTTP request instead of sending a malformed payload.
 #[tokio::test]
-async fn system_one_transports_reject_images() {
+async fn system_one_transport_rejects_unsupported_image_mime_before_request() {
     let models = models_with_classifier("http://127.0.0.1:1");
     let mut model = classifier_model("http://127.0.0.1:1", "typesafe-system-one");
     model.input = vec![InputModality::Text, InputModality::Image];
-    let result = models
-        .classify(&model, &classifier_context_with_image(), None)
-        .await;
+    let mut context = classifier_context();
+    context.images = Some(vec![ImageContent {
+        data: "Z2lm".to_owned(),
+        mime_type: "image/gif".to_owned(),
+    }]);
+    let result = models.classify(&model, &context, None).await;
     assert_eq!(result.stop_reason, ClassifierStopReason::Error);
     let message = result.error_message.expect("error message");
     assert!(
-        message.contains("System One API does not support image input"),
+        message.contains("accepts PNG and JPEG images for jev-latest"),
         "{message}"
     );
 }

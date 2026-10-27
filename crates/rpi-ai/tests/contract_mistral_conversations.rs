@@ -67,9 +67,13 @@ enum ScriptedResponse {
     /// split SSE frames and UTF-8 sequences arbitrarily
     /// (`createBytewiseSseResponse` upstream).
     Dribble(&'static str),
+    /// Headers arrive immediately; the active body outlives the header budget.
+    Slow(&'static str),
     /// 200 response headers, then nothing: the body never arrives and the
     /// socket is held until the client disconnects (abort/timeout tests).
     Hang,
+    /// No response headers at all; the socket is held until timeout.
+    HeadersHang,
 }
 
 /// Serves the scripted responses, one per connection, on a loopback port.
@@ -127,13 +131,28 @@ async fn serve_responses(
                         }
                     }
                 }
-                ScriptedResponse::Hang => {
-                    socket
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\n",
-                        )
-                        .await
-                        .expect("write head");
+                ScriptedResponse::Slow(body) => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.expect("write head");
+                    for chunk in body.as_bytes().chunks(16) {
+                        if socket.write_all(chunk).await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                ScriptedResponse::Hang | ScriptedResponse::HeadersHang => {
+                    if matches!(response, ScriptedResponse::Hang) {
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\n",
+                            )
+                            .await
+                            .expect("write head");
+                    }
                     // Hold the socket open until the client goes away.
                     let mut buf = [0u8; 1024];
                     loop {
@@ -1177,10 +1196,10 @@ async fn mistral_http_transport_aborts_while_waiting_for_an_sse_chunk() {
 }
 
 /// mistral-http-transport.test.ts: "applies the request timeout while
-/// waiting for an SSE chunk".
+/// waiting for response headers".
 #[tokio::test]
-async fn mistral_http_transport_applies_the_request_timeout_while_waiting_for_an_sse_chunk() {
-    let (base_url, _captured) = serve_responses(vec![ScriptedResponse::Hang]).await;
+async fn mistral_http_transport_applies_the_request_timeout_while_waiting_for_response_headers() {
+    let (base_url, _captured) = serve_responses(vec![ScriptedResponse::HeadersHang]).await;
     let m = model("mistral-large-latest", &base_url, json!({}));
     let mut opts = options();
     opts.timeout_ms = Some(5);
@@ -1195,11 +1214,9 @@ async fn mistral_http_transport_applies_the_request_timeout_while_waiting_for_an
     };
     assert_eq!(*reason, rpi_ai::types::ErrorReason::Error);
     assert_eq!(error.stop_reason, StopReason::Error);
-    // Upstream surfaces the Node `TimeoutError` DOMException text
-    // ("The operation was aborted due to timeout", matched by `/timeout/i`).
     assert_eq!(
         error.error_message.as_deref(),
-        Some("The operation was aborted due to timeout")
+        Some("Mistral response headers timed out after 5ms")
     );
 }
 
@@ -1227,4 +1244,47 @@ async fn mistral_http_transport_preserves_http_status_and_response_bodies_in_err
         error.error_message.as_deref(),
         Some("Mistral API error (403): {\"message\":\"blocked by gateway\"}")
     );
+}
+
+#[tokio::test]
+async fn mistral_header_timeout_applies_to_custom_fetch() {
+    let m = model("mistral-large-latest", "http://127.0.0.1:9", json!({}));
+    let mut opts = options();
+    opts.timeout_ms = Some(5);
+    opts.max_retries = Some(0);
+    opts.fetch = Some(std::sync::Arc::new(|_request| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(rpi_ai::types::FetchError("unreachable".to_owned()))
+        })
+    }));
+    let message = MistralConversations
+        .stream(&m, &context(vec![user_text("hello")]), Some(opts))
+        .result()
+        .await
+        .expect("error message");
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("Mistral response headers timed out after 5ms")
+    );
+}
+
+#[tokio::test]
+async fn mistral_active_stream_outlives_header_timeout() {
+    let (base_url, _captured) = serve_responses(vec![ScriptedResponse::Slow(TEXT_SSE)]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let mut opts = options();
+    opts.timeout_ms = Some(100);
+    opts.max_retries = Some(0);
+    let message = MistralConversations
+        .stream(&m, &context(vec![user_text("hello")]), Some(opts))
+        .result()
+        .await
+        .expect("completed");
+    assert_eq!(message.stop_reason, StopReason::Stop, "{message:?}");
+    let rpi_ai::types::AssistantContent::Text(text) = &message.content[0] else {
+        panic!("expected text")
+    };
+    assert_eq!(text.text, "Hello world");
 }

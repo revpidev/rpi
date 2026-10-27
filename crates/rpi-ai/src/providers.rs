@@ -45,6 +45,7 @@ pub mod openai_codex;
 pub mod opencode;
 pub mod opencode_go;
 pub mod openrouter;
+pub mod openrouter_api;
 pub mod qwen_token_plan;
 pub mod qwen_token_plan_cn;
 pub mod qwen_token_plan_individual;

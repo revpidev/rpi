@@ -84,6 +84,9 @@ fn is_retryable_provider_error(error: &ProviderErrorInfo) -> bool {
         Some("false") => return false,
         _ => {}
     }
+    if crate::utils::retry::is_non_retryable_provider_limit_error(&error.message) {
+        return false;
+    }
     match error.status {
         None => true,
         Some(status) => status == 408 || status == 409 || status == 429 || status >= 500,
@@ -301,6 +304,30 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    #[test]
+    fn test_quota_and_workspace_limit_errors_do_not_retry_even_with_budget() {
+        for message in [
+            "429 insufficient_quota",
+            "subscription_sharing_workplace_individual_usage_limit_exceeded: limit reached",
+        ] {
+            assert!(!is_retryable_provider_error(&error(
+                Some(429),
+                &[],
+                message
+            )));
+        }
+        assert!(is_retryable_provider_error(&error(
+            Some(429),
+            &[],
+            "slow down"
+        )));
+        assert!(is_retryable_provider_error(&error(
+            Some(429),
+            &[("x-should-retry", "true")],
+            "insufficient_quota"
+        )));
     }
 
     #[test]

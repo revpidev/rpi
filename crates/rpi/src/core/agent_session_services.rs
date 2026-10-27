@@ -145,8 +145,15 @@ pub async fn create_agent_session_services(
                 .settings_manager
                 .as_ref()
                 .and_then(|manager| manager.get_model_catalog_url());
+            let identity = options.settings_manager.as_ref().map(|settings| {
+                rpi_ai::utils::identity::ClientIdentity::new(
+                    crate::config::VERSION,
+                    crate::core::telemetry::is_install_telemetry_enabled(settings),
+                )
+            });
             ModelRuntime::create(CreateModelRuntimeOptions {
                 catalog_base_url,
+                identity,
                 credentials: None,
                 auth_path: Some(agent_dir.join("auth.json")),
                 models_path: ModelsPathInput::Path(agent_dir.join("models.json")),

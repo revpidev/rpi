@@ -400,9 +400,10 @@ fn test_catalog_openai_grammar_tools_baked() {
     assert_eq!(compat.supports_open_ai_grammar_tools, Some(true));
     assert_eq!(compat.supports_strict_mode, Some(true));
 
-    // GPT-5.4 retired upstream (2e6fe2f98); the grammar-tool assertion moved
-    // to gpt-5.5 with it.
-    let codex = get_builtin_model("openai-codex", "gpt-5.5").expect("codex gpt-5.5");
+    // ChatGPT accounts reject GPT-5.5 (fdce48eb4); GPT-6.1 Sol is the current
+    // grammar/tool-search fixture and has the 500K Codex window (5712b134e).
+    let codex = get_builtin_model("openai-codex", "gpt-6.1-sol").expect("codex gpt-6.1-sol");
+    assert_eq!(codex.context_window, 500_000);
     let compat = codex.compat.as_ref().expect("compat");
     assert_eq!(compat.supports_open_ai_grammar_tools, Some(true));
     assert_eq!(compat.supports_tool_search, Some(true));

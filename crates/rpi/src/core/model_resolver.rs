@@ -16,8 +16,9 @@ use crate::core::model_runtime::ModelRuntime;
 /// `DEFAULT_THINKING_LEVEL` (defaults.ts:3).
 pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 
-/// `defaultModelPerProvider` (model-resolver.ts:14-53) — ids pinned to the
-/// upstream commit; unknown providers fall through to "first available".
+/// `defaultModelPerProvider` (model-resolver.ts:20-62 @ 4a080252f) — ids
+/// pinned to the upstream commit; unknown providers fall through to
+/// "first available".
 pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
     ("ant-ling", "Ring-2.6-1T"),
@@ -29,11 +30,11 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     // discovery); post-login selection falls back to catalog order when the
     // account catalog lacks it (complete_provider_authentication).
     ("radius", "balanced"),
-    ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
+    ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
     ("deepseek", "deepseek-v4-pro"),
     ("google", "gemini-3.1-pro-preview"),
     ("google-vertex", "gemini-3.1-pro-preview"),
-    ("github-copilot", "gpt-5.4"),
+    ("github-copilot", "gpt-6.1-sol"),
     ("openrouter", "moonshotai/kimi-k2.6"),
     ("vercel-ai-gateway", "zai/glm-5.1"),
     ("xai", "grok-4.7"),
@@ -48,8 +49,8 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("moonshotai-cn", "kimi-k2.6"),
     ("huggingface", "moonshotai/Kimi-K2.6"),
     ("fireworks", "accounts/fireworks/models/kimi-k3"),
-    ("baseten", "zai-org/GLM-5.2"),
     ("together", "moonshotai/Kimi-K3"),
+    ("baseten", "zai-org/GLM-5.2"),
     ("opencode", "kimi-k2.6"),
     ("opencode-go", "kimi-k3"),
     ("kimi-coding", "kimi-for-coding"),
@@ -408,10 +409,66 @@ fn match_class(pattern: &[char]) -> Option<(CharClass, &[char])> {
 // Model scope (--models)
 // ============================================================================
 
-/// `ModelScopeDiagnostic` (model-resolver.ts:261-266).
+/// All exact candidates for a model reference, without letting catalog order
+/// discard duplicate ids across providers (d7f7e0dfe).
+fn exact_reference_candidates(reference: &str, models: &[Model]) -> Vec<Model> {
+    let normalized = reference.trim().to_lowercase();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let canonical: Vec<Model> = models
+        .iter()
+        .filter(|model| format!("{}/{}", model.provider, model.id).to_lowercase() == normalized)
+        .cloned()
+        .collect();
+    if !canonical.is_empty() {
+        return canonical;
+    }
+    if let Some(slash) = reference.find('/') {
+        let provider = reference[..slash].trim();
+        let model_id = reference[slash + 1..].trim();
+        if !provider.is_empty() && !model_id.is_empty() {
+            let named: Vec<Model> = models
+                .iter()
+                .filter(|model| {
+                    model.provider.eq_ignore_ascii_case(provider)
+                        && model.id.eq_ignore_ascii_case(model_id)
+                })
+                .cloned()
+                .collect();
+            if !named.is_empty() {
+                return named;
+            }
+        }
+    }
+    models
+        .iter()
+        .filter(|model| model.id.to_lowercase() == normalized)
+        .cloned()
+        .collect()
+}
+
+fn scope_exact_reference(pattern: &str, models: &[Model]) -> (Vec<Model>, Option<ThinkingLevel>) {
+    let candidates = exact_reference_candidates(pattern, models);
+    if !candidates.is_empty() {
+        return (candidates, None);
+    }
+    let Some(colon) = pattern.rfind(':') else {
+        return (Vec::new(), None);
+    };
+    let Some(level) = parse_thinking_level(&pattern[colon + 1..]) else {
+        return (Vec::new(), None);
+    };
+    (
+        exact_reference_candidates(&pattern[..colon], models),
+        Some(level),
+    )
+}
+
+/// `ModelScopeDiagnostic` (model-resolver.ts:318-323).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelScopeDiagnostic {
-    /// `"no-match" | "invalid-thinking-level"`.
+    /// `"no-match" | "invalid-thinking-level" | "ambiguous"`.
     pub code: &'static str,
     pub message: String,
     pub pattern: String,
@@ -487,6 +544,34 @@ pub async fn resolve_model_scope_with_diagnostics(
                     scoped_models.push(ScopedModel {
                         model,
                         thinking_level,
+                    });
+                }
+            }
+            continue;
+        }
+
+        let (exact_candidates, exact_thinking) = scope_exact_reference(pattern, &available_models);
+        let providers: std::collections::BTreeSet<&str> = exact_candidates
+            .iter()
+            .map(|model| model.provider.as_str())
+            .collect();
+        if providers.len() > 1 {
+            diagnostics.push(ModelScopeDiagnostic {
+                code: "ambiguous",
+                message: format!(
+                    "Pattern \"{pattern}\" matches several providers: {}. Use provider/id to choose one.",
+                    providers.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+                pattern: pattern.clone(),
+            });
+            for model in exact_candidates {
+                if !scoped_models
+                    .iter()
+                    .any(|sm| models_are_equal(Some(&sm.model), Some(&model)))
+                {
+                    scoped_models.push(ScopedModel {
+                        model,
+                        thinking_level: exact_thinking,
                     });
                 }
             }
@@ -1819,6 +1904,34 @@ mod tests {
         assert_eq!(resolved.provider, "provider-a");
         assert_eq!(resolved.id, "shared-model");
         assert!(result.error.is_none());
+    }
+
+    /// d7f7e0dfe: scope keeps every provider entry for a duplicated bare id
+    /// and emits an actionable ambiguity diagnostic instead of picking one.
+    #[tokio::test]
+    async fn test_scope_preserves_duplicate_provider_entries_with_diagnostic() {
+        let runtime = runtime_with_ambiguous_models(Some("key-a"), Some("key-b")).await;
+        let result =
+            resolve_model_scope_with_diagnostics(&["shared-model:high".to_owned()], &runtime).await;
+        assert_eq!(result.scoped_models.len(), 2);
+        let providers: std::collections::BTreeSet<&str> = result
+            .scoped_models
+            .iter()
+            .map(|scoped| scoped.model.provider.as_str())
+            .collect();
+        assert_eq!(
+            providers,
+            std::collections::BTreeSet::from(["provider-a", "provider-b"])
+        );
+        assert!(
+            result
+                .scoped_models
+                .iter()
+                .all(|scoped| scoped.thinking_level == Some(ThinkingLevel::High))
+        );
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, "ambiguous");
+        assert!(result.diagnostics[0].message.contains("provider/id"));
     }
 
     /// Exact id across two providers, none authenticated → ambiguity error

@@ -24,7 +24,7 @@ pub fn get_rpi_user_agent() -> String {
 }
 
 #[cfg(unix)]
-fn os_release() -> String {
+pub(crate) fn os_release() -> String {
     // SAFETY: `utsname` is a plain C struct; zeroed is a valid initial state
     // and `uname` writes NUL-terminated arrays on success.
     unsafe {

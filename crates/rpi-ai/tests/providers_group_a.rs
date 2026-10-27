@@ -116,6 +116,7 @@ impl AuthInteraction for RecordingInteraction {
 
 fn models_with_context(ctx: FakeAuthContext) -> Models {
     Models::new(Some(CreateModelsOptions {
+        identity: None,
         credentials: None,
         auth_context: Some(Arc::new(ctx)),
         models_store: None,

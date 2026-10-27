@@ -45,7 +45,7 @@ use crate::types::{
 };
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
-use crate::utils::headers::{headers_to_record, merge_headers, provider_headers_to_header_map};
+use crate::utils::headers::{headers_to_record, provider_headers_to_header_map};
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
@@ -315,11 +315,14 @@ fn build_client_headers(
             .map(|(key, value)| (key.clone(), Some(value.clone())))
             .collect()
     });
-    let merged = merge_headers(
-        model_headers.as_ref(),
-        options.and_then(|o| o.headers.as_ref()),
-    );
-    let empty = ProviderHeaders::new();
+    let merged = crate::utils::headers::merge_headers_chain(&[
+        Some(crate::utils::identity::get_identity_headers(
+            model.into(),
+            options.and_then(|options| options.identity.as_ref()),
+        )),
+        model_headers,
+        options.and_then(|options| options.headers.clone()),
+    ]);
     let mut map = reqwest::header::HeaderMap::new();
     map.insert(
         reqwest::header::AUTHORIZATION,
@@ -330,7 +333,7 @@ fn build_client_headers(
         reqwest::header::CONTENT_TYPE,
         reqwest::header::HeaderValue::from_static("application/json"),
     );
-    let request_headers = provider_headers_to_header_map(merged.as_ref().unwrap_or(&empty))?;
+    let request_headers = provider_headers_to_header_map(&merged)?;
     for (name, value) in &request_headers {
         map.insert(name, value.clone());
     }

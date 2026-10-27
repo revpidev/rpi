@@ -761,21 +761,36 @@ pub fn convert_messages(
                 // Collect all consecutive toolResult messages into a single
                 // user message (Bedrock requires them grouped).
                 let mut tool_results: Vec<Value> = Vec::new();
+                let mut error_images: Vec<Value> = Vec::new();
                 let mut j = i;
                 while j < transformed_messages.len() {
                     let Message::ToolResult(next) = &transformed_messages[j] else {
                         break;
                     };
+                    let split = is_anthropic_claude_model(model)
+                        .then(|| {
+                            crate::utils::transform_messages::split_error_tool_result_images(next)
+                        })
+                        .flatten();
                     tool_results.push(json!({
                         "toolResult": {
                             "toolUseId": next.tool_call_id,
-                            "content": convert_tool_result_content(&next.content)?,
+                            "content": convert_tool_result_content(split.as_ref().map_or(next.content.as_slice(), |split| split.content.as_slice()))?,
                             "status": if next.is_error { "error" } else { "success" },
                         },
                     }));
+                    if let Some(split) = split {
+                        error_images.push(json!({"text": split.caption}));
+                        for image in split.images {
+                            error_images.push(json!({
+                                "image": create_image_block(&image.mime_type, &image.data)?
+                            }));
+                        }
+                    }
                     j += 1;
                 }
                 i = j - 1;
+                tool_results.extend(error_images);
                 result.push(json!({"role": "user", "content": tool_results}));
             }
         }
@@ -1471,6 +1486,7 @@ impl<'a> StreamProcessor<'a> {
                 arguments: Map::new(),
                 thought_signature: None,
                 namespace: None,
+                arguments_error: None,
             }));
         let content_index = self.output.content.len() - 1;
         self.blocks_by_bedrock_index.insert(index, content_index);
@@ -1669,7 +1685,9 @@ impl<'a> StreamProcessor<'a> {
             }
             AssistantContent::ToolCall(call) => {
                 let partial = self.partial_json.remove(&index).unwrap_or_default();
-                call.arguments = parse_streaming_json(Some(&partial));
+                let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(&partial));
+                call.arguments = parsed.arguments;
+                call.arguments_error = parsed.arguments_error;
                 events.push(StreamEvent::ToolCallEnd {
                     content_index: index,
                     tool_call: call.clone(),

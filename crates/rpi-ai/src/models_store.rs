@@ -30,6 +30,10 @@ pub struct ModelsStoreEntry {
     /// (quotes included) and echoed back as If-None-Match.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    /// Irreversible SHA-256 namespace for credential-specific catalogs. The
+    /// raw credential is never persisted. Missing on legacy/public overlays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprint: Option<String>,
 }
 
 /// `ModelsStore` — persistent model catalogs keyed by provider ID
@@ -282,6 +286,7 @@ mod tests {
             last_modified: Some(1),
             checked_at: Some(2),
             etag: Some("\"abc\"".to_owned()),
+            credential_fingerprint: None,
         };
         store
             .write("openai", entry.clone(), None)
@@ -325,6 +330,7 @@ mod tests {
                             last_modified: None,
                             checked_at: Some(index),
                             etag: None,
+                            credential_fingerprint: None,
                         },
                         None,
                     )
@@ -407,6 +413,7 @@ mod tests {
                     last_modified: Some(1),
                     checked_at: None,
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )
@@ -422,6 +429,7 @@ mod tests {
                     last_modified: Some(2),
                     checked_at: None,
                     etag: None,
+                    credential_fingerprint: None,
                 },
                 None,
             )

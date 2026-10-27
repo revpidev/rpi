@@ -105,7 +105,16 @@ pub fn uses_google_thinking_level(model: &crate::types::Model) -> bool {
     // Unanchored `/gemini-3(?:\.\d+)?-(?:pro|flash)/` plus the -latest
     // flash aliases and both hosted Gemma 4 naming forms (gemma-4-* /
     // gemma4-*). Expressed as an exact string scan (no regex on this path).
-    if gemini_3_level_pattern_matches(&id) {
+    if gemini_3_level_pattern_matches(&id)
+        || id.match_indices("gemini-").any(|(index, _)| {
+            let mut digits = id[index + "gemini-".len()..].chars();
+            match digits.next() {
+                Some('4'..='9') => true,
+                Some('1'..='9') => digits.next().is_some_and(|digit| digit.is_ascii_digit()),
+                _ => false,
+            }
+        })
+    {
         return true;
     }
     id == "gemini-flash-latest"
@@ -442,7 +451,7 @@ pub fn convert_messages(model: &Model, context: &TranscriptContext) -> Vec<Value
                         Vec::new()
                     };
 
-                let has_text = !text_result.is_empty();
+                let has_text = !text_result.trim().is_empty();
                 let has_images = !image_content.is_empty();
 
                 // Gemini 3+ models support multimodal function responses with
@@ -833,19 +842,21 @@ mod tests {
             "gemini-3.1-pro-preview",
             "gemini-3-flash-preview",
             "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-10-future",
             "gemini-flash-latest",
             "gemini-flash-lite-latest",
             "gemma-4-27b",
             "gemma4-31b",
             "prefix-gemini-3.1-pro-preview",
+            "gemini-30-pro-x",
         ] {
             assert!(uses_google_thinking_level(&model_with_id(id)), "{id}");
         }
         for id in [
             "gemini-2.5-flash",
             "gemini-2.5-pro",
-            "gemini-3-tts",    // not pro/flash
-            "gemini-30-pro-x", // gemini-3 followed by digits (not .digits)
+            "gemini-3-tts", // not pro/flash
             "gemma-3-12b",
             "claude-sonnet-4.6",
         ] {

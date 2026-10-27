@@ -1,36 +1,31 @@
 #!/usr/bin/env bash
-# Refreshes the vendored built-in model catalog (T13 W4; coding-standards §3.2:
-# generated data is read-only, changes go through the generator).
+# Refreshes or checks the vendored built-in model catalog. Generated data is
+# read-only; all content changes come from the pinned upstream generator.
 #
-# Source of truth: the `packages/ai/scripts/generate-models.ts` output, which
-# pulls models.dev + the OpenRouter/NVIDIA/Vercel APIs and bakes in all
-# correction rules (compat deltas, thinkingLevelMap, pricing tiers, implied
-# Kimi costs). The default upstream data dir is the pinned reference checkout
-# (`external/pi`); it is only used as a fallback source — the refresh flow
-# below generates a fresh snapshot elsewhere.
+# Generate in a throwaway worktree at the pinned commit, never in external/pi:
+#   git -C external/pi worktree add --detach /tmp/pi-catalog-gen <pin>
+#   ln -s "$PWD/external/pi/node_modules" /tmp/pi-catalog-gen/node_modules
+#   cd /tmp/pi-catalog-gen/packages/ai
+#   node scripts/generate-models.ts --strict \
+#     --json-output /tmp/rpi-site-catalog
 #
-# This script is intentionally OFFLINE: it never fetches models.dev itself.
-# Refresh flow:
-#   1. Create a throwaway worktree at the pinned upstream commit (never run the
-#      generator inside `external/pi`: that checkout is a read-only reference):
-#        git -C external/pi worktree add --detach /tmp/pi-catalog-gen <pin>
-#        ln -s "$PWD/external/pi/node_modules" /tmp/pi-catalog-gen/node_modules
-#        cd /tmp/pi-catalog-gen/packages/ai && node scripts/generate-models.ts --strict
-#      (Only an upstream pin bump — an ADR, coding-standards §15.2 — additionally
-#      requires re-checking the generator's correction rules.)
-#   2. Run this script against the worktree's data dir to re-vendor
-#      `*.json` + `.manifest.json` (sha256-checked):
-#        scripts/refresh-model-catalog.sh /tmp/pi-catalog-gen/packages/ai/src/providers/data
-#   3. Re-run the catalog tests; update the pinned `generatedAt` expectation in
-#      crates/rpi-ai/tests/model_catalog.rs and the per-type counts in
-#      crates/rpi-ai/src/generated.rs, then regenerate examples/models.json
-#      (scripts/generate-common-models-json.py).
+# Vendor the same snapshot into rpi, or verify an existing vendoring without
+# changing files:
+#   scripts/refresh-model-catalog.sh /tmp/pi-catalog-gen/packages/ai/src/providers/data
+#   scripts/refresh-model-catalog.sh --check /tmp/pi-catalog-gen/packages/ai/src/providers/data
 #
-# Usage: scripts/refresh-model-catalog.sh [upstream-data-dir]
+# This script is offline: network access belongs to the explicit generation
+# step above. The vendored set is an exact manifest-driven mirror, including
+# removals, and --check is the CI/local regeneration-cleanliness gate.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+CHECK=0
+if [[ "${1:-}" == "--check" ]]; then
+    CHECK=1
+    shift
+fi
 SRC="${1:-external/pi/packages/ai/src/providers/data}"
 DST="crates/rpi-ai/src/providers/data"
 
@@ -39,27 +34,57 @@ if [[ ! -f "$SRC/.manifest.json" ]]; then
     exit 1
 fi
 
-count=$(find "$SRC" -maxdepth 1 -name '*.json' ! -name '.*' | wc -l)
-if [[ "$count" -eq 0 ]]; then
-    echo "error: no provider JSONs in $SRC" >&2
-    exit 1
-fi
+python3 - "$SRC" "$DST" "$CHECK" <<'EOF'
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import sys
 
-cp "$SRC"/*.json "$SRC"/.manifest.json "$DST/"
-echo "vendored $count provider catalogs + .manifest.json from $SRC"
+src, dst, check = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == "1"
+manifest_path = src / ".manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+files = manifest["files"]
+expected = set(files) | {".manifest.json"}
+actual = {path.name for path in src.glob("*.json")}
+if actual != expected:
+    sys.exit(f"error: source file set differs from manifest: {sorted(actual ^ expected)}")
 
-# Post-vendor integrity check: each file must match its manifest sha256.
-python3 - "$DST" <<'EOF'
-import hashlib, json, sys
-d = sys.argv[1]
-manifest = json.load(open(f"{d}/.manifest.json"))
-bad = [
-    name for name, want in manifest["files"].items()
-    if hashlib.sha256(open(f"{d}/{name}", "rb").read()).hexdigest() != want
-]
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+bad = [name for name, want in files.items() if digest(src / name) != want]
 if bad:
-    sys.exit(f"error: sha256 mismatch after vendor: {bad}")
-print(f"ok: {len(manifest['files'])} files match manifest sha256 (generatedAt {manifest['generatedAt']})")
+    sys.exit(f"error: source sha256 mismatch: {bad}")
+
+if check:
+    differences = []
+    if not dst.is_dir():
+        differences.append("destination directory is missing")
+    else:
+        destination_files = {path.name for path in dst.glob("*.json")}
+        differences.extend(f"file set: {name}" for name in sorted(destination_files ^ expected))
+        for name in sorted(expected & destination_files):
+            if (src / name).read_bytes() != (dst / name).read_bytes():
+                differences.append(f"content: {name}")
+    if differences:
+        print("error: vendored catalog differs from generated snapshot:", file=sys.stderr)
+        for difference in differences:
+            print(f"  {difference}", file=sys.stderr)
+        sys.exit(1)
+    print(f"ok: vendored catalog matches generated snapshot ({len(files)} providers)")
+else:
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in sorted(expected):
+        shutil.copyfile(src / name, dst / name)
+    for path in dst.glob("*.json"):
+        if path.name not in expected:
+            path.unlink()
+    bad = [name for name, want in files.items() if digest(dst / name) != want]
+    if bad:
+        sys.exit(f"error: sha256 mismatch after vendor: {bad}")
+    print(f"vendored {len(files)} provider catalogs + .manifest.json from {src}")
+    print(f"ok: manifest sha256 verified (generatedAt {manifest['generatedAt']})")
 EOF
 
 echo "next: cargo test -p rpi-ai --test model_catalog --test compat_matrix"

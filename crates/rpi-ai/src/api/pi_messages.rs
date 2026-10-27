@@ -521,6 +521,7 @@ impl EventConverter {
                         arguments: Map::new(),
                         thought_signature: None,
                         namespace: None,
+                        arguments_error: None,
                     });
                 self.tool_json.insert(content_index, String::new());
                 StreamEvent::ToolCallStart {

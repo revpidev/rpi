@@ -50,6 +50,7 @@ async fn make_llama_context(
         allow_network,
         force: if allow_network { Some(false) } else { None },
         signal,
+        base_url: None,
     }
 }
 

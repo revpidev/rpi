@@ -75,6 +75,8 @@ cargo build --release
 
 在 `~/.rpi/agent/settings.json` / `models.json` 或对应标准环境变量（如 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`）中配置 API key。Anthropic、OpenAI（ChatGPT）、OpenAI Codex、GitHub Copilot、OpenRouter、Kimi、Meta、xAI 与 Radius 支持通过 `/login` 交互式 OAuth 登录。
 
+Kimi Code 使用 OpenAI Chat Completions，官方 base URL 为 `https://api.kimi.com/coding/v1`。`models.json` 或扩展服务商配置中的自定义 `baseUrl` 必须显式包含完整的 `/v1` 路径段。请将旧的 `https://api.kimi.com/coding` 改为 `https://api.kimi.com/coding/v1`，或使用代理本身明确的 `/v1` URL；rpi 不会自动追加后缀、改写 URL 或回退到旧传输协议。
+
 ### 更新
 
 ```bash

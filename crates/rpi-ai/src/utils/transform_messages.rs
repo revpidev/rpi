@@ -86,6 +86,44 @@ fn replace_images_with_placeholder_tool_result(
     result
 }
 
+const ERROR_TOOL_IMAGE_PLACEHOLDER: &str = "(image attached after the tool results)";
+
+pub struct SplitErrorToolResult {
+    pub content: Vec<ToolResultContent>,
+    pub caption: String,
+    pub images: Vec<crate::types::ImageContent>,
+}
+
+/// Split images from an error tool result for providers that require text-only
+/// error results. The caption and images follow all results in the turn.
+pub fn split_error_tool_result_images(message: &ToolResultMessage) -> Option<SplitErrorToolResult> {
+    if !message.is_error {
+        return None;
+    }
+    let images: Vec<crate::types::ImageContent> = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ToolResultContent::Image(image) => Some(image.clone()),
+            ToolResultContent::Text(_) => None,
+        })
+        .collect();
+    if images.is_empty() {
+        return None;
+    }
+    Some(SplitErrorToolResult {
+        content: replace_images_with_placeholder_tool_result(
+            &message.content,
+            ERROR_TOOL_IMAGE_PLACEHOLDER,
+        ),
+        caption: format!(
+            "Images from the error result of tool call {} ({}):",
+            message.tool_call_id, message.tool_name
+        ),
+        images,
+    })
+}
+
 fn downgrade_unsupported_images(messages: Vec<Message>, model: &Model) -> Vec<Message> {
     if model.input.contains(&crate::types::InputModality::Image) {
         return messages;
@@ -162,34 +200,20 @@ pub fn transform_messages(
                     for block in assistant_msg.content.iter() {
                         match block {
                             AssistantContent::Thinking(thinking) => {
-                                // Redacted thinking is opaque encrypted content,
-                                // only valid for the same model.
-                                if thinking.redacted.unwrap_or(false) {
-                                    if is_same_model {
-                                        transformed_content.push(block.clone());
-                                    }
+                                // Thinking from another model is dropped: signatures and encrypted
+                                // reasoning are model-specific, and readable thinking must not
+                                // become visible reply text for the next model (911309429).
+                                if !is_same_model {
                                     continue;
                                 }
-                                // Same model: keep thinking blocks with signatures
-                                // (needed for replay) even when the thinking text
-                                // is empty (OpenAI encrypted reasoning).
-                                if is_same_model && thinking.thinking_signature.is_some() {
+                                if thinking.redacted.unwrap_or(false)
+                                    || thinking.thinking_signature.is_some()
+                                {
                                     transformed_content.push(block.clone());
                                     continue;
                                 }
-                                // Skip empty thinking blocks, convert others to text.
-                                if thinking.thinking.trim().is_empty() {
-                                    continue;
-                                }
-                                if is_same_model {
+                                if !thinking.thinking.trim().is_empty() {
                                     transformed_content.push(block.clone());
-                                } else {
-                                    transformed_content.push(AssistantContent::Text(
-                                        crate::types::TextContent {
-                                            text: thinking.thinking.clone(),
-                                            text_signature: None,
-                                        },
-                                    ));
                                 }
                             }
                             AssistantContent::Text(text) => {
@@ -398,6 +422,7 @@ mod tests {
             arguments: Map::new(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })
     }
 
@@ -556,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_model_thinking_to_text() {
+    fn test_cross_model_thinking_is_dropped_not_exposed_as_text() {
         let thinking = AssistantContent::Thinking(ThinkingContent {
             thinking: "deep thought".to_owned(),
             thinking_signature: Some("sig".to_owned()),
@@ -574,16 +599,11 @@ mod tests {
             Message::Assistant(a) => assert!(matches!(a.content[0], AssistantContent::Thinking(_))),
             other => panic!("expected assistant, got {other:?}"),
         }
-        // Cross model: converted to plain text.
+        // Cross model: the readable reasoning is removed, not converted into
+        // visible answer text (911309429 / transform-messages-cross-model-thinking).
         let out = transform_messages(&messages, &model("other", "openai", &["text"]), None);
         match &out[0] {
-            Message::Assistant(a) => assert_eq!(
-                a.content[0],
-                AssistantContent::Text(TextContent {
-                    text: "deep thought".to_owned(),
-                    text_signature: None
-                })
-            ),
+            Message::Assistant(a) => assert!(a.content.is_empty()),
             other => panic!("expected assistant, got {other:?}"),
         }
     }
@@ -603,6 +623,7 @@ mod tests {
                     arguments: args,
                     thought_signature: Some("ts".to_owned()),
                     namespace: None,
+                    arguments_error: None,
                 })],
             ),
             tool_result("call_long|item_id_with|pipes", "read"),

@@ -140,6 +140,15 @@ pub async fn create_agent_session(
             services.resource_loader.clone(),
         ),
         (explicit_runtime, None) => {
+            let settings_manager = SettingsManager::create(
+                &cwd,
+                Some(&agent_dir),
+                SettingsManagerCreateOptions::default(),
+            );
+            let identity = rpi_ai::utils::identity::ClientIdentity::new(
+                crate::config::VERSION,
+                crate::core::telemetry::is_install_telemetry_enabled(&settings_manager),
+            );
             let runtime = match explicit_runtime {
                 Some(runtime) => runtime,
                 None => {
@@ -156,16 +165,12 @@ pub async fn create_agent_session(
                             Some(_) => ModelsPathInput::Path(agent_dir.join("models.json")),
                             None => ModelsPathInput::Default,
                         },
+                        identity: Some(identity),
                         ..Default::default()
                     })
                     .await
                 }
             };
-            let settings_manager = SettingsManager::create(
-                &cwd,
-                Some(&agent_dir),
-                SettingsManagerCreateOptions::default(),
-            );
             let services = create_agent_session_services(CreateAgentSessionServicesOptions {
                 cwd: cwd.clone(),
                 agent_dir: Some(agent_dir.clone()),

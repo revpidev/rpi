@@ -108,7 +108,7 @@ fn convert_tool_result_output(model: &Model, content: &[ToolResultContent]) -> V
             _ => None,
         })
         .collect();
-    let has_text = !text_result.is_empty();
+    let has_text = !text_result.trim().is_empty();
 
     if images.is_empty() || !model.input.contains(&InputModality::Image) {
         let text = if has_text {
@@ -166,6 +166,9 @@ pub struct ConvertResponsesMessagesOptions<'a> {
     /// pairs anchor late tool declarations.
     pub supports_tool_search: bool,
     pub tool_options: ConvertResponsesToolsOptions,
+    /// Effort carried by in-place configuration updates rather than a changed
+    /// request-level reasoning effort, preserving the prompt-cache prefix.
+    pub configuration_update_effort: Option<&'a str>,
 }
 
 impl Default for ConvertResponsesMessagesOptions<'_> {
@@ -177,8 +180,44 @@ impl Default for ConvertResponsesMessagesOptions<'_> {
             supports_additional_tools: false,
             supports_tool_search: false,
             tool_options: ConvertResponsesToolsOptions::default(),
+            configuration_update_effort: None,
         }
     }
+}
+
+pub fn get_responses_tool_support(
+    supports_mid_convo_system_messages: bool,
+    supports_additional_tools: bool,
+    supports_tool_search: bool,
+) -> crate::utils::transcript::TranscriptToolSupport {
+    use crate::utils::transcript::TranscriptToolSupport;
+    if supports_mid_convo_system_messages && supports_additional_tools {
+        TranscriptToolSupport::Changes
+    } else if supports_tool_search {
+        TranscriptToolSupport::Additions
+    } else {
+        TranscriptToolSupport::None
+    }
+}
+
+fn render_incremental_tools_notice(unavailable: &[String]) -> String {
+    let notice = "This is an incremental tools update. Previously declared tools remain available unless explicitly marked unavailable. A tool declared again here is available again, and its latest definition replaces the earlier one.";
+    if unavailable.is_empty() {
+        notice.to_owned()
+    } else {
+        format!("{notice}\nStill unavailable: {}.", unavailable.join(", "))
+    }
+}
+
+fn render_tool_removal_notice(names: &[String]) -> String {
+    format!(
+        "The following tools are no longer available. Do not call them:\n{}",
+        names
+            .iter()
+            .map(|name| format!("- {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 // =============================================================================
@@ -260,23 +299,51 @@ pub fn convert_responses_messages(
     let transformed_messages =
         transform_messages(&context.messages, model, Some(&mut normalize_tool_call_id));
 
-    let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
-        &context.messages,
-        options.supports_additional_tools || options.supports_tool_search,
+    let tool_support = get_responses_tool_support(
+        options.supports_mid_convo_system_messages,
+        options.supports_additional_tools,
+        options.supports_tool_search,
     );
-    let append_system_tool_additions = |messages: &mut Vec<Value>,
-                                        message: &crate::types::SystemMessage,
-                                        seed: &str|
+    let transcript_tools =
+        crate::utils::transcript::resolve_transcript_tools(&context.messages, tool_support);
+    // `compat?.supportsDeveloperRole !== false`: absent counts as supported.
+    let supports_developer_role = model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.supports_developer_role)
+        != Some(false);
+    let instruction_role = if model.reasoning && supports_developer_role {
+        "developer"
+    } else {
+        "system"
+    };
+    let mut declared_additional_tools = false;
+    let mut unavailable_tools: Vec<String> = Vec::new();
+    let mut system_index = 0usize;
+    let mut append_system_tool_additions = |messages: &mut Vec<Value>,
+                                            message: &crate::types::SystemMessage,
+                                            seed: &str|
      -> Result<(), String> {
-        let tools: Vec<Tool> = if transcript_tools.anchors_additions {
-            message.tools_added.clone().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let tools = message.tools_added.clone().unwrap_or_default();
+        for removed in message.tools_removed.as_deref().unwrap_or_default() {
+            if !unavailable_tools.contains(&removed.name) {
+                unavailable_tools.push(removed.name.clone());
+            }
+        }
+        for tool in &tools {
+            unavailable_tools.retain(|name| name != &tool.name);
+        }
         if tools.is_empty() {
             return Ok(());
         }
-        if options.supports_additional_tools {
+        if tool_support == crate::utils::transcript::TranscriptToolSupport::Changes {
+            if declared_additional_tools {
+                messages.push(json!({
+                    "role": instruction_role,
+                    "content": render_incremental_tools_notice(&unavailable_tools),
+                }));
+            }
+            declared_additional_tools = true;
             messages.push(json!({
                 "type": "additional_tools",
                 "role": "developer",
@@ -284,7 +351,7 @@ pub fn convert_responses_messages(
             }));
             return Ok(());
         }
-        if !options.supports_tool_search {
+        if tool_support != crate::utils::transcript::TranscriptToolSupport::Additions {
             return Ok(());
         }
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
@@ -312,24 +379,15 @@ pub fn convert_responses_messages(
         }));
         Ok(())
     };
-    // `compat?.supportsDeveloperRole !== false`: absent counts as supported.
-    let supports_developer_role = model
-        .compat
-        .as_ref()
-        .and_then(|compat| compat.supports_developer_role)
-        != Some(false);
-    let instruction_role = if model.reasoning && supports_developer_role {
-        "developer"
-    } else {
-        "system"
-    };
 
     let mut msg_index = 0usize;
     for (source_index, msg) in transformed_messages.iter().enumerate() {
         let is_leading_system_message = source_index == 0 && matches!(msg, Message::System(_));
         match msg {
             Message::System(system) => {
-                if !is_leading_system_message {
+                let anchors_tool_changes = system_index >= transcript_tools.folded_system_messages;
+                system_index += 1;
+                if anchors_tool_changes {
                     append_system_tool_additions(
                         &mut messages,
                         system,
@@ -337,11 +395,36 @@ pub fn convert_responses_messages(
                     )?;
                 }
                 if !is_leading_system_message || options.include_system_prompt {
-                    let text = if is_leading_system_message {
+                    let mut parts = vec![if is_leading_system_message {
                         crate::utils::text::get_system_message_text(system)
                     } else {
                         crate::utils::text::render_system_message_update(system)
-                    };
+                    }];
+                    if anchors_tool_changes {
+                        let added: Vec<&str> = system
+                            .tools_added
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect();
+                        let removed: Vec<String> = system
+                            .tools_removed
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|tool| !added.contains(&tool.name.as_str()))
+                            .map(|tool| tool.name.clone())
+                            .collect();
+                        if !removed.is_empty() {
+                            parts.push(render_tool_removal_notice(&removed));
+                        }
+                    }
+                    let text = parts
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
                     if !text.is_empty() {
                         messages.push(json!({
                             "role": instruction_role,
@@ -516,6 +599,15 @@ pub fn convert_responses_messages(
                     msg_index += 1;
                     continue;
                 }
+                if options.configuration_update_effort.is_some()
+                    && is_same_model
+                    && let Some(previous_effort) = assistant.provider_thinking_level.as_deref()
+                {
+                    messages.push(json!({
+                        "type": "configuration_update",
+                        "reasoning": {"effort": previous_effort},
+                    }));
+                }
                 messages.extend(output);
             }
             Message::ToolResult(result) => {
@@ -547,6 +639,12 @@ pub fn convert_responses_messages(
         }
     }
 
+    if let Some(effort) = options.configuration_update_effort {
+        messages.push(json!({
+            "type": "configuration_update",
+            "reasoning": {"effort": effort},
+        }));
+    }
     Ok(messages)
 }
 
@@ -867,6 +965,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             .get("namespace")
                             .and_then(Value::as_str)
                             .map(str::to_owned),
+                        arguments_error: None,
                     }));
                 let slot = Slot::ToolCall {
                     content_index: self.output.content.len() - 1,
@@ -917,6 +1016,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             .get("namespace")
                             .and_then(Value::as_str)
                             .map(str::to_owned),
+                        arguments_error: None,
                     }));
                 let slot = Slot::ToolCall {
                     content_index: self.output.content.len() - 1,
@@ -1194,7 +1294,10 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 if let Some(AssistantContent::ToolCall(block)) =
                     self.output.content.get_mut(content_index)
                 {
-                    block.arguments = parse_streaming_json(Some(&arguments));
+                    let parsed =
+                        crate::utils::json_parse::parse_tool_call_arguments(Some(&arguments));
+                    block.arguments = parsed.arguments;
+                    block.arguments_error = parsed.arguments_error;
                 }
                 if let Some(delta) = arguments.strip_prefix(&previous_partial_json)
                     && !delta.is_empty()
@@ -1360,7 +1463,10 @@ impl<'a> ResponsesStreamProcessor<'a> {
                                     &fallback
                                 }
                             };
-                            block.arguments = parse_streaming_json(Some(source));
+                            let parsed =
+                                crate::utils::json_parse::parse_tool_call_arguments(Some(source));
+                            block.arguments = parsed.arguments;
+                            block.arguments_error = parsed.arguments_error;
                             // 02bd2d1c6: a namespace on the done item wins.
                             if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
                                 block.namespace = Some(namespace.to_owned());
@@ -1935,13 +2041,25 @@ mod tests {
             })
             .filter_map(|item| item["content"].as_str())
             .collect();
-        assert_eq!(developer_texts, vec!["base prompt", "updated guidance"]);
+        assert_eq!(
+            developer_texts,
+            vec![
+                "base prompt",
+                "This is an incremental tools update. Previously declared tools remain available unless explicitly marked unavailable. A tool declared again here is available again, and its latest definition replaces the earlier one.",
+                "updated guidance",
+            ]
+        );
+        let names: Vec<&str> = out
+            .iter()
+            .filter(|item| item["type"] == json!("additional_tools"))
+            .filter_map(|item| item["tools"][0]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["base_tool", "late_tool"]);
         let addition = out
             .iter()
             .find(|item| item["type"] == json!("additional_tools"))
             .expect("additional_tools item");
         assert_eq!(addition["role"], json!("developer"));
-        assert_eq!(addition["tools"][0]["name"], json!("late_tool"));
         assert!(addition["tools"][0].get("defer_loading").is_none());
     }
 

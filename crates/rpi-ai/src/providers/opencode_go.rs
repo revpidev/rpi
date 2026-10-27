@@ -71,6 +71,7 @@ fn api_map() -> HashMap<String, Arc<dyn ProviderStreams>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated::get_builtin_model;
 
     #[test]
     fn api_map_covers_the_four_catalog_apis() {
@@ -92,6 +93,12 @@ mod tests {
                 model.api
             );
         }
+        let gemini = get_builtin_model("opencode-go", "gemini-4-argon").expect("Gemini");
+        assert_eq!(gemini.api, ApiKind::GOOGLE_GENERATIVE_AI.into());
+        assert_eq!(gemini.base_url, "https://opencode.ai/inference/go/v1");
+        let minimax = get_builtin_model("opencode-go", "minimax-m3").expect("MiniMax");
+        assert_eq!(minimax.api, ApiKind::ANTHROPIC_MESSAGES.into());
+        assert_eq!(minimax.base_url, "https://opencode.ai/inference/go");
     }
 
     /// #9326 (561a2e066): provider dispatch wraps every adapter with the

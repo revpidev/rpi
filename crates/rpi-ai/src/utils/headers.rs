@@ -101,6 +101,18 @@ pub fn rpi_user_agent_headers() -> Option<ProviderHeaders> {
     )
 }
 
+/// Identity headers for a chat model. The identity travels in request options
+/// and is read after `before_provider_headers`, never injected into that hook.
+pub fn identity_headers(
+    model: &crate::types::Model,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
+) -> Option<ProviderHeaders> {
+    Some(crate::utils::identity::get_identity_headers(
+        model.into(),
+        identity,
+    ))
+}
+
 pub fn merge_headers_chain(sources: &[Option<ProviderHeaders>]) -> ProviderHeaders {
     let mut merged: Option<ProviderHeaders> = None;
     for source in sources {

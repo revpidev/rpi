@@ -7532,6 +7532,7 @@ mod tests {
             arguments: serde_json::Map::new(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })
     }
 
@@ -8201,6 +8202,7 @@ mod tests {
                     arguments: args.clone(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 }),
             ],
             StopReason::Pending,
@@ -8437,6 +8439,7 @@ mod tests {
                     .unwrap_or_default(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 }),
             ],
             StopReason::Pending,

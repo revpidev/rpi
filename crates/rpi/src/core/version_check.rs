@@ -35,14 +35,13 @@ pub struct LatestRpiRelease {
     pub note: Option<String>,
 }
 
-/// `getPiUserAgent` (utils/pi-user-agent.ts): `rpi/{version} ({platform};
-/// rust; {arch})`.
+/// `getPiUserAgent` (utils/pi-user-agent.ts): the shared detailed client
+/// identity, `rpi/{version} ({platform}; rust/{runtime}; {arch})`.
 pub fn rpi_user_agent(version: &str) -> String {
-    format!(
-        "rpi/{version} ({}; rust; {})",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
+    rpi_ai::utils::identity::format_user_agent(Some(&rpi_ai::utils::identity::ClientIdentity {
+        version: Some(version.to_owned()),
+        ..Default::default()
+    }))
 }
 
 // ===== V14-19: RC 更新通道（rpi 自有，无上游对照）=====

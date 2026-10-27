@@ -413,6 +413,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
             arguments: json!({}).as_object().expect("object").clone(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })
     );
 
@@ -454,6 +455,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
             arguments: json!({"cmd": "ls"}).as_object().expect("object").clone(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })
     );
 
@@ -494,6 +496,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
                 .clone(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })
     );
 
@@ -602,6 +605,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
                 .clone(),
             thought_signature: None,
             namespace: None,
+            arguments_error: None,
         })
     );
     assert_eq!(
@@ -1168,6 +1172,7 @@ async fn preserves_tool_call_metadata_received_only_on_toolcall_end() {
                 .clone(),
             thought_signature: None,
             namespace: Some("dynamic_tools".to_owned()),
+            arguments_error: None,
         })
     );
 }

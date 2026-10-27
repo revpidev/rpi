@@ -19,8 +19,11 @@ pub mod file_store;
 pub mod helpers;
 pub mod interaction;
 pub mod oauth;
+pub mod request;
 pub mod resolve;
 pub mod types;
+
+pub use request::{CredentialGeneration, ResolvedRequestAuth};
 
 pub use anthropic_auth::{AnthropicApiKeyAuth, anthropic_api_key_auth};
 pub use anthropic_federation::{

@@ -107,6 +107,7 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> AssistantContent {
         arguments: arguments.as_object().expect("arguments object").clone(),
         thought_signature: None,
         namespace: None,
+        arguments_error: None,
     })
 }
 

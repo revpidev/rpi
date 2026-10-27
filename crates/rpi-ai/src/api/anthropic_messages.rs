@@ -56,8 +56,8 @@ use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
-    rpi_user_agent_headers,
+    headers_to_record, identity_headers, merge_headers_chain, model_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils::provider_env::get_provider_env_value;
@@ -537,7 +537,7 @@ fn build_request_headers(
             );
         }
         let headers = merge_headers_chain(&[
-            rpi_user_agent_headers(),
+            identity_headers(model, options.stream.identity.as_ref()),
             Some(base),
             model_headers(model),
             dynamic_headers,
@@ -563,7 +563,7 @@ fn build_request_headers(
             Some(format!("Bearer {api_key}")),
         );
         let headers = merge_headers_chain(&[
-            rpi_user_agent_headers(),
+            identity_headers(model, options.stream.identity.as_ref()),
             Some(base),
             model_headers(model),
             options.stream.headers.clone(),
@@ -592,7 +592,7 @@ fn build_request_headers(
                 session_id,
             );
         let headers = merge_headers_chain(&[
-            rpi_user_agent_headers(),
+            identity_headers(model, options.stream.identity.as_ref()),
             Some(base),
             session_affinity_headers,
             model_headers(model),
@@ -614,7 +614,7 @@ fn build_request_headers(
         session_id,
     );
     let headers = merge_headers_chain(&[
-        rpi_user_agent_headers(),
+        identity_headers(model, options.stream.identity.as_ref()),
         Some(base),
         session_affinity_headers,
         model_headers(model),
@@ -938,15 +938,32 @@ fn convert_messages(
                 // Collect all consecutive toolResult messages (z.ai Anthropic
                 // endpoint requires them grouped in one user message).
                 let mut tool_results: Vec<Value> = Vec::new();
+                let mut error_images: Vec<Value> = Vec::new();
                 let mut j = i;
                 while j < transformed_messages.len() {
                     let Message::ToolResult(result) = &transformed_messages[j] else {
                         break;
                     };
-                    tool_results.push(convert_tool_result(result));
+                    let split =
+                        crate::utils::transform_messages::split_error_tool_result_images(result);
+                    let mut converted = convert_tool_result(result);
+                    if let Some(split) = &split {
+                        converted["content"] = convert_content_blocks(&split.content);
+                    }
+                    tool_results.push(converted);
+                    if let Some(split) = split {
+                        error_images.push(json!({"type": "text", "text": split.caption}));
+                        error_images.extend(split.images.into_iter().map(|image| {
+                            json!({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": image.mime_type, "data": image.data},
+                            })
+                        }));
+                    }
                     j += 1;
                 }
                 i = j - 1;
+                tool_results.extend(error_images);
                 params.push(json!({"role": "user", "content": tool_results}));
             }
         }
@@ -1050,23 +1067,28 @@ fn is_anthropic_strict_unsupported_keyword(key: &str, value: &Value) -> bool {
 }
 
 /// `convertTools`.
-fn convert_tools(
+fn convert_tools_with_disable(
     tools: &[Tool],
     is_oauth_token: bool,
     supports_eager_tool_input_streaming: bool,
     supports_strict_tools: bool,
     cache_control: Option<&Value>,
     defer_loading: bool,
+    disable_preferred_strict_tools: bool,
 ) -> Result<Vec<Value>, String> {
     tools
         .iter()
         .enumerate()
         .map(|(index, tool)| {
-            let strict = resolve_json_schema_strict_sampling_with_check(
-                tool,
-                supports_strict_tools,
-                Some(is_anthropic_strict_unsupported_keyword),
-            )?;
+            let strict = if disable_preferred_strict_tools && is_preferred_strict_tool(tool) {
+                None
+            } else {
+                resolve_json_schema_strict_sampling_with_check(
+                    tool,
+                    supports_strict_tools,
+                    Some(is_anthropic_strict_unsupported_keyword),
+                )?
+            };
             // `getJsonSchemaToolParameters` (7915cdac6): the strict-converted
             // parameters feed both the direct schema and the legacy view.
             let schema = get_json_schema_tool_parameters(tool, strict)?;
@@ -1110,6 +1132,52 @@ fn convert_tools(
         .collect()
 }
 
+fn is_preferred_strict_tool(tool: &Tool) -> bool {
+    matches!(
+        tool.constrained_sampling,
+        Some(crate::types::ConstrainedSampling::Config(
+            crate::types::ConstrainedSamplingConfig::JsonSchema {
+                strict: crate::types::ConstrainedSamplingStrict::Prefer,
+            }
+        ))
+    )
+}
+
+fn is_preferred_strict_tool_rejection(error: &crate::utils::provider_retry::RetryError) -> bool {
+    let crate::utils::provider_retry::RetryError::Provider(error) = error else {
+        return false;
+    };
+    error.status == Some(400)
+        && error.message.contains("invalid_request_error")
+        && [
+            "The compiled grammar is too large",
+            "Too many strict tools (",
+            "Schemas contains too many parameters with union types (",
+        ]
+        .iter()
+        .any(|message| error.message.contains(message))
+}
+
+#[cfg(test)]
+fn convert_tools(
+    tools: &[Tool],
+    is_oauth_token: bool,
+    supports_eager_tool_input_streaming: bool,
+    supports_strict_tools: bool,
+    cache_control: Option<&Value>,
+    defer_loading: bool,
+) -> Result<Vec<Value>, String> {
+    convert_tools_with_disable(
+        tools,
+        is_oauth_token,
+        supports_eager_tool_input_streaming,
+        supports_strict_tools,
+        cache_control,
+        defer_loading,
+        false,
+    )
+}
+
 fn text_block(text: &str, cache_control: Option<&Value>) -> Value {
     let mut block = json!({"type": "text", "text": text});
     if let Some(cache_control) = cache_control {
@@ -1121,6 +1189,12 @@ fn text_block(text: &str, cache_control: Option<&Value>) -> Value {
 /// `buildParams` (#9548 restructure): the leading system message supplies the
 /// system text; conversation messages exclude it; native tool changes keep
 /// the initial tools active and defer later ones in place.
+struct BuiltAnthropicParams {
+    params: Value,
+    has_preferred_strict_tools: bool,
+}
+
+#[cfg(test)]
 fn build_params(
     model: &Model,
     context: &TranscriptContext,
@@ -1128,6 +1202,25 @@ fn build_params(
     native_tool_changes: bool,
     options: &AnthropicOptions,
 ) -> Result<Value, String> {
+    build_params_inner(
+        model,
+        context,
+        is_oauth_token,
+        native_tool_changes,
+        options,
+        false,
+    )
+    .map(|built| built.params)
+}
+
+fn build_params_inner(
+    model: &Model,
+    context: &TranscriptContext,
+    is_oauth_token: bool,
+    native_tool_changes: bool,
+    options: &AnthropicOptions,
+    disable_preferred_strict_tools: bool,
+) -> Result<BuiltAnthropicParams, String> {
     let (_retention, cache_control) = get_cache_control(
         model,
         options.stream.cache_retention,
@@ -1167,16 +1260,48 @@ fn build_params(
         .as_ref()
         .and_then(|compat| compat.supports_mid_convo_effort)
         == Some(true);
+    let thinking_disabled = model.reasoning
+        && options.thinking_enabled == Some(false)
+        && model
+            .thinking_level_map
+            .as_ref()
+            .and_then(|map| map.get(&ModelThinkingLevel::Off))
+            != Some(&None);
+    let effort_messages = managed && !thinking_disabled;
+    let has_preferred_strict_tools = !disable_preferred_strict_tools
+        && compat.supports_strict_tools
+        && initial_tools
+            .iter()
+            .chain(
+                context
+                    .messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::System(system) => system.tools_added.as_deref(),
+                        _ => None,
+                    })
+                    .flatten(),
+            )
+            .any(|tool| {
+                is_preferred_strict_tool(tool)
+                    && resolve_json_schema_strict_sampling_with_check(
+                        tool,
+                        true,
+                        Some(is_anthropic_strict_unsupported_keyword),
+                    )
+                    .is_ok_and(|strict| strict == Some(true))
+            });
     // Inline tool definitions for `tool_addition` blocks: the same converter
     // the request-level list uses, without cache control or deferral.
     let convert_tool_definitions = |tools: &[Tool]| -> Result<Vec<Value>, String> {
-        convert_tools(
+        convert_tools_with_disable(
             tools,
             is_oauth_token,
             compat.supports_eager_tool_input_streaming,
             compat.supports_strict_tools,
             None,
             false,
+            disable_preferred_strict_tools,
         )
     };
     let converted = convert_messages(
@@ -1185,9 +1310,9 @@ fn build_params(
         cache_control.as_ref(),
         compat.allow_empty_signature,
         native_tool_changes.then_some(&convert_tool_definitions as _),
-        managed.then_some(model.provider.as_str()),
+        effort_messages.then_some(model.provider.as_str()),
     )?;
-    let messages = if managed {
+    let messages = if effort_messages {
         insert_thinking_level_messages(converted, options.effort.as_deref().unwrap_or("high"))
     } else {
         converted.messages
@@ -1246,13 +1371,14 @@ fn build_params(
         // afterwards: later tools are defined by value in `tool_addition`
         // blocks and withdrawn by `tool_removal`, so the cached prefix
         // survives every tool change (b271b0a52, #9548).
-        let mut tools = convert_tools(
+        let mut tools = convert_tools_with_disable(
             &initial_tools,
             is_oauth_token,
             compat.supports_eager_tool_input_streaming,
             compat.supports_strict_tools,
             tool_cache_control,
             false,
+            disable_preferred_strict_tools,
         )?;
         tools.push(json!({
             "name": DEFERRED_TOOL_PLACEHOLDER_NAME,
@@ -1264,22 +1390,22 @@ fn build_params(
     } else {
         let tools = crate::utils::transcript::get_current_tools(&context.messages);
         if !tools.is_empty() {
-            params["tools"] = Value::Array(convert_tools(
+            params["tools"] = Value::Array(convert_tools_with_disable(
                 &tools,
                 is_oauth_token,
                 compat.supports_eager_tool_input_streaming,
                 compat.supports_strict_tools,
                 tool_cache_control,
                 false,
+                disable_preferred_strict_tools,
             )?);
         }
     }
 
-    // Configure thinking mode: adaptive, budget-based, or explicitly disabled.
-    // Managed effort models always use adaptive thinking so prefix mismatches
-    // can be dropped instead of surfacing as persistent 400 responses
-    // (:1123-1131, 4e69b0c28).
-    if managed {
+    // Disabled thinking cannot carry block binding or effort markers.
+    if thinking_disabled {
+        params["thinking"] = json!({"type": "disabled"});
+    } else if effort_messages {
         let display = options
             .thinking_display
             .unwrap_or(AnthropicThinkingDisplay::Summarized)
@@ -1361,7 +1487,10 @@ fn build_params(
         );
     }
 
-    Ok(params)
+    Ok(BuiltAnthropicParams {
+        params,
+        has_preferred_strict_tools,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1687,6 +1816,7 @@ impl<'a> StreamProcessor<'a> {
                                     .unwrap_or_default(),
                                 thought_signature: None,
                                 namespace: None,
+                                arguments_error: None,
                             },
                         ));
                         self.block_states.push(BlockState {
@@ -1799,9 +1929,11 @@ impl<'a> StreamProcessor<'a> {
                         });
                     }
                     Some(AssistantContent::ToolCall(block)) => {
-                        block.arguments = parse_streaming_json(Some(
+                        let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(
                             &self.block_states[content_index].partial_json,
                         ));
+                        block.arguments = parsed.arguments;
+                        block.arguments_error = parsed.arguments_error;
                         events.push(StreamEvent::ToolCallEnd {
                             content_index,
                             tool_call: block.clone(),
@@ -2036,38 +2168,57 @@ async fn run(
         federation_token.as_deref(),
     );
 
-    let mut params = build_params(model, context, is_oauth_token, native_tool_changes, options)?;
-    if let Some(on_payload) = &options.stream.on_payload
-        && let Some(mut next_params) = on_payload(params.clone(), model).await
-    {
-        // :571-572 — the SDK transport always streams; a caller-supplied
-        // payload cannot turn that off.
-        next_params["stream"] = json!(true);
-        params = next_params;
-    }
+    let mut disable_preferred_strict_tools = false;
+    let response = loop {
+        if options
+            .stream
+            .signal
+            .as_ref()
+            .is_some_and(|signal| signal.is_cancelled())
+        {
+            return Err("Request was aborted".to_owned());
+        }
+        let built = build_params_inner(
+            model,
+            context,
+            is_oauth_token,
+            native_tool_changes,
+            options,
+            disable_preferred_strict_tools,
+        )?;
+        let has_preferred_strict_tools = built.has_preferred_strict_tools;
+        let mut params = built.params;
+        if let Some(on_payload) = &options.stream.on_payload
+            && let Some(mut next_params) = on_payload(params.clone(), model).await
+        {
+            // :571-572 — the SDK transport always streams; a caller-supplied
+            // payload cannot turn that off.
+            next_params["stream"] = json!(true);
+            params = next_params;
+        }
 
-    let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-    let header_map = provider_headers_to_header_map(&headers)?;
-    let mut client_builder =
-        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
-    // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
-    // see api::stream_timeouts): connect_timeout bounds the connection, the
-    // headers wait is bounded in send_provider_request, and the body stream
-    // is wrapped in an inter-chunk idle timeout — an actively streaming
-    // response is never killed by its total duration.
-    if let Some(timeout_ms) = options.stream.timeout_ms {
-        client_builder =
-            client_builder.connect_timeout(std::time::Duration::from_millis(timeout_ms));
-    }
-    let client = client_builder.build().map_err(|error| error.to_string())?;
+        let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
+        let header_map = provider_headers_to_header_map(&headers)?;
+        let mut client_builder =
+            crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
+        // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
+        // see api::stream_timeouts): connect_timeout bounds the connection, the
+        // headers wait is bounded in send_provider_request, and the body stream
+        // is wrapped in an inter-chunk idle timeout — an actively streaming
+        // response is never killed by its total duration.
+        if let Some(timeout_ms) = options.stream.timeout_ms {
+            client_builder =
+                client_builder.connect_timeout(std::time::Duration::from_millis(timeout_ms));
+        }
+        let client = client_builder.build().map_err(|error| error.to_string())?;
 
-    let retry_options = ProviderRetryOptions {
-        max_retries: options.stream.max_retries,
-        max_retry_delay_ms: options.stream.max_retry_delay_ms,
-        ..Default::default()
-    };
-    let initial_federation_token = federation_token.clone();
-    let response = retry_provider_request(
+        let retry_options = ProviderRetryOptions {
+            max_retries: options.stream.max_retries,
+            max_retry_delay_ms: options.stream.max_retry_delay_ms,
+            ..Default::default()
+        };
+        let initial_federation_token = federation_token.clone();
+        let attempt = retry_provider_request(
         || {
             let client = client.clone();
             let url = url.clone();
@@ -2155,11 +2306,41 @@ async fn run(
                 }
             }
         },
-        retry_options,
+        retry_options.clone(),
         options.stream.signal.as_ref(),
     )
-    .await
-    .map_err(|error| error.message())?;
+    .await;
+        match attempt {
+            Ok(response) => break response,
+            Err(error) => {
+                let message = error.message();
+                if !disable_preferred_strict_tools
+                    && has_preferred_strict_tools
+                    && is_preferred_strict_tool_rejection(&error)
+                {
+                    disable_preferred_strict_tools = true;
+                    output.diagnostics.get_or_insert_with(Vec::new).push(
+                        crate::types::AssistantMessageDiagnostic {
+                            kind: "anthropic_strict_tools_fallback".to_owned(),
+                            timestamp: now_ms(),
+                            error: Some(crate::types::DiagnosticErrorInfo {
+                                name: Some("ProviderError".to_owned()),
+                                message,
+                                stack: None,
+                                code: None,
+                            }),
+                            details: Some(serde_json::Map::from_iter([(
+                                "reason".to_owned(),
+                                json!("strict_tool_limits_exceeded"),
+                            )])),
+                        },
+                    );
+                    continue;
+                }
+                return Err(message);
+            }
+        }
+    };
 
     if let Some(on_response) = &options.stream.on_response {
         on_response(
@@ -2234,14 +2415,21 @@ pub fn stream(
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let mut output = initial_output(&model);
-        // :513-520 (4e69b0c28): managed models record the turn's effort at
-        // stream start (`options.effort ?? "high"`); other models leave the
-        // field absent — never an empty string.
+        // Effort is recorded only when this request actually sends effort
+        // markers; disabled thinking has no providerThinkingLevel to replay.
+        let thinking_disabled = model.reasoning
+            && options.thinking_enabled == Some(false)
+            && model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(&ModelThinkingLevel::Off))
+                != Some(&None);
         if model
             .compat
             .as_ref()
             .and_then(|compat| compat.supports_mid_convo_effort)
             == Some(true)
+            && !thinking_disabled
         {
             output.provider_thinking_level =
                 Some(options.effort.clone().unwrap_or_else(|| "high".to_owned()));
@@ -2977,6 +3165,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn error_tool_result_images_follow_all_tool_results() {
+        let message = |id: &str, is_error: bool, content: Value| {
+            serde_json::from_value::<Message>(json!({
+                "role": "toolResult", "toolCallId": id, "toolName": "codemode",
+                "content": content, "isError": is_error, "timestamp": 0
+            }))
+            .expect("tool result")
+        };
+        let text = |text: &str| json!({"type": "text", "text": text});
+        let image = |data: &str| json!({"type": "image", "mimeType": "image/png", "data": data});
+        let messages = vec![
+            message(
+                "call-1",
+                true,
+                json!([
+                    text("Script failed"),
+                    image("AAAA"),
+                    image("CCCC"),
+                    text("Script error")
+                ]),
+            ),
+            message("call-2", false, json!([image("BBBB")])),
+        ];
+        let converted = convert_messages(&messages, false, None, false, None, None)
+            .expect("convert")
+            .messages;
+        let content = converted[0]["content"].as_array().expect("content");
+        assert_eq!(content.len(), 5);
+        assert_eq!(
+            content[0]["content"],
+            json!("Script failed\n(image attached after the tool results)\nScript error")
+        );
+        assert_eq!(content[1]["is_error"], json!(false));
+        assert_eq!(content[1]["content"][1]["source"]["data"], json!("BBBB"));
+        assert_eq!(
+            content[2]["text"],
+            json!("Images from the error result of tool call call-1 (codemode):")
+        );
+        assert_eq!(content[3]["source"]["data"], json!("AAAA"));
+        assert_eq!(content[4]["source"]["data"], json!("CCCC"));
+    }
+
+    #[test]
     fn test_convert_messages_oauth_tool_names() {
         let messages = vec![assistant_message(
             vec![AssistantContent::ToolCall(crate::types::ToolCall {
@@ -2985,6 +3216,7 @@ pub(crate) mod tests {
                 arguments: serde_json::Map::new(),
                 thought_signature: None,
                 namespace: None,
+                arguments_error: None,
             })],
             "anthropic",
             "claude-sonnet-4-5",
@@ -3298,6 +3530,7 @@ pub(crate) mod tests {
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 })],
                 "openai",
                 "gpt-5",
@@ -3332,6 +3565,7 @@ pub(crate) mod tests {
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 })],
                 "anthropic",
                 "claude-sonnet-4-5",
@@ -3386,6 +3620,7 @@ pub(crate) mod tests {
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 })],
                 "anthropic",
                 "claude-sonnet-4-5",
@@ -3418,6 +3653,7 @@ pub(crate) mod tests {
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 })],
                 "anthropic",
                 "claude-sonnet-4-5",
@@ -4177,6 +4413,56 @@ mod mid_convo_effort_tests {
         (captured, message)
     }
 
+    #[tokio::test]
+    async fn off_disables_effort_only_when_the_model_supports_it() {
+        let mut supported = managed_model("anthropic");
+        supported
+            .thinking_level_map
+            .as_mut()
+            .expect("level map")
+            .remove(&ModelThinkingLevel::Off);
+        let ctx = context(
+            vec![
+                user_text("one"),
+                assistant_with_level(&supported, Some("low")),
+                user_text("two"),
+            ],
+            None,
+        );
+        let options = AnthropicOptions {
+            thinking_enabled: Some(false),
+            effort: Some("medium".to_owned()),
+            ..Default::default()
+        };
+        let params = build_params(&supported, &ctx, false, false, &options).expect("params");
+        assert_eq!(params["thinking"], json!({"type": "disabled"}));
+        assert!(params.get("output_config").is_none());
+        assert!(effort_markers(&params).is_empty(), "{params}");
+        let message = stream(&supported, &ctx, options)
+            .result()
+            .await
+            .expect("output");
+        assert_eq!(message.provider_thinking_level, None);
+
+        let unsupported = managed_model("anthropic");
+        let ctx = context(vec![user_text("one")], None);
+        let options = AnthropicOptions {
+            thinking_enabled: Some(false),
+            effort: Some("medium".to_owned()),
+            ..Default::default()
+        };
+        let params = build_params(&unsupported, &ctx, false, false, &options).expect("params");
+        assert_eq!(params["thinking"]["type"], json!("adaptive"));
+        assert!(params["thinking"].get("block_binding").is_some());
+        assert_eq!(params["output_config"], json!({"effort": "high"}));
+        assert!(!effort_markers(&params).is_empty());
+        let message = stream(&unsupported, &ctx, options)
+            .result()
+            .await
+            .expect("output");
+        assert_eq!(message.provider_thinking_level.as_deref(), Some("medium"));
+    }
+
     fn effort_markers(payload: &Value) -> Vec<&Value> {
         payload["messages"]
             .as_array()
@@ -4640,6 +4926,7 @@ mod fireworks_mid_convo_tools_tests {
                         .unwrap_or_default(),
                     thought_signature: None,
                     namespace: None,
+                    arguments_error: None,
                 }),
             ],
             &model.provider,

@@ -287,29 +287,26 @@ fn extract_account_id(token: &str) -> Result<String, CodexError> {
     Ok(account_id.to_owned())
 }
 
-/// `pi (<platform> <release>; <arch>)` — shared consolidation of the
-/// pre-existing local implementation (pi-user-agent.ts:18).
-use crate::utils::rpi_user_agent::get_rpi_user_agent;
-
 /// Case-insensitive header record (JS `Headers` lowercases all names).
 type HeaderRecord = BTreeMap<String, String>;
 
-/// `buildBaseCodexHeaders` (#10429 `0cf65d2bf`): provider defaults first
-/// so model and model/caller headers can override them, matching the other
-/// providers; model headers, then option headers (`None` deletes), then the
-/// fixed Authorization/account-id headers. `StreamOptions.headers`
-/// documents that caller values override provider defaults.
+/// Identity and the Codex originator are defaults below model/request headers.
 fn build_base_codex_headers(
     model: &Model,
     additional_headers: Option<&ProviderHeaders>,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
     account_id: &str,
     token: &str,
 ) -> HeaderRecord {
     let mut headers = HeaderRecord::new();
-    // Literal "rpi" (upstream openai-codex-responses.ts:1593 uses "pi";
-    // ADR-0001 brand rename).
+    // Literal "rpi" (ADR-0001 brand rename). Codex expects this independently
+    // of the optional provider attribution.
     headers.insert("originator".to_owned(), "rpi".to_owned());
-    headers.insert("user-agent".to_owned(), get_rpi_user_agent());
+    for (key, value) in crate::utils::identity::get_identity_headers(model.into(), identity) {
+        if let Some(value) = value {
+            headers.insert(key.to_lowercase(), value);
+        }
+    }
     if let Some(model_headers) = &model.headers {
         for (key, value) in model_headers {
             headers.insert(key.to_lowercase(), value.clone());
@@ -330,11 +327,13 @@ fn build_base_codex_headers(
 fn build_sse_headers(
     model: &Model,
     additional_headers: Option<&ProviderHeaders>,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
     account_id: &str,
     token: &str,
     session_id: Option<&str>,
 ) -> HeaderRecord {
-    let mut headers = build_base_codex_headers(model, additional_headers, account_id, token);
+    let mut headers =
+        build_base_codex_headers(model, additional_headers, identity, account_id, token);
     headers.insert(
         "openai-beta".to_owned(),
         "responses=experimental".to_owned(),
@@ -348,18 +347,17 @@ fn build_sse_headers(
     headers
 }
 
-/// `buildWebSocketHeaders`. Upstream's `delete wsHeaders["OpenAI-Beta"]` in
-/// `connectWebSocket` is a case-mismatched no-op (`headersToRecord` lowercases
-/// keys), so the `openai-beta` header below **is** sent in the handshake —
-/// kept bug-compatible.
+/// `buildWebSocketHeaders`.
 fn build_websocket_headers(
     model: &Model,
     additional_headers: Option<&ProviderHeaders>,
+    identity: Option<&crate::utils::identity::ClientIdentity>,
     account_id: &str,
     token: &str,
     request_id: &str,
 ) -> HeaderRecord {
-    let mut headers = build_base_codex_headers(model, additional_headers, account_id, token);
+    let mut headers =
+        build_base_codex_headers(model, additional_headers, identity, account_id, token);
     headers.remove("accept");
     headers.remove("content-type");
     headers.remove("openai-beta");
@@ -417,7 +415,11 @@ pub fn build_request_body(
         .unwrap_or(false);
     let transcript_tools = crate::utils::transcript::resolve_transcript_tools(
         &context.messages,
-        supports_additional_tools || supports_tool_search,
+        crate::api::openai_responses_shared::get_responses_tool_support(
+            supports_mid_convo_system_messages,
+            supports_additional_tools,
+            supports_tool_search,
+        ),
     );
     let tool_options = ConvertResponsesToolsOptions {
         strict: None,
@@ -436,6 +438,7 @@ pub fn build_request_body(
             supports_additional_tools,
             supports_tool_search,
             tool_options: tool_options.clone(),
+            configuration_update_effort: None,
         },
     )?;
 
@@ -1218,6 +1221,7 @@ async fn run(
     let sse_headers = build_sse_headers(
         model,
         options.stream.headers.as_ref(),
+        options.stream.identity.as_ref(),
         &account_id,
         &api_key,
         codex_session_id.as_deref(),
@@ -1225,6 +1229,7 @@ async fn run(
     let websocket_headers = build_websocket_headers(
         model,
         options.stream.headers.as_ref(),
+        options.stream.identity.as_ref(),
         &account_id,
         &api_key,
         &websocket_request_id,
@@ -2260,14 +2265,19 @@ mod tests {
                 .collect()
         };
 
-        // supportsMidConvoSystemMessages + supportsAdditionalTools:
-        // message-anchored additional_tools, request keeps the initial set.
+        // Every tool is declared in place; no top-level tool can be replaced.
         let m = model(json!({
             "compat": {"supportsOpenAIGrammarTools": true, "supportsMidConvoSystemMessages": true, "supportsAdditionalTools": true}
         }));
         let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
-        assert_eq!(top_level_names(&body), vec!["base_tool"]);
+        assert!(body.get("tools").is_none());
         let input = body["input"].as_array().expect("input");
+        let names: Vec<&str> = input
+            .iter()
+            .filter(|item| item["type"] == json!("additional_tools"))
+            .filter_map(|item| item["tools"][0]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["base_tool", "late_tool"]);
         assert!(
             input
                 .iter()
@@ -2437,7 +2447,7 @@ mod tests {
     #[test]
     fn test_build_sse_headers() {
         let m = model(json!({}));
-        let headers = build_sse_headers(&m, None, "acc_test", "token", Some("sess"));
+        let headers = build_sse_headers(&m, None, None, "acc_test", "token", Some("sess"));
         assert_eq!(
             headers.get("authorization"),
             Some(&"Bearer token".to_owned())
@@ -2459,17 +2469,16 @@ mod tests {
         );
         assert_eq!(headers.get("session-id"), Some(&"sess".to_owned()));
         assert_eq!(headers.get("x-client-request-id"), Some(&"sess".to_owned()));
-        assert!(
-            headers
-                .get("user-agent")
-                .is_some_and(|ua| ua.starts_with("rpi ("))
+        assert_eq!(
+            headers.get("user-agent"),
+            Some(&crate::utils::identity::format_user_agent(None))
         );
     }
 
     #[test]
     fn test_build_websocket_headers() {
         let m = model(json!({}));
-        let headers = build_websocket_headers(&m, None, "acc_test", "token", "req_1");
+        let headers = build_websocket_headers(&m, None, None, "acc_test", "token", "req_1");
         assert_eq!(
             headers.get("openai-beta"),
             Some(&"responses_websockets=2026-02-06".to_owned())
@@ -2492,7 +2501,7 @@ mod tests {
             ("x-extra".to_owned(), Some("1".to_owned())),
         ]
         .into();
-        let headers = build_base_codex_headers(&m, Some(&options_headers), "acc", "token");
+        let headers = build_base_codex_headers(&m, Some(&options_headers), None, "acc", "token");
         // Option `None` deletes the model header (case-insensitively).
         assert!(!headers.contains_key("x-custom"));
         assert_eq!(headers.get("x-extra"), Some(&"1".to_owned()));
@@ -2519,7 +2528,7 @@ mod tests {
             ),
         ]
         .into();
-        let headers = build_base_codex_headers(&m, Some(&options_headers), "acc", "token");
+        let headers = build_base_codex_headers(&m, Some(&options_headers), None, "acc", "token");
         assert_eq!(headers.get("originator"), Some(&"my-app".to_owned()));
         assert_eq!(headers.get("user-agent"), Some(&"my-app/1.0".to_owned()));
         // The auth header stays the resolved token.

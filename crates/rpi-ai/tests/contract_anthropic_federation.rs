@@ -457,6 +457,7 @@ async fn models_stream_simple_threads_federation_env() {
     ])
     .await;
     let models = create_models(Some(CreateModelsOptions {
+        identity: None,
         credentials: None,
         auth_context: Some(Arc::new(MapAuthContext(federation_env(
             &identity.path_str(),

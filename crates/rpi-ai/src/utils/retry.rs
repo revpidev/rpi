@@ -34,9 +34,14 @@ fn non_retryable_provider_limit_error_pattern() -> &'static Regex {
             // Sign in with ChatGPT: the subscription's shared usage limit,
             // which resets after hours rather than seconds (`02eed88fd`).
             "subscription_sharing_usage_limit_exceeded",
+            "subscription_sharing_workplace_individual_usage_limit_exceeded",
         ])
     });
     &PATTERN
+}
+
+pub(crate) fn is_non_retryable_provider_limit_error(message: &str) -> bool {
+    non_retryable_provider_limit_error_pattern().is_match(message)
 }
 
 fn retryable_provider_error_pattern() -> &'static Regex {
@@ -53,28 +58,26 @@ fn retryable_provider_error_pattern() -> &'static Regex {
             "model is at capacity",
             "rate.?limit",
             "too many requests",
-            "429",
-            "500",
-            "502",
-            "503",
-            "504",
-            // #9627 (e5d18382a): Cloudflare-origin 520s are retryable,
-            // like the 52x/54x statuses already listed.
-            "520",
-            "524",
-            "service.?unavailable",
+            // Status codes must not occur inside a longer word or number.
+            "(?:^|[^a-z0-9])(?:429|500|502|503|504|520|524)(?:$|[^a-z0-9])",
+            "service.?(?:is.?)?(?:temporarily.?)?unavailable",
             "server.?error",
             "internal.?error",
-            // Wrapper/provider text for transient upstream failures, including
-            // OpenRouter "Provider returned error" responses (#2264).
-            "provider.?returned.?error",
+            // Wrapper/provider text for transient upstream failures.
+            "provider.?returned.?(?:an.?)?error",
             "exceeded request buffer limit while retrying upstream",
+            "unable to forward upstream",
+            "upstream.?request.?failed",
+            "upstream_stream_read_error",
+            "stream was interrupted",
+            "http/?2 stream failed",
             "network.?error",
             "connection.?error",
             "connection.?refused",
             "connection.?lost",
             "other side closed",
             "fetch failed",
+            "request to \\S+ failed, reason:",
             "getaddrinfo",
             "ENOTFOUND",
             "EAI_AGAIN",
@@ -91,6 +94,7 @@ fn retryable_provider_error_pattern() -> &'static Regex {
             "stream ended before message_stop",
             "stream ended before a terminal response event",
             "http2 request did not get a response",
+            "stream disconnected before completion",
             // #10379 (5b6c792b4): Node ERR_HTTP2_STREAM_CANCEL — the HTTP/2
             // session died before the request was sent, e.g. after the
             // Bedrock SDK's 5-minute session timeout.
@@ -308,6 +312,37 @@ mod tests {
             StopReason::Error,
             Some(AZURE_PEAK_LOAD_ERROR)
         )));
+    }
+
+    #[test]
+    fn retry_matrix_uses_status_boundaries_and_provider_error_kinds() {
+        for message in [
+            "429 too many requests",
+            "upstream request failed",
+            "upstream_stream_read_error",
+            "stream was interrupted",
+            "HTTP/2 stream failed",
+            "The service is temporarily unavailable",
+            "request to https://auth.example.com failed, reason: ",
+            "stream disconnected before completion: stream closed before response.completed",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&assistant(StopReason::Error, Some(message))),
+                "{message}"
+            );
+        }
+        for message in [
+            "request-id-429001",
+            "request 4290 bytes failed",
+            "4130 status code",
+            "x429y",
+            "subscription_sharing_workplace_individual_usage_limit_exceeded: limit reached",
+        ] {
+            assert!(
+                !is_retryable_assistant_error(&assistant(StopReason::Error, Some(message))),
+                "{message}"
+            );
+        }
     }
 
     /// #10278 (3874b3e98) / #10543 (8b5708dbb) / #10379 (5b6c792b4):
