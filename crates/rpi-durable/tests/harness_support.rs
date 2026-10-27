@@ -207,6 +207,7 @@ pub fn options() -> HarnessOptions {
         .collect();
     HarnessOptions {
         models: Models::new(None),
+        identity: None,
         registry: Arc::new(RegistryImpl::with_builtins(builtins)),
         settings: None,
         env: None,

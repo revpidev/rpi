@@ -66,11 +66,15 @@ impl ApiKeyAuth for AlwaysAuth {
     }
 }
 
+/// Identity values observed at the provider boundary.
+pub type IdentityLog = Arc<Mutex<Vec<Option<rpi_ai::utils::identity::ClientIdentity>>>>;
+
 /// A provider that returns scripted responses in order.
 pub struct ScriptedProvider {
     model: Model,
     auth: ProviderAuth,
     scripts: Mutex<VecDeque<Script>>,
+    identity_log: Option<IdentityLog>,
 }
 
 impl ScriptedProvider {
@@ -82,6 +86,12 @@ impl ScriptedProvider {
             .unwrap_or_else(|| {
                 Script::Message(error_message("no scripted reply", "no scripted reply"))
             })
+    }
+
+    fn record_identity(&self, identity: Option<rpi_ai::utils::identity::ClientIdentity>) {
+        if let Some(log) = &self.identity_log {
+            log.lock().expect("identity log").push(identity);
+        }
     }
 
     fn stream_of(&self, script: Script) -> AssistantMessageEventStream {
@@ -160,8 +170,9 @@ impl Provider for ScriptedProvider {
         &self,
         _model: &Model,
         _context: &TranscriptContext,
-        _options: Option<StreamOptions>,
+        options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
+        self.record_identity(options.and_then(|options| options.identity.clone()));
         self.stream_of(self.next())
     }
 
@@ -169,8 +180,9 @@ impl Provider for ScriptedProvider {
         &self,
         _model: &Model,
         _context: &TranscriptContext,
-        _options: Option<SimpleStreamOptions>,
+        options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
+        self.record_identity(options.and_then(|options| options.stream.identity.clone()));
         Ok(self.stream_of(self.next()))
     }
 }
@@ -200,6 +212,12 @@ pub fn model() -> Model {
 
 /// Build a `Models` handle with one scripted provider.
 pub fn test_models(scripts: Vec<Script>) -> Models {
+    test_models_with_identity_log(scripts).0
+}
+
+/// Build a `Models` handle and capture identity at each provider call.
+pub fn test_models_with_identity_log(scripts: Vec<Script>) -> (Models, IdentityLog) {
+    let identity_log = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(ScriptedProvider {
         model: model(),
         auth: ProviderAuth {
@@ -207,10 +225,11 @@ pub fn test_models(scripts: Vec<Script>) -> Models {
             oauth: None,
         },
         scripts: Mutex::new(scripts.into()),
+        identity_log: Some(Arc::clone(&identity_log)),
     });
     let models = Models::new(None);
     models.set_provider(provider);
-    models
+    (models, identity_log)
 }
 
 /// The shared background context.
@@ -246,12 +265,40 @@ pub async fn open(
     open_with_storage(Arc::new(MemoryStorage::new()), extensions, settings, models).await
 }
 
+/// Open a Harness with explicit request identity.
+pub async fn open_with_identity(
+    extensions: Vec<Extension>,
+    settings: Option<HarnessSettings>,
+    models: Models,
+    identity: Option<rpi_ai::utils::identity::ClientIdentity>,
+) -> Opened {
+    open_with_storage_and_identity(
+        Arc::new(MemoryStorage::new()),
+        extensions,
+        settings,
+        models,
+        identity,
+    )
+    .await
+}
+
 /// Open a Harness over `storage`.
 pub async fn open_with_storage(
     storage: Arc<dyn Storage>,
     extensions: Vec<Extension>,
     settings: Option<HarnessSettings>,
     models: Models,
+) -> Opened {
+    open_with_storage_and_identity(storage, extensions, settings, models, None).await
+}
+
+/// Open a Harness over `storage` with explicit request identity.
+pub async fn open_with_storage_and_identity(
+    storage: Arc<dyn Storage>,
+    extensions: Vec<Extension>,
+    settings: Option<HarnessSettings>,
+    models: Models,
+    identity: Option<rpi_ai::utils::identity::ClientIdentity>,
 ) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtin_tasks()));
     for extension in extensions {
@@ -261,6 +308,7 @@ pub async fn open_with_storage(
     let captured = reports.clone();
     let options = HarnessOptions {
         models,
+        identity,
         registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
         settings,
         env: None,

@@ -141,6 +141,59 @@ async fn answer_appends_assistant_entry_and_ends_run_done() {
     assert!(run_task_id(&opened, conversation.id()).await.is_none());
 }
 
+/// durable/harness/types.ts:616-623 and harness.ts:187-198: the Harness
+/// applies its identity over the Models defaults for every model request.
+#[tokio::test]
+async fn harness_model_requests_apply_identity_overrides() {
+    let custom = rpi_ai::utils::identity::ClientAttribution {
+        name: "custom-harness".to_owned(),
+        url: "https://example.test".to_owned(),
+        categories: None,
+    };
+    for (identity, expected_attribution) in [
+        (None, Some(rpi_ai::utils::identity::rpi_attribution())),
+        (
+            Some(rpi_ai::utils::identity::ClientIdentity {
+                attribution: Some(Some(custom.clone())),
+                ..Default::default()
+            }),
+            Some(custom),
+        ),
+        (
+            Some(rpi_ai::utils::identity::ClientIdentity {
+                attribution: Some(None),
+                ..Default::default()
+            }),
+            None,
+        ),
+    ] {
+        let (models, identity_log) =
+            generation_support::test_models_with_identity_log(vec![Script::Message(text_message(
+                "hello",
+                StopReason::Stop,
+            ))]);
+        let opened =
+            generation_support::open_with_identity(Vec::new(), None, models, identity).await;
+        let conversation = root_ready(&opened.harness).await;
+        let submission = submit_input(&conversation, "hi").await;
+        let settled = submission.wait(&context()).await.expect("wait");
+        assert!(
+            matches!(
+                input_status(&settled),
+                Some(InputSubmissionStatus::Done { .. })
+            ),
+            "expected Done, got {settled:?}"
+        );
+        let identities = identity_log.lock().expect("identity log").clone();
+        assert_eq!(identities.len(), 1);
+        let actual = identities[0]
+            .as_ref()
+            .and_then(|identity| identity.attribution.as_ref())
+            .and_then(|attribution| attribution.as_ref());
+        assert_eq!(actual, expected_attribution.as_ref());
+    }
+}
+
 /// upstream: "retries a retryable assistant error, then succeeds".
 #[tokio::test]
 async fn retryable_error_retries_then_succeeds() {

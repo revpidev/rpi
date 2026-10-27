@@ -1031,10 +1031,16 @@ pub async fn open_harness_with_scheduler(
     session.set_conversation_created_hook(conversation_created_hook(
         options.conversation_created.clone(),
     ));
+    let identity = rpi_ai::utils::identity::merge_client_identity(
+        Some(crate::harness::types::default_harness_identity()),
+        options.identity.clone(),
+    )
+    .unwrap_or_else(crate::harness::types::default_harness_identity);
+    let models = rpi_ai::utils::identity::with_client_identity(&options.models, identity);
     let scheduler = scheduler_factory(SchedulerDeps {
         session: Arc::clone(&session),
         storage: Arc::clone(&storage),
-        models: options.models.clone(),
+        models,
         registry: Arc::clone(&options.registry),
         settings: settings.clone(),
         env: options.env.clone(),

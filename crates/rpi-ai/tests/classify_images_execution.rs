@@ -393,25 +393,91 @@ async fn openrouter_classifier_sends_state_image_urls_without_assets() {
     assert!(body.get("assets").is_none(), "{body}");
 }
 
+fn clef_direct_success() -> Value {
+    json!({
+        "success": true,
+        "result": {
+            "model": "clef",
+            "answers": {
+                "q1": { "type": "choice", "choice": "a", "probabilities": { "a": 0.7, "b": 0.3 }, "confidence": 0.7 },
+                "q2": { "type": "score", "score": 2, "confidence": 0.5 },
+                "q3": { "type": "noul", "noul": 0.9912 }
+            },
+            "usage": { "input_tokens": 222, "output_tokens": 0 }
+        }
+    })
+}
+
+/// cloudflare-workers-ai-system-one.test.ts:106-165: Clef returns its output
+/// directly in `result`, without a third-party run record.
+#[tokio::test]
+async fn cloudflare_clef_direct_output_supports_all_models_and_prices() {
+    for (id, input_price) in [
+        ("@cf/cloudflare/clef", 0.24),
+        ("@cf/cloudflare/clef-flash", 0.038),
+        ("@cf/cloudflare/clef-omni", 0.15),
+    ] {
+        let (base_url, _requests) =
+            serve(vec![ScriptResponse::json(200, clef_direct_success())]).await;
+        let models = Models::new(None);
+        models.set_provider(create_provider(CreateProviderOptions {
+            id: "cloudflare-workers-ai".to_owned(),
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(StaticKeyAuth)),
+                oauth: None,
+            },
+            classifiers: std::collections::HashMap::from([(
+                "cloudflare-workers-ai-system-one".to_owned(),
+                cloudflare_workers_ai_system_one_api(),
+            )]),
+            models: Vec::new(),
+            all_models: Vec::new(),
+            images: std::collections::HashMap::new(),
+            base_url: None,
+            headers: None,
+            name: None,
+            api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+            filter_models_fn: None,
+            filter_all_models_fn: None,
+            fetch_models: None,
+        }));
+        let mut model = rpi_ai::generated::get_builtin_classifier_models("cloudflare-workers-ai")
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("Clef catalog model")
+            .clone();
+        model.base_url = base_url;
+        let result = models.classify(&model, &classifier_context(), None).await;
+        assert_eq!(
+            result.stop_reason,
+            ClassifierStopReason::Stop,
+            "{id}: {:?}",
+            result.error_message
+        );
+        match result.answers.get("q3") {
+            Some(ClassifierAnswer::Bool(answer)) => assert_eq!(answer.probability, 0.9912),
+            other => panic!("{id} q3: {other:?}"),
+        }
+        let usage = result.usage.expect("direct Clef usage");
+        assert_eq!(usage.input, 222);
+        assert_eq!(usage.output, 0);
+        assert_eq!(usage.total_tokens, 222);
+        let expected_input_cost = 222.0 * input_price / 1_000_000.0;
+        assert!(
+            (usage.cost.input - expected_input_cost).abs() < 1e-12,
+            "{id}: {:?}",
+            usage.cost
+        );
+    }
+}
+
 /// 7f225f25d: Cloudflare Clef takes data URLs in `input.images` and does not
-/// send TypeSafe's opt-in header.
+/// send TypeSafe's opt-in header. Its direct response shape comes from the
+/// upstream `clefOutput` fixture.
 #[tokio::test]
 async fn cloudflare_clef_classifier_sends_images_list() {
-    let (base_url, mut requests) = serve(vec![ScriptResponse::json(
-        200,
-        json!({
-            "success": true,
-            "result": {
-                "state": "Completed",
-                "result": {
-                    "answers": {
-                        "q1": { "type": "choice", "choice": "a", "probabilities": { "a": 0.7, "b": 0.3 }, "confidence": 0.7 }
-                    }
-                }
-            }
-        }),
-    )])
-    .await;
+    let (base_url, mut requests) =
+        serve(vec![ScriptResponse::json(200, clef_direct_success())]).await;
     let models = Models::new(None);
     models.set_provider(create_provider(CreateProviderOptions {
         id: "cloudflare-workers-ai".to_owned(),

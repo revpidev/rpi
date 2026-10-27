@@ -1236,10 +1236,21 @@ pub type EnvFactory = Arc<
     dyn Fn(EnvTarget, Context) -> BoxFuture<'static, Option<Arc<dyn ExecutionEnv>>> + Send + Sync,
 >;
 
+/// Default request identity for model calls made through a Harness.
+pub fn default_harness_identity() -> rpi_ai::utils::identity::ClientIdentity {
+    rpi_ai::utils::identity::ClientIdentity {
+        attribution: Some(Some(rpi_ai::utils::identity::rpi_attribution())),
+        ..Default::default()
+    }
+}
+
 /// Harness construction options (`HarnessOptions`).
 pub struct HarnessOptions {
     /// pi-ai model access used by generation.
     pub models: Models,
+    /// Request identity merged over [`default_harness_identity`]. An explicit
+    /// `attribution: None` disables provider attribution headers.
+    pub identity: Option<rpi_ai::utils::identity::ClientIdentity>,
     /// Application-owned registry reader.
     pub registry: Arc<dyn RegistryReader>,
     /// Host settings overrides.

@@ -662,6 +662,7 @@ pub async fn open_with_storage(storage: Arc<dyn Storage>, tasks: Vec<AnyTask>) -
     }
     let options = HarnessOptions {
         models: Models::new(None),
+        identity: None,
         registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
         settings: None,
         env: None,

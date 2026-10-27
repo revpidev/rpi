@@ -370,8 +370,8 @@ mod tests {
         let catalog = builtin_catalog().expect("catalog");
         assert_eq!(catalog.manifest().schema_version, 6);
         assert_eq!(catalog.manifest().files.len(), CATALOG_PROVIDER_DATA.len());
-        // 2026-07-30T01:56:27.841Z per the vendored manifest; exact value is
-        // asserted against the manifest string itself, not hardcoded here.
+        // The timestamp is read from the vendored manifest rather than
+        // duplicated here; this test asserts only that it parses.
         assert!(catalog.generated_at().is_some());
     }
 

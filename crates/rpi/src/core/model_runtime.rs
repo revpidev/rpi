@@ -1755,7 +1755,7 @@ fn validate_kimi_coding_base_url(
         return Ok(());
     }
     Err(format!(
-        "Provider {provider_id}, model {model_id}: invalid baseUrl {base_url:?} at models.json {config_key}. Kimi Code now uses OpenAI Chat Completions and requires a URL path containing \"/v1\". Migration example: set \"baseUrl\": \"https://api.kimi.com/coding/v1\" (or your proxy's \"/v1\" path). No suffix is added automatically."
+        "Provider {provider_id}, model {model_id}: invalid baseUrl at models.json {config_key}. Kimi Code now uses OpenAI Chat Completions and requires a URL path containing \"/v1\". Migration example: set \"baseUrl\": \"https://api.kimi.com/coding/v1\" (or your proxy's \"/v1\" path). No suffix is added automatically."
     ))
 }
 
@@ -2869,6 +2869,17 @@ impl ModelRuntime {
         }
     }
 
+    /// Keep Kimi's migration error visible at request time instead of letting
+    /// the generic native-provider composition fallback use the old endpoint.
+    fn kimi_config_error(&self, provider_id: &str) -> Option<ModelsError> {
+        if provider_id != "kimi-coding" {
+            return None;
+        }
+        lock(&self.composition_errors)
+            .get(provider_id)
+            .map(|error| ModelsError::new(ModelsErrorCode::ModelValidation, error.clone()))
+    }
+
     /// `getAuth(model, overrides)` (model-runtime.ts:374-396). Provider-level
     /// configured headers/`authHeader` are baked into the composed provider's
     /// auth resolution ([`ConfiguredApiKeyAuth`]); model-level headers merge
@@ -2878,6 +2889,9 @@ impl ModelRuntime {
         model: &Model,
         overrides: Option<&ModelRuntimeAuthOverrides>,
     ) -> Result<Option<AuthResult>, ModelsError> {
+        if let Some(error) = self.kimi_config_error(&model.provider) {
+            return Err(error);
+        }
         let overrides = overrides.cloned().unwrap_or_default();
         self.models
             .get_auth(
@@ -2897,6 +2911,9 @@ impl ModelRuntime {
         model: &Model,
         overrides: Option<&AuthResolutionOverrides>,
     ) -> Result<Option<rpi_ai::auth::ResolvedRequestAuth>, ModelsError> {
+        if let Some(error) = self.kimi_config_error(&model.provider) {
+            return Err(error);
+        }
         self.models
             .get_resolved_request_auth(model, overrides)
             .await
@@ -2911,6 +2928,9 @@ impl ModelRuntime {
         provider_id: &str,
         overrides: Option<&AuthResolutionOverrides>,
     ) -> Result<Option<AuthResult>, ModelsError> {
+        if let Some(error) = self.kimi_config_error(provider_id) {
+            return Err(error);
+        }
         self.models.get_provider_auth(provider_id, overrides).await
     }
 
@@ -3195,6 +3215,9 @@ impl ModelRuntime {
         context: &Context,
         options: Option<ModelsStreamOptions>,
     ) -> AssistantMessageEventStream {
+        if let Some(error) = self.kimi_config_error(&model.provider) {
+            return rpi_ai::api::lazy::lazy_stream(model, async move { Err(error) });
+        }
         self.models.stream(model, context, options)
     }
 
@@ -3204,6 +3227,9 @@ impl ModelRuntime {
         context: &Context,
         options: Option<ModelsStreamOptions>,
     ) -> Option<AssistantMessage> {
+        if self.kimi_config_error(&model.provider).is_some() {
+            return self.stream(model, context, options).result().await;
+        }
         self.models.complete(model, context, options).await
     }
 
@@ -3218,6 +3244,9 @@ impl ModelRuntime {
         context: &Context,
         options: Option<ModelsSimpleStreamOptions>,
     ) -> AssistantMessageEventStream {
+        if let Some(error) = self.kimi_config_error(&model.provider) {
+            return rpi_ai::api::lazy::lazy_stream(model, async move { Err(error) });
+        }
         if !virtual_models::is_virtual_model(model) {
             return self.models.stream_simple(model, context, options);
         }
@@ -3267,6 +3296,9 @@ impl ModelRuntime {
             next.simple.reasoning = (route.thinking_level != ModelThinkingLevel::Off)
                 .then(|| rpi_ai::types::ThinkingLevel::from_model_level(route.thinking_level))
                 .flatten();
+            if let Some(error) = this.kimi_config_error(&route.model.provider) {
+                return Err(error);
+            }
             Ok(this
                 .models
                 .stream_simple(&route.model, &context, Some(next)))
@@ -3285,6 +3317,9 @@ impl ModelRuntime {
         context: &Context,
         options: Option<ModelsSimpleStreamOptions>,
     ) -> Option<AssistantMessage> {
+        if self.kimi_config_error(&model.provider).is_some() {
+            return self.stream_simple(model, context, options).result().await;
+        }
         self.models.complete_simple(model, context, options).await
     }
 
@@ -5057,6 +5092,61 @@ mod tests {
         let params = merged.sampling_params.as_ref().expect("samplingParams");
         assert_eq!(params["top_p"], serde_json::json!(0.5));
         assert_eq!(params["min_p"], serde_json::json!(0.05));
+    }
+
+    #[tokio::test]
+    async fn invalid_kimi_base_url_fails_auth_and_streaming_without_native_fallback() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers":{"kimi-coding":{"baseUrl":"https://api.kimi.com/coding","apiKey":"test-kimi-key"}}}"#,
+        )
+        .await;
+        let model = runtime
+            .get_model("kimi-coding", "kimi-for-coding")
+            .expect("composed fallback model");
+        let error = runtime
+            .get_auth(&model, None)
+            .await
+            .expect_err("invalid Kimi config must fail before auth");
+        assert!(error.message.contains("providers.kimi-coding.baseUrl"));
+        assert!(error.message.contains("https://api.kimi.com/coding/v1"));
+
+        let stream = runtime
+            .stream(&model, &Context::default(), None)
+            .result()
+            .await
+            .expect("stream error");
+        let simple = runtime
+            .stream_simple(&model, &Context::default(), None)
+            .result()
+            .await
+            .expect("simple stream error");
+        let complete = runtime
+            .complete(&model, &Context::default(), None)
+            .await
+            .expect("complete error");
+        let complete_simple = runtime
+            .complete_simple(&model, &Context::default(), None)
+            .await
+            .expect("complete simple error");
+        for message in [stream, simple, complete, complete_simple] {
+            assert_eq!(message.stop_reason, rpi_ai::types::StopReason::Error);
+            let error = message.error_message.expect("migration error");
+            assert!(error.contains("providers.kimi-coding.baseUrl"), "{error}");
+            assert!(error.contains("https://api.kimi.com/coding/v1"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn kimi_config_error_does_not_echo_url_credentials() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers":{"kimi-coding":{"baseUrl":"https://user:password@example.com/coding?token=secret"}}}"#,
+        )
+        .await;
+        let error = runtime.get_error().expect("composition error");
+        assert!(error.contains("providers.kimi-coding.baseUrl"));
+        assert!(!error.contains("user:password"));
+        assert!(!error.contains("password"));
+        assert!(!error.contains("token=secret"));
     }
 
     #[tokio::test]

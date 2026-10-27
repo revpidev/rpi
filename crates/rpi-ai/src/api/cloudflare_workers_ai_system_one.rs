@@ -3,8 +3,10 @@
 //!
 //! System One models on the Workers AI REST endpoint: `POST
 //! /accounts/{account}/ai/run` with `{ model, input }`. The REST API wraps
-//! the model output in Cloudflare's API envelope and a run record:
-//! `{ success, result: { state: "Completed", result: { answers, usage } } }`.
+//! the model output in Cloudflare's API envelope. Third-party models add a run
+//! record: `{ success, result: { state: "Completed", result: { answers, usage } } }`;
+//! Cloudflare-hosted models return `{ success, result: { model, answers, usage } }`
+//! directly.
 
 use std::sync::Arc;
 
@@ -96,6 +98,9 @@ fn output(body: &Value) -> Result<Value, String> {
     };
     if !is_record(run) {
         return Err(format!("{LABEL} returned an unexpected response"));
+    }
+    if run.get("answers").is_some() {
+        return Ok(run.clone());
     }
     if run.get("state").and_then(Value::as_str) != Some("Completed") {
         return Err(format!(
