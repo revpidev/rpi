@@ -329,7 +329,8 @@ pub(crate) fn codemode_reaches_tools() -> rpi_ext_host::types::ReachesToolsFn {
         let mut words: Vec<String> = Vec::new();
         let mut current = String::new();
         for ch in code.chars() {
-            if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            // `code.match(/\w+/g)` upstream: ASCII word characters only.
+            if ch.is_ascii_alphanumeric() || ch == '_' {
                 current.push(ch);
             } else if !current.is_empty() {
                 if !words.contains(&current) {

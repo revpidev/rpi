@@ -371,18 +371,38 @@ async fn queues_scripts_at_the_process_wide_worker_limit() {
     // A plain script queues until an actual worker exits; its result must not
     // arrive before the release.
     let waiting = tokio::spawn(run_gated_plain(gate.clone()));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait until the third script is really queued before raising the limit.
+    for _ in 0..200 {
+        if workers::pool().waiting() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(!waiting.is_finished(), "the third script must wait");
+    assert_eq!(
+        workers::pool().waiting(),
+        1,
+        "the third script must be queued"
+    );
 
-    // Raise the limit at runtime: a *new* admission is let in while both
-    // original workers are still held (a queued waiter is only re-admitted
-    // by a release, which is also upstream's behavior).
+    // Raise the limit at runtime: the *queued* script is admitted first (FIFO,
+    // upstream admitCodemodeWorkers), and a newcomer behind it still waits
+    // because both original workers remain held.
     set_workers("3");
     assert_eq!(workers::max_workers(), 3);
     let extra = tokio::spawn(run_gated_plain(gate.clone()));
+    let waiting_result = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("raised limit admits the queued script")
+        .expect("task");
+    assert!(
+        waiting_result.is_error != Some(true),
+        "{}",
+        result_text(&waiting_result)
+    );
     let extra_result = tokio::time::timeout(Duration::from_secs(10), extra)
         .await
-        .expect("raised limit admits another worker")
+        .expect("the newcomer settles after the admitted worker exits")
         .expect("task");
     assert!(
         extra_result.is_error != Some(true),
@@ -390,23 +410,13 @@ async fn queues_scripts_at_the_process_wide_worker_limit() {
         result_text(&extra_result)
     );
 
-    // Two releases free both held workers; the first also admits the queued
-    // script.
+    // Two releases free both held workers.
     gate.release();
     gate.release();
     let one = held_one.await.expect("held one");
     let two = held_two.await.expect("held two");
     assert!(one.is_error != Some(true), "{}", result_text(&one));
     assert!(two.is_error != Some(true), "{}", result_text(&two));
-    let waiting_result = tokio::time::timeout(Duration::from_secs(10), waiting)
-        .await
-        .expect("queued script settles once a worker exits")
-        .expect("task");
-    assert!(
-        waiting_result.is_error != Some(true),
-        "{}",
-        result_text(&waiting_result)
-    );
 
     // Invalid values fall back to two and are not an error at runtime.
     for invalid in ["0", "-1", "2.5", "NaN", "Infinity", "abc"] {

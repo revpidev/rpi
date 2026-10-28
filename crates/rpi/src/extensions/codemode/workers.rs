@@ -76,6 +76,13 @@ impl WorkerReservation {
             self.pool.release();
         }
     }
+
+    /// Return the slot without admitting waiters; the caller's drain loop
+    /// continues iteratively.
+    fn reclaim(mut self) {
+        self.released = true;
+        self.pool.reclaim_slot();
+    }
 }
 
 impl Drop for WorkerReservation {
@@ -147,6 +154,11 @@ impl WorkerPool {
         lock(&self.state).active
     }
 
+    /// Number of scripts waiting for a slot. Test/diagnostic helper.
+    pub fn waiting(&self) -> usize {
+        lock(&self.state).waiters.len()
+    }
+
     /// Reserve one slot, waiting in arrival order while all are taken
     /// (`reserveCodemodeWorker`, execute.ts:75-95). Cancelling the wait does
     /// not release a worker that is already running.
@@ -158,17 +170,18 @@ impl WorkerPool {
         if signal.is_some_and(CancellationToken::is_cancelled) {
             return Admission::Aborted;
         }
+        // Always join the queue and run the same FIFO drain as a release:
+        // this is upstream `reserveCodemodeWorker` + `admitCodemodeWorkers`
+        // (execute.ts:78-105), and it keeps an older waiter ahead of a
+        // newcomer when the limit was raised in the meantime.
         let (id, receiver) = {
             let mut state = lock(&self.state);
-            if state.active < (self.limit)() {
-                state.active += 1;
-                return Admission::Reserved(WorkerReservation::new(self.clone()));
-            }
             let id = self.next_waiter.fetch_add(1, Ordering::SeqCst);
             let (grant, receiver) = oneshot::channel();
             state.waiters.push_back(Waiter { id, grant });
             (id, receiver)
         };
+        self.admit();
         let sleep = tokio::time::sleep(timeout);
         tokio::pin!(sleep);
         let aborted = async {
@@ -206,22 +219,43 @@ impl WorkerPool {
     /// (`releaseCodemodeWorker`, execute.ts:108-113). Only a
     /// [`WorkerReservation`] calls this.
     fn release(self: &Arc<Self>) {
-        let mut grants: Vec<oneshot::Sender<WorkerReservation>> = Vec::new();
-        {
-            let mut state = lock(&self.state);
-            state.active = state.active.saturating_sub(1);
-            while !state.waiters.is_empty() && state.active < (self.limit)() {
-                let Some(waiter) = state.waiters.pop_front() else {
-                    break;
-                };
-                state.active += 1;
-                grants.push(waiter.grant);
+        self.reclaim_slot();
+        self.admit();
+    }
+
+    /// Drop one active count without admitting anyone; used when a grant
+    /// cannot be delivered.
+    fn reclaim_slot(&self) {
+        let mut state = lock(&self.state);
+        state.active = state.active.saturating_sub(1);
+    }
+
+    /// Give free slots to waiters in arrival order (`admitCodemodeWorkers`,
+    /// execute.ts:96-105). Each grant carries the slot as a RAII reservation,
+    /// so a receiver that disappears after the send still releases it.
+    fn admit(self: &Arc<Self>) {
+        loop {
+            let grant = {
+                let mut state = lock(&self.state);
+                if state.waiters.is_empty() || state.active >= (self.limit)() {
+                    None
+                } else {
+                    let Some(waiter) = state.waiters.pop_front() else {
+                        break;
+                    };
+                    state.active += 1;
+                    Some(waiter.grant)
+                }
+            };
+            let Some(grant) = grant else {
+                break;
+            };
+            let reservation = WorkerReservation::new(self.clone());
+            if let Err(reservation) = grant.send(reservation) {
+                // The receiver was dropped: return the slot without
+                // recursing and try the next waiter.
+                reservation.reclaim();
             }
-        }
-        // Send outside the lock: a failed send returns the reservation,
-        // whose Drop releases the slot and may grant the next waiter.
-        for grant in grants {
-            let _ = grant.send(WorkerReservation::new(self.clone()));
         }
     }
 
@@ -338,6 +372,49 @@ mod tests {
         let granted = reserved(waiting.await);
         assert_eq!(pool.active(), 1);
         drop(granted);
+        assert_eq!(pool.active(), 0);
+    }
+
+    /// Raising the limit while a waiter is queued admits the oldest waiter,
+    /// not the newcomer (`admitCodemodeWorkers`, execute.ts:96-105).
+    #[tokio::test]
+    async fn a_raised_limit_grants_the_oldest_waiter_first() {
+        let limit = Arc::new(AtomicUsize::new(2));
+        let limit_for_pool = limit.clone();
+        let pool = Arc::new(WorkerPool::with_limit(move || {
+            limit_for_pool.load(Ordering::SeqCst)
+        }));
+        let slot_one = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        let slot_two = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        let mut older = Box::pin(pool.reserve(None, Duration::from_secs(5)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), older.as_mut())
+                .await
+                .is_err()
+        );
+        limit.store(3, Ordering::SeqCst);
+        // A newcomer arrives after the raise; the older waiter is still
+        // ahead of it.
+        let mut newcomer = Box::pin(pool.reserve(None, Duration::from_secs(5)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), newcomer.as_mut())
+                .await
+                .is_err(),
+            "the newcomer must not overtake the queued waiter"
+        );
+        let older_slot = reserved(older.await);
+        assert_eq!(pool.active(), 3);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), newcomer.as_mut())
+                .await
+                .is_err(),
+            "the newcomer still waits at the raised limit"
+        );
+        drop(older_slot);
+        let newcomer_slot = reserved(newcomer.await);
+        drop(slot_one);
+        drop(slot_two);
+        drop(newcomer_slot);
         assert_eq!(pool.active(), 0);
     }
 
