@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Regenerates `codemode-description.json` from the pinned upstream checkout
-// (`external/pi` @ abe508e1b, v1.1.0). See the sibling README for the
+// (`external/pi` @ 4a080252f, v1.4.0). See the sibling README for the
 // provenance and the byte-parity test that consumes the fixture.
 //
 // Usage (Node 22.18+/24 with built-in type stripping):
@@ -58,6 +58,10 @@ source = source.replace(/import type \{[^}]*\} from "[^"]*";/gs, "");
 source = source.replace(
 	'import { wrapToolDefinition } from "../../core/tools/tool-definition-wrapper.ts";',
 	"const wrapToolDefinition = (definition) => ({ ...definition });",
+);
+source = source.replace(
+	'import { SETTINGS_DEFAULTS } from "../../core/settings-defaults.ts";',
+	'const SETTINGS_DEFAULTS = { codemode: { mode: "on", inlineBudget: 4000 } };',
 );
 source = source.replace(
 	'import { loadCodemodeExecutor } from "./execute.lazy.ts";',

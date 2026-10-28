@@ -1,7 +1,7 @@
 # codemode description parity fixture
 
 `codemode-description.json` is generated from the pinned upstream
-(`external/pi` @ `abe508e1b`, v1.1.0) with
+(`external/pi` @ `4a080252f`, v1.4.0) with
 `packages/coding-agent/src/extensions/codemode/tool.ts`
 (`createCodemodeDescription` / `describeScriptCall` / `describeOutput`).
 

@@ -4,7 +4,7 @@
 // Drives BOTH sides against the SAME fixture MCP server and diffs the
 // normalized documents:
 //   upstream side: builtin-upstream-runner.mjs → pinned `external/pi/packages/mcp`
-//                  `McpClient` + `StdioTransport` (@ abe508e1b, READ-ONLY)
+//                  `McpClient` + `StdioTransport` (@ 4a080252f, READ-ONLY)
 //   rpi side:      cargo example `builtin_mcp_parity_runner` (crates/rpi-mcp)
 // The fixture server (`fixture-server.mjs`) records the frame transcript on
 // both runs, so a diff isolates the client implementation.
@@ -36,7 +36,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..");
 const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
 const UPSTREAM = process.env.RPI_MCP_PARITY_UPSTREAM ?? join(REPO, "external", "pi");
-const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "abe508e1b";
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "4a080252f";
 const CARGO = process.env.RPI_MCP_PARITY_CARGO ?? "cargo";
 
 const args = process.argv.slice(2);
