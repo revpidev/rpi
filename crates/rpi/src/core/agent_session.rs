@@ -3279,7 +3279,7 @@ impl AgentSession {
     /// description, parameters, promptGuidelines, exposure, namespace,
     /// annotations, sourceInfo.
     fn tool_info_json(name: &str, entry: &ToolDefinitionEntry) -> serde_json::Value {
-        serde_json::json!({
+        let mut info = serde_json::json!({
             "name": name,
             "description": entry.description,
             "parameters": entry.parameters,
@@ -3293,7 +3293,17 @@ impl AgentSession {
             "namespace": entry.namespace,
             "annotations": entry.annotations,
             "sourceInfo": entry.source_info,
-        })
+        });
+        // Upstream `ToolInfo` carries the `reachesTools` callback. The JSON
+        // boundary cannot carry a callback, so expose presence as a boolean;
+        // callers use `HostActions::tool_reaches` with the actual input for
+        // the word list.
+        if entry.reaches_tools.is_some()
+            && let Some(object) = info.as_object_mut()
+        {
+            object.insert("reachesTools".to_owned(), serde_json::Value::Bool(true));
+        }
+        info
     }
 
     /// `getCommands` (agent-session.ts:2332-2355): extension commands (with
@@ -4148,6 +4158,9 @@ impl AgentSession {
             .agent_run_abort_requested
             .store(false, Ordering::SeqCst);
         self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
+        // Upstream clears restored-but-unregistered names at run start
+        // (`_pendingToolNames.clear()`, agent-session.ts:1895-1897).
+        lock(&self.inner.pending_tool_names).clear();
         self.inner.idle_notify.notify_waiters();
     }
 
@@ -6791,6 +6804,36 @@ mod recovery_omission_tests {
             timestamp: 3,
             duration_ms: None,
         }
+    }
+
+    fn info_entry(reaches: bool) -> ToolDefinitionEntry {
+        ToolDefinitionEntry {
+            description: "tool".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+            prompt_snippet: None,
+            prompt_guidelines: Vec::new(),
+            source_info: AgentSession::synthetic_tool_source_info("<test>", "extension"),
+            exposure: ext::ToolExposure::Direct,
+            namespace: None,
+            annotations: None,
+            output_schema: None,
+            default_active: None,
+            prepare_loadout: None,
+            reaches_tools: reaches.then(|| {
+                Arc::new(|_input: &Value| serde_json::json!("all")) as ext::ReachesToolsFn
+            }),
+        }
+    }
+
+    #[test]
+    fn tool_info_exposes_reaches_tools_presence_only_when_declared() {
+        let with = AgentSession::tool_info_json("t", &info_entry(true));
+        assert_eq!(with["reachesTools"], true);
+        let without = AgentSession::tool_info_json("t", &info_entry(false));
+        assert!(
+            without.get("reachesTools").is_none(),
+            "absent declaration omitted: {without}"
+        );
     }
 
     /// 02726086d (#11227): a recovery omission removes the assistant attempt

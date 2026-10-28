@@ -401,8 +401,17 @@ pub(crate) fn with_settings_write_lock<T>(
         let host_lock = acquire_host_lock_new(&target)?;
         let lease = acquire_lease(&target)?;
         let body = preserve_trailing_newline(None, &next);
-        atomic_replace(&target, &body, None)?;
-        let _ = host_lock.unlock();
+        #[cfg(windows)]
+        {
+            let _ = host_lock.unlock();
+            drop(host_lock);
+            atomic_replace(&target, &body, None)?;
+        }
+        #[cfg(not(windows))]
+        {
+            atomic_replace(&target, &body, None)?;
+            let _ = host_lock.unlock();
+        }
         drop(lease);
         return Ok(value);
     }
@@ -518,6 +527,68 @@ mod tests {
             .expect_err("live lease blocks");
         assert!(error.to_string().contains("Timed out"), "{error}");
         std::fs::remove_dir_all(&lock).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Three writer generations touch one file: the host coordinator
+    /// (A+B), a second new writer (A+B) and an old protocol writer that only
+    /// holds A. Every writer re-reads under A, so no top-level key is lost.
+    #[test]
+    fn three_writer_generations_preserve_each_others_keys() {
+        use fs2::FileExt;
+
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let path_legacy = path.clone();
+
+        let a = std::thread::spawn(move || {
+            with_settings_write_lock(&path_a, |current| {
+                let mut root: serde_json::Value =
+                    serde_json::from_str(current.expect("current")).unwrap();
+                root["defaultModel"] = serde_json::json!("model-a");
+                Ok((Some(serde_json::to_string_pretty(&root).unwrap()), ()))
+            })
+            .unwrap();
+        });
+        let b = std::thread::spawn(move || {
+            with_settings_write_lock(&path_b, |current| {
+                let mut root: serde_json::Value =
+                    serde_json::from_str(current.expect("current")).unwrap();
+                root["statusLine"] = serde_json::json!({"type": "command"});
+                Ok((Some(serde_json::to_string_pretty(&root).unwrap()), ()))
+            })
+            .unwrap();
+        });
+        let legacy = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path_legacy)
+                .unwrap();
+            file.lock_exclusive().unwrap();
+            let raw = std::fs::read_to_string(&path_legacy).unwrap();
+            let mut root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            root["subagents"] = serde_json::json!({"agentOverrides": {}});
+            atomic_replace(
+                &path_legacy,
+                &format!("{}\n", serde_json::to_string_pretty(&root).unwrap()),
+                None,
+            )
+            .unwrap();
+            file.unlock().unwrap();
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+        legacy.join().unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["defaultModel"], "model-a");
+        assert_eq!(root["statusLine"]["type"], "command");
+        assert_eq!(root["subagents"]["agentOverrides"], serde_json::json!({}));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

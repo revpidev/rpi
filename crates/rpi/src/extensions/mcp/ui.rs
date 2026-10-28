@@ -412,6 +412,33 @@ fn merge_signals(
     merged
 }
 
+/// `ensureDiscoveryActive` activation plan (mcp/index.ts:517-540): activate
+/// `codemode`/`tool_search` only when the tool declares `reachesTools`, the
+/// exposure requires it, and it is not already active. `reachable` is the
+/// pre-activation active set plus the newly activated names; callers warn
+/// only when neither discovery tool is reachable.
+fn discovery_plan(
+    active: &[String],
+    needs_codemode: bool,
+    needs_tool_search: bool,
+    has_codemode: bool,
+    has_tool_search: bool,
+    auto_enable_codemode: bool,
+) -> (Vec<String>, Vec<String>) {
+    let codemode = super::super::codemode::tool::CODEMODE_TOOL_NAME.to_owned();
+    let tool_search = super::super::tool_search::TOOL_SEARCH_TOOL_NAME.to_owned();
+    let mut activate = Vec::new();
+    if needs_codemode && has_codemode && auto_enable_codemode && !active.contains(&codemode) {
+        activate.push(codemode);
+    }
+    if needs_tool_search && has_tool_search && !active.contains(&tool_search) {
+        activate.push(tool_search);
+    }
+    let mut reachable = active.to_vec();
+    reachable.extend(activate.iter().cloned());
+    (activate, reachable)
+}
+
 impl McpBuiltinState {
     fn new(
         api: ExtensionApi,
@@ -564,42 +591,37 @@ impl McpBuiltinState {
             return;
         }
         let tools = self.api.get_all_tools().unwrap_or_default();
+        // Upstream requires the registered tool to declare `reachesTools`; a
+        // foreign extension's same-named tool without it is never activated
+        // or treated as reachable (mcp/index.ts:511-516).
+        let declares_reach =
+            |name: &str| ctx.tool_reaches(name, json!({})).ok().flatten().is_some();
         let has_codemode = tools.iter().any(|tool| {
             tool.get("name").and_then(Value::as_str)
                 == Some(super::super::codemode::tool::CODEMODE_TOOL_NAME)
+                && declares_reach(super::super::codemode::tool::CODEMODE_TOOL_NAME)
         });
         let has_tool_search = tools.iter().any(|tool| {
             tool.get("name").and_then(Value::as_str)
                 == Some(super::super::tool_search::TOOL_SEARCH_TOOL_NAME)
+                && declares_reach(super::super::tool_search::TOOL_SEARCH_TOOL_NAME)
         });
         let active = self.api.get_active_tools().unwrap_or_default();
-        let mut activate: Vec<String> = Vec::new();
-        if needs_codemode
-            && has_codemode
-            && self.auto_enable_codemode.load(Ordering::SeqCst)
-            && !active.contains(&super::super::codemode::tool::CODEMODE_TOOL_NAME.to_owned())
-        {
-            activate.push(super::super::codemode::tool::CODEMODE_TOOL_NAME.to_owned());
-        }
-        if needs_tool_search
-            && has_tool_search
-            && !active.contains(&super::super::tool_search::TOOL_SEARCH_TOOL_NAME.to_owned())
-        {
-            activate.push(super::super::tool_search::TOOL_SEARCH_TOOL_NAME.to_owned());
-        }
+        // Only the tools that are active now or were just activated count as
+        // reachable (mcp/index.ts:524 `[...active, ...activate]`).
+        let (activate, reachable) = discovery_plan(
+            &active,
+            needs_codemode,
+            needs_tool_search,
+            has_codemode,
+            has_tool_search,
+            self.auto_enable_codemode.load(Ordering::SeqCst),
+        );
         if !activate.is_empty() {
             let mut all = active.clone();
             all.extend(activate);
             let _ = self.api.set_active_tools(all);
         }
-        let reachable = {
-            let mut all = active;
-            all.extend([
-                super::super::codemode::tool::CODEMODE_TOOL_NAME.to_owned(),
-                super::super::tool_search::TOOL_SEARCH_TOOL_NAME.to_owned(),
-            ]);
-            all
-        };
         if has_codemode
             && reachable
                 .iter()
@@ -3129,6 +3151,24 @@ mod tests {
 #[cfg(test)]
 mod reachability_tests {
     use super::*;
+
+    #[test]
+    fn discovery_plan_requires_reaches_declaration_and_auto_enable() {
+        let active: Vec<String> = Vec::new();
+        let (activate, reachable) = discovery_plan(&active, true, false, true, false, false);
+        assert!(activate.is_empty(), "autoEnableCodemode=false");
+        assert!(reachable.is_empty());
+        let (activate, reachable) = discovery_plan(&active, true, false, true, false, true);
+        assert_eq!(activate, ["codemode"]);
+        assert_eq!(reachable, ["codemode"]);
+        // A foreign same-named tool has no reachesTools declaration.
+        let (activate, reachable) = discovery_plan(&active, true, false, false, false, true);
+        assert!(activate.is_empty());
+        assert!(reachable.is_empty());
+        let (activate, reachable) = discovery_plan(&active, false, true, false, true, false);
+        assert_eq!(activate, ["tool_search"]);
+        assert_eq!(reachable, ["tool_search"]);
+    }
 
     #[test]
     fn reaches_server_matches_all_and_namespace_words() {

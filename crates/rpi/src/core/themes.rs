@@ -2565,6 +2565,20 @@ mod tests {
     /// `appearance` field) must pass the installed validator verbatim; a
     /// user theme copied from `dark.json` must load.
     #[test]
+    fn builtin_themes_point_at_the_revpi_schema() {
+        for (label, content) in [("dark", DARK_THEME_JSON), ("light", LIGHT_THEME_JSON)] {
+            assert!(
+                content.contains("https://revpi.dev/schemas/theme.schema.json"),
+                "{label}: revpi.dev theme schema"
+            );
+            assert!(
+                !content.contains("https://pi.dev/schemas/theme"),
+                "{label}: no pi.dev"
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_accepts_the_builtin_themes() {
         for (label, content) in [("dark", DARK_THEME_JSON), ("light", LIGHT_THEME_JSON)] {
             let value: serde_json::Value =
