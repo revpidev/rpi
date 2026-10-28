@@ -116,7 +116,7 @@ impl CacheWarmer {
             continuation_probability: decision.continuation_probability,
             action: decision.action,
         };
-        // Extension failures fall back to pi's own decision
+        // Extension failures fall back to rpi's own decision
         // (cache-warmer.ts:296-301).
         let action = ((self.deps.decide)(event)).await;
         if !self.validate_run(generation) || self.refresh_deadline_missed(generation) {

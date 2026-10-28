@@ -43,7 +43,7 @@ pub type DecideFuture = std::pin::Pin<
 
 /// `CacheWarmer`'s decision hook: receives the pending decision event,
 /// returns the effective action (extension overrides land inside the
-/// closure; failures fall back to pi's own action — cache-warmer.ts:166-168,
+/// closure; failures fall back to rpi's own action — cache-warmer.ts:166-168,
 /// runner errors already reported by the runner).
 pub type CacheWarmingDecide =
     Arc<dyn Fn(rpi_ext_host::types::CacheWarmingDecisionEvent) -> DecideFuture + Send + Sync>;
@@ -131,7 +131,7 @@ pub struct CacheWarmerDeps {
 }
 
 impl CacheWarmerDeps {
-    /// The default decide hook (cache-warmer.ts:174-176): pi's own action.
+    /// The default decide hook (cache-warmer.ts:174-176): rpi's own action.
     pub fn default_decide() -> CacheWarmingDecide {
         Arc::new(|event| Box::pin(async move { event.action }) as DecideFuture)
     }

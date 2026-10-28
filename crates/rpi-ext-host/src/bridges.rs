@@ -217,6 +217,9 @@ impl UiBridge for OutputUiBridge {
         self.inner.notify(message, kind);
     }
 
+    /// Command text output. This is fire-and-forget like `ui.notify`: the
+    /// sink records a broken stdout for the mode to map to its exit code;
+    /// `validate_only` only checks the channel and writes nothing.
     fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
         if validate_only {
             return Ok(());

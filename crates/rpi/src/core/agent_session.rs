@@ -920,6 +920,30 @@ impl AgentTool for DescriptionOverrideTool {
     }
 }
 
+/// Releases a claimed run-start if the setup future is cancelled before it
+/// hands the run to the agent loop (for example a shutdown select dropping
+/// `begin_prompt` between the claim and `Started`).
+struct RunStartClaim<'a> {
+    session: &'a AgentSession,
+    armed: bool,
+}
+
+impl Drop for RunStartClaim<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.session.reset_run_start();
+        }
+    }
+}
+
+/// Atomic run-start claim (the busy transition): exactly one concurrent
+/// caller can turn an idle session into a starting run.
+fn try_claim_run(active: &AtomicBool) -> bool {
+    active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
 impl AgentSession {
     /// `constructor` (agent-session.ts:375-401).
     #[allow(clippy::too_many_arguments)]
@@ -3960,7 +3984,7 @@ impl AgentSession {
             }));
             return Ok(());
         }
-        // Busy/abort state was armed by `mark_run_starting` before
+        // Busy/abort state was armed by `try_mark_run_starting` before
         // preparation; do not clear an abort requested during setup.
         // `this._failedResponse = undefined; this._recordSelection();`
         // (agent-session.ts:1778-1779 @ 4a080252f).
@@ -4152,20 +4176,28 @@ impl AgentSession {
         (normalized_images, hints)
     }
 
-    /// Mark a run as starting (`_startRun` entry, agent-session.ts:1823-1855
-    /// @ 4a080252f): busy before before_agent_start runs, with the previous
-    /// run's abort request cleared. A request during setup persists until
-    /// the agent loop starts (see the `agent_start` abort check).
-    pub(crate) fn mark_run_starting(&self) {
+    /// Try to mark a run as starting (`_startRun` entry, agent-session.ts:
+    /// 1823-1855 @ 4a080252f): busy before before_agent_start runs, with the
+    /// previous run's abort request cleared. The compare-exchange is the
+    /// single claim point, so two concurrent prompts cannot both observe an
+    /// idle session and start a second run. A request during setup persists
+    /// until the agent loop starts (see the `agent_start` abort check).
+    ///
+    /// Returns `false` when another run already owns the busy state; the
+    /// caller must queue or reject according to its streaming behavior.
+    pub(crate) fn try_mark_run_starting(&self) -> bool {
+        if !try_claim_run(&self.inner.is_agent_run_active) {
+            return false;
+        }
         self.inner
             .agent_run_abort_requested
             .store(false, Ordering::SeqCst);
-        self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
         self.inner.idle_notify.notify_waiters();
+        true
     }
 
-    /// Roll back [`Self::mark_run_starting`] when preparation fails: clear
-    /// the busy state, release held messages and wake idle waiters
+    /// Roll back [`Self::try_mark_run_starting`] when preparation fails:
+    /// clear the busy state, release held messages and wake idle waiters
     /// (agent-session.ts:1827-1831).
     fn reset_run_start(&self) {
         self.inner
@@ -4297,6 +4329,29 @@ impl AgentSession {
         Ok(messages)
     }
 
+    /// Queue a user prompt that arrived while another run owns the busy
+    /// state (agent-session.ts:1158-1172): steer/followUp when the caller
+    /// supplied `streamingBehavior`, otherwise the actionable error the UI
+    /// and RPC layers show.
+    async fn queue_streaming_prompt(
+        &self,
+        text: &str,
+        images: Option<Vec<ImageContent>>,
+        behavior: Option<StreamingBehavior>,
+    ) -> Result<PromptOutcome, RpiError> {
+        let Some(behavior) = behavior else {
+            return Err(RpiError::Session(
+                "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+                    .to_owned(),
+            ));
+        };
+        match behavior {
+            StreamingBehavior::FollowUp => self.queue_follow_up(text, images).await,
+            StreamingBehavior::Steer => self.queue_steer(text, images).await,
+        }
+        Ok(PromptOutcome::Queued)
+    }
+
     /// Preflight half of `prompt` (agent-session.ts:1114-1265): everything up
     /// to and including the message batch. The caller decides when to await
     /// [`Self::run_agent_prompt`], which lets the compaction flush queue the
@@ -4366,61 +4421,85 @@ impl AgentSession {
 
             // Queue while streaming (agent-session.ts:1158-1172).
             if self.is_streaming() {
-                let Some(behavior) = options.streaming_behavior else {
-                    return Err(RpiError::Session(
-                        "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
-                            .to_owned(),
-                    ));
-                };
-                match behavior {
-                    StreamingBehavior::FollowUp => {
-                        self.queue_follow_up(&expanded_text, images).await
-                    }
-                    StreamingBehavior::Steer => self.queue_steer(&expanded_text, images).await,
-                }
-                return Ok(PromptOutcome::Queued);
+                return self
+                    .queue_streaming_prompt(
+                        &expanded_text,
+                        images,
+                        options.streaming_behavior,
+                    )
+                    .await;
             }
 
-            // Validate model (agent-session.ts:1177-1195).
-            let Some(model) = self.model() else {
-                return Err(RpiError::Session(format_no_model_selected_message()));
+            // Claim the run before the auth/model awaits below. Two
+            // concurrent prompts must not both observe an idle session and
+            // start a second run; the compare-exchange makes the claim
+            // atomic, and a loser queues or rejects exactly like a prompt
+            // that arrived while streaming (agent-session.ts:1823-1855).
+            if !self.try_mark_run_starting() {
+                return self
+                    .queue_streaming_prompt(
+                        &expanded_text,
+                        images,
+                        options.streaming_behavior,
+                    )
+                    .await;
+            }
+            // Cancellation-safe claim: if this setup future is dropped before
+            // `Started` (e.g. shutdown wins the caller's select), the guard
+            // releases the busy state instead of wedging the session.
+            let mut claim = RunStartClaim {
+                session: self,
+                armed: true,
             };
-            let has_configured_auth = self.inner.model_runtime.has_configured_auth(&model.provider)
-                || self
+
+            // From this point the run owns the busy state; every error must
+            // release it through `reset_run_start`.
+            let prepared: Result<Vec<AgentMessage>, RpiError> = async {
+                // Validate model (agent-session.ts:1177-1195).
+                let Some(model) = self.model() else {
+                    return Err(RpiError::Session(format_no_model_selected_message()));
+                };
+                let has_configured_auth = self
                     .inner
                     .model_runtime
-                    .check_auth(&model.provider)
-                    .await
-                    .map_err(|error| RpiError::Session(error.message))?
-                    .is_some();
-            if !has_configured_auth {
-                if self.inner.model_runtime.is_using_oauth(&model.provider) {
-                    return Err(RpiError::Session(format!(
-                        "Authentication failed for \"{}\". Credentials may have expired or network is unavailable. Run '/login {}' to re-authenticate.",
-                        model.provider, model.provider
+                    .has_configured_auth(&model.provider)
+                    || self
+                        .inner
+                        .model_runtime
+                        .check_auth(&model.provider)
+                        .await
+                        .map_err(|error| RpiError::Session(error.message))?
+                        .is_some();
+                if !has_configured_auth {
+                    if self.inner.model_runtime.is_using_oauth(&model.provider) {
+                        return Err(RpiError::Session(format!(
+                            "Authentication failed for \"{}\". Credentials may have expired or network is unavailable. Run '/login {}' to re-authenticate.",
+                            model.provider, model.provider
+                        )));
+                    }
+                    return Err(RpiError::Session(format_no_api_key_found_message(
+                        &model.provider,
                     )));
                 }
-                return Err(RpiError::Session(format_no_api_key_found_message(
-                    &model.provider,
-                )));
-            }
 
-            // The session counts as busy from the start of setup
-            // (agent-session.ts:1823-1855 @ 4a080252f): messages sent while
-            // before_agent_start handlers run join this run instead of
-            // starting a second one, and an abort requested meanwhile stops
-            // it once the run exists.
-            self.mark_run_starting();
-            let trigger = BeforeAgentStartTrigger::User {
-                prompt: expanded_text.clone(),
-                images: images.clone(),
-            };
-            let prepared = self.prepare_run_messages(&trigger).await;
+                // The session counts as busy from the start of setup
+                // (agent-session.ts:1823-1855 @ 4a080252f): messages sent
+                // while before_agent_start handlers run join this run
+                // instead of starting a second one, and an abort requested
+                // meanwhile stops it once the run exists.
+                let trigger = BeforeAgentStartTrigger::User {
+                    prompt: expanded_text.clone(),
+                    images: images.clone(),
+                };
+                self.prepare_run_messages(&trigger).await
+            }
+            .await;
             let messages = match prepared {
                 Ok(messages) => messages,
                 Err(error) => {
                     // `_startRun` error path: leave the starting state,
                     // release held messages and wake idle waiters.
+                    claim.armed = false;
                     self.reset_run_start();
                     return Err(error);
                 }
@@ -4429,14 +4508,11 @@ impl AgentSession {
             // preparation succeeds (`_pendingToolNames.clear()`,
             // agent-session.ts:1895-1897); a failed preparation keeps them.
             lock(&self.inner.pending_tool_names).clear();
-            // Upstream clears restored-but-unregistered names after
-            // preparation succeeds (`_pendingToolNames.clear()`,
-            // agent-session.ts:1895-1897); a failed preparation keeps them.
-            lock(&self.inner.pending_tool_names).clear();
             // Held while the run was starting: they go before its starting
             // messages, as they would have while idle.
             self.flush_pending_bash_messages();
             self.flush_pending_custom_messages();
+            claim.armed = false;
             Ok(PromptOutcome::Started(messages))
         }
         .await;
@@ -4704,14 +4780,14 @@ impl AgentSession {
                 };
                 lock(&self.inner.deferred_settled_actions).push(Box::new(move || {
                     Box::pin(async move {
-                        if let Err(error) = session.start_custom_run(message).await {
+                        if let Err(error) = session.start_custom_run(message, deliver_as).await {
                             tracing::warn!("deferred custom run failed: {error}");
                         }
                     }) as BoxFuture<'static, ()>
                 }));
                 return Ok(());
             }
-            self.start_custom_run(message).await?;
+            self.start_custom_run(message, deliver_as).await?;
         } else if self.is_streaming() {
             // Appending now would put the message between an assistant tool
             // call and its result, which providers that validate message
@@ -4730,14 +4806,32 @@ impl AgentSession {
     /// session is busy from the start of setup, before_agent_start receives
     /// the custom trigger, and the usual pending/nextTurn/system-patch
     /// plumbing builds the starting batch.
-    async fn start_custom_run(&self, message: AgentMessage) -> Result<(), RpiError> {
-        self.mark_run_starting();
+    async fn start_custom_run(
+        &self,
+        message: AgentMessage,
+        deliver_as: Option<CustomDeliverAs>,
+    ) -> Result<(), RpiError> {
+        if !self.try_mark_run_starting() {
+            // Another prompt claimed the run between the caller's idle check
+            // and here. Join it exactly like a message sent while streaming
+            // instead of starting a second agent run.
+            match deliver_as {
+                Some(CustomDeliverAs::FollowUp) => self.inner.agent.follow_up(message),
+                _ => self.inner.agent.steer(message),
+            }
+            return Ok(());
+        }
+        let mut claim = RunStartClaim {
+            session: self,
+            armed: true,
+        };
         let trigger = BeforeAgentStartTrigger::Custom {
             message: Box::new(message),
         };
         let messages = match self.prepare_run_messages(&trigger).await {
             Ok(messages) => messages,
             Err(error) => {
+                claim.armed = false;
                 self.reset_run_start();
                 return Err(error);
             }
@@ -4745,6 +4839,8 @@ impl AgentSession {
         lock(&self.inner.pending_tool_names).clear();
         self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
+        // The agent loop's own finally now owns the busy state.
+        claim.armed = false;
         self.run_agent_prompt(messages).await
     }
 
@@ -6754,6 +6850,20 @@ fn agent_error_to_rpi(error: AgentError) -> RpiError {
 
 fn now_iso8601_compact() -> String {
     crate::core::session_manager::now_iso8601().replace([':', '.'], "-")
+}
+
+#[cfg(test)]
+mod run_start_tests {
+    use super::*;
+
+    #[test]
+    fn run_start_claim_is_exclusive_until_reset() {
+        let active = AtomicBool::new(false);
+        assert!(try_claim_run(&active), "first claimant wins");
+        assert!(!try_claim_run(&active), "second claimant is rejected");
+        active.store(false, Ordering::SeqCst);
+        assert!(try_claim_run(&active), "a settled run can be claimed again");
+    }
 }
 
 #[cfg(test)]

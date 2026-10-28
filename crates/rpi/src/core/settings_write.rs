@@ -36,6 +36,23 @@ const LOCK_MAX_ATTEMPTS: u32 = 10;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 const LEASE_WAIT: Duration = Duration::from_millis(200);
 const LEASE_RETRY: Duration = Duration::from_millis(10);
+const SETTINGS_FILE_APPEARED: &str = "appeared while preparing the write";
+/// Windows `fs2`/`LockFileEx` reports a held lock as
+/// `ERROR_LOCK_VIOLATION` (33), not `WouldBlock`; both mean contention.
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // `LockFileEx` reports a held lock as ERROR_LOCK_VIOLATION (33).
+        return error.raw_os_error() == Some(33);
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
 
 /// Physical settings path (following file and directory symlinks, including a
 /// dangling file link). Missing targets are allowed when the physical parent
@@ -105,7 +122,7 @@ fn acquire_host_lock_new(path: &Path) -> WriteResult<std::fs::File> {
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 RpiError::Settings(format!(
-                    "Settings file {} appeared while preparing the write; reload and retry.",
+                    "Settings file {} {SETTINGS_FILE_APPEARED}; reload and retry.",
                     path.display()
                 ))
             } else {
@@ -115,7 +132,7 @@ fn acquire_host_lock_new(path: &Path) -> WriteResult<std::fs::File> {
     for attempt in 1..=LOCK_MAX_ATTEMPTS {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contended(&error) => {
                 if attempt == LOCK_MAX_ATTEMPTS {
                     return Err(RpiError::Settings(format!(
                         "Failed to acquire settings lock for {}: {error}",
@@ -144,7 +161,7 @@ fn acquire_host_lock(path: &Path) -> WriteResult<std::fs::File> {
             .map_err(RpiError::Io)?;
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contended(&error) => {
                 if attempt == LOCK_MAX_ATTEMPTS {
                     return Err(RpiError::Settings(format!(
                         "Failed to acquire settings lock for {}: {error}",
@@ -162,6 +179,8 @@ fn acquire_host_lock(path: &Path) -> WriteResult<std::fs::File> {
     )))
 }
 
+const LEASE_LOCK_FILE: &str = "lease.lock";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LeaseOwner {
     token: String,
@@ -174,11 +193,34 @@ struct LeaseOwner {
 struct LeaseGuard {
     lock_path: PathBuf,
     token: String,
+    /// Authoritative liveness proof: an OS file lock held for the whole lease.
+    /// The OS releases it when the process dies, so a dead owner can always be
+    /// reclaimed on every supported platform (including Windows), even when
+    /// `owner.json` is missing or truncated.
+    lock_file: Option<std::fs::File>,
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        if read_owner(&self.lock_path).is_some_and(|owner| owner.token == self.token) {
+        if !read_owner(&self.lock_path).is_some_and(|owner| owner.token == self.token) {
+            return;
+        }
+        // Move the owned directory aside while the lease.lock handle is still
+        // held, then release the OS lock and remove the released directory. A
+        // concurrent reclaimer never observes a half-removed live lease.
+        let released = PathBuf::from(format!(
+            "{}.released-{}",
+            self.lock_path.display(),
+            self.token
+        ));
+        let renamed = std::fs::rename(&self.lock_path, &released).is_ok();
+        self.lock_file.take();
+        if renamed {
+            // The released path is ours alone; no new owner can appear there.
+            let _ = std::fs::remove_dir_all(&released);
+        } else if read_owner(&self.lock_path).is_some_and(|owner| owner.token == self.token) {
+            // Rename failed (e.g. a Windows handle); only remove the original
+            // path while it still carries our token.
             let _ = std::fs::remove_dir_all(&self.lock_path);
         }
     }
@@ -186,7 +228,19 @@ impl Drop for LeaseGuard {
 
 fn read_owner(lock_path: &Path) -> Option<LeaseOwner> {
     let raw = std::fs::read_to_string(lock_path.join("owner.json")).ok()?;
-    serde_json::from_str(&raw).ok()
+    let owner: LeaseOwner = serde_json::from_str(&raw).ok()?;
+    // Match the subagents reader: a malformed owner is unknown, never a
+    // reason to evict a live lease.
+    let token_ok = !owner.token.is_empty()
+        && owner.token.len() <= 64
+        && owner
+            .token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !token_ok || owner.pid == 0 {
+        return None;
+    }
+    Some(owner)
 }
 
 fn owner_is_dead(owner: &LeaseOwner) -> bool {
@@ -197,11 +251,16 @@ fn owner_is_dead(owner: &LeaseOwner) -> bool {
     let Ok(hostname) = hostname() else {
         return false;
     };
-    if !owner.hostname.is_empty() && owner.hostname != hostname {
+    // An empty local/recorded hostname is unknown, never a licence to evict.
+    if hostname.is_empty()
+        || owner.hostname.is_empty()
+        || !owner.hostname.eq_ignore_ascii_case(&hostname)
+    {
         return false;
     }
-    // `kill(pid, 0)` is not portable; on Unix the subagents reader compares
-    // the process-boot id. Here: a PID that does not exist is dead.
+    // Legacy leases (no `lease.lock`) fall back to process liveness. New
+    // leases are reclaimed by the OS lock alone; this path only protects
+    // writers from older versions.
     #[cfg(unix)]
     {
         let pid = owner.pid as i32;
@@ -211,6 +270,12 @@ fn owner_is_dead(owner: &LeaseOwner) -> bool {
         // SAFETY: signal 0 performs only an existence/permission check.
         let alive = unsafe { libc_kill(pid, 0) } == 0;
         if alive {
+            // A live PID whose recorded start time differs is a reused PID:
+            // the original owner is dead.
+            if let (Some(recorded), Some(current)) = (owner.process_start, process_start(owner.pid))
+            {
+                return recorded != current;
+            }
             return false;
         }
         // EPERM means the process exists but is not ours.
@@ -218,7 +283,8 @@ fn owner_is_dead(owner: &LeaseOwner) -> bool {
     }
     #[cfg(not(unix))]
     {
-        // Best effort on Windows: compare the recorded process start.
+        // Best effort on Windows for legacy leases: compare the recorded
+        // process start. New leases use the lease.lock file lock instead.
         match owner.process_start {
             Some(start) => process_start(owner.pid) != Some(start),
             None => false,
@@ -236,19 +302,43 @@ unsafe fn libc_kill(pid: i32, signal: i32) -> i32 {
     unsafe { kill(pid, signal) }
 }
 
+#[cfg(unix)]
+unsafe fn gethostname(buffer: *mut u8, len: usize) -> i32 {
+    unsafe extern "C" {
+        fn gethostname(name: *mut std::ffi::c_char, len: usize) -> i32;
+    }
+    unsafe { gethostname(buffer.cast(), len) }
+}
+
 fn hostname() -> std::io::Result<String> {
+    // The kernel hostname is the stable identity both writers share; an
+    // exported $HOSTNAME or /etc/hostname is only a fallback. On Windows the
+    // extension writer uses COMPUTERNAME only, so the host must do the same.
     #[cfg(unix)]
     {
+        let mut buffer = [0u8; 256];
+        if unsafe { gethostname(buffer.as_mut_ptr(), buffer.len()) } == 0 {
+            let end = buffer
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(buffer.len());
+            let name = String::from_utf8_lossy(&buffer[..end]).trim().to_owned();
+            if !name.is_empty() {
+                return Ok(name);
+            }
+        }
         if let Ok(name) = std::fs::read_to_string("/etc/hostname") {
             let name = name.trim();
             if !name.is_empty() {
                 return Ok(name.to_owned());
             }
         }
+        Ok(std::env::var("HOSTNAME").unwrap_or_default())
     }
-    Ok(std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_default())
+    #[cfg(not(unix))]
+    {
+        Ok(std::env::var("COMPUTERNAME").unwrap_or_default())
+    }
 }
 
 fn process_start(pid: u64) -> Option<u64> {
@@ -269,6 +359,60 @@ fn process_start(pid: u64) -> Option<u64> {
     }
 }
 
+enum LeaseLockState {
+    /// We acquired the previous owner's lock: the owner is dead.
+    Dead(std::fs::File),
+    /// The lock file exists and is held by a live owner.
+    Alive,
+    /// A legacy lease without `lease.lock`; use owner liveness.
+    Missing,
+}
+
+fn try_claim_lease_lock(lock_path: &Path) -> WriteResult<LeaseLockState> {
+    let path = lock_path.join(LEASE_LOCK_FILE);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LeaseLockState::Missing);
+        }
+        Err(error) => return Err(RpiError::Io(error)),
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(LeaseLockState::Dead(file)),
+        Err(error) if is_lock_contended(&error) => Ok(LeaseLockState::Alive),
+        Err(error) => Err(RpiError::Io(error)),
+    }
+}
+
+fn create_lease_lock(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path.join(LEASE_LOCK_FILE))?;
+    file.try_lock_exclusive()?;
+    Ok(file)
+}
+
+fn retired_lease_path(lock_path: &Path, token: &str) -> PathBuf {
+    PathBuf::from(format!("{}.retired-{}", lock_path.display(), token))
+}
+
+fn ownerless_lease_is_stale(lock_path: &Path) -> bool {
+    std::fs::metadata(lock_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > Duration::from_secs(5))
+}
+
 fn acquire_lease(target: &Path) -> WriteResult<LeaseGuard> {
     let lock_path = PathBuf::from(format!("{}.write-lock", target.display()));
     let deadline = Instant::now() + LEASE_WAIT;
@@ -281,28 +425,109 @@ fn acquire_lease(target: &Path) -> WriteResult<LeaseGuard> {
         };
         match std::fs::create_dir(&lock_path) {
             Ok(()) => {
+                // Write owner.json before creating lease.lock: a peer that
+                // sees a lease directory must never observe a lock file
+                // without owner metadata (that window would look dead).
                 let body = serde_json::to_vec(&owner).unwrap_or_default();
                 if let Err(error) = std::fs::write(lock_path.join("owner.json"), body) {
                     let _ = std::fs::remove_dir_all(&lock_path);
                     return Err(RpiError::Io(error));
                 }
+                let lock_file = match create_lease_lock(&lock_path) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        // A peer may have claimed the unlocked create window
+                        // and now owns this path; remove only our own dir and
+                        // otherwise wait/retry like a contention miss.
+                        if read_owner(&lock_path)
+                            .is_some_and(|current| current.token == owner.token)
+                        {
+                            let _ = std::fs::remove_dir_all(&lock_path);
+                            return Err(RpiError::Io(error));
+                        }
+                        std::thread::sleep(LEASE_RETRY);
+                        continue;
+                    }
+                };
+                // Re-verify after locking: between `create_new` and
+                // `try_lock_exclusive` the file exists unlocked, so a peer
+                // can legitimately classify us as dead and retire the dir.
+                if !read_owner(&lock_path).is_some_and(|current| current.token == owner.token) {
+                    drop(lock_file);
+                    std::thread::sleep(LEASE_RETRY);
+                    continue;
+                }
                 return Ok(LeaseGuard {
                     lock_path,
                     token: owner.token,
+                    lock_file: Some(lock_file),
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let previous = read_owner(&lock_path);
-                if let Some(previous) = previous
-                    && owner_is_dead(&previous)
-                {
-                    let retired = PathBuf::from(format!(
-                        "{}.retired-{}",
-                        lock_path.display(),
-                        previous.token
-                    ));
-                    if std::fs::rename(&lock_path, &retired).is_ok() {
-                        continue;
+                // Capture the owner before locking: a peer can retire and
+                // recreate the directory between our open and lock.
+                let expected_token = read_owner(&lock_path).map(|owner| owner.token);
+                match try_claim_lease_lock(&lock_path)? {
+                    LeaseLockState::Dead(dead_lock) => {
+                        let previous = read_owner(&lock_path);
+                        if previous.as_ref().map(|owner| owner.token.clone()) != expected_token {
+                            drop(dead_lock);
+                            std::thread::sleep(LEASE_RETRY);
+                            continue;
+                        }
+                        // The OS lock only proves local death. A lease that
+                        // names another host is not ours to evict (network
+                        // shares have client-local locks).
+                        let same_host = previous.as_ref().is_none_or(|owner| {
+                            hostname().is_ok_and(|local| {
+                                !local.is_empty()
+                                    && !owner.hostname.is_empty()
+                                    && owner.hostname.eq_ignore_ascii_case(&local)
+                            })
+                        });
+                        if same_host {
+                            let token = previous.as_ref().map_or_else(
+                                || format!("ownerless-{}", rpi_ai::utils::uuid::random_uuid()),
+                                |owner| owner.token.clone(),
+                            );
+                            let retired = retired_lease_path(&lock_path, &token);
+                            let renamed = std::fs::rename(&lock_path, &retired).is_ok();
+                            drop(dead_lock);
+                            // Keep the retired directory as the protocol
+                            // fence; a delayed reclaimer must not rename over
+                            // a replacement lease.
+                            if renamed {
+                                continue;
+                            }
+                        } else {
+                            drop(dead_lock);
+                        }
+                    }
+                    LeaseLockState::Alive => {}
+                    LeaseLockState::Missing => {
+                        match read_owner(&lock_path) {
+                            // Legacy writer: owner liveness is the only signal.
+                            Some(previous) if owner_is_dead(&previous) => {
+                                let retired = retired_lease_path(&lock_path, &previous.token);
+                                if std::fs::rename(&lock_path, &retired).is_ok() {
+                                    continue;
+                                }
+                            }
+                            Some(_) => {}
+                            // Crash between mkdir and owner.json: the tiny
+                            // window is not safe to evict immediately, but an
+                            // old ownerless directory is.
+                            None if ownerless_lease_is_stale(&lock_path) => {
+                                let retired = retired_lease_path(
+                                    &lock_path,
+                                    &format!("ownerless-{}", rpi_ai::utils::uuid::random_uuid()),
+                                );
+                                if std::fs::rename(&lock_path, &retired).is_ok() {
+                                    continue;
+                                }
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -311,7 +536,8 @@ fn acquire_lease(target: &Path) -> WriteResult<LeaseGuard> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(RpiError::Settings(format!(
-                "Timed out waiting for another process to finish updating {}.",
+                "Timed out waiting for another process to finish updating {}. If no other rpi process is running, delete {}.write-lock.",
+                target.display(),
                 target.display()
             )));
         }
@@ -381,9 +607,31 @@ fn atomic_replace(target: &Path, body: &str, mode: Option<u32>) -> WriteResult<(
 /// read-only operation. Holding both locks across `f` is the point: the
 /// caller can re-read and mutate only its own subtree without losing another
 /// writer's top-level keys.
+///
+/// `f` may be called twice when another process creates a missing settings
+/// file between the pre-lock decision and the `create_new` A acquisition; the
+/// retry then runs against the existing file with both locks held.
 pub(crate) fn with_settings_write_lock<T>(
     file_path: &Path,
-    f: impl FnOnce(Option<&str>) -> WriteResult<(Option<String>, T)>,
+    mut f: impl FnMut(Option<&str>) -> WriteResult<(Option<String>, T)>,
+) -> WriteResult<T> {
+    let mut retried = false;
+    loop {
+        match with_settings_write_lock_once(file_path, &mut f) {
+            Err(RpiError::Settings(message))
+                if !retried && message.contains(SETTINGS_FILE_APPEARED) =>
+            {
+                retried = true;
+                continue;
+            }
+            other => return other,
+        }
+    }
+}
+
+fn with_settings_write_lock_once<T>(
+    file_path: &Path,
+    f: &mut impl FnMut(Option<&str>) -> WriteResult<(Option<String>, T)>,
 ) -> WriteResult<T> {
     let target = resolve_write_target(file_path).map_err(RpiError::Io)?;
     let file_existed = target.exists();
@@ -457,6 +705,48 @@ pub(crate) fn with_settings_write_lock<T>(
     Ok(value)
 }
 
+/// Read a settings file under the legacy A lock only.
+///
+/// B (`<target>.write-lock`) is the write lease. A pure read does not need
+/// it: writes replace the file with a same-directory rename, so a reader
+/// always sees a complete old or new document. Skipping B keeps a stale or
+/// crashed writer's lease from making settings unreadable (the 200 ms B wait
+/// used to turn a wedged lease into an empty in-memory settings load).
+pub(crate) fn with_settings_read_lock<T>(
+    file_path: &Path,
+    f: impl FnOnce(Option<&str>) -> WriteResult<T>,
+) -> WriteResult<T> {
+    let target = resolve_write_target(file_path).map_err(RpiError::Io)?;
+    let file = match std::fs::OpenOptions::new().read(true).open(&target) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return f(None),
+        Err(error) => return Err(RpiError::Io(error)),
+    };
+    for attempt in 1..=LOCK_MAX_ATTEMPTS {
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => break,
+            Err(error) if is_lock_contended(&error) => {
+                if attempt == LOCK_MAX_ATTEMPTS {
+                    return Err(RpiError::Settings(format!(
+                        "Failed to acquire settings lock for {}: {error}",
+                        target.display()
+                    )));
+                }
+                std::thread::sleep(LOCK_RETRY_DELAY);
+            }
+            Err(error) => return Err(RpiError::Io(error)),
+        }
+    }
+    let raw = match std::fs::read_to_string(&target) {
+        Ok(raw) => Some(crate::tools::edit_diff::strip_bom(&raw).1),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(RpiError::Io(error)),
+    };
+    let value = f(raw.as_deref())?;
+    let _ = fs2::FileExt::unlock(&file);
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +817,195 @@ mod tests {
             .expect_err("live lease blocks");
         assert!(error.to_string().contains("Timed out"), "{error}");
         std::fs::remove_dir_all(&lock).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_lease_lock_is_reclaimed_even_when_the_pid_is_alive() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let lock = PathBuf::from(format!("{}.write-lock", path.display()));
+        std::fs::create_dir_all(&lock).unwrap();
+        let owner = LeaseOwner {
+            token: "stale".to_owned(),
+            // Deliberately the current (live) PID: the free lease.lock is the
+            // authoritative proof that the previous owner is gone.
+            pid: std::process::id() as u64,
+            hostname: hostname().unwrap_or_default(),
+            process_start: None,
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_vec(&owner).unwrap()).unwrap();
+        std::fs::write(lock.join(LEASE_LOCK_FILE), b"").unwrap();
+
+        with_settings_write_lock(&path, |_current| {
+            Ok((Some("{\n  \"ok\": true\n}".to_owned()), ()))
+        })
+        .expect("free lease.lock is reclaimed");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("ok"), "{raw}");
+        assert!(!lock.exists(), "retired lease removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_lock_violation_counts_as_contention() {
+        assert!(is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        #[cfg(windows)]
+        assert!(is_lock_contended(&std::io::Error::from_raw_os_error(33)));
+        #[cfg(not(windows))]
+        assert!(!is_lock_contended(&std::io::Error::from_raw_os_error(33)));
+        assert!(!is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[test]
+    fn foreign_host_free_lease_lock_is_not_evicted() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let lock = PathBuf::from(format!("{}.write-lock", path.display()));
+        std::fs::create_dir_all(&lock).unwrap();
+        let owner = LeaseOwner {
+            token: "foreign".to_owned(),
+            pid: std::process::id() as u64,
+            hostname: "definitely-another-host".to_owned(),
+            process_start: None,
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_vec(&owner).unwrap()).unwrap();
+        // A client-local lock can be acquired on a network share even while
+        // the owning host is alive; the foreign hostname must still win.
+        std::fs::write(lock.join(LEASE_LOCK_FILE), b"").unwrap();
+
+        let error = with_settings_write_lock(&path, |current| Ok((current.map(str::to_owned), ())))
+            .expect_err("foreign lease is not evicted");
+        assert!(error.to_string().contains("Timed out"), "{error}");
+        assert!(lock.exists(), "foreign lease retained");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_ownerless_lease_without_lock_file_is_reclaimed() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let lock = PathBuf::from(format!("{}.write-lock", path.display()));
+        std::fs::create_dir_all(&lock).unwrap();
+        // Simulate a crash between mkdir and owner.json: no lock file, no
+        // owner, but an old directory.
+        let file = std::fs::File::open(&lock).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(10);
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        drop(file);
+
+        with_settings_write_lock(&path, |_current| {
+            Ok((Some("{\n  \"reclaimed\": true\n}".to_owned()), ()))
+        })
+        .expect("stale ownerless lease reclaimed");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("reclaimed")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn held_lease_lock_blocks_even_when_the_owner_json_is_unknown() {
+        use fs2::FileExt;
+
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let lock = PathBuf::from(format!("{}.write-lock", path.display()));
+        std::fs::create_dir_all(&lock).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(lock.join(LEASE_LOCK_FILE))
+            .unwrap();
+        held.lock_exclusive().unwrap();
+
+        let error = with_settings_write_lock(&path, |current| Ok((current.map(str::to_owned), ())))
+            .expect_err("held lease.lock blocks");
+        assert!(error.to_string().contains("Timed out"), "{error}");
+
+        held.unlock().unwrap();
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_owner_with_a_free_lease_lock_is_reclaimed() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let lock = PathBuf::from(format!("{}.write-lock", path.display()));
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join(LEASE_LOCK_FILE), b"").unwrap();
+
+        with_settings_write_lock(&path, |_current| {
+            Ok((Some("{\n  \"recovered\": true\n}".to_owned()), ()))
+        })
+        .expect("ownerless lease with a free lock is reclaimed");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("recovered")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ownerless_free_lock_reclaims_use_a_unique_fence() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let lock = PathBuf::from(format!("{}.write-lock", path.display()));
+
+        for attempt in 0..2 {
+            std::fs::create_dir_all(&lock).unwrap();
+            std::fs::write(lock.join(LEASE_LOCK_FILE), b"").unwrap();
+            with_settings_write_lock(&path, |_current| {
+                Ok((Some(format!("{{\n  \"attempt\": {attempt}\n}}")), ()))
+            })
+            .unwrap_or_else(|error| panic!("attempt {attempt}: {error}"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_path_ignores_a_held_write_lease() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\n  \"a\": 1\n}\n").unwrap();
+        let lock = PathBuf::from(format!("{}.write-lock", path.display()));
+        std::fs::create_dir_all(&lock).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(lock.join(LEASE_LOCK_FILE))
+            .unwrap();
+        held.lock_exclusive().unwrap();
+
+        let mut seen = None;
+        with_settings_read_lock(&path, |current| {
+            seen = current.map(str::to_owned);
+            Ok(())
+        })
+        .expect("read does not wait on B");
+        assert!(seen.unwrap().contains("\"a\""));
+
+        held.unlock().unwrap();
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

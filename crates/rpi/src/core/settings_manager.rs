@@ -762,6 +762,17 @@ pub trait SettingsStorage: Send + Sync {
         scope: SettingsScope,
         f: &mut WithLockCallback<'_>,
     ) -> Result<(), RpiError>;
+
+    /// Pure read. The file backend takes only the legacy host lock (A) so a
+    /// stale write lease (B) cannot make settings unreadable; in-memory and
+    /// test backends simply reuse their read-modify-write hook.
+    fn with_read_lock(
+        &mut self,
+        scope: SettingsScope,
+        f: &mut WithLockCallback<'_>,
+    ) -> Result<(), RpiError> {
+        self.with_lock(scope, f)
+    }
 }
 
 /// `FileSettingsStorage` (settings-manager.ts:188-255).
@@ -813,6 +824,24 @@ impl SettingsStorage for FileSettingsStorage {
         crate::core::settings_write::with_settings_write_lock(path, |current| {
             let next = f(current)?;
             Ok((next, ()))
+        })
+    }
+
+    fn with_read_lock(
+        &mut self,
+        scope: SettingsScope,
+        f: &mut WithLockCallback<'_>,
+    ) -> Result<(), RpiError> {
+        let path = match scope {
+            SettingsScope::Global => &self.global_settings_path,
+            SettingsScope::Project => &self.project_settings_path,
+        };
+        crate::core::settings_write::with_settings_read_lock(path, |current| {
+            let next = f(current)?;
+            // A read callback must not write; ignore a returned document
+            // (load_from_storage always returns None).
+            let _ = next;
+            Ok(())
         })
     }
 }
@@ -1122,7 +1151,7 @@ impl SettingsManager {
         }
 
         let mut content: Option<String> = None;
-        storage.with_lock(scope, &mut |current| {
+        storage.with_read_lock(scope, &mut |current| {
             content = current.map(str::to_owned);
             Ok(None)
         })?;
@@ -1377,7 +1406,13 @@ impl SettingsManager {
                 _ => Map::new(),
             };
 
-            for field in modified_fields {
+            // Deterministic key order for newly inserted top-level fields:
+            // `modified_fields` is a HashSet and serde_json preserves
+            // insertion order, so an unsorted walk would make the same
+            // write produce different bytes between runs.
+            let mut fields: Vec<&String> = modified_fields.iter().collect();
+            fields.sort();
+            for field in fields {
                 let value = snapshot_settings.get(field);
                 match value {
                     // `mergedSettings[field] = undefined` upstream — the key
@@ -1393,7 +1428,10 @@ impl SettingsManager {
                                 _ => Map::new(),
                             };
                             if let Value::Object(in_memory_nested) = value {
-                                for nested_key in nested_modified {
+                                let mut nested_keys: Vec<&String> =
+                                    nested_modified.iter().collect();
+                                nested_keys.sort();
+                                for nested_key in nested_keys {
                                     match in_memory_nested.get(nested_key) {
                                         Some(nested_value) => {
                                             merged_nested

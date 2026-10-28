@@ -99,10 +99,10 @@ impl Default for BranchSummarySettings {
 
 /// `GenerateBranchSummaryOptions` (branch-summarization.ts:67-90). `args`
 /// carries api key / headers / env / signal / retry; `thinking_level` is
-/// intentionally unused — the upstream branch request options set only
-/// `maxTokens: min(4096, model.maxTokens)` (branch-summarization.ts:345, cap
-/// introduced by e44d75c20 / #8845), never `reasoning`. (P2-14: this
-/// comment previously said 2048 — the pre-#8845 value.)
+/// intentionally unused — the upstream branch request options only set an
+/// output cap (historically `min(4096, model.maxTokens)`, e44d75c20 / #8845),
+/// never `reasoning`. rpi follows #11036 and sends `max_tokens: None`; the
+/// provider sizes the summary from the actual request.
 pub struct GenerateBranchSummaryOptions<'a> {
     pub model: &'a Model,
     pub stream_fn: &'a StreamFn,
@@ -236,7 +236,7 @@ pub fn prepare_branch_entries(entries: &[SessionEntry], token_budget: u64) -> Br
 
     // First pass: collect file ops from ALL entries (even if they don't fit
     // the token budget) — cumulative file tracking from nested branch
-    // summaries. Only pi-generated summaries (`fromHook != true`).
+    // summaries. Only rpi-generated summaries (`fromHook != true`).
     for entry in entries {
         if let SessionEntry::BranchSummary(b) = entry {
             if b.from_hook == Some(true) {

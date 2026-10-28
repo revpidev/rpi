@@ -250,6 +250,10 @@ impl ContextActions for SessionContextActions {
     /// session header timestamp; the four token components and cost are
     /// accumulated from the same five usage-bearing entry kinds as the
     /// built-in footer. The raw provider `totalTokens` is never read.
+    ///
+    /// The snapshot is O(entries) under the session lock (it clones the entry
+    /// list to aggregate); callers such as the statusline must refresh at
+    /// their own cadence rather than on every streaming delta.
     fn session_stats(&self) -> Option<rpi_ext_host::types::SessionStatsSnapshot> {
         let session = self.session()?;
         let manager = session.session_manager();

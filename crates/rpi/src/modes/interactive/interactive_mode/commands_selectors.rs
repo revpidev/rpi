@@ -49,7 +49,9 @@ use rpi_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType, Lo
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::types::{Model, ModelThinkingLevel, ThinkingLevel};
 use rpi_tui::terminal_colors::TerminalColorScheme;
-use rpi_tui::tui::{Component, Focusable, TuiStopOptions, shared_component_from_boxed};
+use rpi_tui::tui::{
+    Component, Focusable, SharedComponent, TuiStopOptions, shared_component_from_boxed,
+};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -2572,31 +2574,24 @@ impl InteractiveUi {
         }
     }
 
-    /// `handleReloadCommand` (interactive-mode.ts:6430-6518): mount the
-    /// reload box (`Reloading keybindings, extensions, skills, prompts,
-    /// themes, and context files...`) in the editor region, reload the
-    /// session in the background, then dismiss the box and restore the
-    /// editor.
-    pub(crate) fn handle_reload_command(&self) {
-        if self.session().is_streaming() {
-            self.show_warning("Wait for the current response to finish before reloading.");
-            return;
-        }
-        if self.session().is_compacting() {
-            self.show_warning("Wait for compaction to finish before reloading.");
-            return;
-        }
+    /// Mount the reload box (interactive-mode.ts:6442-6462): bordered
+    /// container with the muted reloading notice, swapped into the editor
+    /// region and focused until the reload settles. Kept separate from the
+    /// background reload so tests can assert the synchronous mount without
+    /// racing the completion handler.
+    #[cfg(test)]
+    pub(crate) fn mount_reload_box(&self) -> Option<SharedComponent> {
         // `resetExtensionUI()` (interactive-mode.ts:6440): the reload
         // re-runs extension factories, which re-register their declarative
         // autocomplete sources (V17-11 FR-B R4).
         self.reset_extension_autocomplete();
-        let Some(ui) = self.upgrade_self() else {
-            return;
-        };
+        let ui = self.upgrade_self()?;
+        Some(self.build_reload_box(&ui))
+    }
 
-        // Reload box (interactive-mode.ts:6442-6462): bordered container
-        // with the muted reloading notice, swapped into the editor region
-        // and focused until the reload settles.
+    /// Build and mount the box against an already-upgraded UI. The command
+    /// handler and the deterministic test both use this, with one upgrade.
+    fn build_reload_box(&self, ui: &Arc<InteractiveUi>) -> SharedComponent {
         let reload_box = {
             let border_color = {
                 let theme = Arc::clone(&lock(&ui.theme));
@@ -2620,6 +2615,28 @@ impl InteractiveUi {
         };
         ui.show_selector(reload_box.clone());
         ui.render_handle.request_render();
+        reload_box
+    }
+
+    /// `handleReloadCommand` (interactive-mode.ts:6430-6518): mount the
+    /// reload box (`Reloading keybindings, extensions, skills, prompts,
+    /// themes, and context files...`) in the editor region, reload the
+    /// session in the background, then dismiss the box and restore the
+    /// editor.
+    pub(crate) fn handle_reload_command(&self) {
+        if self.session().is_streaming() {
+            self.show_warning("Wait for the current response to finish before reloading.");
+            return;
+        }
+        if self.session().is_compacting() {
+            self.show_warning("Wait for compaction to finish before reloading.");
+            return;
+        }
+        self.reset_extension_autocomplete();
+        let Some(ui) = self.upgrade_self() else {
+            return;
+        };
+        let reload_box = self.build_reload_box(&ui);
 
         // `session.reload()` (agent-session.ts:2600-2628) — the upstream
         // reload-box body (:6470): settings/resources reload + extension
@@ -5013,16 +5030,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_reload_command_mounts_reload_box() {
+    async fn mount_reload_box_renders_the_reloading_notice() {
         let (mode, _terminal, _session, _tmp) = mode_harness().await;
-        mode.ui_state.handle_reload_command();
-        // The reload box replaces the editor content (interactive-mode.ts:
-        // 6442-6462); the reload itself runs in the background.
+        // Assert the synchronous mount directly; the background reload would
+        // otherwise race the render (see the V18-02 review).
+        let reload_box = mode
+            .ui_state
+            .mount_reload_box()
+            .expect("reload box mounted");
         let mounted = lock(&mode.ui_state.editor_container).render(80).join("\n");
         assert!(
             mounted.contains("Reloading keybindings, extensions, skills, prompts,"),
             "reload box: {mounted}"
         );
+        mode.ui_state.hide_selector();
+        drop(reload_box);
     }
 
     /// #62: the `/reload` consumer surfaces the built-in command conflict

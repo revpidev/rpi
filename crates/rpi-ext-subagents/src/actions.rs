@@ -1570,13 +1570,20 @@ fn manage_disable_enable(
     let result = crate::settings_lease::with_settings_file_lease(
         &settings_path,
         || -> Result<(), String> {
-            let mut root: Value = std::fs::read_to_string(&settings_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok())
-                .unwrap_or_else(|| json!({}));
-            if !root.is_object() {
-                root = json!({});
-            }
+            let mut root: Value = match std::fs::read_to_string(&settings_path) {
+                Ok(raw) if !raw.trim().is_empty() => {
+                    serde_json::from_str(&raw).map_err(|error| {
+                        format!(
+                            "settings.json is not valid JSON; refusing to overwrite it: {error}"
+                        )
+                    })?
+                }
+                Ok(_) => json!({}),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+                Err(error) => {
+                    return Err(format!("cannot read settings.json: {error}"));
+                }
+            };
             let Some(root_object) = root.as_object_mut() else {
                 return Err("settings root is not an object.".to_string());
             };
@@ -1641,12 +1648,21 @@ fn manage_reset(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) ->
         let reset_result = crate::settings_lease::with_settings_file_lease(
             &settings_path,
             || -> Result<bool, String> {
-                let Ok(raw) = std::fs::read_to_string(&settings_path) else {
-                    return Ok(false);
+                let raw = match std::fs::read_to_string(&settings_path) {
+                    Ok(raw) => raw,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        return Err(format!("cannot read settings.json: {error}"));
+                    }
                 };
-                let Ok(mut root) = serde_json::from_str::<Value>(&raw) else {
-                    return Ok(false);
-                };
+                let mut root: Value = serde_json::from_str(&raw).map_err(|error| {
+                    format!("settings.json is not valid JSON; refusing to overwrite it: {error}")
+                })?;
+                if !root.is_object() {
+                    return Err("settings root is not an object.".to_string());
+                }
                 let mut changed = false;
                 if let Some(entry) = root
                     .get_mut("subagents")

@@ -282,6 +282,7 @@ fn stop_reason_str(reason: StopReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use rpi_ext_host::api::{NotifyType, UiBridge, UiDialogOptions, UiOutputError};
@@ -327,6 +328,40 @@ mod tests {
         assert_eq!(buffer.text(), "statusline: help\n");
         bridge.emit_text("two\nlines", false).expect("emit");
         assert_eq!(buffer.text(), "statusline: help\ntwo\nlines\n");
+    }
+
+    #[test]
+    fn emit_text_write_failure_is_recorded_for_the_mode_exit_code() {
+        struct Failing(Arc<AtomicUsize>);
+        impl std::io::Write for Failing {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed pipe",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let out = RawStdout::new(Box::new(Failing(writes.clone())));
+        let bridge = output_ui_bridge(PrintOutputMode::Text, out.clone(), Value::Null);
+        // `emitText` is fire-and-forget like `ui.notify`; the mode records the
+        // broken stdout and maps it to exit code 1 at the end of the run.
+        bridge.emit_text("statusline: help", false).expect("emit");
+        assert!(out.has_error());
+        bridge
+            .emit_text("again", false)
+            .expect("later writes dropped");
+        assert!(out.has_error());
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the output guard drops writes after the first error"
+        );
     }
 
     #[test]

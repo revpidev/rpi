@@ -14245,9 +14245,11 @@ mod tests {
     /// TUI event-pump re-entry), and the run loop applies them. Session
     /// replacement cannot run in this harness (the test runtime's session
     /// factory is a deliberate `unreachable!`), so the apply half covers
-    /// `navigateTree` (no session replacement) and `reload` (synchronous box
-    /// mount); fork/newSession are pinned at the queue boundary and by the
-    /// runtime-level action tests.
+    /// `navigateTree` (no session replacement). `reload` is pinned at the
+    /// queue boundary; its box mount is asserted through `mount_reload_box`,
+    /// because the command handler spawns the background reload and that can
+    /// dismiss the box before a render assertion. fork/newSession are pinned
+    /// at the queue boundary and by the runtime-level action tests.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn extension_command_actions_queue_and_apply_in_interactive_mode() {
         // A real host is required: the command-action binding lives on the
@@ -14305,14 +14307,25 @@ mod tests {
         ));
         assert!(matches!(*queued[2], ExtensionSessionCommand::Reload));
 
-        // Reload dispatches synchronously into the reload-box flow.
-        mode.handle_extension_session_command(*queued.pop().expect("reload queued"))
-            .await;
+        // Reload queues its command. The box mount is asserted through the
+        // synchronous helper: `handle_extension_session_command(Reload)`
+        // spawns the background reload, which can dismiss the box before a
+        // render assertion (the load-dependent race this test used to have).
+        assert!(matches!(
+            *queued.pop().expect("reload queued"),
+            ExtensionSessionCommand::Reload
+        ));
+        let reload_box = mode
+            .ui_state
+            .mount_reload_box()
+            .expect("reload box mounted");
         let editor = lock(&mode.ui_state.editor_container).render(80).join("\n");
         assert!(
             editor.contains("Reloading keybindings"),
             "reload box mounted: {editor}"
         );
+        mode.ui_state.hide_selector();
+        drop(reload_box);
 
         // `navigateTree` applies through the same handler (no session
         // replacement) and issues the explicit non-retry compaction flush

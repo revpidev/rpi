@@ -1355,6 +1355,149 @@ async fn w2_before_agent_start_custom_trigger_uses_the_starting_message() {
     assert_eq!(custom_types, ["start-prompt", "handler-note"]);
 }
 
+/// Dropping the setup future (shutdown select) must release the run-start
+/// claim instead of leaving the session permanently busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w2_cancelled_setup_releases_the_run_start_claim() {
+    let entered = Arc::new(Mutex::new(None::<tokio::sync::oneshot::Sender<()>>));
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    *entered.lock().unwrap() = Some(entered_tx);
+    let host = host_with(vec![inline_ext(move |api| {
+        let entered = entered.clone();
+        api.on(
+            ext::EVENT_BEFORE_AGENT_START,
+            Arc::new(move |_event, _ctx| {
+                let entered = entered.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                    }
+                    // Never resolves; dropping the setup future cancels it.
+                    std::future::pending::<()>().await;
+                    Ok(Value::Null)
+                })
+            }),
+        )
+        .expect("register handler");
+    })])
+    .await;
+
+    let fixture = session_fixture(vec![text_step("unused")], Arc::new(host), Vec::new()).await;
+    let session = fixture.session.clone();
+    let task = tokio::spawn(async move {
+        session
+            .prompt("first", rpi::core::agent_session::PromptOptions::default())
+            .await
+    });
+    entered_rx.await.expect("handler entered");
+    assert!(fixture.session.is_streaming());
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.session.wait_for_idle(),
+    )
+    .await
+    .expect("cancelled setup must not wedge the session");
+    assert!(
+        fixture.session.is_idle(),
+        "dropped setup must release the busy state"
+    );
+}
+
+/// A second user prompt that arrives while the first run is still in
+/// `before_agent_start` setup must be rejected (no `streamingBehavior`) or
+/// queued, never start a second run. The claim happens before the handler, so
+/// the second prompt is deterministic here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w2_concurrent_user_prompt_does_not_start_a_second_run() {
+    let entered = Arc::new(Mutex::new(None::<tokio::sync::oneshot::Sender<()>>));
+    let release = Arc::new(Mutex::new(None::<tokio::sync::oneshot::Receiver<()>>));
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    *entered.lock().unwrap() = Some(entered_tx);
+    *release.lock().unwrap() = Some(release_rx);
+    let host = host_with(vec![inline_ext(move |api| {
+        let entered = entered.clone();
+        let release = release.clone();
+        api.on(
+            ext::EVENT_BEFORE_AGENT_START,
+            Arc::new(move |_event, _ctx| {
+                let entered = entered.lock().unwrap().take();
+                let release = release.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                    }
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                    Ok(Value::Null)
+                })
+            }),
+        )
+        .expect("register handler");
+    })])
+    .await;
+
+    let fixture = session_fixture(
+        vec![FauxResponseStep::Factory(Box::new(
+            move |_context, _options, _state, _model| {
+                faux_assistant_message("first done", FauxAssistantOptions::default())
+            },
+        ))],
+        Arc::new(host),
+        Vec::new(),
+    )
+    .await;
+
+    let first_session = fixture.session.clone();
+    let first = tokio::spawn(async move {
+        first_session
+            .prompt("first", rpi::core::agent_session::PromptOptions::default())
+            .await
+    });
+    entered_rx.await.expect("handler entered");
+
+    // The first run owns the busy state from the claim, before the handler.
+    assert!(!fixture.session.is_idle());
+    assert!(fixture.session.is_streaming());
+    let error = fixture
+        .session
+        .prompt("second", rpi::core::agent_session::PromptOptions::default())
+        .await
+        .expect_err("a concurrent prompt without streamingBehavior is rejected");
+    assert!(
+        error.to_string().contains("Agent is already processing"),
+        "{error}"
+    );
+
+    release_tx.send(()).expect("release handler");
+    first.await.expect("join").expect("first prompt");
+    fixture.session.wait_for_idle().await;
+
+    let texts: Vec<String> = fixture
+        .session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::User(user) => Some(match &user.content {
+                rpi_ai::types::UserContent::Text(text) => text.clone(),
+                rpi_ai::types::UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        rpi_ai::types::UserContentBlock::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["first"], "second prompt never entered the session");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w2_before_agent_start_starting_state_queues_and_aborts() {
     let entered = Arc::new(Mutex::new(None::<tokio::sync::oneshot::Sender<()>>));

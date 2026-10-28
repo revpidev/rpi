@@ -66,7 +66,7 @@ pub struct CompactionDetails {
 }
 
 /// `extractFileOperations` (compaction.ts:42-70): file ops from the previous
-/// compaction's `details` (pi-generated only) plus tool calls in messages.
+/// compaction's `details` (rpi-generated only) plus tool calls in messages.
 ///
 /// `pub(crate)` for `harness::agent_harness::prepare_harness_compaction`, the
 /// harness-variant preparation (harness/compaction/compaction.ts:640-713).
@@ -81,7 +81,7 @@ pub(crate) fn extract_file_operations(
         && let SessionEntry::Compaction(prev) = &entries[index]
     {
         // fromHook field kept for session file compatibility; only
-        // pi-generated compactions carry the default details shape.
+        // rpi-generated compactions carry the default details shape.
         if prev.from_hook != Some(true)
             && let Some(details) = &prev.details
         {
@@ -777,8 +777,10 @@ pub fn get_summarization_failure(response: &AssistantMessage, label: &str) -> Op
     None
 }
 
-/// `generateSummaryWithUsage` (compaction.ts:622-686). Budget:
-/// `maxTokens = min(floor(0.8 * reserveTokens), model.maxTokens)`.
+/// `generateSummaryWithUsage` (compaction.ts:622-686). Summary requests use
+/// the provider's normal output sizing (#11036); `reserveTokens` only gates
+/// when compaction starts. `_reserve_tokens` is accepted for API
+/// compatibility and ignored.
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_summary_with_usage(
     current_messages: &[AgentMessage],
@@ -858,12 +860,13 @@ pub async fn generate_summary_with_usage(
 }
 
 /// `generateSummary` (compaction.ts:587-619) — text-only convenience wrapper
-/// (programmatic summarization API, compaction.md).
+/// (programmatic summarization API, compaction.md). `_reserve_tokens` is
+/// accepted for API compatibility and ignored (#11036).
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_summary(
     current_messages: &[AgentMessage],
     model: &Model,
-    reserve_tokens: u64,
+    _reserve_tokens: u64,
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
     stream_fn: &StreamFn,
@@ -873,7 +876,7 @@ pub async fn generate_summary(
     Ok(generate_summary_with_usage(
         current_messages,
         model,
-        reserve_tokens,
+        _reserve_tokens,
         custom_instructions,
         previous_summary,
         stream_fn,
@@ -1323,8 +1326,8 @@ pub async fn compact(
     })
 }
 
-/// `generateTurnPrefixSummary` (compaction.ts:924-969). Budget:
-/// `maxTokens = min(floor(0.5 * reserveTokens), model.maxTokens)`.
+/// `generateTurnPrefixSummary` (compaction.ts:924-969). No fixed output cap:
+/// the provider sizes output from the actual request (#11036).
 async fn generate_turn_prefix_summary(
     messages: &[AgentMessage],
     model: &Model,
