@@ -3143,6 +3143,20 @@ mod reachability_tests {
         assert_eq!(reachable, ["tool_search"]);
     }
 
+    /// A script that uses `ALL_TOOLS` (or any discovery global) reaches every
+    /// server, so MCP waits for every pending server before it runs.
+    #[test]
+    fn codemode_discovery_scripts_reach_every_server() {
+        let reaches = crate::extensions::codemode::tool::codemode_reaches_tools();
+        let reach = reaches(&json!({"code": "return ALL_TOOLS.length"}));
+        assert_eq!(reach, json!("all"));
+        assert!(McpBuiltinState::reaches_server(&reach, "docs-server"));
+        let reach = reaches(&json!({"code": "await tools.mcp__docs_server__search({})"}));
+        assert!(McpBuiltinState::reaches_server(&reach, "docs-server"));
+        let reach = reaches(&json!({"code": "return tools.other()"}));
+        assert!(!McpBuiltinState::reaches_server(&reach, "docs-server"));
+    }
+
     #[test]
     fn reaches_server_matches_all_and_namespace_words() {
         assert!(McpBuiltinState::reaches_server(

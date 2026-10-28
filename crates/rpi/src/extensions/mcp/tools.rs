@@ -111,13 +111,90 @@ fn text_of(content: &[ToolResultContent]) -> String {
         .join("\n")
 }
 
-/// `createMcpResultSchema` (tools.ts:106): the `CallToolResult` scripts
-/// receive, with the tool's own output schema as `structuredContent`.
+/// `CONTENT_BLOCK_SCHEMA` (tools.ts:106-117): MCP content blocks as one
+/// compact type with the fields scripts read most.
+fn content_block_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "type": {"enum": ["text", "image", "audio", "resource_link", "resource"]},
+            "text": {"type": "string"},
+            "data": {"type": "string"},
+            "mimeType": {"type": "string"},
+        },
+        "required": ["type"],
+        "additionalProperties": true,
+    })
+}
+
+/// Keywords whose values are data, so a `$ref` key in them is not a
+/// reference (tools.ts:119-124).
+const SCHEMA_DATA_KEYWORDS: [&str; 4] = ["const", "enum", "default", "examples"];
+/// Keywords whose values map names to schemas, so their keys are names, not
+/// keywords (tools.ts:125-134).
+const SCHEMA_MAP_KEYWORDS: [&str; 6] = [
+    "properties",
+    "patternProperties",
+    "dependentSchemas",
+    "dependencies",
+    "$defs",
+    "definitions",
+];
+
+/// `relocateSchema` (tools.ts:135-156): rewrite local references so they
+/// resolve below `pointer` of the enclosing schema.
+fn relocate_schema(schema: &Value, pointer: &str) -> Value {
+    match schema {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| relocate_schema(item, pointer))
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut relocated = Map::new();
+            for (key, value) in object {
+                if key == "$ref"
+                    && let Some(reference) = value.as_str()
+                    && (reference == "#" || reference.starts_with("#/"))
+                {
+                    relocated.insert(
+                        key.clone(),
+                        Value::String(format!("{pointer}{}", &reference[1..])),
+                    );
+                } else if SCHEMA_DATA_KEYWORDS.contains(&key.as_str()) {
+                    relocated.insert(key.clone(), value.clone());
+                } else if SCHEMA_MAP_KEYWORDS.contains(&key.as_str())
+                    && let Some(map) = value.as_object()
+                {
+                    relocated.insert(
+                        key.clone(),
+                        Value::Object(
+                            map.iter()
+                                .map(|(name, subschema)| {
+                                    (name.clone(), relocate_schema(subschema, pointer))
+                                })
+                                .collect(),
+                        ),
+                    );
+                } else {
+                    relocated.insert(key.clone(), relocate_schema(value, pointer));
+                }
+            }
+            Value::Object(relocated)
+        }
+        other => other.clone(),
+    }
+}
+
+/// `createMcpResultSchema` (tools.ts:159-174): the `CallToolResult` scripts
+/// receive (without `_meta`, which `convert_mcp_result` drops), with the
+/// tool's own output schema as `structuredContent`.
 pub fn create_mcp_result_schema(structured_content_schema: Option<&Value>) -> Value {
     let mut properties = Map::new();
     properties.insert(
         "content".to_owned(),
-        json!({"type": "array", "items": {"type": "object"}}),
+        json!({"type": "array", "items": content_block_schema()}),
     );
     // Servers may send structured content without declaring a schema for it,
     // and it may be any JSON value (#10416): an empty schema renders as
@@ -125,12 +202,17 @@ pub fn create_mcp_result_schema(structured_content_schema: Option<&Value>) -> Va
     properties.insert(
         "structuredContent".to_owned(),
         structured_content_schema
-            .cloned()
+            .map(|schema| relocate_schema(schema, "#/properties/structuredContent"))
             .unwrap_or_else(|| json!({})),
     );
     properties.insert("isError".to_owned(), json!({"type": "boolean"}));
-    properties.insert("_meta".to_owned(), json!({"type": "object"}));
-    json!({"type": "object", "properties": properties, "required": ["content"]})
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["content"],
+        // Fields newer protocol versions add.
+        "additionalProperties": true,
+    })
 }
 
 /// `limitMcpContent` (tools.ts:127): keep model-facing text within
@@ -801,6 +883,50 @@ mod tests {
         let script = converted.structured_content.unwrap();
         assert!(script.get("structuredContent").is_none());
         assert!(script.get("isError").is_none());
+    }
+
+    #[test]
+    fn mcp_result_schema_keeps_content_types_and_relocates_local_references() {
+        let structured = json!({
+            "type": "object",
+            "properties": {
+                "hit": {"type": "boolean"},
+                "root": {"$ref": "#"},
+                "item": {"$ref": "#/$defs/Item"},
+            },
+            "required": ["hit"],
+            "$defs": {"Item": {"type": "string"}},
+        });
+        let schema = create_mcp_result_schema(Some(&structured));
+        assert_eq!(
+            schema["properties"]["content"]["items"]["properties"]["type"]["enum"],
+            json!(["text", "image", "audio", "resource_link", "resource"])
+        );
+        assert_eq!(
+            schema["properties"]["content"]["items"]["properties"]["mimeType"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema["properties"]["structuredContent"]["properties"]["root"]["$ref"],
+            "#/properties/structuredContent"
+        );
+        assert_eq!(
+            schema["properties"]["structuredContent"]["properties"]["item"]["$ref"],
+            "#/properties/structuredContent/$defs/Item"
+        );
+        assert_eq!(
+            schema["properties"]["structuredContent"]["$defs"]["Item"]["type"],
+            "string"
+        );
+        assert!(schema["properties"].get("_meta").is_none());
+        assert_eq!(schema["additionalProperties"], true);
+        // The relocated references resolve against the result schema root.
+        let rendered = rpi_codemode::schema_to_type(&schema, None);
+        assert!(rendered.contains("hit: boolean"), "{rendered}");
+        assert!(
+            !rendered.contains("item?: unknown"),
+            "local reference lost: {rendered}"
+        );
     }
 
     #[test]

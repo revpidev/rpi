@@ -883,7 +883,7 @@ mod tests {
     /// A panicking worker still runs its release callback, so its slot is
     /// returned on abnormal exit (FR-B R4).
     #[test]
-    fn a_panicking_worker_releases_its_slot() {
+    fn worker_release_guard_releases_on_unwind() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let released = Arc::new(AtomicBool::new(false));

@@ -223,7 +223,7 @@ for (const block of result.output) {
 
 ## Limits
 
-- At most two codemode workers may be alive across all sessions in one rpi process; `RPI_CODEMODE_MAX_WORKERS` changes the limit (a positive integer; invalid values keep the default). Each worker's script may use up to 256 MB. A cancelled or timed-out worker occupies its slot until it exits. At capacity, new scripts wait for a free worker in arrival order. A script that gets no worker within 60 seconds, or before its `timeout_ms`, fails without running.
+- At most two codemode workers may be alive across all sessions in one rpi process; `RPI_CODEMODE_MAX_WORKERS` changes the limit (a positive integer; invalid values keep the default). Each worker's script may use up to 256 MB, so raising the limit increases the process's memory and CPU exposure. A cancelled or timed-out worker occupies its slot until it exits. At capacity, new scripts wait for a free worker in arrival order. A script that gets no worker within 60 seconds, or before its `timeout_ms`, fails without running.
 - A script's VM has 256 MB of memory. Running out throws `InternalError: out of memory`; filter or aggregate large data instead of accumulating it.
 - A script that waits on a promise that can never settle (no tool call pending) fails immediately, since there are no timers.
 - Scripts cannot start other `codemode` scripts.

@@ -4,9 +4,10 @@
 #
 # Earlier pin bumps moved these lines repeatedly. The v1.1.0 -> v1.4.0 bump
 # (V18-00, ADR-0038) moved them again; the table below was relocated by symbol
-# against the 4a080252f checkout. Removed MCP_TYPESCRIPT_PREAMBLE and
-# mcpStructuredContentSchema entries are intentionally absent and remain assigned
-# to V18-03 rather than pointing at invented replacements. This check binds each
+# against the 4a080252f checkout. V18-03 removed MCP_TYPESCRIPT_PREAMBLE and
+# mcpStructuredContentSchema with their upstream counterparts; the table now
+# binds the v1.4.0 declaration, worker-admission and MCP result-schema symbols.
+# This check binds each
 # comment to the pinned checkout in both directions:
 #   1. the rpi source still cites the expected `(<basename>:<range>)`, and
 #   2. the cited range in external/pi still contains the expected symbol.
@@ -140,6 +141,9 @@ crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensio
 crates/rpi/src/extensions/mcp/ui.rs@packages/coding-agent/src/extensions/mcp/index.ts@index.ts:1191-1209@await waitForServers
 crates/rpi-mcp/src/types.rs@packages/mcp/src/client.ts@client.ts:143-150@function validateCallToolResult
 crates/rpi/src/modes/interactive/tool_renderers/render_utils.rs@packages/coding-agent/src/core/tools/render-utils.ts@render-utils.ts:146-170@export function toolTimerText
+crates/rpi/src/extensions/mcp/tools.rs@packages/coding-agent/src/extensions/mcp/tools.ts@tools.ts:159-174@export function createMcpResultSchema
+crates/rpi/src/extensions/mcp/tools.rs@packages/coding-agent/src/extensions/mcp/tools.ts@tools.ts:135-156@function relocateSchema
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:362-385@function getScriptReach
 ANCHORS
 
 if ((failures > 0)); then

@@ -468,8 +468,13 @@ fn js_number_text(number: f64) -> String {
     if number == 0.0 {
         return "0".to_owned();
     }
-    if number.fract() == 0.0 && number.is_finite() && number.abs() < 1e21 {
-        return format!("{number:.0}");
+    let magnitude = number.abs();
+    // Rust's `Display` is the shortest representation that round-trips,
+    // like JS, but JS switches to exponential notation outside
+    // [1e-6, 1e21). Inside that window `Display` already matches JS digits
+    // (including no trailing `.0`).
+    if (1e-6..1e21).contains(&magnitude) && magnitude != 0.0 {
+        return format!("{number}");
     }
     let text = serde_json::Number::from_f64(number)
         .map(|number| number.to_string())
@@ -1068,6 +1073,18 @@ mod tests {
         });
         let rendered = schema_to_type(&schema, None);
         assert_eq!(rendered.matches("@multipleOf").count(), 1, "{rendered}");
+
+        // JS `String(number)` uses the shortest round-trip digits inside
+        // [1e-6, 1e21) and exponential notation outside it.
+        assert_eq!(js_number_text(1.0), "1");
+        assert_eq!(js_number_text(1.5), "1.5");
+        assert_eq!(
+            js_number_text(1.2345678901234567e19),
+            "12345678901234567000"
+        );
+        assert_eq!(js_number_text(1e21), "1e+21");
+        assert_eq!(js_number_text(1e-7), "1e-7");
+        assert_eq!(js_number_text(-0.0), "0");
     }
 
     #[test]

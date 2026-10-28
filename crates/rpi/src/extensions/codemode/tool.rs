@@ -287,12 +287,29 @@ pub fn codemode_schema() -> Value {
     })
 }
 
+/// Whether `needle` appears as a whole JavaScript identifier (`\b` with the
+/// ASCII `\w` class), so `ALL_TOOLSX` does not count as `ALL_TOOLS`.
+fn contains_identifier_word(code: &str, needle: &str) -> bool {
+    let is_word = |character: char| character.is_ascii_alphanumeric() || character == '_';
+    let mut offset = 0;
+    while let Some(index) = code[offset..].find(needle) {
+        let start = offset + index;
+        let before = code[..start].chars().next_back();
+        let after = code[start + needle.len()..].chars().next();
+        if !before.is_some_and(is_word) && !after.is_some_and(is_word) {
+            return true;
+        }
+        offset = start + needle.len();
+    }
+    false
+}
+
 /// `createCodemodeToolDefinition` (tool.ts:371-398).
 /// `getScriptReach` (codemode/tool.ts:362-385 @ 4a080252f): a script that
-/// discovers/enumerates tools reaches every tool; otherwise its identifier
+/// uses a discovery global reaches every tool; otherwise its identifier
 /// words may name tools/namespaces (the MCP wait matches a namespace
 /// contained in a word).
-fn codemode_reaches_tools() -> rpi_ext_host::types::ReachesToolsFn {
+pub(crate) fn codemode_reaches_tools() -> rpi_ext_host::types::ReachesToolsFn {
     Arc::new(|input| {
         let code = input
             .get("code")
@@ -302,11 +319,10 @@ fn codemode_reaches_tools() -> rpi_ext_host::types::ReachesToolsFn {
             "searchTools",
             "describeNamespace",
             "describeTool",
-            "listTools",
-            "allTools",
+            "ALL_TOOLS",
         ]
         .iter()
-        .any(|needle| code.contains(needle))
+        .any(|needle| contains_identifier_word(code, needle))
         {
             return serde_json::Value::String("all".to_owned());
         }
@@ -430,6 +446,16 @@ mod reachability_tests {
         );
         assert_eq!(
             reaches(&json!({"code": "return tools.describeNamespace('docs')"})),
+            json!("all")
+        );
+        assert_eq!(
+            reaches(&json!({"code": "return ALL_TOOLS.length"})),
+            json!("all")
+        );
+        // Only whole identifiers count, and `listTools` is not a discovery
+        // global upstream.
+        assert_ne!(
+            reaches(&json!({"code": "const ALL_TOOLSX = 1; return listTools"})),
             json!("all")
         );
         let words = reaches(&json!({"code": "await tools.mcp__docs__search({})"}));

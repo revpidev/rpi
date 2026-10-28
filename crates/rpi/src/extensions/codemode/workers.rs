@@ -107,7 +107,10 @@ pub enum Admission {
 
 struct Waiter {
     id: u64,
-    grant: oneshot::Sender<()>,
+    /// The slot itself travels through the channel: a receiver dropped after
+    /// a successful send drops the queued reservation, which releases the
+    /// slot. A plain `()` would leak it.
+    grant: oneshot::Sender<WorkerReservation>,
 }
 
 #[derive(Default)]
@@ -174,37 +177,51 @@ impl WorkerPool {
                 None => std::future::pending::<()>().await,
             }
         };
+        let mut receiver = receiver;
         let outcome = tokio::select! {
             biased;
-            _ = receiver => return Admission::Reserved(WorkerReservation::new(self.clone())),
+            granted = &mut receiver => {
+                return match granted {
+                    Ok(reservation) => Admission::Reserved(reservation),
+                    // The pool went away; nothing was reserved.
+                    Err(_) => Admission::Aborted,
+                };
+            }
             () = &mut sleep => Admission::Timeout,
             () = aborted => Admission::Aborted,
         };
         // A grant can race the timeout/abort branch: if the waiter is gone
-        // from the queue, admission already granted the slot to us.
+        // from the queue, its reservation is waiting in the channel.
         if self.remove_waiter(id) {
             outcome
         } else {
-            Admission::Reserved(WorkerReservation::new(self.clone()))
+            match receiver.await {
+                Ok(reservation) => Admission::Reserved(reservation),
+                Err(_) => Admission::Aborted,
+            }
         }
     }
 
     /// Release one slot and hand free capacity to waiters in arrival order
     /// (`releaseCodemodeWorker`, execute.ts:108-113). Only a
     /// [`WorkerReservation`] calls this.
-    fn release(&self) {
-        let mut state = lock(&self.state);
-        state.active = state.active.saturating_sub(1);
-        while !state.waiters.is_empty() && state.active < (self.limit)() {
-            let Some(waiter) = state.waiters.pop_front() else {
-                break;
-            };
-            state.active += 1;
-            // A dropped receiver (the reserving future was cancelled) must
-            // not leak the slot.
-            if waiter.grant.send(()).is_err() {
-                state.active -= 1;
+    fn release(self: &Arc<Self>) {
+        let mut grants: Vec<oneshot::Sender<WorkerReservation>> = Vec::new();
+        {
+            let mut state = lock(&self.state);
+            state.active = state.active.saturating_sub(1);
+            while !state.waiters.is_empty() && state.active < (self.limit)() {
+                let Some(waiter) = state.waiters.pop_front() else {
+                    break;
+                };
+                state.active += 1;
+                grants.push(waiter.grant);
             }
+        }
+        // Send outside the lock: a failed send returns the reservation,
+        // whose Drop releases the slot and may grant the next waiter.
+        for grant in grants {
+            let _ = grant.send(WorkerReservation::new(self.clone()));
         }
     }
 
@@ -321,6 +338,55 @@ mod tests {
         let granted = reserved(waiting.await);
         assert_eq!(pool.active(), 1);
         drop(granted);
+        assert_eq!(pool.active(), 0);
+    }
+
+    /// The original N4 race: a waiter is granted, then its future is dropped
+    /// before it observes the reservation. The queued reservation must
+    /// release the slot.
+    #[tokio::test]
+    async fn dropping_a_waiter_after_a_grant_does_not_leak_the_slot() {
+        let pool = Arc::new(WorkerPool::with_limit(|| 1));
+        let slot = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        let mut waiting = Box::pin(pool.reserve(None, Duration::from_secs(5)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        // Grant the waiter, then drop the future without polling it again.
+        drop(slot);
+        drop(waiting);
+        assert_eq!(pool.active(), 0, "a dropped granted waiter leaked its slot");
+        // The capacity is reusable.
+        let next = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        assert_eq!(pool.active(), 1);
+        drop(next);
+    }
+
+    /// A waiter dropped before the grant leaves a stale queue entry; the next
+    /// release must hand the slot to the following waiter, not lose it.
+    #[tokio::test]
+    async fn a_waiter_dropped_while_queued_does_not_lose_the_next_grant() {
+        let pool = Arc::new(WorkerPool::with_limit(|| 1));
+        let slot = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        let mut stale = Box::pin(pool.reserve(None, Duration::from_secs(5)));
+        let mut kept = Box::pin(pool.reserve(None, Duration::from_secs(5)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stale.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), kept.as_mut())
+                .await
+                .is_err()
+        );
+        drop(stale);
+        drop(slot);
+        let next = reserved(kept.await);
+        assert_eq!(pool.active(), 1);
+        drop(next);
         assert_eq!(pool.active(), 0);
     }
 
