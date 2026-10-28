@@ -826,6 +826,19 @@ pub enum NotifyType {
     Error,
 }
 
+/// `ui.hasOverlay()` result (rpi additive, ADR-0041 / V18-02): the current
+/// session's visible overlay state. `visible` counts any visible overlay
+/// (capturing or not, host or extension); `capturing` counts visible
+/// capturing overlays only, so `capturing == true` implies `visible == true`.
+/// Hidden and inline-only components are excluded. The object is always
+/// truthy on the wire — callers must read the fields, not the object.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HasOverlayState {
+    pub visible: bool,
+    pub capturing: bool,
+}
+
 /// Failure reason of the additive `ui.emitText` output channel
 /// (ADR-0040 / V18-02). `UnsupportedOutput` is answered by
 /// [`crate::bridges::NullUiBridge`] and any other bridge that has no
@@ -958,6 +971,15 @@ pub trait UiBridge: Send + Sync {
     /// bridge must opt in explicitly.
     fn emit_text(&self, _text: &str, _validate_only: bool) -> Result<(), UiOutputError> {
         Err(UiOutputError::UnsupportedOutput)
+    }
+
+    /// `ui.hasOverlay` (rpi additive, ADR-0041 / V18-02): the current
+    /// session's `{visible,capturing}` overlay state. Interactive returns the
+    /// real state; RPC/NullUi and other non-interactive bridges return both
+    /// `false` (never a bare boolean). The default keeps old/third-party
+    /// bridges fail-closed.
+    fn has_overlay(&self) -> HasOverlayState {
+        HasOverlayState::default()
     }
 
     /// `onTerminalInput` (types.ts:144) — interactive mode only.

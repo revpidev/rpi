@@ -18,6 +18,7 @@ pub mod events;
 pub mod interactive_ui;
 pub mod model_registry;
 pub mod output;
+pub mod overlay;
 pub mod session_entries;
 pub mod session_stats;
 

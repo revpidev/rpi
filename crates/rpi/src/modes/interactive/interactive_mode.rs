@@ -1443,6 +1443,22 @@ fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) ->
 /// (upstream GCs this; here the mode lives for the process lifetime).
 /// `pub(crate)` so the slash-command handlers in `commands.rs` can
 /// extend it.
+/// One frame of the editor-region selector stack (ADR-0041 / 4a080252f):
+/// each dialog/selector mounts on top of the previous one. `dialog` marks
+/// host/extension dialogs that capture input and count for `ui.hasOverlay`;
+/// inline editor components (`setEditorComponent`) share the region but do
+/// not count as overlays. `blocked` is the OSC 7501 report to restore when
+/// this frame becomes visible again.
+struct SelectorFrame {
+    entry: SharedComponent,
+    dialog: bool,
+    blocked: Option<BlockedStatus>,
+    /// `true` for extension dialogs that must stack over the current frame;
+    /// `false` for legacy host selectors / inline mounts that replace the
+    /// current frame.
+    push: bool,
+}
+
 pub(crate) struct InteractiveUi {
     pub(crate) ui: TuiHandle,
     /// The bound session. Replaceable behind an `RwLock` so session
@@ -1529,6 +1545,8 @@ pub(crate) struct InteractiveUi {
     pub(crate) clipboard_runner_override: Arc<Mutex<Option<clipboard::ClipboardRunnerOverride>>>,
     /// The active selector entry, if any (T12-S5a).
     active_selector: Mutex<Option<SharedComponent>>,
+    /// Editor-region selector frames in open order (last = visible top).
+    selector_stack: Mutex<Vec<SelectorFrame>>,
     /// Weak self-reference for callbacks that need the `Arc<InteractiveUi>`
     /// (selector onSelect closures, escape double-press actions).
     self_arc: Mutex<Option<std::sync::Weak<InteractiveUi>>>,
@@ -1782,7 +1800,9 @@ impl component_registry::ComponentMountPoint for UiMountPoint {
 
     fn show_editor_region(&self, entry: SharedComponent) {
         if let Some(ui) = self.ui.upgrade() {
-            ui.show_selector(entry);
+            // ADR-0024 editor-region components are inline-only mounts: they
+            // must not enter the dialog stack or count for `ui.hasOverlay`.
+            ui.show_inline_selector(entry);
         }
     }
 
@@ -3131,20 +3151,68 @@ impl InteractiveUi {
     /// container's, so the content swap is safe; `set_focus`/
     /// `request_render` go through the renderer's re-entrancy queue.
     pub(crate) fn show_selector(&self, entry: SharedComponent) {
-        // V13-05 (FR-B): replace previous selector / install the new one in
-        // a SINGLE container critical section (swap_editor_region) — never a
-        // transient bare-editor or missing-selector frame, and set_focus
-        // fires once (no focus jitter). M3: the `active_selector`
-        // bookkeeping is held ACROSS the swap so a concurrent
-        // `hide_selector_if_current` (a superseded dialog's late timeout
-        // wake) cannot interleave its editor-restore swap between the
-        // bookkeeping and the container swap — lock order is always
-        // active_selector → editor_container, never the reverse.
+        self.push_selector(entry, true, None, false);
+    }
+
+    /// Mount an extension dialog with its OSC 7501 blocked report
+    /// (interactive-mode.ts:2690-2745). The dialog joins the selector stack;
+    /// closing it restores the previous frame.
+    pub(crate) fn show_dialog(&self, entry: SharedComponent, blocked: BlockedStatus) {
+        self.push_selector(entry, true, Some(blocked), true);
+    }
+
+    /// Mount an inline editor-region component (`setEditorComponent`): it
+    /// shares the region but is not a dialog and does not count for
+    /// `ui.hasOverlay`.
+    pub(crate) fn show_inline_selector(&self, entry: SharedComponent) {
+        self.push_selector(entry, false, None, false);
+    }
+
+    /// Push one selector frame and make it visible. Lock order is
+    /// `selector_stack → active_selector → editor_container` (never the
+    /// reverse). Host dialogs blur an active extension component on the
+    /// 0→1 dialog transition and restore it on 1→0.
+    fn push_selector(
+        &self,
+        entry: SharedComponent,
+        dialog: bool,
+        blocked: Option<BlockedStatus>,
+        force_push: bool,
+    ) {
+        let mut stack = lock(&self.selector_stack);
+        let had_dialog = stack.iter().any(|frame| frame.dialog);
+        // Legacy host selectors replace the visible selector (rpi's pre-stack
+        // behavior); extension dialogs force-push so a second dialog stacks
+        // instead of settling the first. Inline mounts replace each other but
+        // cover a dialog if one is open.
+        let replace_top = !force_push && stack.last().is_some_and(|frame| !frame.push);
+        if replace_top {
+            stack.pop();
+        }
+        stack.push(SelectorFrame {
+            entry: entry.clone(),
+            dialog,
+            blocked: blocked.clone(),
+            push: force_push,
+        });
+        let has_dialog = stack.iter().any(|frame| frame.dialog);
+        // Blur BEFORE the region swap moves TUI focus to the dialog: the
+        // proxy's `set_focused(false)` runs during the swap, and
+        // `dialog_opened` must observe the component as focused to deliver
+        // the blur event (R-U2.2).
+        if has_dialog && !had_dialog {
+            self.component_registry.dialog_opened();
+        }
         {
             let mut active = lock(&self.active_selector);
             *active = Some(entry.clone());
             self.swap_editor_region(entry.clone(), entry);
         }
+        if !has_dialog && had_dialog {
+            self.component_registry.dialog_closed();
+        }
+        self.set_program_status_blocked("extension-dialog", blocked);
+        drop(stack);
         // Clear the settings selector weak ref (selector changed / reinstated).
         *lock(&self.settings_selector_weak) = None;
         // Clear the typed session-selector slot (same supersede semantics —
@@ -3152,50 +3220,106 @@ impl InteractiveUi {
         *lock(&self.session_selector) = None;
     }
 
-    /// The `done()` callback (interactive-mode.ts:4123-4127): restore the
-    /// editor into the container (upstream `editorContainer.clear();
-    /// editorContainer.addChild(editor)`).
+    /// The `done()` callback (interactive-mode.ts:4123-4127): pop the top
+    /// frame and restore the previous one (or the editor when the stack is
+    /// empty). The legacy "clear everything" behavior is intentionally gone:
+    /// a dialog closing must not settle another dialog's promise.
     pub(crate) fn hide_selector(&self) {
-        // M3: same critical-section discipline as `show_selector` — the
-        // take and the editor-restore swap happen under one
-        // `active_selector` guard, so they cannot interleave with a
-        // concurrent show/hide.
+        let frame = {
+            let mut stack = lock(&self.selector_stack);
+            stack.pop()
+        };
+        if let Some(frame) = frame {
+            self.finish_selector_removal(Some(frame));
+        }
+    }
+
+    /// Guarded close for extension dialogs (M3, upstream's
+    /// `activeSelectorToken` guard, interactive-mode.ts:4355-4361): remove
+    /// exactly `entry` from the stack. A late `done()`/timeout for a
+    /// superseded (non-top) frame removes its frame without touching the
+    /// visible dialog; a top frame restores the previous one.
+    pub(crate) fn hide_selector_if_current(&self, entry: &SharedComponent) {
+        let mut stack = lock(&self.selector_stack);
+        let Some(index) = stack
+            .iter()
+            .rposition(|frame| Arc::ptr_eq(&frame.entry, entry))
+        else {
+            return;
+        };
+        let was_top = index + 1 == stack.len();
+        let removed = stack.remove(index);
+        drop(stack);
+        if was_top {
+            self.finish_selector_removal(Some(removed));
+        } else {
+            self.sync_dialog_state_after_removal(removed.dialog);
+        }
+    }
+
+    /// Restore the new top frame (or editor) after a top-frame removal and
+    /// reconcile the dialog/blur/program-status state.
+    fn finish_selector_removal(&self, removed: Option<SelectorFrame>) {
+        let (top_entry, top_dialog, top_blocked, has_dialog) = {
+            let stack = lock(&self.selector_stack);
+            let top = stack.last();
+            (
+                top.map(|frame| frame.entry.clone()),
+                top.is_some_and(|frame| frame.dialog),
+                top.and_then(|frame| frame.blocked.clone()),
+                stack.iter().any(|frame| frame.dialog),
+            )
+        };
         {
             let mut active = lock(&self.active_selector);
-            if active.take().is_some() {
-                // Single critical section: clear → add editor → focus editor
-                // (already atomic; kept via the shared primitive V13-05 FR-B).
-                self.swap_editor_region(self.editor_region.clone(), self.editor_region.clone());
+            *active = top_entry.clone();
+            match top_entry {
+                Some(entry) => self.swap_editor_region(entry.clone(), entry),
+                None => {
+                    self.swap_editor_region(self.editor_region.clone(), self.editor_region.clone())
+                }
             }
         }
-        // Clear the settings selector weak ref (selector is no longer mounted).
+        self.set_program_status_blocked("extension-dialog", top_blocked);
+        // A dialog/component transition 1→0 restores the blurred component;
+        // no transition means the other frame keeps it blurred.
+        if let Some(removed) = removed {
+            if removed.dialog && !has_dialog {
+                self.component_registry.dialog_closed();
+            }
+        } else if !top_dialog && !has_dialog {
+            self.component_registry.dialog_closed();
+        }
         *lock(&self.settings_selector_weak) = None;
         *lock(&self.session_selector) = None;
     }
 
-    /// Guarded close for extension dialogs (M3, upstream's
-    /// `activeSelectorToken` guard, interactive-mode.ts:4355-4361): restore
-    /// the editor only when `entry` is STILL the mounted selector. A
-    /// dialog's `done()`/timeout can wake arbitrarily late (the tokio
-    /// timeout fires on a worker thread); by then another selector may
-    /// legitimately own the editor region (a built-in selector, or another
-    /// extension's dialog) — an unguarded hide would close the replacement.
-    /// Identity is `Arc` pointer equality; a superseded call is a no-op.
-    pub(crate) fn hide_selector_if_current(&self, entry: &SharedComponent) {
-        let mut active = lock(&self.active_selector);
-        let is_current = active
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, entry));
-        if !is_current {
-            // Superseded — the replacement owns the editor region now.
+    /// A non-top frame closed: the visible dialog does not change, but the
+    /// last remaining dialog may have disappeared underneath an inline frame.
+    fn sync_dialog_state_after_removal(&self, removed_was_dialog: bool) {
+        if !removed_was_dialog {
             return;
         }
-        *active = None;
-        self.swap_editor_region(self.editor_region.clone(), self.editor_region.clone());
-        drop(active);
-        // Clear the settings selector weak ref (selector is no longer mounted).
-        *lock(&self.settings_selector_weak) = None;
-        *lock(&self.session_selector) = None;
+        let has_dialog = lock(&self.selector_stack).iter().any(|frame| frame.dialog);
+        if !has_dialog {
+            self.component_registry.dialog_closed();
+        }
+    }
+
+    /// Whether any visible overlay exists in this session (ADR-0041):
+    /// host/extension dialogs on the editor-region stack and ADR-0024
+    /// overlay components (hidden and inline-only components excluded).
+    /// `capturing` counts only visible capturing overlays and therefore
+    /// implies `visible`.
+    pub(crate) fn has_overlay(&self) -> rpi_ext_host::api::HasOverlayState {
+        let top_dialog = lock(&self.selector_stack)
+            .last()
+            .is_some_and(|frame| frame.dialog);
+        let (component_visible, component_capturing) = self.component_registry.overlay_state();
+        rpi_ext_host::api::HasOverlayState {
+            visible: top_dialog || component_visible,
+            capturing: top_dialog || component_capturing,
+        }
     }
 
     /// Whether `entry` still owns the editor region (ADR-0024 C1): the
@@ -5823,6 +5947,7 @@ impl InteractiveMode {
             clipboard_env_override,
             clipboard_runner_override,
             active_selector: Mutex::new(None),
+            selector_stack: Mutex::new(Vec::new()),
             self_arc: Mutex::new(None),
             extension_ui_bridge: Mutex::new(None),
             component_registry: component_registry::ComponentRegistry::new(),
@@ -12466,6 +12591,156 @@ mod tests {
         });
         assert_eq!(task.await.expect("task"), None);
         assert!(lock(&mode.ui_state.active_selector).is_none());
+        mode.shutdown().await;
+    }
+
+    /// ADR-0041 / 4a080252f: concurrent extension dialogs form a stack. The
+    /// second dialog supersedes the first but does not settle it; closing the
+    /// top restores the previous one, and closing the last restores the
+    /// editor. Both promises settle in order.
+    #[tokio::test]
+    async fn w4_dialog_stack_restores_previous_and_settles_both() {
+        use rpi_ext_host::api::{HasOverlayState, UiBridge};
+        async fn wait_until(mut cond: impl FnMut() -> bool) {
+            for _ in 0..200 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("condition not reached");
+        }
+
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&mode.ui_state));
+
+        let a = bridge.clone();
+        let task_a = tokio::spawn(async move { a.select("A", &["a".to_owned()], None).await });
+        wait_until(|| lock(&mode.ui_state.selector_stack).len() == 1).await;
+        assert_eq!(
+            bridge.has_overlay(),
+            HasOverlayState {
+                visible: true,
+                capturing: true
+            }
+        );
+
+        let b = bridge.clone();
+        let task_b = tokio::spawn(async move { b.select("B", &["b".to_owned()], None).await });
+        wait_until(|| lock(&mode.ui_state.selector_stack).len() == 2).await;
+        // Top is B and A is still pending.
+        assert!(!task_a.is_finished(), "A must not settle when B opens");
+        let top_b = lock(&mode.ui_state.selector_stack)
+            .last()
+            .map(|frame| frame.entry.clone())
+            .expect("B frame");
+        lock(&top_b).handle_input("\r");
+        assert_eq!(task_b.await.expect("join"), Some("b".to_owned()));
+        assert!(!task_a.is_finished(), "A stays pending after B closes");
+        assert_eq!(lock(&mode.ui_state.selector_stack).len(), 1);
+        // A is visible again and still capturing.
+        assert_eq!(
+            bridge.has_overlay(),
+            HasOverlayState {
+                visible: true,
+                capturing: true
+            }
+        );
+
+        let top_a = lock(&mode.ui_state.selector_stack)
+            .last()
+            .map(|frame| frame.entry.clone())
+            .expect("A frame");
+        lock(&top_a).handle_input("\r");
+        assert_eq!(task_a.await.expect("join"), Some("a".to_owned()));
+        assert!(lock(&mode.ui_state.selector_stack).is_empty());
+        assert_eq!(bridge.has_overlay(), HasOverlayState::default());
+        mode.shutdown().await;
+    }
+
+    /// ADR-0041: `ui.hasOverlay` counts visible capturing/non-capturing
+    /// overlay components, excludes hidden and inline-only components, and
+    /// never turns a non-capturing HUD into `capturing`.
+    #[tokio::test]
+    async fn c1_has_overlay_tracks_capture_hidden_and_inline_components() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_ext_host::interactive_ui::{MountOptions, OverlayOptions};
+
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState::default(),
+            "empty session"
+        );
+
+        let capturing = bridge
+            .mount_component("ext", MountOptions::default())
+            .await
+            .expect("capturing overlay");
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState {
+                visible: true,
+                capturing: true
+            }
+        );
+        bridge
+            .set_component_hidden("ext", capturing, true)
+            .expect("hide");
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState::default(),
+            "hidden capturing overlay is not visible"
+        );
+        bridge
+            .set_component_hidden("ext", capturing, false)
+            .expect("show");
+        bridge.dispose_component("ext", capturing).expect("dispose");
+
+        let non_capturing = bridge
+            .mount_component(
+                "ext",
+                MountOptions {
+                    overlay_options: Some(OverlayOptions {
+                        non_capturing: true,
+                        ..OverlayOptions::default()
+                    }),
+                    ..MountOptions::default()
+                },
+            )
+            .await
+            .expect("non-capturing overlay");
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState {
+                visible: true,
+                capturing: false
+            },
+            "HUD counts as visible, never capturing"
+        );
+        bridge
+            .dispose_component("ext", non_capturing)
+            .expect("dispose");
+
+        let inline = bridge
+            .mount_component(
+                "ext",
+                MountOptions {
+                    overlay: false,
+                    ..MountOptions::default()
+                },
+            )
+            .await
+            .expect("inline component");
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState::default(),
+            "inline-only components do not count"
+        );
+        bridge.dispose_component("ext", inline).expect("dispose");
         mode.shutdown().await;
     }
 

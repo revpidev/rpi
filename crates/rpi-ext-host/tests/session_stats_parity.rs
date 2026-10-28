@@ -9,6 +9,7 @@
 use rpi_ext_host::api::UiOutputError;
 use rpi_ext_host::types::{SessionStatsSnapshot, SessionTokenStats};
 use rpi_ext_sdk::output::{METHOD_UI_EMIT_TEXT, UNSUPPORTED_OUTPUT, is_unsupported_output};
+use rpi_ext_sdk::overlay::{METHOD_UI_HAS_OVERLAY, has_overlay};
 use rpi_ext_sdk::session_stats::{METHOD_SESSION_STATS, SessionStats};
 
 fn native_snapshot() -> SessionStatsSnapshot {
@@ -76,6 +77,38 @@ fn in_memory_sessions_omit_session_file_on_both_sides() {
     let sdk_json = serde_json::to_value(sdk).expect("sdk json");
     assert_eq!(native_json, sdk_json);
     assert!(native_json.get("sessionFile").is_none());
+}
+
+fn overlay_host(state: serde_json::Value) -> impl rpi_ext_sdk::interactive_ui::HostCall {
+    struct H(serde_json::Value);
+    impl rpi_ext_sdk::interactive_ui::HostCall for H {
+        fn call(
+            &self,
+            _method: &str,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, rpi_ext_sdk::interactive_ui::InteractiveUiError> {
+            Ok(self.0.clone())
+        }
+    }
+    H(state)
+}
+
+#[test]
+fn has_overlay_wire_shape_and_method_match() {
+    assert_eq!(METHOD_UI_HAS_OVERLAY, "ui.hasOverlay");
+    let native = rpi_ext_host::api::HasOverlayState {
+        visible: true,
+        capturing: true,
+    };
+    let native_json = serde_json::to_value(native).expect("native json");
+    let sdk = has_overlay(&overlay_host(native_json.clone())).expect("sdk decode");
+    assert_eq!(sdk.visible, native.visible);
+    assert_eq!(sdk.capturing, native.capturing);
+    assert_eq!(
+        serde_json::to_value(sdk).expect("sdk json"),
+        native_json,
+        "byte-identical visible/capturing"
+    );
 }
 
 #[test]

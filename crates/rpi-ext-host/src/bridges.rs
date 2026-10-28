@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::Value;
 
-use crate::api::{ExtensionWidgetOptions, NotifyType, UiOutputError};
+use crate::api::{ExtensionWidgetOptions, HasOverlayState, NotifyType, UiOutputError};
 use crate::api::{
     SetThemeResult, TerminalInputHandler, ThemeInfo, UiBridge, UiDialogOptions, Unsubscribe,
     WidgetContent, WorkingIndicatorOptions,
@@ -347,6 +347,11 @@ impl UiBridge for OutputUiBridge {
         self.inner.set_tools_expanded(expanded);
     }
 
+    fn has_overlay(&self) -> HasOverlayState {
+        // Output-only bridge: no interactive overlays exist in this mode.
+        HasOverlayState::default()
+    }
+
     fn is_noop(&self) -> bool {
         true
     }
@@ -408,6 +413,10 @@ impl UiBridge for NamespacedUiBridge {
 
     fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
         self.inner.emit_text(text, validate_only)
+    }
+
+    fn has_overlay(&self) -> HasOverlayState {
+        self.inner.has_overlay()
     }
 
     fn on_terminal_input(&self, handler: TerminalInputHandler) -> Unsubscribe {
@@ -825,6 +834,10 @@ impl UiBridge for UiPromptBridge {
 
     fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
         self.inner.emit_text(text, validate_only)
+    }
+
+    fn has_overlay(&self) -> HasOverlayState {
+        self.inner.has_overlay()
     }
 
     fn on_terminal_input(&self, handler: TerminalInputHandler) -> Unsubscribe {

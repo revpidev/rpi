@@ -143,15 +143,12 @@ impl InteractiveUiBridge {
         blocked: BlockedStatus,
     ) -> Option<String> {
         let ui = self.ui()?;
-        // ADR-0024 C1 (R-U2.2): the four bridge dialogs blur the active
-        // interactive component while they own the keyboard and restore its
-        // focus afterwards (unless it was hidden meanwhile, R-U10.2).
-        ui.component_registry.dialog_opened();
-        ui.show_selector(entry.clone());
-        // `programStatus.setBlocked("extension-dialog", blocked)`
-        // (interactive-mode.ts:2729): the OSC 7501 report says what the
-        // dialog waits for while it is open.
-        ui.set_program_status_blocked("extension-dialog", Some(blocked));
+        // ADR-0024 C1 (R-U2.2) / ADR-0041: the dialog joins the selector
+        // stack, blurs the active interactive component on the 0→1 dialog
+        // transition and restores it when the last dialog closes. The same
+        // frame carries the OSC 7501 blocked report
+        // (interactive-mode.ts:2729).
+        ui.show_dialog(entry.clone(), blocked);
         let result = match opts.and_then(|o| o.timeout) {
             Some(ms) if ms > 0 => {
                 match tokio::time::timeout(std::time::Duration::from_millis(ms), rx).await {
@@ -161,21 +158,12 @@ impl InteractiveUiBridge {
             }
             _ => rx.await.ok().flatten(),
         };
-        // M3: guarded close — a late `done()`/timeout wake must only close
-        // the dialog it mounted (upstream `activeSelectorToken` guard,
-        // interactive-mode.ts:4355-4361). By the time we wake, another
-        // selector (built-in, or another extension's dialog) may own the
-        // editor region; an unconditional hide would close the replacement.
-        // The component focus restore shares that guard: a superseded dialog
-        // must not remount/refocus the component over the replacement. The
-        // blocked status clears under the same guard so a superseded dialog
-        // cannot clear its replacement's `blocked` report.
-        if let Some(ui) = self.ui()
-            && ui.selector_is_current(&entry)
-        {
+        // M3/ADR-0041: `hide_selector_if_current` removes exactly this
+        // frame from the stack. A superseded (non-top) dialog only drops its
+        // frame; a top dialog restores the previous frame (or the editor),
+        // and the dialog/focus/blocked state is reconciled by the stack.
+        if let Some(ui) = self.ui() {
             ui.hide_selector_if_current(&entry);
-            ui.set_program_status_blocked("extension-dialog", None);
-            ui.component_registry.dialog_closed();
         }
         result
     }
@@ -569,6 +557,14 @@ impl UiBridge for InteractiveUiBridge {
         Ok(())
     }
 
+    /// `ui.hasOverlay` (ADR-0041 / V18-02): the real session overlay stack.
+    fn has_overlay(&self) -> rpi_ext_host::api::HasOverlayState {
+        self.ui()
+            .map_or_else(rpi_ext_host::api::HasOverlayState::default, |ui| {
+                ui.has_overlay()
+            })
+    }
+
     /// `onTerminalInput` (interactive-mode.ts:2187-2205 area) via the Tui
     /// input-listener registry (tui.ts:651-658). The handler is also stored
     /// in `extension_input_listeners` for re-registration during
@@ -713,24 +709,18 @@ impl UiBridge for InteractiveUiBridge {
             tx,
         )));
         let entry = super::shared_component_from_boxed(Box::new(DialogRegion(dialog)));
-        ui.component_registry.dialog_opened();
-        ui.show_selector(entry.clone());
-        ui.set_program_status_blocked(
-            "extension-dialog",
-            Some(BlockedStatus {
+        ui.show_dialog(
+            entry.clone(),
+            BlockedStatus {
                 kind: ProgramStatusKind::Question,
                 message: "extension custom UI".to_owned(),
-            }),
+            },
         );
         let result = rx.await.ok().flatten();
-        // Guarded close (the `mount_dialog` identity rule): a superseding
-        // selector owns the editor region by the time the dialog resolves.
-        if let Some(ui) = self.ui()
-            && ui.selector_is_current(&entry)
-        {
+        // ADR-0041: `done()`/dispose closes only this frame; a superseded
+        // dialog drops its frame without closing the visible replacement.
+        if let Some(ui) = self.ui() {
             ui.hide_selector_if_current(&entry);
-            ui.set_program_status_blocked("extension-dialog", None);
-            ui.component_registry.dialog_closed();
         }
         result
     }
@@ -794,18 +784,17 @@ impl UiBridge for InteractiveUiBridge {
         };
         *lock(&self.editor_component) = component.clone();
         let previous = lock(&self.editor_component_entry).take();
-        match component {
-            Some(tree) => {
-                let built = component_from_tree(&tree, &Arc::clone(&lock(&ui.theme)));
-                let entry = super::shared_component_from_boxed(built);
-                ui.show_selector(entry.clone());
-                *lock(&self.editor_component_entry) = Some(entry);
-            }
-            None => {
-                if let Some(previous) = previous {
-                    ui.hide_selector_if_current(&previous);
-                }
-            }
+        // The component is an inline editor-region mount, not a dialog: it
+        // must not count for `ui.hasOverlay` (ADR-0041). Replace the
+        // previous inline frame instead of stacking another one.
+        if let Some(previous) = previous {
+            ui.hide_selector_if_current(&previous);
+        }
+        if let Some(tree) = component {
+            let built = component_from_tree(&tree, &Arc::clone(&lock(&ui.theme)));
+            let entry = super::shared_component_from_boxed(built);
+            ui.show_inline_selector(entry.clone());
+            *lock(&self.editor_component_entry) = Some(entry);
         }
     }
 

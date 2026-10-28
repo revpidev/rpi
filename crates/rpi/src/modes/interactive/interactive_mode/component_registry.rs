@@ -1274,6 +1274,28 @@ impl ComponentRegistry {
         }
     }
 
+    /// Visible overlay state for `ui.hasOverlay` (ADR-0041 / V18-02):
+    /// `(visible, capturing)`. Only a mounted, non-hidden overlay component
+    /// counts; editor-region ("inline") components never do. `capturing`
+    /// only reflects components mounted without `nonCapturing`.
+    pub(crate) fn overlay_state(&self) -> (bool, bool) {
+        let Some(state) = self.active_state() else {
+            return (false, false);
+        };
+        if state.is_closed() || state.hidden.load(Ordering::SeqCst) {
+            return (false, false);
+        }
+        let is_overlay = state
+            .overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if !is_overlay {
+            return (false, false);
+        }
+        (true, state.capturing)
+    }
+
     /// The active handle, if any (diagnostics / lifecycle assertions).
     #[cfg(test)]
     pub(crate) fn active_handle(&self) -> Option<ComponentHandle> {

@@ -254,6 +254,12 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             })?;
             Ok(result.map(Value::from).unwrap_or(Value::Null))
         }
+        "ui.hasOverlay" => {
+            // rpi additive (ADR-0041 / V18-02): `{visible,capturing}`. The
+            // object is always truthy; callers must read the fields.
+            let state = ui.has_overlay();
+            Ok(serde_json::to_value(state).unwrap_or(Value::Null))
+        }
         "ui.notify" => {
             ui.notify(
                 str_arg(&args, "message").unwrap_or_default(),
@@ -888,6 +894,17 @@ mod tests {
     }
 
     // -- ADR-0040 / V18-02: additive `ui.emitText` -------------------------
+
+    #[test]
+    fn ui_has_overlay_returns_the_double_false_object_on_null_bridge() {
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        let value =
+            dispatch(&mut state, "ui.hasOverlay", serde_json::json!({})).expect("hasOverlay");
+        assert_eq!(
+            value,
+            serde_json::json!({"visible": false, "capturing": false})
+        );
+    }
 
     #[test]
     fn ui_emit_text_on_null_bridge_is_unsupported_output() {
