@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use rpi_ext_host::api::{
     ExtensionWidgetOptions, NotifyType, SetThemeResult, TerminalInputHandler, TerminalInputResult,
-    ThemeInfo, UiBridge, UiDialogOptions, Unsubscribe, WidgetContent, WidgetPlacement,
-    WorkingIndicatorOptions,
+    ThemeInfo, UiBridge, UiDialogOptions, UiOutputError, Unsubscribe, WidgetContent,
+    WidgetPlacement, WorkingIndicatorOptions,
 };
 use rpi_ext_host::interactive_ui::{
     ComponentEvent, ComponentFrame, ComponentHandle, InteractiveUiError, InteractiveUiErrorKind,
@@ -556,6 +556,17 @@ impl UiBridge for InteractiveUiBridge {
                 NotifyType::Error => ui.show_error(message),
             }
         }
+    }
+
+    /// `ui.emitText` (rpi additive, ADR-0040 / V18-02): TUI command text
+    /// output goes through the same notification surface. `validate_only`
+    /// reports the channel without producing output.
+    fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
+        if validate_only {
+            return Ok(());
+        }
+        self.notify(text, NotifyType::Info);
+        Ok(())
     }
 
     /// `onTerminalInput` (interactive-mode.ts:2187-2205 area) via the Tui

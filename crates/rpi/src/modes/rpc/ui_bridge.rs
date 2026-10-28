@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rpi_ext_host::api::{
     ExtensionWidgetOptions, NotifyType, SetThemeResult, TerminalInputHandler, ThemeInfo, UiBridge,
-    UiDialogOptions, Unsubscribe, WidgetContent, WorkingIndicatorOptions,
+    UiDialogOptions, UiOutputError, Unsubscribe, WidgetContent, WorkingIndicatorOptions,
 };
 use rpi_ext_host::types::ComponentTree;
 use serde_json::{Value, json};
@@ -189,6 +189,17 @@ impl UiBridge for RpcUiBridge {
         }));
     }
 
+    /// `ui.emitText` (rpi additive, ADR-0040 / V18-02): the RPC wire carries
+    /// command text as the same `extension_ui_request{method:"notify"}`
+    /// frame. `validate_only` checks the channel without emitting.
+    fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
+        if validate_only {
+            return Ok(());
+        }
+        self.notify(text, NotifyType::Info);
+        Ok(())
+    }
+
     /// Degraded: raw terminal input is not supported (rpc-mode.ts:165-167).
     fn on_terminal_input(&self, _handler: TerminalInputHandler) -> Unsubscribe {
         Box::new(|| {})
@@ -316,4 +327,61 @@ impl UiBridge for RpcUiBridge {
 
     /// Degraded no-op (rpc-mode.ts:304-306).
     fn set_tools_expanded(&self, _expanded: bool) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use rpi_ext_host::api::UiBridge;
+    use serde_json::Value;
+
+    use super::{RpcUiBridge, new_pending_ui_table};
+    use crate::core::output_guard::RawStdout;
+
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("utf8")
+        }
+    }
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn bridge() -> (RpcUiBridge, SharedBuffer) {
+        let buffer = SharedBuffer::default();
+        let out = RawStdout::new(Box::new(buffer.clone()));
+        (
+            RpcUiBridge::new(out, new_pending_ui_table(), Value::Null),
+            buffer,
+        )
+    }
+
+    #[test]
+    fn emit_text_emits_the_notify_frame_and_validate_only_is_silent() {
+        let (bridge, buffer) = bridge();
+        assert!(!bridge.is_noop(), "RPC has an interactive UI");
+        bridge
+            .emit_text("statusline: help", true)
+            .expect("validate");
+        assert_eq!(buffer.text(), "");
+        bridge.emit_text("statusline: help", false).expect("emit");
+        let frame: Value = serde_json::from_str(buffer.text().trim()).expect("frame json");
+        assert_eq!(frame["type"], "extension_ui_request");
+        assert_eq!(frame["method"], "notify");
+        assert_eq!(frame["message"], "statusline: help");
+        assert_eq!(frame["notifyType"], "info");
+        assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
+    }
 }

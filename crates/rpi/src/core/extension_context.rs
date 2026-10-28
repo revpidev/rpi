@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::core::agent_session::{AgentSession, WeakAgentSession};
 use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::extension_host_adapter::host_of_runner;
+use crate::core::usage_totals::usage_totals_from_entries;
 
 /// `ExtensionContextActions` backed by the bound session (weak — the
 /// session owns the host through the runner slot).
@@ -241,6 +242,36 @@ impl ContextActions for SessionContextActions {
             results.drain(..results.len() - keep);
         }
         results
+    }
+
+    /// `ctx.sessionStats()` (rpi additive, ADR-0040 / V18-02): one absolute
+    /// snapshot under a single `SessionManager` lock. `entryCount` excludes
+    /// the header and is not branch-filtered; `startedAt` comes from the
+    /// session header timestamp; the four token components and cost are
+    /// accumulated from the same five usage-bearing entry kinds as the
+    /// built-in footer. The raw provider `totalTokens` is never read.
+    fn session_stats(&self) -> Option<rpi_ext_host::types::SessionStatsSnapshot> {
+        let session = self.session()?;
+        let manager = session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let header = manager.get_header()?;
+        let entries = manager.get_entries();
+        let totals = usage_totals_from_entries(&entries);
+        Some(rpi_ext_host::types::SessionStatsSnapshot {
+            session_id: manager.get_session_id().to_owned(),
+            session_file: manager
+                .get_session_file()
+                .map(|path| path.to_string_lossy().into_owned()),
+            started_at: header.timestamp.clone(),
+            entry_count: entries.len() as u64,
+            tokens: rpi_ext_host::types::SessionTokenStats {
+                input: totals.input,
+                output: totals.output,
+                cache_read: totals.cache_read,
+                cache_write: totals.cache_write,
+            },
+            cost: totals.cost,
+        })
     }
 
     /// `compact` — fire-and-forget with the callback pair
@@ -518,5 +549,197 @@ impl CommandContextActions for RuntimeCommandActions {
         };
         let session = runtime.lock().await.session().clone();
         session.reload().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rpi_agent::messages::AgentMessage;
+    use rpi_ai::types::{
+        ApiKind, AssistantContent, AssistantMessage, AssistantRole, StopReason, TextContent,
+        ToolResultContent, ToolResultMessage, ToolResultRole, Usage, UsageCost,
+    };
+
+    use crate::core::agent_session::AgentSession;
+
+    fn usage(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost: f64,
+        raw_total: u64,
+    ) -> Usage {
+        Usage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cache_write1h: None,
+            reasoning: None,
+            // Deliberately inconsistent with the four components: the
+            // snapshot must never read the provider's raw total.
+            total_tokens: raw_total,
+            cost: UsageCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: cost,
+            },
+        }
+    }
+
+    fn assistant_message(usage: Usage) -> AgentMessage {
+        AgentMessage::Assistant(AssistantMessage {
+            role: AssistantRole::Assistant,
+            content: vec![AssistantContent::Text(TextContent {
+                text: "ok".to_owned(),
+                text_signature: None,
+            })],
+            api: ApiKind("openai-completions".into()),
+            provider: "custom".to_owned(),
+            model: "m1".to_owned(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: None,
+            thinking_level: None,
+            diagnostics: None,
+            usage,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 1_700_000_000_000,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
+            duration_ms: None,
+        })
+    }
+
+    fn tool_result_message(usage: Usage) -> AgentMessage {
+        AgentMessage::ToolResult(ToolResultMessage {
+            role: ToolResultRole::ToolResult,
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read".to_owned(),
+            content: vec![ToolResultContent::Text(TextContent {
+                text: "ok".to_owned(),
+                text_signature: None,
+            })],
+            details: None,
+            usage: Some(usage),
+            nested_calls: None,
+            is_error: false,
+            timestamp: 1_700_000_000_000,
+            duration_ms: None,
+        })
+    }
+
+    fn actions(session: &AgentSession) -> SessionContextActions {
+        SessionContextActions::new(session)
+    }
+
+    /// ADR-0040: the snapshot aggregates exactly the five usage-bearing
+    /// entry kinds, ignores the raw `totalTokens`, uses the header
+    /// timestamp and counts entries without branch filtering.
+    #[tokio::test]
+    async fn session_stats_snapshot_has_five_usage_kinds_and_ignores_raw_total() {
+        let fixture = crate::modes::interactive::test_support::build_test_session().await;
+        let (started_at, base_entries) = {
+            let manager = fixture.session.session_manager();
+            let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                manager
+                    .get_header()
+                    .expect("session header")
+                    .timestamp
+                    .clone(),
+                manager.get_entries().len(),
+            )
+        };
+        {
+            let manager = fixture.session.session_manager();
+            let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager
+                .append_message(assistant_message(usage(1, 2, 3, 4, 0.1, 999_999)))
+                .expect("assistant");
+            manager
+                .append_message(tool_result_message(usage(10, 20, 30, 40, 1.0, 0)))
+                .expect("tool result");
+            manager
+                .branch_with_summary(
+                    None,
+                    "branch",
+                    None,
+                    None,
+                    Some(usage(100, 200, 300, 400, 10.0, 7)),
+                )
+                .expect("branch summary");
+            manager
+                .append_compaction(
+                    "compact",
+                    None,
+                    0,
+                    None,
+                    None,
+                    Some(usage(1000, 2000, 3000, 4000, 100.0, 1)),
+                )
+                .expect("compaction");
+            manager
+                .append_usage(
+                    "test",
+                    "custom",
+                    "m1",
+                    usage(10_000, 20_000, 30_000, 40_000, 1000.0, 0),
+                    None,
+                )
+                .expect("usage entry");
+        }
+
+        let stats = actions(&fixture.session)
+            .session_stats()
+            .expect("bound snapshot");
+        assert_eq!(stats.session_id, fixture.session.session_id());
+        assert_eq!(stats.session_file, None, "in-memory sessions omit the file");
+        assert_eq!(stats.started_at, started_at);
+        assert_eq!(stats.entry_count, (base_entries + 5) as u64);
+        assert_eq!(stats.tokens.input, 11_111);
+        assert_eq!(stats.tokens.output, 22_222);
+        assert_eq!(stats.tokens.cache_read, 33_333);
+        assert_eq!(stats.tokens.cache_write, 44_444);
+        assert!((stats.cost - 1111.1).abs() < 1e-9, "cost: {}", stats.cost);
+
+        // Same aggregation as the built-in footer/session statistics: the
+        // snapshot and `AgentSession::get_session_stats` must agree on the
+        // four components and cost for the same entries.
+        let footer_stats = fixture.session.get_session_stats();
+        assert_eq!(stats.tokens.input, footer_stats.tokens.input);
+        assert_eq!(stats.tokens.output, footer_stats.tokens.output);
+        assert_eq!(stats.tokens.cache_read, footer_stats.tokens.cache_read);
+        assert_eq!(stats.tokens.cache_write, footer_stats.tokens.cache_write);
+        assert_eq!(stats.cost, footer_stats.cost);
+    }
+
+    /// A fresh session has zeroed components, `entryCount = 0` and the
+    /// header timestamp; an in-memory session omits `sessionFile`.
+    #[tokio::test]
+    async fn session_stats_snapshot_of_a_fresh_session() {
+        let fixture = crate::modes::interactive::test_support::build_test_session().await;
+        let base_entries = {
+            let manager = fixture.session.session_manager();
+            let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager.get_entries().len()
+        };
+        let stats = actions(&fixture.session)
+            .session_stats()
+            .expect("bound snapshot");
+        assert_eq!(stats.entry_count, base_entries as u64);
+        assert_eq!(stats.tokens.input, 0);
+        assert_eq!(stats.tokens.output, 0);
+        assert_eq!(stats.tokens.cache_read, 0);
+        assert_eq!(stats.tokens.cache_write, 0);
+        assert_eq!(stats.cost, 0.0);
+        assert!(stats.session_file.is_none());
+        assert!(!stats.started_at.is_empty());
     }
 }

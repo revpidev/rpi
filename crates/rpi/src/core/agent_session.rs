@@ -75,7 +75,7 @@ use crate::core::session_manager::{NewSessionOptions, SessionManager, StoredEntr
 use crate::core::settings_manager::{RetryConfig, SettingsManager};
 use crate::core::skills::strip_frontmatter;
 use crate::core::system_prompt::{BuildSystemPromptOptions, build_system_prompt};
-use crate::core::usage_totals::{UsageTotals, add_usage_to_totals, create_usage_totals};
+use crate::core::usage_totals::{UsageTotals, add_stored_entry_usage, create_usage_totals};
 use crate::error::RpiError;
 use crate::tools::bash::create_local_bash_operations;
 use crate::tools::bash_executor::{BashExecutorOptions, BashResult, execute_bash};
@@ -5922,48 +5922,24 @@ impl AgentSession {
         let mut totals: UsageTotals = create_usage_totals();
 
         for entry in lock(&self.inner.session_manager).get_entries() {
-            match entry.known() {
-                Some(SessionEntry::BranchSummary(branch_summary)) => {
-                    if let Some(usage) = &branch_summary.usage {
-                        add_usage_to_totals(&mut totals, usage);
+            add_stored_entry_usage(&mut totals, &entry);
+            if let Some(SessionEntry::Message(message_entry)) = entry.known() {
+                total_messages += 1;
+                match &message_entry.message {
+                    AgentMessage::User(_) => user_messages += 1,
+                    AgentMessage::ToolResult(_) => {
+                        tool_results += 1;
                     }
-                }
-                Some(SessionEntry::Compaction(compaction)) => {
-                    if let Some(usage) = &compaction.usage {
-                        add_usage_to_totals(&mut totals, usage);
+                    AgentMessage::Assistant(assistant) => {
+                        assistant_messages += 1;
+                        tool_calls += assistant
+                            .content
+                            .iter()
+                            .filter(|c| matches!(c, rpi_ai::types::AssistantContent::ToolCall(_)))
+                            .count() as u64;
                     }
+                    _ => {}
                 }
-                // `entry.type === "usage"` → session totals
-                // (agent-session.ts:3488-3493, #9668): counted exactly once,
-                // never adds messages.
-                Some(SessionEntry::Usage(usage_entry)) => {
-                    add_usage_to_totals(&mut totals, &usage_entry.usage);
-                }
-                Some(SessionEntry::Message(message_entry)) => {
-                    total_messages += 1;
-                    match &message_entry.message {
-                        AgentMessage::User(_) => user_messages += 1,
-                        AgentMessage::ToolResult(tool_result) => {
-                            tool_results += 1;
-                            if let Some(usage) = &tool_result.usage {
-                                add_usage_to_totals(&mut totals, usage);
-                            }
-                        }
-                        AgentMessage::Assistant(assistant) => {
-                            assistant_messages += 1;
-                            tool_calls += assistant
-                                .content
-                                .iter()
-                                .filter(|c| {
-                                    matches!(c, rpi_ai::types::AssistantContent::ToolCall(_))
-                                })
-                                .count() as u64;
-                            add_usage_to_totals(&mut totals, &assistant.usage);
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
             }
         }
 

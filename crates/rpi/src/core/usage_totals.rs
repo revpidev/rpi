@@ -7,6 +7,8 @@ use rpi_agent::messages::AgentMessage;
 use rpi_agent::session::SessionEntry;
 use rpi_ai::types::Usage;
 
+use crate::core::session_manager::StoredEntry;
+
 /// `UsageTotals` (usage-totals.ts:4-10).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UsageTotals {
@@ -29,6 +31,54 @@ pub fn add_usage_to_totals(totals: &mut UsageTotals, usage: &Usage) {
     totals.cache_read += usage.cache_read;
     totals.cache_write += usage.cache_write;
     totals.cost += usage.cost.total;
+}
+
+/// Add the usage carried by one stored entry, using the same five
+/// usage-bearing kinds as the built-in footer/session statistics
+/// (`assistant` message, `toolResult` message, `branch_summary`,
+/// `compaction`, `usage`). Unknown/raw entries and non-usage entries add
+/// nothing. Shared by [`crate::core::agent_session::AgentSession::get_session_stats`]
+/// and the `ctx.sessionStats` snapshot so the two cannot drift.
+pub fn add_stored_entry_usage(totals: &mut UsageTotals, entry: &StoredEntry) {
+    let Some(typed) = entry.known() else {
+        return;
+    };
+    match typed {
+        SessionEntry::BranchSummary(branch_summary) => {
+            if let Some(usage) = &branch_summary.usage {
+                add_usage_to_totals(totals, usage);
+            }
+        }
+        SessionEntry::Compaction(compaction) => {
+            if let Some(usage) = &compaction.usage {
+                add_usage_to_totals(totals, usage);
+            }
+        }
+        SessionEntry::Usage(usage_entry) => {
+            add_usage_to_totals(totals, &usage_entry.usage);
+        }
+        SessionEntry::Message(message_entry) => match &message_entry.message {
+            AgentMessage::ToolResult(tool_result) => {
+                if let Some(usage) = &tool_result.usage {
+                    add_usage_to_totals(totals, usage);
+                }
+            }
+            AgentMessage::Assistant(assistant) => {
+                add_usage_to_totals(totals, &assistant.usage);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Aggregate [`UsageTotals`] over an entry slice (header already excluded).
+pub fn usage_totals_from_entries(entries: &[StoredEntry]) -> UsageTotals {
+    let mut totals = create_usage_totals();
+    for entry in entries {
+        add_stored_entry_usage(&mut totals, entry);
+    }
+    totals
 }
 
 /// `UsageCostBreakdownEntry` (usage-totals.ts:30-34).

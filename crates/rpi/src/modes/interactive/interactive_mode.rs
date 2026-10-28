@@ -12540,6 +12540,23 @@ mod tests {
         bridge.set_status("ext", None);
         assert!(!ui.footer_data.get_extension_statuses().contains_key("ext"));
 
+        // ui.emitText → the info status row (ADR-0040 / V18-02);
+        // validateOnly only checks the channel.
+        let before_text = lock(&ui.chat_container).children.len();
+        bridge
+            .emit_text("EXT-TEXT", true)
+            .expect("validate channel");
+        assert_eq!(
+            lock(&ui.chat_container).children.len(),
+            before_text,
+            "validateOnly must not write"
+        );
+        bridge.emit_text("EXT-TEXT", false).expect("emit text");
+        assert!(
+            lock(&ui.chat_container).children.len() > before_text,
+            "emitText renders through notify"
+        );
+
         // editor text read/write + paste path.
         bridge.set_editor_text("hello");
         assert_eq!(bridge.get_editor_text(), "hello");

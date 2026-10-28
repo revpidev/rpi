@@ -113,6 +113,24 @@ Response:
 
 **Interactive Esc semantics**: a client implementing Esc should send `clear_queue` then `abort`, and restore the returned texts into its editor (the recommended combination per upstream docs/rpc.md:155-158). `clear_queue` only reads and drains the queues — it triggers no turn and is not coupled to abort; response ordering and queue-consumption semantics are the client's to compose.
 
+## Extension text output (`ui.emitText`, v0.1.8 / ADR-0040)
+
+`ui.emitText {text, validateOnly?}` is the command-text output channel for extensions (for example the statusline configuration/help text). It is **not** gated on `hasUI`:
+
+- **RPC mode** (`--mode rpc`) emits the same fire-and-forget frame shape as `ui.notify`:
+
+  ```json
+  {"type":"extension_ui_request","id":"<uuid>","method":"notify","message":"statusline: help","notifyType":"info"}
+  ```
+
+- **`--mode json`** (print) emits the same frame on the raw stdout stream, interleaved with the session event stream; it does not invent a new event type.
+- **`--mode text`** (print) writes the text plus one trailing newline to stdout.
+- `validateOnly:true` checks the channel and writes nothing; use it before fetching data, opening an editor, or writing files.
+- **TUI** routes the text to the notification area.
+- **NullUi / subagent hosts** answer a structured `call` error whose message is exactly `unsupported-output`; callers must fall back instead of assuming output happened.
+
+`hasUI` keeps its existing meaning: print/json bridges are output-capable but report `hasUI = false` (`is_noop`); only the interactive/RPC bridges report `hasUI = true`.
+
 ## Backpressure and write errors
 
 - Event writes in print/rpc mode go through a unified backpressure write path (`crates/rpi/src/core/output_guard.rs::RawStdout`): when the pipe peer consumes slowly, event sources are throttled naturally — events are never dropped, merged, or buffered unboundedly.
@@ -125,6 +143,7 @@ Response:
 | delta-only conversion + `usage`/`id`/`toolName` increments (key order pinned) | `json_event.rs` unit tests (7) |
 | quadratic-output regression (#7290) | `crates/rpi/tests/regression_7290_json_stream_linear.rs` |
 | backpressure against a slow consumer | `crates/rpi/tests/json_rpc_backpressure_test.rs` |
+| `ui.emitText` RPC/JSON frame + print newline + `validateOnly` + `unsupported-output` | `crates/rpi/src/modes/rpc/ui_bridge.rs` tests, `crates/rpi/src/modes/print_mode.rs` tests, `crates/rpi-ext-host/src/wasm/ui_dispatch.rs` tests |
 | 33-command contract | `crates/rpi` `rpc_mode_test.rs` (20 contract tests) |
 | `clear_queue` retrieve/drain + Esc combination (idle after clear_queue + abort; drained steering not consumed) | `rpc_mode_test.rs` `clear_queue_returns_and_purges_queues` |
 | `prompt` disposition (`handled`/`queued`/`started`) + `streamingBehavior`; `steer`/`follow_up` two-state disposition; this document's field names/shapes | `rpc_mode_test.rs` `prompt_lifecycle_messages_state_stats`, `steer_follow_up_abort_during_streaming`, `prompt_extension_command_reports_handled_without_agent_settled`, `json_rpc_doc_pins_prompt_dispositions` |

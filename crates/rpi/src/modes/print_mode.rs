@@ -73,6 +73,28 @@ fn session_header_json(session_manager: &SessionManager) -> Option<String> {
     serde_json::to_string(&rpi_agent::session::FileEntry::Session(header.clone())).ok()
 }
 
+/// Build the print/json output bridge for `ui.emitText` (ADR-0040 /
+/// 04 §7.4). Both flavors keep `hasUI = false` (`is_noop`) but expose the
+/// mode's controlled stdout sink: plain text gets one trailing newline,
+/// JSON emits the RPC-shaped notify frame.
+pub(crate) fn output_ui_bridge(
+    mode: PrintOutputMode,
+    out: RawStdout,
+    default_theme: serde_json::Value,
+) -> std::sync::Arc<dyn rpi_ext_host::api::UiBridge> {
+    let sink: rpi_ext_host::bridges::UiOutputSink =
+        std::sync::Arc::new(move |chunk: &str| out.write(chunk));
+    match mode {
+        PrintOutputMode::Json => std::sync::Arc::new(
+            rpi_ext_host::bridges::OutputUiBridge::json_notify(default_theme, sink),
+        ),
+        PrintOutputMode::Text => std::sync::Arc::new(rpi_ext_host::bridges::OutputUiBridge::text(
+            default_theme,
+            sink,
+        )),
+    }
+}
+
 /// `runPrintMode` (print-mode.ts:33-169). `out` is the shared raw-stdout
 /// writer (see below); `err` is the process stderr in production and a
 /// captured buffer in tests.
@@ -119,8 +141,10 @@ pub async fn run_print_mode(
             shutdown: None,
         })
         .await;
-    // `setUIContext(noOpUIContext)` equivalent (T15 W4): print/json modes
-    // bind the null bridge — `hasUI` stays false, `ctx.ui` never throws.
+    // `setUIContext` equivalent (T15 W4; ADR-0040 / V18-02): print and
+    // `--mode json` bind an output-capable bridge whose `hasUI` stays false.
+    // `ui.emitText` writes controlled RawStdout (plain text, or a notify
+    // frame in JSON mode) without pretending to be an interactive UI.
     if let Some(host) = session
         .extension_runner()
         .as_any()
@@ -129,10 +153,13 @@ pub async fn run_print_mode(
         })
         .map(|adapter| adapter.host().clone())
     {
+        let bridge = output_ui_bridge(
+            options.mode,
+            out.clone(),
+            crate::core::themes::default_theme_json(),
+        );
         host.set_ui(
-            Some(std::sync::Arc::new(
-                rpi_ext_host::bridges::NullUiBridge::new(crate::core::themes::default_theme_json()),
-            )),
+            Some(bridge),
             match print_mode {
                 ExtensionMode::Json => rpi_ext_host::types::ExtensionMode::Json,
                 _ => rpi_ext_host::types::ExtensionMode::Print,
@@ -249,5 +276,186 @@ fn stop_reason_str(reason: StopReason) -> &'static str {
         StopReason::Pending => "pending",
         // Placeholder variant (R2.1.1); mapped to its wire name explicitly.
         StopReason::Deferred => "deferred",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use rpi_ext_host::api::{NotifyType, UiBridge, UiDialogOptions, UiOutputError};
+    use serde_json::Value;
+
+    use super::{PrintOutputMode, output_ui_bridge};
+    use crate::core::output_guard::RawStdout;
+
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("utf8")
+        }
+    }
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn bridge(mode: PrintOutputMode, theme: Value) -> (Arc<dyn UiBridge>, SharedBuffer) {
+        let buffer = SharedBuffer::default();
+        let out = RawStdout::new(Box::new(buffer.clone()));
+        (output_ui_bridge(mode, out, theme), buffer)
+    }
+
+    #[test]
+    fn text_bridge_writes_one_trailing_newline_and_stays_non_interactive() {
+        let (bridge, buffer) = bridge(PrintOutputMode::Text, Value::Null);
+        assert!(bridge.is_noop(), "hasUI must stay false");
+        bridge
+            .emit_text("statusline: help", true)
+            .expect("validate");
+        assert_eq!(buffer.text(), "", "validateOnly writes nothing");
+        bridge.emit_text("statusline: help", false).expect("emit");
+        assert_eq!(buffer.text(), "statusline: help\n");
+        bridge.emit_text("two\nlines", false).expect("emit");
+        assert_eq!(buffer.text(), "statusline: help\ntwo\nlines\n");
+    }
+
+    #[test]
+    fn json_bridge_emits_the_rpc_notify_frame() {
+        let (bridge, buffer) = bridge(PrintOutputMode::Json, Value::Null);
+        assert!(bridge.is_noop(), "hasUI must stay false");
+        bridge
+            .emit_text("statusline: help", true)
+            .expect("validate");
+        assert_eq!(buffer.text(), "");
+        bridge.emit_text("statusline: help", false).expect("emit");
+        let frame: Value = serde_json::from_str(buffer.text().trim()).expect("frame json");
+        assert_eq!(frame["type"], "extension_ui_request");
+        assert_eq!(frame["method"], "notify");
+        assert_eq!(frame["message"], "statusline: help");
+        assert_eq!(frame["notifyType"], "info");
+        assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn dialogs_stay_noops_on_the_output_bridge() {
+        let (bridge, _buffer) = bridge(PrintOutputMode::Text, Value::Null);
+        assert!(bridge.select("t", &[], None).await.is_none());
+        assert!(!bridge.confirm("t", "m", None).await);
+        assert!(bridge.input("t", None, None).await.is_none());
+        assert!(bridge.editor("t", None).await.is_none());
+        assert!(
+            bridge
+                .custom(rpi_ext_host::types::ComponentTree::default(), None)
+                .await
+                .is_none()
+        );
+    }
+
+    /// Compile-time contract: the default trait surface is unsupported, so a
+    /// bridge that does not opt in fails closed instead of silently dropping
+    /// command output.
+    #[test]
+    fn null_default_is_unsupported_output() {
+        struct NoOutput;
+        #[async_trait::async_trait]
+        impl UiBridge for NoOutput {
+            async fn select(
+                &self,
+                _t: &str,
+                _o: &[String],
+                _opts: Option<UiDialogOptions>,
+            ) -> Option<String> {
+                None
+            }
+            async fn confirm(&self, _t: &str, _m: &str, _o: Option<UiDialogOptions>) -> bool {
+                false
+            }
+            async fn input(
+                &self,
+                _t: &str,
+                _p: Option<&str>,
+                _o: Option<UiDialogOptions>,
+            ) -> Option<String> {
+                None
+            }
+            fn notify(&self, _m: &str, _k: NotifyType) {}
+            fn on_terminal_input(
+                &self,
+                _h: rpi_ext_host::api::TerminalInputHandler,
+            ) -> rpi_ext_host::api::Unsubscribe {
+                Box::new(|| {})
+            }
+            fn set_status(&self, _k: &str, _t: Option<&str>) {}
+            fn set_working_message(&self, _m: Option<&str>) {}
+            fn set_working_visible(&self, _v: bool) {}
+            fn set_working_indicator(
+                &self,
+                _o: Option<rpi_ext_host::api::WorkingIndicatorOptions>,
+            ) {
+            }
+            fn set_hidden_thinking_label(&self, _l: Option<&str>) {}
+            fn set_widget(
+                &self,
+                _k: &str,
+                _c: Option<rpi_ext_host::api::WidgetContent>,
+                _o: Option<rpi_ext_host::api::ExtensionWidgetOptions>,
+            ) {
+            }
+            fn set_footer(&self, _c: Option<rpi_ext_host::types::ComponentTree>) {}
+            fn set_header(&self, _c: Option<rpi_ext_host::types::ComponentTree>) {}
+            fn set_title(&self, _t: &str) {}
+            async fn custom(
+                &self,
+                _c: rpi_ext_host::types::ComponentTree,
+                _o: Option<Value>,
+            ) -> Option<Value> {
+                None
+            }
+            fn paste_to_editor(&self, _t: &str) {}
+            fn set_editor_text(&self, _t: &str) {}
+            fn get_editor_text(&self) -> String {
+                String::new()
+            }
+            async fn editor(&self, _t: &str, _p: Option<&str>) -> Option<String> {
+                None
+            }
+            fn add_autocomplete_provider(&self, _p: Value) {}
+            fn set_editor_component(&self, _c: Option<rpi_ext_host::types::ComponentTree>) {}
+            fn get_editor_component(&self) -> Option<rpi_ext_host::types::ComponentTree> {
+                None
+            }
+            fn theme(&self) -> Value {
+                Value::Null
+            }
+            fn get_all_themes(&self) -> Vec<rpi_ext_host::api::ThemeInfo> {
+                Vec::new()
+            }
+            fn get_theme(&self, _n: &str) -> Option<Value> {
+                None
+            }
+            fn set_theme(&self, _t: Value) -> rpi_ext_host::api::SetThemeResult {
+                rpi_ext_host::api::SetThemeResult {
+                    success: false,
+                    error: None,
+                }
+            }
+            fn get_tools_expanded(&self) -> bool {
+                false
+            }
+            fn set_tools_expanded(&self, _e: bool) {}
+        }
+        let error: UiOutputError = NoOutput.emit_text("x", true).expect_err("default");
+        assert_eq!(error, UiOutputError::UnsupportedOutput);
+        assert_eq!(error.to_string(), "unsupported-output");
     }
 }
