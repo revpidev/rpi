@@ -6,7 +6,7 @@
 //! `declare const ns`. Descriptions become doc comments; schemas become
 //! types.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::identifier::to_codemode_identifier;
 use crate::types::CodemodeToolInfo;
@@ -17,86 +17,30 @@ const INDENT: &str = "  ";
 pub const DEFAULT_INPUT_SCHEMA_MAX_CHARS: usize = 16_000;
 /// Local `$ref` expansions per rendered schema (declarations.ts:12).
 const MAX_REF_EXPANSIONS: usize = 32;
-
-/// TypeScript types for MCP results, from the MCP `CallToolResult` schema,
-/// so `CallToolResult<T>` declarations can refer to them
-/// (declarations.ts:18-93 @ abe508e1b; removed in 4a080252f and assigned to V18-03).
-pub const MCP_TYPESCRIPT_PREAMBLE: &str = r#"type Role = "user" | "assistant";
-type MetaObject = Record<string, unknown>;
-type Annotations = {
-  audience?: Role[];
-  priority?: number;
-  lastModified?: string;
-};
-type Icon = {
-  src: string;
-  mimeType?: string;
-  sizes?: string[];
-  theme?: "light" | "dark";
-};
-type TextResourceContents = {
-  uri: string;
-  mimeType?: string;
-  _meta?: MetaObject;
-  text: string;
-};
-type BlobResourceContents = {
-  uri: string;
-  mimeType?: string;
-  _meta?: MetaObject;
-  blob: string;
-};
-type TextContent = {
-  type: "text";
-  text: string;
-  annotations?: Annotations;
-  _meta?: MetaObject;
-};
-type ImageContent = {
-  type: "image";
-  data: string;
-  mimeType: string;
-  annotations?: Annotations;
-  _meta?: MetaObject;
-};
-type AudioContent = {
-  type: "audio";
-  data: string;
-  mimeType: string;
-  annotations?: Annotations;
-  _meta?: MetaObject;
-};
-type ResourceLink = {
-  icons?: Icon[];
-  name: string;
-  title?: string;
-  uri: string;
-  description?: string;
-  mimeType?: string;
-  annotations?: Annotations;
-  size?: number;
-  _meta?: MetaObject;
-  type: "resource_link";
-};
-type EmbeddedResource = {
-  type: "resource";
-  resource: TextResourceContents | BlobResourceContents;
-  annotations?: Annotations;
-  _meta?: MetaObject;
-};
-type ContentBlock =
-  | TextContent
-  | ImageContent
-  | AudioContent
-  | ResourceLink
-  | EmbeddedResource;
-type CallToolResult<TStructured = { [key: string]: unknown }> = {
-  _meta?: MetaObject;
-  content: ContentBlock[];
-  isError?: boolean;
-  structuredContent?: TStructured;
-  [key: string]: unknown;
-};"#;
+/// JSON Schema keywords with a number or string value shown as
+/// `@keyword value` property tags (declarations.ts:14-34).
+const TAG_KEYWORDS: [&str; 11] = [
+    "minimum",
+    "exclusiveMinimum",
+    "maximum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "minItems",
+    "maxItems",
+];
+/// Tag keywords whose values all hold at once, so only the largest (lower) or
+/// smallest (upper) matters (declarations.ts:28-30).
+const LOWER_BOUNDS: [&str; 4] = ["minimum", "exclusiveMinimum", "minLength", "minItems"];
+const UPPER_BOUNDS: [&str; 4] = ["maximum", "exclusiveMaximum", "maxLength", "maxItems"];
+/// Longest property tag; longer ones (large defaults, long patterns) are left
+/// out (declarations.ts:31-32).
+const MAX_TAG_CHARS: usize = 80;
+/// Characters that end a `//` comment (declarations.ts:33-34).
+const LINE_TERMINATORS: [char; 4] = ['\r', '\n', '\u{2028}', '\u{2029}'];
 
 /// `RenderDeclarationsOptions` (declarations.ts:35-44) collapsed to the two
 /// slices.
@@ -192,66 +136,9 @@ pub fn render_tool_sample(tool: &CodemodeToolInfo) -> String {
     )
 }
 
-/// The `structuredContent` schema of an MCP `CallToolResult` output schema
-/// (detected by a `content` array of objects, boolean `isError`, and object
-/// `_meta`), `Some(true)` when it declares none, or `None` when the schema
-/// is not a `CallToolResult` (declarations.ts:161-175 @ abe508e1b; removed in
-/// 4a080252f and assigned to V18-03).
-pub fn mcp_structured_content_schema(schema: Option<&Value>) -> Option<Value> {
-    let schema = schema?;
-    let schema = schema.as_object()?;
-    let properties = schema.get("properties").and_then(Value::as_object)?;
-    let content = properties.get("content").and_then(Value::as_object)?;
-    if content.get("type").and_then(Value::as_str) != Some("array") {
-        return None;
-    }
-    if content
-        .get("items")
-        .and_then(Value::as_object)
-        .and_then(|items| items.get("type"))
-        .and_then(Value::as_str)
-        != Some("object")
-    {
-        return None;
-    }
-    if properties
-        .get("isError")
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("type"))
-        .and_then(Value::as_str)
-        != Some("boolean")
-    {
-        return None;
-    }
-    if properties
-        .get("_meta")
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("type"))
-        .and_then(Value::as_str)
-        != Some("object")
-    {
-        return None;
-    }
-    // Upstream: `isObject(structuredContent) || typeof structuredContent
-    // === "boolean" ? structuredContent : true` — anything else falls back
-    // to the `true` (no declared shape) sentinel.
-    match properties.get("structuredContent") {
-        Some(value) if value.is_object() || value.is_boolean() => Some(value.clone()),
-        _ => Some(Value::Bool(true)),
-    }
-}
-
-/// The type a tool call resolves to: `CallToolResult<T>` for MCP output
-/// schemas, the schema's type otherwise, and `unknown` without a schema.
+/// The type a tool call resolves to: the output schema's type, and `unknown`
+/// without a schema (declarations.ts:99-102).
 pub fn render_tool_output_type(schema: Option<&Value>) -> String {
-    if let Some(structured) = mcp_structured_content_schema(schema) {
-        let rendered = schema_to_type(&structured, None);
-        return if rendered == "unknown" {
-            "CallToolResult".to_owned()
-        } else {
-            format!("CallToolResult<{rendered}>")
-        };
-    }
     match schema {
         None => "unknown".to_owned(),
         Some(schema) => schema_to_type(schema, None),
@@ -337,17 +224,32 @@ fn union(types: Vec<String>) -> String {
 }
 
 /// Convert a JSON Schema to a TypeScript type expression
-/// (declarations.ts:139-146).
+/// (declarations.ts:133-153): a result longer than `max_chars` is rendered
+/// again without constraint tags, and renders as `unknown` if it is still too
+/// long.
 pub fn schema_to_type(schema: &Value, max_chars: Option<usize>) -> String {
-    let mut context = SchemaContext {
-        root: schema,
-        resolving: Vec::new(),
-        expansions: 0,
+    let render = |tags: bool| {
+        let mut context = SchemaContext {
+            root: schema,
+            resolving: Vec::new(),
+            expansions: 0,
+            tags,
+        };
+        to_type(schema, &mut context)
     };
-    let rendered = to_type(schema, &mut context);
-    match max_chars {
-        Some(max) if rendered.chars().count() > max => "unknown".to_owned(),
-        _ => rendered,
+    let rendered = render(true);
+    let Some(max) = max_chars else {
+        return rendered;
+    };
+    // JS `String.length` counts UTF-16 code units, not Unicode scalars.
+    if rendered.encode_utf16().count() <= max {
+        return rendered;
+    }
+    let untagged = render(false);
+    if untagged.encode_utf16().count() <= max {
+        untagged
+    } else {
+        "unknown".to_owned()
     }
 }
 
@@ -355,6 +257,8 @@ struct SchemaContext<'a> {
     root: &'a Value,
     resolving: Vec<String>,
     expansions: usize,
+    /// Whether property comments include constraint tags.
+    tags: bool,
 }
 
 fn is_object(value: &Value) -> bool {
@@ -521,6 +425,156 @@ fn description_of(property: &Value) -> String {
         .to_owned()
 }
 
+/// JS `String(number)`: integral floats render without a trailing `.0`.
+fn js_number_text(number: f64) -> String {
+    if number.fract() == 0.0 && number.is_finite() && number.abs() < 1e15 {
+        return format!("{number:.0}");
+    }
+    serde_json::Number::from_f64(number)
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| number.to_string())
+}
+
+/// JS `String(value)` for the number and string values a tag can carry.
+fn tag_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(js_number_text(number.as_f64()?)),
+        _ => None,
+    }
+}
+
+/// Identity of a tag value for `Set` semantics (`new Set(values)`).
+fn tag_value_key(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(format!("s:{text}")),
+        Value::Number(number) => Some(format!("n:{}", number)),
+        _ => None,
+    }
+}
+
+/// Replace the characters that would end a `//` comment with `\uXXXX`
+/// escapes (declarations.ts:402-404).
+fn escape_line_terminators(tag: &str) -> String {
+    let mut out = String::with_capacity(tag.len());
+    for ch in tag.chars() {
+        if LINE_TERMINATORS.contains(&ch) {
+            out.push_str(&format!("\\u{:04x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Constraints of a property that its TypeScript type cannot express, as
+/// JSDoc-style tags: `@integer @minimum 1 @maximum 100 @default 20`
+/// (declarations.ts:253-301).
+fn constraint_tags(property: &Value) -> String {
+    let Some(property) = property.as_object() else {
+        return String::new();
+    };
+    // Optional fields such as Pydantic's `int | None` keep their constraints
+    // in the non-null branch. The branch's constraints apply together with
+    // the property's, so both are read.
+    let variants = property
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .or_else(|| property.get("oneOf").and_then(Value::as_array));
+    let non_null: Vec<&Value> = variants
+        .map(|variants| {
+            variants
+                .iter()
+                .filter(|variant| {
+                    !variant.is_object()
+                        || variant.get("type").and_then(Value::as_str) != Some("null")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let branch = non_null.first().copied().filter(|_| non_null.len() == 1);
+    let mut schemas: Vec<Map<String, Value>> = vec![property.clone()];
+    if let Some(branch) = branch.and_then(Value::as_object) {
+        schemas.push(branch.clone());
+    }
+    // Draft-04 and OpenAPI 3.0 make `minimum`/`maximum` exclusive with a
+    // boolean `exclusiveMinimum`/`exclusiveMaximum`.
+    for schema in &mut schemas {
+        if schema.get("exclusiveMinimum") == Some(&Value::Bool(true))
+            && let Some(minimum) = schema.remove("minimum")
+        {
+            schema.insert("exclusiveMinimum".to_owned(), minimum);
+        }
+        if schema.get("exclusiveMaximum") == Some(&Value::Bool(true))
+            && let Some(maximum) = schema.remove("maximum")
+        {
+            schema.insert("exclusiveMaximum".to_owned(), maximum);
+        }
+    }
+
+    let mut tags: Vec<String> = Vec::new();
+    let is_integer = |schema: &Map<String, Value>| match schema.get("type") {
+        Some(Value::String(kind)) => kind == "integer",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("integer")),
+        _ => false,
+    };
+    if schemas.iter().any(is_integer) {
+        tags.push("@integer".to_owned());
+    }
+    for keyword in TAG_KEYWORDS {
+        let values: Vec<&Value> = schemas
+            .iter()
+            .map(|schema| schema.get(keyword).unwrap_or(&Value::Null))
+            .collect();
+        if LOWER_BOUNDS.contains(&keyword) || UPPER_BOUNDS.contains(&keyword) {
+            let numbers: Vec<f64> = values.iter().filter_map(|value| value.as_f64()).collect();
+            let Some(number) = (if LOWER_BOUNDS.contains(&keyword) {
+                numbers.iter().copied().reduce(f64::max)
+            } else {
+                numbers.iter().copied().reduce(f64::min)
+            }) else {
+                continue;
+            };
+            tags.push(format!("@{keyword} {}", js_number_text(number)));
+            continue;
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for value in values {
+            let Some(key) = tag_value_key(value) else {
+                continue;
+            };
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            if let Some(text) = tag_value_text(value) {
+                tags.push(format!("@{keyword} {text}"));
+            }
+        }
+    }
+    if schemas
+        .iter()
+        .any(|schema| schema.get("uniqueItems") == Some(&Value::Bool(true)))
+    {
+        tags.push("@uniqueItems".to_owned());
+    }
+    // Annotations, unlike constraints, come from the property itself.
+    if let Some(default) = property.get("default")
+        && !default.is_null()
+        && let Ok(serialized) = serde_json::to_string(default)
+    {
+        tags.push(format!("@default {serialized}"));
+    }
+    if property.get("deprecated") == Some(&Value::Bool(true)) {
+        tags.push("@deprecated".to_owned());
+    }
+    tags.into_iter()
+        .filter(|tag| tag.encode_utf16().count() <= MAX_TAG_CHARS)
+        .map(|tag| escape_line_terminators(&tag))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn object_type(object: &serde_json::Map<String, Value>, context: &mut SchemaContext<'_>) -> String {
     let properties = object
         .get("properties")
@@ -569,21 +623,34 @@ fn object_type(object: &serde_json::Map<String, Value>, context: &mut SchemaCont
     if members.is_empty() {
         return "{}".to_owned();
     }
-    if !names
+    let comments: Vec<Vec<String>> = names
         .iter()
-        .any(|name| !description_of(&properties[name]).is_empty())
-    {
+        .map(|name| {
+            let mut lines: Vec<String> = description_of(&properties[name])
+                .split(LINE_TERMINATORS.as_slice())
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
+            let tags = if context.tags {
+                constraint_tags(&properties[name])
+            } else {
+                String::new()
+            };
+            if !tags.is_empty() {
+                lines.push(tags);
+            }
+            lines
+        })
+        .collect();
+    if !comments.iter().any(|comment| !comment.is_empty()) {
         return format!("{{ {} }}", members.join(" "));
     }
 
     let mut lines: Vec<String> = vec!["{".to_owned()];
-    for (index, name) in names.iter().enumerate() {
-        let description = description_of(&properties[name]);
-        for line in description.split('\n') {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            if !line.trim().is_empty() {
-                lines.push(format!("{INDENT}// {}", line.trim()));
-            }
+    for (index, comment) in comments.iter().enumerate() {
+        for line in comment {
+            lines.push(format!("{INDENT}// {line}"));
         }
         lines.push(format!(
             "{INDENT}{}",
@@ -608,24 +675,6 @@ mod tests {
 
     use super::*;
     use serde_json::json;
-
-    fn mcp_result_schema(structured_content: Option<Value>) -> Value {
-        let mut properties = serde_json::Map::new();
-        properties.insert(
-            "content".to_owned(),
-            json!({ "type": "array", "items": { "type": "object" } }),
-        );
-        if let Some(structured) = structured_content {
-            properties.insert("structuredContent".to_owned(), structured);
-        }
-        properties.insert("isError".to_owned(), json!({ "type": "boolean" }));
-        properties.insert("_meta".to_owned(), json!({ "type": "object" }));
-        json!({
-            "type": "object",
-            "properties": properties,
-            "required": ["content"],
-        })
-    }
 
     #[test]
     fn renders_primitives_literals_and_unions() {
@@ -740,6 +789,155 @@ mod tests {
         );
     }
 
+    // https://github.com/earendil-works/pi/issues/10707
+    #[test]
+    fn puts_constraints_on_property_comment_lines() {
+        assert_eq!(
+            schema_to_type(
+                &json!({
+                    "type": "object",
+                    "properties": {
+                        "timeoutMs": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 30000,
+                            "default": 0,
+                            "description": "Wait in milliseconds."
+                        },
+                        "id": { "type": "string", "pattern": "^[a-z]+$", "maxLength": 8 },
+                        "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 5, "uniqueItems": true, "deprecated": true },
+                        "name": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }),
+                None
+            ),
+            [
+                "{",
+                "  // @maxLength 8 @pattern ^[a-z]+$",
+                "  id: string;",
+                "  name?: string;",
+                "  // @maxItems 5 @uniqueItems @deprecated",
+                "  tags?: Array<string>;",
+                "  // Wait in milliseconds.",
+                "  // @integer @minimum 0 @maximum 30000 @default 0",
+                "  timeoutMs?: number;",
+                "}",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn reads_constraints_of_optional_fields_from_the_non_null_branch() {
+        // Pydantic's `limit: int | None = Field(None, ge=1, le=100)`.
+        assert_eq!(
+            schema_to_type(
+                &json!({
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 100 }, { "type": "null" }],
+                            "default": null,
+                            "title": "Limit"
+                        }
+                    }
+                }),
+                None
+            ),
+            "{\n  // @integer @minimum 1 @maximum 100\n  limit?: number | null;\n}"
+        );
+        // Constraints of the property and the branch both apply.
+        assert_eq!(
+            schema_to_type(
+                &json!({
+                    "type": "object",
+                    "properties": {
+                        "n": {
+                            "anyOf": [{ "type": "integer", "minimum": 10, "maximum": 50, "format": "int32" }, { "type": "null" }],
+                            "minimum": 0,
+                            "maximum": 20,
+                            "format": "port"
+                        }
+                    }
+                }),
+                None
+            ),
+            "{\n  // @integer @minimum 10 @maximum 20 @format port @format int32\n  n?: number | null;\n}"
+        );
+    }
+
+    #[test]
+    fn reads_draft_04_boolean_exclusive_bounds() {
+        assert_eq!(
+            schema_to_type(
+                &json!({
+                    "type": "object",
+                    "properties": {
+                        "n": { "type": "integer", "minimum": 0, "exclusiveMinimum": true, "maximum": 10, "exclusiveMaximum": false },
+                        "m": { "anyOf": [{ "type": "number", "maximum": 5, "exclusiveMaximum": true }, { "type": "null" }], "maximum": 8 }
+                    }
+                }),
+                None
+            ),
+            [
+                "{",
+                "  // @maximum 8 @exclusiveMaximum 5",
+                "  m?: number | null;",
+                "  // @integer @exclusiveMinimum 0 @maximum 10",
+                "  n?: number;",
+                "}",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn leaves_out_long_tags_and_escapes_line_terminators() {
+        assert_eq!(
+            schema_to_type(
+                &json!({
+                    "type": "object",
+                    "properties": { "config": { "type": "object", "default": { "text": "x".repeat(100) } } }
+                }),
+                None
+            ),
+            "{ config?: { [key: string]: unknown; }; }"
+        );
+        assert_eq!(
+            schema_to_type(
+                &json!({
+                    "type": "object",
+                    "properties": {
+                        "sep": { "type": "string", "pattern": "^[\r\n\u{2028}\u{2029}]$", "default": "\u{2028}", "description": "a\u{2028}b" }
+                    }
+                }),
+                None
+            ),
+            [
+                "{",
+                "  // a",
+                "  // b",
+                "  // @pattern ^[\\u000d\\u000a\\u2028\\u2029]$ @default \"\\u2028\"",
+                "  sep?: string;",
+                "}",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn drops_constraint_tags_before_rendering_a_type_over_the_budget_as_unknown() {
+        let schema =
+            json!({ "type": "object", "properties": { "n": { "type": "integer", "minimum": 1 } } });
+        assert_eq!(
+            schema_to_type(&schema, None),
+            "{\n  // @integer @minimum 1\n  n?: number;\n}"
+        );
+        assert_eq!(schema_to_type(&schema, Some(20)), "{ n?: number; }");
+        assert_eq!(schema_to_type(&schema, Some(10)), "unknown");
+    }
+
     #[test]
     fn resolves_local_references_and_stops_at_recursive_ones() {
         let schema = json!({
@@ -831,51 +1029,27 @@ mod tests {
     }
 
     #[test]
-    fn renders_mcp_call_tool_result_output_schemas() {
-        let input_schema =
-            json!({ "type": "object", "properties": {}, "additionalProperties": false });
-        assert_eq!(
-            render_tool_signature(
-                &CodemodeToolInfo {
-                    name: "mcp__sample__search".to_owned(),
-                    input_schema: Some(input_schema.clone()),
-                    output_schema: Some(mcp_result_schema(Some(json!({
-                        "type": "object",
-                        "properties": { "results": { "type": "array", "items": { "$ref": "#/definitions/Result~1item~0v1" } } },
-                        "required": ["results"],
-                        "additionalProperties": false,
-                        "definitions": {
-                            "Result/item~v1": {
-                                "type": "object",
-                                "properties": { "id": { "type": "string" }, "score": { "type": "number" } },
-                                "required": ["id", "score"],
-                                "additionalProperties": false
-                            }
-                        }
-                    })))),
-                    ..Default::default()
-                },
-                None
-            ),
-            "mcp__sample__search(args: {}): Promise<CallToolResult<{ results: Array<{ id: string; score: number; }>; }>>;"
-        );
+    fn renders_output_schemas_shaped_like_an_mcp_call_tool_result_as_plain_types() {
+        let output_schema = json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "array", "items": { "type": "object" } },
+                "isError": { "type": "boolean" },
+                "_meta": { "type": "object" }
+            },
+            "required": ["content"]
+        });
         assert_eq!(
             render_tool_signature(
                 &CodemodeToolInfo {
                     name: "plain".to_owned(),
-                    input_schema: Some(input_schema),
-                    output_schema: Some(mcp_result_schema(None)),
+                    input_schema: Some(json!({ "type": "object", "properties": {} })),
+                    output_schema: Some(output_schema),
                     ..Default::default()
                 },
                 None
             ),
-            "plain(args: {}): Promise<CallToolResult>;"
-        );
-        assert_eq!(
-            mcp_structured_content_schema(Some(
-                &json!({ "type": "object", "properties": { "content": { "type": "array" } } })
-            )),
-            None
+            "plain(args: { [key: string]: unknown; }): Promise<{ _meta?: { [key: string]: unknown; }; content: Array<{ [key: string]: unknown; }>; isError?: boolean; }>;"
         );
     }
 

@@ -200,6 +200,16 @@ impl CodemodeTimeout {
     }
 }
 
+/// Releases one reserved worker slot. Called exactly once: when the worker
+/// thread actually exits, or when the worker could not be started
+/// (types.ts:149-155 `acquireWorker`).
+pub type WorkerRelease = Box<dyn FnOnce() + Send>;
+
+/// Reserves one worker slot synchronously immediately before a worker thread
+/// starts (types.ts:146-153 `acquireWorker`). `Err` denies admission without
+/// starting a worker. The release callback must not panic.
+pub type AcquireWorker = Arc<dyn Fn() -> Result<WorkerRelease, String> + Send + Sync>;
+
 /// `CodemodeSandboxOptions` (types.ts:135-163).
 #[derive(Default)]
 pub struct CodemodeSandboxOptions {
@@ -215,6 +225,14 @@ pub struct CodemodeSandboxOptions {
     /// inside the script as `InternalError: out of memory`. Default: none
     /// beyond wasm32's address space.
     pub memory_limit_bytes: Option<u64>,
+    /// Shared worker capacity: called immediately before each worker starts.
+    /// Hosts count a worker against their limit until the release callback
+    /// runs, which is at actual worker exit, not when the result settles.
+    pub acquire_worker: Option<AcquireWorker>,
+    /// Test-only seam: runs on the worker thread just before its exit, so a
+    /// test can hold the thread (and its slot) after the result settled.
+    #[doc(hidden)]
+    pub worker_exit_gate: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// `CodemodeExecuteOptions` (types.ts:245-254).

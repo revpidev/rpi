@@ -5,8 +5,8 @@
 use std::collections::{HashMap, HashSet};
 
 use rpi_codemode::{
-    DEFAULT_INPUT_SCHEMA_MAX_CHARS, mcp_structured_content_schema, render_tool_output_type,
-    render_tool_sample, to_codemode_identifier,
+    DEFAULT_INPUT_SCHEMA_MAX_CHARS, render_tool_output_type, render_tool_sample,
+    to_codemode_identifier,
 };
 use rpi_ext_host::types::ToolNamespace;
 
@@ -17,7 +17,7 @@ use crate::extensions::codemode::tool::{ToolInfo, to_codemode_declaration};
 /// (tool.ts:139).
 const CHARS_PER_TOKEN: usize = 4;
 
-const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. Calls still running when the script ends are cancelled.\n- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`";
+const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. A tool whose declaration returns an object resolves on failure too when it returned that object; check its fields. Calls still running when the script ends are cancelled.\n- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`";
 
 /// `CODEMODE_DOCS_PATH` (tool.ts:116): the reference model-facing doc.
 pub fn codemode_docs_path() -> String {
@@ -197,15 +197,6 @@ pub fn create_codemode_description(
         DESCRIPTION_INTRO.to_owned(),
         describe_globals(options.models),
     ];
-    if declarations.iter().any(|declaration| {
-        shown.contains(&declaration.name)
-            && mcp_structured_content_schema(declaration.output_schema.as_ref()).is_some()
-    }) {
-        sections.push(format!(
-            "Shared MCP Types:\n```ts\n{}\n```",
-            rpi_codemode::MCP_TYPESCRIPT_PREAMBLE
-        ));
-    }
     if declarations.is_empty() {
         return sections.join("\n\n");
     }
@@ -243,44 +234,65 @@ pub fn create_codemode_description(
     sections.join("\n\n")
 }
 
-/// What a script call resolves to, in one line (tool.ts:304-319).
+/// The field names of an object schema, `{ output, exit_code, full_output_path? }`,
+/// with the fields of object-typed fields `depth` levels deep:
+/// `{ content, structuredContent?: { results } }` (tool.ts:274-289). `None`
+/// for other schemas.
+fn describe_fields(schema: Option<&serde_json::Value>, depth: usize) -> Option<String> {
+    let object = schema?.as_object()?;
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return None;
+    }
+    let properties = object
+        .get("properties")
+        .and_then(serde_json::Value::as_object)?;
+    let required: HashSet<&str> = object
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
+    let fields: Vec<String> = properties
+        .iter()
+        .map(|(name, field)| {
+            let nested = if depth > 0 {
+                describe_fields(Some(field), depth - 1)
+            } else {
+                None
+            };
+            let optional = if required.contains(name.as_str()) {
+                ""
+            } else {
+                "?"
+            };
+            match nested {
+                Some(nested) => format!("{name}{optional}: {nested}"),
+                None => format!("{name}{optional}"),
+            }
+        })
+        .collect();
+    Some(format!("{{ {} }}", fields.join(", ")))
+}
+
+/// What a script call resolves to, in one line: `a string`, the field names
+/// of an object (see [`describe_fields`]), or the rendered type for anything
+/// else (tool.ts:293-299).
 pub fn describe_output(schema: Option<&serde_json::Value>) -> String {
     let rendered = render_tool_output_type(schema);
     if rendered == "string" {
         return "a string".to_owned();
     }
-    let object = schema.and_then(serde_json::Value::as_object);
-    if let Some(object) = object
-        && object.get("type").and_then(serde_json::Value::as_str) == Some("object")
-        && mcp_structured_content_schema(schema).is_none()
-        && let Some(properties) = object
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-    {
-        let required: HashSet<&str> = object
-            .get("required")
-            .and_then(serde_json::Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let fields: Vec<String> = properties
-            .keys()
-            .map(|name| {
-                if required.contains(name.as_str()) {
-                    name.clone()
-                } else {
-                    format!("{name}?")
-                }
-            })
-            .collect();
-        return format!("`{{ {} }}`", fields.join(", "));
+    match describe_fields(schema, 1) {
+        Some(fields) => format!("`{fields}`"),
+        None => {
+            let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("`{normalized}`")
+        }
     }
-    let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("`{normalized}`")
 }
 
 /// A declared tool's description followed by how scripts call it and what

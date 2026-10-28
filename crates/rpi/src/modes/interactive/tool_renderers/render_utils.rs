@@ -7,11 +7,160 @@
 //! the built-in renderers need.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use rpi_tui::terminal_image::{get_capabilities, hyperlink};
+use rpi_tui::tui::RenderHandle;
 use serde_json::Value;
 
 use crate::core::themes::Theme;
+use crate::modes::interactive::components::tool_execution::lock_recover;
+
+/// `formatToolDuration` (render-utils.ts:117-128 @ 4a080252f): `4.2s` below a
+/// minute, then `1m 30s` and `2h 3m 4s`. Under a minute keeps one decimal and
+/// rounds half away from zero like JS `toFixed(1)` (1250ms → `1.3s`); the
+/// duration is truncated to whole milliseconds first like `Date.now()`
+/// deltas.
+pub fn format_tool_duration(duration: Duration) -> String {
+    let ms = duration.as_millis() as f64;
+    let seconds = ms / 1000.0;
+    if seconds < 60.0 {
+        let tenths = (ms / 100.0).round();
+        return format!("{:.1}s", tenths / 10.0);
+    }
+
+    let total_seconds = seconds.floor() as u64;
+    let minutes = total_seconds / 60;
+    let remainder = total_seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {remainder}s");
+    }
+
+    format!("{}h {}m {remainder}s", minutes / 60, minutes % 60)
+}
+
+#[derive(Default)]
+struct ToolTiming {
+    started_at: Option<Instant>,
+    ended_at: Option<Instant>,
+}
+
+/// The 1s Elapsed ticker (`setInterval`, render-utils.ts:153-155): ticks
+/// `request_render` until stopped; `dispose`/`Drop` joins the thread so no
+/// background task leaks (coding-standards §6.4).
+struct TickerGuard {
+    stop_tx: Option<mpsc::Sender<()>>,
+    thread_handle: Option<JoinHandle<()>>,
+}
+
+impl TickerGuard {
+    fn start(render_handle: RenderHandle) -> Self {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let thread_handle = thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => render_handle.request_render(),
+                }
+            }
+        });
+        Self {
+            stop_tx: Some(stop_tx),
+            thread_handle: Some(thread_handle),
+        }
+    }
+
+    fn dispose(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(thread_handle) = self.thread_handle.take() {
+            let _ = thread_handle.join();
+        }
+    }
+}
+
+impl Drop for TickerGuard {
+    fn drop(&mut self) {
+        self.dispose();
+    }
+}
+
+/// `ToolTimerState` (render-utils.ts:130-135): per-call wall-clock state,
+/// carried by a renderer's [`crate::modes::interactive::components::tool_execution::RendererStateSlot`].
+#[derive(Default)]
+pub struct ToolTimerState {
+    timing: Mutex<ToolTiming>,
+    ticker: Mutex<Option<TickerGuard>>,
+}
+
+impl ToolTimerState {
+    /// `startToolTimer` (render-utils.ts:137-144): start the row's clock once
+    /// execution starts. Call from `renderCall`.
+    pub fn start(&self, execution_started: bool) {
+        if !execution_started {
+            return;
+        }
+        let mut timing = lock_recover(&self.timing);
+        if timing.started_at.is_none() {
+            timing.started_at = Some(Instant::now());
+            timing.ended_at = None;
+        }
+    }
+
+    /// Start or stop the 1s ticker and settle the end time
+    /// (render-utils.ts:156-162). Call from `renderResult`.
+    pub fn tick(&self, render_handle: &RenderHandle, is_partial: bool, is_error: bool) {
+        {
+            let timing = lock_recover(&self.timing);
+            let mut ticker = lock_recover(&self.ticker);
+            if timing.started_at.is_some() && is_partial && ticker.is_none() {
+                *ticker = Some(TickerGuard::start(render_handle.clone()));
+            }
+        }
+        if !is_partial || is_error {
+            {
+                let mut timing = lock_recover(&self.timing);
+                if timing.ended_at.is_none() {
+                    timing.ended_at = Some(Instant::now());
+                }
+            }
+            if let Some(mut guard) = lock_recover(&self.ticker).take() {
+                guard.dispose();
+            }
+        }
+    }
+
+    /// Whether the 1s ticker thread is running (renderer tests).
+    #[cfg(test)]
+    pub fn ticker_running(&self) -> bool {
+        lock_recover(&self.ticker).is_some()
+    }
+
+    /// `toolTimerText` (render-utils.ts:146-170): `Elapsed 4.2s` while the
+    /// result is partial and `Took 4.2s` once it is final. A final result's
+    /// recorded duration wins; the renderer's own clock is the fallback for
+    /// live progress and for results stored without one.
+    pub fn text(&self, is_partial: bool, duration_ms: Option<u64>) -> Option<String> {
+        if !is_partial && let Some(duration_ms) = duration_ms {
+            return Some(format!(
+                "Took {}",
+                format_tool_duration(Duration::from_millis(duration_ms))
+            ));
+        }
+        let timing = lock_recover(&self.timing);
+        let started_at = timing.started_at?;
+        let end = timing.ended_at.unwrap_or_else(Instant::now);
+        let label = if is_partial { "Elapsed" } else { "Took" };
+        Some(format!(
+            "{label} {}",
+            format_tool_duration(end.saturating_duration_since(started_at))
+        ))
+    }
+}
 
 /// `str` (render-utils.ts:25-29): a string arg → itself; `undefined`/`null`
 /// (missing key / `Value::Null`) → `""`; anything else → `None` (invalid

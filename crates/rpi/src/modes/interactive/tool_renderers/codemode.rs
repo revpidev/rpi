@@ -6,7 +6,8 @@
 //! visual lines; the result lists the nested tool calls (the last
 //! [`CALL_PREVIEW_COUNT`] when collapsed, with the `models.*` cost total)
 //! and the script output with the "Script completed/failed" header dropped,
-//! folded to [`OUTPUT_PREVIEW_LINES`] visual lines.
+//! folded to [`OUTPUT_PREVIEW_LINES`] visual lines, followed by the time the
+//! script has been running (`Elapsed`) or took (`Took`), like bash rows.
 //!
 //! The extension registers no render hooks (`crates/rpi/src/extensions/
 //! codemode/tool.rs`), so this built-in definition is what the tool
@@ -21,7 +22,9 @@ use rpi_tui::components::text::Text;
 use rpi_tui::tui::{Component, Container};
 use serde_json::Value;
 
-use super::render_utils::{invalid_arg_text, normalize_display_text, replace_tabs, str_value};
+use super::render_utils::{
+    ToolTimerState, invalid_arg_text, normalize_display_text, replace_tabs, str_value,
+};
 use crate::core::highlight::highlight_code;
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
@@ -278,6 +281,13 @@ fn is_script_header(text: &str) -> bool {
         && output.is_empty()
 }
 
+/// Per-call renderer state (renderer.ts:67 `renderCall` / `:94` `renderResult`):
+/// the row's wall clock.
+#[derive(Default)]
+struct CodemodeRenderState {
+    timer: ToolTimerState,
+}
+
 /// The codemode tool's render definition (renderer.ts:54-140).
 pub struct CodemodeToolRenderer;
 
@@ -288,6 +298,11 @@ impl ToolDefinition for CodemodeToolRenderer {
         theme: &Theme,
         context: &ToolRenderContext,
     ) -> Option<Box<dyn Component>> {
+        context
+            .state
+            .get_or_init::<CodemodeRenderState>()
+            .timer
+            .start(context.execution_started);
         // The code includes the `// @options:` line, so options show as
         // part of the script.
         let code = str_value(args.get("code"));
@@ -328,6 +343,11 @@ impl ToolDefinition for CodemodeToolRenderer {
         theme: &Theme,
         context: &ToolRenderContext,
     ) -> Option<Box<dyn Component>> {
+        let state = context.state.get_or_init::<CodemodeRenderState>();
+        state
+            .timer
+            .tick(&context.render_handle, options.is_partial, context.is_error);
+        let timer_text = state.timer.text(options.is_partial, context.duration_ms);
         let mut component = Container::new();
 
         let calls: Vec<CallView> = result
@@ -436,6 +456,15 @@ impl ToolDefinition for CodemodeToolRenderer {
                 }
             }
         }
+        if let Some(timer_text) = timer_text {
+            component.add_child(Box::new(Spacer::new(1)));
+            component.add_child(Box::new(Text::new(
+                theme.fg("muted", &timer_text),
+                0,
+                0,
+                None,
+            )));
+        }
         Some(Box::new(component))
     }
 
@@ -527,6 +556,43 @@ mod tests {
             .join("\n")
             .trim()
             .to_owned()
+    }
+
+    // #10708
+    #[test]
+    fn shows_the_elapsed_time_while_the_script_runs_and_the_total_once_finished() {
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let mut context = context(&state);
+        CodemodeToolRenderer.render_call(&json!({"code": ""}), &theme, &context);
+        let result = ToolResultState {
+            content: vec![],
+            is_error: false,
+            details: Some(json!({"calls": []})),
+            duration_ms: None,
+        };
+        let render = |is_partial: bool, context: &ToolRenderContext| {
+            let component = CodemodeToolRenderer
+                .render_result(
+                    &result,
+                    ResultRenderOptions {
+                        expanded: false,
+                        is_partial,
+                    },
+                    &theme,
+                    context,
+                )
+                .expect("result component");
+            strip_ansi(&component.render(120).join("\n"))
+        };
+        let partial = render(true, &context);
+        assert!(partial.contains("Elapsed 0."), "partial: {partial}");
+        assert!(!partial.contains("Took"));
+
+        context.duration_ms = Some(5_100);
+        let final_text = render(false, &context);
+        assert!(final_text.contains("Took 5.1s"), "final: {final_text}");
+        assert!(!final_text.contains("Elapsed"));
     }
 
     fn script_header() -> ToolResultContentLoose {

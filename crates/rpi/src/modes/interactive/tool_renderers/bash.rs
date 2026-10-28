@@ -21,22 +21,19 @@
 //!   seconds / hours above, `fe219d7f8`).
 
 use std::cell::RefCell;
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use rpi_tui::components::text::Text;
-use rpi_tui::tui::{Component, RenderHandle};
+use rpi_tui::tui::Component;
 use rpi_tui::utils::{truncate_to_width, wrap_text_with_ansi};
 use serde_json::Value;
 
-use super::render_utils::{invalid_arg_text, str_value};
+use super::render_utils::{ToolTimerState, invalid_arg_text, str_value};
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
 use crate::modes::interactive::components::tool_execution::{
     RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
-    get_text_output, lock_recover,
+    get_text_output,
 };
 use crate::modes::interactive::components::visual_truncate::truncate_to_visual_lines;
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
@@ -45,82 +42,11 @@ use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
 const BASH_PREVIEW_LINES: usize = 5;
 
 /// `BashRenderState` (bash.ts:207-211 `BashRenderState`): per tool call,
-/// carried by the [`RendererStateSlot`].
+/// carried by the [`RendererStateSlot`]. The timing/ticker logic lives in
+/// the shared [`ToolTimerState`] (render-utils.ts:130-170).
 #[derive(Default)]
 pub struct BashRenderState {
-    timing: Mutex<BashTiming>,
-    timer: Mutex<Option<TickerGuard>>,
-}
-
-#[derive(Default)]
-struct BashTiming {
-    started_at: Option<Instant>,
-    ended_at: Option<Instant>,
-}
-
-/// The 1s Elapsed ticker (bash.ts:474-476 `setInterval`): ticks
-/// `request_render` until stopped; `dispose`/`Drop` joins the thread so no
-/// background task leaks (coding-standards §6.4).
-struct TickerGuard {
-    stop_tx: Option<mpsc::Sender<()>>,
-    thread_handle: Option<JoinHandle<()>>,
-}
-
-impl TickerGuard {
-    fn start(render_handle: RenderHandle) -> Self {
-        let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let thread_handle = thread::spawn(move || {
-            loop {
-                match stop_rx.recv_timeout(Duration::from_secs(1)) {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => render_handle.request_render(),
-                }
-            }
-        });
-        Self {
-            stop_tx: Some(stop_tx),
-            thread_handle: Some(thread_handle),
-        }
-    }
-
-    fn dispose(&mut self) {
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
-        if let Some(thread_handle) = self.thread_handle.take() {
-            let _ = thread_handle.join();
-        }
-    }
-}
-
-impl Drop for TickerGuard {
-    fn drop(&mut self) {
-        self.dispose();
-    }
-}
-
-/// `formatDuration` (renderers/bash.ts:32-40 @ pin, `fe219d7f8` / #9628): under a
-/// minute stays `(ms/1000).toFixed(1)` — the tenths digit rounds half away
-/// from zero (`toFixed` picks the larger n on ties, e.g. 1250ms → `1.3s`;
-/// Rust's `{:.1}` would round ties to even) — while ≥1min durations render
-/// as minutes+seconds, adding hours past 59m. Mirrors JS: the duration is
-/// truncated to whole milliseconds first (`Date.now()` deltas are integers).
-fn format_duration(duration: Duration) -> String {
-    let ms = duration.as_millis() as f64;
-    let seconds = ms / 1000.0;
-    if seconds < 60.0 {
-        let tenths = (ms / 100.0).round();
-        return format!("{:.1}s", tenths / 10.0);
-    }
-
-    let total_seconds = seconds.floor() as u64;
-    let minutes = total_seconds / 60;
-    let remainder = total_seconds % 60;
-    if minutes < 60 {
-        return format!("{minutes}m {remainder}s");
-    }
-
-    format!("{}h {}m {remainder}s", minutes / 60, minutes % 60)
+    timer: ToolTimerState,
 }
 
 /// `formatBashCall` (bash.ts:231-237).
@@ -275,32 +201,9 @@ impl Component for BashResultRenderComponent {
             }
         }
 
-        if !self.is_partial
-            && let Some(duration_ms) = self.duration_ms
-        {
-            // bash.ts:103-105: recorded duration wins.
+        if let Some(timer_text) = self.state.timer.text(self.is_partial, self.duration_ms) {
             lines.push(String::new());
-            lines.push(self.theme.fg(
-                "muted",
-                &format!(
-                    "Took {}",
-                    format_duration(Duration::from_millis(duration_ms))
-                ),
-            ));
-        } else {
-            let timing = lock_recover(&self.state.timing);
-            if let Some(started_at) = timing.started_at {
-                // bash.ts:106-109: `Elapsed` while partial, `Took` once
-                // settled.
-                let label = if self.is_partial { "Elapsed" } else { "Took" };
-                let end = timing.ended_at.unwrap_or_else(Instant::now);
-                let duration = end.saturating_duration_since(started_at);
-                lines.push(String::new());
-                lines.push(
-                    self.theme
-                        .fg("muted", &format!("{label} {}", format_duration(duration))),
-                );
-            }
+            lines.push(self.theme.fg("muted", &timer_text));
         }
 
         lines
@@ -323,15 +226,9 @@ impl ToolDefinition for BashToolRenderer {
         context: &ToolRenderContext,
     ) -> Option<Box<dyn Component>> {
         let state = context.state.get_or_init::<BashRenderState>();
-        if context.execution_started {
-            // bash.ts:463-467: first render after execution start records
-            // `startedAt` (and resets `endedAt`).
-            let mut timing = lock_recover(&state.timing);
-            if timing.started_at.is_none() {
-                timing.started_at = Some(Instant::now());
-                timing.ended_at = None;
-            }
-        }
+        // bash.ts:463-467: first render after execution start records
+        // `startedAt` (and resets `endedAt`).
+        state.timer.start(context.execution_started);
         Some(Box::new(Text::new(
             format_bash_call(args, theme),
             0,
@@ -348,27 +245,11 @@ impl ToolDefinition for BashToolRenderer {
         context: &ToolRenderContext,
     ) -> Option<Box<dyn Component>> {
         let state = context.state.get_or_init::<BashRenderState>();
-        {
-            let timing = lock_recover(&state.timing);
-            let mut timer = lock_recover(&state.timer);
-            // bash.ts:473-476: start the 1s Elapsed ticker once executing.
-            if timing.started_at.is_some() && options.is_partial && timer.is_none() {
-                *timer = Some(TickerGuard::start(context.render_handle.clone()));
-            }
-            // bash.ts:477-483: settle the end time and stop the ticker.
-            if !options.is_partial || context.is_error {
-                drop(timing);
-                {
-                    let mut timing = lock_recover(&state.timing);
-                    if timing.ended_at.is_none() {
-                        timing.ended_at = Some(Instant::now());
-                    }
-                }
-                if let Some(mut guard) = timer.take() {
-                    guard.dispose();
-                }
-            }
-        }
+        // bash.ts:473-483: start the 1s Elapsed ticker once executing and
+        // settle the end time/stop it once the result is final.
+        state
+            .timer
+            .tick(&context.render_handle, options.is_partial, context.is_error);
 
         let details = result.details.as_ref();
         let truncation = TruncationView::from_details(details);
@@ -450,8 +331,10 @@ mod tests {
     use super::*;
     use crate::core::themes::load_theme;
     use crate::modes::interactive::components::tool_execution::RendererStateSlot;
+    use crate::modes::interactive::tool_renderers::render_utils::format_tool_duration;
     use rpi_tui::tui::RenderHandle;
     use serde_json::json;
+    use std::time::Duration;
 
     fn theme() -> Theme {
         load_theme("dark", None).expect("builtin dark theme")
@@ -508,14 +391,14 @@ mod tests {
     }
 
     #[test]
-    fn format_duration_matches_js_to_fixed() {
+    fn format_tool_duration_matches_js_to_fixed() {
         // Integer milliseconds with JS `toFixed(1)` semantics: half-away
         // rounding at the tenths digit (1250ms → 1.25 → "1.3", not "1.2").
-        assert_eq!(format_duration(Duration::from_millis(1250)), "1.3s");
-        assert_eq!(format_duration(Duration::from_millis(1249)), "1.2s");
-        assert_eq!(format_duration(Duration::from_millis(50)), "0.1s");
-        assert_eq!(format_duration(Duration::from_millis(0)), "0.0s");
-        assert_eq!(format_duration(Duration::from_millis(999)), "1.0s");
+        assert_eq!(format_tool_duration(Duration::from_millis(1250)), "1.3s");
+        assert_eq!(format_tool_duration(Duration::from_millis(1249)), "1.2s");
+        assert_eq!(format_tool_duration(Duration::from_millis(50)), "0.1s");
+        assert_eq!(format_tool_duration(Duration::from_millis(0)), "0.0s");
+        assert_eq!(format_tool_duration(Duration::from_millis(999)), "1.0s");
     }
 
     /// #9628 (`fe219d7f8`, tool-execution-component.test.ts `test.each`):
@@ -523,7 +406,7 @@ mod tests {
     /// minutes+seconds at ≥1min (note 59_999ms still renders the <60s
     /// branch, where toFixed(1) lands on "60.0s"), hours past 59m.
     #[test]
-    fn format_duration_supports_hours_minutes_seconds() {
+    fn format_tool_duration_supports_hours_minutes_seconds() {
         let cases: &[(u128, &str)] = &[
             (0, "0.0s"),
             (4_200, "4.2s"),
@@ -538,7 +421,7 @@ mod tests {
         ];
         for (ms, formatted) in cases {
             assert_eq!(
-                format_duration(Duration::from_millis(*ms as u64)),
+                format_tool_duration(Duration::from_millis(*ms as u64)),
                 *formatted,
                 "{ms}ms"
             );
@@ -750,7 +633,7 @@ mod tests {
         assert!(stripped.contains("Elapsed 0."), "stripped: {stripped}");
         // The ticker is running for this partial result…
         let render_state = state.get_or_init::<BashRenderState>();
-        assert!(lock_recover(&render_state.timer).is_some());
+        assert!(render_state.timer.ticker_running());
         // …and settles + stops on the final result.
         let component = renderer
             .render_result(
@@ -763,7 +646,7 @@ mod tests {
                 &context,
             )
             .expect("final component");
-        assert!(lock_recover(&render_state.timer).is_none());
+        assert!(!render_state.timer.ticker_running());
         let stripped = strip_ansi(&component.render(80).join("\n"));
         assert!(stripped.contains("Took 0."), "stripped: {stripped}");
     }

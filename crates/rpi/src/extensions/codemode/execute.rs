@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use futures::future::BoxFuture;
@@ -22,6 +23,7 @@ use serde_json::{Value, json};
 use crate::extensions::codemode::tool::{
     CODEMODE_STORE_ENTRY_TYPE, CodemodeMode, ToolInfo, callable_tools, to_codemode_declaration,
 };
+use crate::extensions::codemode::workers::{Admission, WORKER_WAIT_MS, WorkerPool, pool};
 use crate::extensions::tool_search::{
     Bm25Ranker, DEFAULT_TOOL_SEARCH_LIMIT, create_tool_search_document,
 };
@@ -640,27 +642,39 @@ fn format_output(output: Vec<CodemodeOutputItem>) -> Vec<ToolResultContent> {
 }
 
 /// Join adjacent text items into one, each part starting on its own line
-/// (`joinAdjacentText`, execute.ts:284-296).
+/// (`joinAdjacentText`, execute.ts:341-374). The separator check looks at the
+/// last non-empty part, not the joined text: reading the end of a growing
+/// concatenation copies it on every item, which is quadratic (#10678).
 fn join_adjacent_text(items: Vec<ToolResultContent>) -> Vec<ToolResultContent> {
+    fn flush(joined: &mut Vec<ToolResultContent>, parts: &mut Vec<String>, last_part: &mut String) {
+        if !parts.is_empty() {
+            joined.push(ToolResultContent::Text(rpi_ai::types::TextContent {
+                text: parts.concat(),
+                text_signature: None,
+            }));
+        }
+        parts.clear();
+        last_part.clear();
+    }
     let mut joined: Vec<ToolResultContent> = Vec::with_capacity(items.len());
+    let mut parts: Vec<String> = Vec::new();
+    let mut last_part = String::new();
     for item in items {
-        match item {
-            ToolResultContent::Text(text) => {
-                if let Some(ToolResultContent::Text(previous)) = joined.last_mut() {
-                    let separator = if previous.text.is_empty() || previous.text.ends_with('\n') {
-                        ""
-                    } else {
-                        "\n"
-                    };
-                    let prior = std::mem::take(&mut previous.text);
-                    previous.text = format!("{prior}{separator}{}", text.text);
-                } else {
-                    joined.push(ToolResultContent::Text(text));
-                }
-            }
-            other => joined.push(other),
+        let ToolResultContent::Text(text) = item else {
+            flush(&mut joined, &mut parts, &mut last_part);
+            joined.push(item);
+            continue;
+        };
+        if !last_part.is_empty() && !last_part.ends_with('\n') {
+            parts.push("\n".to_owned());
+            last_part = "\n".to_owned();
+        }
+        parts.push(text.text.clone());
+        if !text.text.is_empty() {
+            last_part = text.text;
         }
     }
+    flush(&mut joined, &mut parts, &mut last_part);
     joined
 }
 
@@ -1240,6 +1254,21 @@ fn create_model_globals(
     globals
 }
 
+/// Releases an admission whose worker never started. The sandbox's
+/// `acquire_worker` disarms it when it takes the slot over (execute.ts:559-607).
+struct ReservationGuard {
+    pool: Arc<WorkerPool>,
+    reserved: Arc<AtomicBool>,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.reserved.swap(false, Ordering::SeqCst) {
+            self.pool.release();
+        }
+    }
+}
+
 /// Execute one codemode script (execute.ts:416-537).
 pub async fn execute_codemode(
     request: ToolExecuteRequest,
@@ -1312,6 +1341,10 @@ pub async fn execute_codemode(
             generated_images.fetch_add(count, std::sync::atomic::Ordering::SeqCst);
         })
     };
+
+    // Show the script as running before its first nested call, so the row's
+    // timer starts (execute.ts:515-517).
+    publish();
 
     let callable = callable_tools(&options.api);
     let samples = sample_map(&callable);
@@ -1418,20 +1451,81 @@ pub async fn execute_codemode(
         ));
     }
 
+    // The wait for a worker counts toward the script's deadline
+    // (execute.ts:555-575).
+    let deadline = parsed.options.timeout_ms;
+    let wait_timeout =
+        Duration::from_millis(deadline.unwrap_or(WORKER_WAIT_MS).min(WORKER_WAIT_MS));
+    let wait_started = Instant::now();
+    let pool = pool();
+    let admission = pool.reserve(Some(&signal), wait_timeout).await;
+    let waited_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+    if admission != Admission::Reserved {
+        let waited = started.elapsed().as_secs_f64();
+        let error = match admission {
+            Admission::Aborted => "Script aborted: Execution aborted".to_owned(),
+            Admission::Timeout if deadline.is_some_and(|ms| ms <= WORKER_WAIT_MS) => format!(
+                "Script timed out: Execution timed out after {} ms while waiting for a free codemode worker",
+                deadline.unwrap_or(WORKER_WAIT_MS)
+            ),
+            Admission::Timeout => format!(
+                "No codemode worker became free within {} seconds. All {} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
+                WORKER_WAIT_MS / 1000,
+                crate::extensions::codemode::workers::max_workers()
+            ),
+            Admission::Reserved => unreachable!("handled above"),
+        };
+        return Ok(AgentToolResult {
+            content: vec![
+                ToolResultContent::Text(rpi_ai::types::TextContent {
+                    text: format!("Script failed\nWall time {waited:.1} seconds\nOutput:\n"),
+                    text_signature: None,
+                }),
+                ToolResultContent::Text(rpi_ai::types::TextContent {
+                    text: format!("Script error:\n{error}\n\nThe script did not start."),
+                    text_signature: None,
+                }),
+            ],
+            details: json!({ "calls": [] }),
+            is_error: Some(true),
+            ..Default::default()
+        });
+    }
+    let reserved = Arc::new(AtomicBool::new(true));
+    let _reservation = ReservationGuard {
+        pool: pool.clone(),
+        reserved: reserved.clone(),
+    };
+
     let store = {
         let entries = ctx
             .session_entries(Some(CODEMODE_STORE_ENTRY_TYPE), None)
             .unwrap_or_default();
         read_codemode_store(&entries)
     };
+    let acquire_worker = {
+        let pool = pool.clone();
+        let reserved = reserved.clone();
+        Arc::new(move || {
+            if !reserved.swap(false, Ordering::SeqCst) {
+                return Err("The script already settled".to_owned());
+            }
+            let pool = pool.clone();
+            Ok(Box::new(move || pool.release()) as rpi_codemode::WorkerRelease)
+        })
+    };
     let sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
         tools: sandbox_tools,
         globals,
-        timeout_ms: match parsed.options.timeout_ms {
-            Some(ms) => CodemodeTimeout::Milliseconds(ms),
+        timeout_ms: match deadline {
+            Some(ms) => {
+                CodemodeTimeout::Milliseconds((ms as f64 - waited_ms).round().max(1.0) as u64)
+            }
             None => CodemodeTimeout::Infinite,
         },
         memory_limit_bytes: Some(CODEMODE_MEMORY_LIMIT_BYTES as u64),
+        acquire_worker: Some(acquire_worker),
+        ..Default::default()
     })?;
     let result = sandbox
         .execute(
@@ -1444,6 +1538,9 @@ pub async fn execute_codemode(
         )
         .await;
     sandbox.close().await;
+    // The worker started (or will never start); the guard keeps the slot only
+    // for a sandbox that failed to construct.
+    drop(_reservation);
     let result = result?;
 
     let mut nested = calls
@@ -1578,6 +1675,54 @@ fn to_script_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_item(text: &str) -> ToolResultContent {
+        ToolResultContent::Text(rpi_ai::types::TextContent {
+            text: text.to_owned(),
+            text_signature: None,
+        })
+    }
+
+    fn joined(items: Vec<ToolResultContent>) -> Vec<String> {
+        join_adjacent_text(items)
+            .into_iter()
+            .map(|item| match item {
+                ToolResultContent::Text(text) => format!("text:{:?}", text.text),
+                ToolResultContent::Image(image) => format!("image:{}", image.mime_type),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn joins_adjacent_text_linearly_with_the_last_non_empty_part_separator() {
+        assert_eq!(
+            joined(vec![text_item("a"), text_item("b"), text_item("c")]),
+            vec!["text:\"a\\nb\\nc\"".to_owned()]
+        );
+        // An empty part neither ends the run nor starts a new line.
+        assert_eq!(
+            joined(vec![text_item("a"), text_item(""), text_item("b")]),
+            vec!["text:\"a\\nb\"".to_owned()]
+        );
+        // A trailing newline suppresses the separator for the next part.
+        assert_eq!(
+            joined(vec![text_item("a\n"), text_item("b")]),
+            vec!["text:\"a\\nb\"".to_owned()]
+        );
+        // Images flush the text run.
+        let image = ToolResultContent::Image(rpi_ai::types::ImageContent {
+            data: "aGVsbG8=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        });
+        assert_eq!(
+            joined(vec![text_item("a"), image, text_item("b")]),
+            vec![
+                "text:\"a\"".to_owned(),
+                "image:image/png".to_owned(),
+                "text:\"b\"".to_owned()
+            ]
+        );
+    }
 
     fn questions() -> Value {
         json!({

@@ -163,6 +163,7 @@ Configuration lives in `~/.rpi/agent/` (or `RPI_CODING_AGENT_DIR`); project-loca
 | `RPI_TELEMETRY_URL` | `https://revpi.dev/api/report-install` | Install-count telemetry endpoint; literal `off` disables |
 | `RPI_TELEMETRY` | — | Force telemetry on/off (`1/true/yes` or `0/false/no`) |
 | `RPI_SHARE_VIEWER_URL` | `https://revpi.dev/session` | Session share viewer; literal `off` disables |
+| `RPI_CODEMODE_MAX_WORKERS` | `2` | Maximum codemode workers alive at once in this process; further scripts wait for a free worker |
 | `RPI_CODING_AGENT_DIR` | `~/.rpi/agent` | Config/state directory |
 | `RPI_CODING_AGENT_SESSION_DIR` | `~/.rpi/agent/sessions` | Session storage directory |
 | `RPI_PACKAGE_DIR` | executable directory | Override the package root (Nix/Guix store paths) |

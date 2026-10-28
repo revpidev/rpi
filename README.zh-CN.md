@@ -163,6 +163,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `RPI_TELEMETRY_URL` | `https://revpi.dev/api/report-install` | 安装计数遥测端点；字面量 `off` 关闭 |
 | `RPI_TELEMETRY` | — | 强制开启/关闭遥测（`1/true/yes` 或 `0/false/no`） |
 | `RPI_SHARE_VIEWER_URL` | `https://revpi.dev/session` | 会话分享查看页；字面量 `off` 关闭 |
+| `RPI_CODEMODE_MAX_WORKERS` | `2` | 本进程内同时存活的 codemode worker 上限；超出的脚本等待空闲 worker |
 | `RPI_CODING_AGENT_DIR` | `~/.rpi/agent` | 配置与状态目录 |
 | `RPI_CODING_AGENT_SESSION_DIR` | `~/.rpi/agent/sessions` | 会话存储目录 |
 | `RPI_PACKAGE_DIR` | 可执行文件目录 | 覆盖 package 根目录（Nix/Guix store 路径） |

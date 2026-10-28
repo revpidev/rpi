@@ -28,6 +28,18 @@ use crate::types::{
 #[cfg(test)]
 static LIVE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Runs the host's worker release callback exactly once: at actual worker
+/// exit, or when the worker could not be started.
+struct WorkerReleaseGuard(Option<crate::types::WorkerRelease>);
+
+impl Drop for WorkerReleaseGuard {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
+
 /// Decrements [`LIVE_WORKERS`] when a worker thread exits (test builds).
 #[cfg(test)]
 struct WorkerThreadGuard;
@@ -62,6 +74,8 @@ pub struct CodemodeSandbox {
     globals: Mutex<Vec<CodemodeTool>>,
     timeout: CodemodeTimeout,
     memory_limit_bytes: Option<u64>,
+    acquire_worker: Option<crate::types::AcquireWorker>,
+    worker_exit_gate: Option<Arc<dyn Fn() + Send + Sync>>,
     closed: AtomicBool,
     running: Mutex<HashMap<u64, CancellationToken>>,
     next_execution_id: Mutex<u64>,
@@ -113,6 +127,8 @@ impl CodemodeSandbox {
             globals: Mutex::new(globals),
             timeout: options.timeout_ms,
             memory_limit_bytes: options.memory_limit_bytes,
+            acquire_worker: options.acquire_worker,
+            worker_exit_gate: options.worker_exit_gate,
             closed: AtomicBool::new(false),
             running: Mutex::new(HashMap::new()),
             next_execution_id: Mutex::new(1),
@@ -266,16 +282,60 @@ impl CodemodeSandbox {
             events: events_tx,
             replies: replies_rx,
         };
-        #[cfg(test)]
-        LIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
-        let handle = std::thread::spawn(move || {
-            #[cfg(test)]
-            let _guard = WorkerThreadGuard;
-            run_worker(worker_input)
-        });
-
         let calls = Arc::new(Mutex::new(CallTable::default()));
         let mut output: Vec<CodemodeOutputItem> = Vec::new();
+        // Reserve the shared worker slot immediately before the worker
+        // starts (`acquireWorker`, host.ts:20-46 @ 4a080252f). A denied
+        // reservation fails the execution without starting a worker.
+        let release = match self.acquire_worker.as_ref() {
+            None => None,
+            Some(acquire) => match acquire() {
+                Ok(release) => Some(release),
+                Err(message) => {
+                    return Ok(CodemodeResult::Err {
+                        error: CodemodeError {
+                            kind: CodemodeErrorKind::Sandbox,
+                            name: None,
+                            message,
+                            stack: None,
+                        },
+                        output: std::mem::take(&mut output),
+                        calls: finish_calls(&calls),
+                    });
+                }
+            },
+        };
+        #[cfg(test)]
+        LIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
+        let exit_gate = self.worker_exit_gate.clone();
+        let handle = match std::thread::Builder::new().spawn(move || {
+            #[cfg(test)]
+            let _guard = WorkerThreadGuard;
+            // The release callback runs when the worker thread actually
+            // exits, also when it panics, not when the host settles.
+            let _release = WorkerReleaseGuard(release);
+            run_worker(worker_input);
+            if let Some(gate) = &exit_gate {
+                gate();
+            }
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                // The failed spawn already dropped the closure (and its
+                // guard), releasing the reservation.
+                return Ok(CodemodeResult::Err {
+                    error: CodemodeError {
+                        kind: CodemodeErrorKind::Sandbox,
+                        name: None,
+                        message: format!("Failed to start worker: {error}"),
+                        stack: None,
+                    },
+                    output: std::mem::take(&mut output),
+                    calls: finish_calls(&calls),
+                });
+            }
+        };
+
         // Output is bounded inside the VM instead: the prelude fails the
         // script past `MAX_OUTPUT_CHARS` / `MAX_OUTPUT_ITEMS` (#10283), which
         // is also what upstream does.
@@ -756,6 +816,99 @@ fn finish_calls(calls: &Arc<Mutex<CallTable>>) -> Vec<CodemodeCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker slot is released when the worker thread actually exits, not
+    /// when the host settles the result (`acquireWorker`, host.ts:20-46).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn releases_a_reserved_slot_only_when_the_worker_thread_exits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_hook = released.clone();
+        let exit_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate_state = exit_gate.clone();
+        let gate = Arc::new(move || {
+            let (lock, condvar) = &*gate_state;
+            let mut exited = lock.lock().unwrap_or_else(|error| error.into_inner());
+            while !*exited {
+                exited = condvar
+                    .wait_timeout(exited, Duration::from_secs(5))
+                    .map(|(guard, _)| guard)
+                    .unwrap_or_else(|error| error.into_inner().0);
+            }
+        });
+        let sandbox = Arc::new(
+            CodemodeSandbox::new(CodemodeSandboxOptions {
+                timeout_ms: CodemodeTimeout::Milliseconds(60_000),
+                acquire_worker: Some(Arc::new(move || {
+                    let released = released_for_hook.clone();
+                    Ok(Box::new(move || {
+                        released.store(true, Ordering::SeqCst);
+                    }) as crate::types::WorkerRelease)
+                })),
+                worker_exit_gate: Some(gate),
+                ..Default::default()
+            })
+            .expect("sandbox"),
+        );
+        let result = sandbox
+            .execute("return 1", CodemodeExecuteOptions::default())
+            .await
+            .expect("execution");
+        assert!(matches!(result, CodemodeResult::Ok { .. }));
+        // The result settled while the worker is still alive (the exit gate
+        // has not been released): its slot must still be reserved.
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "slot released before the worker exited"
+        );
+        {
+            let (lock, condvar) = &*exit_gate;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            condvar.notify_all();
+        }
+        for _ in 0..500 {
+            if released.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            released.load(Ordering::SeqCst),
+            "slot not released after the worker exited"
+        );
+    }
+
+    /// A denied reservation fails the execution without starting a worker.
+    #[tokio::test]
+    async fn a_denied_reservation_fails_without_starting_a_worker() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_for_gate = exited.clone();
+        let sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+            acquire_worker: Some(Arc::new(|| Err("no worker slot".to_owned()))),
+            worker_exit_gate: Some(Arc::new(move || {
+                exited_for_gate.store(true, Ordering::SeqCst);
+            })),
+            ..Default::default()
+        })
+        .expect("sandbox");
+        let result = sandbox
+            .execute("return 1", CodemodeExecuteOptions::default())
+            .await
+            .expect("execution");
+        match result {
+            CodemodeResult::Err { error, .. } => {
+                assert_eq!(error.kind, CodemodeErrorKind::Sandbox);
+                assert_eq!(error.message, "no worker slot");
+            }
+            other => panic!("expected a sandbox error, got {other:?}"),
+        }
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "a denied reservation must not start a worker"
+        );
+    }
 
     /// A tool that reports its invocation and then never settles, ignoring
     /// the cancellation signal.

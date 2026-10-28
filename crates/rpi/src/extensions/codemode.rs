@@ -7,6 +7,7 @@
 pub mod description;
 pub mod execute;
 pub mod tool;
+pub mod workers;
 
 use std::sync::Arc;
 

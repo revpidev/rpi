@@ -124,13 +124,26 @@ fn parse_options(directive: &str) -> Result<CodemodeSourceOptions, CodemodeSourc
     Ok(options)
 }
 
-/// Split an optional first-line `// @options: {...}` from the script. Errors
-/// for empty input and invalid options.
+/// Split an optional first-line `// @options: {...}` from the script
+/// (source.ts:101-125). Errors for empty input, invalid options, and an
+/// options line that is not the first line, which would otherwise be ignored
+/// without notice.
 pub fn parse_codemode_source(input: &str) -> Result<ParsedCodemodeSource, CodemodeSourceError> {
     if input.trim().is_empty() {
         return Err(CodemodeSourceError::new(
             "Expected JavaScript source text (non-empty). Provide JS only, optionally with a first line `// @options: {\"max_output_tokens\": 1000}`.",
         ));
+    }
+    if let Some((index, _)) = input
+        .split('\n')
+        .enumerate()
+        .skip(1)
+        .find(|(_, line)| line.trim_start().starts_with(CODEMODE_OPTIONS_PREFIX))
+    {
+        return Err(CodemodeSourceError::new(format!(
+            "The {CODEMODE_OPTIONS_PREFIX} line must be the first line of the input; found one on line {}",
+            index + 1
+        )));
     }
     let newline = input.find('\n');
     let first_line = match newline {
@@ -207,10 +220,33 @@ mod tests {
 
     #[test]
     fn only_treats_the_first_line_as_an_options_line() {
-        let input = "text(1)\n// @options: {\"timeout_ms\": 1}";
-        let parsed = parse_codemode_source(input).expect("second line");
-        assert_eq!(parsed.code, input);
-        assert_eq!(parsed.options, CodemodeSourceOptions::default());
+        // #10631: an options line after the first line used to be ignored, so
+        // its timeout never applied.
+        let cases: [(&str, usize); 4] = [
+            (
+                "// count things\n// @options: {\"timeout_ms\": 1000}\nwhile (true) {}",
+                2,
+            ),
+            (
+                "\n  // @options: {\"timeout_ms\": 1000}\nwhile (true) {}",
+                2,
+            ),
+            ("text(1)\r\n// @options: {\"timeout_ms\": 1}", 2),
+            (
+                "// @options: {\"timeout_ms\": 1}\ntext(1)\n// @options: {\"timeout_ms\": 2}",
+                3,
+            ),
+        ];
+        for (input, line) in cases {
+            let error = parse_codemode_source(input).expect_err(input);
+            assert_eq!(
+                error.message,
+                format!(
+                    "The {CODEMODE_OPTIONS_PREFIX} line must be the first line of the input; found one on line {line}"
+                ),
+                "input {input:?}"
+            );
+        }
         let parsed = parse_codemode_source("// @optionsx {}\ntext(1)").expect("typo");
         assert_eq!(parsed.options, CodemodeSourceOptions::default());
     }
