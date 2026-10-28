@@ -5,7 +5,7 @@
 //! (`NodeAuth.addGoogleAuthHeaders` → `GoogleAuth.getRequestHeaders` →
 //! `authorization: Bearer <access_token>`).
 //!
-//! Upstream has no pi-side source file for this logic; pi only passes
+//! Upstream has no rpi-side source file for this logic; rpi only passes
 //! `googleAuthOptions: {keyFilename}` (from `GOOGLE_APPLICATION_CREDENTIALS`)
 //! into the SDK (`google-vertex.ts` `buildGoogleAuthOptions`). This module
 //! implements the credential resolution chain and token acquisition the SDK

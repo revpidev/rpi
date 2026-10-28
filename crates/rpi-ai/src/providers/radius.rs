@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 
-use crate::api::pi_messages::PiMessages;
+use crate::api::rpi_messages::RpiMessages;
 use crate::auth::oauth::radius::RadiusOAuth;
 use crate::auth::{Credential, ModelsError, ProviderAuth, env_api_key_auth};
 use crate::models::{
@@ -100,7 +100,7 @@ pub fn radius_provider_with(options: RadiusProviderOptions) -> Arc<RadiusProvide
         // list is only a placeholder; [`RadiusProvider::get_models`] is the
         // authority.
         models: Vec::new(),
-        api: ProviderApi::Single(Arc::new(PiMessages)),
+        api: ProviderApi::Single(Arc::new(RpiMessages)),
         ..Default::default()
     });
     Arc::new(RadiusProvider {
@@ -465,7 +465,7 @@ mod tests {
 
     fn radius_model(id: &str) -> Model {
         serde_json::from_value(serde_json::json!({
-            "id": id, "name": id, "api": "pi-messages", "provider": "radius",
+            "id": id, "name": id, "api": "rpi-messages", "provider": "radius",
             "baseUrl": "https://radius.pi.dev/api", "reasoning": false, "input": ["text"],
             "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.1, "cacheWrite": 0.2},
             "contextWindow": 128000, "maxTokens": 16384

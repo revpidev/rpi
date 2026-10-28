@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
-// Scripted HTTP server (same approach as contract_pi_messages.rs)
+// Scripted HTTP server (same approach as contract_rpi_messages.rs)
 // ---------------------------------------------------------------------------
 
 /// One captured request: request line, headers (lowercased names) and body.

@@ -6,7 +6,7 @@
 //! `RPI_LIVE_TEST=1` is set **and** the provider's API key env var is present.
 //! Model ids can be overridden via `RPI_LIVE_<PROVIDER>_MODEL`; base URLs via
 //! `RPI_LIVE_<PROVIDER>_BASE_URL`. openai-codex (OAuth sign-in state) and
-//! pi-messages (internal endpoint) intentionally have no live target.
+//! rpi-messages (internal endpoint) intentionally have no live target.
 
 use futures::StreamExt;
 use rpi_ai::api::anthropic_messages::AnthropicMessages;

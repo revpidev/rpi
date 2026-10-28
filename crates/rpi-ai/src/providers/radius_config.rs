@@ -2,7 +2,7 @@
 //! — Radius gateway config: URL normalization, the sanitized
 //! `RadiusGatewayConfig` shape (stored on the OAuth credential and fetched
 //! from `{gateway}/v1/config`), and model materialization onto the
-//! `pi-messages` API.
+//! `rpi-messages` API.
 //!
 //! Intentional differences:
 //! - The upstream runtime type guards (`isRadiusGatewayModel` /
@@ -25,7 +25,7 @@ use crate::types::{ApiKind, InputModality, Model, ModelCost, ThinkingLevelMap};
 pub const DEFAULT_RADIUS_GATEWAY: &str = "https://radius.pi.dev";
 
 /// `RadiusGatewayModel` — the gateway-reported model shape (everything but
-/// the pi-side `api`/`provider`/`baseUrl`, which materialization supplies).
+/// the rpi-side `api`/`provider`/`baseUrl`, which materialization supplies).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RadiusGatewayModel {
@@ -107,7 +107,7 @@ pub fn get_radius_credential_config(
 }
 
 /// `getRadiusModelsFromConfig` — materialize gateway models onto
-/// `pi-messages` for `provider_id`, served from `config.base_url`.
+/// `rpi-messages` for `provider_id`, served from `config.base_url`.
 pub fn get_radius_models_from_config(
     provider_id: &str,
     config: &RadiusGatewayConfig,
@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn materializes_models_onto_pi_messages() {
+    fn materializes_models_onto_rpi_messages() {
         let config = sanitize_radius_gateway_config(&config_json()).expect("config");
         let models = get_radius_models_from_config("radius", &config);
         assert_eq!(models.len(), 1);

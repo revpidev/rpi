@@ -67,7 +67,7 @@ impl SendFailure {
     }
 
     /// Display message matching the pre-channel `error.to_string()` mapping
-    /// (pi_messages / codex style), with the upstream-parity transport
+    /// (rpi_messages / codex style), with the upstream-parity transport
     /// wording for reqwest failures (see `utils::transport_error`).
     pub fn message(&self) -> String {
         match self {

@@ -1,22 +1,24 @@
 //! Port of `packages/ai/src/api/pi-messages.ts` @ pi 0.82.1 (2efa728).
 //!
-//! pi-messages adapter: streams pi's own message protocol to a backend. The
+//! rpi-messages adapter: streams rpi's own message protocol to a backend. The
 //! request is a single POST of `{ model, context, options }` to
-//! `<baseUrl>/messages` (`?debug=1` when [`PiMessagesOptions::debug`]); the
+//! `<baseUrl>/messages` (`?debug=1` when [`RpiMessagesOptions::debug`]); the
 //! response is an SSE stream of serialized assistant-message events plus a
 //! terminal `done`/`error` event. This is the wire protocol spoken by the
-//! Radius gateway, usable by any backend via a models.json custom provider
-//! with `"api": "rpi-messages"` (legacy `"pi-messages"` still accepted).
+//! Radius gateway; the built-in Radius provider registers this adapter. A
+//! models.json custom provider can use the API kind `"rpi-messages"` (legacy
+//! `"pi-messages"` is accepted on input) only where the host registers the
+//! adapter for that provider.
 //!
 //! `pi-messages.lazy.ts` (`lazyApi(() => import("./pi-messages.ts"))`) is a
-//! code-splitting shim; Rust links statically, so [`PiMessages`] is always
+//! code-splitting shim; Rust links statically, so [`RpiMessages`] is always
 //! available and no lazy-registration equivalent exists.
 //!
 //! Intentional differences (upstream deviations, see D-021):
 //! - `streamSimple`'s `toolChoice`/`debug` smuggling (upstream reads them off
 //!   the `SimpleStreamOptions` object) is not ported: rpi's
 //!   `SimpleStreamOptions` struct has no such fields. They are available via
-//!   [`PiMessagesOptions`] on direct [`stream`] calls.
+//!   [`RpiMessagesOptions`] on direct [`stream`] calls.
 //! - The bespoke SSE reader is ported as written (first `data:` line per
 //!   `\n\n`-separated block, `\r\n` normalization, trailing-block flush),
 //!   not via the shared [`crate::api::sse::SseDecoder`]; a malformed `data:`
@@ -61,9 +63,9 @@ use crate::utils::provider_env::get_provider_env_value;
 // Options
 // ---------------------------------------------------------------------------
 
-/// `PiMessagesOptions` — `StreamOptions` plus pi-messages extras.
+/// `RpiMessagesOptions` — `StreamOptions` plus rpi-messages extras.
 #[derive(Debug, Clone, Default)]
-pub struct PiMessagesOptions {
+pub struct RpiMessagesOptions {
     pub stream: StreamOptions,
     pub reasoning: Option<ThinkingLevel>,
     /// Raw `toolChoice` JSON: `"auto" | "none" | "required" |
@@ -78,11 +80,11 @@ pub struct PiMessagesOptions {
 // Wire types
 // ---------------------------------------------------------------------------
 
-/// `PiMessagesRewriteImpact` — impact summary of a server-side message
+/// `RpiMessagesRewriteImpact` — impact summary of a server-side message
 /// rewrite (e.g. a gateway policy).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PiMessagesRewriteImpact {
+pub struct RpiMessagesRewriteImpact {
     pub policy_id: String,
     pub policy_version: u64,
     pub changed: bool,
@@ -91,11 +93,11 @@ pub struct PiMessagesRewriteImpact {
     pub system_prompt_changed: bool,
 }
 
-/// `PiMessagesEvent` — serialized assistant-message event as sent by a
-/// pi-messages backend.
+/// `RpiMessagesEvent` — serialized assistant-message event as sent by a
+/// rpi-messages backend.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
-pub enum PiMessagesEvent {
+pub enum RpiMessagesEvent {
     #[serde(rename = "start")]
     Start,
     #[serde(rename = "text_start")]
@@ -138,7 +140,8 @@ pub enum PiMessagesEvent {
         reason: DoneReason,
         usage: Usage,
         response_id: Option<String>,
-        rewrite: Option<PiMessagesRewriteImpact>,
+        provider_thinking_level: Option<String>,
+        rewrite: Option<RpiMessagesRewriteImpact>,
     },
     #[serde(rename = "error")]
     Error {
@@ -146,15 +149,16 @@ pub enum PiMessagesEvent {
         usage: Usage,
         error_message: Option<String>,
         response_id: Option<String>,
-        rewrite: Option<PiMessagesRewriteImpact>,
+        provider_thinking_level: Option<String>,
+        rewrite: Option<RpiMessagesRewriteImpact>,
     },
 }
 
-/// `PiMessagesResponseError` — non-2xx response with a machine-readable code
+/// `RpiMessagesResponseError` — non-2xx response with a machine-readable code
 /// and redacted diagnostic details (attached to the error event's message as
-/// a `pi_messages_response_failure` diagnostic).
+/// a `rpi_messages_response_failure` diagnostic).
 #[derive(Debug, Clone)]
-pub struct PiMessagesResponseError {
+pub struct RpiMessagesResponseError {
     pub message: String,
     pub code: Option<String>,
     pub diagnostic_details: Map<String, Value>,
@@ -164,7 +168,7 @@ pub struct PiMessagesResponseError {
 /// response error when the failure was a non-2xx response.
 struct StreamFailure {
     message: String,
-    response_error: Option<PiMessagesResponseError>,
+    response_error: Option<RpiMessagesResponseError>,
 }
 
 impl StreamFailure {
@@ -180,9 +184,9 @@ impl StreamFailure {
 // Error body parsing / formatting
 // ---------------------------------------------------------------------------
 
-/// `parsePiMessagesErrorBody`: the parsed `error` object, only when the body
+/// Parse the error body: the parsed `error` object, only when the body
 /// is JSON with a non-array object `error` member.
-fn parse_pi_messages_error_body(body: &str) -> Option<Value> {
+fn parse_rpi_messages_error_body(body: &str) -> Option<Value> {
     let parsed: Value = serde_json::from_str(body).ok()?;
     let error = parsed.get("error")?;
     error.as_object()?;
@@ -205,9 +209,9 @@ fn error_body_field<'a>(error_body: Option<&'a Value>, field: &str) -> Option<&'
         .and_then(Value::as_str)
 }
 
-/// `formatPiMessagesResponseError`:
+/// Format a response error:
 /// `{status} {statusText}: {error.message ?? body}{code ? ` (${code})` : ""}`.
-fn format_pi_messages_response_error(
+fn format_rpi_messages_response_error(
     status: u16,
     status_text: &str,
     body: &str,
@@ -220,15 +224,15 @@ fn format_pi_messages_response_error(
     format!("{status} {status_text}: {suffix}{code_suffix}")
 }
 
-/// `createPiMessagesResponseError`.
-fn create_pi_messages_response_error(
+/// Create a response error.
+fn create_rpi_messages_response_error(
     model: &Model,
     url: &reqwest::Url,
     status: u16,
     status_text: &str,
     body: &str,
-) -> PiMessagesResponseError {
-    let error_body = parse_pi_messages_error_body(body);
+) -> RpiMessagesResponseError {
+    let error_body = parse_rpi_messages_error_body(body);
     let code = error_body_field(error_body.as_ref(), "code").map(str::to_owned);
     let mut details = Map::new();
     details.insert("version".to_owned(), json!(1));
@@ -244,8 +248,8 @@ fn create_pi_messages_response_error(
         details.insert("body".to_owned(), json!(truncate_diagnostic_string(body)));
     }
     details.insert("timestampMs".to_owned(), json!(now_ms()));
-    PiMessagesResponseError {
-        message: format_pi_messages_response_error(status, status_text, body, error_body.as_ref()),
+    RpiMessagesResponseError {
+        message: format_rpi_messages_response_error(status, status_text, body, error_body.as_ref()),
         code,
         diagnostic_details: details,
     }
@@ -270,11 +274,11 @@ fn append_diagnostic(message: &mut AssistantMessage, diagnostic: AssistantMessag
         .push(diagnostic);
 }
 
-/// `appendRewriteDiagnostic`: a `pi_messages_rewrite` diagnostic carrying the
+/// `appendRewriteDiagnostic`: a `rpi_messages_rewrite` diagnostic carrying the
 /// rewrite impact as details (no `error` member, matching upstream).
 fn append_rewrite_diagnostic(
     message: &mut AssistantMessage,
-    rewrite: Option<&PiMessagesRewriteImpact>,
+    rewrite: Option<&RpiMessagesRewriteImpact>,
 ) {
     let Some(rewrite) = rewrite else { return };
     let Ok(Value::Object(details)) = serde_json::to_value(rewrite) else {
@@ -283,7 +287,7 @@ fn append_rewrite_diagnostic(
     append_diagnostic(
         message,
         AssistantMessageDiagnostic {
-            kind: "pi_messages_rewrite".to_owned(),
+            kind: "rpi_messages_rewrite".to_owned(),
             timestamp: now_ms(),
             error: None,
             details: Some(details),
@@ -295,7 +299,7 @@ fn append_rewrite_diagnostic(
 // Cache retention
 // ---------------------------------------------------------------------------
 
-/// `resolveCacheRetention` (pi-messages): an explicit value wins; otherwise
+/// `resolveCacheRetention` (rpi-messages): an explicit value wins; otherwise
 /// only the legacy env opt-in maps to `"long"` — unset stays unset so the
 /// backend default applies.
 fn resolve_cache_retention(
@@ -348,7 +352,7 @@ fn content_slot(content: &mut Vec<AssistantContent>, index: usize) -> &mut Assis
     &mut content[index]
 }
 
-/// `createEventConverter`: folds pi-messages events into a partial
+/// Fold rpi-messages events into a partial
 /// [`AssistantMessage`] and emits the corresponding [`StreamEvent`]s.
 struct EventConverter {
     partial: AssistantMessage,
@@ -363,12 +367,13 @@ impl EventConverter {
         }
     }
 
-    fn convert(&mut self, event: PiMessagesEvent) -> StreamEvent {
+    fn convert(&mut self, event: RpiMessagesEvent) -> StreamEvent {
         match event {
-            PiMessagesEvent::Done {
+            RpiMessagesEvent::Done {
                 reason,
                 usage,
                 response_id,
+                provider_thinking_level,
                 rewrite,
             } => {
                 self.partial.stop_reason = match reason {
@@ -381,17 +386,21 @@ impl EventConverter {
                 };
                 self.partial.usage = usage;
                 self.partial.response_id = response_id;
+                if let Some(level) = provider_thinking_level {
+                    self.partial.provider_thinking_level = Some(level);
+                }
                 append_rewrite_diagnostic(&mut self.partial, rewrite.as_ref());
                 StreamEvent::Done {
                     reason,
                     message: self.partial.clone(),
                 }
             }
-            PiMessagesEvent::Error {
+            RpiMessagesEvent::Error {
                 reason,
                 usage,
                 error_message,
                 response_id,
+                provider_thinking_level,
                 rewrite,
             } => {
                 self.partial.stop_reason = match reason {
@@ -401,16 +410,19 @@ impl EventConverter {
                 self.partial.usage = usage;
                 self.partial.error_message = error_message;
                 self.partial.response_id = response_id;
+                if let Some(level) = provider_thinking_level {
+                    self.partial.provider_thinking_level = Some(level);
+                }
                 append_rewrite_diagnostic(&mut self.partial, rewrite.as_ref());
                 StreamEvent::Error {
                     reason,
                     error: self.partial.clone(),
                 }
             }
-            PiMessagesEvent::Start => StreamEvent::Start {
+            RpiMessagesEvent::Start => StreamEvent::Start {
                 partial: Arc::new(self.partial.clone()),
             },
-            PiMessagesEvent::TextStart { content_index } => {
+            RpiMessagesEvent::TextStart { content_index } => {
                 *content_slot(&mut self.partial.content, content_index) =
                     AssistantContent::Text(TextContent::default());
                 StreamEvent::TextStart {
@@ -418,7 +430,7 @@ impl EventConverter {
                     partial: Arc::new(self.partial.clone()),
                 }
             }
-            PiMessagesEvent::TextDelta {
+            RpiMessagesEvent::TextDelta {
                 content_index,
                 delta,
             } => {
@@ -435,7 +447,7 @@ impl EventConverter {
                     partial: Arc::new(self.partial.clone()),
                 }
             }
-            PiMessagesEvent::TextEnd {
+            RpiMessagesEvent::TextEnd {
                 content_index,
                 content,
                 content_signature,
@@ -459,7 +471,7 @@ impl EventConverter {
                     partial: Arc::new(self.partial.clone()),
                 }
             }
-            PiMessagesEvent::ThinkingStart { content_index } => {
+            RpiMessagesEvent::ThinkingStart { content_index } => {
                 *content_slot(&mut self.partial.content, content_index) =
                     AssistantContent::Thinking(ThinkingContent::default());
                 StreamEvent::ThinkingStart {
@@ -467,7 +479,7 @@ impl EventConverter {
                     partial: Arc::new(self.partial.clone()),
                 }
             }
-            PiMessagesEvent::ThinkingDelta {
+            RpiMessagesEvent::ThinkingDelta {
                 content_index,
                 delta,
             } => {
@@ -482,7 +494,7 @@ impl EventConverter {
                     partial: Arc::new(self.partial.clone()),
                 }
             }
-            PiMessagesEvent::ThinkingEnd {
+            RpiMessagesEvent::ThinkingEnd {
                 content_index,
                 content,
                 content_signature,
@@ -509,7 +521,7 @@ impl EventConverter {
                     partial: Arc::new(self.partial.clone()),
                 }
             }
-            PiMessagesEvent::ToolCallStart {
+            RpiMessagesEvent::ToolCallStart {
                 content_index,
                 id,
                 tool_name,
@@ -529,7 +541,7 @@ impl EventConverter {
                     partial: Arc::new(self.partial.clone()),
                 }
             }
-            PiMessagesEvent::ToolCallDelta {
+            RpiMessagesEvent::ToolCallDelta {
                 content_index,
                 delta,
             } => {
@@ -552,7 +564,7 @@ impl EventConverter {
                     partial: Arc::new(self.partial.clone()),
                 }
             }
-            PiMessagesEvent::ToolCallEnd {
+            RpiMessagesEvent::ToolCallEnd {
                 content_index,
                 tool_call,
             } => {
@@ -561,9 +573,18 @@ impl EventConverter {
                 let slot = content_slot(&mut self.partial.content, content_index);
                 match slot {
                     AssistantContent::ToolCall(existing) => {
-                        existing.id = tool_call.id;
-                        existing.name = tool_call.name;
-                        existing.arguments = tool_call.arguments;
+                        // `Object.assign(partial.content[i], event.toolCall)`
+                        // copies every field the server sent, including the
+                        // final-argument error and the namespace. The local
+                        // thought signature survives when the server omits it.
+                        existing.id = tool_call.id.clone();
+                        existing.name = tool_call.name.clone();
+                        existing.arguments = tool_call.arguments.clone();
+                        existing.namespace = tool_call.namespace.clone();
+                        existing.arguments_error = tool_call.arguments_error.clone();
+                        if tool_call.thought_signature.is_some() {
+                            existing.thought_signature = tool_call.thought_signature.clone();
+                        }
                     }
                     other => {
                         *other = AssistantContent::ToolCall(tool_call);
@@ -585,13 +606,13 @@ impl EventConverter {
 }
 
 // ---------------------------------------------------------------------------
-// SSE reader (`readPiMessagesEvents` / `parsePiMessagesEvent`)
+// SSE reader: event splitting and incremental UTF-8 decoding.
 // ---------------------------------------------------------------------------
 
 /// Incremental UTF-8 decode mirroring `TextDecoder` with `{ stream: true }`
 /// (invalid sequences become U+FFFD; an incomplete tail stays buffered
 /// unless `flush`). Same logic as `api::sse`, duplicated because the
-/// pi-messages frame splitter differs from the generic SSE decoder.
+/// rpi-messages frame splitter differs from the generic SSE decoder.
 fn decode_utf8_streaming(tail: &mut Vec<u8>, flush: bool) -> String {
     let mut decoded = String::new();
     let mut bytes = std::mem::take(tail);
@@ -631,10 +652,10 @@ fn decode_utf8_streaming(tail: &mut Vec<u8>, flush: bool) -> String {
     decoded
 }
 
-/// `parsePiMessagesEvent`: the first `data:` line of a raw block, trimmed;
+/// Parse one event: the first `data:` line of a raw block, trimmed;
 /// empty or `[DONE]` yields no event. Malformed JSON is an error (upstream
 /// `JSON.parse` throws).
-fn parse_pi_messages_event(raw: &str) -> Result<Option<PiMessagesEvent>, String> {
+fn parse_rpi_messages_event(raw: &str) -> Result<Option<RpiMessagesEvent>, String> {
     let data = raw
         .split('\n')
         .find(|line| line.starts_with("data:"))
@@ -647,23 +668,23 @@ fn parse_pi_messages_event(raw: &str) -> Result<Option<PiMessagesEvent>, String>
     }
 }
 
-/// `readPiMessagesEvents`: buffer chunks, normalize `\r\n` to `\n`, and split
+/// Read events: buffer chunks, normalize `\r\n` to `\n`, and split
 /// events on blank lines; a non-empty tail is parsed at end-of-stream.
 ///
 /// P2 (rc.12 review): like the shared [`SseDecoder`](crate::api::sse), the
 /// *unterminated* tail is capped — a gateway streaming bytes without a
 /// blank-line separator would otherwise grow the buffer unbounded until the
 /// idle timeout (same memory-amplification class rc.11 P2-4 closed for SSE).
-const MAX_PI_MESSAGES_TAIL_BYTES: usize = 1024 * 1024;
+const MAX_RPI_MESSAGES_TAIL_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
-struct PiMessagesEventReader {
+struct RpiMessagesEventReader {
     utf8_tail: Vec<u8>,
     buffer: String,
 }
 
-impl PiMessagesEventReader {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<PiMessagesEvent>, String> {
+impl RpiMessagesEventReader {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<RpiMessagesEvent>, String> {
         self.utf8_tail.extend_from_slice(bytes);
         let decoded = decode_utf8_streaming(&mut self.utf8_tail, false);
         self.buffer.push_str(&decoded);
@@ -672,7 +693,7 @@ impl PiMessagesEventReader {
         while let Some(split) = self.buffer.find("\n\n") {
             let raw = self.buffer[..split].to_owned();
             self.buffer.drain(..split + 2);
-            if let Some(event) = parse_pi_messages_event(&raw)? {
+            if let Some(event) = parse_rpi_messages_event(&raw)? {
                 events.push(event);
             }
         }
@@ -680,7 +701,7 @@ impl PiMessagesEventReader {
         Ok(events)
     }
 
-    fn finish(mut self) -> Result<Vec<PiMessagesEvent>, String> {
+    fn finish(mut self) -> Result<Vec<RpiMessagesEvent>, String> {
         let decoded = decode_utf8_streaming(&mut self.utf8_tail, true);
         self.buffer.push_str(&decoded);
         self.buffer = self.buffer.replace("\r\n", "\n");
@@ -689,15 +710,15 @@ impl PiMessagesEventReader {
             return Ok(Vec::new());
         }
         let raw = std::mem::take(&mut self.buffer);
-        Ok(parse_pi_messages_event(&raw)?.into_iter().collect())
+        Ok(parse_rpi_messages_event(&raw)?.into_iter().collect())
     }
 
     /// The unterminated tail must stay bounded (see
-    /// [`MAX_PI_MESSAGES_TAIL_BYTES`]).
+    /// [`MAX_RPI_MESSAGES_TAIL_BYTES`]).
     fn check_tail_bound(&self) -> Result<(), String> {
-        if self.buffer.len() > MAX_PI_MESSAGES_TAIL_BYTES {
+        if self.buffer.len() > MAX_RPI_MESSAGES_TAIL_BYTES {
             return Err(format!(
-                "pi-messages event exceeds {MAX_PI_MESSAGES_TAIL_BYTES} bytes \
+                "rpi-messages event exceeds {MAX_RPI_MESSAGES_TAIL_BYTES} bytes \
                  without a blank-line separator — malformed stream"
             ));
         }
@@ -710,7 +731,7 @@ impl PiMessagesEventReader {
 // ---------------------------------------------------------------------------
 
 /// `createErrorEvent` message construction: a fresh zero-usage assistant
-/// message (not the partial), with a `pi_messages_response_failure`
+/// message (not the partial), with a `rpi_messages_response_failure`
 /// diagnostic for non-abort HTTP response failures.
 fn create_error_message(model: &Model, failure: StreamFailure, aborted: bool) -> AssistantMessage {
     let mut message = AssistantMessage {
@@ -726,10 +747,10 @@ fn create_error_message(model: &Model, failure: StreamFailure, aborted: bool) ->
         append_diagnostic(
             &mut message,
             AssistantMessageDiagnostic {
-                kind: "pi_messages_response_failure".to_owned(),
+                kind: "rpi_messages_response_failure".to_owned(),
                 timestamp: now_ms(),
                 error: Some(DiagnosticErrorInfo {
-                    name: Some("PiMessagesResponseError".to_owned()),
+                    name: Some("RpiMessagesResponseError".to_owned()),
                     message: response_error.message,
                     stack: None,
                     code: response_error.code.map(NumberOrString::String),
@@ -758,7 +779,7 @@ fn create_error_message(model: &Model, failure: StreamFailure, aborted: bool) ->
 async fn run(
     model: &Model,
     context: &TranscriptContext,
-    options: &PiMessagesOptions,
+    options: &RpiMessagesOptions,
     events: &AssistantMessageEventStream,
 ) -> Result<(), StreamFailure> {
     let Some(api_key) = options.stream.api_key.as_deref() else {
@@ -884,7 +905,7 @@ async fn run(
         let status_text = status.canonical_reason().unwrap_or("").to_owned();
         let body = response.text().await.unwrap_or_default();
         let error =
-            create_pi_messages_response_error(model, &url, status.as_u16(), &status_text, &body);
+            create_rpi_messages_response_error(model, &url, status.as_u16(), &status_text, &body);
         return Err(StreamFailure {
             message: error.message.clone(),
             response_error: Some(error),
@@ -892,7 +913,7 @@ async fn run(
     }
 
     let mut converter = EventConverter::new(model);
-    let mut reader = PiMessagesEventReader::default();
+    let mut reader = RpiMessagesEventReader::default();
     // Inter-chunk idle timeout (upstream bodyTimeout; see
     // api::stream_timeouts).
     let mut byte_stream =
@@ -934,14 +955,14 @@ async fn run(
 fn push_converted(
     converter: &mut EventConverter,
     events: &AssistantMessageEventStream,
-    parsed: Vec<PiMessagesEvent>,
+    parsed: Vec<RpiMessagesEvent>,
 ) -> bool {
-    for pi_event in parsed {
+    for rpi_event in parsed {
         let terminal = matches!(
-            pi_event,
-            PiMessagesEvent::Done { .. } | PiMessagesEvent::Error { .. }
+            rpi_event,
+            RpiMessagesEvent::Done { .. } | RpiMessagesEvent::Error { .. }
         );
-        events.push(converter.convert(pi_event));
+        events.push(converter.convert(rpi_event));
         if terminal {
             return true;
         }
@@ -949,11 +970,11 @@ fn push_converted(
     false
 }
 
-/// `stream` (pi-messages).
+/// `stream` (rpi-messages).
 pub fn stream(
     model: &Model,
     context: &TranscriptContext,
-    options: PiMessagesOptions,
+    options: RpiMessagesOptions,
 ) -> AssistantMessageEventStream {
     let event_stream = AssistantMessageEventStream::new();
     let task_stream = event_stream.clone();
@@ -983,7 +1004,7 @@ pub fn stream(
     event_stream
 }
 
-/// `streamSimple` (pi-messages). Upstream also smuggles `debug` off the
+/// `streamSimple` (rpi-messages). Upstream also smuggles `debug` off the
 /// options object; `toolChoice` forwards verbatim into the request options
 /// (pi-messages.ts:438 — the gateway takes the same `"auto" | "none"`
 /// literals). rpi's [`SimpleStreamOptions`] has no `debug` field, so only
@@ -997,7 +1018,7 @@ pub fn stream_simple(
     Ok(stream(
         model,
         context,
-        PiMessagesOptions {
+        RpiMessagesOptions {
             stream: options
                 .as_ref()
                 .map(|options| options.stream.clone())
@@ -1016,13 +1037,13 @@ pub fn stream_simple(
 
 /// `ProviderStreams` implementation for `ApiKind::RPI_MESSAGES`.
 ///
-/// The trait carries plain [`StreamOptions`]; pi-messages extras
-/// ([`PiMessagesOptions`]) reach [`stream`] only through direct calls or via
+/// The trait carries plain [`StreamOptions`]; rpi-messages extras
+/// ([`RpiMessagesOptions`]) reach [`stream`] only through direct calls or via
 /// [`stream_simple`] reasoning mapping (design §3.3 collapses per-API extras).
 #[derive(Debug, Clone, Copy, Default)]
-pub struct PiMessages;
+pub struct RpiMessages;
 
-impl ProviderStreams for PiMessages {
+impl ProviderStreams for RpiMessages {
     fn stream(
         &self,
         model: &Model,
@@ -1032,9 +1053,9 @@ impl ProviderStreams for PiMessages {
         stream(
             model,
             context,
-            PiMessagesOptions {
+            RpiMessagesOptions {
                 stream: options.unwrap_or_default(),
-                ..PiMessagesOptions::default()
+                ..RpiMessagesOptions::default()
             },
         )
     }
@@ -1054,41 +1075,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_pi_messages_event_first_data_line() {
+    fn test_parse_rpi_messages_event_first_data_line() {
         // Only the first `data:` line is read; other fields are ignored.
         let event =
-            parse_pi_messages_event("event: something\ndata: {\"type\":\"start\"}\ndata: {}")
+            parse_rpi_messages_event("event: something\ndata: {\"type\":\"start\"}\ndata: {}")
                 .expect("parses");
-        assert_eq!(event, Some(PiMessagesEvent::Start));
+        assert_eq!(event, Some(RpiMessagesEvent::Start));
     }
 
     #[test]
-    fn test_parse_pi_messages_event_skips_empty_and_done_sentinel() {
-        assert_eq!(parse_pi_messages_event("data:").expect("ok"), None);
-        assert_eq!(parse_pi_messages_event("data: [DONE]").expect("ok"), None);
-        assert_eq!(parse_pi_messages_event(": comment").expect("ok"), None);
+    fn test_parse_rpi_messages_event_skips_empty_and_done_sentinel() {
+        assert_eq!(parse_rpi_messages_event("data:").expect("ok"), None);
+        assert_eq!(parse_rpi_messages_event("data: [DONE]").expect("ok"), None);
+        assert_eq!(parse_rpi_messages_event(": comment").expect("ok"), None);
     }
 
     #[test]
-    fn test_parse_pi_messages_event_malformed_json_errors() {
-        assert!(parse_pi_messages_event("data: {oops").is_err());
+    fn test_parse_rpi_messages_event_malformed_json_errors() {
+        assert!(parse_rpi_messages_event("data: {oops").is_err());
     }
 
     #[test]
     fn test_reader_crlf_split_chunks_and_trailing_block() {
-        let mut reader = PiMessagesEventReader::default();
+        let mut reader = RpiMessagesEventReader::default();
         // CRLF normalizes; an event split across chunks completes on the
         // blank line; the final block has no trailing blank line.
         let first = reader
             .feed(b"data: {\"type\":\"start\"}\r\n\r\ndata: {\"type\":\"text")
             .expect("feed");
-        assert_eq!(first, vec![PiMessagesEvent::Start]);
+        assert_eq!(first, vec![RpiMessagesEvent::Start]);
         let second = reader
             .feed(b"_start\",\"contentIndex\":0}\n\n")
             .expect("feed");
         assert_eq!(
             second,
-            vec![PiMessagesEvent::TextStart { content_index: 0 }]
+            vec![RpiMessagesEvent::TextStart { content_index: 0 }]
         );
         let third = reader
             .feed(b"data: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"hi\"}")
@@ -1097,7 +1118,7 @@ mod tests {
         let tail = reader.finish().expect("finish");
         assert_eq!(
             tail,
-            vec![PiMessagesEvent::TextDelta {
+            vec![RpiMessagesEvent::TextDelta {
                 content_index: 0,
                 delta: "hi".to_owned(),
             }]
@@ -1109,12 +1130,12 @@ mod tests {
         let full = "data: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"🙈\"}\n\n";
         let bytes = full.as_bytes();
         let cut = bytes.len() / 2;
-        let mut reader = PiMessagesEventReader::default();
+        let mut reader = RpiMessagesEventReader::default();
         assert!(reader.feed(&bytes[..cut]).expect("feed").is_empty());
         let events = reader.feed(&bytes[cut..]).expect("feed");
         assert_eq!(
             events,
-            vec![PiMessagesEvent::TextDelta {
+            vec![RpiMessagesEvent::TextDelta {
                 content_index: 0,
                 delta: "🙈".to_owned(),
             }]
@@ -1149,17 +1170,17 @@ mod tests {
     #[test]
     fn test_error_body_parsing_and_format() {
         let body = r#"{"error":{"message":"Token expired","code":"unauthorized"}}"#;
-        let error_body = parse_pi_messages_error_body(body);
+        let error_body = parse_rpi_messages_error_body(body);
         assert!(error_body.is_some());
         assert_eq!(
-            format_pi_messages_response_error(401, "Unauthorized", body, error_body.as_ref()),
+            format_rpi_messages_response_error(401, "Unauthorized", body, error_body.as_ref()),
             "401 Unauthorized: Token expired (unauthorized)"
         );
         // Non-JSON and non-object `error` bodies fall back to the raw body.
-        assert!(parse_pi_messages_error_body("not json").is_none());
-        assert!(parse_pi_messages_error_body(r#"{"error":"x"}"#).is_none());
+        assert!(parse_rpi_messages_error_body("not json").is_none());
+        assert!(parse_rpi_messages_error_body(r#"{"error":"x"}"#).is_none());
         assert_eq!(
-            format_pi_messages_response_error(500, "Server Error", "raw body", None),
+            format_rpi_messages_response_error(500, "Server Error", "raw body", None),
             "500 Server Error: raw body"
         );
     }

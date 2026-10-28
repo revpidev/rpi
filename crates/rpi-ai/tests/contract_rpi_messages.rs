@@ -1,4 +1,4 @@
-//! Contract tests for the pi-messages adapter, porting the intent of
+//! Contract tests for the rpi-messages adapter, porting the intent of
 //! `packages/ai/test/pi-messages.test.ts` @ pi 0.82.1 (2efa728): drive
 //! `stream()` over a scripted loopback HTTP server and assert both sides of
 //! the contract — the request shape (method / path / headers / body JSON) and
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use rpi_ai::api::pi_messages::{PiMessages, PiMessagesOptions, stream};
+use rpi_ai::api::rpi_messages::{RpiMessages, RpiMessagesOptions, stream};
 use rpi_ai::models::ProviderStreams;
 use rpi_ai::types::{
     ApiKind, AssistantContent, Context, Model, ProviderResponse, StopReason, StreamEvent,
@@ -197,7 +197,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Upstream `createModel`: the Radius "auto" model on the given base URL.
 fn create_model(base_url: &str) -> Model {
     serde_json::from_value(json!({
-        "id": "auto", "name": "Radius Auto", "api": "pi-messages", "provider": "radius",
+        "id": "auto", "name": "Radius Auto", "api": "rpi-messages", "provider": "radius",
         "baseUrl": base_url, "reasoning": false, "input": ["text"],
         "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.1, "cacheWrite": 0.2},
         "contextWindow": 128000, "maxTokens": 16384
@@ -258,8 +258,67 @@ fn api_key_options() -> StreamOptions {
 }
 
 // ---------------------------------------------------------------------------
-// pi-messages describe block
+// rpi-messages describe block
 // ---------------------------------------------------------------------------
+
+/// R2.6.4: the server-authoritative `toolcall_end` may carry an
+/// `argumentsError` and a namespace. Both must survive into the terminal
+/// message (and the ToolCallEnd event) so a malformed final call is rejected
+/// instead of executing the empty `{}` fallback.
+#[tokio::test]
+async fn test_toolcall_end_preserves_arguments_error_and_namespace() {
+    let (base_url, _captured) = serve(vec![ScriptResponse::sse(vec![
+        json!({"type": "start"}),
+        json!({"type": "toolcall_start", "contentIndex": 0, "id": "call_1", "toolName": "read"}),
+        json!({
+            "type": "toolcall_end", "contentIndex": 0,
+            "toolCall": {
+                "type": "toolCall", "id": "call_1", "name": "read",
+                "arguments": {}, "namespace": "mcp__docs",
+                "argumentsError": "malformed final arguments"
+            }
+        }),
+        json!({"type": "done", "reason": "toolUse", "usage": usage_json()}),
+    ])])
+    .await;
+    let model = create_model(&format!("{base_url}/v1"));
+
+    let event_stream = stream(
+        &model,
+        &context(),
+        RpiMessagesOptions {
+            stream: api_key_options(),
+            ..RpiMessagesOptions::default()
+        },
+    );
+    let result_future = event_stream.result();
+    let events = collect(event_stream).await;
+    let message = result_future.await.expect("message");
+
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    let AssistantContent::ToolCall(call) = &message.content[0] else {
+        panic!("expected a toolCall block");
+    };
+    assert!(call.arguments.is_empty());
+    assert_eq!(call.namespace.as_deref(), Some("mcp__docs"));
+    assert_eq!(
+        call.arguments_error.as_deref(),
+        Some("malformed final arguments")
+    );
+
+    let end = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+            _ => None,
+        })
+        .expect("toolcall_end event");
+    assert_eq!(end.namespace.as_deref(), Some("mcp__docs"));
+    assert_eq!(
+        end.arguments_error.as_deref(),
+        Some("malformed final arguments")
+    );
+}
 
 /// Upstream: "streams text and tool calls and resolves the terminal message".
 #[tokio::test]
@@ -277,7 +336,7 @@ async fn test_streams_text_and_tool_calls_and_resolves_the_terminal_message() {
             "type": "toolcall_end", "contentIndex": 1,
             "toolCall": {"type": "toolCall", "id": "call_1", "name": "read", "arguments": {"path": "a.txt"}}
         }),
-        json!({"type": "done", "reason": "toolUse", "usage": usage_json(), "responseId": "resp_1"}),
+        json!({"type": "done", "reason": "toolUse", "usage": usage_json(), "responseId": "resp_1", "providerThinkingLevel": "high"}),
     ])])
     .await;
     let model = create_model(&format!("{base_url}/v1"));
@@ -285,7 +344,7 @@ async fn test_streams_text_and_tool_calls_and_resolves_the_terminal_message() {
     let event_stream = stream(
         &model,
         &context(),
-        PiMessagesOptions {
+        RpiMessagesOptions {
             stream: StreamOptions {
                 session_id: Some("session-1".to_owned()),
                 max_tokens: Some(100),
@@ -301,7 +360,7 @@ async fn test_streams_text_and_tool_calls_and_resolves_the_terminal_message() {
                 ..StreamOptions::default()
             },
             tool_choice: Some(json!("auto")),
-            ..PiMessagesOptions::default()
+            ..RpiMessagesOptions::default()
         },
     );
     let result_future = event_stream.result();
@@ -328,6 +387,7 @@ async fn test_streams_text_and_tool_calls_and_resolves_the_terminal_message() {
 
     assert_eq!(message.stop_reason, StopReason::ToolUse);
     assert_usage_fixture(&message);
+    assert_eq!(message.provider_thinking_level.as_deref(), Some("high"));
     assert_eq!(message.response_id.as_deref(), Some("resp_1"));
     assert_eq!(message.model, "auto");
     assert_eq!(message.provider, "radius");
@@ -393,9 +453,9 @@ async fn test_streams_thinking_blocks_with_signature_and_redacted_flag() {
     let event_stream = stream(
         &model,
         &context(),
-        PiMessagesOptions {
+        RpiMessagesOptions {
             stream: api_key_options(),
-            ..PiMessagesOptions::default()
+            ..RpiMessagesOptions::default()
         },
     );
     let message = result(&event_stream).await;
@@ -427,7 +487,7 @@ async fn test_streams_thinking_blocks_with_signature_and_redacted_flag() {
 /// Upstream: "appends debug=1 and reports response headers via onResponse".
 /// Upstream smuggles `debug` through `streamSimple`; rpi's
 /// `SimpleStreamOptions` cannot carry it (D-021), so `stream` is called
-/// directly with `PiMessagesOptions::debug`.
+/// directly with `RpiMessagesOptions::debug`.
 #[tokio::test]
 async fn test_appends_debug_1_and_reports_response_headers_via_on_response() {
     let (base_url, mut captured) = serve(vec![
@@ -444,7 +504,7 @@ async fn test_appends_debug_1_and_reports_response_headers_via_on_response() {
     let event_stream = stream(
         &model,
         &context(),
-        PiMessagesOptions {
+        RpiMessagesOptions {
             stream: StreamOptions {
                 request: rpi_ai::ProviderRequestOptions {
                     on_response: Some(Arc::new(move |response, _model| {
@@ -458,7 +518,7 @@ async fn test_appends_debug_1_and_reports_response_headers_via_on_response() {
                 ..api_key_options()
             },
             debug: Some(true),
-            ..PiMessagesOptions::default()
+            ..RpiMessagesOptions::default()
         },
     );
     let message = result(&event_stream).await;
@@ -494,7 +554,7 @@ async fn test_surfaces_backend_error_responses_with_diagnostics() {
     let event_stream = stream(
         &model,
         &context(),
-        PiMessagesOptions {
+        RpiMessagesOptions {
             stream: StreamOptions {
                 request: rpi_ai::ProviderRequestOptions {
                     api_key: Some("stale".to_owned()),
@@ -502,7 +562,7 @@ async fn test_surfaces_backend_error_responses_with_diagnostics() {
                 },
                 ..StreamOptions::default()
             },
-            ..PiMessagesOptions::default()
+            ..RpiMessagesOptions::default()
         },
     );
     let message = result(&event_stream).await;
@@ -514,13 +574,13 @@ async fn test_surfaces_backend_error_responses_with_diagnostics() {
     assert!(error_message.contains("Token expired"), "{error_message}");
     assert!(error_message.contains("unauthorized"), "{error_message}");
     let diagnostics = message.diagnostics.as_ref().expect("diagnostics");
-    assert_eq!(diagnostics[0].kind, "pi_messages_response_failure");
+    assert_eq!(diagnostics[0].kind, "rpi_messages_response_failure");
     let details = diagnostics[0].details.as_ref().expect("details");
     assert_eq!(details.get("status"), Some(&json!(401)));
 }
 
 /// Rewrite-diagnostic anchor (requirements §5.2, design §3.3): a `done`/`error`
-/// event carrying `rewrite` appends a `pi_messages_rewrite` diagnostic.
+/// event carrying `rewrite` appends a `rpi_messages_rewrite` diagnostic.
 #[tokio::test]
 async fn test_appends_rewrite_diagnostic_from_done_event() {
     let rewrite = json!({
@@ -540,9 +600,9 @@ async fn test_appends_rewrite_diagnostic_from_done_event() {
     let event_stream = stream(
         &model,
         &context(),
-        PiMessagesOptions {
+        RpiMessagesOptions {
             stream: api_key_options(),
-            ..PiMessagesOptions::default()
+            ..RpiMessagesOptions::default()
         },
     );
     let message = result(&event_stream).await;
@@ -551,7 +611,7 @@ async fn test_appends_rewrite_diagnostic_from_done_event() {
     assert_eq!(message.stop_reason, StopReason::Stop);
     let diagnostics = message.diagnostics.as_ref().expect("diagnostics");
     assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].kind, "pi_messages_rewrite");
+    assert_eq!(diagnostics[0].kind, "rpi_messages_rewrite");
     assert!(diagnostics[0].error.is_none());
     let details = diagnostics[0].details.as_ref().expect("details");
     assert_eq!(details.get("policyId"), Some(&json!("gateway-policy")));
@@ -564,7 +624,7 @@ async fn test_appends_rewrite_diagnostic_from_done_event() {
 async fn test_propagates_server_sent_error_events() {
     let (base_url, _captured) = serve(vec![ScriptResponse::sse(vec![
         json!({"type": "start"}),
-        json!({"type": "error", "reason": "error", "usage": usage_json(), "errorMessage": "Upstream failed"}),
+        json!({"type": "error", "reason": "error", "usage": usage_json(), "errorMessage": "Upstream failed", "providerThinkingLevel": "high"}),
     ])])
     .await;
     let model = create_model(&format!("{base_url}/v1"));
@@ -572,9 +632,9 @@ async fn test_propagates_server_sent_error_events() {
     let event_stream = stream(
         &model,
         &context(),
-        PiMessagesOptions {
+        RpiMessagesOptions {
             stream: api_key_options(),
-            ..PiMessagesOptions::default()
+            ..RpiMessagesOptions::default()
         },
     );
     let message = result(&event_stream).await;
@@ -582,6 +642,7 @@ async fn test_propagates_server_sent_error_events() {
 
     assert_eq!(message.stop_reason, StopReason::Error);
     assert_eq!(message.error_message.as_deref(), Some("Upstream failed"));
+    assert_eq!(message.provider_thinking_level.as_deref(), Some("high"));
     assert_usage_fixture(&message);
     assert!(matches!(events.last(), Some(StreamEvent::Error { .. })));
 }
@@ -591,7 +652,7 @@ async fn test_propagates_server_sent_error_events() {
 async fn test_errors_when_no_api_key_is_provided() {
     let model = create_model("http://127.0.0.1:1/v1");
 
-    let event_stream = stream(&model, &context(), PiMessagesOptions::default());
+    let event_stream = stream(&model, &context(), RpiMessagesOptions::default());
     let message = result(&event_stream).await;
     collect(event_stream).await;
 
@@ -617,9 +678,9 @@ async fn test_errors_when_the_stream_ends_without_a_terminal_event() {
     let event_stream = stream(
         &model,
         &context(),
-        PiMessagesOptions {
+        RpiMessagesOptions {
             stream: api_key_options(),
-            ..PiMessagesOptions::default()
+            ..RpiMessagesOptions::default()
         },
     );
     let message = result(&event_stream).await;
@@ -634,19 +695,19 @@ async fn test_errors_when_the_stream_ends_without_a_terminal_event() {
 }
 
 // ---------------------------------------------------------------------------
-// pi-messages api registration describe block
+// rpi-messages api registration describe block
 // ---------------------------------------------------------------------------
 
 /// Upstream: "is a known api usable on models". The "is registered as a
 /// builtin api provider" case has no rpi counterpart yet (no builtin provider
-/// registry in rpi-ai); `PiMessages` implements `ProviderStreams`, which is
+/// registry in rpi-ai); `RpiMessages` implements `ProviderStreams`, which is
 /// what a registry entry would wrap.
 #[tokio::test]
 async fn test_is_a_known_api_usable_on_models() {
     assert_eq!(ApiKind::RPI_MESSAGES, "rpi-messages");
     // Legacy alias from the pre-rename spelling still resolves.
     assert_eq!(ApiKind::from("pi-messages").as_str(), "rpi-messages");
-    let streams: &dyn ProviderStreams = &PiMessages;
+    let streams: &dyn ProviderStreams = &RpiMessages;
     let model = create_model("http://127.0.0.1:1/v1");
     // Dispatching through the trait yields the same missing-key error stream.
     let event_stream = streams.stream(&model, &context(), None);

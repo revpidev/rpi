@@ -356,7 +356,7 @@ pub fn convert_responses_messages(
         }
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         let call_id = format!(
-            "pi_tool_load_{}",
+            "rpi_tool_load_{}",
             short_hash(&format!("{seed}:{}", names.join(",")))
         );
         messages.push(json!({

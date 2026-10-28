@@ -23,7 +23,7 @@ pub mod openai_prompt_cache;
 pub mod openai_responses;
 pub mod openai_responses_shared;
 pub mod openrouter_images;
-pub mod pi_messages;
+pub mod rpi_messages;
 pub mod session_affinity;
 pub mod simple_options;
 pub mod sse;

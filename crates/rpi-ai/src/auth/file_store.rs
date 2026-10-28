@@ -1376,7 +1376,7 @@ mod tests {
         include_str!("../../../../fixtures/generated/auth/auth-dsl.json");
 
     #[test]
-    fn pi_auth_json_fixture_parses() {
+    fn rpi_auth_json_fixture_parses() {
         let data = parse_storage_data(Some(AUTH_FIXTURE)).expect("fixture parses");
         assert_eq!(data.len(), 2);
         let anthropic = match data

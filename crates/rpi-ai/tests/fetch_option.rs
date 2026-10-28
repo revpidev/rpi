@@ -198,10 +198,10 @@ async fn passes_fetch_through_stream_simple_to_openai_sdk_adapters() {
     assert_eq!(probe.calls(), 3, "one custom fetch call per adapter");
 }
 
-/// Upstream: "uses fetch for Mistral, Codex SSE, and pi-messages HTTP
+/// Upstream: "uses fetch for Mistral, Codex SSE, and rpi-messages HTTP
 /// requests".
 #[tokio::test]
-async fn uses_fetch_for_mistral_codex_sse_and_pi_messages() {
+async fn uses_fetch_for_mistral_codex_sse_and_rpi_messages() {
     let probe = FetchProbe::default();
 
     let mistral = model(
@@ -245,10 +245,10 @@ async fn uses_fetch_for_mistral_codex_sse_and_pi_messages() {
         terminal_error_message(&events)
     );
 
-    let pi = model("pi-messages", "test-provider", UNROUTABLE, json!({}));
+    let rpi_model = model("rpi-messages", "test-provider", UNROUTABLE, json!({}));
     let events = collect(
-        rpi_ai::api::pi_messages::stream_simple(
-            &pi,
+        rpi_ai::api::rpi_messages::stream_simple(
+            &rpi_model,
             &rpi_ai::utils::transcript::normalize_context(&context()),
             Some(simple_options(canned_fetch(&probe), "test-key")),
         )

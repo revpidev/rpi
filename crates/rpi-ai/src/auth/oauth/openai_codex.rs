@@ -84,9 +84,8 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const LOGIN_METHOD_BROWSER: &str = "browser";
 /// `OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD`.
 const LOGIN_METHOD_DEVICE_CODE: &str = "device_code";
-/// Default `originator` (`createAuthorizationFlow(originator = "pi")`).
-/// Default `originator` (upstream "pi"; ADR-0001 brand rename). Overridable
-/// through `LoginOptions.agentName`.
+/// Default `originator` (upstream `createAuthorizationFlow(originator = "pi")`;
+/// ADR-0001 brand rename). Overridable through `LoginOptions.agentName`.
 const ORIGINATOR: &str = "rpi";
 
 fn error(message: impl Into<String>) -> ModelsError {
