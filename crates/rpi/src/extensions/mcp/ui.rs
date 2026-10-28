@@ -594,8 +594,14 @@ impl McpBuiltinState {
         // Upstream requires the registered tool to declare `reachesTools`; a
         // foreign extension's same-named tool without it is never activated
         // or treated as reachable (mcp/index.ts:511-516).
-        let declares_reach =
-            |name: &str| ctx.tool_reaches(name, json!({})).ok().flatten().is_some();
+        // Presence comes from ToolInfo (`reachesTools: true`); the callable
+        // word list remains behind HostActions::tool_reaches.
+        let declares_reach = |name: &str| {
+            tools.iter().any(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some(name)
+                    && tool.get("reachesTools").and_then(Value::as_bool) == Some(true)
+            })
+        };
         let has_codemode = tools.iter().any(|tool| {
             tool.get("name").and_then(Value::as_str)
                 == Some(super::super::codemode::tool::CODEMODE_TOOL_NAME)

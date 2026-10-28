@@ -3360,7 +3360,15 @@ impl AgentSession {
     /// A user/API call replaces the restored loadout, so any pending/suppressed
     /// state from the transcript restore no longer applies.
     pub fn set_active_tools_by_name(&self, tool_names: Vec<String>) {
-        self.clear_tool_restore_state();
+        // Upstream keeps restored pending names when the new loadout only
+        // adds tools; deactivating a current tool clears them. Explicitly
+        // activating a previously suppressed name lifts that suppression.
+        let previous = self.get_active_tool_names();
+        let deactivates = previous.iter().any(|name| !tool_names.contains(name));
+        if deactivates {
+            lock(&self.inner.pending_tool_names).clear();
+        }
+        lock(&self.inner.suppressed_tool_names).retain(|name| !tool_names.contains(name));
         self.apply_active_tool_names(tool_names);
     }
 
@@ -3374,11 +3382,6 @@ impl AgentSession {
         // #9548: rebuilding only refreshes the base options — the live
         // prompt rides the transcript's system messages.
         self.rebuild_system_prompt(&valid_names);
-    }
-
-    fn clear_tool_restore_state(&self) {
-        lock(&self.inner.pending_tool_names).clear();
-        lock(&self.inner.suppressed_tool_names).clear();
     }
 
     /// `_applyToolLoadout` (agent-session.ts:1528-1569 @ 4a080252f): the
@@ -4158,9 +4161,6 @@ impl AgentSession {
             .agent_run_abort_requested
             .store(false, Ordering::SeqCst);
         self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
-        // Upstream clears restored-but-unregistered names at run start
-        // (`_pendingToolNames.clear()`, agent-session.ts:1895-1897).
-        lock(&self.inner.pending_tool_names).clear();
         self.inner.idle_notify.notify_waiters();
     }
 
@@ -4425,6 +4425,14 @@ impl AgentSession {
                     return Err(error);
                 }
             };
+            // Upstream clears restored-but-unregistered names after
+            // preparation succeeds (`_pendingToolNames.clear()`,
+            // agent-session.ts:1895-1897); a failed preparation keeps them.
+            lock(&self.inner.pending_tool_names).clear();
+            // Upstream clears restored-but-unregistered names after
+            // preparation succeeds (`_pendingToolNames.clear()`,
+            // agent-session.ts:1895-1897); a failed preparation keeps them.
+            lock(&self.inner.pending_tool_names).clear();
             // Held while the run was starting: they go before its starting
             // messages, as they would have while idle.
             self.flush_pending_bash_messages();
@@ -4734,6 +4742,7 @@ impl AgentSession {
                 return Err(error);
             }
         };
+        lock(&self.inner.pending_tool_names).clear();
         self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
         self.run_agent_prompt(messages).await
