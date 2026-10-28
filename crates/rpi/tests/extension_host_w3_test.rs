@@ -537,6 +537,7 @@ fn register_tool(api: &ExtensionApi, name: &str, execute: ext::ToolExecuteFn) {
         output_schema: None,
         default_active: None,
         prepare_loadout: None,
+        reaches_tools: None,
     })
     .expect("register tool");
 }
@@ -1377,6 +1378,7 @@ async fn w3_exposure_override_reaches_the_loadout_hook() {
         }),
         render_call: None,
         render_result: None,
+        reaches_tools: None,
     })
     .expect("register hook tool");
 
@@ -1447,6 +1449,7 @@ async fn w3_hidden_tools_are_invisible_to_tool_search() {
         }),
         render_call: None,
         render_result: None,
+        reaches_tools: None,
     })
     .expect("register deferred probe");
 

@@ -357,6 +357,7 @@ pub fn create_tool_search_tool_definition(api: ExtensionApi) -> ToolDefinition {
         annotations: None,
         default_active: Some(false),
         prepare_loadout: None,
+        reaches_tools: Some(crate::core::extensions::reaches_all_tools()),
         render_shell: None,
         prepare_arguments: None,
         execution_mode: None,
@@ -489,6 +490,7 @@ mod tests {
         });
         let namespace = ToolNamespace {
             name: "mcp__docs".to_owned(),
+            aliases: Some(vec!["docs".to_owned()]),
             description: Some("Documentation tools".to_owned()),
             instructions: Some("Prefer search before fetch".to_owned()),
         };

@@ -2951,7 +2951,7 @@ async fn resume_session_with_loadout(
                 role: Default::default(),
                 content: rpi_ai::types::SystemContent::Text("prompt".to_owned()),
                 sections: None,
-                tools_added: Some(added.iter().map(|name| tool(*name)).collect()),
+                tools_added: Some(added.iter().map(|name| tool(name)).collect()),
                 tools_removed: if removed.is_empty() {
                     None
                 } else {

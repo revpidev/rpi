@@ -149,6 +149,13 @@ pub enum InputEventResult {
     },
 }
 
+/// `reachesTools` result that reaches every tool/namespace (for example
+/// resource tools and `tool_search`). The JSON boundary value is upstream's
+/// `"all"`.
+pub fn reaches_all_tools() -> rpi_ext_host::types::ReachesToolsFn {
+    Arc::new(|_input| serde_json::Value::String("all".to_owned()))
+}
+
 /// The message that starts an agent run, without the system-prompt fields
 /// (runner.ts `BeforeAgentStartTrigger` @ 4a080252f). User runs carry the
 /// expanded prompt and images; custom runs carry the starting message from
@@ -354,6 +361,8 @@ pub struct ExtensionToolEntry {
     pub output_schema: Option<serde_json::Value>,
     pub default_active: Option<bool>,
     pub prepare_loadout: Option<rpi_ext_host::types::PrepareLoadoutFn>,
+    /// `reachesTools` declaration (native/L0 only).
+    pub reaches_tools: Option<rpi_ext_host::types::ReachesToolsFn>,
     /// Executable wrapper (host tool definition, wrapper.ts — post-#9548:
     /// the `addedToolNames` attachment is gone; tool changes ride transcript
     /// system messages).

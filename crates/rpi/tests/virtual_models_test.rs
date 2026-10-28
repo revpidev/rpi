@@ -222,6 +222,7 @@ fn stub_edit_tool() -> ext::ToolDefinition {
         annotations: None,
         default_active: None,
         prepare_loadout: None,
+        reaches_tools: None,
         render_shell: None,
         prepare_arguments: None,
         execution_mode: None,

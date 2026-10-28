@@ -149,6 +149,7 @@ async fn fixture() -> Fixture {
                             output_schema: None,
                             default_active: None,
                             prepare_loadout: None,
+                            reaches_tools: None,
                         })
                         .expect("register probe_tool");
                         let events = events.clone();

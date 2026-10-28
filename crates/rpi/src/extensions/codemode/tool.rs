@@ -288,6 +288,47 @@ pub fn codemode_schema() -> Value {
 }
 
 /// `createCodemodeToolDefinition` (tool.ts:371-398).
+/// `getScriptReach` (codemode/tool.ts:362-385 @ 4a080252f): a script that
+/// discovers/enumerates tools reaches every tool; otherwise its identifier
+/// words may name tools/namespaces (the MCP wait matches a namespace
+/// contained in a word).
+fn codemode_reaches_tools() -> rpi_ext_host::types::ReachesToolsFn {
+    Arc::new(|input| {
+        let code = input
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if [
+            "searchTools",
+            "describeNamespace",
+            "describeTool",
+            "listTools",
+            "allTools",
+        ]
+        .iter()
+        .any(|needle| code.contains(needle))
+        {
+            return serde_json::Value::String("all".to_owned());
+        }
+        let mut words: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for ch in code.chars() {
+            if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+                current.push(ch);
+            } else if !current.is_empty() {
+                if !words.contains(&current) {
+                    words.push(current.clone());
+                }
+                current.clear();
+            }
+        }
+        if !current.is_empty() && !words.contains(&current) {
+            words.push(current);
+        }
+        serde_json::Value::Array(words.into_iter().map(serde_json::Value::String).collect())
+    })
+}
+
 pub fn create_codemode_tool_definition(
     api: ExtensionApi,
     model_runtime: Arc<crate::core::model_runtime::ModelRuntime>,
@@ -331,6 +372,7 @@ pub fn create_codemode_tool_definition(
         prepare_loadout: Some(Arc::new(move |loadout| {
             Ok(Some(prepare_codemode_loadout(loadout, &prepare)))
         })),
+        reaches_tools: Some(codemode_reaches_tools()),
         render_shell: None,
         prepare_arguments: None,
         execution_mode: None,
@@ -372,5 +414,32 @@ mod tests {
             }
             other => panic!("expected grammar config, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_scripts_reach_every_tool_and_plain_scripts_return_words() {
+        let reaches = codemode_reaches_tools();
+        assert_eq!(
+            reaches(&json!({"code": "return tools.searchTools('x')"})),
+            json!("all")
+        );
+        assert_eq!(
+            reaches(&json!({"code": "return tools.describeNamespace('docs')"})),
+            json!("all")
+        );
+        let words = reaches(&json!({"code": "await tools.mcp__docs__search({})"}));
+        assert!(
+            words
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|word| word.as_str() == Some("mcp__docs__search")),
+            "{words}"
+        );
     }
 }

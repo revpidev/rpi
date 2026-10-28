@@ -668,6 +668,7 @@ pub struct ToolDefinitionEntry {
     pub output_schema: Option<serde_json::Value>,
     pub default_active: Option<bool>,
     pub prepare_loadout: Option<ext::PrepareLoadoutFn>,
+    pub reaches_tools: Option<ext::ReachesToolsFn>,
 }
 
 impl std::fmt::Debug for ToolDefinitionEntry {
@@ -2925,6 +2926,7 @@ impl AgentSession {
                     output_schema: tool.output_schema().cloned(),
                     default_active: None,
                     prepare_loadout: None,
+                    reaches_tools: None,
                 },
             );
             registry.insert(name, tool);
@@ -2955,6 +2957,7 @@ impl AgentSession {
                     output_schema: entry.output_schema,
                     default_active: entry.default_active,
                     prepare_loadout: entry.prepare_loadout,
+                    reaches_tools: entry.reaches_tools,
                 },
             );
             registry.insert(entry.name.clone(), entry.tool);
@@ -2980,6 +2983,7 @@ impl AgentSession {
                     output_schema: tool.output_schema().cloned(),
                     default_active: None,
                     prepare_loadout: None,
+                    reaches_tools: None,
                 },
             );
             registry.insert(name, tool);
@@ -3329,6 +3333,17 @@ impl AgentSession {
             }));
         }
         commands
+    }
+
+    /// Evaluate a tool's `reachesTools(input)` declaration (native
+    /// extensions; built-ins declare it too). `None` when the tool is
+    /// unknown or has no declaration.
+    pub fn tool_reaches(&self, name: &str, input: Value) -> Option<Value> {
+        let definitions = lock(&self.inner.tool_definitions);
+        definitions
+            .get(name)
+            .and_then(|entry| entry.reaches_tools.as_ref())
+            .map(|reaches| reaches(&input))
     }
 
     /// `setActiveToolsByName` (agent-session.ts:1488-1496 @ 4a080252f).

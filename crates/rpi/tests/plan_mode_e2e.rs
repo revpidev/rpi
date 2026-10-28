@@ -1037,6 +1037,7 @@ async fn late_registered_tools_are_re_tightened_and_restored() {
         }),
         render_call: None,
         render_result: None,
+        reaches_tools: None,
     })
     .expect("register late tool");
 

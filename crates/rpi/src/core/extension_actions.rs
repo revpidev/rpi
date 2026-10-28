@@ -366,6 +366,11 @@ impl HostActions for SessionHostActions {
             .unwrap_or_default()
     }
 
+    fn tool_reaches(&self, name: &str, input: Value) -> Option<Value> {
+        self.session()
+            .and_then(|session| session.tool_reaches(name, input))
+    }
+
     /// `setActiveTools` (agent-session.ts:2395 → :926-941): unknown names
     /// are silently ignored inside `set_active_tools_by_name`.
     fn set_active_tools(&self, tool_names: Vec<String>) {

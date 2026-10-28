@@ -330,6 +330,17 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         .get("namespace")
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok()),
+                    // The upstream field is a callback; a wasm guest can
+                    // declare a static `"all"` or word array instead.
+                    reaches_tools: definition.get("reachesTools").cloned().and_then(|reach| {
+                        match reach {
+                            Value::String(_) | Value::Array(_) => {
+                                Some(std::sync::Arc::new(move |_input: &Value| reach.clone())
+                                    as crate::types::ReachesToolsFn)
+                            }
+                            _ => None,
+                        }
+                    }),
                     execution_mode: definition.get("executionMode").and_then(Value::as_str).map(
                         |mode| match mode {
                             "sequential" => rpi_agent::types::ToolExecutionMode::Sequential,

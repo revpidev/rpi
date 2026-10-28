@@ -591,6 +591,13 @@ pub trait HostActions: Send + Sync {
     /// `getAllTools` (types.ts:1317) — `ToolInfo[]` JSON (types.ts:1546-1548).
     fn get_all_tools(&self) -> Vec<Value>;
 
+    /// Evaluate a tool's `reachesTools(input)` declaration (types.ts:614-621
+    /// @ 4a080252f; native/L0 only). Returns the JSON `"all"` or a word
+    /// array, or `None` when the tool has no declaration/does not exist.
+    fn tool_reaches(&self, _name: &str, _input: Value) -> Option<Value> {
+        None
+    }
+
     /// `setActiveTools` (types.ts:1320).
     fn set_active_tools(&self, tool_names: Vec<String>);
 
@@ -2073,6 +2080,14 @@ impl ExtensionContext {
             .context_actions()?
             .map(|actions| actions.get_append_system_prompt_source_paths())
             .unwrap_or_default())
+    }
+
+    /// Evaluate a tool's `reachesTools(input)` declaration (see
+    /// [`HostActions::tool_reaches`]). Unbound/legacy action sets answer
+    /// `None`.
+    pub fn tool_reaches(&self, name: &str, input: Value) -> Result<Option<Value>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self.runtime.require_actions()?.tool_reaches(name, input))
     }
 
     /// `ctx.sessionFile()` (rpi additive, ADR-0022) — authoritative

@@ -650,6 +650,7 @@ impl McpBuiltinState {
             .filter(|description| !description.trim().is_empty());
         let namespace = ToolNamespace {
             name: mcp_namespace(&server_name),
+            aliases: Some(vec![server_name.clone()]),
             description,
             instructions: connection.instructions(),
         };
@@ -1997,7 +1998,25 @@ impl McpBuiltinState {
         }
         let is_codemode = tool_name == super::super::codemode::tool::CODEMODE_TOOL_NAME;
         let is_search = tool_name == super::super::tool_search::TOOL_SEARCH_TOOL_NAME;
-        let waiting: Vec<watch::Receiver<bool>> = if is_codemode {
+        // Shared `ToolDefinition.reachesTools` declaration: a tool that
+        // reaches other tools waits only for the servers its input may name.
+        let reach = ctx
+            .tool_reaches(
+                tool_name,
+                event.get("input").cloned().unwrap_or(Value::Null),
+            )
+            .ok()
+            .flatten();
+        let waiting: Vec<watch::Receiver<bool>> = if let Some(reach) = reach {
+            pending
+                .into_iter()
+                .filter(|(server, _, _)| {
+                    let name = lock(&server.entry).name.clone();
+                    Self::reaches_server(&reach, &name)
+                })
+                .map(|(_, ready, _)| ready)
+                .collect()
+        } else if is_codemode {
             let code = event
                 .get("input")
                 .and_then(|input| input.get("code"))
@@ -2020,6 +2039,22 @@ impl McpBuiltinState {
         self.wait_for_servers(waiting, ctx.signal().unwrap_or(None))
             .await;
         Ok(Value::Null)
+    }
+
+    /// `reachesServer` (mcp/index.ts:224-228): "all" reaches every server;
+    /// otherwise a word contains the server's `mcp__<name>` namespace.
+    fn reaches_server(reach: &Value, server: &str) -> bool {
+        match reach {
+            Value::String(value) if value == "all" => true,
+            Value::Array(words) => {
+                let namespace = format!("mcp__{}", server.replace('-', "_"));
+                words
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|word| word.contains(&namespace))
+            }
+            _ => false,
+        }
     }
 
     /// `mcp_servers_change` handler (index.ts:1055).
@@ -3088,5 +3123,31 @@ mod tests {
         );
         assert!(lock(&server.entry).config.enabled());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::*;
+
+    #[test]
+    fn reaches_server_matches_all_and_namespace_words() {
+        assert!(McpBuiltinState::reaches_server(
+            &json!("all"),
+            "docs-server"
+        ));
+        assert!(McpBuiltinState::reaches_server(
+            &json!(["mcp__docs_server__search"]),
+            "docs-server"
+        ));
+        assert!(McpBuiltinState::reaches_server(
+            &json!(["prefix-mcp__docs_server-suffix"]),
+            "docs-server"
+        ));
+        assert!(!McpBuiltinState::reaches_server(
+            &json!(["mcp__other__search"]),
+            "docs-server"
+        ));
+        assert!(!McpBuiltinState::reaches_server(&json!(null), "docs"));
     }
 }

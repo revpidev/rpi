@@ -93,6 +93,7 @@ fn tool_definition(
         execute,
         render_call: None,
         render_result: None,
+        reaches_tools: None,
     }
 }
 

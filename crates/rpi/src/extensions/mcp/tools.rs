@@ -583,6 +583,7 @@ pub fn create_mcp_tool_definition(options: CreateMcpToolOptions) -> ToolDefiniti
         annotations,
         default_active: None,
         prepare_loadout: None,
+        reaches_tools: None,
         render_shell: renderers.render_shell,
         prepare_arguments: None,
         execution_mode: None,

@@ -100,6 +100,7 @@ fn description_and_script_call_text_match_upstream_byte_for_byte() {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned(),
+                        aliases: None,
                         description: namespace
                             .get("description")
                             .and_then(Value::as_str)

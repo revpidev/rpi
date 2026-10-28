@@ -652,6 +652,7 @@ fn minimal_tool(name: &str) -> ext::ToolDefinition {
         output_schema: None,
         default_active: None,
         prepare_loadout: None,
+        reaches_tools: None,
     }
 }
 
@@ -1469,6 +1470,7 @@ fn te01_tool_definition(name: &str) -> ext::ToolDefinition {
         output_schema: None,
         default_active: None,
         prepare_loadout: None,
+        reaches_tools: None,
     }
 }
 

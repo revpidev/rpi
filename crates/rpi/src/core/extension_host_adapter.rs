@@ -833,6 +833,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
                     output_schema: definition.output_schema.clone(),
                     default_active: definition.default_active,
                     prepare_loadout: definition.prepare_loadout.clone(),
+                    reaches_tools: definition.reaches_tools.clone(),
                     tool: Arc::new(HostToolAdapter {
                         host: self.host.clone(),
                         definition,

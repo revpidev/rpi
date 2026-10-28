@@ -89,6 +89,7 @@ fn extension_tool(
         execute: Arc::new(|_request, _ctx| Box::pin(async move { Ok(text_result("ok")) })),
         render_call: None,
         render_result: None,
+        reaches_tools: None,
     }
 }
 

@@ -722,13 +722,17 @@ fn namespace_suffix(name: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn is_namespace_name(namespace: &str, query: &str) -> bool {
-    let id = to_codemode_identifier(namespace);
+fn is_namespace_name(namespace: &rpi_ext_host::types::ToolNamespace, query: &str) -> bool {
     let query_id = to_codemode_identifier(query);
-    namespace == query
-        || id == query_id
-        || namespace_suffix(namespace) == Some(query)
-        || namespace_suffix(&id) == Some(query_id.as_str())
+    let mut names: Vec<&str> = vec![namespace.name.as_str()];
+    names.extend(namespace.aliases.iter().flatten().map(String::as_str));
+    names.into_iter().any(|name| {
+        let id = to_codemode_identifier(name);
+        name == query
+            || id == query_id
+            || namespace_suffix(name) == Some(query)
+            || namespace_suffix(&id) == Some(query_id.as_str())
+    })
 }
 
 fn sample_map(tools: &[ToolInfo]) -> HashMap<String, String> {
@@ -802,7 +806,7 @@ fn create_discovery_globals(
                             Some(query) => tool
                                 .namespace
                                 .as_ref()
-                                .is_some_and(|namespace| is_namespace_name(&namespace.name, query)),
+                                .is_some_and(|namespace| is_namespace_name(namespace, query)),
                         })
                         .map(|tool| {
                             create_tool_search_document(
@@ -873,7 +877,7 @@ fn create_discovery_globals(
                         let Some(tool_namespace) = tool.namespace.as_ref() else {
                             continue;
                         };
-                        if !is_namespace_name(&tool_namespace.name, name) {
+                        if !is_namespace_name(tool_namespace, name) {
                             continue;
                         }
                         if namespace.is_none() {
@@ -1705,5 +1709,19 @@ mod tests {
             ),
             "{error}"
         );
+    }
+    #[test]
+    fn namespace_names_accept_aliases_and_identifiers() {
+        let namespace = rpi_ext_host::types::ToolNamespace {
+            name: "mcp__docs-server".to_owned(),
+            aliases: Some(vec!["docs".to_owned(), "documentation".to_owned()]),
+            description: None,
+            instructions: None,
+        };
+        assert!(is_namespace_name(&namespace, "docs"));
+        assert!(is_namespace_name(&namespace, "documentation"));
+        assert!(is_namespace_name(&namespace, "mcp__docs-server"));
+        assert!(is_namespace_name(&namespace, "docs_server"));
+        assert!(!is_namespace_name(&namespace, "other"));
     }
 }

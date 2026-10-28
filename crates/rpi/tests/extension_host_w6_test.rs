@@ -337,6 +337,7 @@ async fn w6_native_and_wasm_gate_behave_identically() {
             output_schema: None,
             default_active: None,
             prepare_loadout: None,
+            reaches_tools: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })

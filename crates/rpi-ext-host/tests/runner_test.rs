@@ -76,6 +76,7 @@ fn minimal_tool(name: &str, label: &str) -> ToolDefinition {
         output_schema: None,
         default_active: None,
         prepare_loadout: None,
+        reaches_tools: None,
     }
 }
 
@@ -2759,6 +2760,7 @@ fn tool_loadout_changes_and_namespace_wire_shape() {
     );
     let namespace = ToolNamespace {
         name: "mcp__docs".to_owned(),
+        aliases: None,
         description: Some("Docs tools".to_owned()),
         instructions: None,
     };

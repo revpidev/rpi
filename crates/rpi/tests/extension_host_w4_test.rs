@@ -424,6 +424,7 @@ async fn w4_tool_render_override_and_inheritance() {
             output_schema: None,
             default_active: None,
             prepare_loadout: None,
+            reaches_tools: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })
@@ -518,6 +519,7 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
             output_schema: None,
             default_active: None,
             prepare_loadout: None,
+            reaches_tools: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })
@@ -587,6 +589,7 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
             output_schema: None,
             default_active: None,
             prepare_loadout: None,
+            reaches_tools: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })
@@ -743,6 +746,7 @@ async fn w4_tool_definition_without_resolvers_keeps_the_no_hook_none() {
             output_schema: None,
             default_active: None,
             prepare_loadout: None,
+            reaches_tools: None,
         })
         .expect("tool");
         Box::pin(async { Ok(()) })

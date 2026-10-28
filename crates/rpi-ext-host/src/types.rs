@@ -1595,6 +1595,10 @@ pub struct ToolAnnotations {
 pub struct ToolNamespace {
     /// For example `mcp__docs`.
     pub name: String,
+    /// Other names that refer to the namespace where tools look it up by
+    /// name (codemode `describeNamespace()` / `searchTools({namespace})`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>,
     /// Short summary shown with the group in model-facing listings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -1687,6 +1691,13 @@ pub struct ToolLoadoutChanges {
 pub type PrepareLoadoutFn =
     Arc<dyn Fn(&ToolLoadout) -> Result<Option<ToolLoadoutChanges>, String> + Send + Sync>;
 
+/// `ToolDefinition.reachesTools` (types.ts:614-621 @ 4a080252f): which tools
+/// a call with the given input may reach. Returns the JSON `"all"` or an
+/// array of words that may name a tool/namespace (the MCP wait matches a
+/// server namespace contained in a word). Native/L0 only: the wasm JSON
+/// boundary cannot carry the callback.
+pub type ReachesToolsFn = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
+
 /// `ToolDefinition` (types.ts:443-492).
 ///
 /// Render placeholder decision: `render_call` / `render_result` are typed
@@ -1722,6 +1733,8 @@ pub struct ToolDefinition {
     /// Adjust how the loadout is presented to the model while this tool is
     /// active (types.ts:615).
     pub prepare_loadout: Option<PrepareLoadoutFn>,
+    /// Which tools a call may reach (types.ts:614-621; native/L0 only).
+    pub reaches_tools: Option<ReachesToolsFn>,
     /// `"default" | "self"` (types.ts:458).
     pub render_shell: Option<String>,
     pub prepare_arguments: Option<PrepareArgumentsFn>,
