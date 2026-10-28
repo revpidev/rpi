@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::session::SessionEntry;
 use rpi_tui::tui::Component;
-use rpi_tui::utils::{truncate_to_width, visible_width};
+use rpi_tui::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 
 use crate::core::agent_session::{AgentSession, ContextUsage};
 use crate::core::themes::Theme;
@@ -583,7 +583,10 @@ impl Component for FooterComponent {
         );
         let mut lines = vec![pwd_line, format!("{dim_stats_left}{dim_remainder}")];
 
-        // Extension statuses on a single line, sorted by key (footer.ts:232-241).
+        // Extension statuses: sorted by key, whitespace-folded, joined with a
+        // single space, then wrapped to the terminal width (R3.2.6 /
+        // ADR-0040). Wrapping never truncates and re-opens active ANSI SGR
+        // codes, so the footer grows with the content.
         let extension_statuses = self.footer_data.get_extension_statuses();
         if !extension_statuses.is_empty() {
             let status_line = extension_statuses
@@ -591,12 +594,7 @@ impl Component for FooterComponent {
                 .map(|text| sanitize_status_text(text))
                 .collect::<Vec<_>>()
                 .join(" ");
-            lines.push(truncate_to_width(
-                &status_line,
-                width,
-                &self.theme.fg("dim", "..."),
-                false,
-            ));
+            lines.extend(wrap_text_with_ansi(&status_line, width));
         }
 
         lines
@@ -963,7 +961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extension_status_line_is_sorted_and_truncated() {
+    async fn extension_status_line_is_sorted_and_sanitized() {
         let harness = crate::modes::interactive::test_support::build_test_session().await;
         let footer_data = Arc::new(FooterDataProvider::new(&harness.cwd));
         footer_data.set_extension_status("zeta", "z status");
@@ -977,6 +975,54 @@ mod tests {
             status_line, "a status with newlines z status",
             "status: {status_line}"
         );
+    }
+
+    /// R3.2.6 / ADR-0040: the status row wraps at the terminal width instead
+    /// of truncating, keeps every SGR color across line breaks, and grows the
+    /// footer by one line per wrapped row. 40/80/120 columns all preserve the
+    /// full content.
+    #[tokio::test]
+    async fn extension_status_line_wraps_without_truncating_and_keeps_sgr() {
+        let harness = crate::modes::interactive::test_support::build_test_session().await;
+        let footer_data = Arc::new(FooterDataProvider::new(&harness.cwd));
+        footer_data.set_extension_status(
+            "rpi-usage",
+            "\u{1b}[31mfive-hour quota 39 percent with a fairly long tail\u{1b}[0m",
+        );
+        footer_data.set_extension_status("status", "repo:main branch with extra words");
+        let footer = FooterComponent::new(harness.session.clone(), footer_data, theme());
+
+        for width in [40usize, 80, 120] {
+            let lines = footer.render(width);
+            assert!(lines.len() >= 3, "width {width}: {lines:?}");
+            for line in &lines[2..] {
+                assert!(
+                    visible_width(line) <= width,
+                    "width {width}: line exceeds width: {line:?}"
+                );
+            }
+            let status_text = lines[2..]
+                .iter()
+                .map(|line| strip_ansi(line))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                status_text.contains("five-hour quota 39 percent"),
+                "{status_text}"
+            );
+            assert!(status_text.contains("tail"), "{status_text}");
+            assert!(status_text.contains("repo:main"), "{status_text}");
+            assert!(status_text.contains("extra words"), "{status_text}");
+            assert!(!status_text.contains("..."), "no truncation: {status_text}");
+            if width == 40 {
+                assert!(lines.len() > 3, "wrapped footer grows: {lines:?}");
+                let colored = lines[2..]
+                    .iter()
+                    .filter(|line| line.contains("\u{1b}[31m"))
+                    .count();
+                assert!(colored >= 2, "SGR re-opened on continuation: {lines:?}");
+            }
+        }
     }
 
     /// TE44 FR-D/G14: the `rpi-usage` entry coexists with the statusline
