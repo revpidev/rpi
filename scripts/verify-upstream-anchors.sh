@@ -76,7 +76,6 @@ crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@de
 crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:12@MAX_REF_EXPANSIONS
 crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:35-44@export interface RenderDeclarationsOptions
 crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:91-99@export function renderToolSample
-crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:139-146@export function schemaToType
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:14-41@export interface CodemodeTool \{
 crates/rpi-codemode/src/types.rs@packages/codemode/src/declarations.ts@declarations.ts:76-90@export function renderToolSignature
 crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:51@export type CodemodeCallStatus
@@ -118,7 +117,7 @@ crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/exte
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:203-227@function selectCatalog
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:228-276@export function createCodemodeDescription
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:293-313@function describeOutput
-crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:304-319@function describeScriptCall
+crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:293-313@function describeScriptCall
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/settings-schema.ts@settings-schema.ts:470@export interface CodemodeSettings
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/index.ts@index.ts:20-30@function readMode
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/agent-session.ts@agent-session.ts:1514-1526@getAllTools
@@ -128,6 +127,19 @@ crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:371-398@export function createCodemodeToolDefinition
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:383@exposure: "model-only"
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:387@constrainedSampling: \{ type: "grammar"
+
+crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:14-34@const TAG_KEYWORDS
+crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:133-153@export function schemaToType
+crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:253-301@function constraintTags
+crates/rpi-codemode/src/source.rs@packages/codemode/src/source.ts@source.ts:101-125@export function parseCodemodeSource
+crates/rpi-codemode/src/runtime/host.rs@packages/codemode/src/runtime/host.ts@host.ts:20-46@acquireWorker
+crates/rpi-codemode/src/types.rs@packages/codemode/src/types.ts@types.ts:149-155@acquireWorker
+crates/rpi/src/extensions/codemode/workers.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:55-110@function reserveCodemodeWorker
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:341-374@function joinAdjacentText
+crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensions/codemode/execute.ts@execute.ts:515-517@publish\(\);
+crates/rpi/src/extensions/mcp/ui.rs@packages/coding-agent/src/extensions/mcp/index.ts@index.ts:1191-1209@await waitForServers
+crates/rpi-mcp/src/types.rs@packages/mcp/src/client.ts@client.ts:143-150@function validateCallToolResult
+crates/rpi/src/modes/interactive/tool_renderers/render_utils.rs@packages/coding-agent/src/core/tools/render-utils.ts@render-utils.ts:146-170@export function toolTimerText
 ANCHORS
 
 if ((failures > 0)); then
