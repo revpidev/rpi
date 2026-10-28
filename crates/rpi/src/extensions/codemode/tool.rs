@@ -459,6 +459,25 @@ mod reachability_tests {
             reaches(&json!({"code": "const ALL_TOOLSX = 1; return listTools"})),
             json!("all")
         );
+        // The fallback splitter is `\w+`: a hyphen and non-ASCII letters do
+        // not join an identifier.
+        let words = reaches(&json!({"code": "return tools.mcp__docs-server.get"}));
+        let words = words.as_array().expect("word list");
+        assert!(
+            !words
+                .iter()
+                .any(|word| word.as_str() == Some("mcp__docs-server")),
+            "{words:?}"
+        );
+        let words = reaches(&json!({"code": "const café = 1"}));
+        assert!(
+            !words
+                .as_array()
+                .expect("word list")
+                .iter()
+                .any(|word| word.as_str() == Some("café")),
+            "{words}"
+        );
         let words = reaches(&json!({"code": "await tools.mcp__docs__search({})"}));
         assert!(
             words

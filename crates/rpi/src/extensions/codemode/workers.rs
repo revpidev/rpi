@@ -39,8 +39,15 @@ fn parse_max_workers(raw: Option<&str>) -> usize {
     let Ok(value) = raw.trim().parse::<f64>() else {
         return DEFAULT_MAX_WORKERS;
     };
-    if value.is_finite() && value.fract() == 0.0 && value > 0.0 && value <= usize::MAX as f64 {
-        value as usize
+    if value.is_finite() && value.fract() == 0.0 && value > 0.0 {
+        // JS has one number type; a value above `usize::MAX` is still a
+        // valid positive integer, so clamp instead of falling back (it is
+        // effectively unlimited either way).
+        if value >= usize::MAX as f64 {
+            usize::MAX
+        } else {
+            value as usize
+        }
     } else {
         DEFAULT_MAX_WORKERS
     }
@@ -495,6 +502,7 @@ mod tests {
         assert_eq!(parse_max_workers(Some("3")), 3);
         assert_eq!(parse_max_workers(Some(" 4 ")), 4);
         assert_eq!(parse_max_workers(Some("1e3")), 1000);
+        assert_eq!(parse_max_workers(Some("1e20")), usize::MAX);
         for invalid in ["", "0", "-1", "2.5", "NaN", "Infinity", "-Infinity", "abc"] {
             assert_eq!(
                 parse_max_workers(Some(invalid)),
