@@ -154,15 +154,16 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 }
             }
             Message::Assistant(assistant) => {
-                let mut thinking_parts: Vec<&str> = Vec::new();
                 let mut tool_calls: Vec<String> = Vec::new();
                 let mut has_text = false;
 
                 for block in &assistant.content {
                     match block {
-                        rpi_ai::types::AssistantContent::Thinking(thinking) => {
-                            thinking_parts.push(thinking.thinking.as_str());
-                        }
+                        // Thinking is omitted from summaries (#15e7bdc14):
+                        // replayed thinking is often not part of the live
+                        // context, and including it can make the request
+                        // larger than the conversation it summarizes.
+                        rpi_ai::types::AssistantContent::Thinking(_) => {}
                         rpi_ai::types::AssistantContent::ToolCall(tool_call) => {
                             let args_str = tool_call
                                 .arguments
@@ -185,12 +186,6 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                     }
                 }
 
-                if !thinking_parts.is_empty() {
-                    parts.push(format!(
-                        "[Assistant thinking]: {}",
-                        thinking_parts.join("\n")
-                    ));
-                }
                 if has_text {
                     parts.push(format!(
                         "[Assistant]: {}",

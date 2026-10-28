@@ -22,8 +22,8 @@ use rpi_agent::compaction::utils::{
     format_file_operations, serialize_conversation,
 };
 use rpi_agent::compaction::{
-    CompactionSettings, SummarizationArgs, calculate_context_tokens, compact,
-    complete_summarization, estimate_context_tokens, estimate_tokens, find_cut_point,
+    CompactionPreparation, CompactionSettings, SummarizationArgs, calculate_context_tokens,
+    compact, complete_summarization, estimate_context_tokens, estimate_tokens, find_cut_point,
     generate_summary_with_usage, prepare_compaction,
 };
 use rpi_agent::messages::AgentMessage;
@@ -285,11 +285,28 @@ fn golden_serialize_conversation() {
     for case in golden["serializeConversation"].as_array().expect("array") {
         let name = case["name"].as_str().expect("name");
         let messages = llm_messages(&case["messages"]);
-        assert_eq!(
-            serialize_conversation(&messages),
-            case["expected"].as_str().expect("expected str"),
-            "serializeConversation/{name}"
+        // The vendored upstream dist predates 15e7bdc14 (thinking omission):
+        // strip `[Assistant thinking]:` sections from its recorded expectation
+        // so every other byte still participates in the golden comparison.
+        let expected = case["expected"]
+            .as_str()
+            .expect("expected str")
+            .split("\n\n")
+            .filter(|part| !part.starts_with("[Assistant thinking]:"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let actual = serialize_conversation(&messages);
+        assert_eq!(actual, expected, "serializeConversation/{name}");
+        assert!(
+            !actual.contains("[Assistant thinking]"),
+            "serializeConversation/{name}: thinking omitted"
         );
+        if name == "all_roles" {
+            assert!(
+                !actual.contains("let me look"),
+                "replayed thinking text never reaches the summary"
+            );
+        }
     }
 }
 
@@ -584,11 +601,11 @@ async fn prompt_history_initial_byte_exact() {
     );
     let options = prompt_json("history_initial_options.json");
     let (_, captured_options) = &capture.calls.lock().expect("calls")[0];
-    assert_eq!(
-        captured_options.max_tokens,
-        Some(options["maxTokens"].as_u64().expect("maxTokens") as u32),
-        "maxTokens"
-    );
+    // #11036: summary requests carry no fixed output cap; the provider sizes
+    // output from the actual request. The vendored dist still records the old
+    // 0.8*reserveTokens value, which is intentionally no longer used.
+    let _ = options["maxTokens"].as_u64();
+    assert_eq!(captured_options.max_tokens, None, "maxTokens");
     assert_eq!(
         captured_options.cache_retention,
         Some(rpi_ai::types::CacheRetention::None),
@@ -1054,7 +1071,16 @@ async fn prompt_split_turn_compact_byte_exact() {
         captured_prompt(&capture, 0),
         prompt_text("history_in_split_turn.txt")
     );
-    assert_eq!(captured_prompt(&capture, 1), prompt_text("turn_prefix.txt"));
+    // adfc14461 (#11058): `/compact <instructions>` now also reaches the
+    // split-turn prefix summarizer. The vendored dist predates that fix, so
+    // its recorded prompt is extended with the documented focus suffix.
+    assert_eq!(
+        captured_prompt(&capture, 1),
+        format!(
+            "{}\n\nAdditional focus: keep the auth details",
+            prompt_text("turn_prefix.txt")
+        )
+    );
     assert_eq!(result.summary, prompt_text("split_turn_merged_summary.txt"));
 
     let expected = prompt_json("split_turn_result.json");
@@ -1215,10 +1241,9 @@ async fn prompt_branch_summary_byte_exact() {
             .is_empty()
     );
     let (_, captured_options) = &capture.calls.lock().expect("calls")[0];
-    assert_eq!(
-        captured_options.max_tokens,
-        Some(expected["maxTokens"].as_u64().expect("maxTokens") as u32)
-    );
+    // #11036: branch summaries also use the provider's output sizing.
+    let _ = expected["maxTokens"].as_u64();
+    assert_eq!(captured_options.max_tokens, None);
     assert_eq!(
         captured_options.cache_retention,
         Some(rpi_ai::types::CacheRetention::None)
@@ -1256,23 +1281,18 @@ async fn prompt_branch_custom_instructions_byte_exact() {
     );
 }
 
-/// V14-02 FR-I (e44d75c20, #8845): branch summary output cap is
-/// `min(4096, model.maxTokens)` — a model above 4096 gets 4096, a model
-/// below gets its own maxTokens, and `maxTokens: 0` means uncapped (4096).
+/// #11036 (6fcb48670): branch summaries no longer cap output at
+/// `min(4096, model.maxTokens)`; the provider sizes output from the actual
+/// request for every model cap (including `maxTokens: 0`).
 #[tokio::test]
-async fn branch_summary_output_cap_min_4096_model_max_tokens() {
+async fn branch_summary_has_no_fixed_output_cap() {
     let mut b = EntryBuilder::new();
     b.user("one");
     b.assistant(vec![text_block("a1")]);
     b.user("two");
     let entries = b.finish();
 
-    let cases: Vec<(u32, u32)> = vec![
-        (16384, 4096), // model above the cap → 4096
-        (1000, 1000),  // model below the cap → its own limit
-        (0, 4096),     // no limit → cap applies
-    ];
-    for (model_max_tokens, expected) in cases {
+    for model_max_tokens in [16_384u32, 1000, 0] {
         let mut model = test_model();
         model.max_tokens = model_max_tokens;
         let capture = capture_stream_fn(&["SUMMARY"]);
@@ -1289,8 +1309,7 @@ async fn branch_summary_output_cap_min_4096_model_max_tokens() {
         let _ = generate_branch_summary(&entries, &options).await;
         let (_, captured_options) = capture.calls.lock().expect("calls")[0].clone();
         assert_eq!(
-            captured_options.max_tokens,
-            Some(expected),
+            captured_options.max_tokens, None,
             "model.maxTokens = {model_max_tokens}"
         );
     }
@@ -1470,4 +1489,53 @@ fn oversized_trailing_tool_results_prepare_compaction_keeps_pair() {
         })
         .collect();
     assert_eq!(prefix_texts, ["read the large file"]);
+}
+
+/// adfc14461 (#11058): `/compact <instructions>` reaches the split-turn
+/// prefix summarizer even when the prefix is the only new content since the
+/// previous compaction (`messages_to_summarize` empty).
+#[tokio::test]
+async fn split_turn_prefix_applies_custom_instructions_without_history() {
+    let preparation = CompactionPreparation {
+        first_kept_entry_id: "entry-keep".to_owned(),
+        messages_to_summarize: Vec::new(),
+        turn_prefix_messages: vec![AgentMessage::User(rpi_ai::types::UserMessage {
+            role: rpi_ai::types::UserRole::User,
+            content: rpi_ai::types::UserContent::Blocks(vec![
+                rpi_ai::types::UserContentBlock::Text(rpi_ai::types::TextContent {
+                    text: "keep going".to_owned(),
+                    text_signature: None,
+                }),
+            ]),
+            timestamp: 1,
+        })],
+        is_split_turn: true,
+        tokens_before: 10,
+        previous_summary: None,
+        file_ops: create_file_ops(),
+        settings: CompactionSettings {
+            enabled: true,
+            reserve_tokens: 16384,
+            keep_recent_tokens: 150,
+        },
+    };
+    let capture = capture_stream_fn(&["PREFIX SUMMARY"]);
+    let result = compact(
+        &preparation,
+        &test_model(),
+        Some("keep migration decisions"),
+        &capture.stream_fn,
+        &SummarizationArgs::default(),
+        None,
+    )
+    .await
+    .expect("compact");
+
+    let prompt = captured_prompt(&capture, 0);
+    assert!(
+        prompt.contains("Additional focus: keep migration decisions"),
+        "prefix prompt: {prompt}"
+    );
+    assert!(result.summary.starts_with("No prior history."));
+    assert!(result.summary.ends_with("PREFIX SUMMARY"));
 }

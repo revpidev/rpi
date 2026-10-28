@@ -399,13 +399,10 @@ pub async fn generate_branch_summary(
         tools: None,
     };
     let request_options = StreamOptions {
-        // Output cap (e44d75c20, #8845): min(4096, model.maxTokens) with
-        // maxTokens == 0 meaning no limit (upstream Infinity branch).
-        max_tokens: Some(if model.max_tokens > 0 {
-            4096u64.min(u64::from(model.max_tokens)) as u32
-        } else {
-            4096
-        }),
+        // Summaries use the provider's normal output sizing (#11036): the
+        // former min(4096, model.maxTokens) cap made reasoning-heavy models
+        // hit the token cap before the summary was complete.
+        max_tokens: None,
         request: rpi_ai::ProviderRequestOptions {
             signal: args.signal.clone(),
             api_key: args.api_key.clone(),

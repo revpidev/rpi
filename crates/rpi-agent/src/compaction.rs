@@ -623,17 +623,15 @@ pub struct SummarizationArgs {
 
 /// `createSummarizationOptions` (compaction.ts:539-553): reasoning models get
 /// the session thinking level (unless "off").
-fn create_summarization_options(
-    model: &Model,
-    max_tokens: u64,
-    args: &SummarizationArgs,
-) -> StreamOptions {
+fn create_summarization_options(model: &Model, args: &SummarizationArgs) -> StreamOptions {
     let reasoning = match &args.thinking_level {
         Some(level) if model.reasoning && *level != ThinkingLevel::Off => Some(*level),
         _ => None,
     };
     StreamOptions {
-        max_tokens: Some(max_tokens.min(u32::MAX as u64) as u32),
+        // Summaries use the provider's normal output sizing from the actual
+        // request (#11036): no fixed `reserveTokens`-derived cap.
+        max_tokens: None,
         reasoning,
         request: rpi_ai::ProviderRequestOptions {
             signal: args.signal.clone(),
@@ -785,15 +783,13 @@ pub fn get_summarization_failure(response: &AssistantMessage, label: &str) -> Op
 pub async fn generate_summary_with_usage(
     current_messages: &[AgentMessage],
     model: &Model,
-    reserve_tokens: u64,
+    _reserve_tokens: u64,
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
     stream_fn: &StreamFn,
     args: &SummarizationArgs,
     callbacks: Option<&RetryCallbacks>,
 ) -> Result<SummaryWithUsage, AgentError> {
-    let max_tokens = summary_max_tokens(reserve_tokens, 0.8, model);
-
     // Use update prompt if we have a previous summary, otherwise initial prompt.
     let mut base_prompt = match previous_summary {
         Some(_) => UPDATE_SUMMARIZATION_PROMPT.to_owned(),
@@ -825,7 +821,7 @@ pub async fn generate_summary_with_usage(
         timestamp: now_millis(),
     })];
 
-    let completion_options = create_summarization_options(model, max_tokens, args);
+    let completion_options = create_summarization_options(model, args);
     let context = Context {
         system_prompt: Some(SUMMARIZATION_SYSTEM_PROMPT.to_owned()),
         messages: summarization_messages,
@@ -886,18 +882,6 @@ pub async fn generate_summary(
     )
     .await?
     .text)
-}
-
-/// Shared maxTokens budget: `min(floor(factor * reserveTokens),
-/// model.maxTokens > 0 ? model.maxTokens : +Infinity)` (compaction.ts:637-640
-/// and :937-940).
-fn summary_max_tokens(reserve_tokens: u64, factor: f64, model: &Model) -> u64 {
-    let budget = (factor * reserve_tokens as f64).floor() as u64;
-    if model.max_tokens > 0 {
-        budget.min(model.max_tokens as u64)
-    } else {
-        budget
-    }
 }
 
 // ============================================================================
@@ -1286,7 +1270,7 @@ pub async fn compact(
         let turn_prefix_result = generate_turn_prefix_summary(
             &preparation.turn_prefix_messages,
             model,
-            settings.reserve_tokens,
+            custom_instructions,
             stream_fn,
             args,
             callbacks,
@@ -1344,17 +1328,19 @@ pub async fn compact(
 async fn generate_turn_prefix_summary(
     messages: &[AgentMessage],
     model: &Model,
-    reserve_tokens: u64,
+    custom_instructions: Option<&str>,
     stream_fn: &StreamFn,
     args: &SummarizationArgs,
     callbacks: Option<&RetryCallbacks>,
 ) -> Result<SummaryWithUsage, AgentError> {
-    let max_tokens = summary_max_tokens(reserve_tokens, 0.5, model);
     let llm_messages = convert_to_llm(messages);
     let conversation_text = serialize_conversation(&llm_messages);
-    let prompt_text = format!(
+    let mut prompt_text = format!(
         "# Conversation\n{conversation_text}\n\n# Instructions\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
     );
+    if let Some(instructions) = custom_instructions {
+        prompt_text = format!("{prompt_text}\n\nAdditional focus: {instructions}");
+    }
     let summarization_messages = vec![rpi_ai::types::Message::User(UserMessage {
         role: UserRole::User,
         content: rpi_ai::types::UserContent::Blocks(vec![UserContentBlock::Text(TextContent {
@@ -1372,7 +1358,7 @@ async fn generate_turn_prefix_summary(
     let response = complete_summarization(
         model,
         &context,
-        &create_summarization_options(model, max_tokens, args),
+        &create_summarization_options(model, args),
         stream_fn,
         args.retry.as_ref(),
         callbacks,
