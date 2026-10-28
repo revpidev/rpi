@@ -423,10 +423,16 @@ impl HttpShared {
         method: reqwest::Method,
         extra: Vec<(String, String)>,
         body: Option<String>,
+        signal: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<reqwest::Response, McpTransportError> {
         let mut attempt = 0;
         loop {
             let (headers, token) = self.headers(&extra).await?;
+            // The sender may have given up while the shared authorization
+            // recovery was in progress; do not dispatch (or retry) then.
+            if signal.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err(McpTransportError::Aborted);
+            }
             let mut request = self
                 .http
                 .request(method.clone(), self.url.clone())
@@ -538,7 +544,7 @@ impl HttpShared {
             extra.push(("last-event-id".to_owned(), last_event_id.to_owned()));
         }
         let response = self
-            .authorized_fetch(reqwest::Method::GET, extra, None)
+            .authorized_fetch(reqwest::Method::GET, extra, None, None)
             .await?;
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             return Ok(None);
@@ -824,6 +830,14 @@ impl McpTransport for StreamableHttpTransport {
     }
 
     async fn send(&self, message: serde_json::Value) -> Result<(), McpTransportError> {
+        self.send_with_options(message, Default::default()).await
+    }
+
+    async fn send_with_options(
+        &self,
+        message: serde_json::Value,
+        options: crate::transport::McpTransportSendOptions,
+    ) -> Result<(), McpTransportError> {
         if !self.started.load(Ordering::SeqCst) || self.shared.closed.load(Ordering::SeqCst) {
             return Err(McpTransportError::ConnectionClosed);
         }
@@ -842,6 +856,7 @@ impl McpTransport for StreamableHttpTransport {
                     ("content-type".to_owned(), "application/json".to_owned()),
                 ],
                 Some(body),
+                options.signal.as_ref(),
             )
             .await?;
         let response = self.shared.check_response(response).await?;

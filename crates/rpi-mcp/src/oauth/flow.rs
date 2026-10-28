@@ -766,20 +766,21 @@ async fn run_flow(
     };
     if let Some(code) = &options.authorization_code {
         // RFC 9207: never send a code from another authorization server to
-        // this one.
-        if let Some(metadata) = &metadata {
-            let iss = options.iss.as_deref();
-            if (iss.is_some()
-                || metadata
-                    .authorization_response_iss_parameter_supported
-                    .unwrap_or(false))
-                && iss != Some(metadata.issuer.as_str())
-            {
-                return Err(OAuthFlowError::IssuerMismatch {
-                    expected: metadata.issuer.clone(),
-                    received: iss.map(str::to_owned),
-                });
-            }
+        // this one. Without metadata there is no issuer to compare with, so
+        // any `iss` is rejected (#10565; never skip the check because
+        // discovery found nothing).
+        let iss = options.iss.as_deref();
+        if (iss.is_some()
+            || metadata
+                .as_ref()
+                .and_then(|metadata| metadata.authorization_response_iss_parameter_supported)
+                .unwrap_or(false))
+            && iss != metadata.as_ref().map(|metadata| metadata.issuer.as_str())
+        {
+            return Err(OAuthFlowError::IssuerMismatch {
+                expected: metadata.as_ref().map(|metadata| metadata.issuer.clone()),
+                received: iss.map(str::to_owned),
+            });
         }
         let tokens = exchange_authorization_code(
             &discovered.authorization_server_url,

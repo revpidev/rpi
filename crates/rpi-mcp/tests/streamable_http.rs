@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -560,5 +561,275 @@ async fn close_reuses_the_last_request_token() {
         calls.load(std::sync::atomic::Ordering::SeqCst),
         calls_before,
         "close must not ask the auth provider for a token"
+    );
+}
+
+/// A caller whose request was cancelled or timed out while the transport
+/// waited for a shared authorization refresh must not be retried afterwards
+/// (upstream #10598).
+struct RefreshingAuth {
+    token: Mutex<String>,
+    waiting: std::sync::atomic::AtomicUsize,
+    all_waiting: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl rpi_mcp::AuthProvider for RefreshingAuth {
+    async fn token(&self) -> Option<String> {
+        Some(self.token.lock().unwrap().clone())
+    }
+
+    async fn on_unauthorized(
+        &self,
+        _context: rpi_mcp::UnauthorizedContext,
+    ) -> Result<(), rpi_mcp::protocol::McpError> {
+        use std::sync::atomic::Ordering;
+        let waiting = self.waiting.fetch_add(1, Ordering::SeqCst) + 1;
+        self.all_waiting.notify_waiters();
+        if waiting >= 3 {
+            // All three callers share one recovery.
+        }
+        self.release.acquire().await.expect("refresh gate").forget();
+        *self.token.lock().unwrap() = "new".to_owned();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn does_not_retry_requests_cancelled_while_authorization_recovered() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+
+    let executed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let executed_for_handler = executed.clone();
+    let handler: Handler = Arc::new(move |request: RecordedRequest| {
+        let executed = executed_for_handler.clone();
+        Box::pin(async move {
+            if request.method == "GET" {
+                return TestResponse {
+                    status: 405,
+                    headers: vec![],
+                    body: Vec::new(),
+                };
+            }
+            if request.method == "DELETE" {
+                return TestResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: Vec::new(),
+                };
+            }
+            if request.body_method() == Some("tools/call") {
+                let name = request
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("params"))
+                    .and_then(|params| params.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if request.header("authorization").as_deref() == Some("Bearer old") {
+                    return TestResponse {
+                        status: 401,
+                        headers: vec![("www-authenticate".to_owned(), "Bearer".to_owned())],
+                        body: Vec::new(),
+                    };
+                }
+                executed.lock().unwrap().push(name);
+                return protocol_response(&request);
+            }
+            protocol_response(&request)
+        })
+    });
+    let (url, _requests) = start_server(handler).await;
+    let auth = Arc::new(RefreshingAuth {
+        token: Mutex::new("old".to_owned()),
+        waiting: AtomicUsize::new(0),
+        all_waiting: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut options = StreamableHttpTransportOptions::new(&url);
+    options.auth_provider = Some(auth.clone());
+    let transport = Arc::new(StreamableHttpTransport::new(options).unwrap());
+    let client = McpClient::new(McpClientOptions::new("http-test", "1.0.0"));
+    client.connect(transport).await.unwrap();
+
+    let aborted_signal = CancellationToken::new();
+    let aborted = {
+        let client = client.clone();
+        let signal = aborted_signal.clone();
+        tokio::spawn(async move {
+            client
+                .call_tool(
+                    "aborted",
+                    Some(json!({})),
+                    McpRequestOptions {
+                        signal: Some(signal),
+                        ..Default::default()
+                    },
+                )
+                .await
+        })
+    };
+    let timed_out = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .call_tool(
+                    "timed-out",
+                    Some(json!({})),
+                    McpRequestOptions {
+                        timeout_ms: Some(200),
+                        ..Default::default()
+                    },
+                )
+                .await
+        })
+    };
+    let kept = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .call_tool("kept", Some(json!({})), McpRequestOptions::default())
+                .await
+        })
+    };
+    // All three wait on the same recovery before the test releases it.
+    for _ in 0..200 {
+        if auth.waiting.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        let notified = auth.all_waiting.notified();
+        if auth.waiting.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+    }
+    assert_eq!(auth.waiting.load(Ordering::SeqCst), 3);
+    aborted_signal.cancel();
+    let aborted_result = tokio::time::timeout(Duration::from_secs(2), aborted)
+        .await
+        .expect("aborted request settles promptly")
+        .expect("task");
+    assert!(
+        matches!(aborted_result, Err(McpError::Aborted)),
+        "{aborted_result:?}"
+    );
+    let timed_out_result = tokio::time::timeout(Duration::from_secs(2), timed_out)
+        .await
+        .expect("timed-out request settles promptly")
+        .expect("task");
+    assert!(
+        matches!(timed_out_result, Err(McpError::Timeout { .. })),
+        "{timed_out_result:?}"
+    );
+    auth.release.add_permits(3);
+    let kept_result = tokio::time::timeout(Duration::from_secs(2), kept)
+        .await
+        .expect("kept request settles")
+        .expect("task")
+        .expect("kept call succeeds");
+    assert_eq!(kept_result.content[0]["text"], "hello");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        executed.lock().unwrap().clone(),
+        vec!["kept".to_owned()],
+        "cancelled and timed-out calls must not reach the server"
+    );
+    client.close().await.unwrap();
+}
+
+/// Closing the session while an authorization recovery is in progress must
+/// not send the late request with the recovered token (upstream #10565 /
+/// #10598).
+#[tokio::test]
+async fn close_during_authorization_recovery_does_not_dispatch_the_late_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let executed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let executed_for_handler = executed.clone();
+    let handler: Handler = Arc::new(move |request: RecordedRequest| {
+        let executed = executed_for_handler.clone();
+        Box::pin(async move {
+            if request.method == "GET" || request.method == "DELETE" {
+                return TestResponse {
+                    status: if request.method == "GET" { 405 } else { 200 },
+                    headers: vec![],
+                    body: Vec::new(),
+                };
+            }
+            if request.body_method() == Some("tools/call") {
+                let name = request
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("params"))
+                    .and_then(|params| params.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if request.header("authorization").as_deref() == Some("Bearer old") {
+                    return TestResponse {
+                        status: 401,
+                        headers: vec![("www-authenticate".to_owned(), "Bearer".to_owned())],
+                        body: Vec::new(),
+                    };
+                }
+                executed.lock().unwrap().push(name);
+                return protocol_response(&request);
+            }
+            protocol_response(&request)
+        })
+    });
+    let (url, _requests) = start_server(handler).await;
+    let auth = Arc::new(RefreshingAuth {
+        token: Mutex::new("old".to_owned()),
+        waiting: AtomicUsize::new(0),
+        all_waiting: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut options = StreamableHttpTransportOptions::new(&url);
+    options.auth_provider = Some(auth.clone());
+    let transport = Arc::new(StreamableHttpTransport::new(options).unwrap());
+    let client = McpClient::new(McpClientOptions::new("http-test", "1.0.0"));
+    client.connect(transport).await.unwrap();
+
+    let call = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .call_tool("late", Some(json!({})), McpRequestOptions::default())
+                .await
+        })
+    };
+    for _ in 0..200 {
+        if auth.waiting.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        let notified = auth.all_waiting.notified();
+        if auth.waiting.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
+    }
+    assert_eq!(auth.waiting.load(Ordering::SeqCst), 1);
+    // Closing must not wait for the network-bound recovery (#10565).
+    tokio::time::timeout(Duration::from_secs(2), client.close())
+        .await
+        .expect("close settles without the recovery")
+        .unwrap();
+    auth.release.add_permits(1);
+    let call_result = tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .expect("late request settles")
+        .expect("task");
+    assert!(
+        matches!(call_result, Err(McpError::ConnectionClosed(_))),
+        "{call_result:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        executed.lock().unwrap().is_empty(),
+        "the late request must not be dispatched after close"
     );
 }

@@ -23,6 +23,9 @@ struct AsState {
     issuer: Mutex<String>,
     token_body: Mutex<Value>,
     registrations: Mutex<Vec<Value>>,
+    /// When false, the well-known endpoints 404 so discovery finds no
+    /// authorization server metadata.
+    metadata: Mutex<bool>,
 }
 
 impl AsState {
@@ -49,6 +52,9 @@ async fn handle(State(state): State<Arc<AsState>>, request: Request<Body>) -> Re
     let base = state.issuer.lock().unwrap().clone();
     match path.as_str() {
         "/.well-known/oauth-authorization-server" | "/.well-known/openid-configuration" => {
+            if !*state.metadata.lock().unwrap() {
+                return Response::builder().status(404).body(Body::empty()).unwrap();
+            }
             let metadata = json!({
                 "issuer": base,
                 "authorization_endpoint": format!("{base}/authorize"),
@@ -93,7 +99,16 @@ async fn handle(State(state): State<Arc<AsState>>, request: Request<Body>) -> Re
 }
 
 async fn start_as() -> (String, Arc<AsState>) {
+    start_as_with_metadata(true).await
+}
+
+async fn start_as_without_metadata() -> (String, Arc<AsState>) {
+    start_as_with_metadata(false).await
+}
+
+async fn start_as_with_metadata(metadata: bool) -> (String, Arc<AsState>) {
     let state = Arc::new(AsState::default());
+    *state.metadata.lock().unwrap() = metadata;
     let app = Router::new().fallback(handle).with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -289,6 +304,82 @@ async fn issuer_mismatch_rejects_before_the_code_exchange() {
         "{error}"
     );
     assert_eq!(state.calls(), 0, "no token request before the iss check");
+}
+
+/// #10565: without authorization server metadata there is no issuer to
+/// compare the response's `iss` with, so any `iss` is rejected before the
+/// code exchange. An authorization response without `iss` still works.
+#[tokio::test]
+async fn issuer_mismatch_without_discovered_metadata_fails_closed() {
+    let (as_url, state) = start_as_without_metadata().await;
+    let store: Arc<dyn McpOAuthStateStore> = Arc::new(MemoryOAuthStateStore::default());
+    let provider = McpOAuthProvider::new(McpOAuthProviderOptions {
+        server_url: format!("{as_url}/mcp"),
+        redirect_url: "http://127.0.0.1:7777/callback".to_owned(),
+        client_metadata: OAuthClientMetadata::default(),
+        client_metadata_document: None,
+        client_id: Some("pre-registered".to_owned()),
+        client_secret: None,
+        store: Some(store),
+        on_redirect: Arc::new(|_| {}),
+    });
+    provider
+        .save_client_information(rpi_mcp::oauth::OAuthClientInformation {
+            client_id: "pre-registered".to_owned(),
+            ..Default::default()
+        })
+        .await;
+
+    // The first pass stores the PKCE verifier the code exchange needs.
+    let redirect = authorize_mcp(
+        &provider,
+        &OAuthFlowOptions {
+            server_url: format!("{as_url}/mcp"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(redirect, OAuthFlowResult::Redirect);
+    assert_eq!(state.calls(), 0);
+
+    let error = authorize_mcp(
+        &provider,
+        &OAuthFlowOptions {
+            server_url: format!("{as_url}/mcp"),
+            authorization_code: Some("unverifiable".to_owned()),
+            iss: Some("https://attacker.example".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    match &error {
+        OAuthFlowError::IssuerMismatch {
+            expected: None,
+            received,
+        } => assert_eq!(received.as_deref(), Some("https://attacker.example")),
+        other => panic!("expected an issuer mismatch, got {other:?}"),
+    }
+    assert!(
+        error.to_string().contains("expected none"),
+        "message names the absent issuer: {error}"
+    );
+    assert_eq!(state.calls(), 0, "no token request before the iss check");
+
+    // A response without `iss` has nothing to compare and is accepted.
+    let result = authorize_mcp(
+        &provider,
+        &OAuthFlowOptions {
+            server_url: format!("{as_url}/mcp"),
+            authorization_code: Some("no-metadata".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, OAuthFlowResult::Authorized);
+    assert_eq!(state.calls(), 1);
 }
 
 #[tokio::test]

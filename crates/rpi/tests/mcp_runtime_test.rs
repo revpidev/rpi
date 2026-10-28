@@ -27,11 +27,16 @@ struct ScriptedServer {
 
 impl ScriptedServer {
     async fn start() -> Self {
+        Self::start_with_capabilities(json!({"tools": {}})).await
+    }
+
+    async fn start_with_capabilities(capabilities: Value) -> Self {
         let (client, server) = create_in_memory_transport_pair();
         let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let subscription = {
             let transport = server.clone();
             let requests = requests.clone();
+            let capabilities = capabilities.clone();
             server.events().on_message(Arc::new(move |message: &rpi_mcp::JsonRpcMessage| {
                 requests.lock().unwrap().push(message.to_json());
                 let rpi_mcp::JsonRpcMessage::Request { id, method, .. } = message else {
@@ -40,16 +45,21 @@ impl ScriptedServer {
                 let id = id.clone();
                 let method = method.clone();
                 let transport = transport.clone();
+                let capabilities = capabilities.clone();
                 tokio::spawn(async move {
                     let result = match method.as_str() {
                         "initialize" => json!({
                             "protocolVersion": "2025-11-25",
-                            "capabilities": {"tools": {}},
+                            "capabilities": capabilities,
                             "serverInfo": {"name": "scripted", "version": "1.0.0"},
                         }),
                         "tools/list" => {
                             json!({"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]})
                         }
+                        "resources/list" => {
+                            json!({"resources": [{"uri": "file:///x", "name": "x"}]})
+                        }
+                        "resources/templates/list" => json!({"resourceTemplates": []}),
                         "ping" => json!({}),
                         _ => json!({}),
                     };
@@ -173,6 +183,60 @@ async fn connects_lists_tools_and_closes() {
     connection.close().await;
     assert_eq!(connection.state(), ServerState::Closed);
     assert!(connection.get_client().await.is_err());
+}
+
+/// #10526: connecting no longer lists resources; the connection only reports
+/// whether the server offers them, and the resource tools list on demand.
+#[tokio::test]
+async fn reports_resources_without_listing_them_at_connect() {
+    use rpi::extensions::mcp::resources::McpResourceServer;
+    use rpi::extensions::mcp::runtime::McpServerConnectionHandle;
+
+    let server =
+        ScriptedServer::start_with_capabilities(json!({"tools": {}, "resources": {}})).await;
+    let (factory, _queue) = queued_factory(vec![server.transport.clone()]);
+    let connection = Arc::new(McpServerConnection::new(McpServerConnectionOptions {
+        entry: stdio_entry("scripted"),
+        cwd: "/tmp".to_owned(),
+        create_transport: factory,
+        credentials: Arc::new(McpOAuthCredentialStore::new(std::path::Path::new(
+            "/tmp/rpi-mcp-test",
+        ))),
+        provider_token: None,
+        on_tools: Arc::new(|_| {}),
+        on_change: None,
+        log: None,
+    }));
+    connection.get_client().await.unwrap();
+    assert!(connection.has_resources());
+    let list_requests = |requests: &[Value]| {
+        requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request.get("method").and_then(Value::as_str),
+                    Some("resources/list" | "resources/templates/list")
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        list_requests(&server.requests.lock().unwrap()),
+        0,
+        "connecting must not list resources"
+    );
+    let handle = McpServerConnectionHandle(connection.clone());
+    let resources = handle
+        .all_resources(rpi_mcp::McpRequestOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(
+        list_requests(&server.requests.lock().unwrap()),
+        1,
+        "the resource tool lists on demand"
+    );
+    connection.close().await;
 }
 
 #[tokio::test]

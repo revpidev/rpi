@@ -175,7 +175,7 @@ pub async fn discover_authorization_server_metadata(
             let trim = |value: &str| value.strip_suffix('/').unwrap_or(value).to_owned();
             if trim(&metadata.issuer) != trim(&expected) {
                 return Err(OAuthFlowError::IssuerMismatch {
-                    expected,
+                    expected: Some(expected),
                     received: Some(metadata.issuer),
                 });
             }

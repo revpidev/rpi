@@ -211,22 +211,6 @@ pub fn render_servers_section(servers: &[McpServerListing]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// `scriptNeedsServer` (index.ts:237): whether a codemode script names the
-/// server's namespace, or searches/enumerates/describes tools.
-pub fn script_needs_server(code: &str, server: &str) -> bool {
-    for marker in [
-        "searchTools",
-        "describeNamespace",
-        "describeTool",
-        "ALL_TOOLS",
-    ] {
-        if code.contains(marker) {
-            return true;
-        }
-    }
-    code.contains(&mcp_namespace(server))
-}
-
 /// Replaceable-coexistence detection (FR-H, `resource-loader.ts:116-146`):
 /// the source path of the extension that registered an `mcp` tool or `/mcp`
 /// command other than the built-in itself, or `None` when the built-in owns
@@ -1595,17 +1579,13 @@ fn describe_state(server: &McpServer) -> Option<String> {
         ),
         ServerState::Connected => {
             let tools = connection.tools().len();
-            let resources = connection.resources().len();
-            let resource_count = if resources > 0 {
-                format!(
-                    " · {resources} resource{}",
-                    if resources == 1 { "" } else { "s" }
-                )
+            let resources = if connection.has_resources() {
+                " · resources"
             } else {
-                String::new()
+                ""
             };
             format!(
-                "connected · {tools} tool{}{resource_count}",
+                "connected · {tools} tool{}{resources}",
                 if tools == 1 { "" } else { "s" }
             )
         }
@@ -2024,8 +2004,6 @@ impl McpBuiltinState {
         if pending.is_empty() {
             return Ok(Value::Null);
         }
-        let is_codemode = tool_name == super::super::codemode::tool::CODEMODE_TOOL_NAME;
-        let is_search = tool_name == super::super::tool_search::TOOL_SEARCH_TOOL_NAME;
         // Shared `ToolDefinition.reachesTools` declaration: a tool that
         // reaches other tools waits only for the servers its input may name.
         let reach = ctx
@@ -2044,25 +2022,26 @@ impl McpBuiltinState {
                 })
                 .map(|(_, ready, _)| ready)
                 .collect()
-        } else if is_codemode {
-            let code = event
-                .get("input")
-                .and_then(|input| input.get("code"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            pending
-                .into_iter()
-                .filter(|(server, _, _)| {
-                    let name = lock(&server.entry).name.clone();
-                    script_needs_server(&code, &name)
-                })
-                .map(|(_, ready, _)| ready)
-                .collect()
-        } else if is_search || is_resource_tool(tool_name) {
+        } else if is_resource_tool(tool_name) {
+            // The resource tools reach every server.
             pending.into_iter().map(|(_, ready, _)| ready).collect()
         } else {
-            Vec::new()
+            // A direct MCP call waits for its own server, including a
+            // reconnect that is still closing its old transport
+            // (index.ts:1191-1209).
+            let owner = lock(&self.tools)
+                .tool_owners
+                .get(tool_name)
+                .and_then(|owner| owner.split('\0').next())
+                .map(str::to_owned);
+            match owner {
+                Some(owner) => pending
+                    .into_iter()
+                    .filter(|(server, _, _)| lock(&server.entry).name == owner)
+                    .map(|(_, ready, _)| ready)
+                    .collect(),
+                None => Vec::new(),
+            }
         };
         self.wait_for_servers(waiting, ctx.signal().unwrap_or(None))
             .await;
@@ -2752,18 +2731,6 @@ mod tests {
             instructions: None,
         }];
         assert!(render_servers_section(&direct).is_none());
-    }
-
-    #[test]
-    fn script_needs_server_detection() {
-        assert!(script_needs_server(
-            "await tools.mcp__docs__search({})",
-            "docs"
-        ));
-        assert!(script_needs_server("return searchTools('x')", "docs"));
-        assert!(script_needs_server("return ALL_TOOLS.length", "docs"));
-        assert!(!script_needs_server("return 1", "docs"));
-        assert!(!script_needs_server("await tools.other()", "docs"));
     }
 
     #[test]

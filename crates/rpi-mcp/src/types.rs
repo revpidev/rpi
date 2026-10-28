@@ -437,7 +437,9 @@ pub fn validate_read_resource_result(value: &Value) -> Result<ReadResourceResult
 }
 
 /// The `CallToolResult` shape, validated and normalized (`content` defaults
-/// to `[]`; client.ts:145).
+/// to `[]`; client.ts:143-150). `structuredContent` may be any JSON value,
+/// including arrays and an explicit `null` (MCP 2026-07-28); `None` means the
+/// field is missing and `Some(Value::Null)` means it is present as null.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallToolResult {
     pub content: Vec<Value>,
@@ -446,7 +448,7 @@ pub struct CallToolResult {
     pub meta: Option<Value>,
 }
 
-/// `validateCallToolResult` (client.ts:145).
+/// `validateCallToolResult` (client.ts:143-150).
 pub fn validate_call_tool_result(value: &Value) -> Result<CallToolResult, McpError> {
     let Some(map) = value.as_object() else {
         return Err(invalid("Invalid MCP tools/call result"));
@@ -457,22 +459,13 @@ pub fn validate_call_tool_result(value: &Value) -> Result<CallToolResult, McpErr
     {
         return Err(invalid("Invalid MCP tools/call result"));
     }
-    if let Some(structured) = map.get("structuredContent")
-        && !structured.is_null()
-        && !is_object(structured)
-    {
-        return Err(invalid("Invalid MCP tools/call structured content"));
-    }
     Ok(CallToolResult {
         content: map
             .get("content")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
-        structured_content: map
-            .get("structuredContent")
-            .cloned()
-            .filter(|value| !value.is_null()),
+        structured_content: map.get("structuredContent").cloned(),
         is_error: map.get("isError").and_then(Value::as_bool),
         meta: map.get("_meta").cloned().filter(|value| !value.is_null()),
     })
@@ -544,12 +537,26 @@ mod tests {
     }
 
     #[test]
-    fn call_tool_result_defaults_content() {
+    fn call_tool_result_defaults_content_and_accepts_any_structured_content() {
         let result = validate_call_tool_result(&json!({"structuredContent": {"a": 1}})).unwrap();
         assert!(result.content.is_empty());
         assert_eq!(result.structured_content, Some(json!({"a": 1})));
         assert!(validate_call_tool_result(&json!({"content": "x"})).is_err());
-        assert!(validate_call_tool_result(&json!({"structuredContent": []})).is_err());
+        // #10416: MCP 2026-07-28 allows any JSON value, and an explicit null
+        // stays distinct from a missing field.
+        for structured in [
+            json!([{"id": 1}]),
+            json!("text"),
+            json!(3),
+            json!(false),
+            Value::Null,
+        ] {
+            let result =
+                validate_call_tool_result(&json!({"structuredContent": structured})).unwrap();
+            assert_eq!(result.structured_content, Some(structured));
+        }
+        let missing = validate_call_tool_result(&json!({"content": []})).unwrap();
+        assert_eq!(missing.structured_content, None);
     }
 
     #[test]

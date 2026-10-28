@@ -119,9 +119,15 @@ pub fn create_mcp_result_schema(structured_content_schema: Option<&Value>) -> Va
         "content".to_owned(),
         json!({"type": "array", "items": {"type": "object"}}),
     );
-    if let Some(schema) = structured_content_schema {
-        properties.insert("structuredContent".to_owned(), schema.clone());
-    }
+    // Servers may send structured content without declaring a schema for it,
+    // and it may be any JSON value (#10416): an empty schema renders as
+    // `unknown` instead of an object map.
+    properties.insert(
+        "structuredContent".to_owned(),
+        structured_content_schema
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    );
     properties.insert("isError".to_owned(), json!({"type": "boolean"}));
     properties.insert("_meta".to_owned(), json!({"type": "object"}));
     json!({"type": "object", "properties": properties, "required": ["content"]})
@@ -354,11 +360,17 @@ pub fn convert_mcp_result(
         }));
     }
     let (content, full_output_path) = limit_mcp_content(converted, &options.saver());
-    let script_result = json!({
-        "content": result.content,
-        "structuredContent": result.structured_content,
-        "isError": result.is_error,
-    });
+    // Missing fields stay absent, as `JSON.stringify` drops `undefined`;
+    // an explicit `null` structured content is sent as null (#10416).
+    let mut script_result = serde_json::Map::new();
+    script_result.insert("content".to_owned(), json!(result.content));
+    if let Some(structured) = &result.structured_content {
+        script_result.insert("structuredContent".to_owned(), structured.clone());
+    }
+    if let Some(is_error) = result.is_error {
+        script_result.insert("isError".to_owned(), Value::Bool(is_error));
+    }
+    let script_result = Value::Object(script_result);
     AgentToolResult {
         content,
         details: McpToolDetails {
@@ -744,7 +756,7 @@ mod tests {
         };
         let converted = convert_mcp_result("s", "t", &result, &ConvertMcpResultOptions::default());
         assert_eq!(converted.is_error, Some(true));
-        let structured = converted.structured_content.unwrap();
+        let structured = converted.structured_content.clone().unwrap();
         assert_eq!(structured["structuredContent"], json!({"count": 3}));
         assert!(structured.get("_meta").is_none());
         assert!(text_of(&converted.content).contains("ok"));
@@ -752,6 +764,35 @@ mod tests {
             converted.details.get("server").and_then(Value::as_str),
             Some("s")
         );
+
+        // #10416: arrays, primitives and null reach scripts unchanged, and a
+        // missing field stays absent instead of becoming null.
+        for structured in [json!([{"id": 1}]), json!("text"), json!(3), Value::Null] {
+            let result = CallToolResult {
+                content: vec![],
+                structured_content: Some(structured.clone()),
+                is_error: None,
+                meta: None,
+            };
+            let converted =
+                convert_mcp_result("s", "t", &result, &ConvertMcpResultOptions::default());
+            let script = converted.structured_content.unwrap();
+            assert_eq!(script["structuredContent"], structured);
+            assert!(
+                script.get("isError").is_none(),
+                "missing isError stays absent"
+            );
+        }
+        let missing = CallToolResult {
+            content: vec![],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+        let converted = convert_mcp_result("s", "t", &missing, &ConvertMcpResultOptions::default());
+        let script = converted.structured_content.unwrap();
+        assert!(script.get("structuredContent").is_none());
+        assert!(script.get("isError").is_none());
     }
 
     #[test]

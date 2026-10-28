@@ -43,6 +43,10 @@ pub enum McpTransportError {
     /// Local IO failure (spawn, pipe, network).
     #[error("{0}")]
     Io(String),
+    /// The caller no longer waits for the reply; the message must not be
+    /// dispatched (for example when retrying after an authorization refresh).
+    #[error("MCP request aborted")]
+    Aborted,
     /// Any other transport failure.
     #[error("{0}")]
     Other(String),
@@ -103,6 +107,7 @@ impl McpTransportError {
             McpTransportError::AuthorizationRequired => McpError::AuthorizationRequired,
             McpTransportError::SessionExpired { .. } => McpError::SessionExpired,
             McpTransportError::Io(message) => McpError::Network(message),
+            McpTransportError::Aborted => McpError::Aborted,
             McpTransportError::Other(message) => McpError::Transport(message),
         }
     }
@@ -246,11 +251,29 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+/// `McpTransportSendOptions` (transport.ts:9-22 @ 4a080252f): aborted once
+/// the sender no longer waits for a reply, so a transport must not dispatch
+/// the message after that (for example when retrying after an authorization
+/// refresh).
+#[derive(Clone, Default)]
+pub struct McpTransportSendOptions {
+    pub signal: Option<tokio_util::sync::CancellationToken>,
+}
+
 /// A transport the client drives (`McpTransport`, transport.ts:9).
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     async fn start(&self) -> Result<(), McpTransportError>;
     async fn send(&self, message: serde_json::Value) -> Result<(), McpTransportError>;
+    /// `send(message, options)`; the default ignores the abort signal (stdio
+    /// and in-memory transports dispatch synchronously).
+    async fn send_with_options(
+        &self,
+        message: serde_json::Value,
+        _options: McpTransportSendOptions,
+    ) -> Result<(), McpTransportError> {
+        self.send(message).await
+    }
     async fn close(&self) -> Result<(), McpTransportError>;
     /// `setProtocolVersion?` (transport.ts:15).
     fn set_protocol_version(&self, _version: &str) {}

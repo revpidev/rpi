@@ -1,5 +1,14 @@
 //! OAuth errors (port of `packages/mcp/src/oauth/errors.ts` @ 4a080252f).
 
+/// Format an issuer like the upstream error message: a JSON string, or
+/// `none` when it is absent.
+fn display_issuer(issuer: &Option<String>) -> String {
+    issuer
+        .as_deref()
+        .map(|issuer| format!("{issuer:?}"))
+        .unwrap_or_else(|| "none".to_owned())
+}
+
 /// `OAuthError` (errors.ts:1): an OAuth error response (`error` +
 /// `error_description`), or a generic flow failure.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -11,10 +20,16 @@ pub enum OAuthFlowError {
         message: String,
         error_uri: Option<String>,
     },
-    /// `OAuthIssuerMismatchError` (errors.ts:12).
-    #[error("OAuth issuer mismatch: expected {expected:?}, received {received:?}")]
+    /// `OAuthIssuerMismatchError` (errors.ts:12): `expected` is `None` when
+    /// no authorization server metadata was discovered, so no issuer could
+    /// be compared with the response's `iss`.
+    #[error(
+        "OAuth issuer mismatch: expected {}, received {}",
+        display_issuer(expected),
+        display_issuer(received)
+    )]
     IssuerMismatch {
-        expected: String,
+        expected: Option<String>,
         received: Option<String>,
     },
     /// `OAuthInsecureEndpointError` (errors.ts:28).

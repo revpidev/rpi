@@ -623,8 +623,9 @@ struct ServerReport {
     state: String,
     tools: Vec<String>,
     tool_exposure: Map<String, Value>,
-    resources: Option<usize>,
-    resource_templates: Option<usize>,
+    /// Whether the server offers resources. They are not listed: listing
+    /// every one can take long.
+    resources: Option<bool>,
     error: Option<String>,
 }
 
@@ -669,8 +670,7 @@ async fn list(
                 }
             }
             if connection.has_resources() {
-                report.resources = Some(connection.resources().len());
-                report.resource_templates = Some(connection.resource_templates().len());
+                report.resources = Some(true);
             }
             if connection.state() != ServerState::Connected {
                 report.error = connection.error();
@@ -704,7 +704,6 @@ async fn list(
                 }
                 if let Some(resources) = report.resources {
                     value["resources"] = json!(resources);
-                    value["resourceTemplates"] = json!(report.resource_templates.unwrap_or(0));
                 }
                 if let Some(error) = &report.error {
                     value["error"] = json!(error);
@@ -760,11 +759,8 @@ async fn list(
                 .join(", ");
             options.log(format!("  tools: {tools}"));
         }
-        if let Some(resources) = report.resources {
-            options.log(format!(
-                "  resources: {resources}, URI templates: {}",
-                report.resource_templates.unwrap_or(0)
-            ));
+        if report.resources == Some(true) {
+            options.log("  offers resources");
         }
         if let Some(error) = &report.error {
             options.log(format!("  {}", error.replace('\n', "\n  ")));

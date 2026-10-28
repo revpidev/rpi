@@ -673,8 +673,27 @@ impl McpClient {
                 }
             });
         }
-        if let Err(error) = transport.send(message).await {
-            self.cancel_pending(&id, error.into_mcp_error(), false, None);
+        // Do not await the dispatch: a request that was cancelled or timed
+        // out while the transport waited for an authorization refresh must
+        // settle promptly, and the transport must not dispatch it afterwards
+        // (client.ts:437-442, #10598).
+        {
+            let client = self.clone();
+            let id = id.clone();
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                if let Err(error) = transport
+                    .send_with_options(
+                        message,
+                        crate::transport::McpTransportSendOptions {
+                            signal: Some(settled.clone()),
+                        },
+                    )
+                    .await
+                {
+                    client.cancel_pending(&id, error.into_mcp_error(), false, None);
+                }
+            });
         }
         match receiver.await {
             Ok(result) => result,

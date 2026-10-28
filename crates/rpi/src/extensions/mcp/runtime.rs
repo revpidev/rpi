@@ -233,8 +233,6 @@ pub struct McpServerConnection {
     error: Mutex<Option<String>>,
     tools: Mutex<Vec<McpTool>>,
     has_resources: AtomicBool,
-    resources: Mutex<Vec<Resource>>,
-    resource_templates: Mutex<Vec<ResourceTemplate>>,
     instructions: Mutex<Option<String>>,
     challenge: Arc<Mutex<Option<OAuthChallenge>>>,
     client: AsyncMutex<Option<Arc<McpClient>>>,
@@ -305,8 +303,6 @@ impl McpServerConnection {
             error: Mutex::new(None),
             tools: Mutex::new(Vec::new()),
             has_resources: AtomicBool::new(false),
-            resources: Mutex::new(Vec::new()),
-            resource_templates: Mutex::new(Vec::new()),
             instructions: Mutex::new(None),
             challenge,
             client: AsyncMutex::new(None),
@@ -356,14 +352,6 @@ impl McpServerConnection {
 
     pub fn has_resources(&self) -> bool {
         self.has_resources.load(Ordering::SeqCst)
-    }
-
-    pub fn resources(&self) -> Vec<Resource> {
-        lock(&self.resources).clone()
-    }
-
-    pub fn resource_templates(&self) -> Vec<ResourceTemplate> {
-        lock(&self.resource_templates).clone()
     }
 
     pub fn instructions(&self) -> Option<String> {
@@ -651,20 +639,6 @@ impl McpServerConnection {
         }
         {
             let connection = self.clone();
-            let client_for_refresh = client.clone();
-            client.on_notification(
-                "notifications/resources/list_changed",
-                Arc::new(move |_| {
-                    let connection = connection.clone();
-                    let client = client_for_refresh.clone();
-                    tokio::spawn(async move {
-                        connection.refresh_resources(client, generation).await;
-                    });
-                }),
-            );
-        }
-        {
-            let connection = self.clone();
             let client_for_close = client.clone();
             client.on_close(Arc::new(move || {
                 connection.handle_client_close(&client_for_close);
@@ -690,19 +664,16 @@ impl McpServerConnection {
             } else {
                 Vec::new()
             };
-            let (resources, resource_templates) = if has_resources {
-                fetch_resources(&setup_client).await
-            } else {
-                (Vec::new(), Vec::new())
-            };
             if self.is_closed() {
                 return Err(McpError::Transport("shut down while connecting".to_owned()));
             }
             *self.client.lock().await = Some(setup_client.clone());
             *lock(&self.tools) = tools;
+            // The lists are not fetched at connect: listing every resource
+            // can take long (a large drive) and used to keep the server's
+            // tools out of the first prompt. The resource tools list and
+            // read on demand (#10526).
             self.has_resources.store(has_resources, Ordering::SeqCst);
-            *lock(&self.resources) = resources;
-            *lock(&self.resource_templates) = resource_templates;
             *lock(&self.instructions) = setup_client
                 .instructions()
                 .map(|instructions| instructions.trim().to_owned())
@@ -751,25 +722,6 @@ impl McpServerConnection {
                 *lock(&self.error) = Some(format!("Failed to refresh tools: {error}"));
             }
         }
-        self.changed();
-    }
-
-    /// `refreshResources` (runtime.ts:528).
-    async fn refresh_resources(self: &Arc<Self>, client: Arc<McpClient>, generation: u64) {
-        let (resources, templates) = fetch_resources(&client).await;
-        let same_client = self
-            .client
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &client));
-        if !same_client || self.is_closed() || generation != self.generation.load(Ordering::SeqCst)
-        {
-            return;
-        }
-        *lock(&self.resources) = resources;
-        *lock(&self.resource_templates) = templates;
-        (self.on_tools)(self);
         self.changed();
     }
 
@@ -878,32 +830,6 @@ impl McpServerConnection {
             provider.settled().await;
         }
     }
-}
-
-/// `fetchResources` (runtime.ts:130): resources and templates at connect
-/// time, without MCP App resources.
-async fn fetch_resources(client: &Arc<McpClient>) -> (Vec<Resource>, Vec<ResourceTemplate>) {
-    let resources = client
-        .list_resources(McpRequestOptions::default())
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|resource| {
-            !super::resources::is_mcp_app_uri(&resource.uri, resource.mime_type.as_deref())
-        })
-        .collect();
-    let templates = without_templates(
-        client.list_resource_templates(McpRequestOptions::default()),
-        Vec::new(),
-    )
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .filter(|template| {
-        !super::resources::is_mcp_app_uri(&template.uri_template, template.mime_type.as_deref())
-    })
-    .collect();
-    (resources, templates)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

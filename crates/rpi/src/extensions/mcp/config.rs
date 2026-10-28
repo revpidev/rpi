@@ -597,12 +597,17 @@ pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<McpServerCo
     ))
 }
 
+/// Strip a UTF-8 BOM before parsing (#11191).
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{FEFF}').unwrap_or(text)
+}
+
 /// `readConfigFile` (config.ts) into one loaded config.
 fn read_config_file(path: &Path, scope: McpScope, state: &mut LoadedMcpConfig) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
-    let parsed: Value = match serde_json::from_str(&text) {
+    let parsed: Value = match serde_json::from_str(strip_bom(&text)) {
         Ok(parsed) => parsed,
         Err(error) => {
             state.errors.push(format!("{}: {error}", path.display()));
@@ -840,9 +845,8 @@ fn edit_mcp_servers(
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).ok();
     let parsed: Value = match &text {
-        Some(text) => {
-            serde_json::from_str(text).map_err(|error| format!("{}: {error}", path.display()))?
-        }
+        Some(text) => serde_json::from_str(strip_bom(text))
+            .map_err(|error| format!("{}: {error}", path.display()))?,
         None => Value::Object(Map::new()),
     };
     let mut parsed = match parsed {
@@ -1303,6 +1307,66 @@ mod tests {
         )
         .unwrap();
         assert!(!added);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Regression: #11191. A BOM at the start of either file must not skip
+    // its servers, and editing it must keep working.
+    #[test]
+    fn reads_and_edits_mcp_json_files_with_a_utf8_bom() {
+        let dir = tempdir();
+        let agent = dir.join("agent");
+        let cwd = dir.join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let global = agent.join("mcp.json");
+        let project = cwd.join(".rpi").join("mcp.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global,
+            "\u{FEFF}{\"mcpServers\":{\"demo\":{\"command\":\"echo\",\"enabled\":false}}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            "\u{FEFF}{\"mcpServers\":{\"local\":{\"command\":\"local-cmd\"}}}\n",
+        )
+        .unwrap();
+
+        let loaded = load_mcp_config(&agent, &cwd, true);
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        let servers: Vec<(&str, McpScope)> = loaded
+            .servers
+            .iter()
+            .map(|server| {
+                (
+                    server.name.as_str(),
+                    server.scope.unwrap_or(McpScope::Global),
+                )
+            })
+            .collect();
+        assert_eq!(
+            servers,
+            vec![("demo", McpScope::Global), ("local", McpScope::Project)]
+        );
+
+        assert!(
+            !add_mcp_server_config(
+                &global,
+                "other",
+                &validate_mcp_server_config("other", &json!({"command": "other-cmd"})).unwrap(),
+            )
+            .unwrap()
+        );
+        let raw: Value =
+            serde_json::from_str(strip_bom(&std::fs::read_to_string(&global).unwrap())).unwrap();
+        assert_eq!(
+            raw["mcpServers"],
+            json!({
+                "demo": {"command": "echo", "enabled": false},
+                "other": {"command": "other-cmd"},
+            })
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

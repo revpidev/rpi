@@ -188,6 +188,31 @@ mod tests {
                 text: "{\n  \"a\": 1\n}".to_owned()
             }]
         );
+        // #10416: structured content may be any JSON value, including null.
+        let array = CallToolResult {
+            content: vec![],
+            structured_content: Some(json!([1, 2])),
+            is_error: None,
+            meta: None,
+        };
+        assert_eq!(
+            to_llm_content(&array),
+            vec![LlmContent::Text {
+                text: "[\n  1,\n  2\n]".to_owned()
+            }]
+        );
+        let null = CallToolResult {
+            content: vec![],
+            structured_content: Some(serde_json::Value::Null),
+            is_error: None,
+            meta: None,
+        };
+        assert_eq!(
+            to_llm_content(&null),
+            vec![LlmContent::Text {
+                text: "null".to_owned()
+            }]
+        );
         let empty = CallToolResult {
             content: vec![],
             structured_content: None,
