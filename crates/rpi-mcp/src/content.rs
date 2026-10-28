@@ -181,6 +181,7 @@ mod tests {
             structured_content: Some(json!({"a": 1})),
             is_error: None,
             meta: None,
+            extra: Default::default(),
         };
         assert_eq!(
             to_llm_content(&result),
@@ -194,6 +195,7 @@ mod tests {
             structured_content: Some(json!([1, 2])),
             is_error: None,
             meta: None,
+            extra: Default::default(),
         };
         assert_eq!(
             to_llm_content(&array),
@@ -206,6 +208,7 @@ mod tests {
             structured_content: Some(serde_json::Value::Null),
             is_error: None,
             meta: None,
+            extra: Default::default(),
         };
         assert_eq!(
             to_llm_content(&null),
@@ -218,6 +221,7 @@ mod tests {
             structured_content: None,
             is_error: None,
             meta: None,
+            extra: Default::default(),
         };
         assert!(to_llm_content(&empty).is_empty());
     }

@@ -137,6 +137,14 @@ const deferredTool = {
 	description: "Deferred tool.",
 	parameters: { type: "object", properties: {} },
 };
+const recursive = {
+	name: "recursive",
+	description: "A recursively rooted schema.",
+	parameters: {
+		type: "object",
+		properties: { child: { $ref: "#" }, name: { type: "string" } },
+	},
+};
 const long = {
 	name: "long_tool",
 	description: "A".repeat(4000),
@@ -165,6 +173,7 @@ const cases = [
 	},
 	{ name: "budget-rotation", tools: [long, echo, read], options: { models: true, inlineBudget: 40 } },
 	{ name: "budget-zero", tools: [echo], options: { models: true, inlineBudget: 0 } },
+	{ name: "root-ref", tools: [recursive], options: { models: true, inlineBudget: 3000 } },
 	{ name: "mcp-shared-types", tools: [mcp, echo], options: { models: true, inlineBudget: 2000 } },
 	// #10343: listed tools carry their prompt guidelines.
 	{

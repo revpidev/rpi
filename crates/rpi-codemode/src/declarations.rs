@@ -265,13 +265,49 @@ fn is_object(value: &Value) -> bool {
     value.is_object()
 }
 
+/// `decodeURIComponent` for one JSON pointer segment: percent-escapes are
+/// decoded as UTF-8; malformed escapes stay literal instead of throwing.
+fn decode_uri_component(segment: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
+        {
+            decoded.push(high * 16 + low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| segment.to_owned())
+}
+
 fn resolve_ref(reference: &str, root: &Value) -> Option<Value> {
-    if reference != "#" && !reference.starts_with("#/") {
+    if reference == "#" {
+        // Upstream's `ref.slice(2)` over `"#"` is empty, so the loop is
+        // skipped and the root schema is returned.
+        return Some(root.clone());
+    }
+    if !reference.starts_with("#/") {
         return None;
     }
     let mut current = root;
     for segment in reference[2..].split('/').filter(|part| !part.is_empty()) {
-        let key = segment.replace("~1", "/").replace("~0", "~");
+        let key = decode_uri_component(segment)
+            .replace("~1", "/")
+            .replace("~0", "~");
         current = current.as_object()?.get(&key)?;
     }
     if current.is_boolean() || current.is_object() {
@@ -425,14 +461,27 @@ fn description_of(property: &Value) -> String {
         .to_owned()
 }
 
-/// JS `String(number)`: integral floats render without a trailing `.0`.
+/// JS `String(number)`: integral floats render without a trailing `.0`
+/// (also above 1e15), and exponential notation uses an explicit exponent
+/// sign like JS (`1e+21`, `1e-7`).
 fn js_number_text(number: f64) -> String {
-    if number.fract() == 0.0 && number.is_finite() && number.abs() < 1e15 {
+    if number == 0.0 {
+        return "0".to_owned();
+    }
+    if number.fract() == 0.0 && number.is_finite() && number.abs() < 1e21 {
         return format!("{number:.0}");
     }
-    serde_json::Number::from_f64(number)
+    let text = serde_json::Number::from_f64(number)
         .map(|number| number.to_string())
-        .unwrap_or_else(|| number.to_string())
+        .unwrap_or_else(|| number.to_string());
+    let Some((mantissa, exponent)) = text.split_once(['e', 'E']) else {
+        return text;
+    };
+    match exponent.parse::<i32>() {
+        Ok(exponent) if exponent >= 0 => format!("{mantissa}e+{exponent}"),
+        Ok(exponent) => format!("{mantissa}e{exponent}"),
+        Err(_) => text,
+    }
 }
 
 /// JS `String(value)` for the number and string values a tag can carry.
@@ -444,11 +493,17 @@ fn tag_value_text(value: &Value) -> Option<String> {
     }
 }
 
-/// Identity of a tag value for `Set` semantics (`new Set(values)`).
+/// Identity of a tag value for `Set` semantics (`new Set(values)`):
+/// numbers compare by value (`1` and `1.0` are the same), and `-0` equals
+/// `0` like JS `SameValueZero`.
 fn tag_value_key(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(format!("s:{text}")),
-        Value::Number(number) => Some(format!("n:{}", number)),
+        Value::Number(number) => {
+            let value = number.as_f64()?;
+            let value = if value == 0.0 { 0.0 } else { value };
+            Some(format!("n:{:016x}", value.to_bits()))
+        }
         _ => None,
     }
 }
@@ -961,6 +1016,58 @@ mod tests {
             schema_to_type(&schema, None),
             "{ item: { id: string; parent?: unknown; }; legacy?: \"a\" | \"b\"; remote?: unknown; }"
         );
+    }
+
+    #[test]
+    fn resolves_the_root_reference_and_percent_decoded_segments() {
+        // `{"$ref":"#"}` resolves to the root and stops at the recursion
+        // instead of panicking (upstream `ref.slice(2)` is empty).
+        let schema = json!({
+            "type": "object",
+            "properties": { "child": { "$ref": "#" } }
+        });
+        assert_eq!(
+            schema_to_type(&schema, None),
+            "{ child?: { child?: unknown; }; }"
+        );
+        assert_eq!(schema_to_type(&json!({ "$ref": "#" }), None), "unknown");
+
+        let schema = json!({
+            "type": "object",
+            "properties": { "item": { "$ref": "#/$defs/a%20b" } },
+            "$defs": { "a b": { "type": "string" } }
+        });
+        assert_eq!(schema_to_type(&schema, None), "{ item?: string; }");
+    }
+
+    #[test]
+    fn numeric_tags_dedupe_by_value_and_format_like_js() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "n": {
+                    "type": "number",
+                    "multipleOf": 1,
+                    "anyOf": [{ "type": "number", "multipleOf": 1.0 }, { "type": "null" }],
+                    "default": 1000000000000000000000.0
+                }
+            }
+        });
+        let rendered = schema_to_type(&schema, None);
+        assert!(
+            rendered.contains("@multipleOf 1 @default 1e+21"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("@multipleOf 1").count(), 1, "{rendered}");
+        // `-0` equals `0` for tag dedupe.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "n": { "multipleOf": 0, "anyOf": [{ "multipleOf": -0.0 }, { "type": "null" }] }
+            }
+        });
+        let rendered = schema_to_type(&schema, None);
+        assert_eq!(rendered.matches("@multipleOf").count(), 1, "{rendered}");
     }
 
     #[test]

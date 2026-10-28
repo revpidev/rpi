@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -23,7 +22,7 @@ use serde_json::{Value, json};
 use crate::extensions::codemode::tool::{
     CODEMODE_STORE_ENTRY_TYPE, CodemodeMode, ToolInfo, callable_tools, to_codemode_declaration,
 };
-use crate::extensions::codemode::workers::{Admission, WORKER_WAIT_MS, WorkerPool, pool};
+use crate::extensions::codemode::workers::{Admission, WORKER_WAIT_MS, pool};
 use crate::extensions::tool_search::{
     Bm25Ranker, DEFAULT_TOOL_SEARCH_LIMIT, create_tool_search_document,
 };
@@ -1254,18 +1253,23 @@ fn create_model_globals(
     globals
 }
 
-/// Releases an admission whose worker never started. The sandbox's
-/// `acquire_worker` disarms it when it takes the slot over (execute.ts:559-607).
-struct ReservationGuard {
-    pool: Arc<WorkerPool>,
-    reserved: Arc<AtomicBool>,
-}
-
-impl Drop for ReservationGuard {
-    fn drop(&mut self) {
-        if self.reserved.swap(false, Ordering::SeqCst) {
-            self.pool.release();
-        }
+/// The error result for a script that never got a worker (execute.ts:560-575).
+fn admission_failure(started: Instant, error: String) -> AgentToolResult {
+    let waited = started.elapsed().as_secs_f64();
+    AgentToolResult {
+        content: vec![
+            ToolResultContent::Text(rpi_ai::types::TextContent {
+                text: format!("Script failed\nWall time {waited:.1} seconds\nOutput:\n"),
+                text_signature: None,
+            }),
+            ToolResultContent::Text(rpi_ai::types::TextContent {
+                text: format!("Script error:\n{error}\n\nThe script did not start."),
+                text_signature: None,
+            }),
+        ],
+        details: json!({ "calls": [] }),
+        is_error: Some(true),
+        ..Default::default()
     }
 }
 
@@ -1460,41 +1464,33 @@ pub async fn execute_codemode(
     let pool = pool();
     let admission = pool.reserve(Some(&signal), wait_timeout).await;
     let waited_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
-    if admission != Admission::Reserved {
-        let waited = started.elapsed().as_secs_f64();
-        let error = match admission {
-            Admission::Aborted => "Script aborted: Execution aborted".to_owned(),
-            Admission::Timeout if deadline.is_some_and(|ms| ms <= WORKER_WAIT_MS) => format!(
-                "Script timed out: Execution timed out after {} ms while waiting for a free codemode worker",
-                deadline.unwrap_or(WORKER_WAIT_MS)
-            ),
-            Admission::Timeout => format!(
-                "No codemode worker became free within {} seconds. All {} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
-                WORKER_WAIT_MS / 1000,
-                crate::extensions::codemode::workers::max_workers()
-            ),
-            Admission::Reserved => unreachable!("handled above"),
-        };
-        return Ok(AgentToolResult {
-            content: vec![
-                ToolResultContent::Text(rpi_ai::types::TextContent {
-                    text: format!("Script failed\nWall time {waited:.1} seconds\nOutput:\n"),
-                    text_signature: None,
-                }),
-                ToolResultContent::Text(rpi_ai::types::TextContent {
-                    text: format!("Script error:\n{error}\n\nThe script did not start."),
-                    text_signature: None,
-                }),
-            ],
-            details: json!({ "calls": [] }),
-            is_error: Some(true),
-            ..Default::default()
-        });
-    }
-    let reserved = Arc::new(AtomicBool::new(true));
-    let _reservation = ReservationGuard {
-        pool: pool.clone(),
-        reserved: reserved.clone(),
+    let reservation = match admission {
+        Admission::Reserved(reservation) => reservation,
+        Admission::Aborted => {
+            return Ok(admission_failure(
+                started,
+                "Script aborted: Execution aborted".to_owned(),
+            ));
+        }
+        Admission::Timeout if deadline.is_some_and(|ms| ms <= WORKER_WAIT_MS) => {
+            return Ok(admission_failure(
+                started,
+                format!(
+                    "Script timed out: Execution timed out after {} ms while waiting for a free codemode worker",
+                    deadline.unwrap_or(WORKER_WAIT_MS)
+                ),
+            ));
+        }
+        Admission::Timeout => {
+            return Ok(admission_failure(
+                started,
+                format!(
+                    "No codemode worker became free within {} seconds. All {} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
+                    WORKER_WAIT_MS / 1000,
+                    crate::extensions::codemode::workers::max_workers()
+                ),
+            ));
+        }
     };
 
     let store = {
@@ -1503,15 +1499,21 @@ pub async fn execute_codemode(
             .unwrap_or_default();
         read_codemode_store(&entries)
     };
+    // The sandbox takes the reservation over immediately before its worker
+    // starts; if it never starts one, dropping this handle releases the slot.
+    let reservation = Arc::new(std::sync::Mutex::new(Some(reservation)));
     let acquire_worker = {
-        let pool = pool.clone();
-        let reserved = reserved.clone();
+        let reservation = reservation.clone();
         Arc::new(move || {
-            if !reserved.swap(false, Ordering::SeqCst) {
+            let reservation = reservation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            let Some(reservation) = reservation else {
                 return Err("The script already settled".to_owned());
-            }
-            let pool = pool.clone();
-            Ok(Box::new(move || pool.release()) as rpi_codemode::WorkerRelease)
+            };
+            // The worker's exit drops the reservation, releasing the slot.
+            Ok(Box::new(move || reservation.release()) as rpi_codemode::WorkerRelease)
         })
     };
     let sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
@@ -1538,9 +1540,6 @@ pub async fn execute_codemode(
         )
         .await;
     sandbox.close().await;
-    // The worker started (or will never start); the guard keeps the slot only
-    // for a sandbox that failed to construct.
-    drop(_reservation);
     let result = result?;
 
     let mut nested = calls

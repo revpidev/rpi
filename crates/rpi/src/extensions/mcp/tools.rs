@@ -362,7 +362,8 @@ pub fn convert_mcp_result(
     let (content, full_output_path) = limit_mcp_content(converted, &options.saver());
     // Missing fields stay absent, as `JSON.stringify` drops `undefined`;
     // an explicit `null` structured content is sent as null (#10416).
-    let mut script_result = serde_json::Map::new();
+    // Unmodelled result fields pass through like upstream's `{ ...result }`.
+    let mut script_result = result.extra.clone();
     script_result.insert("content".to_owned(), json!(result.content));
     if let Some(structured) = &result.structured_content {
         script_result.insert("structuredContent".to_owned(), structured.clone());
@@ -753,11 +754,16 @@ mod tests {
             structured_content: Some(json!({"count": 3})),
             is_error: Some(true),
             meta: Some(json!({"ignored": true})),
+            extra: json!({"serverTime": 3})
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
         };
         let converted = convert_mcp_result("s", "t", &result, &ConvertMcpResultOptions::default());
         assert_eq!(converted.is_error, Some(true));
         let structured = converted.structured_content.clone().unwrap();
         assert_eq!(structured["structuredContent"], json!({"count": 3}));
+        assert_eq!(structured["serverTime"], 3, "extra fields pass through");
         assert!(structured.get("_meta").is_none());
         assert!(text_of(&converted.content).contains("ok"));
         assert_eq!(
@@ -773,6 +779,7 @@ mod tests {
                 structured_content: Some(structured.clone()),
                 is_error: None,
                 meta: None,
+                extra: Default::default(),
             };
             let converted =
                 convert_mcp_result("s", "t", &result, &ConvertMcpResultOptions::default());
@@ -788,6 +795,7 @@ mod tests {
             structured_content: None,
             is_error: None,
             meta: None,
+            extra: Default::default(),
         };
         let converted = convert_mcp_result("s", "t", &missing, &ConvertMcpResultOptions::default());
         let script = converted.structured_content.unwrap();

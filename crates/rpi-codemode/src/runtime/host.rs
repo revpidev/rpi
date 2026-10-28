@@ -880,6 +880,27 @@ mod tests {
         );
     }
 
+    /// A panicking worker still runs its release callback, so its slot is
+    /// returned on abnormal exit (FR-B R4).
+    #[test]
+    fn a_panicking_worker_releases_its_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_guard = released.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = WorkerReleaseGuard(Some(Box::new(move || {
+                released_for_guard.store(true, Ordering::SeqCst);
+            })));
+            panic!("worker crashed");
+        }));
+        assert!(outcome.is_err());
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the guard must release the slot while unwinding"
+        );
+    }
+
     /// A denied reservation fails the execution without starting a worker.
     #[tokio::test]
     async fn a_denied_reservation_fails_without_starting_a_worker() {

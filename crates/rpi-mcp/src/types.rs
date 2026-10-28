@@ -440,12 +440,15 @@ pub fn validate_read_resource_result(value: &Value) -> Result<ReadResourceResult
 /// to `[]`; client.ts:143-150). `structuredContent` may be any JSON value,
 /// including arrays and an explicit `null` (MCP 2026-07-28); `None` means the
 /// field is missing and `Some(Value::Null)` means it is present as null.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CallToolResult {
     pub content: Vec<Value>,
     pub structured_content: Option<Value>,
     pub is_error: Option<bool>,
     pub meta: Option<Value>,
+    /// Result fields this client does not model, kept like upstream's
+    /// passthrough object (`{ ...result }` minus `_meta`).
+    pub extra: Map<String, Value>,
 }
 
 /// `validateCallToolResult` (client.ts:143-150).
@@ -459,6 +462,16 @@ pub fn validate_call_tool_result(value: &Value) -> Result<CallToolResult, McpErr
     {
         return Err(invalid("Invalid MCP tools/call result"));
     }
+    let extra = map
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "content" | "structuredContent" | "isError" | "_meta"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
     Ok(CallToolResult {
         content: map
             .get("content")
@@ -468,6 +481,7 @@ pub fn validate_call_tool_result(value: &Value) -> Result<CallToolResult, McpErr
         structured_content: map.get("structuredContent").cloned(),
         is_error: map.get("isError").and_then(Value::as_bool),
         meta: map.get("_meta").cloned().filter(|value| !value.is_null()),
+        extra,
     })
 }
 
@@ -557,6 +571,14 @@ mod tests {
         }
         let missing = validate_call_tool_result(&json!({"content": []})).unwrap();
         assert_eq!(missing.structured_content, None);
+        let extra = validate_call_tool_result(&json!({
+            "content": [],
+            "futureField": {"x": 1},
+            "_meta": {"kept": true}
+        }))
+        .unwrap();
+        assert_eq!(extra.extra.get("futureField"), Some(&json!({"x": 1})));
+        assert!(!extra.extra.contains_key("_meta"));
     }
 
     #[test]

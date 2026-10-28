@@ -46,12 +46,59 @@ fn parse_max_workers(raw: Option<&str>) -> usize {
     }
 }
 
+/// One reserved worker slot. Dropping it releases the slot, so a caller that
+/// is cancelled after admission (or a sandbox that never starts its worker)
+/// cannot leak capacity. The release callback handed to the sandbox owns this
+/// value, which is why the slot outlives the caller-side handle until the
+/// worker actually exits.
+pub struct WorkerReservation {
+    pool: Arc<WorkerPool>,
+    released: bool,
+}
+
+impl WorkerReservation {
+    fn new(pool: Arc<WorkerPool>) -> Self {
+        Self {
+            pool,
+            released: false,
+        }
+    }
+
+    /// Release the slot now. Equivalent to dropping the reservation, but
+    /// explicit at the worker-exit boundary.
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.pool.release();
+        }
+    }
+}
+
+impl Drop for WorkerReservation {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+impl std::fmt::Debug for WorkerReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerReservation")
+            .field("released", &self.released)
+            .finish()
+    }
+}
+
 /// The outcome of one admission attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Admission {
-    /// One worker slot is reserved; the caller must pass its release callback
-    /// to the sandbox.
-    Reserved,
+    /// One worker slot is reserved. Dropping the reservation releases it; the
+    /// caller normally moves it into the sandbox's release callback.
+    Reserved(WorkerReservation),
     /// The caller's signal fired while waiting; nothing was reserved.
     Aborted,
     /// The wait deadline passed; nothing was reserved.
@@ -101,7 +148,7 @@ impl WorkerPool {
     /// (`reserveCodemodeWorker`, execute.ts:75-95). Cancelling the wait does
     /// not release a worker that is already running.
     pub async fn reserve(
-        &self,
+        self: &Arc<Self>,
         signal: Option<&CancellationToken>,
         timeout: Duration,
     ) -> Admission {
@@ -112,7 +159,7 @@ impl WorkerPool {
             let mut state = lock(&self.state);
             if state.active < (self.limit)() {
                 state.active += 1;
-                return Admission::Reserved;
+                return Admission::Reserved(WorkerReservation::new(self.clone()));
             }
             let id = self.next_waiter.fetch_add(1, Ordering::SeqCst);
             let (grant, receiver) = oneshot::channel();
@@ -129,7 +176,7 @@ impl WorkerPool {
         };
         let outcome = tokio::select! {
             biased;
-            _ = receiver => return Admission::Reserved,
+            _ = receiver => return Admission::Reserved(WorkerReservation::new(self.clone())),
             () = &mut sleep => Admission::Timeout,
             () = aborted => Admission::Aborted,
         };
@@ -138,13 +185,14 @@ impl WorkerPool {
         if self.remove_waiter(id) {
             outcome
         } else {
-            Admission::Reserved
+            Admission::Reserved(WorkerReservation::new(self.clone()))
         }
     }
 
     /// Release one slot and hand free capacity to waiters in arrival order
-    /// (`releaseCodemodeWorker`, execute.ts:108-113).
-    pub fn release(&self) {
+    /// (`releaseCodemodeWorker`, execute.ts:108-113). Only a
+    /// [`WorkerReservation`] calls this.
+    fn release(&self) {
         let mut state = lock(&self.state);
         state.active = state.active.saturating_sub(1);
         while !state.waiters.is_empty() && state.active < (self.limit)() {
@@ -187,17 +235,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn reserved(admission: Admission) -> WorkerReservation {
+        match admission {
+            Admission::Reserved(reservation) => reservation,
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn admits_arrival_order_and_counts_each_slot_once() {
-        let pool = WorkerPool::with_limit(|| 2);
-        assert_eq!(
-            pool.reserve(None, Duration::from_millis(50)).await,
-            Admission::Reserved
-        );
-        assert_eq!(
-            pool.reserve(None, Duration::from_millis(50)).await,
-            Admission::Reserved
-        );
+        let pool = Arc::new(WorkerPool::with_limit(|| 2));
+        let first_slot = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        let second_slot = reserved(pool.reserve(None, Duration::from_millis(50)).await);
         let first = pool.reserve(None, Duration::from_secs(5));
         let second = pool.reserve(None, Duration::from_secs(5));
         // Poll both waiters into the queue, then release one slot: the
@@ -214,33 +263,30 @@ mod tests {
                 .await
                 .is_err()
         );
-        pool.release();
-        assert_eq!(first.await, Admission::Reserved);
+        drop(first_slot);
+        let waiting_slot = reserved(first.await);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), second.as_mut())
                 .await
                 .is_err(),
             "the second waiter must still wait"
         );
-        pool.release();
-        assert_eq!(second.await, Admission::Reserved);
+        drop(waiting_slot);
+        let last_slot = reserved(second.await);
         assert_eq!(pool.active(), 2);
-        pool.release();
-        pool.release();
+        drop(second_slot);
+        drop(last_slot);
         assert_eq!(pool.active(), 0);
     }
 
     #[tokio::test]
     async fn waits_with_a_deadline_and_a_cancellable_signal() {
-        let pool = WorkerPool::with_limit(|| 1);
-        assert_eq!(
-            pool.reserve(None, Duration::from_millis(50)).await,
-            Admission::Reserved
-        );
-        assert_eq!(
+        let pool = Arc::new(WorkerPool::with_limit(|| 1));
+        let slot = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        assert!(matches!(
             pool.reserve(None, Duration::from_millis(10)).await,
             Admission::Timeout
-        );
+        ));
         let signal = CancellationToken::new();
         let waiting = pool.reserve(Some(&signal), Duration::from_secs(5));
         let mut waiting = std::pin::pin!(waiting);
@@ -250,36 +296,53 @@ mod tests {
                 .is_err()
         );
         signal.cancel();
-        assert_eq!(waiting.await, Admission::Aborted);
+        assert!(matches!(waiting.await, Admission::Aborted));
         // The running worker keeps its slot; a cancelled waiter releases
         // nothing.
         assert_eq!(pool.active(), 1);
-        pool.release();
+        drop(slot);
+        assert_eq!(pool.active(), 0);
+    }
+
+    /// A caller that goes away after a grant must not leak the slot.
+    #[tokio::test]
+    async fn dropping_a_granted_reservation_releases_the_slot() {
+        let pool = Arc::new(WorkerPool::with_limit(|| 1));
+        let slot = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        let waiting = pool.reserve(None, Duration::from_secs(5));
+        let mut waiting = std::pin::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        drop(slot);
+        // The waiting caller is granted, then goes away before using it.
+        let granted = reserved(waiting.await);
+        assert_eq!(pool.active(), 1);
+        drop(granted);
+        assert_eq!(pool.active(), 0);
     }
 
     #[tokio::test]
     async fn reads_the_limit_on_every_admission() {
         let limit = Arc::new(AtomicUsize::new(1));
         let limit_for_pool = limit.clone();
-        let pool = WorkerPool::with_limit(move || limit_for_pool.load(Ordering::SeqCst));
-        assert_eq!(
-            pool.reserve(None, Duration::from_millis(50)).await,
-            Admission::Reserved
-        );
-        assert_eq!(
+        let pool = Arc::new(WorkerPool::with_limit(move || {
+            limit_for_pool.load(Ordering::SeqCst)
+        }));
+        let first = reserved(pool.reserve(None, Duration::from_millis(50)).await);
+        assert!(matches!(
             pool.reserve(None, Duration::from_millis(10)).await,
             Admission::Timeout
-        );
+        ));
         limit.store(2, Ordering::SeqCst);
-        // The next admission reads the raised limit, and a waiting caller is
-        // admitted by the next release.
-        assert_eq!(
-            pool.reserve(None, Duration::from_millis(50)).await,
-            Admission::Reserved
-        );
+        // The next admission reads the raised limit.
+        let second = reserved(pool.reserve(None, Duration::from_millis(50)).await);
         assert_eq!(pool.active(), 2);
-        pool.release();
-        pool.release();
+        drop(first);
+        drop(second);
+        assert_eq!(pool.active(), 0);
     }
 
     #[test]
