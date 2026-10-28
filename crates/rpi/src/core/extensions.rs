@@ -149,6 +149,30 @@ pub enum InputEventResult {
     },
 }
 
+/// The message that starts an agent run, without the system-prompt fields
+/// (runner.ts `BeforeAgentStartTrigger` @ 4a080252f). User runs carry the
+/// expanded prompt and images; custom runs carry the starting message from
+/// `sendMessage(..., { triggerTurn: true })` while idle.
+#[derive(Debug, Clone)]
+pub enum BeforeAgentStartTrigger {
+    User {
+        prompt: String,
+        images: Option<Vec<ImageContent>>,
+    },
+    Custom {
+        message: Box<AgentMessage>,
+    },
+}
+
+impl BeforeAgentStartTrigger {
+    pub fn message_type(&self) -> &'static str {
+        match self {
+            Self::User { .. } => "user",
+            Self::Custom { .. } => "custom",
+        }
+    }
+}
+
 /// `BeforeAgentStartCombinedResult` (extensions/types.ts + runner.ts
 /// :113-117 @ #9548): the combined result across handlers — injected
 /// messages plus the (possibly handler-mutated) prompt options. A handler's
@@ -504,8 +528,7 @@ pub trait ExtensionRunner: Send + Sync {
     /// combined result, or `None` when no handler is registered.
     async fn emit_before_agent_start(
         &self,
-        _text: &str,
-        _images: Option<&[ImageContent]>,
+        _trigger: &BeforeAgentStartTrigger,
         _system_prompt_options: &crate::core::system_prompt::BuildSystemPromptOptions,
     ) -> Option<BeforeAgentStartResult> {
         None

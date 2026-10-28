@@ -784,16 +784,36 @@ pub struct ProviderStreamEvent {
     pub data: Value,
 }
 
-/// `BeforeAgentStartEvent` (types.ts:693-703). `system_prompt_options` is
-/// the upstream `BuildSystemPromptOptions` JSON.
+/// `BeforeAgentStartEvent` (types.ts:929-961 @ 4a080252f): a tagged union
+/// on `messageType`. A run started by a submitted prompt / RPC prompt /
+/// `sendUserMessage` carries `user` + `prompt`/`images`; a run started by
+/// `sendMessage(..., { triggerTurn: true })` while idle carries `custom` +
+/// the starting message. `systemPromptOptions` is the upstream
+/// `BuildSystemPromptOptions` JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BeforeAgentStartEvent {
-    pub prompt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub images: Option<Vec<ImageContent>>,
-    pub system_prompt: String,
-    pub system_prompt_options: Value,
+#[serde(tag = "messageType", rename_all = "lowercase")]
+pub enum BeforeAgentStartEvent {
+    /// A user-message run.
+    #[serde(rename_all = "camelCase")]
+    User {
+        /// The raw user prompt text (after expansion).
+        prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<ImageContent>>,
+        /// The current (chained) system prompt.
+        system_prompt: String,
+        system_prompt_options: Value,
+    },
+    /// An idle custom-message run (`triggerTurn: true`).
+    #[serde(rename_all = "camelCase")]
+    Custom {
+        /// The custom message that starts the run (boxed: the union keeps
+        /// the common user variant small).
+        message: Box<AgentMessage>,
+        /// The current (chained) system prompt.
+        system_prompt: String,
+        system_prompt_options: Value,
+    },
 }
 
 /// `BeforeAgentStartEventResult["message"]` — `Pick<CustomMessage,

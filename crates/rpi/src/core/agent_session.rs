@@ -63,8 +63,9 @@ use crate::core::auth_guidance::{
 };
 use crate::core::compaction_runner::{CompactionEvent, CompactionRunner};
 use crate::core::extensions::{
-    ExtensionErrorInfo, ExtensionMode, ExtensionRunner, ExtensionRunnerRef, InputEventResult,
-    InputSource, SessionStartEvent, SessionStartReason, StreamingBehavior, read_runner,
+    BeforeAgentStartTrigger, ExtensionErrorInfo, ExtensionMode, ExtensionRunner,
+    ExtensionRunnerRef, InputEventResult, InputSource, SessionStartEvent, SessionStartReason,
+    StreamingBehavior, read_runner,
 };
 use crate::core::model_resolver::ScopedModel;
 use crate::core::model_runtime::ModelRuntime;
@@ -2179,6 +2180,15 @@ impl AgentSession {
 
     /// `_handleAgentEvent` (agent-session.ts:1074-1086).
     async fn handle_agent_event(&self, event: AgentEvent) {
+        // An abort requested while the run was starting (e.g. during
+        // before_agent_start) stops it when the loop starts
+        // (agent-session.ts:1104-1107 @ 4a080252f). `agent_start` is awaited
+        // before the first request.
+        if matches!(event, AgentEvent::AgentStart)
+            && self.inner.agent_run_abort_requested.load(Ordering::SeqCst)
+        {
+            self.inner.agent.abort();
+        }
         // `_nestedToolCalls.clear()` on `agent_end` (agent-session.ts:1085).
         if matches!(event, AgentEvent::AgentEnd { .. }) {
             self.clear_nested_tool_calls();
@@ -3834,10 +3844,8 @@ impl AgentSession {
             }));
             return Ok(());
         }
-        self.inner
-            .agent_run_abort_requested
-            .store(false, Ordering::SeqCst);
-        self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
+        // Busy/abort state was armed by `mark_run_starting` before
+        // preparation; do not clear an abort requested during setup.
         // `this._failedResponse = undefined; this._recordSelection();`
         // (agent-session.ts:1778-1779 @ 4a080252f).
         *lock(&self.inner.failed_response) = None;
@@ -4028,6 +4036,151 @@ impl AgentSession {
         (normalized_images, hints)
     }
 
+    /// Mark a run as starting (`_startRun` entry, agent-session.ts:1823-1855
+    /// @ 4a080252f): busy before before_agent_start runs, with the previous
+    /// run's abort request cleared. A request during setup persists until
+    /// the agent loop starts (see the `agent_start` abort check).
+    pub(crate) fn mark_run_starting(&self) {
+        self.inner
+            .agent_run_abort_requested
+            .store(false, Ordering::SeqCst);
+        self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
+        self.inner.idle_notify.notify_waiters();
+    }
+
+    /// Roll back [`Self::mark_run_starting`] when preparation fails: clear
+    /// the busy state, release held messages and wake idle waiters
+    /// (agent-session.ts:1827-1831).
+    fn reset_run_start(&self) {
+        self.inner
+            .is_agent_run_active
+            .store(false, Ordering::SeqCst);
+        self.flush_pending_bash_messages();
+        self.flush_pending_custom_messages();
+        self.resolve_idle_wait_if_idle();
+    }
+
+    /// Prepare a run and return its starting messages (`_prepareRun`,
+    /// agent-session.ts:1879-1934 @ 4a080252f): compaction first, then
+    /// before_agent_start (user or custom trigger), the prompt option/tool
+    /// loadout union, followed by the starting message, pending nextTurn
+    /// messages and handler-injected custom messages, with the system patch
+    /// first when the prompt changed.
+    async fn prepare_run_messages(
+        &self,
+        trigger: &BeforeAgentStartTrigger,
+    ) -> Result<Vec<AgentMessage>, RpiError> {
+        // Check if we need to compact before sending (catches aborted
+        // responses). The starting message is sent below, so do not call
+        // agent.continue() here.
+        if let Some(last_assistant) = self.find_last_assistant_message() {
+            self.check_compaction(&last_assistant, false).await;
+        }
+
+        // before_agent_start extension event (agent-session.ts:1891-1934
+        // @ 4a080252f). Handlers may edit `systemPromptOptions` (collections
+        // mutable) or return `systemPrompt` — the runner chains the latter
+        // as `forceSystemPrompt` on the options and threads the mutated
+        // options back in the combined result.
+        // Baseline for the edit check: upstream's normalized options always
+        // carry a selectedTools array (absent → default four,
+        // system-prompt.ts:58) — mirror that when the base is unset.
+        let selected_tools_before = lock(&self.inner.base_system_prompt_options)
+            .selected_tools
+            .clone()
+            .unwrap_or_else(|| {
+                ["read", "bash", "edit", "write"]
+                    .map(str::to_owned)
+                    .to_vec()
+            });
+        let base_options = lock(&self.inner.base_system_prompt_options).clone();
+        let result = self
+            .runner()
+            .emit_before_agent_start(trigger, &base_options)
+            .await;
+        let (mut options, result_messages) = match result {
+            Some(combined) => (combined.system_prompt_options, combined.messages),
+            None => (
+                lock(&self.inner.base_system_prompt_options).clone(),
+                Vec::new(),
+            ),
+        };
+        // Handlers may edit `event.systemPromptOptions.selectedTools` or
+        // call `setActiveTools()`, which updates the live loadout instead.
+        // An explicit edit wins; otherwise the live loadout is
+        // authoritative, so a `setActiveTools()` call is not undone here
+        // (agent-session.ts:1407-1413). A missing key (`None`) is NOT an
+        // edit — the rpi replacement-style ABI lets a handler return a
+        // partial options object, and `normalizeBuildSystemPromptOptions`
+        // upstream (system-prompt.ts:58) can never produce "absent";
+        // treating it as unedited keeps the current loadout instead of
+        // clearing every tool.
+        let handler_edited_tools = options.selected_tools.as_ref().is_some_and(|tools| {
+            tools.len() != selected_tools_before.len()
+                || tools
+                    .iter()
+                    .zip(selected_tools_before.iter())
+                    .any(|(name, before)| name != before)
+        });
+        if !handler_edited_tools {
+            options.selected_tools = Some(self.get_active_tool_names());
+        }
+
+        let mut messages: Vec<AgentMessage> = Vec::new();
+        match trigger {
+            BeforeAgentStartTrigger::User { prompt, images } => {
+                // Build the message batch (agent-session.ts:2028-2044
+                // @ f5c946480): after the hook so extension-driven model
+                // selection determines the resize profile used for the
+                // request and history (#9631).
+                let (normalized_images, image_hints) = self.normalize_prompt_images(images.clone());
+                let user_text = if image_hints.is_empty() {
+                    prompt.clone()
+                } else {
+                    format!("{prompt}\n\n{}", image_hints.join("\n"))
+                };
+                let mut user_content: Vec<UserContentBlock> =
+                    vec![UserContentBlock::Text(TextContent {
+                        text: user_text,
+                        text_signature: None,
+                    })];
+                user_content.extend(normalized_images.into_iter().map(UserContentBlock::Image));
+                messages.push(AgentMessage::User(UserMessage {
+                    role: UserRole::User,
+                    content: UserContent::Blocks(user_content),
+                    timestamp: now_millis(),
+                }));
+            }
+            BeforeAgentStartTrigger::Custom { message } => {
+                messages.push((**message).clone());
+            }
+        }
+
+        // Pending "nextTurn" asides.
+        messages.extend(lock(&self.inner.pending_next_turn_messages).drain(..));
+
+        for msg in result_messages {
+            messages.push(AgentMessage::Custom(CustomMessage {
+                role: CustomRole::Custom,
+                custom_type: msg.custom_type,
+                content: msg.content.unwrap_or_default(),
+                display: msg.display,
+                details: msg.details,
+                timestamp: now_millis(),
+            }));
+        }
+        // #9548: diff the desired sections against what the model currently
+        // has (replayed from the transcript) — the patch rides a system
+        // message placed before the user turn; tool changes are declared by
+        // the agent loop before the request.
+        let update_message = self.prepare_prompt_and_tool_loadout(&mut options, None);
+        *lock(&self.inner.run_system_prompt_options) = Some(options);
+        if let Some(update) = update_message {
+            messages.insert(0, AgentMessage::System(update));
+        }
+        Ok(messages)
+    }
+
     /// Preflight half of `prompt` (agent-session.ts:1114-1265): everything up
     /// to and including the message batch. The caller decides when to await
     /// [`Self::run_agent_prompt`], which lets the compaction flush queue the
@@ -4112,11 +4265,6 @@ impl AgentSession {
                 return Ok(PromptOutcome::Queued);
             }
 
-            // Flush any pending bash and custom messages before the new
-            // prompt (agent-session.ts:1226-1227).
-            self.flush_pending_bash_messages();
-            self.flush_pending_custom_messages();
-
             // Validate model (agent-session.ts:1177-1195).
             let Some(model) = self.model() else {
                 return Err(RpiError::Session(format_no_model_selected_message()));
@@ -4141,107 +4289,30 @@ impl AgentSession {
                 )));
             }
 
-            // Pre-prompt compaction check (agent-session.ts:1197-1202).
-            if let Some(last_assistant) = self.find_last_assistant_message() {
-                self.check_compaction(&last_assistant, false).await;
-            }
-
-            // before_agent_start extension event (agent-session.ts:1398-1436
-            // @ #9548). Handlers may edit `systemPromptOptions` (collections
-            // mutable) or return `systemPrompt` — the runner chains the
-            // latter as `forceSystemPrompt` on the options and threads the
-            // mutated options back in the combined result.
-            // Baseline for the edit check: upstream's normalized options
-            // always carry a selectedTools array (absent → default four,
-            // system-prompt.ts:58) — mirror that when the base is unset.
-            let selected_tools_before = lock(&self.inner.base_system_prompt_options)
-                .selected_tools
-                .clone()
-                .unwrap_or_else(|| {
-                    ["read", "bash", "edit", "write"]
-                        .map(str::to_owned)
-                        .to_vec()
-                });
-            let base_options = lock(&self.inner.base_system_prompt_options).clone();
-            let result = self
-                .runner()
-                .emit_before_agent_start(&expanded_text, images.as_deref(), &base_options)
-                .await;
-            let (mut options, result_messages) = match result {
-                Some(combined) => (combined.system_prompt_options, combined.messages),
-                None => (
-                    lock(&self.inner.base_system_prompt_options).clone(),
-                    Vec::new(),
-                ),
+            // The session counts as busy from the start of setup
+            // (agent-session.ts:1823-1855 @ 4a080252f): messages sent while
+            // before_agent_start handlers run join this run instead of
+            // starting a second one, and an abort requested meanwhile stops
+            // it once the run exists.
+            self.mark_run_starting();
+            let trigger = BeforeAgentStartTrigger::User {
+                prompt: expanded_text.clone(),
+                images: images.clone(),
             };
-            // Handlers may edit `event.systemPromptOptions.selectedTools` or
-            // call `setActiveTools()`, which updates the live loadout
-            // instead. An explicit edit wins; otherwise the live loadout is
-            // authoritative, so a `setActiveTools()` call is not undone here
-            // (agent-session.ts:1407-1413). A missing key (`None`) is NOT an
-            // edit — the rpi replacement-style ABI lets a handler return a
-            // partial options object, and `normalizeBuildSystemPromptOptions`
-            // upstream (system-prompt.ts:58) can never produce "absent";
-            // treating it as unedited keeps the current loadout instead of
-            // clearing every tool.
-            let handler_edited_tools = options.selected_tools.as_ref().is_some_and(|tools| {
-                tools.len() != selected_tools_before.len()
-                    || tools
-                        .iter()
-                        .zip(selected_tools_before.iter())
-                        .any(|(name, before)| name != before)
-            });
-            if !handler_edited_tools {
-                options.selected_tools = Some(self.get_active_tool_names());
-            }
-
-            // Build the message batch (agent-session.ts:2028-2044
-            // @ f5c946480): after the hook so extension-driven model
-            // selection determines the resize profile used for the request
-            // and history (#9631).
-            let (normalized_images, image_hints) = self.normalize_prompt_images(images.clone());
-            let user_text = if image_hints.is_empty() {
-                expanded_text.clone()
-            } else {
-                format!("{expanded_text}\n\n{}", image_hints.join("\n"))
+            let prepared = self.prepare_run_messages(&trigger).await;
+            let messages = match prepared {
+                Ok(messages) => messages,
+                Err(error) => {
+                    // `_startRun` error path: leave the starting state,
+                    // release held messages and wake idle waiters.
+                    self.reset_run_start();
+                    return Err(error);
+                }
             };
-
-            let mut messages: Vec<AgentMessage> = Vec::new();
-            let mut user_content: Vec<UserContentBlock> =
-                vec![UserContentBlock::Text(TextContent {
-                    text: user_text,
-                    text_signature: None,
-                })];
-            user_content.extend(normalized_images.into_iter().map(UserContentBlock::Image));
-            messages.push(AgentMessage::User(UserMessage {
-                role: UserRole::User,
-                content: UserContent::Blocks(user_content),
-                timestamp: now_millis(),
-            }));
-
-            // Pending "nextTurn" asides.
-            messages.extend(lock(&self.inner.pending_next_turn_messages).drain(..));
-
-            for msg in result_messages {
-                messages.push(AgentMessage::Custom(CustomMessage {
-                    role: CustomRole::Custom,
-                    custom_type: msg.custom_type,
-                    content: msg.content.unwrap_or_default(),
-                    display: msg.display,
-                    details: msg.details,
-                    timestamp: now_millis(),
-                }));
-            }
-            // #9548: diff the desired sections against what the model
-            // currently has (replayed from the transcript) — the patch rides
-            // a system message placed before the user turn; tool changes are
-            // declared by the agent loop before the request.
-            let update_message = self.prepare_prompt_and_tool_loadout(&mut options, None);
-            *lock(&self.inner.run_system_prompt_options) = Some(options);
-            if let Some(update) = update_message {
-                messages.insert(0, AgentMessage::System(update));
-            }
-
+            // Held while the run was starting: they go before its starting
+            // messages, as they would have while idle.
+            self.flush_pending_bash_messages();
+            self.flush_pending_custom_messages();
             Ok(PromptOutcome::Started(messages))
         }
         .await;
@@ -4500,7 +4571,23 @@ impl AgentSession {
                 _ => self.inner.agent.steer(message),
             }
         } else if trigger_turn == Some(true) {
-            self.run_agent_prompt(vec![message]).await?;
+            if self.inner.is_emitting_agent_settled.load(Ordering::SeqCst) {
+                // Defer until every settled handler finished
+                // (agent-session.ts:2335-2343 @ 4a080252f). Re-evaluate the
+                // state at that point by starting the prepared custom run.
+                let session = AgentSession {
+                    inner: self.inner.clone(),
+                };
+                lock(&self.inner.deferred_settled_actions).push(Box::new(move || {
+                    Box::pin(async move {
+                        if let Err(error) = session.start_custom_run(message).await {
+                            tracing::warn!("deferred custom run failed: {error}");
+                        }
+                    }) as BoxFuture<'static, ()>
+                }));
+                return Ok(());
+            }
+            self.start_custom_run(message).await?;
         } else if self.is_streaming() {
             // Appending now would put the message between an assistant tool
             // call and its result, which providers that validate message
@@ -4512,6 +4599,28 @@ impl AgentSession {
             self.append_custom_message(message);
         }
         Ok(())
+    }
+
+    /// Start a run from an idle `sendMessage(..., { triggerTurn: true })`
+    /// custom message (`_startRun({messageType:"custom"})` @ 4a080252f): the
+    /// session is busy from the start of setup, before_agent_start receives
+    /// the custom trigger, and the usual pending/nextTurn/system-patch
+    /// plumbing builds the starting batch.
+    async fn start_custom_run(&self, message: AgentMessage) -> Result<(), RpiError> {
+        self.mark_run_starting();
+        let trigger = BeforeAgentStartTrigger::Custom {
+            message: Box::new(message),
+        };
+        let messages = match self.prepare_run_messages(&trigger).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.reset_run_start();
+                return Err(error);
+            }
+        };
+        self.flush_pending_bash_messages();
+        self.flush_pending_custom_messages();
+        self.run_agent_prompt(messages).await
     }
 
     /// `_appendCustomMessage` (agent-session.ts:1512-1525): state append +

@@ -451,15 +451,27 @@ pub struct ProviderStreamEvent {
     pub data: Value,
 }
 
-/// `before_agent_start` payload (`systemPromptOptions` as JSON).
+/// `before_agent_start` payload (`systemPromptOptions` as JSON): a tagged
+/// union on `messageType`. `user` runs carry the prompt/images; `custom`
+/// runs (idle `sendMessage(..., {triggerTurn:true})`) carry the starting
+/// message (types.ts:929-961 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BeforeAgentStartEvent {
-    pub prompt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub images: Option<Value>,
-    pub system_prompt: String,
-    pub system_prompt_options: Value,
+#[serde(tag = "messageType", rename_all = "lowercase")]
+pub enum BeforeAgentStartEvent {
+    #[serde(rename_all = "camelCase")]
+    User {
+        prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        images: Option<Value>,
+        system_prompt: String,
+        system_prompt_options: Value,
+    },
+    #[serde(rename_all = "camelCase")]
+    Custom {
+        message: Value,
+        system_prompt: String,
+        system_prompt_options: Value,
+    },
 }
 
 /// `before_agent_start` result message.
@@ -930,7 +942,14 @@ mod tests {
             serde_json::json!({"status": 200, "headers": {"x": "y"}}),
         );
         round_trip::<BeforeAgentStartEvent>(serde_json::json!({
+            "messageType": "user",
             "prompt": "hi",
+            "systemPrompt": "base",
+            "systemPromptOptions": {"cwd": "/w"},
+        }));
+        round_trip::<BeforeAgentStartEvent>(serde_json::json!({
+            "messageType": "custom",
+            "message": {"role": "custom", "customType": "note", "content": [], "display": false},
             "systemPrompt": "base",
             "systemPromptOptions": {"cwd": "/w"},
         }));

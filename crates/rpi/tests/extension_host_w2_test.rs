@@ -1285,3 +1285,172 @@ async fn w2_selected_tools_edit_renders_registered_inactive_tool_snippet() {
         "active read tool still rendered: {declared_tools}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// a447ba11f: before_agent_start for idle custom-message runs + Starting busy
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w2_before_agent_start_custom_trigger_uses_the_starting_message() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let log = observed.clone();
+    let host = host_with(vec![inline_ext(move |api| {
+        let log = log.clone();
+        api.on(
+            ext::EVENT_BEFORE_AGENT_START,
+            Arc::new(move |event, _ctx| {
+                log.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+                Box::pin(async {
+                    Ok(json!({
+                        "message": {"customType": "handler-note", "display": false}
+                    }))
+                })
+            }),
+        )
+        .expect("register handler");
+    })])
+    .await;
+
+    let fixture = session_fixture(
+        vec![FauxResponseStep::Factory(Box::new(
+            |_context, _options, _state, _model| {
+                faux_assistant_message("done", FauxAssistantOptions::default())
+            },
+        ))],
+        Arc::new(host),
+        Vec::new(),
+    )
+    .await;
+
+    fixture
+        .session
+        .send_custom_message("start-prompt", None, false, None, Some(true), None)
+        .await
+        .expect("custom trigger run");
+    fixture.session.wait_for_idle().await;
+
+    let events = observed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(events.len(), 1, "one starting event");
+    assert_eq!(events[0]["messageType"], "custom");
+    assert_eq!(events[0]["message"]["customType"], "start-prompt");
+    assert!(
+        events[0].get("prompt").is_none(),
+        "custom runs carry no prompt"
+    );
+    assert!(
+        events[0]["systemPrompt"]
+            .as_str()
+            .is_some_and(|prompt| !prompt.is_empty())
+    );
+
+    let custom_types: Vec<String> = fixture
+        .session
+        .messages()
+        .into_iter()
+        .filter_map(|message| match message {
+            AgentMessage::Custom(custom) => Some(custom.custom_type),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(custom_types, ["start-prompt", "handler-note"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w2_before_agent_start_starting_state_queues_and_aborts() {
+    let entered = Arc::new(Mutex::new(None::<tokio::sync::oneshot::Sender<()>>));
+    let release = Arc::new(Mutex::new(None::<tokio::sync::oneshot::Receiver<()>>));
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    *entered.lock().unwrap() = Some(entered_tx);
+    *release.lock().unwrap() = Some(release_rx);
+    let calls = handler_calls.clone();
+    let host = host_with(vec![inline_ext(move |api| {
+        let entered = entered.clone();
+        let release = release.clone();
+        let calls = calls.clone();
+        api.on(
+            ext::EVENT_BEFORE_AGENT_START,
+            Arc::new(move |_event, _ctx| {
+                let entered = entered.lock().unwrap().take();
+                let release = release.lock().unwrap().take();
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                    }
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                    Ok(Value::Null)
+                })
+            }),
+        )
+        .expect("register handler");
+    })])
+    .await;
+
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let counter = provider_calls.clone();
+    let aborted_at_request = Arc::new(AtomicUsize::new(0));
+    let aborted_flag = aborted_at_request.clone();
+    let fixture = session_fixture(
+        vec![FauxResponseStep::Factory(Box::new(
+            move |_context, options, _state, _model| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if options
+                    .and_then(|options| options.signal.as_ref())
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                {
+                    aborted_flag.store(1, Ordering::SeqCst);
+                }
+                faux_assistant_message("done", FauxAssistantOptions::default())
+            },
+        ))],
+        Arc::new(host),
+        Vec::new(),
+    )
+    .await;
+
+    let session = fixture.session.clone();
+    let run = tokio::spawn(async move {
+        session
+            .send_custom_message("starting", None, false, None, Some(true), None)
+            .await
+    });
+    entered_rx.await.expect("handler entered");
+
+    // The session is busy from the start of setup: isIdle/isStreaming are
+    // already false/true, and a second triggerTurn message must not start a
+    // second run (it queues into this one).
+    assert!(!fixture.session.is_idle());
+    assert!(fixture.session.is_streaming());
+    fixture
+        .session
+        .send_custom_message("queued", None, false, None, Some(true), None)
+        .await
+        .expect("queued into the starting run");
+    assert_eq!(
+        handler_calls.load(Ordering::SeqCst),
+        1,
+        "no second setup while starting"
+    );
+
+    // A request during setup aborts the run once it exists.
+    fixture.session.request_abort();
+    release_tx.send(()).expect("release handler");
+    run.await.expect("join").expect("run result");
+    fixture.session.wait_for_idle().await;
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        1,
+        "no extra request/run after the abort"
+    );
+    assert_eq!(
+        aborted_at_request.load(Ordering::SeqCst),
+        1,
+        "the run's provider request carries the cancelled signal"
+    );
+    assert!(fixture.session.is_abort_requested());
+}

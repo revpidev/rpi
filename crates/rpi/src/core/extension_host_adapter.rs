@@ -620,22 +620,31 @@ impl ExtensionRunner for ExtensionHostAdapter {
 
     async fn emit_before_agent_start(
         &self,
-        text: &str,
-        images: Option<&[ImageContent]>,
+        trigger: &crate::core::extensions::BeforeAgentStartTrigger,
         system_prompt_options: &crate::core::system_prompt::BuildSystemPromptOptions,
     ) -> Option<BeforeAgentStartResult> {
         // #9548: the event carries the structured options; the rendered
         // prompt is recomputed per handler inside the runner (chained), so
-        // the session no longer pre-renders it.
+        // the session no longer pre-renders it. 4a080252f: the payload is a
+        // `messageType` union — user runs carry `prompt`/`images`, custom
+        // runs carry the starting `message`.
         let options_json = serde_json::to_value(system_prompt_options).unwrap_or(Value::Null);
         let base_prompt = crate::core::system_prompt::build_system_prompt(system_prompt_options);
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "type": ext::EVENT_BEFORE_AGENT_START,
-            "prompt": text,
-            "images": images,
+            "messageType": trigger.message_type(),
             "systemPrompt": base_prompt,
             "systemPromptOptions": options_json,
         });
+        match trigger {
+            crate::core::extensions::BeforeAgentStartTrigger::User { prompt, images } => {
+                payload["prompt"] = serde_json::Value::String(prompt.clone());
+                payload["images"] = serde_json::to_value(images).unwrap_or(Value::Null);
+            }
+            crate::core::extensions::BeforeAgentStartTrigger::Custom { message } => {
+                payload["message"] = serde_json::to_value(message.as_ref()).unwrap_or(Value::Null);
+            }
+        }
         let result = self.host.emit_before_agent_start(payload).await?;
         let messages = result
             .get("messages")
