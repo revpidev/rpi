@@ -8698,8 +8698,11 @@ mod registry_tests {
         assert!(!settings_packages(&dirs).contains("ext-b"));
     }
 
+    /// ADR-0038: the retired `rpi-mcp-adapter` is no longer in the
+    /// deprecated table, so update treats it like any other source: no skip
+    /// note, no removal guidance, and no automatic deletion of user files.
     #[test]
-    fn test_update_skips_deprecated_extension_but_updates_the_rest() {
+    fn test_update_retired_mcp_adapter_is_not_deprecated() {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
         serve_registry_extension(&transport, "rpi-mcp-adapter", "0.1.0", true);
@@ -8720,159 +8723,24 @@ mod registry_tests {
             }
         })));
 
-        let (_archive, deprecated_download) =
-            serve_registry_extension(&transport, "rpi-mcp-adapter", "0.2.0", true);
+        serve_registry_extension(&transport, "rpi-mcp-adapter", "0.2.0", true);
         serve_registry_extension(&transport, "ext-a", "0.2.0", true);
         manager.update(None).unwrap();
 
+        // No deprecated skip: the source updates like any other extension.
         assert_eq!(
             extension_registry::installed_extension_version(
                 &dirs.agent_dir.join("extensions/rpi-mcp-adapter")
             )
             .as_deref(),
-            Some("0.1.0"),
-            "the deprecated extension is never updated"
+            Some("0.2.0")
         );
-        assert_eq!(
-            extension_registry::installed_extension_version(
-                &dirs.agent_dir.join("extensions/ext-a")
-            )
-            .as_deref(),
-            Some("0.2.0"),
-            "sibling extensions still update"
-        );
-        let skip_notes: Vec<String> = notes.lock().unwrap().clone();
+        let notes = notes.lock().unwrap();
         assert!(
-            skip_notes.iter().any(|message| message.starts_with(
-                "Skipping rpi-mcp-adapter: the \"rpi-mcp-adapter\" extension is deprecated"
-            ) && message.contains("rpi remove rpi-mcp-adapter")),
-            "skip note emitted: {skip_notes:?}"
-        );
-        // No download was attempted for the deprecated extension.
-        assert!(
-            !transport.calls().contains(&deprecated_download),
-            "no download call for a skipped extension"
-        );
-    }
-
-    #[test]
-    fn test_update_single_source_deprecated_is_a_skip_not_an_error() {
-        let dirs = TestDirs::new();
-        let transport = MapTransport::new();
-        serve_registry_extension(&transport, "rpi-mcp-adapter", "0.1.0", true);
-        let mut manager = manager_ok(&dirs, transport.clone());
-        manager
-            .install_and_persist("rpi-mcp-adapter", false)
-            .unwrap();
-
-        let notes = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let sink = notes.clone();
-        manager.set_progress_callback(Some(Box::new(move |event| {
-            if event.kind == ProgressKind::Start
-                && let Some(message) = &event.message
-            {
-                sink.lock().unwrap().push(message.clone());
-            }
-        })));
-
-        serve_registry_extension(&transport, "rpi-mcp-adapter", "0.2.0", true);
-        manager.update(Some("rpi-mcp-adapter")).unwrap();
-        assert_eq!(
-            extension_registry::installed_extension_version(
-                &dirs.agent_dir.join("extensions/rpi-mcp-adapter")
-            )
-            .as_deref(),
-            Some("0.1.0")
-        );
-        assert!(
-            notes
-                .lock()
-                .unwrap()
+            !notes
                 .iter()
-                .any(|message| message.starts_with("Skipping rpi-mcp-adapter:")),
-            "explicit update reports the skip instead of failing"
-        );
-    }
-
-    #[test]
-    fn test_update_skips_untracked_deprecated_install() {
-        let dirs = TestDirs::new();
-        let transport = MapTransport::new();
-        let manager = manager_ok(&dirs, transport.clone());
-        // Legit carries no settings entry; the loader would still pick it up.
-        place_untracked_extension(&dirs, "rpi-mcp-adapter", "0.1.0");
-        serve_registry_extension(&transport, "rpi-mcp-adapter", "0.2.0", true);
-
-        manager.update(None).unwrap();
-        assert_eq!(
-            extension_registry::installed_extension_version(
-                &dirs.agent_dir.join("extensions/rpi-mcp-adapter")
-            )
-            .as_deref(),
-            Some("0.1.0"),
-            "untracked deprecated installs are discovered but skipped"
-        );
-    }
-
-    #[test]
-    fn test_update_skips_deprecated_github_install() {
-        let dirs = TestDirs::new();
-        let transport = MapTransport::new();
-        serve_github_release(
-            &transport,
-            "acme",
-            "rpi",
-            "v0.1.0",
-            "rpi-mcp-adapter",
-            "0.1.0",
-            false,
-        );
-        let mut manager = manager_ok(&dirs, transport.clone());
-        manager
-            .install_and_persist("github:acme/rpi@v0.1.0", false)
-            .unwrap();
-
-        let notes = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let sink = notes.clone();
-        manager.set_progress_callback(Some(Box::new(move |event| {
-            if event.kind == ProgressKind::Start
-                && let Some(message) = &event.message
-            {
-                sink.lock().unwrap().push(message.clone());
-            }
-        })));
-
-        serve_github_release(
-            &transport,
-            "acme",
-            "rpi",
-            "v0.1.1",
-            "rpi-mcp-adapter",
-            "0.1.1",
-            false,
-        );
-        let update_api = extension_registry::github_release_api_url("acme", "rpi", Some("v0.1.1"));
-        manager.update(Some("github:acme/rpi")).unwrap();
-        assert_eq!(
-            extension_registry::installed_extension_version(
-                &dirs.agent_dir.join("extensions/rpi-mcp-adapter")
-            )
-            .as_deref(),
-            Some("0.1.0")
-        );
-        assert!(
-            !transport.calls().contains(&update_api),
-            "the deprecated github: install is skipped before any network call"
-        );
-        // The `.rpi-install-source` marker names the exact removal source.
-        assert!(
-            notes
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|message| message.contains("rpi remove github:acme/rpi@v0.1.0")),
-            "skip note names the github source: {:?}",
-            notes.lock().unwrap()
+                .any(|message| message.contains("deprecated") || message.contains("rpi remove")),
+            "no deprecation guidance: {notes:?}"
         );
     }
 

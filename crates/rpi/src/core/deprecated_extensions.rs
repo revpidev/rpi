@@ -1,13 +1,16 @@
 //! Extensions superseded by a host built-in (rpi-own; no upstream
 //! counterpart).
 //!
-//! v0.1.6 moved MCP into the host (`builtin:mcp`,
-//! [`crate::extensions::mcp`]), which retires the first-party
-//! `rpi-mcp-adapter` extension's reason to exist; v0.1.7 removed the
-//! extension from the workspace and the registry entry goes away with the
-//! release (deleted from the site after the RC; ADR-0037, TE49), so fresh
-//! installs are no longer possible. An already-installed copy stays
-//! loadable for users who intentionally keep it, but it is deprecated:
+//! The mechanism was introduced in v0.1.6 for `rpi-mcp-adapter` after MCP
+//! moved into the host (`builtin:mcp`, [`crate::extensions::mcp`]) and the
+//! extension was removed from the workspace/registry in v0.1.7 (ADR-0037,
+//! TE49). ADR-0038 removes the remaining startup/update removal guidance in
+//! v0.1.8: the table below is empty, so an already-installed copy produces
+//! no deprecation warning and no update skip, while the generic mechanism
+//! stays available for a future host replacement. No user file is deleted
+//! automatically and the retired extension is not restored.
+//!
+//! When the table has an entry, every consumer behaves as before:
 //!
 //! - every `rpi update` path (extension update included) skips it, so it is
 //!   never upgraded again ([`crate::core::package_manager`] consumes
@@ -37,21 +40,24 @@ pub struct DeprecatedExtension {
     pub replacement: &'static str,
 }
 
-/// Deprecated first-party extensions. The official-site registry entry is
-/// retired with the v0.1.7 release (ADR-0037, TE49), so this table drives
-/// the installed-user guidance below; it stays until the mechanism itself
-/// is removed. Deprecated extensions are not packaged (see
+/// Deprecated first-party extensions. ADR-0038 removed the only historical
+/// entry (`rpi-mcp-adapter`) together with its startup/update guidance in
+/// v0.1.8; the table and the generic consumers stay for a future host
+/// replacement. Deprecated extensions are not packaged (see
 /// `.github/workflows/build.yml` `EXT_CRATES`).
-pub const DEPRECATED_EXTENSIONS: &[DeprecatedExtension] = &[DeprecatedExtension {
-    name: "rpi-mcp-adapter",
-    replacement: "MCP",
-}];
+pub const DEPRECATED_EXTENSIONS: &[DeprecatedExtension] = &[];
+
+/// The deprecated-extension record for `name` when present in `entries`.
+fn find_entry<'a>(
+    entries: &'a [DeprecatedExtension],
+    name: &str,
+) -> Option<&'a DeprecatedExtension> {
+    entries.iter().find(|entry| entry.name == name)
+}
 
 /// The deprecated-extension record for `name`, when present.
 pub fn deprecated_extension(name: &str) -> Option<&'static DeprecatedExtension> {
-    DEPRECATED_EXTENSIONS
-        .iter()
-        .find(|entry| entry.name == name)
+    find_entry(DEPRECATED_EXTENSIONS, name)
 }
 
 /// Name recorded by an installed extension directory: the manifest `name`
@@ -136,10 +142,22 @@ pub fn installed_deprecated_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Vec<InstalledDeprecatedExtension> {
+    installed_deprecated_extensions_in(DEPRECATED_EXTENSIONS, agent_dir, cwd, project_trusted)
+}
+
+/// [`installed_deprecated_extensions`] over an explicit table (unit tests
+/// exercise the retained mechanism without adding a production entry).
+fn installed_deprecated_extensions_in(
+    entries: &'static [DeprecatedExtension],
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Vec<InstalledDeprecatedExtension> {
     let mut found = Vec::new();
-    collect_installed(&agent_dir.join("extensions"), false, &mut found);
+    collect_installed(entries, &agent_dir.join("extensions"), false, &mut found);
     if project_trusted {
         collect_installed(
+            entries,
             &crate::config::get_project_config_dir(cwd).join("extensions"),
             true,
             &mut found,
@@ -149,6 +167,7 @@ pub fn installed_deprecated_extensions(
 }
 
 fn collect_installed(
+    table: &'static [DeprecatedExtension],
     root: &Path,
     project_scope: bool,
     found: &mut Vec<InstalledDeprecatedExtension>,
@@ -170,7 +189,7 @@ fn collect_installed(
         let Some(name) = installed_extension_dir_name(&dir) else {
             continue;
         };
-        let Some(extension) = deprecated_extension(&name) else {
+        let Some(extension) = find_entry(table, &name) else {
             continue;
         };
         found.push(InstalledDeprecatedExtension {
@@ -235,95 +254,120 @@ mod tests {
         .unwrap();
     }
 
+    const TEST_ENTRIES: &[DeprecatedExtension] = &[DeprecatedExtension {
+        name: "test-replaced",
+        replacement: "Test capability",
+    }];
+
     #[test]
-    fn deprecated_extension_matches_only_the_table() {
-        let entry = deprecated_extension("rpi-mcp-adapter").expect("table entry");
-        assert_eq!(entry.replacement, "MCP");
+    fn retired_mcp_adapter_is_no_longer_deprecated() {
+        assert!(DEPRECATED_EXTENSIONS.is_empty());
+        assert!(deprecated_extension("rpi-mcp-adapter").is_none());
         assert!(deprecated_extension("rpi-subagents").is_none());
-        assert!(deprecated_extension("rpi-mcp-adapter-extra").is_none());
+    }
+
+    /// ADR-0038: an installed copy of the retired plugin no longer produces a
+    /// startup removal notice, whether the user keeps it enabled, disables it,
+    /// or simply leaves it unloaded. The scan is install-directory based, so
+    /// the three local states differ only in loader state, which this path
+    /// never consults.
+    #[test]
+    fn retired_mcp_adapter_produces_no_startup_guidance() {
+        let dir = TestDir::new();
+        let root = dir.path().join("extensions");
+        write_manifest(&root.join("rpi-mcp-adapter"), "rpi-mcp-adapter");
+        write_manifest(&root.join("renamed-mcp"), "rpi-mcp-adapter");
+        let found = installed_deprecated_extensions(dir.path(), dir.path(), false);
+        assert!(found.is_empty(), "no startup notice: {found:?}");
     }
 
     #[test]
-    fn scan_finds_manifest_name_and_dir_name_and_skips_staging_dirs() {
+    fn generic_scan_finds_manifest_name_and_dir_name_and_skips_staging_dirs() {
         let dir = TestDir::new();
         let root = dir.path().join("extensions");
         // A renamed directory still matches through the manifest name.
-        write_manifest(&root.join("my-mcp"), "rpi-mcp-adapter");
+        write_manifest(&root.join("renamed"), "test-replaced");
         // Without a readable manifest the directory name is the identity.
-        std::fs::create_dir_all(root.join("rpi-mcp-adapter")).unwrap();
+        std::fs::create_dir_all(root.join("test-replaced")).unwrap();
         write_manifest(&root.join("rpi-todo"), "rpi-todo");
         // Staging directories are never surfaced.
-        write_manifest(&root.join("rpi-mcp-adapter.tmp-1"), "rpi-mcp-adapter");
-        let found = installed_deprecated_extensions(dir.path(), dir.path(), false);
+        write_manifest(&root.join("test-replaced.tmp-1"), "test-replaced");
+        let found = installed_deprecated_extensions_in(TEST_ENTRIES, dir.path(), dir.path(), false);
         let mut names: Vec<String> = found
             .iter()
             .map(|item| item.dir.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["my-mcp", "rpi-mcp-adapter"]);
+        assert_eq!(names, ["renamed", "test-replaced"]);
         assert!(
             found
                 .iter()
-                .all(|item| item.extension.name == "rpi-mcp-adapter")
+                .all(|item| item.extension.name == "test-replaced")
         );
         assert!(found.iter().all(|item| !item.project_scope));
     }
 
     #[test]
-    fn scan_gates_the_project_root_on_trust() {
+    fn generic_scan_gates_the_project_root_on_trust() {
         let dir = TestDir::new();
         let cwd = dir.path().join("project");
         write_manifest(
-            &crate::config::get_project_config_dir(&cwd).join("extensions/rpi-mcp-adapter"),
-            "rpi-mcp-adapter",
+            &crate::config::get_project_config_dir(&cwd).join("extensions/test-replaced"),
+            "test-replaced",
         );
-        let untrusted = installed_deprecated_extensions(&dir.path().join("agent"), &cwd, false);
+        let untrusted = installed_deprecated_extensions_in(
+            TEST_ENTRIES,
+            &dir.path().join("agent"),
+            &cwd,
+            false,
+        );
         assert!(untrusted.is_empty());
-        let trusted = installed_deprecated_extensions(&dir.path().join("agent"), &cwd, true);
+        let trusted =
+            installed_deprecated_extensions_in(TEST_ENTRIES, &dir.path().join("agent"), &cwd, true);
         assert_eq!(trusted.len(), 1);
         assert!(trusted[0].project_scope);
-        assert_eq!(
-            trusted[0].removal_command(),
-            "rpi remove rpi-mcp-adapter -l"
-        );
+        assert_eq!(trusted[0].removal_command(), "rpi remove test-replaced -l");
     }
 
     #[test]
     fn removal_source_prefers_the_github_install_marker() {
         let dir = TestDir::new();
-        let install = dir.path().join("extensions/rpi-mcp-adapter");
-        write_manifest(&install, "rpi-mcp-adapter");
+        let install = dir.path().join("extensions/test-replaced");
+        write_manifest(&install, "test-replaced");
         std::fs::write(
             install.join(extension_registry::GITHUB_INSTALL_MARKER_FILE),
             "github:revpidev/rpi\n",
         )
         .unwrap();
-        let found = installed_deprecated_extensions(dir.path(), dir.path(), false);
+        let found = installed_deprecated_extensions_in(TEST_ENTRIES, dir.path(), dir.path(), false);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].removal_source(), "github:revpidev/rpi");
         assert_eq!(found[0].removal_command(), "rpi remove github:revpidev/rpi");
         assert_eq!(
             found[0].startup_message(),
-            "The \"rpi-mcp-adapter\" extension is deprecated and will no longer be updated: MCP \
-             is now built into rpi. Uninstall it with \"rpi remove github:revpidev/rpi\" to use \
-             the built-in extension."
+            "The \"test-replaced\" extension is deprecated and will no longer be updated: Test \
+             capability is now built into rpi. Uninstall it with \"rpi remove \
+             github:revpidev/rpi\" to use the built-in extension."
         );
     }
 
     #[test]
     fn update_skip_message_names_source_and_removal_command() {
-        let extension = deprecated_extension("rpi-mcp-adapter").unwrap();
+        let extension = &DeprecatedExtension {
+            name: "test-replaced",
+            replacement: "Test capability",
+        };
         assert_eq!(
-            update_skip_message(extension, "rpi-mcp-adapter", "rpi-mcp-adapter", false),
-            "Skipping rpi-mcp-adapter: the \"rpi-mcp-adapter\" extension is deprecated and will \
-             no longer be updated (MCP is now built into rpi). Uninstall it with \"rpi remove \
-             rpi-mcp-adapter\"."
+            update_skip_message(extension, "test-replaced", "test-replaced", false),
+            "Skipping test-replaced: the \"test-replaced\" extension is deprecated and will \
+             no longer be updated (Test capability is now built into rpi). Uninstall it with \"rpi \
+             remove test-replaced\"."
         );
         assert_eq!(
-            update_skip_message(extension, "rpi-mcp-adapter@^0.1", "rpi-mcp-adapter", true),
-            "Skipping rpi-mcp-adapter@^0.1: the \"rpi-mcp-adapter\" extension is deprecated and \
-             will no longer be updated (MCP is now built into rpi). Uninstall it with \"rpi \
-             remove rpi-mcp-adapter -l\"."
+            update_skip_message(extension, "test-replaced@^0.1", "test-replaced", true),
+            "Skipping test-replaced@^0.1: the \"test-replaced\" extension is deprecated and \
+             will no longer be updated (Test capability is now built into rpi). Uninstall it with \
+             \"rpi remove test-replaced -l\"."
         );
     }
 }

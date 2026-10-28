@@ -1218,11 +1218,12 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         ),
                     });
                 }
-                // Deprecated-extension startup notice (rpi-own, v0.1.6):
-                // MCP moved into the host, so an installed rpi-mcp-adapter
-                // is recommended for removal even when it is disabled or
-                // not loaded this session. `rpi update` skips it; this is
-                // the persistent nudge.
+                // Deprecated-extension startup notice (rpi-own, v0.1.6;
+                // ADR-0038, v0.1.8): the table is empty after the retired
+                // `rpi-mcp-adapter` entry was removed, so an installed copy
+                // no longer produces a removal recommendation. The generic
+                // loop stays for a future host-built-in replacement; it
+                // never deletes user files.
                 if !parsed.no_extensions {
                     for installed in
                         crate::core::deprecated_extensions::installed_deprecated_extensions(
