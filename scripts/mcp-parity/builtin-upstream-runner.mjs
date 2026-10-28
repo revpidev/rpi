@@ -21,15 +21,15 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 
-const PI = process.env.RPI_MCP_PARITY_PI;
+const UPSTREAM = process.env.RPI_MCP_PARITY_UPSTREAM;
 const FIXTURE = process.env.RPI_MCP_FIXTURE_SERVER;
 const LOG = process.env.RPI_MCP_FIXTURE_LOG;
-if (!PI || !FIXTURE || !LOG) {
-  console.error("orchestrator env (RPI_MCP_PARITY_PI/RPI_MCP_FIXTURE_SERVER/RPI_MCP_FIXTURE_LOG) missing");
+if (!UPSTREAM || !FIXTURE || !LOG) {
+  console.error("orchestrator env (RPI_MCP_PARITY_UPSTREAM/RPI_MCP_FIXTURE_SERVER/RPI_MCP_FIXTURE_LOG) missing");
   process.exit(2);
 }
 
-const mcpEntry = pathToFileURL(join(PI, "packages", "mcp", "src", "index.ts")).href;
+const mcpEntry = pathToFileURL(join(UPSTREAM, "packages", "mcp", "src", "index.ts")).href;
 const { McpClient, StdioTransport } = await import(mcpEntry);
 
 function normalizeValue(value) {

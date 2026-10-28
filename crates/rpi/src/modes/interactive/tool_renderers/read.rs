@@ -137,7 +137,7 @@ struct CompactReadClassification {
 
 /// `getPiDocsClassification` (read.ts:103-120): whether the absolute path
 /// lives in the pi/rpi package's own `README.md` / `docs/` / `examples/`.
-fn get_pi_docs_classification(
+fn get_rpi_docs_classification(
     absolute_path: &Path,
     package_root: &Path,
 ) -> Option<CompactReadClassification> {
@@ -191,7 +191,7 @@ fn get_compact_read_classification(
         });
     }
 
-    if let Some(classification) = get_pi_docs_classification(&absolute_path, package_root) {
+    if let Some(classification) = get_rpi_docs_classification(&absolute_path, package_root) {
         return Some(classification);
     }
 

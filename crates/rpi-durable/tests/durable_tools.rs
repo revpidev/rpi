@@ -511,7 +511,7 @@ async fn powershell_falls_back_to_the_next_program() {
     let dir = TempDir::new("durable-powershell-fallback");
     let env = create_env(&dir);
     let tool = create_power_shell_tool(Some(rpi_durable::tools::PowerShellToolOptions {
-        programs: Some(vec!["pi-durable-missing-pwsh".to_string(), fake_pwsh()]),
+        programs: Some(vec!["rpi-durable-missing-pwsh".to_string(), fake_pwsh()]),
         ..Default::default()
     }));
     let (result, _, _) = run_tool(&tool, json!({ "command": "x" }), Some(Arc::clone(&env))).await;

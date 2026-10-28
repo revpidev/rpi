@@ -2283,8 +2283,8 @@ async fn cache_warming_decision_uses_the_last_extension_override() {
 async fn cache_warming_decision_falls_back_to_own_action() {
     // No handlers → the event's own action; a handler without an action
     // field keeps it too; a failing handler is reported and skipped
-    // (cache-warmer.ts:296-301 "Extension failures fall back to pi's own
-    // decision").
+    // (cache-warmer.ts:296-301 extension failures fall back to the
+    // built-in decision).
     let host = host_with(vec![inline_ext("noop", |api| {
         api.on(
             ext::EVENT_CACHE_WARMING_DECISION,

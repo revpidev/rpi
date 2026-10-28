@@ -1289,7 +1289,7 @@ mod tests {
     #[test]
     fn router_reducer_loop_answers_a_single_question() {
         let (questions, items) = fixture(false, 1);
-        let keybindings = Keybindings::pi_defaults();
+        let keybindings = Keybindings::rpi_defaults();
         let ctx = context(&questions, &items);
         let mut state = QuestionnaireState::initial();
         let runtime = QuestionnaireRuntime {

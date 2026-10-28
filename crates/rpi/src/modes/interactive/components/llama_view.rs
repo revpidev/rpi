@@ -870,7 +870,7 @@ mod tests {
         assert_eq!(ids, ["alpha", "omega", "beta", "zeta"]);
     }
 
-    /// Input modalities drive the image marker in `to_pi_model` — the
+    /// Input modalities drive the image marker in `to_rpi_model` — the
     /// description only surfaces context; `is_loaded` covers sleeping
     /// (index.ts:7-9).
     #[test]

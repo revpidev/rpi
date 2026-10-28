@@ -33,7 +33,7 @@ const previewBox = await import(`${SNAPSHOT}/view/components/preview/preview-box
 // node_modules; this leg loads the same file by path (the runner lives
 // outside the deps tree, so bare resolution would not find it).
 const DEPS = SNAPSHOT.replace(/\/snapshot\/?$/, "");
-const piTui = await import(`${DEPS}/node_modules/@earendil-works/pi-tui/index.ts`);
+const upstreamTui = await import(`${DEPS}/node_modules/@earendil-works/pi-tui/index.ts`);
 
 /** Upstream `buildItemsForQuestion` (ask-user-question.ts:289-297). */
 function buildItemsForQuestion(question) {
@@ -125,7 +125,7 @@ function keysCase(input, keyMatrix) {
 	const runtimeInput = input.runtime ?? {};
 	const bindings = { ...DEFAULT_BINDINGS, ...(runtimeInput.bindings ?? {}) };
 	const keybindings = {
-		matches: (data, name) => (bindings[name] ?? []).some((key) => piTui.matchesKey(data, key)),
+		matches: (data, name) => (bindings[name] ?? []).some((key) => upstreamTui.matchesKey(data, key)),
 	};
 	const items = itemsByTab[state.currentTab] ?? [];
 	const runtime = {

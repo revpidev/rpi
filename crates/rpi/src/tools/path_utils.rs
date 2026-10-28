@@ -367,7 +367,7 @@ mod tests {
     // Port of "should resolve tilde-prefixed filenames against cwd"
     #[test]
     fn test_resolve_tilde_filename_against_cwd() {
-        let cwd = std::env::temp_dir().join("pi-path-utils-cwd");
+        let cwd = std::env::temp_dir().join("rpi-path-utils-cwd");
         assert_eq!(resolve_to_cwd("~draft.md", &cwd), cwd.join("~draft.md"));
         assert_eq!(resolve_to_cwd("@~draft.md", &cwd), cwd.join("~draft.md"));
     }

@@ -10,7 +10,7 @@
 //!   the same `packages/tui/src/keys.ts` source the upstream package uses).
 //! - Upstream resolves `tui.*` keybinding names through the host keybinding
 //!   manager (which honors user overrides). The interactive-UI ABI exposes no
-//!   keybinding channel, so [`Keybindings::pi_defaults`] pins the upstream
+//!   keybinding channel, so [`Keybindings::rpi_defaults`] pins the upstream
 //!   default key ids; see the TE30 landing note in
 //!   `rpi-docs/extensions/rpi-ask-user-question/02-design.md` §4.
 //! - `QuestionnaireRuntime.currentItem`/`items` borrow the per-tab item list
@@ -54,7 +54,7 @@ pub const SPACE_KEY: &str = " ";
 
 /// Name → key-id table used by [`route_key`].
 ///
-/// Production uses [`Self::pi_defaults`] (the upstream keybinding defaults);
+/// Production uses [`Self::rpi_defaults`] (the upstream keybinding defaults);
 /// the parity harness injects the same ids from `state-vectors.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keybindings {
@@ -63,7 +63,7 @@ pub struct Keybindings {
 
 impl Default for Keybindings {
     fn default() -> Self {
-        Self::pi_defaults()
+        Self::rpi_defaults()
     }
 }
 
@@ -72,7 +72,7 @@ impl Keybindings {
     /// (`packages/tui/src/keybindings.ts` +
     /// `packages/coding-agent/src/core/keybindings.ts` defaults; `escape` and
     /// `ctrl+c` both cancel, `shift+enter`/`ctrl+j` both insert a newline).
-    pub fn pi_defaults() -> Self {
+    pub fn rpi_defaults() -> Self {
         let mut entries: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut entry = |name: &str, keys: &[&str]| {
             entries.insert(
@@ -674,7 +674,7 @@ mod tests {
             Self {
                 questions,
                 items,
-                keybindings: Keybindings::pi_defaults(),
+                keybindings: Keybindings::rpi_defaults(),
             }
         }
 
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn collapse_key_off_disables_toggle() {
         let mut fixture = Fixture::new(false, 1);
-        fixture.keybindings = Keybindings::pi_defaults();
+        fixture.keybindings = Keybindings::rpi_defaults();
         let state = QuestionnaireState::initial();
         let runtime = QuestionnaireRuntime {
             keybindings: &fixture.keybindings,

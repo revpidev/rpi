@@ -35,6 +35,18 @@ GENERATED_COMMENT = (
 )
 ID_RE = re.compile(r'"\$id"\s*:\s*"https://pi\.dev/schemas/([^"]+)"')
 COMMENT_RE = re.compile(r'"\$comment"\s*:\s*"[^"]*"')
+# Upstream describes `auto` as "Radius when authenticated, otherwise a gist".
+# rpi has no Radius share backend, so the published contract must describe the
+# actual mapping instead of promising a service rpi never calls.
+UPSTREAM_SHARE_DESCRIPTION = (
+    '"description": "Destination used by /share. \\"auto\\" uses Radius when '
+    'authenticated and otherwise creates a GitHub gist."'
+)
+RPI_SHARE_DESCRIPTION = (
+    '"description": "Destination used by /share. \\"auto\\" and \\"gist\\" '
+    'create a GitHub gist; \\"radius\\" is recognized but unsupported and '
+    'fails explicitly."'
+)
 
 
 class SyncError(Exception):
@@ -65,6 +77,37 @@ def render(source: Path) -> bytes:
     text, comments = COMMENT_RE.subn(f'"$comment": "{GENERATED_COMMENT}"', text)
     if comments != 1:
         raise SyncError(f"{source}: expected exactly one $comment, found {comments}")
+    app_text = {
+        "models.schema.json": [
+            ("pi infers", "rpi infers", 1),
+            ("pi-controlled values", "rpi-controlled values", 2),
+            ("Pi warms only tiers", "rpi warms only tiers", 2),
+            ("When omitted, Pi auto-detects", "When omitted, rpi auto-detects", 1),
+        ],
+        "settings.schema.json": [
+            ("Pi-managed HTTP clients", "rpi-managed HTTP clients", 1),
+        ],
+        "theme.schema.json": [
+            ("Pi Coding Agent Theme", "Rpi Coding Agent Theme", 1),
+            ("Theme schema for Pi coding agent", "Theme schema for the rpi coding agent", 1),
+        ],
+    }
+    for old, new, expected in app_text.get(source.name, []):
+        count = text.count(old)
+        if count != expected:
+            raise SyncError(
+                f"{source}: expected {expected} occurrence(s) of {old!r}, found {count}"
+            )
+        text = text.replace(old, new)
+    if source.name == "settings.schema.json":
+        text, share = text.replace(
+            UPSTREAM_SHARE_DESCRIPTION, RPI_SHARE_DESCRIPTION
+        ), text.count(UPSTREAM_SHARE_DESCRIPTION)
+        if share != 1:
+            raise SyncError(
+                f"{source}: expected exactly one sessionShareDestination "
+                f"description, found {share}"
+            )
     if "https://pi.dev" in text:
         raise SyncError(f"{source}: a pi.dev reference survived the rewrite")
     return text.encode("utf-8")
@@ -87,6 +130,12 @@ def write_files(files: dict[str, bytes], output: Path) -> None:
 
 
 def check_files(files: dict[str, bytes], output: Path) -> bool:
+    if not output.is_dir():
+        if output == OUTPUT_DIR:
+            print(f"missing repository schema directory: {output}", file=sys.stderr)
+            return False
+        print(f"note: {output} not present; skipping site copy", file=sys.stderr)
+        return True
     ok = True
     for name, data in files.items():
         target = output / name
@@ -109,8 +158,8 @@ def main() -> int:
         if not args.no_site:
             outputs.append(SITE_DIR)
         if args.check:
-            ok = all(check_files(files, output) for output in outputs)
-            return 0 if ok else 1
+            results = [check_files(files, output) for output in outputs]
+            return 0 if all(results) else 1
         for output in outputs:
             write_files(files, output)
         print(

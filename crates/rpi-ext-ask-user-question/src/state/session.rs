@@ -344,7 +344,7 @@ impl QuestionnaireComponent {
             state: QuestionnaireState::initial(),
             questions: params.questions.clone(),
             items_by_tab,
-            keybindings: Keybindings::pi_defaults(),
+            keybindings: Keybindings::rpi_defaults(),
             i18n,
             theme: Theme::dark(),
             input: InputBuffer::new(),
@@ -836,9 +836,9 @@ mod tests {
     }
 
     #[test]
-    fn input_buffer_keyboard_path_matches_pi_defaults() {
+    fn input_buffer_keyboard_path_matches_rpi_defaults() {
         let mut buffer = InputBuffer::new();
-        let keybindings = Keybindings::pi_defaults();
+        let keybindings = Keybindings::rpi_defaults();
         buffer.handle_input("h", &keybindings);
         buffer.handle_input("i", &keybindings);
         buffer.handle_input("\n", &keybindings); // ctrl+j / shift+enter newline

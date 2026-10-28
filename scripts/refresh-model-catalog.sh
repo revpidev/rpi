@@ -3,16 +3,16 @@
 # read-only; all content changes come from the pinned upstream generator.
 #
 # Generate in a throwaway worktree at the pinned commit, never in external/pi:
-#   git -C external/pi worktree add --detach /tmp/pi-catalog-gen <pin>
-#   ln -s "$PWD/external/pi/node_modules" /tmp/pi-catalog-gen/node_modules
-#   cd /tmp/pi-catalog-gen/packages/ai
+#   git -C external/pi worktree add --detach /tmp/rpi-catalog-gen <pin>
+#   ln -s "$PWD/external/pi/node_modules" /tmp/rpi-catalog-gen/node_modules
+#   cd /tmp/rpi-catalog-gen/packages/ai
 #   node scripts/generate-models.ts --strict \
 #     --json-output /tmp/rpi-site-catalog
 #
 # Vendor the same snapshot into rpi, or verify an existing vendoring without
 # changing files:
-#   scripts/refresh-model-catalog.sh /tmp/pi-catalog-gen/packages/ai/src/providers/data
-#   scripts/refresh-model-catalog.sh --check /tmp/pi-catalog-gen/packages/ai/src/providers/data
+#   scripts/refresh-model-catalog.sh /tmp/rpi-catalog-gen/packages/ai/src/providers/data
+#   scripts/refresh-model-catalog.sh --check /tmp/rpi-catalog-gen/packages/ai/src/providers/data
 #
 # This script is offline: network access belongs to the explicit generation
 # step above. The vendored set is an exact manifest-driven mirror, including

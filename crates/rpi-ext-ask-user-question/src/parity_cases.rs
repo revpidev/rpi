@@ -79,7 +79,7 @@ pub fn replay_keys_case(input: &Value, key_matrix: &[Value]) -> Value {
     let items = fixture_items(input, &questions);
     let state = state_from_json(&input.get("setup").cloned().unwrap_or(Value::Null));
     let runtime_input = input.get("runtime").cloned().unwrap_or(Value::Null);
-    let mut keybindings = Keybindings::pi_defaults();
+    let mut keybindings = Keybindings::rpi_defaults();
     if let Some(bindings) = runtime_input.get("bindings").and_then(Value::as_object) {
         for (name, keys) in bindings {
             if let Ok(keys) = serde_json::from_value::<Vec<String>>(keys.clone()) {

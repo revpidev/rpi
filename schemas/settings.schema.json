@@ -65,7 +65,7 @@
           "const": "radius"
         }
       ],
-      "description": "Destination used by /share. \"auto\" uses Radius when authenticated and otherwise creates a GitHub gist.",
+      "description": "Destination used by /share. \"auto\" and \"gist\" create a GitHub gist; \"radius\" is recognized but unsupported and fails explicitly.",
       "default": "auto"
     },
     "steeringMode": {
@@ -637,7 +637,7 @@
     },
     "httpProxy": {
       "type": "string",
-      "description": "Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for Pi-managed HTTP clients."
+      "description": "Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for rpi-managed HTTP clients."
     },
     "httpIdleTimeoutMs": {
       "anyOf": [

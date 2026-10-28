@@ -121,8 +121,8 @@ function trackRoot() {
 // both tracks; buildArgsCase survives only for --record-args-golden runs
 // against a v0.48-era worktree, gated behind
 // RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1 (it throws otherwise).
-let legacyPiArgsModule;
-function legacyPiArgs() {
+let legacyUpstreamArgsModule;
+function legacyUpstreamArgs() {
 	if (!process.env.RPI_SUBAGENTS_PARITY_ARGS_LEGACY) {
 		throw new Error(
 			"pi-args.ts is deleted at every reachable pin (v0.65+); the args face "
@@ -130,13 +130,13 @@ function legacyPiArgs() {
 				+ "v0.48-era worktree to re-record",
 		);
 	}
-	legacyPiArgsModule ??= import(moduleUrl(REGRESSION_ROOT, "src/runs/shared/pi-args.ts"));
-	return legacyPiArgsModule;
+	legacyUpstreamArgsModule ??= import(moduleUrl(REGRESSION_ROOT, "src/runs/shared/pi-args.ts"));
+	return legacyUpstreamArgsModule;
 }
 
 function buildArgsCase(input) {
 	try {
-		const result = legacyPiArgs().buildPiArgs({
+		const result = legacyUpstreamArgs().buildPiArgs({
 			baseArgs: ["--mode", "json", "-p"],
 			task: input.task ?? "",
 			taskDelivery: input.taskDelivery === "file" ? "file" : undefined,

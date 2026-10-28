@@ -13,7 +13,7 @@ use crate::types::{FetchToolConfig, IncludeReplies};
 /// `VALID_OS_VALUES` (settings.ts:11-17).
 const VALID_OS_VALUES: [&str; 5] = ["windows", "macos", "linux", "android", "ios"];
 
-/// `ResolvedPiSmartFetchSettings` (settings.ts:31-33).
+/// upstream `ResolvedPiSmartFetchSettings` (settings.ts:31-33).
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSettings {
     pub verbose_by_default: bool,
@@ -69,7 +69,7 @@ fn read_include_replies(source: &Value, keys: &[&str]) -> Option<IncludeReplies>
     })
 }
 
-/// Normalized `PiSmartFetchSettings` — all reads resolved through the
+/// Normalized upstream `PiSmartFetchSettings` — all reads resolved through the
 /// `smartFetch*` → `webFetch*` alias chains (settings.ts:107-143).
 #[derive(Debug, Clone, Default)]
 pub struct NormalizedSettings {
@@ -84,7 +84,7 @@ pub struct NormalizedSettings {
     pub temp_dir: Option<String>,
 }
 
-/// `normalizePiSmartFetchSettings` (settings.ts:107-143).
+/// upstream `normalizePiSmartFetchSettings` (settings.ts:107-143).
 pub fn normalize_settings(input: &Value) -> NormalizedSettings {
     let source = match input {
         Value::Object(map) => Value::Object(map.clone()),
@@ -127,7 +127,7 @@ pub fn normalize_settings(input: &Value) -> NormalizedSettings {
     }
 }
 
-/// `resolvePiSmartFetchSettings` (settings.ts:145-178): project overrides
+/// upstream `resolvePiSmartFetchSettings` (settings.ts:145-178): project overrides
 /// global per key; the temp dir default is [VARIANT] `smart-fetch-rpi`
 /// (upstream `smart-fetch-pi`, requirements §3).
 pub fn resolve_settings(global: &Value, project: &Value) -> ResolvedSettings {
@@ -223,7 +223,7 @@ pub fn read_settings_file(path: &Path) -> Value {
         .unwrap_or_else(|| Value::Object(Default::default()))
 }
 
-/// `loadPiSmartFetchSettings` (settings.ts:188-200): global
+/// upstream `loadPiSmartFetchSettings` (settings.ts:188-200): global
 /// `<agentDir>/settings.json` + project `<cwd>/.rpi/settings.json`, project
 /// overriding global per key. Read on EVERY execute — no caching (upstream
 /// semantics; settings edits apply to the next tool call).

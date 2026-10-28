@@ -36,7 +36,7 @@ dependency closure beyond an npm install that contains tsx:
 - `RPI_MCP_PARITY_DEPS` — out-of-tree npm install root (default
   `/tmp/rpi-mcp-parity-deps`); tsx may instead be resolved from
   `external/pi/node_modules`.
-- `RPI_MCP_PARITY_PI` — upstream pi source root (default `external/pi`).
+- `RPI_MCP_PARITY_UPSTREAM` — upstream pi source root (default `external/pi`).
 - `RPI_MCP_PARITY_CARGO` — cargo binary (default `cargo`).
 - `--out-dir <dir>` — report directory override (default
   `fixtures/generated/mcp-parity/`).

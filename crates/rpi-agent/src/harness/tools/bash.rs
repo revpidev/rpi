@@ -689,7 +689,7 @@ mod tests {
         let dir = TempDir::new();
         let cwd = dir.path().to_string_lossy().into_owned();
         let env = NodeExecutionEnv::new(&cwd).with_shell_env(BTreeMap::from([(
-            "PI_BASH_PREPARE_INHERITED".to_string(),
+            "RPI_BASH_PREPARE_INHERITED".to_string(),
             "inherited".to_string(),
         )]));
         env.create_dir(
@@ -716,12 +716,12 @@ mod tests {
                 *received_signal2.lock().unwrap() = Some(signal);
                 execution.cwd = turn_context.workspace.clone();
                 execution.env = BTreeMap::from([(
-                    "PI_BASH_PREPARE_EXPLICIT".to_string(),
+                    "RPI_BASH_PREPARE_EXPLICIT".to_string(),
                     "explicit".to_string(),
                 )]);
                 execution.inherit_env = false;
                 execution.command.push_str(
-                    "\nprintf '%s:%s:%s:%s' \"$prefix\" \"${PI_BASH_PREPARE_INHERITED-}\" \"$PI_BASH_PREPARE_EXPLICIT\" \"$PWD\"",
+                    "\nprintf '%s:%s:%s:%s' \"$prefix\" \"${RPI_BASH_PREPARE_INHERITED-}\" \"$RPI_BASH_PREPARE_EXPLICIT\" \"$PWD\"",
                 );
                 Box::pin(async {})
             },

@@ -5827,7 +5827,7 @@ mod tests {
 
     #[test]
     fn keeps_slice_helper_widths_consistent_with_visible_width() {
-        let text = "out 192M\t.pi/skill-tests/results-ha";
+        let text = "out 192M\t.rpi/skill-tests/results-ha";
         let (slice_text, width) = slice_with_width(text, 0, 10, true);
 
         assert_eq!(slice_text, "out 192M");
@@ -5837,7 +5837,7 @@ mod tests {
 
     #[test]
     fn keeps_overlay_segment_widths_consistent_with_visible_width() {
-        let text = "out 192M\t.pi/skill-tests/results-ha";
+        let text = "out 192M\t.rpi/skill-tests/results-ha";
         let segments = extract_segments(text, 10, 13, 10, true);
 
         assert_eq!(segments.before, "out 192M");

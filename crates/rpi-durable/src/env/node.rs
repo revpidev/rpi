@@ -571,7 +571,7 @@ impl NodeExecutionEnv {
         let path = self
             .create_temp_file(
                 Some(CreateTempFileOptions {
-                    prefix: Some("pi-output-".to_string()),
+                    prefix: Some("rpi-output-".to_string()),
                     suffix: Some(".log".to_string()),
                 }),
                 context,

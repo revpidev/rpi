@@ -575,7 +575,7 @@ mod tests {
             max_lines: 3,
             max_bytes: 51200,
             max_rolling_bytes: 102400,
-            temp_file_prefix: "pi-test".to_string(),
+            temp_file_prefix: "rpi-test".to_string(),
         });
 
         // 4 lines with trailing newline: "line\nline\nline\nline\n"
@@ -597,7 +597,7 @@ mod tests {
             max_bytes: 51200,
             // Small rolling buffer to trigger trim easily.
             max_rolling_bytes: 50,
-            temp_file_prefix: "pi-test".to_string(),
+            temp_file_prefix: "rpi-test".to_string(),
         });
 
         // Feed enough data to exceed max_rolling_bytes * 2 = 100 bytes.
@@ -618,7 +618,7 @@ mod tests {
             max_lines: 2000,
             max_bytes: 10, // tiny limit
             max_rolling_bytes: 20,
-            temp_file_prefix: "pi-test-tf".to_string(),
+            temp_file_prefix: "rpi-test-tf".to_string(),
         });
 
         acc.append(b"this is more than ten bytes of output");
@@ -643,7 +643,7 @@ mod tests {
             max_lines: 3,
             max_bytes: 51200,
             max_rolling_bytes: 102400,
-            temp_file_prefix: "pi-test-tf".to_string(),
+            temp_file_prefix: "rpi-test-tf".to_string(),
         });
 
         for i in 0..10 {
@@ -686,7 +686,7 @@ mod tests {
             max_lines: 2000,
             max_bytes: 51200,
             max_rolling_bytes: 5, // tiny — forces trim mid-line
-            temp_file_prefix: "pi-test".to_string(),
+            temp_file_prefix: "rpi-test".to_string(),
         });
 
         // Feed a long line without newlines so trim cuts mid-line.

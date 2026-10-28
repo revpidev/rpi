@@ -788,9 +788,9 @@ impl ResolvedPackagePaths {
 /// `onMissing` callback (package-manager.ts:102).
 pub type OnMissing<'a> = Option<&'a mut dyn FnMut(&str) -> MissingSourceAction>;
 
-/// `PiManifest` (package-manager.ts:158-163).
+/// `RpiManifest` (package-manager.ts:158-163).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PiManifest {
+struct RpiManifest {
     extensions: Option<Vec<String>>,
     skills: Option<Vec<String>>,
     prompts: Option<Vec<String>>,
@@ -824,7 +824,7 @@ impl ResourceType {
         }
     }
 
-    fn manifest_entries(self, manifest: &PiManifest) -> Option<&Vec<String>> {
+    fn manifest_entries(self, manifest: &RpiManifest) -> Option<&Vec<String>> {
         match self {
             ResourceType::Extensions => manifest.extensions.as_ref(),
             ResourceType::Skills => manifest.skills.as_ref(),
@@ -4444,7 +4444,7 @@ impl DefaultPackageManager {
             return true;
         }
 
-        if let Some(manifest) = read_pi_manifest(package_root) {
+        if let Some(manifest) = read_rpi_manifest(package_root) {
             for resource_type in RESOURCE_TYPES {
                 self.add_manifest_entries(
                     resource_type.manifest_entries(&manifest),
@@ -4478,7 +4478,7 @@ impl DefaultPackageManager {
         accumulator: &mut ResourceAccumulator,
         metadata: &PackageMetadata,
     ) {
-        let manifest = read_pi_manifest(package_root);
+        let manifest = read_rpi_manifest(package_root);
         let entries = manifest
             .as_ref()
             .and_then(|m| resource_type.manifest_entries(m));
@@ -4553,7 +4553,7 @@ impl DefaultPackageManager {
         package_root: &Path,
         resource_type: ResourceType,
     ) -> Vec<PathBuf> {
-        let manifest = read_pi_manifest(package_root);
+        let manifest = read_rpi_manifest(package_root);
         let entries = manifest
             .as_ref()
             .and_then(|m| resource_type.manifest_entries(m));
@@ -4586,8 +4586,8 @@ impl DefaultPackageManager {
         collect_resource_files(&convention_dir, resource_type)
     }
 
-    // `readPiManifest` (package-manager.ts:2228-2241) is the free
-    // `read_pi_manifest`.
+    // upstream `readPiManifest` (package-manager.ts:2228-2241) is the free
+    // `read_rpi_manifest`.
 
     /// `addManifestEntries` (package-manager.ts:2243-2261).
     fn add_manifest_entries(
@@ -4754,10 +4754,11 @@ fn has_glob_pattern(s: &str) -> bool {
     s.contains('*') || s.contains('?')
 }
 
-/// `readPiManifest` / `readPiManifestFile` (pi-manifest.ts,
+/// upstream `readPiManifest` / `readPiManifestFile` (pi-manifest.ts,
 /// package-manager.ts:536-544 / 2228-2241 @ pi 0.84.1+): `package.json#rpi`
 /// (legacy `package.json#pi` still accepted; `"rpi"` wins on conflict);
-/// malformed JSON, a missing `pi`, or a non-object `pi` yields `None`.
+/// malformed JSON, a missing `rpi` (and legacy `pi`), or a non-object value
+/// yields `None`.
 /// Individual resource fields are only collected when the value is a
 /// `string[]`; a non-array or non-string-element field is left `None`
 /// (upstream: field omitted from the manifest object).
@@ -4765,7 +4766,7 @@ fn has_glob_pattern(s: &str) -> bool {
 /// Ported from the independent `src/core/pi-manifest.ts` (commit: new file
 /// at 4181f66). rpi keeps the function in this module rather than creating
 /// a separate file — the Rust workspace has no per-file export constraint.
-fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
+fn read_rpi_manifest(package_root: &Path) -> Option<RpiManifest> {
     let package_json_path = package_root.join("package.json");
     if !package_json_path.exists() {
         return None;
@@ -4779,13 +4780,13 @@ fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
     // Resource manifest key: `"rpi"` (ADR-0001 brand rename); the
     // upstream `"pi"` key is still accepted so upstream-style packages
     // keep working. `"rpi"` wins when both are present.
-    let pi = parsed.get("rpi").or_else(|| parsed.get("pi"))?;
+    let manifest_value = parsed.get("rpi").or_else(|| parsed.get("pi"))?;
     // isObject(pkg.pi): must be a JSON object (not array / primitive / null).
-    if !pi.is_object() {
+    if !manifest_value.is_object() {
         return None;
     }
     let string_array = |key: &str| -> Option<Vec<String>> {
-        let entries = pi.get(key)?;
+        let entries = manifest_value.get(key)?;
         if !entries.is_array() {
             return None;
         }
@@ -4802,7 +4803,7 @@ fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
                 .collect(),
         )
     };
-    Some(PiManifest {
+    Some(RpiManifest {
         extensions: string_array("extensions"),
         skills: string_array("skills"),
         prompts: string_array("prompts"),
@@ -4817,7 +4818,7 @@ fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
     let package_json_path = dir.join("package.json");
     if package_json_path.exists()
-        && let Some(manifest) = read_pi_manifest(dir)
+        && let Some(manifest) = read_rpi_manifest(dir)
         && let Some(entries) = &manifest.extensions
         && !entries.is_empty()
     {
@@ -6257,10 +6258,10 @@ mod tests {
         );
     }
 
-    // --- read_pi_manifest type strictness (pi-manifest.ts) -------------------
+    // --- read_rpi_manifest type strictness (pi-manifest.ts) -------------------
 
     #[test]
-    fn test_read_pi_manifest_non_object_pi_treated_as_null() {
+    fn test_read_rpi_manifest_non_object_pi_treated_as_null() {
         // Port of pi-manifest.ts isObject check: a non-object `pi` field
         // must yield None (same as missing/null pi).
         let dirs = TestDirs::new();
@@ -6269,7 +6270,7 @@ mod tests {
             &pkg_dir.join("package.json"),
             r#"{"name": "pkg", "pi": "not-an-object"}"#,
         );
-        // read_pi_manifest is private; observable effect: same as missing pi.
+        // read_rpi_manifest is private; observable effect: same as missing pi.
         // With no manifest and no convention dirs/files, collect_package_resources
         // returns false and the dir itself is added as a raw extension entry.
         let manager = test_manager(&dirs, FakeRunner::ok());
@@ -6282,7 +6283,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_pi_manifest_rpi_key_wins_over_legacy_pi_key() {
+    fn test_read_rpi_manifest_rpi_key_wins_over_legacy_pi_key() {
         // ADR-0001 brand rename: the resource manifest key is `"rpi"`; the
         // upstream `"pi"` key is still accepted, and `"rpi"` wins when a
         // package carries both.
@@ -6302,7 +6303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_pi_manifest_array_field_with_non_strings_omitted() {
+    fn test_read_rpi_manifest_array_field_with_non_strings_omitted() {
         // When a resource field has non-string elements, it is omitted from
         // the manifest (treated as if the field were absent). The manifest is
         // still a valid object, so collect_package_resources processes it —
@@ -6485,7 +6486,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_package_json_pi_manifest_entries() {
+    fn test_resolve_package_json_legacy_pi_manifest_entries() {
         let dirs = TestDirs::new();
         let package_dir = dirs.cwd.join("pkg");
         write_file(

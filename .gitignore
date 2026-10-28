@@ -6,7 +6,9 @@
 *.swp
 .DS_Store
 .tooling/
+# Legacy local subagents harness artifacts (not an rpi-owned identifier).
 .pi-subagents/
+.rpi-subagents/
 
 # Machine-local cargo env (wreq/btls-sys LIBCLANG_PATH etc. — absolute
 # host paths, each machine configures its own; never commit)

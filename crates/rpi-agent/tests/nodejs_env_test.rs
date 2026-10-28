@@ -200,9 +200,11 @@ async fn test_expands_home_relative_paths_and_file_urls() {
     let env = env_at(root.root());
     let home = std::env::var_os("HOME").expect("HOME must be set");
     assert_eq!(
-        env.absolute_path("~/pi-node-env-test", None).await.unwrap(),
+        env.absolute_path("~/rpi-node-env-test", None)
+            .await
+            .unwrap(),
         PathBuf::from(home)
-            .join("pi-node-env-test")
+            .join("rpi-node-env-test")
             .to_string_lossy()
     );
     let file_path = root.root().join("file with spaces.txt");
@@ -620,18 +622,18 @@ async fn test_exec_can_replace_instead_of_inherit_default_env() {
     let root = TestDir::new();
     let mut shell_env = BTreeMap::new();
     shell_env.insert(
-        "PI_NODE_ENV_CONFIGURED_TEST".to_string(),
+        "RPI_NODE_ENV_CONFIGURED_TEST".to_string(),
         "configured".to_string(),
     );
     let env = env_at(root.root()).with_shell_env(shell_env);
     let mut explicit_env = BTreeMap::new();
     explicit_env.insert(
-        "PI_NODE_ENV_EXPLICIT_TEST".to_string(),
+        "RPI_NODE_ENV_EXPLICIT_TEST".to_string(),
         "explicit".to_string(),
     );
     let result = env
         .exec(
-            "printf '%s:%s:%s' \"${PI_NODE_ENV_INHERITED_TEST-}\" \"${PI_NODE_ENV_CONFIGURED_TEST-}\" \"${PI_NODE_ENV_EXPLICIT_TEST-}\"",
+            "printf '%s:%s:%s' \"${RPI_NODE_ENV_INHERITED_TEST-}\" \"${RPI_NODE_ENV_CONFIGURED_TEST-}\" \"${RPI_NODE_ENV_EXPLICIT_TEST-}\"",
             Some(ShellExecOptions {
                 inherit_env: Some(false),
                 env: Some(explicit_env),

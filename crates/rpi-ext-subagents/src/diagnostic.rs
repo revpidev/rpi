@@ -18,8 +18,8 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-/// `PI_CORE_CHILD_TOOLS` (tool-availability.ts:16).
-pub const PI_CORE_CHILD_TOOLS: [&str; 7] = ["bash", "edit", "find", "grep", "ls", "read", "write"];
+/// `RPI_CORE_CHILD_TOOLS` (tool-availability.ts:16).
+pub const RPI_CORE_CHILD_TOOLS: [&str; 7] = ["bash", "edit", "find", "grep", "ls", "read", "write"];
 
 /// Frontmatter tool names satisfied by a differently-named registered tool:
 /// upstream-host agents advertise `intercom`; rpi children carry the
@@ -127,7 +127,7 @@ pub fn write_child_tool_diagnostic(
     let available_names: std::collections::BTreeSet<&str> = available
         .iter()
         .map(String::as_str)
-        .chain(PI_CORE_CHILD_TOOLS.iter().copied())
+        .chain(RPI_CORE_CHILD_TOOLS.iter().copied())
         .collect();
     let missing: Vec<String> = required
         .iter()

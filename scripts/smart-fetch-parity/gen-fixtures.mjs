@@ -17,14 +17,14 @@ import { join } from "node:path";
 
 // The pinned upstream sources resolve their bare imports (typebox, linkedom,
 // …) from a staging tree under /tmp — external/ must stay pristine (G4).
-// Staging layout: <deps>/node_modules + <deps>/core-src + <deps>/pi-src
+// Staging layout: <deps>/node_modules + <deps>/core-src + <deps>/upstream-src
 // (copies, NOT symlinks: node realpaths symlinks and would resolve bare
 // imports back inside external/). run.sh re-copies before generating.
 const STAGING = process.env.RPI_SF_STAGING ?? "/tmp/rpi-smart-fetch-parity-deps";
 
 const format = await import(join(STAGING, "core-src/format.ts"));
 const tool = await import(join(STAGING, "core-src/tool.ts"));
-const settings = await import(join(STAGING, "pi-src/settings.ts"));
+const settings = await import(join(STAGING, "upstream-src/settings.ts"));
 const extract = await import(join(STAGING, "core-src/extract.ts"));
 
 const OUT_DIR = new URL("../../fixtures/generated/smart-fetch-parity/", import.meta.url)

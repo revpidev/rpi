@@ -13,6 +13,36 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+fn assert_no_app_brand(value: &Value, path: &str) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "$comment" {
+                    continue;
+                }
+                assert_no_app_brand(child, &format!("{path}.{key}"));
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                assert_no_app_brand(child, &format!("{path}[{index}]"));
+            }
+        }
+        Value::String(text) => {
+            for needle in ["Pi ", "pi infers", "pi-controlled"] {
+                let unbranded = text.match_indices(needle).any(|(index, _)| {
+                    index == 0 || !text.as_bytes()[index - 1].eq_ignore_ascii_case(&b'r')
+                });
+                assert!(
+                    !unbranded,
+                    "{path}: app-branded schema text {needle:?}: {text}"
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn schema(name: &str) -> (Value, Validator) {
     let path = root().join("schemas").join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
@@ -34,6 +64,7 @@ fn schemas_are_branded_and_complete() {
         assert!(!text.contains("https://pi.dev"), "{name}: pi.dev endpoint");
         assert!(text.contains("https://revpi.dev/schemas/"), "{name}: id");
         let value: Value = serde_json::from_str(&text).expect("json");
+        assert_no_app_brand(&value, name);
         assert_eq!(
             value["$schema"], "https://json-schema.org/draft/2020-12/schema",
             "{name}: draft"
@@ -42,6 +73,26 @@ fn schemas_are_branded_and_complete() {
             value["$id"],
             format!("https://revpi.dev/schemas/{name}"),
             "{name}: $id"
+        );
+    }
+}
+
+#[test]
+fn site_schema_copies_match_when_the_checkout_is_present() {
+    let site = root().join("../rpi-pages/schemas");
+    if !site.is_dir() {
+        return;
+    }
+    for name in [
+        "settings.schema.json",
+        "models.schema.json",
+        "keybindings.schema.json",
+        "theme.schema.json",
+    ] {
+        assert_eq!(
+            std::fs::read(root().join("schemas").join(name)).expect("repo schema"),
+            std::fs::read(site.join(name)).expect("site schema"),
+            "{name}: site copy is stale"
         );
     }
 }
@@ -66,6 +117,24 @@ fn settings_schema_accepts_rpi_own_keys_and_share_destination() {
     );
     let bad = serde_json::json!({"sessionShareDestination": "elsewhere"});
     assert!(!validator.is_valid(&bad), "unknown destination rejected");
+}
+
+#[test]
+fn settings_schema_describes_rpi_share_destination_semantics() {
+    let text = std::fs::read_to_string(root().join("schemas/settings.schema.json"))
+        .expect("settings schema");
+    let value: Value = serde_json::from_str(&text).expect("json");
+    let description = value["properties"]["sessionShareDestination"]["description"]
+        .as_str()
+        .expect("description");
+    assert_eq!(
+        description,
+        "Destination used by /share. \"auto\" and \"gist\" create a GitHub gist; \"radius\" is recognized but unsupported and fails explicitly."
+    );
+    assert!(
+        !description.contains("Radius when authenticated"),
+        "rpi has no Radius share backend: {description}"
+    );
 }
 
 #[test]

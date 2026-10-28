@@ -29,9 +29,9 @@ ensure_deps() {
 stage_sources() {
   # Copies (NOT symlinks): node realpaths symlinks and would resolve bare
   # imports back inside external/, where no node_modules exists.
-  rm -rf "$STAGING/core-src" "$STAGING/pi-src"
+  rm -rf "$STAGING/core-src" "$STAGING/upstream-src"
   cp -r "$UPSTREAM/packages/core/src" "$STAGING/core-src"
-  cp -r "$UPSTREAM/packages/pi-smart-fetch/src" "$STAGING/pi-src"
+  cp -r "$UPSTREAM/packages/pi-smart-fetch/src" "$STAGING/upstream-src"
 }
 
 generate() {

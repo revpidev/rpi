@@ -19,7 +19,7 @@
 //   RPI_MCP_PARITY_DEPS   out-of-tree npm install root (default
 //                         /tmp/rpi-mcp-parity-deps); tsx may instead be
 //                         resolved from external/pi/node_modules.
-//   RPI_MCP_PARITY_PI     upstream pi source root (default external/pi)
+//   RPI_MCP_PARITY_UPSTREAM     upstream pi source root (default external/pi)
 //   RPI_MCP_PARITY_CARGO  cargo binary (default `cargo`)
 //
 // Exits non-zero when the documents differ. Reports land in
@@ -35,8 +35,8 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..");
 const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
-const PI = process.env.RPI_MCP_PARITY_PI ?? join(REPO, "external", "pi");
-const PI_PIN = process.env.RPI_MCP_PARITY_PI_PIN ?? "abe508e1b";
+const UPSTREAM = process.env.RPI_MCP_PARITY_UPSTREAM ?? join(REPO, "external", "pi");
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "abe508e1b";
 const CARGO = process.env.RPI_MCP_PARITY_CARGO ?? "cargo";
 
 const args = process.argv.slice(2);
@@ -49,15 +49,15 @@ for (let i = 0; i < args.length; i++) {
 // prefer the pinned parity deps, fall back to the upstream workspace install.
 const tsxCandidates = [
   join(DEPS, "node_modules", "tsx", "dist", "loader.mjs"),
-  join(PI, "node_modules", "tsx", "dist", "loader.mjs"),
+  join(UPSTREAM, "node_modules", "tsx", "dist", "loader.mjs"),
 ];
 const tsxLoader = tsxCandidates.find((candidate) => existsSync(candidate));
 if (!tsxLoader) {
   console.error(`tsx not found; install the external/pi deps (npm ci in external/pi) or point RPI_MCP_PARITY_DEPS at a closure containing tsx`);
   process.exit(2);
 }
-if (!existsSync(join(PI, "packages", "mcp", "src", "index.ts"))) {
-  console.error(`missing ${PI}/packages/mcp — the pi submodule must be checked out`);
+if (!existsSync(join(UPSTREAM, "packages", "mcp", "src", "index.ts"))) {
+  console.error(`missing ${UPSTREAM}/packages/mcp — the pi submodule must be checked out`);
   process.exit(2);
 }
 
@@ -116,7 +116,7 @@ let rpi;
 try {
   const common = {
     RPI_MCP_PARITY_DEPS: DEPS,
-    RPI_MCP_PARITY_PI: PI,
+    RPI_MCP_PARITY_UPSTREAM: UPSTREAM,
     RPI_MCP_FIXTURE_SERVER: join(HERE, "fixture-server.mjs"),
   };
   upstream = runSide(
@@ -173,7 +173,7 @@ const lines = [
   "",
   // No volatile lines (no timestamp, no run-time HEAD): the committed report
   // must be byte-identical across reruns so `git status` stays clean.
-  `Upstream: external/pi/packages/mcp @ ${PI_PIN} (McpClient + StdioTransport, tsx)`,
+  `Upstream: external/pi/packages/mcp @ ${UPSTREAM_PIN} (McpClient + StdioTransport, tsx)`,
   `rpi: crates/rpi-mcp`,
   "",
   "Normalization: JSON-RPC ids → `$id`; `clientInfo.name` → `parity-client` (O1 brand exemption); " +

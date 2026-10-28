@@ -167,7 +167,7 @@ fn should_ignore_extra_markdown_files_in_auto_discovered_skill_dirs() {
     let skill_dir = fixture
         .agent_dir
         .join("skills")
-        .join("pi-skills")
+        .join("rpi-skills")
         .join("browser-tools");
     write(
         &skill_dir.join("SKILL.md"),

@@ -38,6 +38,43 @@ English; never expand a Chinese surface. Do not hand-translate generated
 artifacts (e.g. `fixtures/generated/**`) — fix their generator instead when
 it is in scope.
 
+## Naming standard (mandatory)
+
+- When an upstream spelling starts with `pi_`/`Pi`/`PI_`, the rpi-owned
+  counterpart uses `rpi_`/`Rpi`/`RPI_`: files, modules, functions and variables
+  `rpi_`/`rpi-`; types `Rpi*`; constants `RPI_*`; tests and temp directories
+  `rpi_*`/`rpi-*`. This includes protocol/adapter modules (`rpi_messages`,
+  `RpiMessages`), diagnostic `kind` strings and project-owned test environment
+  variables. Ordinary business names that do not carry the upstream project
+  prefix (`AgentSession`, `SessionManager`) keep their descriptive spelling.
+- Never use `pi_`, `Pi` or `PI_` for an rpi-owned name. The upstream project
+  is Pi; sharing its name makes ownership ambiguous. Do not introduce an
+  alias for a renamed rpi-owned symbol.
+- Only these `pi` spellings are allowed, and the matching comment must say
+  they are upstream/compatibility values:
+  - Upstream source paths, package names, plugin repository names and
+    documentation URLs in provenance comments (`packages/ai/src/api/pi-messages.ts`,
+    `@earendil-works/pi-tui`, `external/pi`, `pi-subagents`,
+    `pi-mcp-adapter`, `pi.dev`).
+  - Legacy values that are read, never written: the `"pi-messages"` and
+    `"pi-virtual"` API kinds (normalized to `rpi-messages`/`rpi-virtual`),
+    `package.json#pi`, `skills/pi-subagents`,
+    `</pi-subagents-refinement>`, and old `PI_*` environment names in
+    migration/diagnostic comments.
+  - Upstream parity harness environment names that configure the pinned
+    upstream process (`PI_*` in `scripts/*-parity`), and fixtures that execute
+    pinned upstream Node code (`PI_PACKAGE_DIR` in
+    `crates/rpi/tests/fixtures/`).
+  - External services and third-party names: `radius.pi.dev`, OAuth
+    `client_id: "pi-gateway"`, `pi-intercom`, and npm package names.
+  - Durable persisted view/entry/task kind literals (`pi.agent`,
+    `pi.generation`, `pi.entries.*`) are on-disk data contracts; they stay
+    upstream-compatible and must not be renamed without a durable migration.
+  - Historical release notes (`changes/v0.1.*.md`, history in
+    `CHANGELOG.md`).
+- Renaming a project-owned `pi_*` symbol updates every reference, test name,
+  fixture and document. See ADR-0028's 2026-10-28 amendment.
+
 ## Repository layout
 
 | Path | What it is |

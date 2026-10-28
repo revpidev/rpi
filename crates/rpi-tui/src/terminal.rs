@@ -1836,7 +1836,7 @@ mod tests {
     mod program_status {
         use super::*;
 
-        const WORKING: &str = "\x1b]7501;state=working:app=pi\x1b\\";
+        const WORKING: &str = "\x1b]7501;state=working:app=rpi\x1b\\";
         const CLEAR: &str = "\x1b]7501;state=clear\x1b\\";
 
         #[test]
@@ -1844,7 +1844,7 @@ mod tests {
             let mut harness = setup_negotiation();
             harness.terminal.set_program_status(&ProgramStatus {
                 state: crate::program_status::ProgramStatusState::Working,
-                app: Some("pi".into()),
+                app: Some("rpi".into()),
                 kind: None,
                 message: None,
             });
@@ -1881,7 +1881,7 @@ mod tests {
             harness.send("\x1b]7501;?\x07");
             harness.terminal.set_program_status(&ProgramStatus {
                 state: crate::program_status::ProgramStatusState::Working,
-                app: Some("pi".into()),
+                app: Some("rpi".into()),
                 kind: None,
                 message: None,
             });
@@ -1901,7 +1901,7 @@ mod tests {
             assert_eq!(harness.writes()[0], "\x1b[>7u\x1b[?u\x1b[c");
             harness.terminal.set_program_status(&ProgramStatus {
                 state: crate::program_status::ProgramStatusState::Working,
-                app: Some("pi".into()),
+                app: Some("rpi".into()),
                 kind: None,
                 message: None,
             });
@@ -1911,7 +1911,7 @@ mod tests {
             assert_eq!(harness.writes()[0], "\x1b[>7u\x1b[?u\x1b[c");
             harness.terminal.set_program_status(&ProgramStatus {
                 state: crate::program_status::ProgramStatusState::Working,
-                app: Some("pi".into()),
+                app: Some("rpi".into()),
                 kind: None,
                 message: None,
             });
@@ -1923,7 +1923,7 @@ mod tests {
             let mut harness = setup_negotiation();
             harness.terminal.set_program_status(&ProgramStatus {
                 state: crate::program_status::ProgramStatusState::Working,
-                app: Some("pi".into()),
+                app: Some("rpi".into()),
                 kind: None,
                 message: None,
             });
@@ -1944,7 +1944,7 @@ mod tests {
             let mut harness = setup_negotiation();
             harness.terminal.set_program_status(&ProgramStatus {
                 state: crate::program_status::ProgramStatusState::Working,
-                app: Some("pi".into()),
+                app: Some("rpi".into()),
                 kind: None,
                 message: None,
             });
@@ -1957,7 +1957,7 @@ mod tests {
             let writes_before_restart = harness.writes().len();
             harness.terminal.set_program_status(&ProgramStatus {
                 state: crate::program_status::ProgramStatusState::Working,
-                app: Some("pi".into()),
+                app: Some("rpi".into()),
                 kind: None,
                 message: None,
             });

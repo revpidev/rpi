@@ -185,7 +185,7 @@ fn context_window_of(model: &LlamaModelInfo) -> u32 {
 /// (`{server}/v1`) and the `typesafe-system-one` transport appends
 /// `/systemone`. The upstream chat-model label-probability fallback
 /// classifier is not ported ([N/A-struct], ADR-0034 decision 6 / V17-16).
-fn to_pi_classifier_model(
+fn to_rpi_classifier_model(
     model: &LlamaModelInfo,
     server_url: &str,
 ) -> Result<ClassifierModel, LlamaError> {
@@ -205,7 +205,7 @@ fn to_pi_classifier_model(
     })
 }
 
-fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaError> {
+fn to_rpi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaError> {
     let context_window = context_window_of(model);
     let mut input = vec![InputModality::Text];
     if model
@@ -308,10 +308,10 @@ impl LlamaProvider {
                 continue;
             }
             if is_chat_model(model) {
-                models.push(to_pi_model(model, server_url)?);
+                models.push(to_rpi_model(model, server_url)?);
             }
             if is_decision_model(model) {
-                classifiers.push(to_pi_classifier_model(model, server_url)?);
+                classifiers.push(to_rpi_classifier_model(model, server_url)?);
             }
         }
         *lock(&self.models) = models;
@@ -806,23 +806,23 @@ mod tests {
     /// reported context falls back to 128000; `n_ctx_train` fills in for a
     /// missing `n_ctx`.
     #[test]
-    fn to_pi_model_context_window_fallbacks() {
+    fn to_rpi_model_context_window_fallbacks() {
         let mut model = model_info("m", LlamaModelStatusValue::LOADED);
-        let converted = to_pi_model(&model, "http://localhost:8080").expect("convert");
+        let converted = to_rpi_model(&model, "http://localhost:8080").expect("convert");
         assert_eq!(converted.context_window, 128_000);
 
         model.meta = Some(LlamaModelMeta {
             n_ctx_train: Some(8192),
             ..Default::default()
         });
-        let converted = to_pi_model(&model, "http://localhost:8080").expect("convert");
+        let converted = to_rpi_model(&model, "http://localhost:8080").expect("convert");
         assert_eq!(converted.context_window, 8192);
 
         model.meta = Some(LlamaModelMeta {
             n_ctx: Some(0),
             ..Default::default()
         });
-        let converted = to_pi_model(&model, "http://localhost:8080").expect("convert");
+        let converted = to_rpi_model(&model, "http://localhost:8080").expect("convert");
         assert_eq!(converted.context_window, 128_000);
     }
 
@@ -928,16 +928,16 @@ mod tests {
     /// V17-16 FR-A R1/R2: classifier context windows share the chat
     /// computation (`contextWindowOf`, provider.ts:72-79).
     #[test]
-    fn to_pi_classifier_model_context_window_matches_chat() {
+    fn to_rpi_classifier_model_context_window_matches_chat() {
         let mut model = model_info("m", LlamaModelStatusValue::LOADED);
-        let classifier = to_pi_classifier_model(&model, "http://localhost:8080").expect("convert");
+        let classifier = to_rpi_classifier_model(&model, "http://localhost:8080").expect("convert");
         assert_eq!(classifier.context_window, 128_000);
 
         model.meta = Some(LlamaModelMeta {
             n_ctx_train: Some(8192),
             ..Default::default()
         });
-        let classifier = to_pi_classifier_model(&model, "http://localhost:8080").expect("convert");
+        let classifier = to_rpi_classifier_model(&model, "http://localhost:8080").expect("convert");
         assert_eq!(classifier.context_window, 8192);
 
         model.meta = Some(LlamaModelMeta {
@@ -945,9 +945,9 @@ mod tests {
             n_ctx_train: Some(8192),
             ..Default::default()
         });
-        let classifier = to_pi_classifier_model(&model, "http://localhost:8080").expect("convert");
+        let classifier = to_rpi_classifier_model(&model, "http://localhost:8080").expect("convert");
         assert_eq!(classifier.context_window, 4096);
-        let chat = to_pi_model(&model, "http://localhost:8080").expect("convert");
+        let chat = to_rpi_model(&model, "http://localhost:8080").expect("convert");
         assert_eq!(classifier.context_window, chat.context_window);
     }
 
@@ -1070,14 +1070,14 @@ mod tests {
         // A previously published llama model in the stored snapshot.
         let mut stored_model = model_info("kept-model", LlamaModelStatusValue::LOADED);
         stored_model.source = Some("preset".to_owned());
-        let pi_model = to_pi_model(&stored_model, "http://localhost:8080").expect("model");
+        let rpi_model = to_rpi_model(&stored_model, "http://localhost:8080").expect("model");
 
         let store = Arc::new(InMemoryModelsStore::new());
         store
             .write(
                 LLAMA_PROVIDER_ID,
                 ModelsStoreEntry {
-                    models: vec![AnyModel::Chat(pi_model.clone())],
+                    models: vec![AnyModel::Chat(rpi_model.clone())],
                     last_modified: None,
                     checked_at: None,
                     etag: None,
@@ -1137,7 +1137,7 @@ mod tests {
 
         let mut chat = model_info("kept-chat", LlamaModelStatusValue::LOADED);
         chat.source = Some("preset".to_owned());
-        let chat = to_pi_model(&chat, "http://localhost:8080").expect("chat");
+        let chat = to_rpi_model(&chat, "http://localhost:8080").expect("chat");
 
         let mut decision = model_info("kept-decision", LlamaModelStatusValue::LOADED);
         decision.architecture = Some(LlamaArchitecture {
@@ -1145,7 +1145,7 @@ mod tests {
             output_modalities: vec!["decisions".to_owned()],
         });
         let stored_classifier =
-            to_pi_classifier_model(&decision, "http://localhost:8080").expect("classifier");
+            to_rpi_classifier_model(&decision, "http://localhost:8080").expect("classifier");
         let mut foreign = stored_classifier.clone();
         foreign.provider = "other".to_owned();
         let mut wrong_api = stored_classifier.clone();

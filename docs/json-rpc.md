@@ -126,6 +126,7 @@ Response:
 - **`--mode json`** (print) emits the same frame on the raw stdout stream, interleaved with the session event stream; it does not invent a new event type.
 - **`--mode text`** (print) writes the text plus one trailing newline to stdout.
 - `validateOnly:true` checks the channel and writes nothing; use it before fetching data, opening an editor, or writing files.
+- Write failures are fire-and-forget (like `ui.notify`): a broken stdout is recorded by the mode's output guard. RPC exits immediately with code 1 on the error notification; print maps it to exit code 1 at the end of the run. `emitText` itself does not report the write error.
 - **TUI** routes the text to the notification area.
 - **NullUi / subagent hosts** answer a structured `call` error whose message is exactly `unsupported-output`; callers must fall back instead of assuming output happened.
 

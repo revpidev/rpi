@@ -892,7 +892,7 @@ async fn argv_exec_reports_missing_programs_and_empty_argv_as_spawn_errors() {
     let env = create_env(&dir);
     let missing = env
         .exec(
-            argv(&["pi-durable-conformance-missing-program"]),
+            argv(&["rpi-durable-conformance-missing-program"]),
             None,
             &context(),
         )

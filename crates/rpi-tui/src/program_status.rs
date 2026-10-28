@@ -266,12 +266,12 @@ mod tests {
         assert_eq!(
             format_program_status(&ProgramStatus {
                 state: ProgramStatusState::Blocked,
-                app: Some("pi".into()),
+                app: Some("rpi".into()),
                 kind: Some(ProgramStatusKind::Permission),
                 message: Some("Allow bash?".into()),
             }),
             format!(
-                "\x1b]7501;state=blocked:app=pi:kind=permission:msg={}\x1b\\",
+                "\x1b]7501;state=blocked:app=rpi:kind=permission:msg={}\x1b\\",
                 base64::engine::general_purpose::STANDARD.encode("Allow bash?")
             )
         );
@@ -333,7 +333,7 @@ mod tests {
     fn cuts_long_messages_at_a_utf8_boundary_within_the_spec_limits() {
         let sequence = format_program_status(&ProgramStatus {
             state: ProgramStatusState::Working,
-            app: Some("pi".into()),
+            app: Some("rpi".into()),
             kind: None,
             message: Some("é".repeat(2000)),
         });

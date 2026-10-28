@@ -65,8 +65,8 @@ const UPSTREAM_MODULES = [
 // TE31: the preview modules additionally need `visibleWidth`/
 // `truncateToWidth` from the pinned upstream utils module (plus its
 // `get-east-asian-width` dependency, installed at the pi-tui pin).
-const PI_TUI_KEYS = resolve(REPO, "external/pi/packages/tui/src/keys.ts");
-const PI_TUI_UTILS = resolve(REPO, "external/pi/packages/tui/src/utils.ts");
+const UPSTREAM_TUI_KEYS = resolve(REPO, "external/pi/packages/tui/src/keys.ts");
+const UPSTREAM_TUI_UTILS = resolve(REPO, "external/pi/packages/tui/src/utils.ts");
 const GOLDEN_DIR = resolve(GENERATED, "golden-frames");
 
 function sha256(path) {
@@ -141,19 +141,19 @@ function materializeSnapshot() {
 		resolve(stubDir, "package.json"),
 		`${JSON.stringify({ name: "@earendil-works/pi-tui", version: "0.0.0-harness", type: "module", main: "index.ts" }, null, 2)}\n`,
 	);
-	copyFileSync(PI_TUI_KEYS, resolve(stubDir, "keys.ts"));
-	copyFileSync(PI_TUI_UTILS, resolve(stubDir, "utils.ts"));
+	copyFileSync(UPSTREAM_TUI_KEYS, resolve(stubDir, "keys.ts"));
+	copyFileSync(UPSTREAM_TUI_UTILS, resolve(stubDir, "utils.ts"));
 	writeFileSync(
 		resolve(stubDir, "index.ts"),
 		'export * from "./keys.ts";\nexport * from "./utils.ts";\n',
 	);
 	hashes.push({
 		module: "external/pi/packages/tui/src/keys.ts (pi-tui stub)",
-		sha256: sha256(PI_TUI_KEYS),
+		sha256: sha256(UPSTREAM_TUI_KEYS),
 	});
 	hashes.push({
 		module: "external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31)",
-		sha256: sha256(PI_TUI_UTILS),
+		sha256: sha256(UPSTREAM_TUI_UTILS),
 	});
 	return hashes;
 }

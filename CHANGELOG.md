@@ -2,10 +2,11 @@
 
 ## [Unreleased]
 
-### v0.1.8 draft — V18-01 providers and catalog
+### v0.1.8 draft — V18-00/V18-01/V18-02
 
-This section currently covers only V18-01 and V18-02; the other v0.1.8 tasks and final release review are pending.
+This section currently covers only the completed V18-00, V18-01 and V18-02 work; the other v0.1.8 tasks and final release review are pending.
 
+- **CJK-friendly Markdown in HTML export** (V18-00): the Pi v1.4.0 viewer assets include the CJK-friendly Markdown parser; a deterministic synchronizer vendors the six embedded assets and the export loads the parser between the base Markdown and highlight scripts.
 - **Configuration schemas, share destination and coordinated settings writes**: revpi.dev-branded settings/models/keybindings/theme schemas are vendored by a pinned sync script; built-in themes use the revpi.dev theme schema; `/share` honors `sessionShareDestination` (`auto`/`gist`; `radius` fails explicitly) and all first-party settings writers share the host `fs2` → `<target>.write-lock` lock order with in-lock re-read, preserved keys/newline/mode and atomic replacement.
 - **mcp-adapter uninstall guidance removed**: installed `rpi-mcp-adapter` copies no longer trigger a startup removal recommendation or an `rpi update` skip note. The plugin stays retired (no crate/registry restoration), user files are not deleted automatically, and the generic deprecated-extension mechanism remains for a future host-built-in replacement.
 - **Extension startup and concurrent dialogs**: `before_agent_start` is a `messageType` union, fires for idle custom `triggerTurn` runs, counts the session busy from setup, applies setup-time aborts at the first request, and keeps the patched system prompt stable. Extension dialogs stack (closing the top restores the previous; late `done()`/timeout closes only its frame), and the additive `ui.hasOverlay` returns `{visible,capturing}` (hidden/inline excluded, capturing implies visible; RPC/NullUi double false).
@@ -18,6 +19,8 @@ This section currently covers only V18-01 and V18-02; the other v0.1.8 tasks and
 - **Catalog and transport refresh**: 42 provider catalogs and 1718 entries (1602 chat, 63 image, 53 classifier) generated from Pi v1.4.0 at 2026-10-27T01:36:18.091Z, including new Copilot/NVIDIA defaults, MiniMax M3.1 Flash, Kimi K3.1 Pro, Grok `xhigh`, and the corrected 500K Codex context window. OpenCode uses `/inference` and `/inference/go` independently of its fixed usage origin. OpenRouter adds per-key `/models/user` metadata, regional endpoints, same-key offline cache fallback, and negative-price normalization.
 - **Shared compatibility and identity**: provider/model/extension/classifier compatibility inheritance now covers image input and opt-in headers; identity reaches chat, image/classifier, extension and durable request seams. Model changes discard prior-model thinking blocks, ambiguous bare ids prefer an unambiguous configured provider without dropping scoped duplicates, and process-local auth generations distinguish key, account and origin changes without serializing secrets. Custom/proxy origins cannot inherit official subscription OAuth identities.
 - **Provider fixes**: classifier image/compat dispatch; final malformed tool arguments rejected across all five streaming adapters; Anthropic strict-tool fallback narrowed to supported schema errors; Copilot oversized-request compaction; workspace/quota retry classification; error tool-result image ordering; whitespace-only output; Mistral header-only timeouts; and Gemini/OpenAI-compatible thinking/content ordering.
+- **Review fixes**: Radius/rpi-messages `toolcall_end` now preserves `argumentsError` and `namespace`, and `done`/`error` carry `providerThinkingLevel`; settings leases hold an OS-locked `lease.lock` so crashed/ownerless leases are reclaimable (including on Windows) and reads no longer block on a stale write lease; the run-start transition is an atomic claim so concurrent prompts cannot start a second run or clear the winner's busy state.
+- **Internal naming**: the synthetic Responses tool-load call-id prefix is now `rpi_tool_load_`; rpi-owned `pi_*`/`Pi*`/`PI_*` symbols were renamed to rpi spelling (`rpi_messages`, `RpiMessages`, `rpi_messages_*`, `rpi_defaults`, `to_rpi_model`, `RpiManifest`); upstream paths, the legacy `"pi-messages"` API kind and external service identifiers remain as provenance/compatibility values.
 
 ## [0.1.7] - 2026-10-19
 

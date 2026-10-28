@@ -53,7 +53,7 @@ impl InteractiveUi {
         // stopping does not destroy the component tree.
         self.ui.stop(TuiStopOptions::default());
 
-        // Temp dir `pi-editor-{pid}/prompt.md` (external-editor.ts:14-17;
+        // Temp dir `rpi-editor-{pid}/prompt.md` (external-editor.ts:14-17;
         // pid-scoped instead of mkdtemp so the path is reproducible).
         let dir = std::env::temp_dir().join(format!("rpi-editor-{}", std::process::id()));
         let file_path = dir.join("prompt.md");

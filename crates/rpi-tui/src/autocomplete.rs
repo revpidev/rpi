@@ -1543,7 +1543,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -1572,7 +1572,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder("cwd", &folder_structure(&[], &[("file.txt", "content")]));
@@ -1597,7 +1597,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -1626,7 +1626,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder("cwd", &folder_structure(&["src"], &[("src.txt", "text")]));
@@ -1658,7 +1658,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -1686,7 +1686,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -1729,7 +1729,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -1768,7 +1768,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         let outside_dir = temp.path.join("outside").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
@@ -1821,7 +1821,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -1864,7 +1864,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         let flooded_dirs: Vec<String> = (0..250)
@@ -1903,7 +1903,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -1931,7 +1931,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -1973,7 +1973,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         let outside_dir = temp.path.join("outside").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
@@ -2014,7 +2014,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         let outside_dir = temp.path.join("outside").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
@@ -2046,7 +2046,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -2075,7 +2075,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let normal_base_dir = temp.path.join("cwd-normal").to_string_lossy().into_owned();
         let query_in_path_base_dir = temp
             .path
@@ -2159,7 +2159,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -2206,7 +2206,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-root");
+        let temp = TempDir::new("rpi-autocomplete-root");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -2248,7 +2248,7 @@ mod tests {
 
     #[test]
     fn preserves_dot_slash_prefix_when_completing_paths() {
-        let temp = TempDir::new("pi-autocomplete");
+        let temp = TempDir::new("rpi-autocomplete");
         let base_dir = temp.path.to_string_lossy().into_owned();
         temp.setup_folder(
             "",
@@ -2278,7 +2278,7 @@ mod tests {
 
     #[test]
     fn preserves_dot_slash_prefix_for_directory_completions() {
-        let temp = TempDir::new("pi-autocomplete");
+        let temp = TempDir::new("rpi-autocomplete");
         let base_dir = temp.path.to_string_lossy().into_owned();
         temp.setup_folder(
             "",
@@ -2310,7 +2310,7 @@ mod tests {
 
     #[test]
     fn quotes_paths_with_spaces_for_direct_completion() {
-        let temp = TempDir::new("pi-autocomplete");
+        let temp = TempDir::new("rpi-autocomplete");
         let base_dir = temp.path.to_string_lossy().into_owned();
         temp.setup_folder(
             "",
@@ -2340,7 +2340,7 @@ mod tests {
 
     #[test]
     fn continues_completion_inside_quoted_paths() {
-        let temp = TempDir::new("pi-autocomplete");
+        let temp = TempDir::new("rpi-autocomplete");
         let base_dir = temp.path.to_string_lossy().into_owned();
         temp.setup_folder(
             "",
@@ -2378,7 +2378,7 @@ mod tests {
 
     #[test]
     fn applies_quoted_completion_without_duplicating_closing_quote() {
-        let temp = TempDir::new("pi-autocomplete");
+        let temp = TempDir::new("rpi-autocomplete");
         let base_dir = temp.path.to_string_lossy().into_owned();
         temp.setup_folder(
             "",
@@ -2428,7 +2428,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-cjk");
+        let temp = TempDir::new("rpi-autocomplete-cjk");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder("cwd", &folder_structure(&[], &[("README.md", "readme")]));
@@ -2517,7 +2517,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-cjk");
+        let temp = TempDir::new("rpi-autocomplete-cjk");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -2585,7 +2585,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-cjk");
+        let temp = TempDir::new("rpi-autocomplete-cjk");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -2668,7 +2668,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-cjk");
+        let temp = TempDir::new("rpi-autocomplete-cjk");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder("cwd", &folder_structure(&[], &[("说明.md", "text")]));
@@ -2698,7 +2698,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-cjk");
+        let temp = TempDir::new("rpi-autocomplete-cjk");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -2727,7 +2727,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-cjk");
+        let temp = TempDir::new("rpi-autocomplete-cjk");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         for separator in [" ", "\u{3000}", "，", "。"] {
@@ -2792,7 +2792,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-cjk");
+        let temp = TempDir::new("rpi-autocomplete-cjk");
         let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
@@ -2942,7 +2942,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-wrappers");
+        let temp = TempDir::new("rpi-autocomplete-wrappers");
         let base_dir = temp.path.join("cwd");
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder("cwd", &folder_structure(&[], &[("src/main.rs", "x")]));
@@ -2973,7 +2973,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-at-wrappers");
+        let temp = TempDir::new("rpi-autocomplete-at-wrappers");
         let base_dir = temp.path.join("cwd");
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder("cwd", &folder_structure(&[], &[("README.md", "readme")]));
@@ -3010,7 +3010,7 @@ mod tests {
             eprintln!("skipping: fd is not installed");
             return;
         };
-        let temp = TempDir::new("pi-autocomplete-wrapper-closers");
+        let temp = TempDir::new("rpi-autocomplete-wrapper-closers");
         let base_dir = temp.path.join("cwd");
         fs::create_dir_all(&base_dir).unwrap();
         temp.setup_folder(
