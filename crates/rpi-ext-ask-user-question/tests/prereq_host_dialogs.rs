@@ -75,6 +75,7 @@ fn dialog_extension(dialogs: usize) -> InlineExtension {
             output_schema: None,
             default_active: None,
             prepare_loadout: None,
+            reaches_tools: None,
         })
         .expect("register dialog_asker");
         Box::pin(async { Ok(()) })
